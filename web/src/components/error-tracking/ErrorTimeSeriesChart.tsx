@@ -1,5 +1,17 @@
-import { getErrorTimeSeriesOptions } from '@/api/client/@tanstack/react-query.gen'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import {
+  getErrorTimeSeriesOptions,
+  // Deploy events overlaid as vertical markers — "did a deploy cause this?"
+  // Same endpoint + chart component MetricsExplorer uses for its OTel charts.
+  getProjectDeploymentsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
+import {
+  ThresholdLineChart,
+  type ThresholdMarker,
+} from '@/components/charts/threshold-line-chart'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -8,35 +20,23 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  ChartConfig,
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-} from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import React, { useMemo, useState } from 'react'
-import { Line, LineChart, XAxis, YAxis } from 'recharts'
 
 interface ErrorTimeSeriesChartProps {
   project: ProjectResponse
   startDate: Date
   endDate: Date
+  environmentId?: number
 }
-
-const chartConfig = {
-  count: {
-    label: 'Errors',
-    color: 'var(--chart-1)',
-  },
-} satisfies ChartConfig
 
 export function ErrorTimeSeriesChart({
   project,
   startDate,
   endDate,
+  environmentId,
 }: ErrorTimeSeriesChartProps) {
   // Calculate time range in hours to determine appropriate bucket
   const timeRangeHours = useMemo(() => {
@@ -68,6 +68,7 @@ export function ErrorTimeSeriesChart({
         start_time: startDate.toISOString(),
         end_time: endDate.toISOString(),
         bucket: selectedBucket,
+        environment_id: environmentId,
       },
     }),
     enabled: !!startDate && !!endDate,
@@ -95,6 +96,73 @@ export function ErrorTimeSeriesChart({
     if (!data) return 0
     return data.reduce((sum, point) => sum + point.count, 0)
   }, [data])
+
+  // ── Deploy markers ──
+  // Overlay deploy events that fall inside the visible window as vertical
+  // lines, snapped to the nearest chart bucket — mirrors MetricsExplorer's
+  // deploy-marker overlay so "did a deploy cause this?" works the same way
+  // across every chart in the app.
+  const deploysQuery = useQuery({
+    ...getProjectDeploymentsOptions({
+      path: { id: project.id },
+      query: {
+        per_page: 50,
+        ...(environmentId != null ? { environment_id: environmentId } : {}),
+      },
+    }),
+    enabled: !!project.id,
+  })
+  const deployMarkers = useMemo<ThresholdMarker[]>(() => {
+    const deploys = deploysQuery.data?.deployments ?? []
+    if (chartData.length === 0 || deploys.length === 0) return []
+    const fromMs = startDate.getTime()
+    const toMs = endDate.getTime()
+    // Timestamps come back in seconds; normalise to ms.
+    const toMs10 = (n: number) => (n < 1e12 ? n * 1000 : n)
+    const bucketMs = chartData.map((p) => new Date(p.timestamp).getTime())
+    // Multiple deploys can snap to the same bucket — recharts renders one
+    // <ReferenceLine> per marker, and two labels at an identical x stack
+    // directly on top of each other and render as garbled overlapping text.
+    // Group by bucket and collapse each group into a single marker.
+    const byBucket = new Map<
+      number,
+      { label: string; title?: string; count: number }
+    >()
+    for (const d of deploys) {
+      const at = d.finished_at ?? d.started_at ?? d.created_at
+      const ts = toMs10(at)
+      if (ts < fromMs || ts > toMs) continue
+      // Snap to the nearest bucket (the categorical x axis can't take a raw ts).
+      let best = 0
+      let bestDiff = Infinity
+      for (let i = 0; i < bucketMs.length; i++) {
+        const diff = Math.abs(bucketMs[i] - ts)
+        if (diff < bestDiff) {
+          bestDiff = diff
+          best = i
+        }
+      }
+      const existing = byBucket.get(best)
+      if (existing) {
+        existing.count += 1
+      } else {
+        byBucket.set(best, {
+          label: d.commit_hash ? d.commit_hash.slice(0, 7) : 'deploy',
+          title: d.commit_message ?? undefined,
+          count: 1,
+        })
+      }
+    }
+    const markers: ThresholdMarker[] = []
+    for (const [best, m] of byBucket) {
+      markers.push({
+        x: chartData[best].date,
+        label: m.count > 1 ? `${m.label} +${m.count - 1}` : m.label,
+        title: m.title,
+      })
+    }
+    return markers
+  }, [deploysQuery.data, chartData, startDate, endDate])
 
   return (
     <Card>
@@ -169,49 +237,15 @@ export function ErrorTimeSeriesChart({
                 Total errors in period
               </p>
             </div>
-            <ChartContainer config={chartConfig} className="h-[400px] w-full">
-              <LineChart
-                accessibilityLayer
-                data={chartData}
-                margin={{
-                  left: 12,
-                  right: 12,
-                  top: 12,
-                  bottom: 12,
-                }}
-              >
-                <XAxis
-                  dataKey="date"
-                  tickLine={false}
-                  axisLine={false}
-                  tickMargin={8}
-                  minTickGap={32}
-                />
-                <YAxis
-                  tickLine={false}
-                  axisLine={false}
-                  tickMargin={8}
-                  tickFormatter={(value) => value.toLocaleString()}
-                />
-                <ChartTooltip
-                  cursor={false}
-                  content={<ChartTooltipContent />}
-                />
-                <Line
-                  dataKey="count"
-                  type="monotone"
-                  stroke="var(--color-count)"
-                  strokeWidth={2}
-                  dot={{
-                    fill: 'var(--color-count)',
-                    r: 4,
-                  }}
-                  activeDot={{
-                    r: 6,
-                  }}
-                />
-              </LineChart>
-            </ChartContainer>
+            <ThresholdLineChart
+              data={chartData}
+              xKey="date"
+              series={{ dataKey: 'count', label: 'Errors', tone: 'neutral' }}
+              markers={deployMarkers}
+              height={400}
+              tooltipValueFormatter={(v) => v.toLocaleString()}
+              yTickFormatter={(v) => v.toLocaleString()}
+            />
           </div>
         )}
       </CardContent>

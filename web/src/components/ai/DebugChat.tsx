@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
 import { Button } from '@/components/ui/button'
 import { Sparkles } from 'lucide-react'
@@ -20,7 +23,7 @@ interface DebugChatProps {
 /**
  * A standalone "Debug with AI" trigger that opens the persistent assistant dock
  * (ADR-023) straight into this entity's conversation. Render only when the
- * project's `ai_debug_chat_enabled` toggle is on.
+ * user has access to the project.
  */
 export function DebugChat({
   projectId,

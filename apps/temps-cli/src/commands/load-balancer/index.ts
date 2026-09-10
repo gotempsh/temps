@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -11,7 +14,7 @@ import {
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, keyValue } from '../../ui/output.js'
 
 interface ListOptions {
   json?: boolean
@@ -37,6 +40,14 @@ interface RemoveOptions {
   domain: string
   force?: boolean
   yes?: boolean
+}
+
+/** Split a user-supplied target (with or without a scheme) into host + port, defaulting the port from the scheme. */
+export function parseTarget(target: string): { host: string; port: number } {
+  const targetUrl = new URL(target.includes('://') ? target : `http://${target}`)
+  const host = targetUrl.hostname
+  const port = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'), 10)
+  return { host, port }
 }
 
 export function registerLoadBalancerCommands(program: Command): void {
@@ -164,9 +175,7 @@ async function createRouteAction(options: CreateOptions): Promise<void> {
     }
   }
 
-  const targetUrl = new URL(target.includes('://') ? target : `http://${target}`)
-  const host = targetUrl.hostname
-  const port = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'), 10)
+  const { host, port } = parseTarget(target)
 
   await withSpinner(`Creating route for ${domain}...`, async () => {
     const { error } = await createRoute({
@@ -255,9 +264,7 @@ async function updateRouteAction(options: UpdateOptions): Promise<void> {
     })
   }
 
-  const targetUrl = new URL(target.includes('://') ? target : `http://${target}`)
-  const host = targetUrl.hostname
-  const port = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'), 10)
+  const { host, port } = parseTarget(target)
 
   await withSpinner(`Updating route for ${domain}...`, async () => {
     const { error } = await updateRoute({

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Retention service for cleaning up expired log data
 //!
 //! - Nightly job: deletes S3/filesystem chunks where ended_at < NOW() - retention_interval

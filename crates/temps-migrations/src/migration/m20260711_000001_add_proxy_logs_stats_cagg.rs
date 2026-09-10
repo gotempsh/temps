@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Continuous aggregate for per-project proxy-log statistics.
 //!
 //! The proxy dashboard endpoints (`GET /proxy-logs/stats/projects-health` and

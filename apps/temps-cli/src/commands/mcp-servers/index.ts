@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { readFileSync } from 'node:fs'
 import { requireAuth } from '../../config/store.js'
@@ -34,7 +37,7 @@ interface ListResponse {
 // --- Helpers ---
 
 /** Resolve value: if prefixed with @, read from file path */
-function resolveValue(value: string): string {
+export function resolveValue(value: string): string {
   if (value.startsWith('@')) {
     const filePath = value.slice(1)
     try {
@@ -46,7 +49,7 @@ function resolveValue(value: string): string {
   return value
 }
 
-function parseJson(value: string): Record<string, unknown> {
+export function parseJson(value: string): Record<string, unknown> {
   const raw = resolveValue(value)
   try {
     return JSON.parse(raw)
@@ -107,7 +110,6 @@ interface DeleteOptions {
 export function registerMcpServersCommands(program: Command): void {
   const mcp = program
     .command('mcp-servers')
-    .alias('mcp')
     .description('Manage MCP server definitions (global or project-scoped)')
 
   mcp

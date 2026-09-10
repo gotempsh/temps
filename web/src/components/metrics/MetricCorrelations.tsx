@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Cross-signal "what changed" strip for a drilled-in metric.
 //
 // The correlation moat: Temps owns metrics, deploys, traces, and errors, so when
@@ -17,7 +20,7 @@
 import type { ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { useAlertStatus } from './alert-status'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { ArrowUpRight, Bug, Eye, Network, Rocket } from 'lucide-react'
 
 /** The relative ranges the explorer offers; a subset is shared with Traces. */

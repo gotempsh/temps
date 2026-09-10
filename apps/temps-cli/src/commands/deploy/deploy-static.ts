@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../../lib/api-client.js'
 import { resolveProjectSlug } from '../../config/resolve-project.js'
@@ -380,7 +383,7 @@ export async function deployStatic(options: DeployStaticOptions): Promise<void> 
   }
 }
 
-function isValidArchive(path: string): boolean {
+export function isValidArchive(path: string): boolean {
   const ext = extname(path).toLowerCase()
   const name = basename(path).toLowerCase()
   // Check for .tar.gz extension (two-part extension)
@@ -390,7 +393,7 @@ function isValidArchive(path: string): boolean {
   return ext === '.tgz' || ext === '.zip'
 }
 
-function getContentType(path: string): string {
+export function getContentType(path: string): string {
   const name = basename(path).toLowerCase()
   if (name.endsWith('.tar.gz') || name.endsWith('.tgz')) {
     return 'application/gzip'
@@ -401,7 +404,7 @@ function getContentType(path: string): string {
   return 'application/octet-stream'
 }
 
-function formatFileSize(bytes: number): string {
+export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`

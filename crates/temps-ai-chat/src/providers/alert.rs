@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The metric-alert context provider (ADR-023, P2).
 //!
 //! Seeds a chat to investigate a metric alert and make it actionable — turning
@@ -37,7 +40,8 @@ impl ConversationContextProvider for AlertChatProvider {
         "alert"
     }
 
-    async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed> {
+    async fn seed(&self, project_id: Option<i32>, context_id: &str) -> Option<ConversationSeed> {
+        let project_id = project_id?;
         let rule_id: i32 = context_id.parse().ok()?;
         let rule = metric_alert_rules::Entity::find_by_id(rule_id)
             .one(self.db.as_ref())

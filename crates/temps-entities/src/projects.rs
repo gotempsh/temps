@@ -1,12 +1,19 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
+use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
+use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
 use super::source_type::SourceType;
+use super::types::ProjectType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "projects")]
@@ -51,6 +58,24 @@ pub struct Model {
     /// (the default), the AI may only read data; write-action proposals are
     /// suppressed. Operators enable this per-project via the UI.
     pub ai_write_actions_enabled: bool,
+    /// Opt-in for native error-tracking source context. When true, Temps
+    /// accepts raw source-file uploads for this project and resolves native
+    /// (Go/Rust/etc.) stack frames against them so the error UI shows the
+    /// actual source code around each frame. Off by default — uploading
+    /// application source is always a deliberate choice.
+    #[sea_orm(default_value = "false")]
+    pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning of this project's deployed Docker
+    /// images (post-deployment scan + daily rescans). Off by default — scanning
+    /// costs CPU/time per image and requires the `trivy` binary; project owners
+    /// explicitly enable it when they want the coverage.
+    #[sea_orm(default_value = "false")]
+    pub vulnerability_scanning_enabled: bool,
+    /// Where the auto-capture job reads source from, relative to the git
+    /// checkout. NULL = default to the deployment's Docker build context (the
+    /// directory the image was built from) — the correct root for Dockerfile
+    /// deploys and monorepos. Set it to narrow/override that default.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, preview environments auto-created for branches are
@@ -71,6 +96,29 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Product-level project classification. Unlike `source_type`, which
+    /// describes how bytes reach the deployer, this distinguishes a regular
+    /// application from a versioned template-backed service.
+    #[sea_orm(default_value = "server")]
+    pub project_type: ProjectType,
+    /// Opt-in: accept deployments whose source differs from `source_type`.
+    ///
+    /// `source_type` stays the project's primary/default source — a Git project
+    /// keeps its repository, webhooks and rollback-rebuild behaviour. When this
+    /// is true the project will additionally accept an uploaded source archive
+    /// (`drop`), so the same project can be shipped from git, a Docker image, or
+    /// a local folder. NULL means off.
+    pub allow_alternate_sources: Option<bool>,
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Service projects additionally persist their complete,
+    /// immutable template release in `service_template`.
+    #[serde(skip_serializing)]
+    pub template_slug: Option<String>,
+    /// Immutable resolved service-template release. Stored as JSONB so an
+    /// existing service remains deployable and editable without consulting the
+    /// mutable catalog. Only `project_type = service` may populate it.
+    #[serde(skip_serializing)]
+    pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
     /// the webhook on repo connect. NULL when not connected to a GitLab repository.
     pub gitlab_webhook_id: Option<i32>,
@@ -107,6 +155,71 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Opt-in for AI summarization of API traffic analytics for this project.
+    /// NULL/false = off; true = generate an AI summary when AI is configured
+    /// and the project calls `GET /projects/{id}/api-analytics/summary`.
+    /// Falls back to `null` summary gracefully when no AI provider is configured.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// How long (in hours) to retain built Docker images before the nightly
+    /// cleanup removes them. NULL means use the system default, sourced from
+    /// `AppSettings.image_retention.default_hours` (336 hours / 14 days
+    /// out of the box).
+    pub image_retention_hours: Option<i32>,
+    /// ADR-040 §1: how much of a span may leave this instance for Temps Cloud.
+    ///
+    /// `metered` (the default for every existing and new project) is exactly
+    /// today's behaviour — pseudonymised identifiers, constant span name, no
+    /// attributes. `queryable` is a per-project opt-in that ships real span
+    /// names, service names, trace/span identifiers and allowlisted attributes
+    /// so the data can be read back into the console.
+    ///
+    /// Not a secret and therefore not encrypted; it is a consent flag, and an
+    /// operator must be able to read it back verbatim to know what their
+    /// instance is doing.
+    #[sea_orm(default_value = "metered")]
+    pub cloud_telemetry_fidelity: CloudTelemetryFidelity,
+    /// ADR-040 §1: exact-match keys whose span attributes may be mirrored to
+    /// Temps Cloud at `queryable` fidelity.
+    ///
+    /// **Default-deny.** Empty (the default, even after opting into
+    /// `queryable`) means no attributes leave at all. Arbitrary span
+    /// attributes routinely carry headers, SQL and user identifiers, so this
+    /// closes that hazard by construction rather than by operator diligence.
+    /// Matching is exact — no prefixes, no globs — so a broad pattern cannot
+    /// quietly widen egress later.
+    #[sea_orm(default_value = "{}")]
+    pub cloud_telemetry_attribute_allowlist: Vec<String>,
+    /// ADR-041 §1: whether this project's spans are stored on this instance at
+    /// all, or written straight to Temps Cloud through the durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour. `cloud` is a per-project opt-in that is only
+    /// reachable when `cloud_telemetry_fidelity` is `queryable`, the instance
+    /// is linked, and the Cloud telemetry switch is on — a Cloud-primary
+    /// project at `metered` fidelity would store nothing readable anywhere.
+    ///
+    /// This is the operator's *declared intent*. The effective destination can
+    /// temporarily differ (quota exhaustion, disconnect, queue overflow); that
+    /// history lives in `project_telemetry_write_intervals` (signal_group =
+    /// 'spans'), never here.
+    #[sea_orm(default_value = "local")]
+    pub cloud_telemetry_write_mode: CloudTelemetryWriteMode,
+    /// ADR-043 §1: whether this project's analytics events, metrics and proxy
+    /// logs are stored on this instance at all, or written straight to Temps
+    /// Cloud through the shared durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour — analytics events, OTel metrics, service metrics and
+    /// proxy logs go to their local stores (Postgres / TimescaleDB). `cloud`
+    /// is a per-project opt-in subject to the same gate as
+    /// `cloud_telemetry_write_mode`: `queryable` fidelity, active Cloud link,
+    /// and Cloud telemetry switch on.
+    ///
+    /// This is the operator's *declared intent* for the non-span signal group.
+    /// The effective destination history lives in
+    /// `project_telemetry_write_intervals` (signal_group = 'analytics').
+    #[sea_orm(default_value = "local")]
+    pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

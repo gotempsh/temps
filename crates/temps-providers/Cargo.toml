@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-providers"
 version.workspace = true
@@ -54,6 +57,7 @@ axum = { workspace = true }
 axum-macros = { workspace = true }
 schemars = { workspace = true }
 urlencoding = "2.1"
+percent-encoding = { workspace = true }
 tokio-postgres = "0.7"
 base64 = { workspace = true }
 

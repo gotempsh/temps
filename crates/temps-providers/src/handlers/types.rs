@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::health_monitor::ExternalServiceHealthMonitor;
 use crate::{ExternalServiceManager, QueryService};
 
@@ -5,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SensitiveValueResponse {
+    pub value: String,
+}
 
 use sea_orm::DatabaseConnection;
 use temps_auth::ApiKeyService;
@@ -35,6 +43,10 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Reconciles private application database networks after a service link
+    /// changes. Absent when application workspaces are not installed.
+    pub application_network_reconciler:
+        Option<Arc<dyn temps_core::ApplicationDataNetworkReconciler>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -96,6 +108,34 @@ pub enum ServiceTypeRoute {
     Minio,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CreatableServiceTypeRoute {
+    Mariadb,
+    Mongodb,
+    Postgres,
+    Redis,
+    S3,
+    Kv,
+    Blob,
+    Rustfs,
+}
+
+impl From<CreatableServiceTypeRoute> for crate::externalsvc::ServiceType {
+    fn from(service_type: CreatableServiceTypeRoute) -> Self {
+        match service_type {
+            CreatableServiceTypeRoute::Mariadb => Self::Mariadb,
+            CreatableServiceTypeRoute::Mongodb => Self::Mongodb,
+            CreatableServiceTypeRoute::Postgres => Self::Postgres,
+            CreatableServiceTypeRoute::Redis => Self::Redis,
+            CreatableServiceTypeRoute::S3 => Self::S3,
+            CreatableServiceTypeRoute::Kv => Self::Kv,
+            CreatableServiceTypeRoute::Blob => Self::Blob,
+            CreatableServiceTypeRoute::Rustfs => Self::Rustfs,
+        }
+    }
+}
+
 impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
@@ -124,7 +164,6 @@ impl ServiceTypeRoute {
             ServiceTypeRoute::Kv,
             ServiceTypeRoute::Blob,
             ServiceTypeRoute::Rustfs,
-            ServiceTypeRoute::Minio,
         ]
     }
 
@@ -212,6 +251,18 @@ pub struct ExternalServiceInfo {
     /// to decide whether to poll the monitoring endpoints.
     #[serde(default)]
     pub metrics_enabled: bool,
+    /// S3 source ID that this service's continuous archiving (Postgres/
+    /// Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+    /// currently writes to. Null for service types with no continuous
+    /// archiving concept, or a Postgres/MariaDB service that has never had
+    /// one provisioned. Change it with `repoint_continuous_archive_source`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_archive_s3_source_id: Option<i32>,
+    /// When `continuous_archive_s3_source_id` was last set. Null alongside
+    /// a non-null source id means it was set by the original provisioning
+    /// flow rather than an explicit repoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_archive_pinned_at: Option<String>,
 }
 
 /// Public info about a cluster member.
@@ -316,6 +367,17 @@ pub struct ProviderMetadata {
 }
 
 impl ProviderMetadata {
+    /// Providers offered by new-service creation surfaces.
+    ///
+    /// Deprecated providers remain in `get_all` so existing services can
+    /// still resolve their metadata through `get_by_type`.
+    pub fn get_creatable() -> Vec<Self> {
+        Self::get_all()
+            .into_iter()
+            .filter(|provider| ServiceTypeRoute::get_all().contains(&provider.service_type))
+            .collect()
+    }
+
     pub fn get_all() -> Vec<Self> {
         vec![
             Self {
@@ -365,9 +427,111 @@ impl ProviderMetadata {
     }
 
     pub fn get_by_type(service_type: &ServiceTypeRoute) -> Option<Self> {
-        Self::get_all()
+        let metadata = Self::get_all()
             .into_iter()
-            .find(|p| &p.service_type == service_type)
+            .find(|p| &p.service_type == service_type);
+        if metadata.is_some() {
+            return metadata;
+        }
+
+        match service_type {
+            ServiceTypeRoute::Rustfs => Some(Self {
+                service_type: ServiceTypeRoute::Rustfs,
+                display_name: "RustFS".to_string(),
+                description: "High-performance S3-compatible object storage".to_string(),
+                icon_url: "/providers/s3.svg".to_string(),
+                color: "#C72E49".to_string(),
+            }),
+            ServiceTypeRoute::Kv => Some(Self {
+                service_type: ServiceTypeRoute::Kv,
+                display_name: "KV Store".to_string(),
+                description: "Managed key-value storage backed by Redis".to_string(),
+                icon_url: "/providers/redis.svg".to_string(),
+                color: "#DC382D".to_string(),
+            }),
+            ServiceTypeRoute::Blob => Some(Self {
+                service_type: ServiceTypeRoute::Blob,
+                display_name: "Blob Storage".to_string(),
+                description: "Managed S3-compatible object storage backed by RustFS".to_string(),
+                icon_url: "/providers/s3.svg".to_string(),
+                color: "#C72E49".to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CreatableServiceTypeRoute, CreateExternalServiceRequest, ProviderMetadata, ServiceTypeRoute,
+    };
+
+    #[test]
+    fn deprecated_minio_is_not_advertised_for_creation() {
+        assert!(!ServiceTypeRoute::get_all().contains(&ServiceTypeRoute::Minio));
+        assert!(ProviderMetadata::get_creatable()
+            .iter()
+            .all(|provider| provider.service_type != ServiceTypeRoute::Minio));
+    }
+
+    #[test]
+    fn deprecated_minio_still_parses_and_has_metadata_for_existing_services() {
+        assert_eq!(
+            ServiceTypeRoute::from_str("minio").expect("legacy MinIO type should remain readable"),
+            ServiceTypeRoute::Minio
+        );
+        assert!(ProviderMetadata::get_by_type(&ServiceTypeRoute::Minio).is_some());
+    }
+
+    #[test]
+    fn managed_service_aliases_have_detail_metadata_without_duplicate_cards() {
+        let creatable = ProviderMetadata::get_creatable();
+
+        for service_type in [
+            ServiceTypeRoute::Kv,
+            ServiceTypeRoute::Blob,
+            ServiceTypeRoute::Rustfs,
+        ] {
+            let metadata = ProviderMetadata::get_by_type(&service_type)
+                .expect("managed service alias should have detail metadata");
+            assert_eq!(metadata.service_type, service_type);
+            assert!(creatable
+                .iter()
+                .all(|provider| provider.service_type != service_type));
+        }
+    }
+
+    #[test]
+    fn deprecated_minio_is_rejected_by_creation_request_type() {
+        assert!(serde_json::from_str::<CreatableServiceTypeRoute>("\"minio\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<CreatableServiceTypeRoute>("\"s3\"")
+                .expect("S3 should remain creatable"),
+            CreatableServiceTypeRoute::S3
+        );
+    }
+
+    #[test]
+    fn create_service_project_link_is_optional_and_deserializes_when_selected() {
+        let unlinked: CreateExternalServiceRequest = serde_json::from_value(serde_json::json!({
+            "name": "standalone-db",
+            "service_type": "postgres",
+            "version": "18",
+            "parameters": {}
+        }))
+        .expect("project selection should remain optional");
+        assert_eq!(unlinked.project_id, None);
+
+        let linked: CreateExternalServiceRequest = serde_json::from_value(serde_json::json!({
+            "name": "project-db",
+            "service_type": "postgres",
+            "version": "18",
+            "parameters": {},
+            "project_id": 42
+        }))
+        .expect("a project selection should deserialize");
+        assert_eq!(linked.project_id, Some(42));
     }
 }
 
@@ -376,14 +540,27 @@ pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
     pub parameter_schema: Option<serde_json::Value>,
     pub current_parameters: Option<HashMap<String, String>>,
+    /// Parameter names whose values are masked in `current_parameters` and
+    /// may be fetched only through the audited reveal endpoint.
+    pub sensitive_parameters: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateExternalServiceRequest {
     pub name: String,
-    pub service_type: ServiceTypeRoute,
+    pub service_type: CreatableServiceTypeRoute,
     pub version: Option<String>,
+    /// Service-type-specific configuration. Read
+    /// `GET /external-services/types/{service_type}/parameters` before creating
+    /// a service and provide every field its schema marks as required. Secret
+    /// values that the schema describes as auto-generated may be omitted.
     pub parameters: HashMap<String, serde_json::Value>,
+    /// Optionally link the new service to this project as part of the same
+    /// request. The caller must have write access to the target project. If
+    /// linking fails, Temps removes the newly created service so callers do
+    /// not have to recover an ambiguous half-created resource.
+    #[serde(default)]
+    pub project_id: Option<i32>,
     /// Target node ID for the service. Omit or null to run on the control plane.
     #[serde(default)]
     pub node_id: Option<i32>,
@@ -428,6 +605,24 @@ pub struct UpdateExternalServiceRequest {
     /// When provided, the service will be recreated with the new image while preserving data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
+}
+
+/// Deliberately, explicitly move where a service's continuous archiving
+/// process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
+/// `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
+/// dedicated, guarded operation rather than something a schedule change
+/// does implicitly.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RepointContinuousArchiveSourceRequest {
+    /// The S3 source continuous archiving should point at from now on.
+    pub new_s3_source_id: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ContinuousArchiveSourceResponse {
+    pub service_id: i32,
+    pub continuous_archive_s3_source_id: i32,
+    pub continuous_archive_pinned_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -589,6 +784,27 @@ impl From<crate::services::ServiceHealthSnapshot> for ServiceHealthResponse {
                 })
                 .collect(),
         }
+    }
+}
+
+/// Live connection variables for a service in one environment.
+///
+/// Every value is plaintext — this is the response of the audited issuance
+/// endpoint, not of the masked bulk read. Callers must treat it as a
+/// credential: do not log it, do not cache it, do not put it in an error.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct RuntimeCredentialsResponse {
+    /// Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.
+    pub variables: std::collections::HashMap<String, String>,
+}
+
+/// Debug prints names only. A `{:?}` of a credential response in a log line
+/// would defeat the point of the endpoint being audited.
+impl std::fmt::Debug for RuntimeCredentialsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&String> = self.variables.keys().collect();
+        names.sort();
+        write!(f, "RuntimeCredentialsResponse {{ variables: {names:?} }}")
     }
 }
 

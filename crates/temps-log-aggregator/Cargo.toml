@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-log-aggregator"
 version.workspace = true
@@ -39,8 +42,8 @@ hex = { workspace = true }
 sea-orm = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-axum-test = "18.1.0"
-serial_test = "3.2"
+axum-test = "21.0.0"
+serial_test = "4.0"
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 temps-database = { path = "../temps-database" }

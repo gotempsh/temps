@@ -1,4 +1,10 @@
-import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import {
+  getProxyLogByIdOptions,
+  getProxyLogByRequestIdOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -11,7 +17,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink } from 'react-router'
 import {
   Activity,
   AlertCircle,
@@ -27,19 +33,27 @@ import {
   Monitor,
   Network,
   Server,
+  ShieldCheck,
   Smartphone,
   Tablet,
   Zap,
 } from 'lucide-react'
 
 interface ProxyLogDetailProps {
-  logId: number
+  /**
+   * request_id of the log row (list links navigate with it — it resolves
+   * under both the TimescaleDB and ClickHouse backends), or a legacy
+   * numeric serial id from an old deep-link.
+   */
+  logId: string
   /**
    * Event time of the log row, forwarded from the list link. Bounds the
    * backend's hypertable lookup; without it the lookup falls back to a
    * wider (slower) scan.
    */
   timestamp?: string
+  /** Project scope required for non-administrator detail lookups. */
+  projectId?: number
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -47,6 +61,62 @@ function formatBytes(bytes: number | null | undefined): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/** Placeholder the backend writes in place of a credential value. */
+const REDACTED = '[REDACTED]'
+
+interface HeaderListProps {
+  title: string
+  headers: { [key: string]: string } | null | undefined
+}
+
+/**
+ * One side of the headers card.
+ *
+ * Renders the empty/absent state explicitly rather than collapsing to nothing:
+ * "no headers stored for this request" and "this request had no headers" look
+ * identical if you render neither, and the first one is a thing an operator
+ * needs to be able to find out.
+ */
+function HeaderList({ title, headers }: HeaderListProps) {
+  const entries = headers ? Object.entries(headers) : []
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-2">
+        <FileText className="h-4 w-4 text-muted-foreground" />
+        <p className="text-sm font-medium">{title}</p>
+        {entries.length > 0 && (
+          <Badge variant="secondary">{entries.length}</Badge>
+        )}
+      </div>
+
+      {entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          Not captured for this request.
+        </p>
+      ) : (
+        <div className="bg-muted rounded-md divide-y divide-border overflow-hidden">
+          {entries.map(([name, value]) => (
+            <div
+              key={name}
+              className="grid grid-cols-1 sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)] gap-1 sm:gap-3 p-2 font-mono text-xs"
+            >
+              <span className="font-medium break-all">{name}</span>
+              {value === REDACTED ? (
+                <span className="text-muted-foreground italic">
+                  {REDACTED}
+                </span>
+              ) : (
+                <span className="break-all">{value}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function getDeviceIcon(deviceType: string | null | undefined) {
@@ -62,17 +132,28 @@ function getDeviceIcon(deviceType: string | null | undefined) {
   }
 }
 
-export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
-  const {
-    data: log,
-    isLoading,
-    error,
-  } = useQuery({
+export function ProxyLogDetail({
+  logId,
+  timestamp,
+  projectId,
+}: ProxyLogDetailProps) {
+  const isLegacyNumericId = /^\d+$/.test(logId)
+
+  const byId = useQuery({
     ...getProxyLogByIdOptions({
-      path: { id: logId },
-      query: timestamp ? { timestamp } : undefined,
+      path: { id: parseInt(logId, 10) },
+      query: { timestamp, project_id: projectId },
     }),
+    enabled: isLegacyNumericId,
   })
+  const byRequestId = useQuery({
+    ...getProxyLogByRequestIdOptions({
+      path: { request_id: logId },
+      query: { timestamp, project_id: projectId },
+    }),
+    enabled: !isLegacyNumericId,
+  })
+  const { data: log, isLoading, error } = isLegacyNumericId ? byId : byRequestId
 
   if (isLoading) {
     return (
@@ -415,6 +496,26 @@ export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
               </div>
             </>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Headers — always rendered: an operator needs to be able to tell
+          "this request sent no headers" apart from "we don't store them". */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Network className="h-5 w-5" />
+            Headers
+          </CardTitle>
+          <CardDescription className="flex items-center gap-2">
+            <ShieldCheck className="h-4 w-4 shrink-0" />
+            Credential headers (Cookie, Authorization, API keys) are redacted
+            before storage and are never written to disk.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <HeaderList title="Request Headers" headers={log.request_headers} />
+          <HeaderList title="Response Headers" headers={log.response_headers} />
         </CardContent>
       </Card>
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Prometheus text-exposition scraping helpers.
 //!
 //! This module provides a small, dependency-light Prometheus scraper used by

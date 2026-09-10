@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, getErrorMessage } from '../../lib/api-client.js'
@@ -70,6 +73,13 @@ interface RestoreRunShowOptions {
   id: string
   json?: boolean
 }
+
+// Backup formats that support point-in-time recovery. "walg" is Postgres's
+// continuous-archive format; "mariadb_physical" is the MariaDB analog (a
+// mariadb-backup physical base backup with archived binlogs for replay).
+// Anything else (pg_dump, mariadb_dump, unknown/empty) is a logical/one-shot
+// backup and cannot be replayed to an arbitrary point in time.
+const PITR_CAPABLE_FORMATS = new Set(['walg', 'mariadb_physical'])
 
 // ---- Actions -------------------------------------------------------------
 
@@ -150,14 +160,16 @@ async function listBackupsAction(options: ListBackupsOptions): Promise<void> {
       accessor: (r) =>
         typeof r.size_bytes === 'number' && r.size_bytes != null
           ? formatBytes(r.size_bytes)
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => typeof r.size_bytes === 'number' && r.size_bytes != null ? value : colors.muted(value),
     },
     {
-      header: 'Location',
-      accessor: (r) =>
-        (r.location ?? '').startsWith('s3://')
-          ? colors.success('WAL-G')
-          : colors.muted('legacy'),
+      header: 'Format',
+      accessor: (r) => r.format || 'unknown',
+      color: (value, r) =>
+        r.format && PITR_CAPABLE_FORMATS.has(r.format)
+          ? colors.success(value)
+          : colors.muted(value),
     },
     {
       header: 'Created',
@@ -258,14 +270,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
 
   // Step 4: confirmation.
   if (!options.yes) {
-    const modeLabel =
-      mode.mode === 'in_place'
-        ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
-        : mode.mode === 'new_service'
-          ? `Clone into new service '${targetName}'`
-          : mode.to_new_service
-            ? `Point-in-time recovery → new service '${targetName}'`
-            : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+    const modeLabel = describeRestoreMode(mode, serviceName, targetName)
     newline()
     header(`${icons.arrow} ${modeLabel}`)
     keyValue('Source service', `${serviceName} (id ${serviceId}, ${serviceType})`)
@@ -275,10 +280,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     }
     newline()
     const go = await promptConfirm({
-      message:
-        mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
-          ? `This will OVERWRITE data on '${serviceName}'. Continue?`
-          : `Proceed with restore?`,
+      message: describeRestoreConfirmPrompt(mode, serviceName),
       default: false,
     })
     if (!go) {
@@ -358,17 +360,18 @@ async function listRunsAction(options: RestoreRunsOptions): Promise<void> {
     { header: 'Phase', accessor: (r) => r.phase },
     {
       header: 'Status',
-      accessor: (r) =>
-        statusBadge(
-          r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
-        ),
+      accessor: (r) => r.status,
+      color: (_value, r) => statusBadge(
+        r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
+      ),
     },
     {
       header: 'Target',
       accessor: (r) =>
         r.target_service_id != null
           ? `#${r.target_service_id} (${r.target_service_name ?? ''})`
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => r.target_service_id != null ? value : colors.muted(value),
     },
     {
       header: 'Started',
@@ -422,6 +425,33 @@ async function showRunAction(options: RestoreRunShowOptions): Promise<void> {
 }
 
 // ---- Helpers -------------------------------------------------------------
+
+/**
+ * Describe the confirmation header shown before a restore runs. Getting the
+ * DESTRUCTIVE/OVERWRITE wording right matters: it's the only warning a human
+ * operator sees before data on the source service is replaced in place.
+ */
+export function describeRestoreMode(
+  mode: RestoreRequestMode,
+  serviceName: string,
+  targetName?: string,
+): string {
+  return mode.mode === 'in_place'
+    ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
+    : mode.mode === 'new_service'
+      ? `Clone into new service '${targetName}'`
+      : mode.to_new_service
+        ? `Point-in-time recovery → new service '${targetName}'`
+        : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+}
+
+/** Only in-place restores (or PITR that stays in place) overwrite the source
+ *  service, so only those get the OVERWRITE warning in the confirm prompt. */
+export function describeRestoreConfirmPrompt(mode: RestoreRequestMode, serviceName: string): string {
+  return mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
+    ? `This will OVERWRITE data on '${serviceName}'. Continue?`
+    : `Proceed with restore?`
+}
 
 async function askForBackupId(): Promise<number> {
   const value = await promptText({
@@ -485,7 +515,7 @@ async function pollRestoreRun(runId: number): Promise<RestoreRunView> {
   throw new Error('Restore poll timeout')
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let v = n
@@ -525,7 +555,7 @@ export function registerRestoreCommands(services: Command): void {
     )
     .option(
       '--pitr <iso>',
-      'Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service.',
+      'Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service.',
     )
     .option('-y, --yes', 'Skip confirmation')
     .option('--no-wait', 'Return immediately without polling run status')

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -111,14 +114,52 @@ pub struct RestoreRunAudit {
     pub target_service_name: Option<String>,
 }
 
+/// Security audit record for a PostgreSQL major-upgrade mutation.
+///
+/// A service may be linked to more than one project, so the complete project
+/// set is retained rather than selecting an arbitrary project as the owner.
+#[derive(Debug, Clone, Serialize)]
+pub struct PgUpgradeMutationAudit {
+    pub context: AuditContext,
+    pub action: PgUpgradeAuditAction,
+    pub project_ids: Vec<i32>,
+    pub service_id: i32,
+    pub upgrade_id: i32,
+    pub from_version: String,
+    pub to_version: String,
+    pub status: String,
+    pub phase: String,
+    pub attempt: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PgUpgradeAuditAction {
+    Started,
+    Retried,
+    CancellationRequested,
+    RolledBack,
+}
+
+impl PgUpgradeAuditAction {
+    fn operation_type(self) -> &'static str {
+        match self {
+            Self::Started => "POSTGRES_MAJOR_UPGRADE_STARTED",
+            Self::Retried => "POSTGRES_MAJOR_UPGRADE_RETRIED",
+            Self::CancellationRequested => "POSTGRES_MAJOR_UPGRADE_CANCELLATION_REQUESTED",
+            Self::RolledBack => "POSTGRES_MAJOR_UPGRADE_ROLLED_BACK",
+        }
+    }
+}
+
 // Implement AuditOperation for S3 Source audit structs
 impl AuditOperation for S3SourceCreatedAudit {
     fn operation_type(&self) -> String {
         "S3_SOURCE_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -140,8 +181,8 @@ impl AuditOperation for S3SourceUpdatedAudit {
         "S3_SOURCE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -163,8 +204,8 @@ impl AuditOperation for S3SourceDeletedAudit {
         "S3_SOURCE_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -187,8 +228,8 @@ impl AuditOperation for BackupScheduleUpdatedAudit {
         "BACKUP_SCHEDULE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -210,8 +251,8 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
         "BACKUP_SCHEDULE_STATUS_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -233,8 +274,8 @@ impl AuditOperation for BackupRunAudit {
         "BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -256,8 +297,8 @@ impl AuditOperation for BackupDeletedAudit {
         "BACKUP_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -279,8 +320,8 @@ impl AuditOperation for BackupRetentionCleanupAudit {
         "BACKUP_RETENTION_CLEANUP".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -302,8 +343,8 @@ impl AuditOperation for ExternalServiceBackupRunAudit {
         "EXTERNAL_SERVICE_BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -337,8 +378,8 @@ impl AuditOperation for ScheduleServicesAttachedAudit {
         "BACKUP_SCHEDULE_SERVICES_ATTACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -371,8 +412,8 @@ impl AuditOperation for ScheduleServiceDetachedAudit {
         "BACKUP_SCHEDULE_SERVICE_DETACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -409,8 +450,8 @@ impl AuditOperation for ScheduleRunNowAudit {
         "BACKUP_SCHEDULE_RUN_NOW".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -432,8 +473,31 @@ impl AuditOperation for RestoreRunAudit {
         "EXTERNAL_SERVICE_RESTORE_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for PgUpgradeMutationAudit {
+    fn operation_type(&self) -> String {
+        self.action.operation_type().to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

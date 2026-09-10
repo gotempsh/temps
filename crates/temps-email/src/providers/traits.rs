@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email provider trait definitions
 
 use async_trait::async_trait;
@@ -111,6 +114,21 @@ pub struct DomainIdentityDetails {
     /// MAIL FROM subdomain (e.g., "send" for send.domain.com)
     #[serde(default)]
     pub mail_from_subdomain: Option<String>,
+    /// Whether this provider manages DNS-based sender authentication records
+    /// (SPF/DKIM) for this identity at all. `false` for providers like SMTP
+    /// that have no domain-management API and no records to probe — for
+    /// those, an empty `spf_record`/`dkim_records` means "not applicable",
+    /// not "not yet configured", so the required-record verification gate
+    /// must not require them. Defaults to `true` so providers that do manage
+    /// records (Scaleway, SES) are unaffected without listing the field.
+    #[serde(default = "DomainIdentityDetails::default_manages_dns_records")]
+    pub manages_dns_records: bool,
+}
+
+impl DomainIdentityDetails {
+    fn default_manages_dns_records() -> bool {
+        true
+    }
 }
 
 /// Domain verification status
@@ -176,6 +194,20 @@ pub struct SendEmailResponse {
 /// Default MAIL FROM subdomain used for split architecture
 pub const DEFAULT_MAIL_FROM_SUBDOMAIN: &str = "send";
 
+/// Summary of a domain identity already registered on the provider's side,
+/// returned by `list_identities` for populating an "import existing domain"
+/// picker.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderDomainIdentity {
+    /// The domain name as registered with the provider
+    pub domain: String,
+    /// Provider-internal identity identifier (e.g. Scaleway's domain UUID;
+    /// SES uses the domain name itself)
+    pub provider_identity_id: String,
+    /// The provider's current verification status for this domain
+    pub status: VerificationStatus,
+}
+
 /// Email provider trait for abstracting different email services
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
@@ -187,21 +219,53 @@ pub trait EmailProvider: Send + Sync {
     /// send emails from @domain.com without knowing about the internal architecture.
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError>;
 
-    /// Verify domain DNS configuration
-    async fn verify_identity(&self, domain: &str) -> Result<VerificationStatus, EmailError>;
+    /// Verify domain DNS configuration.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain
+    /// (e.g. Scaleway's domain UUID stored in `email_domains.provider_identity_id`).
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn verify_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError>;
 
-    /// Get detailed identity info with per-record verification status
-    async fn get_identity_details(&self, domain: &str)
-        -> Result<DomainIdentityDetails, EmailError>;
+    /// Get detailed identity info with per-record verification status.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain.
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn get_identity_details(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<DomainIdentityDetails, EmailError>;
 
-    /// Delete domain identity
-    async fn delete_identity(&self, domain: &str) -> Result<(), EmailError>;
+    /// Delete domain identity.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain.
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn delete_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError>;
 
     /// Send an email
     async fn send(&self, email: &SendEmailRequest) -> Result<SendEmailResponse, EmailError>;
 
     /// Get the provider type
     fn provider_type(&self) -> EmailProviderType;
+
+    /// List domain identities already registered on the provider's side, to
+    /// populate an "import existing domain" picker instead of requiring the
+    /// operator to type the domain name (and, for Scaleway, its internal
+    /// UUID) by hand.
+    ///
+    /// Returns `Err(EmailError::UnsupportedOperation { .. })` for providers
+    /// with no domain-management API to list against (SMTP) — callers must
+    /// treat that as "this provider type can never support the picker", not
+    /// a transient failure worth retrying, and fall back to manual entry.
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError>;
 }
 
 #[cfg(test)]

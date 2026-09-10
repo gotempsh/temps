@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Verify remote worker-node container logs reach searchable history with the
 # new container/node filters. Run AFTER e2e-harden.sh (cluster up, 2-replica
 # "e2e-app" deployed across worker-1 + worker-2).

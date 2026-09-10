@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Real-Postgres coverage for project-scoped domain delivery configuration.
 //!
 //! Provider I/O is represented by a deterministic fake while migrations,

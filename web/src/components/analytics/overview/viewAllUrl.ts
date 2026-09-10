@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Build the URL for a "View all" dimension page while preserving the current
  * date-filter query params (filter / from / to) from the overview.

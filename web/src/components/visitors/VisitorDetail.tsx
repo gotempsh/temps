@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   enrichVisitorMutation,
   getVisitorDetailsOptions,
@@ -67,7 +70,7 @@ import {
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface VisitorDetailProps {
   project: ProjectResponse

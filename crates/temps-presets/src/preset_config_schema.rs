@@ -1,9 +1,15 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Preset configuration schemas
 //!
 //! Defines the configuration options available for each preset type.
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
+use temps_entities::preset::{
+    ComposePublicPort, DockerfileVariant, ImageRuntimeConfig, NixpacksProvider,
+};
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -14,6 +20,11 @@ use utoipa::ToSchema;
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DockerfilePresetConfig {
+    /// Catalog variant. Normally omitted; `custom` selects the generated
+    /// Dockerfile compatibility preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<DockerfileVariant>,
+
     /// Custom Dockerfile path (relative to build context)
     /// If not specified, defaults to "Dockerfile" in the build context
     #[cfg_attr(feature = "openapi", schema(example = "docker/Dockerfile"))]
@@ -25,20 +36,48 @@ pub struct DockerfilePresetConfig {
     #[cfg_attr(feature = "openapi", schema(example = "./api"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_context: Option<String>,
+
+    /// Durable runtime selected for a curated single-container image template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_runtime: Option<ImageRuntimeConfig>,
+}
+
+/// Configuration for Docker Compose deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DockerComposePresetConfig {
+    /// Path to the Compose file relative to the project directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_path: Option<String>,
+
+    /// User-provided docker-compose.override.yml content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_override: Option<String>,
+
+    /// Compose service ports that should be publicly routed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_ports: Vec<ComposePublicPort>,
+
+    /// Services granted the limited startup capability profile after explicit approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxed_capability_services: Vec<String>,
 }
 
 /// Configuration for Nixpacks preset
-/// Nixpacks auto-detects your application and uses nixpacks.toml for configuration
-/// No additional parameters needed - configuration is expressed in nixpacks.toml file
+/// Nixpacks provider and inline build-plan configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct NixpacksPresetConfig {
-    /// This preset uses nixpacks.toml for configuration
-    /// Place a nixpacks.toml file in your project directory with your settings
-    /// See: https://nixpacks.com/docs/configuration/file
-    #[serde(skip)]
-    _marker: (),
+    /// Optional inline nixpacks.toml contents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nixpacks_config: Option<String>,
+
+    /// Ordered Nixpacks providers. Empty means repository config or auto-detect;
+    /// include `...` to combine auto-detection with explicit providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<NixpacksProvider>,
 }
 
 /// Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
@@ -78,7 +117,9 @@ pub struct StaticPresetConfig {
 pub enum PresetConfigSchema {
     /// Configuration for Dockerfile preset
     Dockerfile(DockerfilePresetConfig),
-    /// Configuration for Nixpacks preset (uses nixpacks.toml, no params needed)
+    /// Configuration for Docker Compose
+    DockerCompose(DockerComposePresetConfig),
+    /// Configuration for Nixpacks provider selection and inline build plan
     Nixpacks(NixpacksPresetConfig),
     /// Configuration for static site presets (Vite, Next.js, etc.)
     Static(StaticPresetConfig),
@@ -112,8 +153,10 @@ mod tests {
     #[test]
     fn test_dockerfile_config_serialization() {
         let config = DockerfilePresetConfig {
+            variant: None,
             dockerfile_path: Some("docker/Dockerfile".to_string()),
             build_context: Some("./api".to_string()),
+            image_runtime: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();
@@ -136,10 +179,47 @@ mod tests {
     }
 
     #[test]
+    fn test_docker_compose_config_serialization() {
+        let config = DockerComposePresetConfig {
+            compose_path: Some("deploy/compose.yml".to_string()),
+            compose_override: None,
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 3000,
+                ..Default::default()
+            }],
+            relaxed_capability_services: vec!["database".to_string()],
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["composePath"], "deploy/compose.yml");
+        assert_eq!(json["publicPorts"][0]["service"], "web");
+        assert_eq!(json["publicPorts"][0]["port"], 3000);
+        assert_eq!(json["relaxedCapabilityServices"][0], "database");
+    }
+
+    #[test]
+    fn test_nixpacks_config_serialization() {
+        let config = NixpacksPresetConfig {
+            nixpacks_config: Some("[start]\ncmd = \"python main.py\"".to_string()),
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["providers"], serde_json::json!(["...", "python"]));
+        assert_eq!(
+            json["nixpacksConfig"],
+            "[start]\ncmd = \"python main.py\""
+        );
+    }
+
+    #[test]
     fn test_preset_config_schema_union() {
         let dockerfile_config = PresetConfigSchema::Dockerfile(DockerfilePresetConfig {
+            variant: None,
             dockerfile_path: Some("Dockerfile.prod".to_string()),
             build_context: None,
+            image_runtime: None,
         });
 
         let json = serde_json::to_value(&dockerfile_config).unwrap();

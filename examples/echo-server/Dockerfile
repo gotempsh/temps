@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Zero-dependency echo server — builds in seconds (no npm install needed).
 FROM node:22-alpine
 

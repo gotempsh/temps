@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::avatar::generate_avatar_data_url;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -73,6 +76,7 @@ pub struct RouteUser {
     pub image: String,
     pub mfa_enabled: bool,
     pub email_verified: bool,
+    pub must_change_password: bool,
     #[schema(format = "int64", example = "1683900000000")]
     pub created_at: i64,
     #[schema(format = "int64", example = "1683900000000")]
@@ -108,6 +112,8 @@ pub struct CreateUserRequest {
     pub email: Option<String>,
     pub password: Option<String>,
     pub roles: Vec<String>,
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -149,11 +155,33 @@ pub struct ChangePasswordRequest {
 
 // Add new request/response types
 #[derive(Deserialize, utoipa::ToSchema)]
+pub struct SetupMfaRequest {
+    /// Required to enroll MFA on an account that has a password set.
+    /// Omit (or leave empty) for SSO-only accounts with no local password.
+    #[schema(example = "current_password_value")]
+    pub current_password: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct VerifyMfaRequest {
     pub code: String,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct VerifyStepUpRequest {
+    /// Current TOTP value or an unused recovery code.
+    pub code: String,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
+pub struct StepUpResponse {
+    /// ISO 8601 timestamp after which sensitive actions require verification
+    /// again.
+    #[schema(value_type = String, format = DateTime)]
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MfaSetupResponse {
     pub secret_key: String,
     pub qr_code: String,
@@ -176,6 +204,7 @@ impl From<temps_entities::users::Model> for RouteUser {
             image: generate_avatar_data_url(&db_user.name),
             mfa_enabled: db_user.mfa_enabled,
             email_verified: db_user.email_verified,
+            must_change_password: db_user.must_change_password,
             created_at: db_user.created_at.timestamp_millis(),
             updated_at: db_user.updated_at.timestamp_millis(),
             deleted_at: db_user.deleted_at.map(|d| d.timestamp_millis()),
@@ -204,6 +233,7 @@ impl From<crate::user_service::ServiceUser> for RouteUser {
             image: service_user.image,
             mfa_enabled: service_user.mfa_enabled,
             email_verified: service_user.email_verified,
+            must_change_password: service_user.must_change_password,
             created_at: service_user.created_at.timestamp_millis(),
             updated_at: service_user.updated_at.timestamp_millis(),
             deleted_at: service_user.deleted_at.map(|d| d.timestamp_millis()),

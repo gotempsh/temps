@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persist Static Assets Job
 //!
 //! Extracts immutable static assets (JS chunks, CSS, fonts, images) from the built
@@ -7,15 +10,17 @@
 //! The proxy looks up assets by URL path in the file store — no database table needed.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use sea_orm::{ActiveModelTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use temps_core::static_files::{MAX_PUBLIC_STATIC_ASSET_BYTES, MAX_STATIC_PATH_COMPONENTS};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_deployer::ImageBuilder;
 use temps_entities::static_asset_cache;
-use temps_file_store::FileStore;
+use temps_file_store::{FileStore, FileStoreError};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
@@ -73,7 +78,79 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
     "ico", "json", "txt", "xml",
 ];
 
+#[derive(Debug, thiserror::Error)]
+enum PersistStaticAssetError {
+    #[error("Failed to inspect static asset '{path}': {source}")]
+    Metadata {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to read static asset '{path}': {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to store static asset '{path}' in CAS: {source}")]
+    Store {
+        path: String,
+        #[source]
+        source: FileStoreError,
+    },
+}
+
+struct PersistedStaticAsset {
+    content_hash: Option<String>,
+    size_bytes: u64,
+}
+
 impl PersistStaticAssetsJob {
+    async fn persist_asset_blob(
+        file_store: Option<&dyn FileStore>,
+        asset_path: &Path,
+    ) -> Result<Option<PersistedStaticAsset>, PersistStaticAssetError> {
+        let metadata = tokio::fs::metadata(asset_path).await.map_err(|source| {
+            PersistStaticAssetError::Metadata {
+                path: asset_path.display().to_string(),
+                source,
+            }
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_PUBLIC_STATIC_ASSET_BYTES {
+            return Ok(None);
+        }
+
+        let file_bytes =
+            tokio::fs::read(asset_path)
+                .await
+                .map_err(|source| PersistStaticAssetError::Read {
+                    path: asset_path.display().to_string(),
+                    source,
+                })?;
+        let size_bytes = file_bytes.len() as u64;
+        if size_bytes != metadata.len() || size_bytes > MAX_PUBLIC_STATIC_ASSET_BYTES {
+            return Ok(None);
+        }
+
+        let content_hash = if let Some(file_store) = file_store {
+            Some(
+                file_store
+                    .put_blob(Bytes::from(file_bytes))
+                    .await
+                    .map_err(|source| PersistStaticAssetError::Store {
+                        path: asset_path.display().to_string(),
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(PersistedStaticAsset {
+            content_hash,
+            size_bytes,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: String,
@@ -162,11 +239,14 @@ impl PersistStaticAssetsJob {
     /// Recursively find all static asset files in a directory, excluding .map files.
     fn find_static_assets(dir: &Path) -> Vec<PathBuf> {
         let mut assets = Vec::new();
-        Self::walk_dir_for_assets(dir, &mut assets);
+        Self::walk_dir_for_assets(dir, 0, &mut assets);
         assets
     }
 
-    fn walk_dir_for_assets(dir: &Path, assets: &mut Vec<PathBuf>) {
+    fn walk_dir_for_assets(dir: &Path, depth: usize, assets: &mut Vec<PathBuf>) {
+        if depth >= MAX_STATIC_PATH_COMPONENTS {
+            return;
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -174,9 +254,15 @@ impl PersistStaticAssetsJob {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                Self::walk_dir_for_assets(&path, assets);
-            } else if Self::is_static_asset(&path) {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                Self::walk_dir_for_assets(&path, depth + 1, assets);
+            } else if metadata.is_file() && Self::is_static_asset(&path) {
                 // Exclude source map files — handled by CaptureSourceMapsJob
                 if path.extension().and_then(|e| e.to_str()) != Some("map") {
                     assets.push(path);
@@ -300,16 +386,26 @@ impl WorkflowTask for PersistStaticAssetsJob {
                 )
             };
 
-            // Create temporary directory for extraction
-            let temp_dir =
-                std::env::temp_dir().join(format!("temps-persist-assets-{}", uuid::Uuid::new_v4()));
+            // Acquire first so reverse drop order removes the extracted
+            // directory before releasing capacity to another extraction.
+            let _extraction_permit = super::acquire_archive_extraction_permit().await?;
 
-            if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-                warn!("Failed to create temp directory: {}", e);
-                self.log(format!("⚠️ Failed to create temp directory: {}", e))
+            // RAII ownership guarantees cleanup on every continue/return path;
+            // tempfile creates owner-only directories on Unix.
+            let temp_dir = match tempfile::Builder::new()
+                .prefix("temps-persist-assets-")
+                .tempdir()
+            {
+                Ok(temp_dir) => temp_dir,
+                Err(error) => {
+                    warn!("Failed to create secure temp directory: {}", error);
+                    self.log(format!(
+                        "⚠️ Failed to create secure temp directory: {error}"
+                    ))
                     .await?;
-                continue;
-            }
+                    continue;
+                }
+            };
 
             // Extract files from the container image
             self.log(format!(
@@ -318,16 +414,16 @@ impl WorkflowTask for PersistStaticAssetsJob {
             ))
             .await?;
 
-            match self
+            let extraction_result = self
                 .image_builder
-                .extract_from_image(image_tag, &absolute_search_path, &temp_dir)
-                .await
-            {
+                .extract_from_image(image_tag, &absolute_search_path, temp_dir.path())
+                .await;
+            match extraction_result {
                 Ok(()) => {
                     debug!(
                         "Extracted files from {} to {}",
                         absolute_search_path,
-                        temp_dir.display()
+                        temp_dir.path().display()
                     );
                 }
                 Err(e) => {
@@ -340,13 +436,12 @@ impl WorkflowTask for PersistStaticAssetsJob {
                         absolute_search_path, e
                     ))
                     .await?;
-                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                     continue;
                 }
             }
 
             // Find all static asset files (excluding .map files)
-            let asset_files = Self::find_static_assets(&temp_dir);
+            let asset_files = Self::find_static_assets(temp_dir.path());
 
             if asset_files.is_empty() {
                 self.log(format!(
@@ -354,7 +449,6 @@ impl WorkflowTask for PersistStaticAssetsJob {
                     absolute_search_path
                 ))
                 .await?;
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 continue;
             }
 
@@ -367,7 +461,9 @@ impl WorkflowTask for PersistStaticAssetsJob {
 
             // Persist each asset: store blob in CAS + insert DB row for URL→hash mapping
             for asset_path in &asset_files {
-                let relative_path = asset_path.strip_prefix(&temp_dir).unwrap_or(asset_path);
+                let relative_path = asset_path
+                    .strip_prefix(temp_dir.path())
+                    .unwrap_or(asset_path);
 
                 let container_relative = format!(
                     "{}/{}",
@@ -376,40 +472,36 @@ impl WorkflowTask for PersistStaticAssetsJob {
                 );
                 let url_path = self.apply_rewrites(&container_relative);
 
-                let file_bytes = match tokio::fs::read(asset_path).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("Failed to read asset {}: {}", asset_path.display(), e);
+                let persisted = match Self::persist_asset_blob(
+                    self.file_store.as_deref(),
+                    asset_path,
+                )
+                .await
+                {
+                    Ok(Some(persisted)) => persisted,
+                    Ok(None) => {
+                        warn!(
+                            asset_path = %asset_path.display(),
+                            maximum_size_bytes = MAX_PUBLIC_STATIC_ASSET_BYTES,
+                            "Skipping static asset because it is oversized, not a file, or changed while reading"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(asset_path = %asset_path.display(), reason = %error, "Failed to persist static asset");
                         continue;
                     }
                 };
-                let file_size = file_bytes.len() as u64;
-
-                // Store blob in CAS (deduplicated by content hash)
-                let content_hash = if let Some(file_store) = &self.file_store {
-                    match file_store
-                        .put_blob(bytes::Bytes::from(file_bytes.clone()))
-                        .await
-                    {
-                        Ok(hash) => Some(hash),
-                        Err(e) => {
-                            warn!("Failed to store blob for {}: {}", url_path, e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
 
                 // Insert URL→hash mapping in database
-                if let (Some(hash), Some(db)) = (&content_hash, &self.db) {
+                if let (Some(hash), Some(db)) = (&persisted.content_hash, &self.db) {
                     let record = static_asset_cache::ActiveModel {
                         url_path: Set(url_path.clone()),
                         content_hash: Set(hash.clone()),
                         project_id: Set(self.project_id),
                         environment_id: Set(self.environment_id),
                         deployment_id: Set(self.deployment_id),
-                        size_bytes: Set(file_size as i64),
+                        size_bytes: Set(persisted.size_bytes as i64),
                         created_at: Set(chrono::Utc::now()),
                         ..Default::default()
                     };
@@ -422,12 +514,7 @@ impl WorkflowTask for PersistStaticAssetsJob {
                 }
 
                 total_assets += 1;
-                total_size += file_size;
-            }
-
-            // Clean up temp directory
-            if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
-                warn!("Failed to clean up temp directory: {}", e);
+                total_size += persisted.size_bytes;
             }
         }
 
@@ -475,6 +562,23 @@ impl WorkflowTask for PersistStaticAssetsJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_file_store::OpenedBlob;
+
+    #[test]
+    fn extracted_static_asset_temp_directory_is_removed_on_scope_exit() {
+        let extraction_path;
+        {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("temps-persist-assets-test-")
+                .tempdir()
+                .expect("create extraction directory");
+            extraction_path = temp_dir.path().to_path_buf();
+            std::fs::write(temp_dir.path().join("app.js"), b"temporary asset")
+                .expect("write temporary asset");
+        }
+        assert!(!extraction_path.exists());
+    }
 
     #[test]
     fn test_detect_log_level() {
@@ -770,6 +874,103 @@ mod tests {
         assert!(assets.iter().any(|p| p.ends_with("style.css")));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn static_asset_walk_stops_at_shared_path_depth_limit() {
+        let temp_dir = tempfile::TempDir::new().expect("temporary extraction root");
+        let mut maximum_parent = temp_dir.path().to_path_buf();
+        for index in 0..(MAX_STATIC_PATH_COMPONENTS - 1) {
+            maximum_parent.push(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&maximum_parent).expect("create maximum-depth directory");
+        let accepted = maximum_parent.join("accepted.js");
+        std::fs::write(&accepted, "accepted").expect("write maximum-depth asset");
+
+        let too_deep_parent = maximum_parent.join("too-deep");
+        std::fs::create_dir(&too_deep_parent).expect("create over-depth directory");
+        let rejected = too_deep_parent.join("rejected.js");
+        std::fs::write(&rejected, "rejected").expect("write over-depth asset");
+
+        let assets = PersistStaticAssetsJob::find_static_assets(temp_dir.path());
+
+        assert!(assets.contains(&accepted));
+        assert!(!assets.contains(&rejected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_asset_walk_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::TempDir::new().expect("temporary extraction root");
+        let outside = tempfile::TempDir::new().expect("outside directory");
+        std::fs::write(outside.path().join("private.js"), "private").expect("write outside asset");
+        symlink(outside.path(), temp_dir.path().join("linked")).expect("create directory symlink");
+
+        let assets = PersistStaticAssetsJob::find_static_assets(temp_dir.path());
+
+        assert!(assets.is_empty());
+    }
+
+    struct CountingFileStore {
+        put_blob_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FileStore for CountingFileStore {
+        async fn put_blob(&self, _data: Bytes) -> Result<String, FileStoreError> {
+            self.put_blob_calls.fetch_add(1, Ordering::Relaxed);
+            Ok("a".repeat(64))
+        }
+
+        async fn get_blob(&self, _hash: &str) -> Result<Bytes, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn open_blob(&self, _hash: &str) -> Result<OpenedBlob, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn blob_exists(&self, _hash: &str) -> Result<bool, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn delete_blob(&self, _hash: &str) -> Result<bool, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn put(&self, _path: &str, _data: Bytes) -> Result<u64, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn get(&self, _path: &str) -> Result<Bytes, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+
+        async fn exists(&self, _path: &str) -> Result<bool, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_asset_is_rejected_before_put_blob() {
+        let temporary = tempfile::tempdir().expect("temporary asset directory");
+        let oversized = temporary.path().join("oversized.js");
+        let file = std::fs::File::create(&oversized).expect("create sparse oversized asset");
+        file.set_len(MAX_PUBLIC_STATIC_ASSET_BYTES + 1)
+            .expect("size sparse oversized asset");
+        drop(file);
+        let store = CountingFileStore {
+            put_blob_calls: AtomicUsize::new(0),
+        };
+
+        let result = PersistStaticAssetsJob::persist_asset_blob(Some(&store), &oversized)
+            .await
+            .expect("oversized assets are skipped without IO errors");
+
+        assert!(result.is_none());
+        assert_eq!(store.put_blob_calls.load(Ordering::Relaxed), 0);
     }
 
     // Minimal mock for tests that don't need real image extraction

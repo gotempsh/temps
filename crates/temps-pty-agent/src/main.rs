@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Entrypoint for the agent binary. Parses `--socket` and hands off to
 //! `server::run`. The process lives for the container's lifetime; the
 //! supervisor in sandbox-entrypoint.sh respawns it on crash.

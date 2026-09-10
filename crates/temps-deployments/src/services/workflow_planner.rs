@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Workflow Planner
 //!
 //! Determines which jobs to create for a deployment based on project configuration
@@ -5,10 +8,178 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{EncryptionService, SecretsManagerResolver};
+use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
-use tracing::{debug, info};
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+use super::env_resolver::merge_managed_service_environment;
+use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
+
+#[derive(Debug, Error)]
+pub enum WorkflowPlanningError {
+    #[error(
+        "Failed to seal workflow field '{field}' for deployment {deployment_id} \
+         (project {project_id}): {source}"
+    )]
+    SealSensitiveField {
+        deployment_id: i32,
+        project_id: i32,
+        field: &'static str,
+        #[source]
+        source: crate::services::sensitive_envelope::SensitiveEnvelopeError,
+    },
+
+    #[error("Failed to serialize {count} cross-node service blocker(s) into the deploy job config: {source}")]
+    SerializeCrossNodeBlockers {
+        count: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// One linked external service that a replica scheduled onto another node
+/// would not be able to reach, and what to do about it.
+///
+/// Travels in the deploy job's config (it carries no credentials — service
+/// name, DNS name, and operator guidance only) so the failure is raised by
+/// the replica that would actually have been broken, not by every
+/// deployment of a project that merely *has* a linked service.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CrossNodeServiceBlocker {
+    pub service_id: i32,
+    pub service_name: String,
+    /// Name that would have to resolve. `None` when the service name yields
+    /// no legal DNS label at all.
+    pub fqdn: Option<String>,
+    /// What is wrong, naming the concrete setting or missing state.
+    pub detail: String,
+    /// The next action that fixes it.
+    pub remedy: String,
+    /// Console path that configures the missing piece.
+    pub setup_path: String,
+}
+
+impl CrossNodeServiceBlocker {
+    fn new(
+        link: &temps_providers::ServiceCrossNodeLink,
+        reason: temps_providers::CrossNodeBlockReason,
+    ) -> Self {
+        Self {
+            service_id: link.service_id,
+            service_name: link.service_name.clone(),
+            fqdn: link.fqdn.clone(),
+            detail: reason.detail(&link.service_name),
+            remedy: reason.remedy().to_string(),
+            setup_path: reason.setup_path(link.service_id),
+        }
+    }
+
+    /// Single-line, self-contained explanation for logs and job failures.
+    pub fn describe(&self) -> String {
+        format!(
+            "linked service '{}' (id {}): {} {}",
+            self.service_name, self.service_id, self.detail, self.remedy
+        )
+    }
+}
+
+/// Result of planning the connection strings for a remotely-scheduled
+/// replica: the rewritten variables, plus anything that could not be made
+/// to work.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteEnvironmentPlan {
+    /// `None` in single-node mode / when there is nothing remote to plan for.
+    pub variables: Option<std::collections::HashMap<String, String>>,
+    /// Non-empty when at least one linked service has no working cross-node
+    /// address. Those variables are deliberately left pointing at the
+    /// same-host container name rather than at a plausible-looking address
+    /// that can never connect.
+    pub blockers: Vec<CrossNodeServiceBlocker>,
+}
+
+/// Job-config key holding the [`CrossNodeServiceBlocker`] list. Read back by
+/// `WorkflowExecutionService` when it builds the deploy job.
+pub const CROSS_NODE_BLOCKERS_KEY: &str = "cross_node_service_blockers";
+
+/// Write the blocker list into a deploy job's config. Omitted entirely when
+/// empty so existing job configs are byte-identical to before.
+fn insert_cross_node_blockers(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    blockers: &[CrossNodeServiceBlocker],
+) -> Result<(), WorkflowPlanningError> {
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    let value = serde_json::to_value(blockers).map_err(|source| {
+        WorkflowPlanningError::SerializeCrossNodeBlockers {
+            count: blockers.len(),
+            source,
+        }
+    })?;
+    config.insert(CROSS_NODE_BLOCKERS_KEY.to_string(), value);
+    Ok(())
+}
+
+/// Read the blocker list back out of a deploy job's config. Unknown or
+/// malformed values degrade to "no blockers" rather than failing the
+/// deployment: a stale job config must not become an outage.
+pub fn read_cross_node_blockers(config: &serde_json::Value) -> Vec<CrossNodeServiceBlocker> {
+    config
+        .get(CROSS_NODE_BLOCKERS_KEY)
+        .and_then(|v| serde_json::from_value::<Vec<CrossNodeServiceBlocker>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Swap every occurrence of a linked service's Docker container name for the
+/// address a container on another node must use, in place.
+///
+/// Only the host part changes: the port inside the connection string is the
+/// container port, which is identical on every node, so services exposing
+/// several ports (S3/RustFS) keep working without special-casing.
+///
+/// Returns the keys that changed, so callers can log *which* variables were
+/// touched without ever logging a value (they contain credentials).
+fn rewrite_service_host(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    container_name: &str,
+    replacement_host: &str,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (key, value) in env_vars.iter_mut() {
+        if value.contains(container_name) {
+            *value = value.replace(container_name, replacement_host);
+            changed.push(key.clone());
+        }
+    }
+    changed.sort();
+    changed
+}
+
+/// Decide what a linked service's container name should be rewritten to for
+/// a container on another node — or why nothing valid exists.
+///
+/// Pure: the whole cross-node addressing decision is exercised in unit tests
+/// without Docker, a cluster, or a database.
+fn cross_node_rewrite_target(
+    link: &temps_providers::ServiceCrossNodeLink,
+    cluster_dns_enabled: bool,
+) -> Result<String, temps_providers::CrossNodeBlockReason> {
+    let Some(fqdn) = link.fqdn.as_deref() else {
+        return Err(temps_providers::CrossNodeBlockReason::NoDnsName);
+    };
+    if !cluster_dns_enabled {
+        // Without the per-node resolver in the container's resolv.conf the
+        // FQDN is just an unresolvable string. There is no fallback: the
+        // service's host port is bound to loopback on its own node.
+        return Err(temps_providers::CrossNodeBlockReason::ClusterDnsDisabled);
+    }
+    if !link.dns_record_published {
+        return Err(temps_providers::CrossNodeBlockReason::DnsRecordMissing);
+    }
+    Ok(fqdn.to_string())
+}
 
 /// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
 ///
@@ -33,6 +204,43 @@ pub struct JobDefinition {
 
 use super::deployment_token_service::DeploymentTokenService;
 
+const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
+
+/// Derive an opaque, stable namespace for BuildKit cache mounts.
+///
+/// Cache mounts are writable and live on a shared builder. A public namespace
+/// would allow an unrelated project to mount or poison another project's
+/// cache. The HMAC-derived value is stable for warm builds of the same ref but
+/// cannot be derived by tenants that do not hold the Temps master key.
+fn buildkit_cache_mount_namespace(
+    encryption_service: &EncryptionService,
+    project_id: i32,
+    environment_id: i32,
+    cache_ref: &str,
+) -> String {
+    let domain = format!(
+        "temps-buildkit-cache-v1:project={project_id}:environment={environment_id}:ref={cache_ref}"
+    );
+    hex::encode(encryption_service.derive_subkey(&domain))
+}
+
+/// Secrets resolved for one deployment: plaintext values, plus which Compose
+/// services each one may be read by.
+///
+/// The scope sits beside the values rather than inside them because service
+/// names are not sensitive. Only `values` is sealed into `job_config`, so the
+/// scope stays readable for debugging without widening what the encrypted
+/// envelope has to carry.
+///
+/// A key absent from `compose_services` is delivered to every service. Only
+/// the Compose preset consults this map; every other preset deploys a single
+/// container, which receives all of `values`.
+#[derive(Debug, Default, Clone)]
+pub struct GatheredSecrets {
+    pub values: std::collections::HashMap<String, String>,
+    pub compose_services: std::collections::HashMap<String, Vec<String>>,
+}
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -56,6 +264,50 @@ pub struct WorkflowPlanner {
 }
 
 impl WorkflowPlanner {
+    fn seal_sensitive_field(
+        &self,
+        job_config: &mut serde_json::Map<String, serde_json::Value>,
+        deployment: &deployments::Model,
+        field: &'static str,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<(), WorkflowPlanningError> {
+        crate::services::sensitive_envelope::write_sealed(
+            job_config,
+            self.encryption_service.as_ref(),
+            field,
+            values,
+        )
+        .map_err(|source| WorkflowPlanningError::SealSensitiveField {
+            deployment_id: deployment.id,
+            project_id: deployment.project_id,
+            field,
+            source,
+        })
+    }
+
+    fn buildkit_cache_namespace_for(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+    ) -> String {
+        // Tags take precedence during checkout, followed by branches and
+        // direct commit deployments. Branch deployments retain a stable cache
+        // namespace across commits, while detached commits remain isolated.
+        let cache_ref = deployment
+            .tag_ref
+            .as_deref()
+            .or(deployment.branch_ref.as_deref())
+            .or(deployment.commit_sha.as_deref())
+            .unwrap_or(&project.main_branch);
+        buildkit_cache_mount_namespace(
+            self.encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            cache_ref,
+        )
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         log_service: Arc<LogService>,
@@ -96,7 +348,7 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables - auto-generated per project/environment:
-    ///    - `SENTRY_DSN` is always added (server-side / generic).
+    ///    - `SENTRY_DSN` and `SENTRY_TUNNEL` are always added (server-side / generic).
     ///    - A framework-specific public-DSN var is added so client bundlers expose it.
     ///      The exact name follows each framework's public-prefix convention so
     ///      `import.meta.env.<VAR>` / `process.env.<VAR>` resolves at build time:
@@ -127,10 +379,11 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use std::collections::HashMap;
+        use std::collections::{BTreeMap, HashMap};
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+        let mut explicit_project_vars = HashMap::new();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
@@ -171,13 +424,13 @@ impl WorkflowPlanner {
                 } else {
                     env_var.value
                 };
-                env_vars_map.insert(env_var.key, value);
+                explicit_project_vars.insert(env_var.key, value);
             }
         }
 
         debug!(
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
-            env_vars_map.len()
+            explicit_project_vars.len()
         );
 
         // 2. Get runtime environment variables from external services
@@ -195,6 +448,8 @@ impl WorkflowPlanner {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
+        let mut linked_service_vars: BTreeMap<String, Vec<HashMap<String, String>>> =
+            BTreeMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -203,6 +458,18 @@ impl WorkflowPlanner {
                 project_service.service_id, project.id, environment.id
             );
 
+            let service = match self
+                .external_service_manager
+                .get_service(project_service.service_id)
+                .await
+            {
+                Ok(service) => service,
+                Err(error) => {
+                    failed_services.push((project_service.service_id, error.to_string()));
+                    continue;
+                }
+            };
+            let service_type = canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -219,8 +486,10 @@ impl WorkflowPlanner {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Merge service env vars into the main map
-                    env_vars_map.extend(service_env_vars);
+                    linked_service_vars
+                        .entry(service_type)
+                        .or_default()
+                        .push(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -253,6 +522,19 @@ impl WorkflowPlanner {
 
             return Err(anyhow::anyhow!(error_message));
         }
+
+        // Apply reviewed native-template aliases (for example Keycloak's
+        // KC_DB_* contract) before explicit project values take precedence.
+        // This is the normal deployment path; rollback and promotion use the
+        // same shared merge in DeploymentEnvResolver.
+        merge_managed_service_environment(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
+            project.service_template.as_ref(),
+            project.id,
+            environment.id,
+        )?;
 
         // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
         //
@@ -348,11 +630,25 @@ impl WorkflowPlanner {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
+                        let sentry_tunnel =
+                            format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH);
+                        env_vars_map.insert("SENTRY_TUNNEL".to_string(), sentry_tunnel.clone());
+
                         // Add framework-specific public DSN env var based on preset.
                         // Each client bundler only exposes vars matching its own prefix
                         // convention to the browser bundle, so we mirror that mapping.
                         if let Some(public_var) = public_sentry_dsn_var(project.preset) {
                             env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
+                        }
+
+                        // Add the same-origin tunnel path browser SDKs should pass as
+                        // `Sentry.init({ tunnel })`. The value is a constant (not
+                        // project-specific), but injecting it as an env var — rather
+                        // than hardcoding it in every framework's setup snippet — means
+                        // the path can change in one place (here) without touching
+                        // deployed apps' source or docs.
+                        if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
+                            env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
                     }
                     Err(e) => {
@@ -456,19 +752,24 @@ impl WorkflowPlanner {
                 "http/protobuf".to_string(),
             );
 
-            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
-            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
-                env_vars_map.insert(
-                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
-                    format!("Authorization=Bearer {}", token),
-                );
-            }
+            // Always include the project slug so authentication failures retain
+            // project context. Authorization is added when token provisioning
+            // succeeded (the token is already in TEMPS_API_TOKEN).
+            let token = env_vars_map.get("TEMPS_API_TOKEN").map(String::as_str);
+            let existing_headers = env_vars_map
+                .get("OTEL_EXPORTER_OTLP_HEADERS")
+                .map(String::as_str);
+            let otel_headers =
+                super::env_resolver::otel_exporter_headers(token, existing_headers, &project.slug);
+            env_vars_map.insert("OTEL_EXPORTER_OTLP_HEADERS".to_string(), otel_headers);
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
@@ -497,11 +798,11 @@ impl WorkflowPlanner {
         &self,
         project: &projects::Model,
         environment: &environments::Model,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    ) -> anyhow::Result<GatheredSecrets> {
         use std::collections::{HashMap, HashSet};
-        use temps_entities::{secret_environments, secrets};
+        use temps_entities::{secret_compose_services, secret_environments, secrets};
 
-        let mut out: HashMap<String, String> = HashMap::new();
+        let mut out = GatheredSecrets::default();
 
         // 1. All secrets for this project.
         let all_secrets = secrets::Entity::find()
@@ -516,9 +817,23 @@ impl WorkflowPlanner {
         // 2. Junction rows — which secrets are environment-scoped.
         let secret_ids: Vec<i32> = all_secrets.iter().map(|s| s.id).collect();
         let junctions = secret_environments::Entity::find()
-            .filter(secret_environments::Column::SecretId.is_in(secret_ids))
+            .filter(secret_environments::Column::SecretId.is_in(secret_ids.clone()))
             .all(self.db.as_ref())
             .await?;
+
+        // 3. Compose-service scoping. A secret with no rows here goes to every
+        //    service, which is how every secret behaved before scoping existed.
+        let service_rows = secret_compose_services::Entity::find()
+            .filter(secret_compose_services::Column::SecretId.is_in(secret_ids))
+            .all(self.db.as_ref())
+            .await?;
+        let mut service_bindings: HashMap<i32, Vec<String>> = HashMap::new();
+        for row in service_rows {
+            service_bindings
+                .entry(row.secret_id)
+                .or_default()
+                .push(row.service_name);
+        }
 
         let mut bindings: HashMap<i32, HashSet<i32>> = HashMap::new();
         for j in junctions {
@@ -550,75 +865,76 @@ impl WorkflowPlanner {
                         e
                     )
                 })?;
-            out.insert(secret.key, plaintext);
+            if let Some(services) = service_bindings.remove(&secret.id) {
+                out.compose_services.insert(secret.key.clone(), services);
+            }
+            out.values.insert(secret.key, plaintext);
         }
 
         info!(
-            "Gathered {} secret file(s) for deployment to env {}",
-            out.len(),
+            "Gathered {} secret file(s) ({} compose-scoped) for deployment to env {}",
+            out.values.len(),
+            out.compose_services.len(),
             environment.id
         );
         Ok(out)
     }
 
-    /// Build remote environment variables by rewriting connection strings for cross-node access.
+    /// Build the environment variables a replica receives when it is
+    /// scheduled onto a node **other than** the control plane.
     ///
-    /// When `private_address` is set in multi-node settings, this method:
-    /// 1. Copies the local environment variables
-    /// 2. For each linked external service, replaces Docker container names and internal ports
-    ///    with the control plane's private address and host port
-    /// 3. Rewrites TEMPS_API_URL if it references localhost/127.0.0.1
+    /// ## Why the address has to be a DNS name
     ///
-    /// Returns `None` if `private_address` is not configured (single-node mode).
+    /// A managed service container publishes its port to `127.0.0.1` on its
+    /// own host and nowhere else — enforced by
+    /// `temps_providers::utils::local_port_binding`, which is a deliberate
+    /// security property. So `<node private address>:<host port>`, the form
+    /// this method used to emit, is unreachable from every other node: the
+    /// port is simply not bound on that interface. Apps linked to a database
+    /// that happened to land on a different node were handed a connection
+    /// string that could never connect, and nothing anywhere said so.
+    ///
+    /// The address that does work across nodes is the container's IP on the
+    /// multi-host overlay, reached by name through the internal
+    /// `*.temps.local` zone (ADR-011) — the same mechanism cluster members
+    /// already use. So the rewrite is now purely `container name -> FQDN`,
+    /// leaving the port untouched (the container port is the same on every
+    /// node, and services that expose several ports keep working).
+    ///
+    /// ## When it can't work
+    ///
+    /// Cross-node resolution needs `AppSettings.cluster_dns.enabled` **and**
+    /// a published A record. When either is missing there is no address that
+    /// can work, so this method emits a [`CrossNodeServiceBlocker`] instead
+    /// of a plausible-looking broken one. The deploy job fails loudly with
+    /// that blocker if — and only if — the replica really is scheduled
+    /// remotely; a deployment that stays on the control plane is unaffected.
+    ///
+    /// Returns an empty plan (no variables, no blockers) in single-node mode
+    /// or when the project has no cross-node exposure at all.
     async fn build_remote_environment_variables(
         &self,
         project: &projects::Model,
         local_env_vars: &std::collections::HashMap<String, String>,
-    ) -> Option<std::collections::HashMap<String, String>> {
+    ) -> RemoteEnvironmentPlan {
         use temps_entities::project_services;
 
-        // Get the private address for cross-node service connectivity.
-        // Priority: multi_node.private_address > host from external_url
-        let private_address = match self.config_service.get_settings().await {
-            Ok(settings) => {
-                if let Some(addr) = settings.multi_node.private_address {
-                    addr
-                } else {
-                    // Fall back to extracting host from external URL
-                    match self.config_service.get_external_url_or_default().await {
-                        Ok(url) => {
-                            if let Ok(parsed) = url::Url::parse(&url) {
-                                match parsed.host_str() {
-                                    Some(host)
-                                        if host != "localhost"
-                                            && host != "127.0.0.1"
-                                            && host != "localho.st" =>
-                                    {
-                                        info!(
-                                            "No private_address configured, falling back to external URL host: {}",
-                                            host
-                                        );
-                                        host.to_string()
-                                    }
-                                    _ => return None,
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        Err(_) => return None,
-                    }
-                }
+        let settings = match self.config_service.get_settings().await {
+            Ok(settings) => settings,
+            Err(e) => {
+                warn!(
+                    project_id = project.id,
+                    error = %e,
+                    "Could not read settings while planning cross-node env vars; \
+                     falling back to single-node behaviour"
+                );
+                return RemoteEnvironmentPlan::default();
             }
-            Err(_) => return None,
         };
+        let cluster_dns_enabled = settings.cluster_dns.enabled;
 
-        info!(
-            "build_remote_environment_variables: resolved private_address={}",
-            private_address
-        );
-
-        // Only build remote env vars if there are active worker nodes
+        // Only build remote env vars when there is somewhere remote to
+        // schedule to. Single-node installs never use them.
         use temps_entities::nodes;
         let has_active_nodes = matches!(
             nodes::Entity::find()
@@ -628,12 +944,17 @@ impl WorkflowPlanner {
             Ok(Some(_))
         );
         if !has_active_nodes {
-            return None;
+            return RemoteEnvironmentPlan::default();
         }
 
-        let mut remote_vars = local_env_vars.clone();
+        // Private address is only used to rewrite the control-plane API URL
+        // (which *is* bound on that interface). It is deliberately no longer
+        // used for managed services — see the doc comment.
+        let private_address = self.resolve_control_plane_private_address(&settings).await;
 
-        // Get all services linked to this project
+        let mut remote_vars = local_env_vars.clone();
+        let mut blockers: Vec<CrossNodeServiceBlocker> = Vec::new();
+
         let project_services_list = match project_services::Entity::find()
             .filter(project_services::Column::ProjectId.eq(project.id))
             .all(self.db.as_ref())
@@ -641,90 +962,143 @@ impl WorkflowPlanner {
         {
             Ok(services) => services,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to query project services for remote env var rewriting: {}",
-                    e
+                warn!(
+                    project_id = project.id,
+                    error = %e,
+                    "Failed to query linked services for cross-node env vars"
                 );
-                return None;
+                return RemoteEnvironmentPlan::default();
             }
         };
 
         info!(
-            "Building remote env vars for project {}: {} linked services, private_address={}",
+            "Planning cross-node env vars for project {}: {} linked service(s), cluster_dns_enabled={}",
             project.id,
             project_services_list.len(),
-            private_address
+            cluster_dns_enabled
         );
 
-        // For each service, get its address mapping and do replacements
         for project_service in &project_services_list {
-            match self
+            let link = match self
                 .external_service_manager
-                .get_service_effective_address(project_service.service_id)
+                .get_service_cross_node_link(project_service.service_id)
                 .await
             {
-                Ok((container_name, internal_port, host_port)) => {
-                    info!(
-                        "Service {}: container_name={}, internal_port={}, host_port={} — rewriting to {}:{}",
-                        project_service.service_id, container_name, internal_port, host_port,
-                        private_address, host_port
-                    );
-                    let mut rewritten_count = 0;
-                    for (key, value) in remote_vars.iter_mut() {
-                        // Replace container_name:internal_port → private_address:host_port
-                        if value.contains(&container_name) {
-                            let old_value = value.clone();
-                            *value = value
-                                .replace(
-                                    &format!("{}:{}", container_name, internal_port),
-                                    &format!("{}:{}", private_address, host_port),
-                                )
-                                .replace(&container_name, &private_address);
-                            info!("Rewrote {}={} -> {}", key, old_value, value);
-                            rewritten_count += 1;
-                        }
-                    }
-                    if rewritten_count == 0 {
-                        tracing::warn!(
-                            "Service {} container_name='{}' not found in any env var value",
-                            project_service.service_id,
-                            container_name
-                        );
-                    }
-                }
+                Ok(link) => link,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get effective address for service {} (skipping rewrite): {}",
-                        project_service.service_id,
-                        e
+                    warn!(
+                        service_id = project_service.service_id,
+                        error = %e,
+                        "Failed to resolve cross-node link for linked service"
+                    );
+                    continue;
+                }
+            };
+
+            // Only services actually referenced by a variable matter. A
+            // linked-but-unused service can't break anything, so it must not
+            // be able to block a deployment either.
+            let referenced = remote_vars
+                .values()
+                .any(|value| value.contains(&link.container_name));
+            if !referenced {
+                debug!(
+                    service_id = link.service_id,
+                    container = %link.container_name,
+                    "Linked service is not referenced by any environment variable; \
+                     nothing to rewrite"
+                );
+                continue;
+            }
+
+            match cross_node_rewrite_target(&link, cluster_dns_enabled) {
+                Ok(fqdn) => {
+                    let rewritten_keys =
+                        rewrite_service_host(&mut remote_vars, &link.container_name, &fqdn);
+                    // Connection strings carry credentials. Log the affected
+                    // keys only — never any value.
+                    info!(
+                        service_id = link.service_id,
+                        fqdn = %fqdn,
+                        keys = %rewritten_keys.join(", "),
+                        "Rewrote environment variables to the service's internal DNS name"
                     );
                 }
-            }
-        }
-
-        // Rewrite TEMPS_API_URL if it references localhost/127.0.0.1
-        if let Some(api_url) = remote_vars.get("TEMPS_API_URL").cloned() {
-            if api_url.contains("localhost") || api_url.contains("127.0.0.1") {
-                let rewritten = api_url
-                    .replace("localhost", &private_address)
-                    .replace("127.0.0.1", &private_address);
-                remote_vars.insert("TEMPS_API_URL".to_string(), rewritten.clone());
-
-                // Also rewrite OTEL endpoint which is derived from TEMPS_API_URL
-                if let Some(otel_url) = remote_vars.get("OTEL_EXPORTER_OTLP_ENDPOINT").cloned() {
-                    let rewritten_otel = otel_url
-                        .replace("localhost", &private_address)
-                        .replace("127.0.0.1", &private_address);
-                    remote_vars.insert("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), rewritten_otel);
+                Err(reason) => {
+                    warn!(
+                        service_id = link.service_id,
+                        service_name = %link.service_name,
+                        "No cross-node address exists for linked service: {}",
+                        reason.detail(&link.service_name)
+                    );
+                    blockers.push(CrossNodeServiceBlocker::new(&link, reason));
                 }
             }
         }
 
-        debug!(
-            "Built remote environment variables with private_address={}",
-            private_address
+        // The control-plane API listens on a real interface, so the private
+        // address is the right substitution here (unlike managed services).
+        if let Some(private_address) = private_address.as_deref() {
+            if let Some(api_url) = remote_vars.get("TEMPS_API_URL").cloned() {
+                if api_url.contains("localhost") || api_url.contains("127.0.0.1") {
+                    let rewritten = api_url
+                        .replace("localhost", private_address)
+                        .replace("127.0.0.1", private_address);
+                    remote_vars.insert("TEMPS_API_URL".to_string(), rewritten);
+
+                    // OTEL endpoint is derived from TEMPS_API_URL.
+                    if let Some(otel_url) = remote_vars.get("OTEL_EXPORTER_OTLP_ENDPOINT").cloned()
+                    {
+                        let rewritten_otel = otel_url
+                            .replace("localhost", private_address)
+                            .replace("127.0.0.1", private_address);
+                        remote_vars
+                            .insert("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), rewritten_otel);
+                    }
+                }
+            }
+        } else {
+            debug!(
+                project_id = project.id,
+                "No control-plane private address configured; leaving TEMPS_API_URL as-is"
+            );
+        }
+
+        RemoteEnvironmentPlan {
+            variables: Some(remote_vars),
+            blockers,
+        }
+    }
+
+    /// Address a worker node uses to reach the control-plane API.
+    ///
+    /// `multi_node.private_address` when set, else the host of the external
+    /// URL when that host is not a loopback alias. `None` when neither is
+    /// usable — callers then leave API URLs untouched rather than
+    /// substituting something that cannot be right.
+    async fn resolve_control_plane_private_address(
+        &self,
+        settings: &temps_core::AppSettings,
+    ) -> Option<String> {
+        if let Some(addr) = settings.multi_node.private_address.as_deref() {
+            return Some(addr.to_string());
+        }
+
+        let url = self
+            .config_service
+            .get_external_url_or_default()
+            .await
+            .ok()?;
+        let parsed = url::Url::parse(&url).ok()?;
+        let host = parsed.host_str()?;
+        if host == "localhost" || host == "127.0.0.1" || host == "localho.st" {
+            return None;
+        }
+        info!(
+            "No private_address configured, falling back to external URL host: {}",
+            host
         );
-        Some(remote_vars)
+        Some(host.to_string())
     }
 
     /// Create all jobs for a deployment based on project configuration
@@ -827,16 +1201,19 @@ impl WorkflowPlanner {
     /// Determine the fallback port configuration for the container
     ///
     /// This method resolves manual port overrides during job planning.
-    /// The actual port used at deployment time is determined by inspecting the built image
-    /// in DeployImageJob.resolve_container_port() with this priority:
+    /// The actual port used at deployment time is determined by
+    /// `DeployImageJob.resolve_container_port()` with this priority:
     ///
-    /// 1. Image EXPOSE directive (inspected after build - highest priority)
-    /// 2. Environment-level exposed_port
-    /// 3. Project-level exposed_port
+    /// 1. Environment-level exposed_port override
+    /// 2. Project-level exposed_port setting
+    /// 3. Image EXPOSE directive (inspected after build)
     /// 4. Default: 3000
     ///
     /// Note: Image inspection happens in the deploy job (after build completes),
     /// not during planning, since the image doesn't exist yet at planning time.
+    /// This method only returns the value used as fallback/default (steps 1, 2
+    /// and 4); callers must separately consult `super::port_resolver::configured_port_override()`
+    /// to pass the "was this explicit" distinction through to the deploy job.
     ///
     /// # Arguments
     /// * `environment` - Environment model with optional exposed_port
@@ -848,31 +1225,14 @@ impl WorkflowPlanner {
         project: &projects::Model,
         _image_name: Option<&str>, // Unused - inspection happens in deploy job after build
     ) -> u16 {
-        // 1. Check environment-level port override (from deployment_config)
-        if let Some(ref deployment_config) = environment.deployment_config {
-            if let Some(port) = deployment_config.exposed_port {
-                debug!(
-                    "Using environment-level port override: {} (environment: {})",
-                    port, environment.name
-                );
-                return port as u16;
-            }
+        if let Some(port) = super::port_resolver::configured_port_override(environment, project) {
+            return port;
         }
 
-        // 2. Check project-level port override (from deployment_config)
-        if let Some(ref deployment_config) = project.deployment_config {
-            if let Some(port) = deployment_config.exposed_port {
-                debug!(
-                    "Using project-level port override: {} (project: {})",
-                    port, project.name
-                );
-                return port as u16;
-            }
-        }
-
-        // 3. Default to 3000
         // Note: Image EXPOSE directive will be checked in DeployImageJob after build completes
-        debug!("Using default port: 3000 (will be overridden by image EXPOSE if present)");
+        debug!(
+            "Using default port: 3000 (may be overridden by image EXPOSE detection since neither environment nor project configures a port)"
+        );
         3000
     }
 
@@ -916,6 +1276,11 @@ impl WorkflowPlanner {
             if metadata.static_bundle_path.is_some() {
                 debug!("Inferred StaticFiles deployment from static_bundle_path in metadata");
                 return SourceType::StaticFiles;
+            }
+
+            if metadata.source_bundle_path.is_some() {
+                debug!("Inferred UploadedSource deployment from source_bundle_path in metadata");
+                return SourceType::UploadedSource;
             }
         }
 
@@ -965,29 +1330,63 @@ impl WorkflowPlanner {
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
-        // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
+        // This is a platform-owned build argument, not a tenant runtime
+        // variable. Drop any user-controlled value before planning so it
+        // cannot override the HMAC namespace or leak into deployed containers.
+        if env_vars
+            .remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+            .is_some()
+        {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Ignoring tenant-provided reserved BuildKit cache namespace"
+            );
+        }
+
+        // Inject deployment-owned runtime variables for stale-chunk prevention
+        // and a deterministic default port. Source-specific planners may
+        // replace PORT later after inspecting an external image.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
         //   Vite:    base: process.env.TEMPS_ASSET_PREFIX || '/'
         // The value is the deployment slug, which is unique and URL-safe.
-        let asset_prefix = format!("/_temps/assets/{}", deployment.slug);
-        env_vars.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
-        // NEXT_PUBLIC_ prefix makes it available at build time in Next.js client bundles
-        if project.preset == temps_entities::preset::Preset::NextJs {
-            env_vars.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
-        }
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
 
         debug!(
             "📦 Gathered {} environment variables for deployment",
             env_vars.len()
         );
 
-        // Build remote environment variables (connection strings rewritten for worker nodes)
-        let remote_env_vars = self
+        // Build remote environment variables (connection strings rewritten
+        // to the linked services' internal DNS names for worker nodes).
+        let remote_env_plan = self
             .build_remote_environment_variables(project, &env_vars)
             .await;
-        if remote_env_vars.is_some() {
+        if remote_env_plan.variables.is_some() {
             debug!("📦 Built remote environment variables for cross-node deployments");
+        }
+        for blocker in &remote_env_plan.blockers {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Cross-node deployment blocked: {}",
+                blocker.describe()
+            );
         }
 
         // Gather secrets — decrypted plaintext values, mounted as files at
@@ -997,10 +1396,23 @@ impl WorkflowPlanner {
 
         // Docker Compose preset uses its own deployment path
         if project.preset == temps_entities::preset::Preset::DockerCompose {
+            let buildkit_cache_namespace =
+                self.buildkit_cache_namespace_for(project, environment, deployment);
             return self
-                .plan_compose_deployment(project, environment, deployment, env_vars)
+                .plan_compose_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    secrets,
+                    buildkit_cache_namespace,
+                )
                 .await;
         }
+        // Single-container presets deploy one container, which receives every
+        // secret in scope for the environment; compose-service scoping does
+        // not apply to them.
+        let secrets = secrets.values;
 
         // Route to appropriate job planning based on effective source type
         match effective_source_type {
@@ -1010,7 +1422,7 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
-                    remote_env_vars,
+                    remote_env_plan,
                     secrets,
                 )
                 .await
@@ -1025,7 +1437,18 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
-                    remote_env_vars,
+                    remote_env_plan,
+                    secrets,
+                )
+                .await
+            }
+            SourceType::UploadedSource => {
+                self.plan_git_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    remote_env_plan,
                     secrets,
                 )
                 .await
@@ -1058,10 +1481,27 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         mut env_vars: std::collections::HashMap<String, String>,
-        remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
+
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
+        let source_job_id = if source_bundle_path.is_some() {
+            "prepare_source_bundle"
+        } else {
+            "download_repo"
+        };
+
+        // BuildKit's predefined BUILDKIT_CACHE_MOUNT_NS argument is applied to
+        // every RUN --mount=type=cache ID. Scope it by project, environment,
+        // and checked-out ref so unrelated tenants and preview branches cannot
+        // read or poison each other's writable compiler/package caches.
+        let buildkit_cache_namespace =
+            self.buildkit_cache_namespace_for(project, environment, deployment);
 
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
@@ -1099,7 +1539,17 @@ impl WorkflowPlanner {
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
         // Job 1: Download repository (only if git info is available)
-        if has_git_info {
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: source_job_id.to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             // Determine which branch/commit to use for this deployment
             // Priority: deployment.branch_ref > deployment.commit_sha > project.main_branch
             let branch_or_commit = deployment
@@ -1138,34 +1588,80 @@ impl WorkflowPlanner {
 
         // Check if this preset supports static deployment using temps-presets
         // Get the preset instance and check if it has a static output directory
-        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let runtime_slug =
+            temps_presets::runtime_slug(project.preset, project.preset_config.as_ref());
+        let preset_instance =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())?;
         let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
 
         debug!(
             "Preset {} static output directory: {:?}",
-            project.preset, static_output_dir
+            runtime_slug, static_output_dir
         );
 
         // Job 2: Build container image (skip for static deployments)
         // The BuildImageJob will generate Dockerfile from preset if it doesn't exist
         // Depends on download_repo only if git info is available
-        let build_dependencies = if has_git_info {
-            vec!["download_repo".to_string()]
+        let build_dependencies = if has_git_info || source_job_id == "prepare_source_bundle" {
+            vec![source_job_id.to_string()]
         } else {
             vec![]
         };
 
-        // Determine deployment strategy: Static or Container
-        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+        // Presets that have nothing to build (a plain static site: no
+        // package.json, no build tool) skip Docker/autopack entirely — a
+        // single job deploys straight from the downloaded checkout. Building
+        // an image just to immediately discard it (or, worse, run it as a
+        // long-lived container purely to serve files) is pure overhead for
+        // content with zero compile step.
+        let needs_container_build = preset_instance
+            .as_ref()
+            .map(|preset| preset.needs_container_build())
+            .unwrap_or(true);
+
+        // Determine deployment strategy: source-only, static (build + extract), or Container
+        let deploy_job_id = if !needs_container_build {
+            debug!(
+                "📄 Using source-only static deployment for preset {} (no build step)",
+                project.preset
+            );
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticFromSourceJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some(
+                    "Deploy static files directly from the repository — no build, no container"
+                        .to_string(),
+                ),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "directory": project.directory,
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_static".to_string()
+        } else if let Some(output_dir) = static_output_dir {
             // Static deployment path: BuildImageJob + DeployStaticJob
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
 
-            // Convert environment variables to build args
-            let mut build_args_map = serde_json::Map::new();
-            for (key, value) in &env_vars {
-                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
+            // Build args contain every resolved environment value, including
+            // secrets. Keep the static-deployment path aligned with container
+            // deployments: store only an encrypted envelope plus a plaintext
+            // key index for diagnostics.
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace.clone(),
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1182,6 +1678,14 @@ impl WorkflowPlanner {
                 }
             }
 
+            let mut build_job_config = serde_json::json!({
+                "dockerfile_path": dockerfile_path,
+                "build_context": build_context,
+            });
+            if let Some(obj) = build_job_config.as_object_mut() {
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+            }
+
             // Job 2: Build image (for static deployments, this builds the static files inside container)
             jobs.push(JobDefinition {
                 job_id: "build_image".to_string(),
@@ -1189,11 +1693,7 @@ impl WorkflowPlanner {
                 name: "Build Container Image".to_string(),
                 description: Some("Build Docker image and compile static files".to_string()),
                 dependencies: build_dependencies.clone(),
-                job_config: Some(serde_json::json!({
-                    "dockerfile_path": dockerfile_path,
-                    "build_args": build_args_map,
-                    "build_context": build_context
-                })),
+                job_config: Some(build_job_config),
                 required_for_completion: true,
             });
 
@@ -1261,10 +1761,14 @@ impl WorkflowPlanner {
             // whole map under `build_args_encrypted` instead so an operator
             // dumping `deployment_jobs.job_config` for debugging never sees
             // an env-var value they shouldn't.
-            let build_args_map: std::collections::HashMap<String, String> = env_vars
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1286,13 +1790,7 @@ impl WorkflowPlanner {
                 "build_context": build_context,
             });
             if let Some(obj) = build_job_config.as_object_mut() {
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "build_args",
-                    &build_args_map,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal build_args: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
             }
 
             jobs.push(JobDefinition {
@@ -1310,6 +1808,8 @@ impl WorkflowPlanner {
             let exposed_port = self
                 .resolve_exposed_port(environment, project, Some(&image_name))
                 .await;
+            let configured_port =
+                super::port_resolver::configured_port_override(environment, project);
 
             debug!(
                 "📡 Container will expose port {} (image: {})",
@@ -1319,7 +1819,7 @@ impl WorkflowPlanner {
             let mut deploy_env_vars = env_vars.clone();
             deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
 
-            let remote_deploy_env_vars = remote_env_vars.as_ref().map(|rv| {
+            let remote_deploy_env_vars = remote_env_plan.variables.as_ref().map(|rv| {
                 let mut remote = rv.clone();
                 remote.insert("PORT".to_string(), exposed_port.to_string());
                 remote
@@ -1336,6 +1836,7 @@ impl WorkflowPlanner {
 
             let mut job_config = serde_json::json!({
                 "port": exposed_port,
+                "configured_port": configured_port,
                 "replicas": replicas,
                 "image_name": image_name
             });
@@ -1343,28 +1844,24 @@ impl WorkflowPlanner {
                 // Seal env vars, remote env vars, and secret-file contents.
                 // None of these end up in `job_config` in plaintext anymore;
                 // the executor pulls them back through `read_sealed`.
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "environment_variables",
                     &deploy_env_vars,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+                )?;
 
                 if let Some(ref remote_vars) = remote_deploy_env_vars {
                     info!(
                         "Sealing remote_environment_variables in job config ({} keys)",
                         remote_vars.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
+                    self.seal_sensitive_field(
                         obj,
-                        self.encryption_service.as_ref(),
+                        deployment,
                         "remote_environment_variables",
                         remote_vars,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                    })?;
+                    )?;
                 } else {
                     info!("No remote_environment_variables to store (single-node mode or no active nodes)");
                 }
@@ -1374,14 +1871,14 @@ impl WorkflowPlanner {
                         "Sealing {} secret file(s) in deploy job config",
                         secrets.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
-                        obj,
-                        self.encryption_service.as_ref(),
-                        "secrets",
-                        &secrets,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                    self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
                 }
+
+                // Carries no credentials — service names and operator
+                // guidance only — so it rides in plaintext. The deploy job
+                // raises it as a hard failure iff a replica really lands on
+                // a node that cannot reach these services.
+                insert_cross_node_blockers(obj, &remote_env_plan.blockers)?;
             }
 
             jobs.push(JobDefinition {
@@ -1486,12 +1983,34 @@ impl WorkflowPlanner {
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
                     "environment_id": deployment.environment_id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
             debug!(
                 "Added configure_crons job to workflow (runs after deployment is marked complete)"
+            );
+
+            // Job: Reconcile metric alert rules from .temps.yaml alerts: section.
+            // Runs in parallel with configure_crons, after deployment is complete.
+            // NOT required for deployment completion.
+            jobs.push(JobDefinition {
+                job_id: "configure_metric_alerts".to_string(),
+                job_type: "ConfigureMetricAlertsJob".to_string(),
+                name: "Configure Metric Alerts".to_string(),
+                description: Some(
+                    "Reconcile metric alert rules from .temps.yaml with the database".to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "download_job_id": source_job_id
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
             );
 
             // Job: Sync agent definitions from .temps/agents/*.yaml
@@ -1504,7 +2023,7 @@ impl WorkflowPlanner {
                 dependencies: vec!["mark_deployment_complete".to_string()],
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false,
             });
@@ -1537,10 +2056,12 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // Job 7: Scan for vulnerabilities (only if git info is available AND a
+        // container image was actually built — a source-only static deployment
+        // has no image to scan)
         // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
         // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info {
+        if has_git_info && needs_container_build && project.vulnerability_scanning_enabled {
             jobs.push(JobDefinition {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
@@ -1555,7 +2076,7 @@ impl WorkflowPlanner {
                     "environment_id": deployment.environment_id,
                     "branch": deployment.branch_ref,
                     "commit_hash": deployment.commit_sha,
-                    "download_job_id": "download_repo",
+                    "download_job_id": source_job_id,
                     "build_job_id": "build_image"
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
@@ -1563,13 +2084,19 @@ impl WorkflowPlanner {
             debug!(
                 "Added scan_vulnerabilities job to workflow (runs after deployment is marked complete)"
             );
+        } else if !project.vulnerability_scanning_enabled {
+            debug!(
+                "Skipping vulnerability scan job - vulnerability scanning is disabled for project {}",
+                project.id
+            );
         } else {
             debug!("Skipping vulnerability scan job - no git info available");
         }
 
         // Job 8: Capture source maps (only for JS-based presets with git info)
-        // Extracts .map files from the built image for error symbolication
-        if has_git_info {
+        // Extracts .map files from the built image for error symbolication —
+        // a source-only static deployment has no build output to extract from
+        if has_git_info && needs_container_build {
             // Search paths are relative to the image's WORKDIR (detected at runtime).
             // The CaptureSourceMapsJob inspects the image to find the WORKDIR and
             // prepends it to these relative paths.
@@ -1621,6 +2148,46 @@ impl WorkflowPlanner {
             );
         }
 
+        // Job 9: Capture source files (native symbolication — Go/Rust/etc.).
+        // Uploads raw source from the git checkout so native stack frames show
+        // source code. Opt-in per project, so it is only scheduled when the
+        // project has enabled source context (no overhead for anyone else).
+        if has_git_info && project.error_source_context_enabled {
+            let release = deployment
+                .commit_sha
+                .clone()
+                .unwrap_or_else(|| format!("deploy-{}", deployment.id));
+
+            jobs.push(JobDefinition {
+                job_id: "capture_source_files".to_string(),
+                job_type: "CaptureSourceFilesJob".to_string(),
+                name: "Capture Source Files".to_string(),
+                description: Some(
+                    "Upload application source from the checkout for native error symbolication"
+                        .to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "release": release,
+                    "download_job_id": source_job_id,
+                    "build_job_id": "build_image",
+                    // None = default to the Docker build context; a set value
+                    // (or .temps.yaml sourceContext.root) overrides it.
+                    "error_source_root": project.error_source_root,
+                    "extensions": [
+                        "go", "rs", "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt",
+                        "c", "h", "cpp", "cc", "hpp", "cs", "php", "swift", "scala", "ex", "exs",
+                    ],
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added capture_source_files job to workflow (release: {})",
+                release
+            );
+        }
+
         info!(
             "Planned {} jobs for Git-based project {}",
             jobs.len(),
@@ -1637,14 +2204,30 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        secrets: GatheredSecrets,
+        buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
+
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
-
-        // Job 1: Download repository (only if git-backed)
-        if has_git_info {
+        // Job 1: prepare either the uploaded archive or the Git checkout.
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: "prepare_source_bundle".to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             let branch_or_commit = deployment
                 .branch_ref
                 .as_ref()
@@ -1673,7 +2256,7 @@ impl WorkflowPlanner {
         }
 
         // Get compose path from preset config
-        let compose_path = project
+        let current_compose_path = project
             .preset_config
             .as_ref()
             .and_then(|pc| {
@@ -1684,28 +2267,44 @@ impl WorkflowPlanner {
                 }
             })
             .unwrap_or_else(|| "docker-compose.yml".to_string());
-
         // Job 2: Deploy Compose Stack (no build step)
-        let deploy_dependencies = if has_git_info {
+        let deploy_dependencies = if deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.as_ref())
+            .is_some()
+        {
+            vec!["prepare_source_bundle".to_string()]
+        } else if has_git_info {
             vec!["download_repo".to_string()]
         } else {
             vec![]
         };
 
         let mut compose_job_config = serde_json::json!({
-            "compose_path": compose_path,
+            "compose_path": current_compose_path,
             "project_id": project.id,
             "environment_id": environment.id,
             "directory": project.directory,
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_vars",
-                &env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal compose environment_vars: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            // Sealed under its own field, never merged into `environment_vars`:
+            // the compose executor mounts these as files so they stay out of
+            // `docker inspect` and out of the generated env files.
+            self.seal_sensitive_field(obj, deployment, "secrets", &secrets.values)?;
+            // Service names are not sensitive, so they stay plaintext: an
+            // operator dumping job_config can see which service was entitled
+            // to which key without being able to read any value.
+            obj.insert(
+                "secret_compose_services".to_string(),
+                serde_json::to_value(&secrets.compose_services)?,
+            );
+            let build_args = std::collections::HashMap::from([(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            )]);
+            self.seal_sensitive_field(obj, deployment, "build_args", &build_args)?;
         }
 
         jobs.push(JobDefinition {
@@ -1765,7 +2364,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
-        remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
@@ -1849,13 +2448,40 @@ impl WorkflowPlanner {
         let exposed_port = self
             .resolve_exposed_port(environment, project, Some(&external_image_ref))
             .await;
+        let configured_port = super::port_resolver::configured_port_override(environment, project);
+
+        // Release identity for image deploys. Unlike git builds (which have a
+        // commit SHA), an image deploy is pinned to an image tag/digest — that
+        // IS the deployed artifact's identity. Inject it as SENTRY_RELEASE /
+        // OTEL_SERVICE_VERSION so error events and traces are attributable to
+        // the exact image, and so it can be used as the join key for source-map
+        // / source-file uploads. Prefer an explicit commit SHA when present,
+        // then the image tag, falling back to the full ref (e.g. a digest).
+        // `or_insert` so a user-provided value always wins.
+        let release_id = deployment
+            .commit_sha
+            .clone()
+            .or_else(|| image_ref_release(&external_image_ref))
+            .unwrap_or_else(|| external_image_ref.clone());
 
         let mut deploy_env_vars = env_vars.clone();
         deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+        deploy_env_vars
+            .entry("SENTRY_RELEASE".to_string())
+            .or_insert_with(|| release_id.clone());
+        deploy_env_vars
+            .entry("OTEL_SERVICE_VERSION".to_string())
+            .or_insert_with(|| release_id.clone());
 
-        let remote_deploy_env_vars = remote_env_vars.as_ref().map(|rv| {
+        let remote_deploy_env_vars = remote_env_plan.variables.as_ref().map(|rv| {
             let mut remote = rv.clone();
             remote.insert("PORT".to_string(), exposed_port.to_string());
+            remote
+                .entry("SENTRY_RELEASE".to_string())
+                .or_insert_with(|| release_id.clone());
+            remote
+                .entry("OTEL_SERVICE_VERSION".to_string())
+                .or_insert_with(|| release_id.clone());
             remote
         });
 
@@ -1868,33 +2494,25 @@ impl WorkflowPlanner {
 
         let mut job_config = serde_json::json!({
             "port": exposed_port,
+            "configured_port": configured_port,
             "replicas": replicas,
             "image_name": external_image_ref,
             "use_external_image": true,
         });
         if let Some(obj) = job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_variables",
-                &deploy_env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
 
             if let Some(ref remote_vars) = remote_deploy_env_vars {
                 info!(
                     "Sealing remote_environment_variables in docker image job config ({} keys)",
                     remote_vars.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "remote_environment_variables",
                     remote_vars,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                })?;
+                )?;
             } else {
                 info!("No remote_environment_variables for docker image deployment");
             }
@@ -1904,14 +2522,12 @@ impl WorkflowPlanner {
                     "Sealing {} secret file(s) in docker image deploy job config",
                     secrets.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "secrets",
-                    &secrets,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             }
+
+            // See the git-deploy path: plaintext by design, enforced by the
+            // deploy job only when the replica is actually scheduled remotely.
+            insert_cross_node_blockers(obj, &remote_env_plan.blockers)?;
         }
 
         jobs.push(JobDefinition {
@@ -2014,6 +2630,7 @@ impl WorkflowPlanner {
                 "project_slug": project.slug,
                 "environment_slug": environment.slug,
                 "deployment_slug": deployment.slug,
+                "source_directory": project.directory,
             })),
             required_for_completion: true,
         });
@@ -2058,49 +2675,33 @@ impl WorkflowPlanner {
     }
 }
 
-/// Returns the framework-specific public-DSN env var name for a preset, or
-/// `None` if the preset has no client bundler (backend-only) or has no
-/// build-time public-prefix convention (Angular reads from `environment.ts`,
-/// generic Docker/Nixpacks/Static presets don't know the framework).
+/// Extract a release identifier (tag or digest) from a container image
+/// reference. This is the deployed artifact's identity for image deploys —
+/// used as SENTRY_RELEASE / OTEL_SERVICE_VERSION.
 ///
-/// Each entry follows the bundler's own public-prefix rule — that's the only
-/// prefix the bundler will inline into the browser bundle.
-pub(crate) fn public_sentry_dsn_var(
-    preset: temps_entities::preset::Preset,
-) -> Option<&'static str> {
-    use temps_entities::preset::Preset;
-    match preset {
-        // Next.js: `NEXT_PUBLIC_*` is inlined into the client bundle.
-        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_DSN"),
-        // Nuxt 3+: `NUXT_PUBLIC_*` is exposed via `useRuntimeConfig().public`.
-        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_DSN"),
-        // Vite-based frameworks (Remix uses Vite since v2.5; SolidStart is Vinxi/Vite).
-        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
-            Some("VITE_SENTRY_DSN")
+/// Handles the registry-port ambiguity: the tag separator is the LAST `:` and
+/// only counts if it comes after the last `/` (so `registry:5000/app` has no
+/// tag, but `registry:5000/app:v1` → `v1`). A `@sha256:...` digest is returned
+/// whole. Returns `None` when the ref carries no explicit tag or digest.
+fn image_ref_release(image_ref: &str) -> Option<String> {
+    // Digest form: name@sha256:abcdef... — the digest is the identity.
+    if let Some((_, digest)) = image_ref.split_once('@') {
+        if !digest.is_empty() {
+            return Some(digest.to_string());
         }
-        // SvelteKit / Astro / Rsbuild all use `PUBLIC_*` as their public prefix.
-        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_DSN"),
-        // Docusaurus is webpack-based and exposes `REACT_APP_*` via DefinePlugin.
-        Preset::Docusaurus => Some("REACT_APP_SENTRY_DSN"),
-        // Angular has no build-time public prefix; users wire `SENTRY_DSN` into
-        // `environment.ts` themselves. Backend / generic presets only need
-        // server-side `SENTRY_DSN`, which is always added.
-        Preset::Angular
-        | Preset::Python
-        | Preset::FastApi
-        | Preset::Flask
-        | Preset::Django
-        | Preset::Rails
-        | Preset::Go
-        | Preset::Rust
-        | Preset::Java
-        | Preset::Laravel
-        | Preset::NodeJs
-        | Preset::Dockerfile
-        | Preset::DockerCompose
-        | Preset::Nixpacks
-        | Preset::Static => None,
     }
+
+    // Tag form: the tag is after the last ':', but only if that ':' is in the
+    // final path segment (otherwise it's a registry host:port).
+    let last_segment_start = image_ref.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let last_segment = &image_ref[last_segment_start..];
+    if let Some((_, tag)) = last_segment.rsplit_once(':') {
+        if !tag.is_empty() {
+            return Some(tag.to_string());
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -2113,6 +2714,233 @@ mod tests {
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+    // ── Cross-node linking of external services ────────────────────────
+    //
+    // Regression cover for: an app on node A linked to a database on node B
+    // used to be handed `<node B private address>:<host port>`, which can
+    // never connect because managed service ports bind to 127.0.0.1 on
+    // their own host. These tests pin the three outcomes: same-node keeps
+    // the container name, cross-node with DNS uses the FQDN, and cross-node
+    // without DNS produces a typed blocker instead of a broken address.
+
+    fn link(fqdn: Option<&str>, published: bool) -> temps_providers::ServiceCrossNodeLink {
+        temps_providers::ServiceCrossNodeLink {
+            service_id: 7,
+            service_name: "orders-db".to_string(),
+            container_name: "postgres-orders-db".to_string(),
+            node_id: Some(3),
+            fqdn: fqdn.map(str::to_string),
+            dns_record_published: published,
+        }
+    }
+
+    fn linked_env_vars() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            (
+                "POSTGRES_URL".to_string(),
+                "postgresql://app:pw@postgres-orders-db:5432/orders".to_string(),
+            ),
+            (
+                "POSTGRES_HOST".to_string(),
+                "postgres-orders-db".to_string(),
+            ),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("LOG_LEVEL".to_string(), "debug".to_string()),
+        ])
+    }
+
+    #[test]
+    fn same_node_env_vars_keep_the_container_name() {
+        // The local map is what a same-node container receives. Nothing in
+        // the cross-node path may mutate it, so linking over the shared
+        // bridge network keeps working exactly as before.
+        let local = linked_env_vars();
+        let mut remote = local.clone();
+
+        rewrite_service_host(&mut remote, "postgres-orders-db", "orders-db.temps.local");
+
+        assert_eq!(
+            local["POSTGRES_URL"], "postgresql://app:pw@postgres-orders-db:5432/orders",
+            "the same-node map must be untouched"
+        );
+        assert_ne!(local["POSTGRES_URL"], remote["POSTGRES_URL"]);
+    }
+
+    #[test]
+    fn cross_node_with_dns_rewrites_host_to_fqdn_and_keeps_the_port() {
+        let mut vars = linked_env_vars();
+
+        let changed =
+            rewrite_service_host(&mut vars, "postgres-orders-db", "orders-db.temps.local");
+
+        assert_eq!(
+            vars["POSTGRES_URL"],
+            "postgresql://app:pw@orders-db.temps.local:5432/orders"
+        );
+        assert_eq!(vars["POSTGRES_HOST"], "orders-db.temps.local");
+        // Port and unrelated variables are untouched.
+        assert_eq!(vars["POSTGRES_PORT"], "5432");
+        assert_eq!(vars["LOG_LEVEL"], "debug");
+        assert_eq!(changed, vec!["POSTGRES_HOST", "POSTGRES_URL"]);
+    }
+
+    #[test]
+    fn cross_node_never_emits_a_private_address_and_host_port() {
+        let mut vars = linked_env_vars();
+        rewrite_service_host(&mut vars, "postgres-orders-db", "orders-db.temps.local");
+
+        // The old, permanently-broken form. Managed service ports bind to
+        // loopback on their own host, so this must never be produced again.
+        for value in vars.values() {
+            assert!(
+                !value.contains("10.100."),
+                "cross-node values must not contain a node underlay address: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_target_is_the_fqdn_when_dns_is_enabled_and_published() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), true), true),
+            Ok("orders-db.temps.local".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_cluster_dns_is_disabled() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), true), false),
+            Err(temps_providers::CrossNodeBlockReason::ClusterDnsDisabled)
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_no_record_is_published() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), false), true),
+            Err(temps_providers::CrossNodeBlockReason::DnsRecordMissing)
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_the_service_has_no_dns_name() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(None, true), true),
+            Err(temps_providers::CrossNodeBlockReason::NoDnsName)
+        );
+    }
+
+    #[test]
+    fn blocker_names_the_service_the_setting_and_the_fix() {
+        let blocker = CrossNodeServiceBlocker::new(
+            &link(Some("orders-db.temps.local"), true),
+            temps_providers::CrossNodeBlockReason::ClusterDnsDisabled,
+        );
+
+        assert_eq!(blocker.service_id, 7);
+        assert_eq!(blocker.fqdn.as_deref(), Some("orders-db.temps.local"));
+
+        let described = blocker.describe();
+        assert!(described.contains("orders-db"), "{described}");
+        assert!(described.contains("id 7"), "{described}");
+        assert!(described.contains("Cluster DNS is disabled"), "{described}");
+        assert!(described.contains("Enable cluster DNS"), "{described}");
+        assert_eq!(blocker.setup_path, "/settings/nodes");
+    }
+
+    #[test]
+    fn blockers_round_trip_through_the_job_config() {
+        let blockers = vec![CrossNodeServiceBlocker::new(
+            &link(Some("orders-db.temps.local"), false),
+            temps_providers::CrossNodeBlockReason::DnsRecordMissing,
+        )];
+
+        let mut config = serde_json::Map::new();
+        insert_cross_node_blockers(&mut config, &blockers).expect("serialize");
+
+        let value = serde_json::Value::Object(config);
+        assert_eq!(read_cross_node_blockers(&value), blockers);
+    }
+
+    #[test]
+    fn no_blockers_means_no_job_config_key() {
+        let mut config = serde_json::Map::new();
+        insert_cross_node_blockers(&mut config, &[]).expect("serialize");
+
+        assert!(
+            !config.contains_key(CROSS_NODE_BLOCKERS_KEY),
+            "an unblocked deployment's job config must be unchanged"
+        );
+        assert!(read_cross_node_blockers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn malformed_blocker_config_degrades_to_no_blockers() {
+        // A stale or hand-edited job config must not become an outage.
+        let value = serde_json::json!({ CROSS_NODE_BLOCKERS_KEY: "not-a-list" });
+        assert!(read_cross_node_blockers(&value).is_empty());
+    }
+
+    #[test]
+    fn buildkit_cache_namespace_is_stable_and_opaque() {
+        let encryption_service = create_test_encryption_service();
+
+        let first =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+        let second =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains("main"));
+        assert!(!first.contains("42"));
+    }
+
+    #[test]
+    fn buildkit_cache_namespace_isolates_tenants_and_refs() {
+        let encryption_service = create_test_encryption_service();
+        let namespace = |project_id, environment_id, cache_ref| {
+            buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project_id,
+                environment_id,
+                cache_ref,
+            )
+        };
+
+        let baseline = namespace(42, 7, "refs/heads/main");
+        assert_ne!(baseline, namespace(43, 7, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 8, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 7, "refs/heads/feature"));
+    }
+
+    #[test]
+    fn image_ref_release_extracts_tag_digest_and_handles_registry_port() {
+        // Simple tag.
+        assert_eq!(
+            image_ref_release("registry.gitlab.com/group/app:prod-7c3a1ac9"),
+            Some("prod-7c3a1ac9".to_string())
+        );
+        // Registry with a port must NOT be mistaken for a tag.
+        assert_eq!(image_ref_release("localhost:5000/app"), None);
+        // Registry port AND a tag.
+        assert_eq!(
+            image_ref_release("localhost:5000/app:v1.2.3"),
+            Some("v1.2.3".to_string())
+        );
+        // Digest form wins and is returned whole.
+        assert_eq!(
+            image_ref_release("registry.io/app@sha256:abc123"),
+            Some("sha256:abc123".to_string())
+        );
+        // No tag / no digest.
+        assert_eq!(image_ref_release("registry.io/app"), None);
+        // Bare name with tag.
+        assert_eq!(image_ref_release("app:latest"), Some("latest".to_string()));
+    }
 
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
         let server_config = Arc::new(
@@ -2435,6 +3263,7 @@ mod tests {
     async fn test_job_configuration() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
@@ -2445,10 +3274,10 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
-            create_test_encryption_service(),
+            encryption_service.clone(),
         );
 
-        let (_project, _environment, deployment) =
+        let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
@@ -2475,10 +3304,38 @@ mod tests {
                 config_obj.get("build_args_keys").is_some(),
                 "build_image config must include build_args_keys index",
             );
+            let build_arg_keys = config_obj
+                .get("build_args_keys")
+                .and_then(|value| value.as_array())
+                .expect("build_args_keys must be an array");
+            assert!(
+                build_arg_keys
+                    .iter()
+                    .any(|key| { key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG) }),
+                "BuildKit cache namespace must be forwarded as a build arg",
+            );
             // Plaintext `build_args` must NOT appear — that would leak env-var values.
             assert!(
                 config_obj.get("build_args").is_none(),
                 "plaintext build_args must not be present (envelope leak)",
+            );
+            let opened = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let expected_namespace = buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project.id,
+                environment.id,
+                &project.main_branch,
+            );
+            assert_eq!(
+                opened
+                    .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                    .map(String::as_str),
+                Some(expected_namespace.as_str()),
+                "planner must overwrite the reserved build arg with its HMAC namespace",
             );
         }
 
@@ -2493,6 +3350,292 @@ mod tests {
             assert!(config_obj.get("port").is_some());
             assert!(config_obj.get("replicas").is_some());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_build_args_are_sealed() -> Result<(), Box<dyn std::error::Error>> {
+        const STATIC_SECRET: &str = "static-build-secret-must-not-leak";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping static build-args sealing test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "STATIC_DATABASE_PASSWORD".to_string(),
+            STATIC_SECRET.to_string(),
+        );
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(SucceedingSecretsResolver { secrets });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::Static).await?;
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .expect("static deployment must include build_image");
+        let config = build_job
+            .job_config
+            .as_ref()
+            .expect("build_image must include job_config");
+
+        assert!(
+            config.get("build_args").is_none(),
+            "static build args must never be persisted in plaintext",
+        );
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_arg_keys = config
+            .get("build_args_keys")
+            .and_then(serde_json::Value::as_array)
+            .expect("static build args must include a plaintext key index");
+        assert!(
+            build_arg_keys
+                .iter()
+                .any(|key| key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)),
+            "static builds must receive the BuildKit cache namespace",
+        );
+        assert!(
+            !config.to_string().contains(STATIC_SECRET),
+            "sealed static job_config must not contain secret values",
+        );
+
+        let opened = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        assert_eq!(
+            opened.get("STATIC_DATABASE_PASSWORD").map(String::as_str),
+            Some(STATIC_SECRET),
+            "executor must recover static build args from the sealed envelope",
+        );
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            &project.main_branch,
+        );
+        assert_eq!(
+            opened
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_source_compose_uses_bundle_and_project_location(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping uploaded Compose planner test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.git_provider_connection_id = Set(None);
+        project_update.directory = Set("saved-root".to_string());
+        project_update.preset_config =
+            Set(Some(temps_entities::preset::PresetConfig::DockerCompose(
+                temps_entities::preset::DockerComposeConfig {
+                    compose_path: Some("stack/compose.yaml".to_string()),
+                    ..Default::default()
+                },
+            )));
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let prepare = jobs
+            .iter()
+            .find(|job| job.job_id == "prepare_source_bundle")
+            .expect("uploaded Compose must prepare its source archive");
+        assert_eq!(prepare.job_type, "PrepareSourceBundleJob");
+        assert_eq!(prepare.dependencies, None);
+        assert_eq!(
+            prepare
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("archive_path"))
+                .and_then(serde_json::Value::as_str),
+            Some("source-bundles/fixture.zip")
+        );
+
+        let compose = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("uploaded Compose must deploy the prepared stack");
+        assert_eq!(compose.job_type, "DeployComposeJob");
+        assert_eq!(
+            compose.dependencies,
+            Some(serde_json::json!(["prepare_source_bundle"]))
+        );
+        let compose_config = compose
+            .job_config
+            .as_ref()
+            .expect("Compose job must include configuration");
+        assert_eq!(
+            compose_config
+                .get("compose_path")
+                .and_then(serde_json::Value::as_str),
+            Some("stack/compose.yaml")
+        );
+        assert_eq!(
+            compose_config
+                .get("directory")
+                .and_then(serde_json::Value::as_str),
+            Some("saved-root")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        const TENANT_VALUE: &str = "tenant-controlled-cache-namespace";
+        const CACHE_REF: &str = "feature/compose-cache";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping Compose cache namespace test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+        let mut deployment_active: deployments::ActiveModel = deployment.into();
+        deployment_active.branch_ref = Set(Some(CACHE_REF.to_string()));
+        let deployment = deployment_active.update(db.as_ref()).await?;
+
+        let tenant_var = env_vars::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            key: Set(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string()),
+            value: Set(TENANT_VALUE.to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(tenant_var.id),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let compose_job = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("Compose deployment must include deploy_compose");
+        let config = compose_job
+            .job_config
+            .as_ref()
+            .expect("Compose job must have configuration");
+
+        assert!(config.get("build_args").is_none());
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            CACHE_REF,
+        );
+        assert_eq!(
+            build_args
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+        assert!(!config.to_string().contains(TENANT_VALUE));
+
+        let runtime_env = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "environment_vars",
+        )?;
+        assert!(
+            !runtime_env.contains_key(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG),
+            "reserved BuildKit namespace must never enter Compose service runtime environments",
+        );
+        assert!(!runtime_env
+            .values()
+            .any(|value| value == &expected_namespace));
 
         Ok(())
     }
@@ -2713,6 +3856,69 @@ mod tests {
                 public_sentry_dsn_var(preset),
                 None,
                 "expected no public DSN var for {:?}",
+                preset
+            );
+        }
+    }
+
+    #[test]
+    fn public_sentry_tunnel_var_mirrors_dsn_var_presets() {
+        use temps_entities::preset::Preset;
+
+        // Every preset that gets a public DSN var must also get a tunnel
+        // var, under the same public prefix — they're both read by the same
+        // `Sentry.init({ dsn, tunnel })` call in the browser bundle.
+        for preset in [
+            Preset::NextJs,
+            Preset::Nuxt,
+            Preset::Vite,
+            Preset::React,
+            Preset::Vue,
+            Preset::SolidStart,
+            Preset::Remix,
+            Preset::SvelteKit,
+            Preset::Astro,
+            Preset::Rsbuild,
+            Preset::Docusaurus,
+        ] {
+            let dsn_var = public_sentry_dsn_var(preset);
+            let tunnel_var = public_sentry_tunnel_var(preset);
+            assert!(
+                dsn_var.is_some() && tunnel_var.is_some(),
+                "expected both DSN and tunnel vars for {:?}",
+                preset
+            );
+            assert_eq!(
+                dsn_var.unwrap().replace("_DSN", "_TUNNEL"),
+                tunnel_var.unwrap(),
+                "tunnel var must share the DSN var's public prefix for {:?}",
+                preset
+            );
+        }
+
+        // Presets with no public DSN var get no tunnel var either.
+        for preset in [
+            Preset::Angular,
+            Preset::Python,
+            Preset::FastApi,
+            Preset::Flask,
+            Preset::Django,
+            Preset::Rails,
+            Preset::Go,
+            Preset::Rust,
+            Preset::Java,
+            Preset::Laravel,
+            Preset::NodeJs,
+            Preset::Dockerfile,
+            Preset::DockerCompose,
+            Preset::Nixpacks,
+            Preset::Autopack,
+            Preset::Static,
+        ] {
+            assert_eq!(
+                public_sentry_tunnel_var(preset),
+                None,
+                "expected no tunnel var for {:?}",
                 preset
             );
         }

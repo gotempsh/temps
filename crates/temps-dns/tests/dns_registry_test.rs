@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for [`DnsRegistry`] (ADR-011).
 //!
 //! These run against a real TimescaleDB container — the schema invariants
@@ -11,7 +14,7 @@ use std::sync::Arc;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 use temps_migrations::{Migrator, MigratorTrait};
-use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn boot_db() -> Option<Arc<DatabaseConnection>> {
     if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
@@ -21,10 +24,18 @@ async fn boot_db() -> Option<Arc<DatabaseConnection>> {
     }
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        // Without this, `start()` returns before PostgreSQL accepts clients
+        // and the test races the database ("Connection reset by peer").
+        // Must match on stderr: the temporary initdb server logs its "ready"
+        // line to stdout, the real server to stderr.
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_startup_timeout(std::time::Duration::from_secs(120))
         .start()
         .await
     {
@@ -142,6 +153,25 @@ async fn replace_endpoints_for_owner_handles_ip_churn() {
     assert_eq!(mine.len(), 1, "exactly one record for owner after replace");
     assert_eq!(mine[0].target_ip.as_deref(), Some("172.20.5.99"));
     assert_eq!(mine[0].generation, g2);
+
+    // `list_by_owner` is what callers use to answer "is this name actually
+    // resolvable?" before handing an address to a workload, so it must see
+    // exactly the same single, current record.
+    let owned = registry
+        .list_by_owner(OwnerKind::ServiceMember, 42)
+        .await
+        .expect("list_by_owner");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].fqdn, "pg-orders-0.pg-orders.temps.local");
+    assert_eq!(owned[0].target_ip.as_deref(), Some("172.20.5.99"));
+
+    // An owner that never published anything reports nothing published,
+    // rather than erroring — that's the "record missing" signal.
+    let none = registry
+        .list_by_owner(OwnerKind::ServiceRole, 42)
+        .await
+        .expect("list_by_owner for an owner with no records");
+    assert!(none.is_empty());
 }
 
 #[tokio::test]
@@ -188,7 +218,7 @@ async fn delete_by_owner_only_bumps_generation_when_something_changes() {
 }
 
 #[tokio::test]
-async fn get_changes_since_returns_diff_or_snapshot() {
+async fn get_changes_since_returns_authoritative_snapshot_after_change() {
     let Some(db) = boot_db().await else { return };
     let registry = DnsRegistry::new(db.clone());
 
@@ -222,13 +252,14 @@ async fn get_changes_since_returns_diff_or_snapshot() {
     assert!(nothing.records.is_empty());
     assert_eq!(nothing.generation, g2);
 
-    // since=g2-1 → diff containing only the latest record.
-    let diff = registry.get_changes_since(g2 - 1).await.unwrap();
-    assert!(!diff.full_snapshot);
-    assert!(
-        diff.records.iter().all(|r| r.generation > g2 - 1),
-        "diff must only contain rows with generation > since"
-    );
+    // since=g2-1 → full snapshot. Replacements delete old row IDs, and
+    // without deletion tombstones an incremental response would leave stale
+    // records in every worker resolver.
+    let changed = registry.get_changes_since(g2 - 1).await.unwrap();
+    assert!(changed.full_snapshot);
+    assert_eq!(changed.generation, g2);
+    assert!(changed.records.iter().any(|r| r.fqdn == "x.temps.local"));
+    assert!(changed.records.iter().any(|r| r.fqdn == "y.temps.local"));
 }
 
 #[tokio::test]

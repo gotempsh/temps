@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Custom types for common data structures and validation
 
 use chrono::{DateTime as ChronoDateTime, NaiveDateTime, Utc};

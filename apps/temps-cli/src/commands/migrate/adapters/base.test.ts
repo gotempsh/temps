@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { test, expect, describe } from 'bun:test'
 import {
   isLikelySecret,
@@ -318,7 +321,7 @@ describe('buildSummary', () => {
 
   test('adds manual actions for data services', () => {
     const summary = buildSummary(
-      'coolify',
+      'vercel',
       {
         envVars: [],
         services: [

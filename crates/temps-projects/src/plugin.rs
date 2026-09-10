@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,9 +74,23 @@ impl TempsPlugin for ProjectsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let project_service = context.require_service::<ProjectService>();
+        let external_service_manager =
+            context.require_service::<temps_providers::ExternalServiceManager>();
+        let deployment_canceller = context.require_service::<dyn temps_core::DeploymentCanceller>();
+        let deployment_container_cleaner =
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
+        let config_service = context.require_service::<temps_config::ConfigService>();
+        let public_hostname_resolver = context
+            .get_service::<dyn temps_core::PublicHostnameResolver>()
+            .unwrap_or_else(|| {
+                Arc::new(temps_core::StandardHostnameResolver)
+                    as Arc<dyn temps_core::PublicHostnameResolver>
+            });
+        let project_archive_cleaner =
+            context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -85,9 +102,15 @@ impl TempsPlugin for ProjectsPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
+            external_service_manager,
+            deployment_canceller,
+            deployment_container_cleaner,
             custom_domain_service,
             audit_service,
             template_service,
+            config_service,
+            public_hostname_resolver,
+            project_archive_cleaner,
             telemetry,
             project_access_checker,
         });

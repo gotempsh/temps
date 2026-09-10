@@ -1,13 +1,19 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod agent;
 pub mod api_key;
+mod api_url;
 pub mod backfill;
 pub mod backup;
 pub mod build;
 pub mod ch_backfill_domains;
+pub mod cloud_telemetry_backfill;
 pub mod deploy;
 pub mod doctor;
 pub mod domain;
 pub mod edge;
+pub mod firecracker;
 pub mod join;
 pub mod migrate;
 pub mod network;
@@ -29,6 +35,7 @@ pub use deploy::DeployCommand;
 pub use doctor::DoctorCommand;
 pub use domain::DomainCommand;
 pub use edge::EdgeCommand;
+pub use firecracker::FirecrackerCommand;
 pub use join::JoinCommand;
 pub use migrate::MigrateCommand;
 pub use network::NetworkCommand;

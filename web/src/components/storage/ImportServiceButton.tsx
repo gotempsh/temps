@@ -1,6 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import { Download } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 export function ImportServiceButton(_props: { onSuccess?: () => void }) {
   const navigate = useNavigate()

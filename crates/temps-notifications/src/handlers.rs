@@ -1,10 +1,18 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::digest::DigestService;
+use crate::routing::{
+    CreateNotificationRoute, NotificationRoute, NotificationRouteError, NotificationRoutePage,
+    NotificationRoutingService, UpdateNotificationRoute,
+};
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
+    NotificationProviderCreateError, NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -21,6 +29,7 @@ use utoipa::OpenApi;
 
 pub struct NotificationState {
     notification_service: Arc<NotificationService>,
+    notification_routing_service: Arc<NotificationRoutingService>,
     notification_preferences_service: Arc<NotificationPreferencesService>,
     digest_service: Arc<DigestService>,
     pub audit_service: Arc<dyn AuditLogger>,
@@ -29,12 +38,14 @@ pub struct NotificationState {
 impl NotificationState {
     pub fn new(
         notification_service: Arc<NotificationService>,
+        notification_routing_service: Arc<NotificationRoutingService>,
         notification_preferences_service: Arc<NotificationPreferencesService>,
         digest_service: Arc<DigestService>,
         audit_service: Arc<dyn AuditLogger>,
     ) -> Self {
         Self {
             notification_service,
+            notification_routing_service,
             notification_preferences_service,
             digest_service,
             audit_service,
@@ -57,12 +68,27 @@ struct NotificationPreferencesAudit {
     action: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct NotificationRouteAudit {
+    context: AuditContext,
+    route_id: i32,
+    action: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct NotificationProviderConfigRevealedAudit {
+    context: AuditContext,
+    provider_id: i32,
+    provider_type: String,
+    field: String,
+}
+
 impl AuditOperation for NotificationProviderAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -80,8 +106,46 @@ impl AuditOperation for NotificationPreferencesAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for NotificationRouteAudit {
+    fn operation_type(&self) -> String {
+        self.action.clone()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    }
+}
+
+impl AuditOperation for NotificationProviderConfigRevealedAudit {
+    fn operation_type(&self) -> String {
+        "NOTIFICATION_PROVIDER_CONFIG_REVEALED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -108,10 +172,16 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
     paths(
         list_notification_providers,
         get_notification_provider,
+        reveal_notification_provider_config,
         create_notification_provider,
         update_notification_provider,
         delete_notification_provider,
         test_notification_provider,
+        list_notification_routes,
+        get_notification_route,
+        create_notification_route,
+        update_notification_route,
+        delete_notification_route,
         create_slack_provider,
         create_notification_email_provider,
         create_webhook_provider,
@@ -131,6 +201,11 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
             CreateProviderRequest,
             UpdateProviderRequest,
             TestProviderResponse,
+            NotificationRoute,
+            NotificationRoutePage,
+            CreateNotificationRouteRequest,
+            UpdateNotificationRouteRequest,
+            SensitiveConfigValueResponse,
             SlackConfig,
             EmailConfig,
             WebhookConfig,
@@ -157,6 +232,7 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
     ),
     tags(
         (name = "Notification Providers", description = "Notification provider management endpoints"),
+        (name = "Notification Routes", description = "Severity routing from notifications to providers"),
         (name = "Notification Preferences", description = "User notification preferences and settings")
     )
 )]
@@ -171,6 +247,11 @@ pub struct NotificationProviderResponse {
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SensitiveConfigValueResponse {
+    pub value: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -310,8 +391,7 @@ pub struct CloudflareConfig {
     #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
     pub account_id: String,
     /// Cloudflare API token with the Email Sending permission. Encrypted at
-    /// rest; like the other notification providers, it is returned decrypted to
-    /// authorized callers so the edit form can prefill (not masked).
+    /// rest and masked in normal API responses.
     pub api_token: String,
     /// Verified sender address (must belong to a domain enabled for Cloudflare
     /// Email Sending).
@@ -465,6 +545,92 @@ async fn get_notification_provider(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/notification-providers/{id}/config/{field}",
+    responses(
+        (status = 200, description = "Sensitive provider configuration value", body = SensitiveConfigValueResponse),
+        (status = 400, description = "Field is not revealable"),
+        (status = 403, description = "Missing secrets:read permission"),
+        (status = 404, description = "Provider or field not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID"),
+        ("field" = String, Path, description = "Sensitive field, such as password or headers.Authorization")
+    ),
+    tag = "Notification Providers",
+    security(("bearer_auth" = []))
+)]
+async fn reveal_notification_provider_config(
+    State(app_state): State<Arc<NotificationState>>,
+    Path((id, field)): Path<(i32, String)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersRead);
+    permission_guard!(auth, SecretsRead);
+
+    let revealed = app_state
+        .notification_service
+        .reveal_provider_config_value(id, &field)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                NotificationProviderRevealError::ProviderNotFound { .. }
+                | NotificationProviderRevealError::FieldNotFound { .. } => StatusCode::NOT_FOUND,
+                NotificationProviderRevealError::FieldNotRevealable { .. } => {
+                    StatusCode::BAD_REQUEST
+                }
+                NotificationProviderRevealError::Database { .. }
+                | NotificationProviderRevealError::Decryption { .. }
+                | NotificationProviderRevealError::Serialization { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            let detail = if status == StatusCode::INTERNAL_SERVER_ERROR {
+                error!(provider_id = id, error = %error, "Notification config reveal failed");
+                "The provider configuration could not be read".to_string()
+            } else {
+                error.to_string()
+            };
+            ErrorBuilder::new(status)
+                .title("Configuration field could not be revealed")
+                .detail(detail)
+                .build()
+        })?;
+    let (provider_type, value) = revealed;
+
+    let audit = NotificationProviderConfigRevealedAudit {
+        context: make_audit_context(&auth, &metadata),
+        provider_id: id,
+        provider_type,
+        field,
+    };
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
+        error!(provider_id = id, error = %error, "Failed to audit notification config reveal");
+    }
+    require_notification_reveal_audit(audit_result)?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveConfigValueResponse { value }),
+    ))
+}
+
+fn require_notification_reveal_audit(
+    result: std::result::Result<(), anyhow::Error>,
+) -> Result<(), Problem> {
+    result.map_err(|_| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Configuration value could not be revealed")
+            .detail("The audit record for this reveal could not be written")
+            .build()
+    })
+}
+
 /// Create a new notification provider
 #[utoipa::path(
     post,
@@ -490,7 +656,12 @@ async fn create_notification_provider(
     info!("Creating notification provider {}", request.name);
     match app_state
         .notification_service
-        .add_provider(request.name, request.provider_type, request.config)
+        .add_provider(
+            request.name,
+            request.provider_type,
+            request.config,
+            request.enabled.unwrap_or(true),
+        )
         .await
     {
         Ok(provider) => {
@@ -525,13 +696,10 @@ async fn create_notification_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create notification provider: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create notification provider",
+        )),
     }
 }
 impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
@@ -544,6 +712,31 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
+fn notification_provider_write_problem(error: &anyhow::Error, title: &'static str) -> Problem {
+    if let Some(validation_error) = error.downcast_ref::<NotificationProviderConfigMergeError>() {
+        return ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid masked provider configuration")
+            .detail(validation_error.to_string())
+            .build();
+    }
+
+    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .title(title)
+        .detail("The notification provider could not be updated")
+        .build()
+}
+
+fn notification_provider_create_problem(
+    error: &NotificationProviderCreateError,
+    title: &'static str,
+) -> Problem {
+    tracing::error!(error = %error, "Notification provider creation failed");
+    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .title(title)
+        .detail("The notification provider and its catch-all route could not be created")
+        .build()
+}
+
 /// Update a notification provider
 #[utoipa::path(
     put,
@@ -551,6 +744,7 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     request_body = UpdateProviderRequest,
     responses(
         (status = 200, description = "Successfully updated provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid minimum severity or masked provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -614,10 +808,10 @@ async fn update_notification_provider(
             .build()),
         Err(e) => {
             error!("Failed to update notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(notification_provider_write_problem(
+                &e,
+                "Failed to update notification provider",
+            ))
         }
     }
 }
@@ -698,7 +892,9 @@ async fn test_notification_provider(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, NotificationProvidersRead);
+    // Sends a real test notification through the provider (Slack message, webhook
+    // POST, etc.) rather than just reading configuration, so it requires write.
+    permission_guard!(auth, NotificationProvidersWrite);
     info!("Testing notification provider {}", id);
     match app_state.notification_service.test_provider(id).await {
         Ok(result) => {
@@ -713,7 +909,7 @@ async fn test_notification_provider(
             }
 
             let message = if result {
-                Some("Test email sent successfully".to_string())
+                Some("Test notification sent successfully".to_string())
             } else {
                 Some("Test failed - provider connection or configuration issue".to_string())
             };
@@ -765,10 +961,11 @@ async fn create_slack_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Slack notification provider {}", request.name);
+    let enabled = request.enabled.unwrap_or(true);
     let config = serde_json::to_value(request.config).unwrap_or_default();
     match app_state
         .notification_service
-        .add_provider(request.name, "slack".to_string(), config)
+        .add_provider(request.name, "slack".to_string(), config, enabled)
         .await
     {
         Ok(provider) => {
@@ -803,13 +1000,10 @@ async fn create_slack_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Slack notification provider: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create Slack notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Slack notification provider",
+        )),
     }
 }
 
@@ -836,10 +1030,11 @@ async fn create_notification_email_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Email notification provider {}", request.name);
+    let enabled = request.enabled.unwrap_or(true);
     let config = serde_json::to_value(&request.config).unwrap_or_default();
     match app_state
         .notification_service
-        .add_provider(request.name, "email".to_string(), config)
+        .add_provider(request.name, "email".to_string(), config, enabled)
         .await
     {
         Ok(provider) => {
@@ -874,13 +1069,10 @@ async fn create_notification_email_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Email notification provider: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create Email notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Email notification provider",
+        )),
     }
 }
 
@@ -891,6 +1083,7 @@ async fn create_notification_email_provider(
     request_body = UpdateSlackProviderRequest,
     responses(
         (status = 200, description = "Successfully updated Slack provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -960,10 +1153,10 @@ async fn update_slack_provider(
             .build()),
         Err(e) => {
             error!("Failed to update Slack notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Slack notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(notification_provider_write_problem(
+                &e,
+                "Failed to update Slack notification provider",
+            ))
         }
     }
 }
@@ -975,6 +1168,7 @@ async fn update_slack_provider(
     request_body = UpdateNotificationEmailProviderRequest,
     responses(
         (status = 200, description = "Successfully updated Email provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1044,10 +1238,10 @@ async fn update_notification_email_provider(
             .build()),
         Err(e) => {
             error!("Failed to update Email notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Email notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(notification_provider_write_problem(
+                &e,
+                "Failed to update Email notification provider",
+            ))
         }
     }
 }
@@ -1098,10 +1292,11 @@ async fn create_webhook_provider(
             .build());
     }
 
+    let enabled = request.enabled.unwrap_or(true);
     let config = serde_json::to_value(&request.config).unwrap_or_default();
     match app_state
         .notification_service
-        .add_provider(request.name, "webhook".to_string(), config)
+        .add_provider(request.name, "webhook".to_string(), config, enabled)
         .await
     {
         Ok(provider) => {
@@ -1136,13 +1331,10 @@ async fn create_webhook_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Webhook notification provider: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create Webhook notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Webhook notification provider",
+        )),
     }
 }
 
@@ -1153,6 +1345,7 @@ async fn create_webhook_provider(
     request_body = UpdateWebhookProviderRequest,
     responses(
         (status = 200, description = "Successfully updated Webhook provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1175,7 +1368,10 @@ async fn update_webhook_provider(
     info!("Updating Webhook notification provider {}", id);
 
     // Validate URL format
-    if !request.config.url.starts_with("http://") && !request.config.url.starts_with("https://") {
+    if request.config.url != "***"
+        && !request.config.url.starts_with("http://")
+        && !request.config.url.starts_with("https://")
+    {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid webhook URL")
             .detail("Webhook URL must start with http:// or https://")
@@ -1243,10 +1439,10 @@ async fn update_webhook_provider(
                 "Failed to update Webhook notification provider {}: {}",
                 id, e
             );
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Webhook notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(notification_provider_write_problem(
+                &e,
+                "Failed to update Webhook notification provider",
+            ))
         }
     }
 }
@@ -1274,10 +1470,11 @@ async fn create_cloudflare_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Cloudflare notification provider {}", request.name);
+    let enabled = request.enabled.unwrap_or(true);
     let config = serde_json::to_value(request.config).unwrap_or_default();
     match app_state
         .notification_service
-        .add_provider(request.name, "cloudflare".to_string(), config)
+        .add_provider(request.name, "cloudflare".to_string(), config, enabled)
         .await
     {
         Ok(provider) => {
@@ -1312,13 +1509,10 @@ async fn create_cloudflare_provider(
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(e) => {
-            error!("Failed to create Cloudflare notification provider: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to create Cloudflare notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
-        }
+        Err(e) => Err(notification_provider_create_problem(
+            &e,
+            "Failed to create Cloudflare notification provider",
+        )),
     }
 }
 
@@ -1329,6 +1523,7 @@ async fn create_cloudflare_provider(
     request_body = UpdateCloudflareProviderRequest,
     responses(
         (status = 200, description = "Successfully updated Cloudflare provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid minimum severity or provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1401,10 +1596,10 @@ async fn update_cloudflare_provider(
                 "Failed to update Cloudflare notification provider {}: {}",
                 id, e
             );
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Cloudflare notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(notification_provider_write_problem(
+                &e,
+                "Failed to update Cloudflare notification provider",
+            ))
         }
     }
 }
@@ -1681,6 +1876,29 @@ async fn trigger_weekly_digest(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
+    // The weekly digest is an *instance-wide* operator report: its queries
+    // aggregate events, error groups and funnels across every project with
+    // only a time-window predicate, and the result is delivered to whatever
+    // notification providers are configured. `NotificationPreferencesWrite`
+    // and `NotificationProvidersCreate` are both in the default `Role::User`,
+    // so without this any tenant could point a provider at themselves and
+    // trigger a dump of every other tenant's top pages (often containing PII),
+    // visitor geography, error titles and funnel conversion rates. Restrict
+    // the trigger to instance administrators; deployment tokens carry no user
+    // identity and are never operators.
+    if auth.is_deployment_token()
+        || !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin))
+    {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .type_("https://temps.sh/probs/insufficient-permissions")
+            .title("Instance Administrator Required")
+            .detail(
+                "The weekly digest aggregates data across every project on this instance, \
+                 so only an instance administrator may generate and send it.",
+            )
+            .value("user_role", auth.effective_role.to_string())
+            .build());
+    }
 
     info!("Manually triggering weekly digest generation");
 
@@ -1733,8 +1951,252 @@ pub struct TriggerDigestResponse {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateNotificationRouteRequest {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub min_severity: String,
+    pub max_severity: String,
+    pub provider_ids: Vec<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateNotificationRouteRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub min_severity: Option<String>,
+    pub max_severity: Option<String>,
+    pub provider_ids: Option<Vec<i32>>,
+}
+
+fn notification_route_problem(error: NotificationRouteError) -> Problem {
+    let (status, title) = match error {
+        NotificationRouteError::InvalidName
+        | NotificationRouteError::NameTooLong { .. }
+        | NotificationRouteError::InvalidMinimumSeverity { .. }
+        | NotificationRouteError::InvalidMaximumSeverity { .. }
+        | NotificationRouteError::InvalidSeverityRange { .. }
+        | NotificationRouteError::NoProviders
+        | NotificationRouteError::ProviderNotFound { .. } => {
+            (StatusCode::BAD_REQUEST, "Invalid notification route")
+        }
+        NotificationRouteError::RouteNotFound { .. } => {
+            (StatusCode::NOT_FOUND, "Notification route not found")
+        }
+        NotificationRouteError::DuplicateName { .. } => {
+            (StatusCode::CONFLICT, "Notification route already exists")
+        }
+        NotificationRouteError::Database { .. }
+        | NotificationRouteError::CatchAllRouteDatabase { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Notification route operation failed",
+        ),
+    };
+    let detail = if matches!(
+        error,
+        NotificationRouteError::Database { .. }
+            | NotificationRouteError::CatchAllRouteDatabase { .. }
+    ) {
+        tracing::error!(error = %error, "Notification route database operation failed");
+        "The notification route operation could not be completed".to_string()
+    } else {
+        error.to_string()
+    };
+    ErrorBuilder::new(status)
+        .title(title)
+        .detail(detail)
+        .build()
+}
+
+#[utoipa::path(
+    get,
+    path = "/notification-routes",
+    params(temps_core::PaginationParams),
+    responses(
+        (status = 200, description = "Notification routes", body = NotificationRoutePage),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn list_notification_routes(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+    Query(pagination): Query<temps_core::PaginationParams>,
+) -> Result<Json<NotificationRoutePage>, Problem> {
+    permission_guard!(auth, NotificationProvidersRead);
+    let (page, page_size) = pagination.normalize();
+    app_state
+        .notification_routing_service
+        .list(page, page_size)
+        .await
+        .map(Json)
+        .map_err(notification_route_problem)
+}
+
+#[utoipa::path(
+    get,
+    path = "/notification-routes/{id}",
+    params(("id" = i32, Path, description = "Route ID")),
+    responses(
+        (status = 200, description = "Notification route", body = NotificationRoute),
+        (status = 404, description = "Route not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn get_notification_route(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<Json<NotificationRoute>, Problem> {
+    permission_guard!(auth, NotificationProvidersRead);
+    app_state
+        .notification_routing_service
+        .get(id)
+        .await
+        .map(Json)
+        .map_err(notification_route_problem)
+}
+
+#[utoipa::path(
+    post,
+    path = "/notification-routes",
+    request_body = CreateNotificationRouteRequest,
+    responses(
+        (status = 201, description = "Route created", body = NotificationRoute),
+        (status = 400, description = "Invalid route"),
+        (status = 409, description = "Route name already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn create_notification_route(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateNotificationRouteRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersCreate);
+    let route = app_state
+        .notification_routing_service
+        .create(CreateNotificationRoute {
+            name: request.name,
+            enabled: request.enabled.unwrap_or(true),
+            min_severity: request.min_severity,
+            max_severity: request.max_severity,
+            provider_ids: request.provider_ids,
+        })
+        .await
+        .map_err(notification_route_problem)?;
+    let audit = NotificationRouteAudit {
+        context: make_audit_context(&auth, &metadata),
+        route_id: route.id,
+        action: "NOTIFICATION_ROUTE_CREATED".to_string(),
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(route_id = route.id, error = %error, "Failed to audit notification route creation");
+    }
+    Ok((StatusCode::CREATED, Json(route)))
+}
+
+#[utoipa::path(
+    put,
+    path = "/notification-routes/{id}",
+    params(("id" = i32, Path, description = "Route ID")),
+    request_body = UpdateNotificationRouteRequest,
+    responses(
+        (status = 200, description = "Route updated", body = NotificationRoute),
+        (status = 400, description = "Invalid route"),
+        (status = 404, description = "Route not found"),
+        (status = 409, description = "Route name already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn update_notification_route(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateNotificationRouteRequest>,
+) -> Result<Json<NotificationRoute>, Problem> {
+    permission_guard!(auth, NotificationProvidersWrite);
+    let route = app_state
+        .notification_routing_service
+        .update(
+            id,
+            UpdateNotificationRoute {
+                name: request.name,
+                enabled: request.enabled,
+                min_severity: request.min_severity,
+                max_severity: request.max_severity,
+                provider_ids: request.provider_ids,
+            },
+        )
+        .await
+        .map_err(notification_route_problem)?;
+    let audit = NotificationRouteAudit {
+        context: make_audit_context(&auth, &metadata),
+        route_id: route.id,
+        action: "NOTIFICATION_ROUTE_UPDATED".to_string(),
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(route_id = route.id, error = %error, "Failed to audit notification route update");
+    }
+    Ok(Json(route))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/notification-routes/{id}",
+    params(("id" = i32, Path, description = "Route ID")),
+    responses(
+        (status = 204, description = "Route deleted"),
+        (status = 404, description = "Route not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn delete_notification_route(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, NotificationProvidersDelete);
+    app_state
+        .notification_routing_service
+        .delete(id)
+        .await
+        .map_err(notification_route_problem)?;
+    let audit = NotificationRouteAudit {
+        context: make_audit_context(&auth, &metadata),
+        route_id: id,
+        action: "NOTIFICATION_ROUTE_DELETED".to_string(),
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(route_id = id, error = %error, "Failed to audit notification route deletion");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub fn configure_routes() -> Router<Arc<NotificationState>> {
     Router::new()
+        .route(
+            "/notification-routes",
+            get(list_notification_routes).post(create_notification_route),
+        )
+        .route(
+            "/notification-routes/{id}",
+            get(get_notification_route)
+                .put(update_notification_route)
+                .delete(delete_notification_route),
+        )
         .route("/notification-providers", get(list_notification_providers))
         .route(
             "/notification-providers",
@@ -1756,6 +2218,10 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         .route(
             "/notification-providers/{id}",
             get(get_notification_provider),
+        )
+        .route(
+            "/notification-providers/{id}/config/{field}",
+            get(reveal_notification_provider_config),
         )
         .route(
             "/notification-providers/{id}",
@@ -1796,11 +2262,167 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::sync::Arc;
+    use sea_orm::MockDatabase;
+    use std::sync::{Arc, Mutex};
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::notification_providers;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
+
+    #[test]
+    fn credential_reveal_fails_closed_when_audit_write_fails() {
+        assert!(require_notification_reveal_audit(Ok(())).is_ok());
+        let problem =
+            require_notification_reveal_audit(Err(anyhow::anyhow!("database unavailable")))
+                .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn masked_provider_update_validation_maps_to_bad_request() {
+        let error =
+            anyhow::Error::new(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                path: "headers.X-Authorization".to_string(),
+            });
+
+        let problem =
+            notification_provider_write_problem(&error, "Failed to update notification provider");
+
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingAuditLogger {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            self.operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Credential Auditor".to_string(),
+            email: "auditor@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "credential-reveal-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_reveal_returns_no_store_response_and_writes_audit() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-reveal-test",
+        ));
+        let config = serde_json::json!({
+            "oauth": {
+                "client_secret": "handler-secret",
+                "issuer": "https://issuer.example.test"
+            }
+        });
+        let provider = notification_providers::Model {
+            id: 17,
+            name: "Custom OAuth".to_string(),
+            provider_type: "custom".to_string(),
+            config: encryption_service
+                .encrypt_string(&config.to_string())
+                .expect("test config encryption should succeed"),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![provider]])
+                .into_connection(),
+        );
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let preferences_service = Arc::new(NotificationPreferencesService::new(db.clone()));
+        let digest_service = Arc::new(DigestService::new(db.clone(), notification_service.clone()));
+        let audit_logger = RecordingAuditLogger::default();
+        let state = Arc::new(NotificationState::new(
+            notification_service,
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            preferences_service,
+            digest_service,
+            Arc::new(audit_logger.clone()),
+        ));
+
+        let response = reveal_notification_provider_config(
+            State(state),
+            Path((17, "oauth.client_secret".to_string())),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+        )
+        .await
+        .expect("authorized reveal should succeed")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reveal response body should be readable");
+        let revealed: SensitiveConfigValueResponse =
+            serde_json::from_slice(&body).expect("reveal response should be JSON");
+        assert_eq!(revealed.value, "handler-secret");
+        assert_eq!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .as_slice(),
+            ["NOTIFICATION_PROVIDER_CONFIG_REVEALED"]
+        );
+    }
 
     struct TestSetup {
         pub test_db: TestDatabase,
@@ -1870,6 +2492,7 @@ mod tests {
 
             let notification_state = Arc::new(NotificationState::new(
                 notification_service,
+                Arc::new(NotificationRoutingService::new(test_db.connection_arc())),
                 notification_preferences_service,
                 digest_service,
                 Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
@@ -1912,9 +2535,25 @@ mod tests {
         }
     }
 
+    macro_rules! test_setup_or_skip {
+        () => {
+            match TestSetup::new().await {
+                Ok(setup) => setup,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                        eprintln!("Skipping Docker-dependent test: {message}");
+                        return Ok(());
+                    }
+                    panic!("Failed to set up notification handler test: {message}");
+                }
+            }
+        };
+    }
+
     #[tokio::test]
     async fn test_list_notification_providers() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -1938,7 +2577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateNotificationEmailProviderRequest {
             name: "Test Email Provider".to_string(),
@@ -1966,7 +2605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -1987,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateProviderRequest {
             name: "Test Generic Provider".to_string(),
@@ -2018,7 +2657,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_slack_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateSlackProviderRequest {
             name: "Test Slack Provider".to_string(),
@@ -2045,7 +2684,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateProviderRequest {
             name: Some("Updated Provider Name".to_string()),
@@ -2075,7 +2714,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_slack_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateSlackProviderRequest {
             name: Some("Updated Slack Provider".to_string()),
@@ -2105,7 +2744,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateNotificationEmailProviderRequest {
             name: Some("Updated Email Provider".to_string()),
@@ -2143,7 +2782,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2163,7 +2802,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2181,10 +2820,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn notification_route_database_problem_hides_internal_details() {
+        let problem = notification_route_problem(NotificationRouteError::Database {
+            route_id: Some(42),
+            operation: "load",
+            source: sea_orm::DbErr::Custom("secret schema detail".to_string()),
+        });
+        let body = serde_json::to_value(&problem.body).expect("problem body should serialize");
+
+        assert_eq!(
+            body["detail"],
+            "The notification route operation could not be completed"
+        );
+        assert!(!body.to_string().contains("secret schema detail"));
+    }
+
     // Integration test that actually sends an email through Mailpit
     #[tokio::test]
     async fn test_email_integration_with_mailpit() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         // Create an email provider directly using the service
         let email_config = serde_json::to_value(setup.create_test_email_config())?;
@@ -2196,6 +2851,7 @@ mod tests {
                 "Mailpit Test Provider".to_string(),
                 "email".to_string(),
                 email_config,
+                true,
             )
             .await?;
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `PostgresWalgEngine`: WAL-G–based backup of an external Postgres service,
 //! implemented against `engine_v2::BackupEngine`.
 //!
@@ -27,9 +30,11 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
+use super::dispatch::service_container_name;
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use temps_providers::externalsvc::ExternalService;
 
 const ENGINE_KEY: &str = "postgres_walg";
 
@@ -75,6 +80,25 @@ impl BackupEngine for PostgresWalgEngine {
             .ok_or_else(|| BackupError::PermanentFailure {
                 reason: format!("service {} not found", service_id),
             })?;
+
+        temps_providers::continuous_archive::ensure_continuous_archive_source_pin(
+            deps.db.as_ref(),
+            &service,
+            s3_source_id,
+            "WAL-G continuous archiving",
+        )
+        .await
+        .map_err(|e| match e {
+            temps_providers::continuous_archive::ContinuousArchiveError::Mismatch(reason) => {
+                BackupError::PermanentFailure { reason }
+            }
+            temps_providers::continuous_archive::ContinuousArchiveError::Database {
+                context,
+                source,
+            } => BackupError::Failed {
+                reason: format!("{context}: {source}"),
+            },
+        })?;
 
         let s3_source = v2_common::load_s3_source(deps.db.as_ref(), s3_source_id).await?;
         let s3_client = v2_common::build_s3_client(
@@ -133,18 +157,61 @@ impl BackupEngine for PostgresWalgEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
-        let container_name = format!("postgres-{}", service.name);
-        let container_endpoint = temps_providers::externalsvc::S3Credentials {
+        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
+
+        let container_name = service_container_name(&service);
+        let s3_credentials = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
             force_path_style: s3_source.force_path_style.unwrap_or(true),
+        };
+        let container_endpoint = s3_credentials
+            .resolve_endpoint_for_container(&deps.docker, &container_name)
+            .await;
+
+        // ── Enable continuous WAL archiving BEFORE the base backup ──────────
+        // Must happen first, not after: `wal-g backup-push` ends with
+        // `pg_stop_backup()`, which force-completes the current WAL segment
+        // so the backup's checkpoint is recoverable -- but Postgres only
+        // marks a completed segment `.ready` for archiving if `archive_mode`
+        // is already on at that moment. Enabling archiving *after* the base
+        // backup doesn't retroactively archive that already-completed
+        // segment (no `.ready` marker was ever written for it), so a
+        // restore's `wal-g wal-fetch` finds nothing and Postgres fails to
+        // start with "could not locate required checkpoint record". Non-fatal
+        // by design: a failure here still lets the base backup proceed, it
+        // just won't be immediately restorable.
+        //
+        // No-op after the first backup on a given service: `enable_continuous_archiving`
+        // checks whether archiving is already active before doing the
+        // (container-recreating) enable dance again.
+        let postgres_service = temps_providers::externalsvc::postgres::PostgresService::new(
+            service.name.clone(),
+            std::sync::Arc::new(deps.docker.clone()),
+        );
+        let service_config = temps_providers::externalsvc::ServiceConfig {
+            name: service.name.clone(),
+            service_type: temps_providers::externalsvc::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
+        };
+        if let Err(e) = postgres_service
+            .enable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
+            .await
+        {
+            error!(
+                backup_id,
+                container = %container_name,
+                "Failed to enable continuous WAL archiving before backup-push; the base backup \
+                 will proceed but will not be immediately restorable: {}",
+                e
+            );
         }
-        .resolve_endpoint_for_container(&deps.docker, &container_name)
-        .await;
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values
@@ -165,6 +232,11 @@ impl BackupEngine for PostgresWalgEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
+        // Absent unless this source holds a temporary credential, so a
+        // long-lived one produces exactly the environment it did before.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
         if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {
@@ -267,7 +339,6 @@ impl BackupEngine for PostgresWalgEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
-
 struct PgParams {
     username: String,
     password: String,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cron Configuration Service Adapter
 //!
 //! Provides a simple wrapper service that can be used in the deployment workflow

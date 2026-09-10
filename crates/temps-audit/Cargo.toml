@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-audit"
 version.workspace = true
@@ -21,5 +24,10 @@ sea-orm = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# `mock` powers MockDatabase for the handler authorization tests.
+sea-orm = { workspace = true, features = ["mock"] }

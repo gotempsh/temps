@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::Deserialize;
 use serde_json::Value;
 use temps_core::DateTime;
@@ -341,6 +344,21 @@ pub struct EventDetailQuery {
 #[derive(Deserialize, Clone, ToSchema)]
 pub struct EventVisitorsQuery {
     /// The specific event name to list visitors for
+    pub event_name: String,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub start_date: DateTime,
+    pub end_date: DateTime,
+    /// Page number (1-based, default: 1)
+    pub page: Option<u64>,
+    /// Items per page (default: 20, max: 100)
+    pub per_page: Option<u64>,
+}
+
+/// Query parameters for the raw event entries list
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct EventEntriesQuery {
+    /// The specific event name to list occurrences for
     pub event_name: String,
     pub project_id: i32,
     pub environment_id: Option<i32>,

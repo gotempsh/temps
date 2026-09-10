@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps-ai-api-tools` — Phase 1 CORE of ADR-024.
 //!
 //! Provides [`InternalApiCaller`]: a substrate-agnostic component that turns the
@@ -42,7 +45,7 @@ mod integration_tests;
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,
-    WritePrepareOutcome,
+    ProjectSelectorScope, WritePrepareOutcome,
 };
 pub use error::ApiToolError;
 pub use handle::{ApiToolsHandle, WriteApiToolsHandle};

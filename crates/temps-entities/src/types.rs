@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::{DeriveActiveEnum, EnumIter};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -65,6 +68,10 @@ pub enum ProjectType {
     Static,
     #[sea_orm(string_value = "server")]
     Server,
+    /// Curated, template-backed service whose applied release is persisted on
+    /// the project and can be upgraded independently of the live catalog.
+    #[sea_orm(string_value = "service")]
+    Service,
 }
 
 impl Display for ProjectType {
@@ -78,6 +85,7 @@ impl ProjectType {
         match self {
             ProjectType::Static => "static",
             ProjectType::Server => "server",
+            ProjectType::Service => "service",
         }
     }
 }
@@ -89,6 +97,7 @@ impl FromStr for ProjectType {
         match s {
             "static" => Ok(ProjectType::Static),
             "server" => Ok(ProjectType::Server),
+            "service" => Ok(ProjectType::Service),
             _ => Err(format!("Invalid ProjectType: {}", s)),
         }
     }

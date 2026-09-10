@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add `on_demand_backoff_until` to the `domains` table (ADR-018).
 //!
 //! Backs the per-host negative cache (ADR §4 Layer 2): when an on-demand TLS

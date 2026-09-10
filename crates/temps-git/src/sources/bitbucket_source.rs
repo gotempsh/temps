@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bitbucket Cloud API implementation of ProjectSource
 //!
 //! Fetches files directly from the Bitbucket REST API v2.0 on-demand via

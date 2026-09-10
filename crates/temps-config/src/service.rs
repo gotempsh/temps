@@ -1,10 +1,17 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, Set};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::settings;
+use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
 use tokio::{
     fs as tokio_fs,
@@ -18,7 +25,6 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
-use rand::Rng;
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
@@ -36,8 +42,207 @@ pub enum ConfigServiceError {
     #[error("Invalid configuration: {details}")]
     InvalidConfiguration { details: String },
 
+    #[error("Cluster CA is not initialized")]
+    ClusterCaNotInitialized,
+
+    #[error("Cluster CA fingerprint does not match the currently active trust root")]
+    ClusterCaFingerprintMismatch,
+
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    #[error("OS randomness failed while {operation}: {reason}")]
+    RandomnessFailed { operation: String, reason: String },
+
+    #[error(
+        "Failed to set TimescaleDB compression policy for {table} to {after_hours} hours: {source}"
+    )]
+    CompressionPolicyUpdate {
+        table: &'static str,
+        after_hours: u32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "Failed to set TimescaleDB retention policy for {table} to {after_days} days: {source}"
+    )]
+    RetentionPolicyUpdate {
+        table: &'static str,
+        after_days: u32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCaRotationResult {
+    pub previous_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
+}
+
+fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
+    fill_random_bytes_with(&mut rand::rngs::SysRng, operation, bytes)
+}
+
+fn fill_random_bytes_with<R: rand::TryCryptoRng>(
+    rng: &mut R,
+    operation: &str,
+    bytes: &mut [u8],
+) -> Result<(), ConfigServiceError> {
+    rng.try_fill_bytes(bytes)
+        .map_err(|error| ConfigServiceError::RandomnessFailed {
+            operation: operation.to_string(),
+            reason: error.to_string(),
+        })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveTelemetryPolicies {
+    pub metrics_raw_days: Option<u32>,
+    pub metrics_hourly_days: Option<u32>,
+    pub metrics_daily_years: Option<u32>,
+    pub proxy_logs_compression_hours: Option<u32>,
+    pub otel_spans_compression_hours: Option<u32>,
+    pub proxy_logs_retention_days: Option<u32>,
+    pub otel_spans_retention_days: Option<u32>,
+    pub otel_logs_retention_days: Option<u32>,
+    pub otel_metrics_retention_days: Option<u32>,
+}
+
+/// Effective cluster-wide container-network allocation state.
+///
+/// The pool is mutable only before the first control-plane or worker subnet is
+/// allocated. Keeping that lock state beside the values lets operator surfaces
+/// explain why an established cluster cannot be edited in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNetworkState {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct TimescalePolicyRow {
+    hypertable_name: String,
+    proc_name: String,
+    interval_seconds: i64,
+}
+
+const SECONDS_PER_HOUR: i64 = 60 * 60;
+const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
+
+fn rounded_u32(value: i64, divisor: i64) -> Option<u32> {
+    if value <= 0 {
+        return None;
+    }
+    u32::try_from((value + divisor / 2) / divisor).ok()
+}
+
+fn policies_from_rows(rows: Vec<TimescalePolicyRow>) -> EffectiveTelemetryPolicies {
+    let mut policies = EffectiveTelemetryPolicies::default();
+
+    for row in rows {
+        let value = match row.proc_name.as_str() {
+            "policy_compression" => rounded_u32(row.interval_seconds, SECONDS_PER_HOUR),
+            "policy_retention" => rounded_u32(row.interval_seconds, SECONDS_PER_DAY),
+            _ => None,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+
+        match (row.hypertable_name.as_str(), row.proc_name.as_str()) {
+            ("service_metrics", "policy_retention") => policies.metrics_raw_days = Some(value),
+            ("service_metrics_hourly", "policy_retention") => {
+                policies.metrics_hourly_days = Some(value)
+            }
+            ("service_metrics_daily", "policy_retention") => {
+                // The API represents this tier in whole years. Do not claim an
+                // arbitrary manually configured day count (for example 500
+                // days) is an exact year value. Leaving it unset falls back to
+                // the configured value, and the next save reconciles the drift.
+                if value % 365 == 0 {
+                    policies.metrics_daily_years = Some(value / 365);
+                }
+            }
+            ("proxy_logs", "policy_compression") => {
+                policies.proxy_logs_compression_hours = Some(value)
+            }
+            ("otel_spans", "policy_compression") => {
+                policies.otel_spans_compression_hours = Some(value)
+            }
+            ("proxy_logs", "policy_retention") => policies.proxy_logs_retention_days = Some(value),
+            ("otel_spans", "policy_retention") => policies.otel_spans_retention_days = Some(value),
+            ("otel_log_events", "policy_retention") => {
+                policies.otel_logs_retention_days = Some(value)
+            }
+            ("otel_metrics", "policy_retention") => {
+                policies.otel_metrics_retention_days = Some(value)
+            }
+            _ => {}
+        }
+    }
+
+    policies
+}
+
+fn compression_policy_sql(table: &'static str, after_hours: u32) -> String {
+    format!(
+        "SELECT remove_compression_policy('{table}', if_exists => TRUE); \
+         SELECT add_compression_policy(\
+             '{table}', \
+             compress_after => make_interval(hours => {after_hours}), \
+             if_not_exists => TRUE\
+         )"
+    )
+}
+
+async fn replace_compression_policy<C>(
+    db: &C,
+    table: &'static str,
+    after_hours: u32,
+) -> Result<(), ConfigServiceError>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared(&compression_policy_sql(table, after_hours))
+        .await
+        .map_err(|source| ConfigServiceError::CompressionPolicyUpdate {
+            table,
+            after_hours,
+            source,
+        })?;
+    Ok(())
+}
+
+fn retention_policy_sql(table: &'static str, after_days: u32) -> String {
+    format!(
+        "SELECT remove_retention_policy('{table}', if_exists => TRUE); \
+         SELECT add_retention_policy(\
+             '{table}', \
+             drop_after => make_interval(days => {after_days}), \
+             if_not_exists => TRUE\
+         )"
+    )
+}
+
+async fn replace_retention_policy<C>(
+    db: &C,
+    table: &'static str,
+    after_days: u32,
+) -> Result<(), ConfigServiceError>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared(&retention_policy_sql(table, after_days))
+        .await
+        .map_err(|source| ConfigServiceError::RetentionPolicyUpdate {
+            table,
+            after_days,
+            source,
+        })?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,6 +294,12 @@ pub struct ServerConfig {
     pub clickhouse_database: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
+
+    // Required Docker networks that every deployed app container should join
+    // before start, in addition to Temps' primary app network. This is useful
+    // for self-hosted installs where apps depend on services exposed by a
+    // sibling Docker Compose network.
+    pub docker_extra_networks: Vec<String>,
 }
 
 impl ServerConfig {
@@ -116,7 +327,7 @@ impl ServerConfig {
         let auth_secret = if auth_secret_path.exists() {
             fs::read_to_string(&auth_secret_path)?.trim().to_string()
         } else {
-            let secret = Self::generate_auth_secret();
+            let secret = Self::generate_auth_secret()?;
             fs::write(&auth_secret_path, &secret)?;
             Self::restrict_file_permissions(&auth_secret_path);
             secret
@@ -127,7 +338,7 @@ impl ServerConfig {
         let encryption_key = if encryption_key_path.exists() {
             fs::read_to_string(&encryption_key_path)?.trim().to_string()
         } else {
-            let key = Self::generate_encryption_key();
+            let key = Self::generate_encryption_key()?;
             fs::write(&encryption_key_path, &key)?;
             Self::restrict_file_permissions(&encryption_key_path);
             key
@@ -239,6 +450,8 @@ impl ServerConfig {
             clickhouse_password: std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
+
+            docker_extra_networks: parse_csv_env("TEMPS_DOCKER_EXTRA_NETWORKS"),
         })
     }
 
@@ -253,17 +466,17 @@ impl ServerConfig {
     }
 
     /// Generate a 32-byte auth secret (64 hex characters)
-    fn generate_auth_secret() -> String {
+    fn generate_auth_secret() -> Result<String, ConfigServiceError> {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill(&mut bytes);
-        hex::encode(bytes)
+        fill_secure_random_bytes("generating the server auth secret", &mut bytes)?;
+        Ok(hex::encode(bytes))
     }
 
     /// Generate a 32-byte encryption key (64 hex characters)
-    fn generate_encryption_key() -> String {
+    fn generate_encryption_key() -> Result<String, ConfigServiceError> {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill(&mut bytes);
-        hex::encode(bytes)
+        fill_secure_random_bytes("generating the server encryption key", &mut bytes)?;
+        Ok(hex::encode(bytes))
     }
 
     /// Set file permissions to owner-only (0o600) for sensitive files.
@@ -317,6 +530,20 @@ impl ServerConfig {
     }
 }
 
+fn parse_csv_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // Default domain for local development (resolves to 127.0.0.1)
 pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 
@@ -329,6 +556,16 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Default)]
+struct SettingsCacheState {
+    snapshot: Option<(AppSettings, std::time::Instant)>,
+    /// Monotonic generation protecting publication from stale in-flight
+    /// database reads. Kept under the same lock as the snapshot and global TLS
+    /// publication so invalidation cannot split the generation check from its
+    /// side effects.
+    generation: u64,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -338,7 +575,7 @@ pub struct ConfigService {
     /// would amplify any request flood into a Postgres QPS flood. Invalidated
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
-    settings_cache: tokio::sync::RwLock<Option<(AppSettings, std::time::Instant)>>,
+    settings_cache: tokio::sync::RwLock<SettingsCacheState>,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -353,7 +590,7 @@ impl ConfigService {
         Self {
             config,
             db,
-            settings_cache: tokio::sync::RwLock::new(None),
+            settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
     }
@@ -461,6 +698,96 @@ impl ConfigService {
         matches!(self.get_database_backend(), DatabaseBackend::Postgres)
     }
 
+    /// Read the active TimescaleDB retention/compression durations in one
+    /// metadata query. This view contains one row per background policy, so
+    /// the query does not scan telemetry data or hypertable chunks.
+    pub async fn get_effective_telemetry_policies(
+        &self,
+    ) -> Result<EffectiveTelemetryPolicies, ConfigServiceError> {
+        if !self.is_postgres() {
+            return Ok(EffectiveTelemetryPolicies::default());
+        }
+
+        let rows = TimescalePolicyRow::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+SELECT
+    hypertable_name,
+    proc_name,
+    EXTRACT(
+        EPOCH FROM (
+            CASE proc_name
+                WHEN 'policy_compression' THEN config ->> 'compress_after'
+                WHEN 'policy_retention' THEN config ->> 'drop_after'
+            END
+        )::interval
+    )::BIGINT AS interval_seconds
+FROM timescaledb_information.jobs
+WHERE proc_name IN ('policy_compression', 'policy_retention')
+  AND hypertable_schema = current_schema()
+  AND hypertable_name IN (
+      'service_metrics',
+      'service_metrics_hourly',
+      'service_metrics_daily',
+      'proxy_logs',
+      'otel_spans',
+      'otel_log_events',
+      'otel_metrics'
+  )
+"#
+            .to_owned(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        Ok(policies_from_rows(rows))
+    }
+
+    /// Count exactly the services the MetricsScraper will include in its next
+    /// cycle. This is a COUNT over the control-plane service table, not a scan
+    /// of metric samples.
+    pub async fn count_monitored_services(&self) -> Result<u64, ConfigServiceError> {
+        external_services::Entity::find()
+            .filter(external_services::Column::MetricsEnabled.eq(true))
+            .filter(external_services::Column::Status.eq("running"))
+            .count(self.db.as_ref())
+            .await
+            .map_err(ConfigServiceError::from)
+    }
+
+    /// Read the cluster-wide overlay pool and whether any node already owns a
+    /// subnet. This is deliberately read-only: changes must go through the
+    /// allocator's exclusive-lock and no-existing-allocation guard.
+    pub async fn get_cluster_network_state(
+        &self,
+    ) -> Result<ClusterNetworkState, ConfigServiceError> {
+        let config = network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "network_config singleton row is missing".to_string(),
+            })?;
+        let subnet_prefix_len = u8::try_from(config.subnet_prefix_len).map_err(|_| {
+            ConfigServiceError::InvalidConfiguration {
+                details: format!(
+                    "network_config subnet prefix {} is outside the supported u8 range",
+                    config.subnet_prefix_len
+                ),
+            }
+        })?;
+        let worker_allocations = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .count(self.db.as_ref())
+            .await?;
+
+        Ok(ClusterNetworkState {
+            compute_pool_cidr: config.compute_pool_cidr,
+            subnet_prefix_len,
+            allocation_count: worker_allocations
+                + u64::from(config.control_plane_compute_cidr.is_some()),
+        })
+    }
+
     /// Check if using MySQL/MariaDB database
     pub fn is_mysql(&self) -> bool {
         matches!(self.get_database_backend(), DatabaseBackend::MySql)
@@ -504,7 +831,7 @@ impl ConfigService {
         } else {
             // Generate new key using OS CSPRNG
             let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill(&mut bytes);
+            fill_secure_random_bytes("creating the persisted encryption key", &mut bytes)?;
             let key = hex::encode(bytes);
 
             // Ensure data directory exists
@@ -536,7 +863,7 @@ impl ConfigService {
         } else {
             // Generate new secret using OS CSPRNG (32 bytes as 64 hex characters)
             let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill(&mut bytes);
+            fill_secure_random_bytes("creating the persisted auth secret", &mut bytes)?;
             let secret = hex::encode(bytes);
 
             // Ensure data directory exists
@@ -585,12 +912,14 @@ impl ConfigService {
         // the proxy's per-request callers off the database (see field docs).
         {
             let cached = self.settings_cache.read().await;
-            if let Some((settings, fetched_at)) = cached.as_ref() {
+            if let Some((settings, fetched_at)) = cached.snapshot.as_ref() {
                 if fetched_at.elapsed() < SETTINGS_CACHE_TTL {
                     return Ok(settings.clone());
                 }
             }
         }
+
+        let generation = self.settings_cache.read().await.generation;
 
         // Cache miss or stale: load from the DB and repopulate.
         let record = settings::Entity::find_by_id(1)
@@ -600,34 +929,202 @@ impl ConfigService {
         let settings = record
             .map(|r| AppSettings::from_json(r.data))
             .unwrap_or_default();
-        // Republish process-wide TLS opt-in so server-side make_client()
-        // callsites (deployer, agent, providers) see the latest value
-        // without an explicit init step at startup.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
-        *self.settings_cache.write().await = Some((settings.clone(), std::time::Instant::now()));
+        self.cache_settings_if_current(generation, settings.clone())
+            .await;
         Ok(settings)
+    }
+
+    async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
+        // Publish the process-wide TLS opt-in under the same generation
+        // guard as the settings snapshot. A DB read started before an
+        // invalidation must not be able to restore stale TLS behavior after
+        // the newer settings have become authoritative.
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
+    }
+
+    async fn replace_settings_cache(&self, settings: AppSettings) {
+        let mut cache = self.settings_cache.write().await;
+        cache.generation = cache.generation.wrapping_add(1);
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
     }
 
     /// Update the application settings
     pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
-        // Refresh the TLS opt-in cache as soon as the operator toggles it
-        // in the settings UI; otherwise the change wouldn't take effect
-        // until the next get_settings() call.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
 
-        // Check if record exists
-        let existing = settings::Entity::find_by_id(1)
-            .one(self.db.as_ref())
-            .await?;
+        // The settings row can drift from the actual TimescaleDB jobs (for
+        // example after a manual policy change). Prefer the live, tiny policy
+        // snapshot when deciding what must be replaced. If metadata is
+        // temporarily unavailable, retain the previous settings comparison so
+        // unrelated settings can still be saved.
+        let effective_policies = if self.is_postgres() {
+            match self.get_effective_telemetry_policies().await {
+                Ok(policies) => Some(policies),
+                Err(error) => {
+                    warn!(%error, "Failed to read active TimescaleDB policies before settings update");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Persist the settings and replace changed TimescaleDB policies in one
+        // transaction. A policy error therefore cannot leave the API reporting
+        // a delay that the database did not actually apply (or vice versa).
+        let txn = self.db.begin().await?;
+
+        // Check if record exists.
+        //
+        // Locked FOR UPDATE on Postgres: this is a read-modify-write of a
+        // shared JSON document, and the window between the read and the write
+        // below spans the TimescaleDB policy comparison — seconds, not
+        // microseconds. Without the lock two concurrent writers both merge
+        // onto the same pre-race snapshot and the loser's sub-document (e.g.
+        // the admin gate's allowlist, saved from the console at the same
+        // moment as a startup `console_version` write) is silently dropped
+        // despite `to_json_merged`. SQLite serializes write transactions
+        // already and has no `FOR UPDATE`, so the lock is Postgres-only.
+        let existing_query = settings::Entity::find_by_id(1);
+        let existing_query = if self.is_postgres() {
+            existing_query.lock_exclusive()
+        } else {
+            existing_query
+        };
+        let existing = existing_query.one(&txn).await?;
+
+        let previous_compression = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()).observability_compression)
+            .unwrap_or_default();
+        let previous_retention = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()).observability_retention)
+            .unwrap_or_default();
+        let previous_monitoring = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()).monitoring)
+            .unwrap_or_default();
+
+        if self.db.get_database_backend() == DatabaseBackend::Postgres {
+            let monitoring = &settings.monitoring;
+            let metric_policies = [
+                (
+                    "service_metrics",
+                    monitoring.retention_raw_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.metrics_raw_days)
+                        .unwrap_or(Some(previous_monitoring.retention_raw_days)),
+                ),
+                (
+                    "service_metrics_hourly",
+                    monitoring.retention_hourly_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.metrics_hourly_days)
+                        .unwrap_or(Some(previous_monitoring.retention_hourly_days)),
+                ),
+                (
+                    "service_metrics_daily",
+                    monitoring.retention_daily_years.saturating_mul(365),
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| {
+                            policies
+                                .metrics_daily_years
+                                .map(|years| years.saturating_mul(365))
+                        })
+                        .unwrap_or(Some(
+                            previous_monitoring
+                                .retention_daily_years
+                                .saturating_mul(365),
+                        )),
+                ),
+            ];
+            for (table, after_days, previous_days) in metric_policies {
+                if Some(after_days) != previous_days {
+                    replace_retention_policy(&txn, table, after_days).await?;
+                }
+            }
+
+            let compression = &settings.observability_compression;
+            let proxy_logs_compression_hours = effective_policies
+                .as_ref()
+                .map(|policies| policies.proxy_logs_compression_hours)
+                .unwrap_or(Some(previous_compression.proxy_logs_after_hours));
+            if Some(compression.proxy_logs_after_hours) != proxy_logs_compression_hours {
+                replace_compression_policy(&txn, "proxy_logs", compression.proxy_logs_after_hours)
+                    .await?;
+            }
+            let otel_spans_compression_hours = effective_policies
+                .as_ref()
+                .map(|policies| policies.otel_spans_compression_hours)
+                .unwrap_or(Some(previous_compression.otel_spans_after_hours));
+            if Some(compression.otel_spans_after_hours) != otel_spans_compression_hours {
+                replace_compression_policy(&txn, "otel_spans", compression.otel_spans_after_hours)
+                    .await?;
+            }
+
+            let retention = &settings.observability_retention;
+            let policies = [
+                (
+                    "proxy_logs",
+                    retention.proxy_logs_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.proxy_logs_retention_days)
+                        .unwrap_or(Some(previous_retention.proxy_logs_days)),
+                ),
+                (
+                    "otel_spans",
+                    retention.otel_spans_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.otel_spans_retention_days)
+                        .unwrap_or(Some(previous_retention.otel_spans_days)),
+                ),
+                (
+                    "otel_log_events",
+                    retention.otel_logs_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.otel_logs_retention_days)
+                        .unwrap_or(Some(previous_retention.otel_logs_days)),
+                ),
+                (
+                    "otel_metrics",
+                    retention.otel_metrics_days,
+                    effective_policies
+                        .as_ref()
+                        .map(|policies| policies.otel_metrics_retention_days)
+                        .unwrap_or(Some(previous_retention.otel_metrics_days)),
+                ),
+            ];
+            for (table, after_days, previous_days) in policies {
+                if Some(after_days) != previous_days {
+                    replace_retention_policy(&txn, table, after_days).await?;
+                }
+            }
+        }
 
         if let Some(existing_model) = existing {
-            // Update existing settings
+            // Update existing settings. Merge into the stored document rather
+            // than replacing it: the `settings` row carries sub-documents owned
+            // by other subsystems (`admin_gate`) that `AppSettings` cannot
+            // round-trip. See `AppSettings::to_json_merged`.
+            let merged = settings.to_json_merged(&existing_model.data);
             let mut active_model: settings::ActiveModel = existing_model.into();
-            active_model.data = Set(settings.to_json());
+            active_model.data = Set(merged);
             active_model.updated_at = Set(now);
-            active_model.update(self.db.as_ref()).await?;
+            active_model.update(&txn).await?;
         } else {
             // Create new settings
             let new_settings = settings::ActiveModel {
@@ -636,13 +1133,16 @@ impl ConfigService {
                 created_at: Set(now),
                 updated_at: Set(now),
             };
-            new_settings.insert(self.db.as_ref()).await?;
+            new_settings.insert(&txn).await?;
         }
+
+        txn.commit().await?;
 
         // Write-through: refresh the cache with the just-written value so an
         // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL.
-        *self.settings_cache.write().await = Some((settings, std::time::Instant::now()));
+        // waiting out SETTINGS_CACHE_TTL. Runtime TLS publication happens in
+        // the same generation-checked critical section.
+        self.replace_settings_cache(settings).await;
 
         Ok(())
     }
@@ -653,7 +1153,21 @@ impl ConfigService {
     /// reconnect-recovery (so a NOTIFY missed during a connection gap can't
     /// strand stale data). Takes the async write lock, so it must be awaited.
     pub async fn invalidate_settings_cache(&self) {
-        *self.settings_cache.write().await = None;
+        {
+            let mut cache = self.settings_cache.write().await;
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.snapshot = None;
+            // Fail closed until the authoritative row has been reloaded. This
+            // is important when the invalidated value had insecure TLS enabled.
+            temps_core::tls::set_insecure_tls(false);
+        }
+
+        // Reload immediately so cross-process settings changes (including an
+        // intentional insecure-TLS opt-in) become effective when the NOTIFY is
+        // processed, rather than waiting for an unrelated future caller.
+        if let Err(error) = self.get_settings().await {
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+        }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
@@ -763,6 +1277,212 @@ impl ConfigService {
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Atomically update only managed Cloud export consent. The settings row
+    /// is shared by many subsystems, so reading through the cache and writing
+    /// the whole document would lose concurrent unrelated changes.
+    pub async fn update_cloud_features(
+        &self,
+        telemetry_enabled: bool,
+        backups_enabled: bool,
+        notifications_enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.telemetry_enabled = telemetry_enabled;
+        current.cloud.backups_enabled = backups_enabled;
+        current.cloud.notifications_enabled = notifications_enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Persist cluster CA material exactly once and return the material that
+    /// owns the settings row after the transaction commits.
+    ///
+    /// Token minting and node registration can race during initial cluster
+    /// setup. Locking the singleton settings row keeps every enrollment pinned
+    /// to one trust root instead of allowing two callers to publish different
+    /// CAs. A half-populated CA is never repaired implicitly because replacing
+    /// either half could invalidate already-issued node identities.
+    pub async fn initialize_cluster_ca_material(
+        &self,
+        generated_cert_pem: String,
+        generated_key_encrypted: String,
+    ) -> Result<(String, String), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+
+        let material = match (
+            current.multi_node.cluster_ca_cert_pem.as_ref(),
+            current.multi_node.cluster_ca_key_encrypted.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            (None, None) => {
+                current.multi_node.cluster_ca_cert_pem = Some(generated_cert_pem.clone());
+                current.multi_node.cluster_ca_key_encrypted = Some(generated_key_encrypted.clone());
+                (generated_cert_pem, generated_key_encrypted)
+            }
+            (Some(_), None) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA certificate exists but its encrypted private key is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA encrypted private key exists but its certificate is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+        };
+
+        let needs_write = existing
+            .as_ref()
+            .map(|model| {
+                let saved = AppSettings::from_json(model.data.clone());
+                saved.multi_node.cluster_ca_cert_pem.is_none()
+                    && saved.multi_node.cluster_ca_key_encrypted.is_none()
+            })
+            .unwrap_or(true);
+
+        if needs_write {
+            let now = Utc::now();
+            if let Some(model) = existing {
+                let merged = current.to_json_merged(&model.data);
+                let mut active: settings::ActiveModel = model.into();
+                active.data = Set(merged);
+                active.updated_at = Set(now);
+                active.update(&transaction).await?;
+            } else {
+                settings::ActiveModel {
+                    id: Set(1),
+                    data: Set(current.to_json()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(&transaction)
+                .await?;
+            }
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(material)
+    }
+
+    /// Replace a complete cluster CA pair and revoke every outstanding node
+    /// enrollment token in the same transaction.
+    ///
+    /// The caller must provide the fingerprint it independently observed before
+    /// starting recovery. This compare-and-swap guard prevents a stale browser
+    /// tab or automation run from replacing a newer trust root. Existing worker
+    /// certificates intentionally stop authenticating after this commits; every
+    /// worker must be re-enrolled against the returned root.
+    pub async fn rotate_cluster_ca_material(
+        &self,
+        expected_fingerprint: &str,
+        replacement_cert_pem: String,
+        replacement_key_encrypted: String,
+    ) -> Result<ClusterCaRotationResult, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let model = query
+            .one(&transaction)
+            .await?
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        let mut current = AppSettings::from_json(model.data.clone());
+        let current_cert = current
+            .multi_node
+            .cluster_ca_cert_pem
+            .as_deref()
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        if current.multi_node.cluster_ca_key_encrypted.is_none() {
+            return Err(ConfigServiceError::InvalidConfiguration {
+                details: "cluster CA certificate exists but its encrypted private key is missing"
+                    .to_string(),
+            });
+        }
+
+        let previous_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(current_cert)
+            .map_err(|error| ConfigServiceError::InvalidConfiguration {
+                details: format!("active cluster CA certificate is invalid: {error}"),
+            })?;
+        if !previous_fingerprint.eq_ignore_ascii_case(expected_fingerprint.trim()) {
+            return Err(ConfigServiceError::ClusterCaFingerprintMismatch);
+        }
+
+        current.multi_node.cluster_ca_cert_pem = Some(replacement_cert_pem);
+        current.multi_node.cluster_ca_key_encrypted = Some(replacement_key_encrypted);
+        let now = Utc::now();
+        let merged = current.to_json_merged(&model.data);
+        let mut active: settings::ActiveModel = model.into();
+        active.data = Set(merged);
+        active.updated_at = Set(now);
+        active.update(&transaction).await?;
+
+        let revoked = node_enrollment_tokens::Entity::update_many()
+            .col_expr(
+                node_enrollment_tokens::Column::RevokedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(node_enrollment_tokens::Column::UpdatedAt, Expr::value(now))
+            .filter(node_enrollment_tokens::Column::RevokedAt.is_null())
+            .exec(&transaction)
+            .await?;
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(ClusterCaRotationResult {
+            previous_fingerprint,
+            revoked_enrollment_tokens: revoked.rows_affected,
+        })
     }
 
     /// Initialize default settings if they don't exist
@@ -945,7 +1665,45 @@ impl Drop for ConfigService {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
+
+    struct FailingCryptoRng;
+
+    impl rand::TryRng for FailingCryptoRng {
+        type Error = std::io::Error;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+    }
+
+    impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[test]
+    fn randomness_failure_preserves_config_operation_context() {
+        let error = fill_random_bytes_with(
+            &mut FailingCryptoRng,
+            "testing config entropy",
+            &mut [0u8; 32],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::RandomnessFailed { operation, reason }
+                if operation == "testing config entropy"
+                    && reason.contains("config entropy unavailable")
+        ));
+    }
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(
@@ -970,6 +1728,446 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn settings_row_with_cluster_ca(
+        cert_pem: Option<&str>,
+        encrypted_key: Option<&str>,
+    ) -> settings::Model {
+        let mut app_settings = AppSettings::default();
+        app_settings.multi_node.cluster_ca_cert_pem = cert_pem.map(ToString::to_string);
+        app_settings.multi_node.cluster_ca_key_encrypted = encrypted_key.map(ToString::to_string);
+        settings::Model {
+            id: 1,
+            data: app_settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_persists_first_complete_pair() {
+        let empty = settings_row_with_cluster_ca(None, None);
+        let persisted = settings_row_with_cluster_ca(Some("generated-cert"), Some("generated-key"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[empty], [persisted]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material(
+                "generated-cert".to_string(),
+                "generated-key".to_string(),
+            )
+            .await
+            .expect("first complete cluster CA pair should be persisted");
+
+        assert_eq!(material.0, "generated-cert");
+        assert_eq!(material.1, "generated-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_reuses_existing_pair() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some("existing-cert"),
+                Some("existing-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material("racing-cert".to_string(), "racing-key".to_string())
+            .await
+            .expect("existing cluster CA should win initialization race");
+
+        assert_eq!(material.0, "existing-cert");
+        assert_eq!(material.1, "existing-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_rejects_partial_state() {
+        for row in [
+            settings_row_with_cluster_ca(Some("orphan-cert"), None),
+            settings_row_with_cluster_ca(None, Some("orphan-key")),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = ConfigService::new(test_config(), Arc::new(db));
+
+            let error = service
+                .initialize_cluster_ca_material(
+                    "generated-cert".to_string(),
+                    "generated-key".to_string(),
+                )
+                .await
+                .expect_err("partial CA state must require operator recovery");
+
+            assert!(matches!(
+                error,
+                ConfigServiceError::InvalidConfiguration { details }
+                    if details.contains("refusing automatic replacement")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_replaces_pair_and_revokes_tokens() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let expected = temps_core::node_pki::ca_fingerprint_sha256(&existing.cert_pem)
+            .expect("test cluster CA fingerprint should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                [settings_row_with_cluster_ca(
+                    Some(&existing.cert_pem),
+                    Some("existing-encrypted-key"),
+                )],
+                [settings_row_with_cluster_ca(
+                    Some("replacement-cert"),
+                    Some("replacement-encrypted-key"),
+                )],
+            ])
+            .append_exec_results([
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+            ])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let result = service
+            .rotate_cluster_ca_material(
+                &expected,
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect("matching expected root should rotate atomically");
+
+        assert_eq!(result.previous_fingerprint, expected);
+        assert_eq!(result.revoked_enrollment_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_rejects_stale_fingerprint() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some(&existing.cert_pem),
+                Some("existing-encrypted-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .rotate_cluster_ca_material(
+                "stale-fingerprint",
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect_err("stale operator state must not replace the active root");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::ClusterCaFingerprintMismatch
+        ));
+    }
+
+    fn timescale_policy_row(
+        hypertable_name: &str,
+        proc_name: &str,
+        interval_seconds: i64,
+    ) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (
+                "hypertable_name".to_string(),
+                Value::String(Some(Box::new(hypertable_name.to_string()))),
+            ),
+            (
+                "proc_name".to_string(),
+                Value::String(Some(Box::new(proc_name.to_string()))),
+            ),
+            (
+                "interval_seconds".to_string(),
+                Value::BigInt(Some(interval_seconds)),
+            ),
+        ])
+    }
+
+    fn count_row(count: i64) -> BTreeMap<String, Value> {
+        BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(count)))])
+    }
+
+    fn network_config_row(
+        subnet_prefix_len: i32,
+        control_plane_compute_cidr: Option<&str>,
+    ) -> network_config::Model {
+        network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.240.0.0/16".to_string(),
+            subnet_prefix_len,
+            transport: "vxlan".to_string(),
+            vxlan_vni: 42,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: control_plane_compute_cidr.map(str::to_string),
+            control_plane_underlay_address: Some("10.200.4.1".to_string()),
+            control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
+            control_plane_setup_generation: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_counts_control_plane_and_worker_allocations() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[network_config_row(24, Some("10.240.0.0/24"))]])
+                .append_query_results([[count_row(2)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let state = svc
+            .get_cluster_network_state()
+            .await
+            .expect("valid cluster network state should load");
+
+        assert_eq!(state.compute_pool_cidr, "10.240.0.0/16");
+        assert_eq!(state.subnet_prefix_len, 24);
+        assert_eq!(state.allocation_count, 3);
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_requires_the_singleton_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<network_config::Model>::new()])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("a missing singleton must be reported");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("singleton row is missing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_rejects_an_invalid_prefix() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[network_config_row(300, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("an out-of-range prefix must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("outside the supported u8 range")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_propagates_database_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "network configuration unavailable".to_string(),
+            )])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("database errors must remain typed");
+
+        assert!(matches!(error, ConfigServiceError::Database(_)));
+    }
+
+    #[test]
+    fn compression_policy_sql_uses_an_integer_interval_and_idempotent_replace() {
+        let sql = compression_policy_sql("proxy_logs", 24);
+        assert!(sql.contains("remove_compression_policy('proxy_logs', if_exists => TRUE)"));
+        assert!(sql.contains("make_interval(hours => 24)"));
+        assert!(sql.contains("if_not_exists => TRUE"));
+    }
+
+    #[test]
+    fn retention_policy_sql_uses_an_integer_interval_and_idempotent_replace() {
+        let sql = retention_policy_sql("otel_spans", 90);
+        assert!(sql.contains("remove_retention_policy('otel_spans', if_exists => TRUE)"));
+        assert!(sql.contains("make_interval(days => 90)"));
+        assert!(sql.contains("if_not_exists => TRUE"));
+    }
+
+    #[test]
+    fn timescale_policy_rows_map_to_ui_units() {
+        let rows = vec![
+            TimescalePolicyRow {
+                hypertable_name: "service_metrics".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 14 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "service_metrics_hourly".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 90 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "service_metrics_daily".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 730 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "proxy_logs".into(),
+                proc_name: "policy_compression".into(),
+                interval_seconds: 24 * SECONDS_PER_HOUR,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "otel_spans".into(),
+                proc_name: "policy_compression".into(),
+                interval_seconds: 12 * SECONDS_PER_HOUR,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "proxy_logs".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 30 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "otel_spans".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 60 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "otel_log_events".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 45 * SECONDS_PER_DAY,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "otel_metrics".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 90 * SECONDS_PER_DAY,
+            },
+        ];
+
+        assert_eq!(
+            policies_from_rows(rows),
+            EffectiveTelemetryPolicies {
+                metrics_raw_days: Some(14),
+                metrics_hourly_days: Some(90),
+                metrics_daily_years: Some(2),
+                proxy_logs_compression_hours: Some(24),
+                otel_spans_compression_hours: Some(12),
+                proxy_logs_retention_days: Some(30),
+                otel_spans_retention_days: Some(60),
+                otel_logs_retention_days: Some(45),
+                otel_metrics_retention_days: Some(90),
+            }
+        );
+    }
+
+    #[test]
+    fn timescale_policy_rows_ignore_unknown_or_non_positive_intervals() {
+        let rows = vec![
+            TimescalePolicyRow {
+                hypertable_name: "proxy_logs".into(),
+                proc_name: "policy_compression".into(),
+                interval_seconds: 0,
+            },
+            TimescalePolicyRow {
+                hypertable_name: "unknown_table".into(),
+                proc_name: "policy_retention".into(),
+                interval_seconds: 30 * SECONDS_PER_DAY,
+            },
+        ];
+
+        assert_eq!(
+            policies_from_rows(rows),
+            EffectiveTelemetryPolicies::default()
+        );
+    }
+
+    #[test]
+    fn timescale_policy_rows_do_not_round_partial_years() {
+        let policies = policies_from_rows(vec![TimescalePolicyRow {
+            hypertable_name: "service_metrics_daily".into(),
+            proc_name: "policy_retention".into(),
+            interval_seconds: 500 * SECONDS_PER_DAY,
+        }]);
+
+        assert_eq!(policies.metrics_daily_years, None);
+    }
+
+    #[tokio::test]
+    async fn effective_policy_query_reads_timescale_metadata_without_telemetry_scan() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[
+                    timescale_policy_row("proxy_logs", "policy_compression", 24 * SECONDS_PER_HOUR),
+                    timescale_policy_row("otel_metrics", "policy_retention", 90 * SECONDS_PER_DAY),
+                ]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let policies = svc
+            .get_effective_telemetry_policies()
+            .await
+            .expect("Timescale metadata query should map active jobs");
+
+        assert_eq!(policies.proxy_logs_compression_hours, Some(24));
+        assert_eq!(policies.otel_metrics_retention_days, Some(90));
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements[0].statements()[0].to_string();
+        assert!(sql.contains("timescaledb_information.jobs"));
+        assert!(sql.contains("hypertable_schema = current_schema()"));
+        assert!(!sql.contains("FROM proxy_logs"));
+        assert!(!sql.contains("FROM otel_metrics"));
+    }
+
+    #[tokio::test]
+    async fn monitored_service_count_matches_scraper_predicates() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[count_row(4)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert_eq!(svc.count_monitored_services().await.unwrap(), 4);
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements[0].statements()[0].to_string();
+        assert!(sql.contains("metrics_enabled"));
+        assert!(sql.contains("status"));
+        assert!(sql.contains("running"));
     }
 
     // The proxy reads settings on the per-request hot path, so get_settings()
@@ -1005,6 +2203,7 @@ mod tests {
         // get_settings, then update_settings' existence check, plus slack.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
+                vec![settings_row("old.example.com")],
                 vec![settings_row("old.example.com")],
                 vec![settings_row("old.example.com")],
                 vec![settings_row("old.example.com")],
@@ -1045,6 +2244,205 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_settings_applies_changed_observability_compression_policies() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row("logs.example.com")],
+                vec![settings_row("logs.example.com")],
+                vec![settings_row("logs.example.com")],
+            ])
+            // proxy policy, span policy, settings row update
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut updated = AppSettings::default();
+        updated.observability_compression.proxy_logs_after_hours = 12;
+        updated.observability_compression.otel_spans_after_hours = 48;
+
+        svc.update_settings(updated.clone())
+            .await
+            .expect("changed compression policies should be applied transactionally");
+
+        let cached = svc.get_settings().await.expect("updated settings cache");
+        assert_eq!(
+            cached.observability_compression,
+            updated.observability_compression
+        );
+    }
+
+    #[tokio::test]
+    async fn update_settings_recreates_a_missing_live_policy_even_when_json_matches() {
+        let current = AppSettings::default();
+        let live_rows = vec![
+            timescale_policy_row(
+                "service_metrics",
+                "policy_retention",
+                i64::from(current.monitoring.retention_raw_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "service_metrics_hourly",
+                "policy_retention",
+                i64::from(current.monitoring.retention_hourly_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "service_metrics_daily",
+                "policy_retention",
+                i64::from(current.monitoring.retention_daily_years) * 365 * SECONDS_PER_DAY,
+            ),
+            // proxy_logs compression is intentionally missing.
+            timescale_policy_row(
+                "otel_spans",
+                "policy_compression",
+                i64::from(current.observability_compression.otel_spans_after_hours)
+                    * SECONDS_PER_HOUR,
+            ),
+            timescale_policy_row(
+                "proxy_logs",
+                "policy_retention",
+                i64::from(current.observability_retention.proxy_logs_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_spans",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_spans_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_log_events",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_logs_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_metrics",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_metrics_days) * SECONDS_PER_DAY,
+            ),
+        ];
+        let row = settings_row("localhost");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([live_rows])
+                .append_query_results([[row.clone()], [row]])
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        svc.update_settings(current)
+            .await
+            .expect("missing live policy should be recreated");
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("add_compression_policy"));
+        assert!(sql.contains("proxy_logs"));
+    }
+
+    #[tokio::test]
+    async fn compression_policy_errors_include_table_and_requested_delay() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors(vec![sea_orm::DbErr::Custom("Timescale job error".into())])
+            .into_connection();
+
+        let error = replace_compression_policy(&db, "otel_spans", 12)
+            .await
+            .expect_err("policy error should be returned");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::CompressionPolicyUpdate {
+                table: "otel_spans",
+                after_hours: 12,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_settings_applies_changed_observability_retention_policies() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row("retention.example.com")],
+                vec![settings_row("retention.example.com")],
+                vec![settings_row("retention.example.com")],
+            ])
+            // Four telemetry retention policies, then the settings row update.
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                };
+                5
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut updated = AppSettings::default();
+        updated.observability_retention.proxy_logs_days = 14;
+        updated.observability_retention.otel_spans_days = 60;
+        updated.observability_retention.otel_logs_days = 45;
+        updated.observability_retention.otel_metrics_days = 30;
+
+        svc.update_settings(updated.clone())
+            .await
+            .expect("changed retention policies should be applied transactionally");
+
+        let cached = svc.get_settings().await.expect("updated settings cache");
+        assert_eq!(
+            cached.observability_retention,
+            updated.observability_retention
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_policy_errors_include_table_and_requested_window() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors(vec![sea_orm::DbErr::Custom("Timescale job error".into())])
+            .into_connection();
+
+        let error = replace_retention_policy(&db, "otel_log_events", 45)
+            .await
+            .expect_err("policy error should be returned");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::RetentionPolicyUpdate {
+                table: "otel_log_events",
+                after_days: 45,
+                ..
+            }
+        ));
+    }
+
     // A settings_change NOTIFY must force the next get_settings() to re-read
     // from the DB instead of serving the stale cached snapshot (the whole point
     // of the cross-process invalidation path; the listener calls this method).
@@ -1071,5 +2469,70 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_rejects_a_stale_in_flight_cache_publication() {
+        temps_core::tls::set_insecure_tls(false);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("new.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let stale_generation = svc.settings_cache.read().await.generation;
+
+        svc.invalidate_settings_cache().await;
+
+        let stale = AppSettings {
+            preview_domain: "old.example.com".to_string(),
+            insecure_tls: true,
+            ..AppSettings::default()
+        };
+        assert!(!svc.cache_settings_if_current(stale_generation, stale).await);
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "rejected stale settings must not mutate process-wide TLS behavior"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "new.example.com",
+            "a read started before invalidation must not republish stale settings"
+        );
+        temps_core::tls::set_insecure_tls(false);
+    }
+
+    #[tokio::test]
+    async fn invalidation_serializes_cache_and_tls_publication() {
+        temps_core::tls::set_insecure_tls(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("strict.example.com")]])
+            .into_connection();
+        let svc = Arc::new(ConfigService::new(test_config(), Arc::new(db)));
+
+        // Hold the cache-publication lock while invalidation starts. The
+        // invalidator must not advance the generation or mutate TLS outside
+        // that lock; this is the check-to-publication interleaving that used to
+        // permit a stale insecure-TLS value to survive invalidation.
+        let cache_guard = svc.settings_cache.write().await;
+        let invalidation = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.invalidate_settings_cache().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "invalidation must wait for the cache/TLS publication lock"
+        );
+        drop(cache_guard);
+
+        invalidation.await.expect("invalidation task");
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "invalidation must finish with the reloaded strict TLS setting"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "strict.example.com"
+        );
+        temps_core::tls::set_insecure_tls(false);
     }
 }

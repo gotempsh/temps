@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -27,6 +30,12 @@ pub struct Model {
     pub id: i32,
     /// FK to `projects(id)`. Indexed; rules are scoped by project.
     pub project_id: i32,
+    /// FK to `environments(id)`, optional. `NULL` = project-scoped rule created
+    /// via the UI/API (existing behaviour). Non-null = config-as-code rule
+    /// declared in `.temps.yaml` and upserted by the deployment reconciler.
+    /// When set, `ON DELETE CASCADE` ensures rules are removed when the
+    /// environment is deleted.
+    pub environment_id: Option<i32>,
     /// Human-readable rule name.
     pub name: String,
     /// The metric name the rule evaluates (e.g. `http.server.duration`).
@@ -106,11 +115,24 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Project,
+    #[sea_orm(
+        belongs_to = "super::environments::Entity",
+        from = "Column::EnvironmentId",
+        to = "super::environments::Column::Id",
+        on_delete = "Cascade"
+    )]
+    Environment,
 }
 
 impl Related<super::projects::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Project.def()
+    }
+}
+
+impl Related<super::environments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Environment.def()
     }
 }
 

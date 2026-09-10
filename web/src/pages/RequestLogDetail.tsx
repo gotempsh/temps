@@ -1,10 +1,17 @@
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { useParams, useNavigate, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProxyLogByIdOptions,
+  getProxyLogByRequestIdOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { httpStatusClass } from '@/lib/http-status-class'
 import {
   ArrowLeft,
   Monitor,
@@ -31,26 +38,51 @@ export default function RequestLogDetail({
   // lookup. Absent on bare deep-links, which fall back to a wider scan.
   const ts = searchParams.get('ts')
 
-  const {
-    data: logDetail,
-    isLoading,
-    error,
-  } = useQuery({
+  // The list navigates by request_id (resolves under both the TimescaleDB
+  // and ClickHouse backends — the latter has no serial id column). Purely
+  // numeric params are legacy serial-id deep-links and keep using the by-id
+  // endpoint.
+  const isLegacyNumericId = /^\d+$/.test(logId || '')
+
+  const byId = useQuery({
     ...getProxyLogByIdOptions({
       path: {
         id: parseInt(logId || '0'),
       },
-      query: ts ? { timestamp: ts } : undefined,
+      query: { timestamp: ts ?? undefined, project_id: projectResponse.id },
     }),
-    enabled: !!logId,
+    enabled: !!logId && isLegacyNumericId,
   })
+  const byRequestId = useQuery({
+    ...getProxyLogByRequestIdOptions({
+      path: {
+        request_id: logId || '',
+      },
+      query: { timestamp: ts ?? undefined, project_id: projectResponse.id },
+    }),
+    enabled: !!logId && !isLegacyNumericId,
+  })
+  const {
+    data: logDetail,
+    isLoading,
+    error,
+  } = isLegacyNumericId ? byId : byRequestId
 
   const getStatusColor = (status: number) => {
-    if (status >= 200 && status < 300) return 'bg-green-100 text-green-800'
-    if (status >= 300 && status < 400) return 'bg-yellow-100 text-yellow-800'
-    if (status >= 400 && status < 500) return 'bg-orange-100 text-orange-800'
-    if (status >= 500) return 'bg-red-100 text-red-800'
-    return 'bg-gray-100 text-gray-800'
+    switch (httpStatusClass(status)) {
+      case '1xx':
+        return 'bg-blue-100 text-blue-800'
+      case '2xx':
+        return 'bg-green-100 text-green-800'
+      case '3xx':
+        return 'bg-yellow-100 text-yellow-800'
+      case '4xx':
+        return 'bg-orange-100 text-orange-800'
+      case '5xx':
+        return 'bg-red-100 text-red-800'
+      default:
+        return 'bg-gray-100 text-gray-800'
+    }
   }
 
   const getMethodColor = (method: string) => {

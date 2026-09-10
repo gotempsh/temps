@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Vercel `@vercel/sandbox` SDK compatibility test suite.
 //!
 //! This file pins the `/v1/sandboxes/*` contract to what the
@@ -80,6 +83,14 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/{id}/jobs",
         // Client-generated preview password (temps extension).
         "/v1/sandboxes/{id}/preview-password",
+        // Expiring preview share links (temps extension).
+        "/v1/sandboxes/{id}/preview-link",
+        // Firecracker backend extensions (ADR-029): operations timeline,
+        // live disk resize, and host-global rootfs inventory/GC.
+        "/v1/sandboxes/{id}/events",
+        "/v1/sandboxes/{id}/resize",
+        "/v1/sandboxes/rootfs",
+        "/v1/sandboxes/rootfs/gc",
     ]
 }
 
@@ -365,8 +376,14 @@ fn sandbox_response_matches_sdk_envelope() {
             cwd: "/workspace".into(),
             name: "demo".into(),
             image: Some("node:20".into()),
+            backend: None,
+            disk_size_mb: None,
             preview_url_template: String::new(),
             preview_password_hint: None,
+            agent_run_id: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         },
         routes: Vec::new(),
     };
@@ -437,8 +454,14 @@ fn sandbox_status_uses_sdk_enum_values() {
                 cwd: "/".into(),
                 name: String::new(),
                 image: None,
+                backend: None,
+                disk_size_mb: None,
                 preview_url_template: String::new(),
                 preview_password_hint: None,
+                agent_run_id: None,
+                lifecycle: "ephemeral".to_string(),
+                project_id: None,
+                source_repo_url: None,
             },
             routes: Vec::new(),
         };

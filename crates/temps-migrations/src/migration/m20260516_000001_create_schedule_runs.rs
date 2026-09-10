@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration: create `schedule_runs` table and add `schedule_run_id` to `backups`.
 //!
 //! ## Purpose

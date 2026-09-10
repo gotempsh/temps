@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import * as React from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
 
@@ -37,6 +40,12 @@ interface SearchableSelectProps {
   disabled?: boolean
   className?: string
   contentClassName?: string
+  /** Use strict case-insensitive substring matching instead of cmdk fuzzy matching. */
+  searchMode?: 'fuzzy' | 'contains'
+  /** Optional leading icon rendered before the trigger label. */
+  icon?: React.ReactNode
+  /** Native title attribute on the trigger button (tooltip on hover). */
+  title?: string
 }
 
 export function SearchableSelect({
@@ -49,6 +58,9 @@ export function SearchableSelect({
   disabled,
   className,
   contentClassName,
+  searchMode = 'fuzzy',
+  icon,
+  title,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false)
 
@@ -77,13 +89,17 @@ export function SearchableSelect({
           role="combobox"
           aria-expanded={open}
           disabled={disabled}
+          title={title}
           className={cn(
             'h-10 w-full justify-between font-normal',
             !selected && 'text-muted-foreground',
             className
           )}
         >
-          <span className="truncate">{selected?.label ?? placeholder}</span>
+          <span className="flex min-w-0 items-center">
+            {icon}
+            <span className="truncate">{selected?.label ?? placeholder}</span>
+          </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
@@ -94,12 +110,24 @@ export function SearchableSelect({
         )}
         align="start"
       >
-        <Command>
+        <Command
+          filter={
+            searchMode === 'contains'
+              ? (itemValue, search) =>
+                  itemValue.toLowerCase().includes(search.trim().toLowerCase())
+                    ? 1
+                    : 0
+              : undefined
+          }
+        >
           <CommandInput placeholder={searchPlaceholder} />
           <CommandList className="max-h-[320px]">
             <CommandEmpty>{emptyText}</CommandEmpty>
             {grouped.map(([group, items]) => (
-              <CommandGroup key={group || '__default'} heading={group || undefined}>
+              <CommandGroup
+                key={group || '__default'}
+                heading={group || undefined}
+              >
                 {items.map((opt) => (
                   <CommandItem
                     key={opt.value}

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Import Orchestrator
 //!
 //! This crate provides the HTTP API and orchestration layer for importing workloads

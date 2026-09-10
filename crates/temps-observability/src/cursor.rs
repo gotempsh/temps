@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pagination cursor for the merged event stream.
 //!
 //! The merge service returns rows ordered by `(ts DESC, kind, id)`. To page

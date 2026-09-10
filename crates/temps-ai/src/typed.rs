@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Ergonomic, schema-derived helpers over the object-safe [`AiService`](crate::AiService).
 //!
 //! Object-safety forbids generic methods on the trait object, so the typed API

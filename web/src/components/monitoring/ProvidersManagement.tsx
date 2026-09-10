@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -9,8 +12,10 @@ import {
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
@@ -30,13 +35,13 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Bell, EllipsisVertical, Plus } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { Bell, EllipsisVertical } from 'lucide-react'
+import { useNavigate } from 'react-router'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderForm } from './ProviderForm'
-import { ProviderFormData, providerSchema } from './schemas'
+import { ProviderFormData, providerUpdateSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
   provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
@@ -165,7 +170,7 @@ export function ProvidersManagement() {
   })
 
   const editForm = useForm<ProviderFormData>({
-    resolver: zodResolver(providerSchema),
+    resolver: zodResolver(providerUpdateSchema),
     defaultValues: {
       name: '',
       provider_type: 'email',
@@ -244,6 +249,21 @@ export function ProvidersManagement() {
     }
   }
 
+  const handleRevealCredential = async (field: string) => {
+    if (!editingProvider) {
+      throw new Error('No notification provider is selected')
+    }
+
+    const { data } = await revealNotificationProviderConfig({
+      path: {
+        id: editingProvider.id,
+        field,
+      },
+      throwOnError: true,
+    })
+    return data.value
+  }
+
   const handleDelete = async (provider: ExtendedNotificationProvider) => {
     await deleteMutation.mutateAsync({
       path: { id: provider.id },
@@ -271,7 +291,7 @@ export function ProvidersManagement() {
   }
 
   const handleEdit = (provider: ExtendedNotificationProvider) => {
-    navigate(`/monitoring/providers/edit/${provider.id}`)
+    navigate(`/settings/notifications/${provider.id}`)
   }
 
   const handleToggleEnabled = async (
@@ -319,15 +339,18 @@ export function ProvidersManagement() {
             Notification Providers
           </h2>
           <p className="text-muted-foreground">
-            Manage your notification providers for alerts and updates.
+            Configure where notifications can be delivered. Routes decide which
+            alerts reach each destination.
           </p>
         </div>
 
+        {/* Only one of this and the empty-state button is ever mounted, so
+            the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
-          <Button onClick={() => navigate('/monitoring/providers/add')}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Provider
-          </Button>
+          <CreateActionButton
+            onClick={() => navigate('/settings/notifications/new')}
+            label="Add Provider"
+          />
         )}
       </div>
 
@@ -337,10 +360,10 @@ export function ProvidersManagement() {
           title="No notification providers configured"
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
-            <Button onClick={() => navigate('/monitoring/providers/add')}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Provider
-            </Button>
+            <CreateActionButton
+              onClick={() => navigate('/settings/notifications/new')}
+              label="Add Provider"
+            />
           }
         />
       ) : (
@@ -425,6 +448,8 @@ export function ProvidersManagement() {
               onSubmit={onEditSubmit}
               isEdit
               isLoading={isLoadingProviderType}
+              revealScopeKey={`${editingProvider?.id}:${editingProvider?.updated_at}`}
+              onRevealCredential={handleRevealCredential}
             />
           </div>
         </DialogContent>

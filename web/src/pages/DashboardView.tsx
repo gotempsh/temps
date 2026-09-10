@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — getDashboardOptions is generated from the new
 // GET /otel/dashboards/{id} endpoint (operationId get_dashboard). Not present
@@ -34,7 +37,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft, LayoutDashboard, Pencil } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 interface DashboardViewProps {
   project: ProjectResponse

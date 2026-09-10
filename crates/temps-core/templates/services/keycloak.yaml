@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Keycloak uses a Temps-managed PostgreSQL dependency rather than an
+# application-local database container.
+slug: keycloak
+name: Keycloak
+version: 1.0.0
+kind: service
+description: Production-ready identity and access management backed by a Temps-managed PostgreSQL database.
+git:
+  url: https://github.com/keycloak/keycloak.git
+  ref: 26.7.2
+preset: dockerfile
+image_url: /templates/keycloak.svg
+image: quay.io/keycloak/keycloak@sha256:9d1f1b2b7261ff53c66cb1092dfcdc34a5fb77e81f9e6a6e75b8b6a795de8067
+command:
+  - start
+resources:
+  cpu_request: 500000
+  cpu_limit: 1000000
+  memory_request: 512
+  memory_limit: 1536
+exposed_port: 8080
+health_check_path: /realms/master
+tags:
+  - authentication
+  - identity
+  - security
+  - sso
+features:
+  - Single sign-on and identity federation
+  - OpenID Connect, OAuth 2.0, and SAML
+  - PostgreSQL managed, backed up, and restored by Temps
+  - Pinned image version with editable project configuration
+services:
+  - postgres
+managed_service_bindings:
+  postgres:
+    KC_DB_URL_HOST: POSTGRES_HOST
+    KC_DB_URL_PORT: POSTGRES_PORT
+    KC_DB_URL_DATABASE: POSTGRES_DB
+    KC_DB_USERNAME: POSTGRES_USER
+    KC_DB_PASSWORD: POSTGRES_PASSWORD
+env_vars:
+  - name: KC_DB
+    description: Keycloak database vendor
+    default: postgres
+    required: true
+  - name: KC_BOOTSTRAP_ADMIN_USERNAME
+    description: Initial administrator username
+    default: admin
+    required: true
+  - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+    description: Initial administrator password
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: KC_HOSTNAME_STRICT
+    description: Resolve the public hostname from Temps reverse-proxy headers
+    default: "false"
+    required: true
+  - name: KC_HTTP_ENABLED
+    description: Allow HTTP between the Temps proxy and Keycloak
+    default: "true"
+    required: true
+  - name: KC_PROXY_HEADERS
+    description: Trust the reverse proxy forwarding headers supplied by Temps
+    default: xforwarded
+    required: true
+is_public: true
+is_featured: true
+sort_order: 0

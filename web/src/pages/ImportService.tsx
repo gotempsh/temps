@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   listAvailableContainersOptions,
   importExternalServiceMutation,
@@ -34,7 +37,7 @@ import { customAlphabet } from 'nanoid'
 import { getServiceTypeWithFallback } from '@/lib/service-type-detector'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod'
 

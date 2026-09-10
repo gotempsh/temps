@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult, PaginatorTrait,
@@ -71,51 +74,87 @@ impl ErrorAnalyticsService {
         })
     }
 
-    /// Get error time series data with gap filling
-    /// Uses TimescaleDB's time_bucket_gapfill to return all buckets between start and end time,
-    /// filling missing buckets with 0 counts
+    /// Get error time series data with gap filling.
+    ///
+    /// Uses TimescaleDB's `time_bucket_gapfill` to return all buckets between `start_time` and
+    /// `end_time`, filling missing buckets with 0 counts.  When `environment_id` is supplied it
+    /// is AND-combined with `project_id` so callers cannot read cross-project data by providing
+    /// an environment that belongs to a different project.
     pub async fn get_error_time_series(
         &self,
         project_id: i32,
         start_time: UtcDateTime,
         end_time: UtcDateTime,
         bucket: &str, // e.g., "1h", "15m", "1d", "1 hour", "30 minutes"
+        environment_id: Option<i32>,
     ) -> Result<Vec<ErrorTimeSeriesPoint>, ErrorTrackingError> {
         // Normalize bucket format to PostgreSQL interval format
         let interval = Self::normalize_bucket_interval(bucket);
 
-        // Use time_bucket_gapfill to fill missing time buckets with 0 counts
-        // This ensures the frontend always gets a complete time series
-        // Note: time_bucket_gapfill requires subquery pattern to avoid "no top level" error
-        let sql = r#"
-            SELECT
-                bucket::timestamptz as timestamp,
-                count
-            FROM (
+        // Use time_bucket_gapfill to fill missing time buckets with 0 counts.
+        // Note: time_bucket_gapfill requires subquery pattern to avoid "no top level" error.
+        // The environment_id filter (when present) is always AND-combined with project_id.
+        let results = if let Some(env_id) = environment_id {
+            let sql = r#"
                 SELECT
-                    time_bucket_gapfill($1::interval, timestamp, $2::timestamptz, $3::timestamptz) as bucket,
-                    COALESCE(COUNT(*), 0) as count
-                FROM error_events
-                WHERE project_id = $4
-                    AND timestamp >= $2::timestamptz
-                    AND timestamp <= $3::timestamptz
-                GROUP BY bucket
-            ) sub
-            ORDER BY timestamp ASC
-            "#;
-
-        let results = ErrorTimeSeriesPoint::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            sql,
-            vec![
-                interval.into(),
-                start_time.into(),
-                end_time.into(),
-                project_id.into(),
-            ],
-        ))
-        .all(self.db.as_ref())
-        .await?;
+                    bucket::timestamptz as timestamp,
+                    count
+                FROM (
+                    SELECT
+                        time_bucket_gapfill($1::interval, timestamp, $2::timestamptz, $3::timestamptz) as bucket,
+                        COALESCE(COUNT(*), 0) as count
+                    FROM error_events
+                    WHERE project_id = $4
+                        AND timestamp >= $2::timestamptz
+                        AND timestamp <= $3::timestamptz
+                        AND environment_id = $5
+                    GROUP BY bucket
+                ) sub
+                ORDER BY timestamp ASC
+                "#;
+            ErrorTimeSeriesPoint::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![
+                    interval.into(),
+                    start_time.into(),
+                    end_time.into(),
+                    project_id.into(),
+                    env_id.into(),
+                ],
+            ))
+            .all(self.db.as_ref())
+            .await?
+        } else {
+            let sql = r#"
+                SELECT
+                    bucket::timestamptz as timestamp,
+                    count
+                FROM (
+                    SELECT
+                        time_bucket_gapfill($1::interval, timestamp, $2::timestamptz, $3::timestamptz) as bucket,
+                        COALESCE(COUNT(*), 0) as count
+                    FROM error_events
+                    WHERE project_id = $4
+                        AND timestamp >= $2::timestamptz
+                        AND timestamp <= $3::timestamptz
+                    GROUP BY bucket
+                ) sub
+                ORDER BY timestamp ASC
+                "#;
+            ErrorTimeSeriesPoint::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![
+                    interval.into(),
+                    start_time.into(),
+                    end_time.into(),
+                    project_id.into(),
+                ],
+            ))
+            .all(self.db.as_ref())
+            .await?
+        };
 
         Ok(results)
     }
@@ -435,6 +474,9 @@ impl ErrorAnalyticsService {
                 visitor_id: group.visitor_id,
                 created_at: group.created_at,
                 updated_at: group.updated_at,
+                events_in_range: None,
+                affected_users: None,
+                deployment: None,
             })
             .collect())
     }

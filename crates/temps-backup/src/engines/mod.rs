@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Backup engine implementations for `temps-backup` (ADR-014 Phase 1–4).
 //!
 //! Each module implements the [`temps_backup_core::BackupEngine`] trait for a

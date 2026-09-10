@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { PagePathSparkline, ProjectResponse } from '@/api/client'
 import {
   ChartConfig,
@@ -7,7 +10,7 @@ import {
 } from '@/components/ui/chart'
 import { Clock, ExternalLink, TrendingUp, Users } from 'lucide-react'
 import { useMemo } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router'
 import { Area, AreaChart, XAxis, YAxis } from 'recharts'
 
 interface PageListItemProps {

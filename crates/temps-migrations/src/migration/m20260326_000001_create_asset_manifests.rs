@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to drop asset_manifests table.
 //!
 //! The asset_manifests table is no longer needed — static assets are now stored

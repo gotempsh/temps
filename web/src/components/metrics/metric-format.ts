@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Shared metric formatting + histogram helpers.
 //
 // Extracted from MetricsExplorer.tsx so the dashboard tiles render values and

@@ -1,21 +1,37 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { DeploymentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
   getDeploymentOptions,
+  getFailureReportPreviewOptions,
+  getDeploymentJobsOptions,
   getSettingsOptions,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
+  sendFailureReportMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,12 +39,24 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
+import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
+import { normalizeUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -46,19 +74,15 @@ import {
   Play,
   RotateCcw,
   RotateCw,
+  Send,
   X,
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 type BadgeVariant =
-  | 'default'
-  | 'secondary'
-  | 'destructive'
-  | 'success'
-  | 'warning'
-  | 'outline'
+  'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
 
 function statusBadgeVariant(status: string): BadgeVariant {
   switch (status) {
@@ -71,18 +95,6 @@ function statusBadgeVariant(status: string): BadgeVariant {
     default:
       return 'secondary'
   }
-}
-
-// The environment's URLs come through `environment.domains` (domains[0] is the
-// stable env URL). A deployment also has its own deployment-specific `url`.
-// The current deployment is served at the environment's stable domain, so we
-// surface that; older deployments fall back to their deployment-specific URL.
-function resolvePrimaryUrl(deployment: DeploymentResponse): string | null {
-  const normalize = (u: string) => (u.startsWith('http') ? u : `https://${u}`)
-  const envUrl = deployment.environment.domains?.[0]
-  if (deployment.is_current && envUrl) return normalize(envUrl)
-  if (deployment.url) return normalize(deployment.url)
-  return envUrl ? normalize(envUrl) : null
 }
 
 function formatDurationMs(ms?: number | null): string | null {
@@ -117,8 +129,12 @@ function buildUrlEntries(
     seen.add(primaryUrl)
   }
   deployment.environment.domains?.forEach((domain) => {
-    const url = domain.startsWith('http') ? domain : `https://${domain}`
-    if (seen.has(url)) return
+    // Same scheme validation as the primary URL. These entries are rendered as
+    // links too, and custom domains reach this array as raw user-supplied
+    // strings, so the weaker `startsWith('http')` test used to let
+    // `httpfoo://` and `//evil.com` through to an href.
+    const url = normalizeUrl(domain)
+    if (!url || seen.has(url)) return
     seen.add(url)
     entries.push({ url, display: domain, kind: 'preview' })
   })
@@ -412,8 +428,10 @@ function SecondaryActions({
 // Top-level failure/cancellation banner shown directly under the header for
 // deployments that didn't succeed.
 function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
+  const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
   return (
     <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
@@ -421,11 +439,174 @@ function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
         <p className="text-sm font-medium text-destructive">
           {isCancelled ? 'Deployment cancelled' : 'Deployment failed'}
         </p>
-        <p className="mt-0.5 break-words text-sm text-destructive/80">
-          {deployment.cancelled_reason}
+        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-destructive/80">
+          {isExpanded ? failureReason.fullReason : failureReason.summary}
         </p>
+        {failureReason.hasMore && (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
+            aria-expanded={isExpanded}
+            onClick={() => setIsExpanded((expanded) => !expanded)}
+          >
+            {isExpanded ? 'Collapse error' : 'Show full error'}
+          </Button>
+        )}
       </div>
     </div>
+  )
+}
+
+// "Help us fix this" — offered only for a genuinely failed deployment (not a
+// user-initiated cancel). Finds the failed job, then offers to send a
+// redacted, user-editable copy of its trace to the Temps team, or to copy it
+// for a pre-filled GitHub issue instead.
+function DeployFailureReport({
+  project,
+  deployment,
+}: {
+  project: ProjectResponse
+  deployment: DeploymentResponse
+}) {
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+  // `null` until the user types — the textarea then falls back to the fetched
+  // preview, so we never need an effect to "seed" state from the query.
+  const [editedText, setEditedText] = useState<string | null>(null)
+
+  const isFailed = deployment.status === 'failed'
+
+  const { data: jobsData } = useQuery({
+    ...getDeploymentJobsOptions({
+      path: { project_id: project.id, deployment_id: deployment.id },
+    }),
+    enabled: isFailed,
+  })
+  const failedJob = jobsData?.jobs.find((job) => job.status === 'failure')
+
+  const previewQuery = useQuery({
+    ...getFailureReportPreviewOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: deployment.id,
+        job_id: failedJob?.job_id ?? '',
+      },
+    }),
+    enabled: isFailed && !!failedJob,
+  })
+  const reportText = editedText ?? previewQuery.data?.redacted_log ?? ''
+
+  const sendReport = useMutation({
+    ...sendFailureReportMutation(),
+    meta: {
+      errorTitle: 'Failed to send failure report',
+    },
+    onSuccess: () => {
+      toast.success('Failure report sent — thank you for helping us fix this')
+      setIsDialogOpen(false)
+      setEditedText(null)
+    },
+  })
+
+  if (!isFailed || !failedJob) return null
+
+  const handleOpenGithubIssue = async () => {
+    const body = previewQuery.data?.github_issue_body ?? ''
+    const title = previewQuery.data?.github_issue_title ?? 'Deploy failure'
+    if (previewQuery.data?.redacted_log) {
+      await writeToClipboard(previewQuery.data.redacted_log)
+      toast.info('Redacted log copied — paste it into the issue body')
+    }
+    const url = `https://github.com/gotempsh/temps/issues/new?title=${encodeURIComponent(
+      title
+    )}&body=${encodeURIComponent(body)}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">
+            Help us fix this in the next release
+          </p>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Send a redacted copy of the failure trace to the Temps team, or open
+            a GitHub issue.
+          </p>
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <DialogTrigger asChild>
+                      <Button
+                        size="sm"
+                        disabled={
+                          previewQuery.data?.reporting_enabled === false
+                        }
+                      >
+                        <Send className="mr-2 h-4 w-4" />
+                        Send failure report
+                      </Button>
+                    </DialogTrigger>
+                  </span>
+                </TooltipTrigger>
+                {previewQuery.data?.reporting_enabled === false && (
+                  <TooltipContent>
+                    Outbound reporting is disabled on this instance
+                    (TEMPS_TELEMETRY).
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            </TooltipProvider>
+            <DialogContent className="max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Send failure report</DialogTitle>
+                <DialogDescription>
+                  This is a redacted copy of the build trace for the failed
+                  stage. Review and edit it before sending — nothing is sent
+                  until you press Send.
+                </DialogDescription>
+              </DialogHeader>
+              {previewQuery.isLoading ? (
+                <Skeleton className="h-64 w-full" />
+              ) : (
+                <Textarea
+                  value={reportText}
+                  onChange={(e) => setEditedText(e.target.value)}
+                  className="h-64 font-mono text-xs"
+                />
+              )}
+              <DialogFooter>
+                <Button
+                  onClick={() =>
+                    sendReport.mutate({
+                      path: {
+                        project_id: project.id,
+                        deployment_id: deployment.id,
+                        job_id: failedJob.job_id,
+                      },
+                      body: { report_text: reportText },
+                    })
+                  }
+                  disabled={sendReport.isPending || !reportText}
+                >
+                  {sendReport.isPending ? 'Sending...' : 'Send'}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Button variant="outline" size="sm" onClick={handleOpenGithubIssue}>
+            <GithubIcon className="mr-2 h-4 w-4" />
+            Open a GitHub issue instead
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -759,7 +940,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to create deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })
@@ -771,7 +951,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to redeploy image',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })
@@ -825,21 +1004,28 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
     if (project.source_type === 'docker_image') {
-      const ref = deployment?.metadata?.externalImageRef
+      const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
+      const ref =
+        editedImageRef?.trim() || deployment?.metadata?.externalImageRef
       if (!ref) {
         toast.error('No image reference found for this deployment')
         return
       }
       await redeployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
+        body: {
+          ...deploymentRuntime,
+          image_ref: ref,
+        },
       })
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return
@@ -1037,13 +1223,13 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
   const hasBuildConfig = Boolean(
     md &&
-      (md.builder ||
-        md.deploymentSourceType ||
-        md.externalImageRef ||
-        md.healthCheckPath ||
-        md.dockerfilePath ||
-        md.staticBundlePath ||
-        md.imageUploadedLocally)
+    (md.builder ||
+      md.deploymentSourceType ||
+      md.externalImageRef ||
+      md.healthCheckPath ||
+      md.dockerfilePath ||
+      md.staticBundlePath ||
+      md.imageUploadedLocally)
   )
 
   // The resource facts worth surfacing, as compact chips: CPU + memory
@@ -1110,6 +1296,19 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
         <CancelledReason deployment={deployment} />
+
+        {/* Failed Compose candidates are the primary debugging surface, so
+            keep their live logs beside the concise failure summary instead
+            of below the complete deployment pipeline. */}
+        <RetainedFailedContainers
+          projectId={deployment.project_id}
+          projectSlug={project.slug}
+          environmentId={deployment.environment_id}
+          deploymentId={deployment.id}
+          deploymentStatus={deployment.status}
+        />
+
+        <DeployFailureReport project={project} deployment={deployment} />
 
         {resourceBadges.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
@@ -1215,7 +1414,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         )}
 
         {/* Deployment Pipeline — failed stages expose a "Debug with AI" sidebar
-            (ADR-023), gated on the project's ai_debug_chat_enabled toggle */}
+          (ADR-023), gated by the user's project access */}
         <DeploymentStages project={project} deployment={deployment} />
 
         {/* Captured logs from previous containers (survive teardown) */}

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds the schema for the internal DNS layer (ADR-011): authoritative service
 //! endpoint records + per-node resolver applied-state.
 //!

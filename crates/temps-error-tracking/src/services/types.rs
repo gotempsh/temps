@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use temps_core::UtcDateTime;
 
 use sea_orm::{DbErr, FromQueryResult};
@@ -176,6 +179,25 @@ pub struct ErrorGroupDomain {
     pub visitor_id: Option<i32>,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
+    /// Count of error events in the requested time window (None when no date range was requested)
+    pub events_in_range: Option<i64>,
+    /// Count of distinct affected visitors/users in the requested time window (None when no date range was requested)
+    pub affected_users: Option<i64>,
+    /// The deployment this group's `deployment_id` points to, resolved for the current page only.
+    /// None when the group has no `deployment_id`, or (rarely) when the deployment row itself
+    /// was deleted after the error group linked to it.
+    pub deployment: Option<ErrorGroupDeploymentSummary>,
+}
+
+/// Minimal deployment info surfaced on an error group — just enough to show
+/// "which commit was this error seen on" without pulling in the full
+/// deployment response (build stats, screenshots, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorGroupDeploymentSummary {
+    pub id: i32,
+    pub commit_hash: Option<String>,
+    pub commit_message: Option<String>,
+    pub branch: Option<String>,
 }
 
 /// Domain model for error events

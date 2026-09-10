@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import { ProjectResponse } from '@/api/client'
@@ -41,7 +44,7 @@ import {
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 import AnsiToHtml from 'ansi-to-html'
 import {
   AlertCircle,

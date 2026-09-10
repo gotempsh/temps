@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Dependency & Container Scan
 
 # Supply-chain scanning for Temps' own code (tracked as bherila/temps#23).
@@ -28,6 +31,11 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -40,17 +48,37 @@ jobs:
       contents: read
       # rustsec/audit-check publishes results as a GitHub check run.
       checks: write
+      # On `schedule` runs specifically, the action also files/updates a
+      # GitHub issue for any advisory found (see rustsec/audit-check's
+      # README, "Granular Permissions" -- it only does this off cron, not on
+      # pull_request/push). Without this, a schedule run 403s with
+      # "Resource not accessible by integration" against the Issues API even
+      # when zero vulnerabilities are found, since the action still needs to
+      # check for/close a prior issue.
+      issues: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: dependency-scan-cargo-audit
+          # Save from `main` only -- writes are scoped to the producing ref,
+          # so without this every open PR held its own ~340MB copy under this
+          # key (9 simultaneous copies measured = ~2.9GB, more than a quarter
+          # of the repo's 10GB cache pool). That's what was evicting
+          # `temps-musl-fast-*` -- the much larger, much more valuable shared
+          # musl build cache in rust-tests.yml -- turning its restore-keys
+          # fallback into a full ~80min cold compile on every workflow run.
+          # See the matching `save-if` note on the `test-build`/
+          # `nextest-archive` caches in rust-tests.yml for the same lesson.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Runs `cargo audit` against Cargo.lock and fails the job if any
       # RUSTSEC advisory matches a resolved dependency (all advisories, not
@@ -67,8 +95,24 @@ jobs:
       #   separately, not a drop-in version bump.
       # - RUSTSEC-2018-0017 (tempdir): transitive via nixpacks, no newer
       #   nixpacks release drops it yet.
+      # - RUSTSEC-2024-0436 (paste): transitive via clickhouse ->
+      #   higher-kinded-types -> polonius-the-crab -> paste. Proc-macro only
+      #   (compile-time codegen, not linked into the binary); clickhouse
+      #   0.15.1 is already the latest release and doesn't drop it.
+      # - RUSTSEC-2026-0173 (proc-macro-error2): transitive via sea-orm ->
+      #   sea-orm-macros -> sea-bae -> proc-macro-error2 (distinct from the
+      #   already-ignored RUSTSEC-2024-0370, which is the original
+      #   proc-macro-error crate via a different path). Proc-macro only;
+      #   sea-orm 1.1.20 is the pinned major, 2.0 is a breaking migration.
+      # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core ->
+      #   derivative. Proc-macro only; pingora-core 0.8.1 is already latest.
+      # - RUSTSEC-2025-0069 (daemonize): transitive via pingora-core ->
+      #   daemonize. Runtime dep in pingora-core, but temps-proxy/server.rs
+      #   explicitly sets `daemon: false` (systemd owns process lifecycle),
+      #   so pingora never calls into daemonize's fork/detach path -- the
+      #   code is compiled in but never executed.
       #
-      # The three below are real vulnerabilities (not just "unmaintained"
+      # The four below are real vulnerabilities (not just "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
       # Full reachability analysis for each lives in the root Cargo.toml
       # under "Dependency Overrides - Security Fixes" -- re-verify that
@@ -90,12 +134,40 @@ jobs:
       #   signed payload isn't attacker-controlled). Keys are per-customer,
       #   not a shared temps secret. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
+      # - RUSTSEC-2026-0235 (rkyv 0.7.46 via rust_decimal <- sea-orm):
+      #   out-of-bounds read when validating archives containing Rc/Arc.
+      #   rkyv is an OPTIONAL feature of rust_decimal that nothing in this
+      #   workspace enables -- it is in Cargo.lock (which cargo resolves over
+      #   the maximal feature set) but has zero occurrences in
+      #   `cargo tree --target all -e normal`, i.e. it is never compiled, let
+      #   alone fed an archive. No fix is reachable from here: the patch is
+      #   in 0.8.17, upstream dropped the 0.7 series, and rust_decimal 1.42.1
+      #   (latest) still declares `rkyv ^0.7.46`.
+      #   NOTE: this entry exists only because cargo-audit reads Cargo.lock
+      #   rather than what is built. Switching this gate to cargo-auditable
+      #   (`cargo audit bin` against the compiled binary) would drop it
+      #   without an exception -- see the PR that added this line.
+      # - RUSTSEC-2026-0253 (lru 0.16.4, unsound UAF in LruCache::pop()):
+      #   transitive via aws-sdk-s3, which pins `lru = "^0.16.3"`. Verified
+      #   2026-08-24 against aws-sdk-s3 1.143.0 (crates.io latest as of that
+      #   date) that the requirement is unchanged -- upgrading aws-sdk-s3
+      #   does not pull the fixed lru 0.18.2.
       # Remove an entry once its upstream is fixed/replaced.
+      # Install a checksum-verified release binary before audit-check runs.
+      # audit-check otherwise compiles cargo-audit from a newly-resolved
+      # dependency graph, which can fail independently of this repository's
+      # Cargo.lock (for example, when an upstream build-only crate is broken).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
       - name: Run cargo-audit
-        uses: rustsec/audit-check@v2.0.0
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2025-0069,RUSTSEC-2026-0253
 
   web-audit:
     name: Web Dependency Audit (bun audit)
@@ -104,15 +176,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -148,12 +220,26 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # ghcr.io/${{ github.repository_owner }}/temps is a private package --
+      # anonymous pulls 401 (confirmed: `curl
+      # https://ghcr.io/token?scope=repository:gotempsh/temps:pull` returns
+      # UNAUTHORIZED even for this public repo's own image). Trivy's `remote`
+      # fallback therefore needs an authenticated pull, same as release.yml
+      # uses to publish the image in the first place.
+      packages: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Trivy vulnerability scanner on published image
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           # Matches the tag naming release.yml publishes for stable releases
           # (ghcr.io/${{ github.repository_owner }}/temps:<channel_tag>) --
@@ -175,6 +261,6 @@ jobs:
       - name: Upload Trivy results to GitHub code scanning
         if: always()
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
         with:
           sarif_file: trivy-results.sarif

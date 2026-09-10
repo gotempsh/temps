@@ -1,6 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import Table from 'cli-table3'
 import chalk from 'chalk'
 import { colors } from './output.js'
+import { sanitizeTerminalText } from './terminal.js'
 
 export interface TableColumn<T> {
   header: string
@@ -121,7 +125,7 @@ export function createTable<T>(
   const preset = stylePresets[options.style ?? 'default']
 
   const table = new Table({
-    head: columns.map((col) => colors.bold(col.header)),
+    head: columns.map((col) => colors.bold(sanitizeTerminalText(col.header))),
     colAligns: columns.map((col) => col.align ?? 'left'),
     colWidths: columns.map((col) => col.width ?? null),
     ...preset,
@@ -139,7 +143,8 @@ export function createTable<T>(
         value = ''
       }
 
-      let strValue = value === null || value === undefined ? '' : String(value)
+      let strValue =
+        value === null || value === undefined ? '' : sanitizeTerminalText(value)
 
       if (col.color) {
         strValue = col.color(strValue, item)
@@ -177,8 +182,11 @@ export function detailsTable(
   })
 
   for (const [key, value] of Object.entries(details)) {
-    const displayValue = value === null || value === undefined ? colors.muted('not set') : String(value)
-    table.push([colors.muted(key), displayValue])
+    const displayValue =
+      value === null || value === undefined
+        ? colors.muted('not set')
+        : sanitizeTerminalText(value)
+    table.push([colors.muted(sanitizeTerminalText(key)), displayValue])
   }
 
   console.log(table.toString())
@@ -188,6 +196,7 @@ export function detailsTable(
  * Status badge formatter
  */
 export function statusBadge(status: string): string {
+  const safeStatus = sanitizeTerminalText(status)
   const statusColors: Record<string, (s: string) => string> = {
     running: chalk.green,
     active: chalk.green,
@@ -208,8 +217,12 @@ export function statusBadge(status: string): string {
     error: chalk.red,
     unhealthy: chalk.red,
     cancelled: chalk.red,
+    degraded: chalk.yellow,
+    failing: chalk.red,
+    disabled: chalk.gray,
+    never_delivered: chalk.gray,
   }
 
-  const colorFn = statusColors[status.toLowerCase()] ?? chalk.white
-  return colorFn(`● ${status}`)
+  const colorFn = statusColors[safeStatus.toLowerCase()] ?? chalk.white
+  return colorFn(`● ${safeStatus}`)
 }

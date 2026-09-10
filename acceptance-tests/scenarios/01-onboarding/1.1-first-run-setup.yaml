@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 id: "1.1"
 title: First-run setup creates exactly one admin user
 section: 01-onboarding

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -24,7 +27,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, Loader2, MailCheck } from 'lucide-react'
 import { useForm } from 'react-hook-form'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { z } from 'zod'
 import { usePageTitle } from '@/hooks/usePageTitle'
 

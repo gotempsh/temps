@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Backfill recent analytics events for all projects in the demo database.
  * Reuses existing visitor IDs for speed — only inserts events.

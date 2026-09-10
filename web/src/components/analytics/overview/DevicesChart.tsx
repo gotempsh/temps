@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getPropertyBreakdownOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
@@ -14,7 +17,7 @@ import { format } from 'date-fns'
 import type { LucideIcon } from 'lucide-react'
 import { BarChart3, Monitor, Smartphone, Tablet } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 const DEVICE_ICONS: Record<string, LucideIcon> = {

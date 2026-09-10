@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   createAlertRuleMutation,
   getAlertRuleOptions,
@@ -36,17 +39,48 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useMemo } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
 const TRIGGER_TYPES = [
-  { value: 'new_issue', label: 'New Issue', description: 'Fires once when a new error group is first created. Does not fire again for subsequent events in the same group.' },
-  { value: 'regression', label: 'Regression', description: 'Fires when a new event arrives for an error group that was previously marked as "resolved" or "ignored". The group is automatically re-opened.' },
-  { value: 'frequency', label: 'Frequency', description: 'Fires when the number of events in an error group exceeds the configured threshold within the time window. Can fire repeatedly after cooldown expires.' },
-  { value: 'new_user', label: 'New User Affected', description: 'Fires when the first event with user context (user ID, email, or visitor ID) is added to an error group.' },
-  { value: 'user_count', label: 'User Count', description: 'Fires when the number of unique users affected by an error group reaches the configured threshold.' },
-  { value: 'status_change', label: 'Status Change', description: 'Fires when an error group status is manually changed (e.g. resolved, assigned, ignored).' },
+  {
+    value: 'new_issue',
+    label: 'New Issue',
+    description:
+      'Fires once when a new error group is first created. Does not fire again for subsequent events in the same group.',
+  },
+  {
+    value: 'regression',
+    label: 'Regression',
+    description:
+      'Fires when a new event arrives for an error group that was previously marked as "resolved" or "ignored". The group is automatically re-opened.',
+  },
+  {
+    value: 'frequency',
+    label: 'Frequency',
+    description:
+      'Fires when the number of events in an error group exceeds the configured threshold within the time window. Can fire repeatedly after cooldown expires.',
+  },
+  {
+    value: 'new_user',
+    label: 'New User Affected',
+    description:
+      'Fires when the first event with user context (user ID, email, or visitor ID) is added to an error group.',
+  },
+  {
+    value: 'user_count',
+    label: 'User Count',
+    description:
+      'Fires when the number of unique users affected by an error group reaches the configured threshold.',
+  },
+  {
+    value: 'status_change',
+    label: 'Status Change',
+    description:
+      'Fires when an error group status is manually changed (e.g. resolved, assigned, ignored).',
+  },
 ] as const
 
 const PRIORITIES = [
@@ -59,11 +93,13 @@ const PRIORITIES = [
 const alertRuleSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   trigger_type: z.string().min(1, 'Trigger type is required'),
-  trigger_config: z.object({
-    count: z.number().min(1).optional(),
-    window_minutes: z.number().min(1).optional(),
-    threshold: z.number().min(1).optional(),
-  }).optional(),
+  trigger_config: z
+    .object({
+      count: z.number().min(1).optional(),
+      window_minutes: z.number().min(1).optional(),
+      threshold: z.number().min(1).optional(),
+    })
+    .optional(),
   cooldown_minutes: z.number().min(0),
   notification_priority: z.string(),
   environment_filter: z.number().nullable().optional(),
@@ -82,9 +118,9 @@ interface AlertRuleFormProps {
 }
 
 export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
-  const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { ruleId } = useParams()
+  const { ruleId, slug } = useParams()
+  const goBack = useGoBack(`/projects/${slug}/errors/alert-rules`)
   const isEditing = !!ruleId
 
   const { data: existingRule, isLoading: ruleLoading } = useQuery({
@@ -96,7 +132,10 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
 
   const defaultValues = useMemo<AlertRuleFormData>(() => {
     if (existingRule) {
-      const config = (existingRule.trigger_config ?? {}) as Record<string, unknown>
+      const config = (existingRule.trigger_config ?? {}) as Record<
+        string,
+        unknown
+      >
       return {
         name: existingRule.name,
         trigger_type: existingRule.trigger_type,
@@ -136,8 +175,12 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     meta: { errorTitle: 'Failed to create alert rule' },
     onSuccess: () => {
       toast.success('Alert rule created')
-      queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
-      navigate(-1)
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          (query.queryKey[0] as Record<string, unknown>)?._id ===
+          'listAlertRules',
+      })
+      goBack()
     },
   })
 
@@ -146,15 +189,21 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     meta: { errorTitle: 'Failed to update alert rule' },
     onSuccess: () => {
       toast.success('Alert rule updated')
-      queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
-      navigate(-1)
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          (query.queryKey[0] as Record<string, unknown>)?._id ===
+          'listAlertRules',
+      })
+      goBack()
     },
   })
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
   const onSubmit = async (data: AlertRuleFormData) => {
-    const triggerConfig = needsConfig(data.trigger_type) ? data.trigger_config : undefined
+    const triggerConfig = needsConfig(data.trigger_type)
+      ? data.trigger_config
+      : undefined
 
     if (isEditing) {
       await updateMutation.mutateAsync({
@@ -189,7 +238,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
 
   if (isEditing && ruleLoading) {
     return (
-      <div className="space-y-6 max-w-2xl mx-auto">
+      <div className="mx-auto w-full max-w-5xl space-y-6">
         <div className="flex items-center gap-4">
           <Skeleton className="h-9 w-9" />
           <Skeleton className="h-8 w-48" />
@@ -200,9 +249,9 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
   }
 
   return (
-    <div className="space-y-6 max-w-2xl mx-auto">
+    <div className="mx-auto w-full max-w-5xl space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>
@@ -234,7 +283,10 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                   <FormItem>
                     <FormLabel>Name</FormLabel>
                     <FormControl>
-                      <Input placeholder="e.g. Critical error spike" {...field} />
+                      <Input
+                        placeholder="e.g. Critical error spike"
+                        {...field}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -262,7 +314,10 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                       </SelectContent>
                     </Select>
                     <FormDescription>
-                      {TRIGGER_TYPES.find((t) => t.value === field.value)?.description}
+                      {
+                        TRIGGER_TYPES.find((t) => t.value === field.value)
+                          ?.description
+                      }
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -286,7 +341,11 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                                 placeholder="100"
                                 value={field.value ?? ''}
                                 onChange={(e) =>
-                                  field.onChange(e.target.value ? Number(e.target.value) : undefined)
+                                  field.onChange(
+                                    e.target.value
+                                      ? Number(e.target.value)
+                                      : undefined
+                                  )
                                 }
                               />
                             </FormControl>
@@ -309,7 +368,11 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                                 placeholder="60"
                                 value={field.value ?? ''}
                                 onChange={(e) =>
-                                  field.onChange(e.target.value ? Number(e.target.value) : undefined)
+                                  field.onChange(
+                                    e.target.value
+                                      ? Number(e.target.value)
+                                      : undefined
+                                  )
                                 }
                               />
                             </FormControl>
@@ -332,7 +395,11 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                               placeholder="10"
                               value={field.value ?? ''}
                               onChange={(e) =>
-                                field.onChange(e.target.value ? Number(e.target.value) : undefined)
+                                field.onChange(
+                                  e.target.value
+                                    ? Number(e.target.value)
+                                    : undefined
+                                )
                               }
                             />
                           </FormControl>
@@ -368,7 +435,9 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                       </SelectContent>
                     </Select>
                     <FormDescription>
-                      Adds a prefix to email subjects (e.g. [CRITICAL]) and is included in webhook/Slack payloads. Use it to filter or sort notifications in your inbox.
+                      Adds a prefix to email subjects (e.g. [CRITICAL]) and is
+                      included in webhook/Slack payloads. Use it to filter or
+                      sort notifications in your inbox.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -389,7 +458,10 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                       />
                     </FormControl>
                     <FormDescription>
-                      Minimum time between notifications for the same rule and error group. After an alert fires, it won't fire again for this group until the cooldown expires and a new matching event arrives.
+                      Minimum time between notifications for the same rule and
+                      error group. After an alert fires, it won&apos;t fire
+                      again for this group until the cooldown expires and a new
+                      matching event arrives.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -403,7 +475,9 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                   <FormItem>
                     <FormLabel>Error Level Filter</FormLabel>
                     <Select
-                      onValueChange={(v) => field.onChange(v === 'all' ? null : v)}
+                      onValueChange={(v) =>
+                        field.onChange(v === 'all' ? null : v)
+                      }
                       value={field.value ?? 'all'}
                     >
                       <FormControl>
@@ -455,7 +529,11 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                       ? 'Update Rule'
                       : 'Create Rule'}
                 </Button>
-                <Button type="button" variant="outline" onClick={() => navigate(-1)}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => goBack()}
+                >
                   Cancel
                 </Button>
               </div>

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # ci-local.sh — Run the same checks as the GitHub Actions PR pipeline.
 #
 # Mirrors .github/workflows/rust-tests.yml jobs: fmt, check, clippy.

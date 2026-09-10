@@ -1,4 +1,7 @@
-import { Link } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -23,20 +26,9 @@ import {
 import { Button } from '@/components/ui/button'
 import { listSecretsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 
 // ── Types from existing endpoints ───────────────────────────────────────────
-
-interface CatalogEntry {
-  id: string
-  name: string
-  credential_saved: boolean
-  current_auth_type: string | null
-}
-
-interface CatalogResponse {
-  default_provider: string
-  providers: CatalogEntry[]
-}
 
 interface SandboxStatus {
   docker_available: boolean
@@ -83,18 +75,10 @@ function ToneIcon({ tone }: { tone: Tone }) {
 
 export function AgentSandboxDashboard() {
   usePageTitle('AI Workflows')
-  const { data: catalog, isPending: catalogPending } =
-    useQuery<CatalogResponse>({
-      queryKey: ['ai-provider-catalog'],
-      queryFn: async () => {
-        // TODO(sdk-regen): migrate once /settings/ai-providers endpoint is
-        // added to the generated SDK.
-        const r = await fetch('/api/settings/ai-providers')
-        if (!r.ok) throw new Error('Failed to load AI provider catalog')
-        return r.json()
-      },
-      staleTime: 60 * 1000,
-    })
+  const { data: catalog, isPending: catalogPending } = useQuery({
+    ...aiProviderCatalogQueryOptions,
+    staleTime: 60 * 1000,
+  })
 
   const { data: sandboxStatus, isPending: sandboxPending } =
     useQuery<SandboxStatus | null>({
@@ -129,7 +113,7 @@ export function AgentSandboxDashboard() {
   // Provider: ok if active provider has a saved credential; bad if no provider
   // has one at all; warn if active is unconfigured but a sibling is.
   const activeProvider = catalog?.providers.find(
-    (p) => p.id === catalog?.default_provider,
+    (p) => p.id === catalog?.default_provider
   )
   const anyConfigured = catalog?.providers.some((p) => p.credential_saved)
   const providerTone: Tone = catalogPending
@@ -321,7 +305,9 @@ export function AgentSandboxDashboard() {
                     </CardTitle>
                     <ArrowRight className="h-4 w-4 text-muted-foreground opacity-0 -translate-x-1 transition group-hover:opacity-100 group-hover:translate-x-0" />
                   </div>
-                  <CardDescription className="text-xs">{c.hint}</CardDescription>
+                  <CardDescription className="text-xs">
+                    {c.hint}
+                  </CardDescription>
                 </CardHeader>
                 <CardContent>
                   <div className="flex items-center gap-2 text-sm">
@@ -368,7 +354,11 @@ export function AgentSandboxDashboard() {
               <p className="font-medium">Preview gateway</p>
               <p className="text-muted-foreground text-xs">
                 A shared proxy container that exposes dev servers running inside
-                sandboxes via <code className="bg-muted px-1 rounded">ws-*.preview-domain</code>.
+                sandboxes via{' '}
+                <code className="bg-muted px-1 rounded">
+                  ws-*.preview-domain
+                </code>
+                .
               </p>
             </div>
           </div>
@@ -377,8 +367,12 @@ export function AgentSandboxDashboard() {
             <div>
               <p className="font-medium">Secrets</p>
               <p className="text-muted-foreground text-xs">
-                Encrypted env vars and files injected into every sandbox. Reference
-                via <code className="bg-muted px-1 rounded">{'${TEMPS_SECRET:NAME}'}</code>.
+                Encrypted env vars and files injected into every sandbox.
+                Reference via{' '}
+                <code className="bg-muted px-1 rounded">
+                  {'${TEMPS_SECRET:NAME}'}
+                </code>
+                .
               </p>
             </div>
           </div>

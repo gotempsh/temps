@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { type CreateApiKeyRequest } from '@/api/client'
 import { createApiKeyMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
@@ -33,18 +36,29 @@ import {
   ChevronRight,
   Edit,
 } from 'lucide-react'
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useRef, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 
 export default function ApiKeyCreate() {
   usePageTitle('Create API Key')
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const requestedReturnTo = searchParams.get('returnTo')
+  const returnTo =
+    requestedReturnTo?.startsWith('/') && !requestedReturnTo.startsWith('//')
+      ? requestedReturnTo
+      : '/settings/keys'
+  const isHarnessSetup = returnTo === '/setup/ai'
   const [step, setStep] = useState(1)
-  const [keyName, setKeyName] = useState('')
+  const [keyName, setKeyName] = useState(searchParams.get('name') ?? '')
   const [expiresAt, setExpiresAt] = useState('')
-  const [selectedRole, setSelectedRole] = useState<string>('')
+  const [selectedRole, setSelectedRole] = useState<string>(
+    searchParams.get('role') ?? ''
+  )
   const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(
     new Set()
   )
@@ -53,9 +67,12 @@ export default function ApiKeyCreate() {
   const [copiedKey, setCopiedKey] = useState(false)
   const [openCategories, setOpenCategories] = useState<Set<string>>(new Set())
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
+  const isSubmittingRef = useRef(false)
 
   const { data: permissionsData, isLoading: isLoadingPermissions } =
     useApiKeyPermissions()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const createMutation = useMutation({
     ...createApiKeyMutation(),
@@ -67,6 +84,18 @@ export default function ApiKeyCreate() {
       setCreatedKeyId(response.id)
       setStep(4) // Show success step
       toast.success('API key created successfully')
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          createMutation.mutate(variables)
+        )
+      ) {
+        return
+      }
+      toast.error(
+        sensitiveActionErrorMessage(error, 'Failed to create API key')
+      )
     },
   })
 
@@ -131,17 +160,30 @@ export default function ApiKeyCreate() {
   }
 
   const handleSubmit = () => {
+    const trimmedName = keyName.trim()
+    if (!trimmedName || isSubmittingRef.current || createMutation.isPending) {
+      return
+    }
+    isSubmittingRef.current = true
+
     const data: CreateApiKeyRequest = {
-      name: keyName,
+      name: trimmedName,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
         : undefined,
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
     }
-    createMutation.mutate({
-      body: data,
-    })
+    createMutation.mutate(
+      {
+        body: data,
+      },
+      {
+        onSettled: () => {
+          isSubmittingRef.current = false
+        },
+      }
+    )
   }
 
   const canProceed = () => {
@@ -214,7 +256,7 @@ export default function ApiKeyCreate() {
 
             <div className="space-y-4 p-4 bg-muted rounded-lg">
               <div className="text-sm">
-                <strong>Name:</strong> {keyName}
+                <strong>Name:</strong> {keyName.trim()}
               </div>
               <div className="text-sm">
                 <strong>Access Level:</strong>{' '}
@@ -240,7 +282,9 @@ export default function ApiKeyCreate() {
                   Edit Permissions
                 </Button>
               )}
-              <Button onClick={() => navigate('/settings/keys')}>Go to API Keys</Button>
+              <Button onClick={() => navigate(returnTo)}>
+                {isHarnessSetup ? 'Continue harness setup' : 'Go to API Keys'}
+              </Button>
             </div>
           </CardContent>
         </Card>
@@ -250,9 +294,14 @@ export default function ApiKeyCreate() {
 
   return (
     <div className="container max-w-4xl mx-auto py-6 space-y-6">
+      {verificationDialog}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate('/settings/keys')}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => navigate(returnTo)}
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
@@ -263,6 +312,17 @@ export default function ApiKeyCreate() {
           </div>
         </div>
       </div>
+
+      {isHarnessSetup && (
+        <Alert className="border-primary/20 bg-primary/5">
+          <Shield className="h-4 w-4" />
+          <AlertDescription>
+            This creates the dedicated admin credential requested by AI harness
+            setup. After copying the key, you&apos;ll return to the skill and
+            verification steps.
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Progress Steps */}
       <div className="flex items-center justify-center mb-8">
@@ -333,7 +393,8 @@ export default function ApiKeyCreate() {
                   autoFocus
                 />
                 <p className="text-sm text-muted-foreground">
-                  Choose a name that helps you remember what this key is used for
+                  Choose a name that helps you remember what this key is used
+                  for
                 </p>
               </div>
 
@@ -357,7 +418,11 @@ export default function ApiKeyCreate() {
               </div>
 
               <div className="flex justify-end gap-3">
-                <Button type="button" variant="outline" onClick={() => navigate('/settings/keys')}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => navigate(returnTo)}
+                >
                   Cancel
                 </Button>
                 <Button type="submit" disabled={!canProceed()}>
@@ -559,7 +624,7 @@ export default function ApiKeyCreate() {
               Back
             </Button>
             <div className="flex gap-3">
-              <Button variant="outline" onClick={() => navigate('/settings/keys')}>
+              <Button variant="outline" onClick={() => navigate(returnTo)}>
                 Cancel
               </Button>
               <Button onClick={() => setStep(3)} disabled={!canProceed()}>
@@ -583,7 +648,7 @@ export default function ApiKeyCreate() {
             <div className="space-y-4">
               <div>
                 <Label className="text-muted-foreground">Name</Label>
-                <p className="font-medium">{keyName}</p>
+                <p className="font-medium">{keyName.trim()}</p>
               </div>
 
               <Separator />
@@ -646,7 +711,7 @@ export default function ApiKeyCreate() {
                 Back
               </Button>
               <div className="flex gap-3">
-                <Button variant="outline" onClick={() => navigate('/settings/keys')}>
+                <Button variant="outline" onClick={() => navigate(returnTo)}>
                   Cancel
                 </Button>
                 <Button

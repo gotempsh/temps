@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::git_provider::{
     AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
     GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
@@ -947,6 +950,13 @@ impl GitProviderService for BitbucketProvider {
             .send_with_retry(|| self.apply_auth(client.get(&url)))
             .await?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitProviderError::CommitNotFound {
+                repository: format!("{}/{}", owner, repo),
+                commit_sha: reference.to_string(),
+            });
+        }
+
         if !response.status().is_success() {
             return Err(GitProviderError::ApiError(format!(
                 "Failed to get commit {} for {}/{}: {}",
@@ -1623,17 +1633,16 @@ fn parse_raw_author(raw: &str) -> (String, String) {
 /// Generate a cryptographically random 64-character hex token (32 bytes) for
 /// use as a Bitbucket webhook delivery URL path token.
 ///
-/// Uses `rand::rngs::OsRng` (MUST-FIX 1 — not `thread_rng`).
+/// Uses `rand::rngs::SysRng` (MUST-FIX 1 — not the thread-local RNG).
 ///
 /// The token is embedded in the webhook callback URL:
 /// `{temps_url}/api/webhook/git/bitbucket/events/{token}`.
 /// It is stored encrypted in `projects.bitbucket_webhook_token` and
 /// compared in constant time in the webhook handler (MUST-FIX 3).
-pub fn generate_bitbucket_webhook_token() -> String {
-    use rand::RngCore;
+pub fn generate_bitbucket_webhook_token() -> Result<String, rand::rngs::SysError> {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 
 // ── Shared helper: constant-time secret-in-path lookup ────────────────────────
@@ -1798,15 +1807,15 @@ mod tests {
 
     #[test]
     fn test_generate_bitbucket_webhook_token_is_64_hex_chars() {
-        let tok = generate_bitbucket_webhook_token();
+        let tok = generate_bitbucket_webhook_token().unwrap();
         assert_eq!(tok.len(), 64, "32 bytes => 64 hex chars");
         assert!(tok.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_generate_bitbucket_webhook_token_is_unique() {
-        let t1 = generate_bitbucket_webhook_token();
-        let t2 = generate_bitbucket_webhook_token();
+        let t1 = generate_bitbucket_webhook_token().unwrap();
+        let t2 = generate_bitbucket_webhook_token().unwrap();
         assert_ne!(t1, t2);
     }
 

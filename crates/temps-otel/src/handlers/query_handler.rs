@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Query handlers for the monitoring UI.
 //!
 //! These endpoints are authenticated via the standard RequireAuth flow
@@ -94,8 +97,71 @@ pub struct TraceQueryParams {
     pub sort_by: Option<String>,
     /// Sort direction: "asc" or "desc" (default).
     pub sort_order: Option<String>,
+    /// Whether to compute `total` on the trace-summaries list. Defaults to
+    /// true. Set false when the caller only needs the page itself (an
+    /// existence probe, a poll, an infinite-scroll feed): the total is a
+    /// second aggregation over the whole window, and skipping it removes one
+    /// of the two queries the endpoint would otherwise issue.
+    pub include_total: Option<bool>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// Query parameters for `GET /otel/span-stats`.
+///
+/// Every filter is optional. With no project selection, report across all accessible
+/// projects. Pass `project_id` for
+/// one project, or `project_ids` (comma-separated) to rank operations across
+/// several at once. Each project is access-checked individually.
+#[derive(Debug, Deserialize)]
+pub struct SpanStatsQueryParams {
+    /// Single project to report on. Ignored when `project_ids` is given.
+    pub project_id: Option<i32>,
+    /// Comma-separated project ids, e.g. `4,5,6`. At most
+    /// [`SPAN_STATS_MAX_PROJECTS`].
+    pub project_ids: Option<String>,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
+    pub service_name: Option<String>,
+    /// Exact span name — "how slow did *this* operation get?".
+    pub span_name: Option<String>,
+    /// Substring match on the span name (case-insensitive).
+    pub name_pattern: Option<String>,
+    /// `server` | `client` | `internal` | `producer` | `consumer`.
+    pub kind: Option<String>,
+    /// `ok` | `error` | `unset`. `error` answers "how slow are the failures?".
+    pub status: Option<String>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    /// Span attribute filters as comma-separated `key=value` pairs.
+    pub attributes: Option<String>,
+    /// Ignore spans faster than this before aggregating.
+    pub min_duration_ms: Option<f64>,
+    /// Drop operations with fewer than this many samples (default 1).
+    pub min_count: Option<u64>,
+    /// `total_time` (default) | `p50` | `p95` | `p99` | `max` | `avg` |
+    /// `stddev` | `count` | `errors` | `error_rate` | `variability` | `tail_ratio`.
+    pub sort_by: Option<String>,
+    /// `asc` | `desc` (default).
+    pub sort_order: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// Response for `GET /otel/span-stats`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SpanStatsResponse {
+    pub data: Vec<SpanStats>,
+    /// Total number of distinct operations matching the filters, for pagination.
+    pub total: u64,
+    /// The window actually aggregated, echoed back because it is defaulted
+    /// server-side when the caller omits it.
+    #[schema(value_type = String, format = DateTime)]
+    pub start_time: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub end_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +221,12 @@ pub struct TracesResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TraceSummariesResponse {
     pub data: Vec<TraceSummary>,
-    pub total: u64,
+    /// Total traces matching the filters, ignoring pagination. Omitted when
+    /// the request passed `include_total=false`, in which case the caller
+    /// asked not to pay for the count — treat its absence as "unknown", not
+    /// as zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -181,8 +252,76 @@ pub struct QuotaResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct HasTracesResponse {
+    pub has_traces: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PipelineStatsResponse {
     pub stats: PipelineStats,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IngestErrorsResponse {
+    /// Failure groups, most recently seen first.
+    pub errors: Vec<IngestErrorSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestErrorsQuery {
+    /// Max groups to return. Defaults to 20, capped at 100.
+    pub limit: Option<u32>,
+}
+
+/// One `(timestamp, value)` sample in a pipeline series.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineHistoryPoint {
+    /// ISO 8601 timestamp with `Z` suffix (bucket start).
+    pub time: String,
+    /// Bucket value — the mean per-sample delta, see [`PipelineSeries`].
+    pub value: f64,
+}
+
+/// One charted counter over the requested window.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineSeries {
+    /// Metric name, e.g. `otel.spans_dropped`.
+    pub name: String,
+    /// Buckets in ascending time order. Empty when the window predates the
+    /// first sample (a freshly started server has no history yet).
+    pub points: Vec<PipelineHistoryPoint>,
+}
+
+/// Time-series history for every counter the pipeline-stats sampler publishes.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineHistoryResponse {
+    /// One entry per sampled counter, always the full set in a stable order —
+    /// a counter with no data yet is present with an empty `points`, never
+    /// omitted, so the client can render an empty chart instead of dropping
+    /// the panel.
+    pub series: Vec<PipelineSeries>,
+    /// Resolved window start (ISO 8601, `Z`).
+    pub start_time: String,
+    /// Resolved window end (ISO 8601, `Z`).
+    pub end_time: String,
+    /// Bucket width actually used, in seconds. Server-derived from the window
+    /// so a caller cannot request 1-minute buckets over 7 days.
+    pub step_seconds: i64,
+    /// Interval the sampler writes at, in seconds. The client needs this to
+    /// label values honestly: a bucket is the *mean delta per sample*, so
+    /// "events per `sample_interval_seconds`", not a bucket total.
+    pub sample_interval_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineHistoryQuery {
+    /// Preset window: `1h` | `6h` | `24h` | `7d`. Ignored when both
+    /// `start_time` and `end_time` are given.
+    pub range: Option<String>,
+    /// Explicit window start (RFC 3339). Must be paired with `end_time`.
+    pub start_time: Option<DateTime<Utc>>,
+    /// Explicit window end (RFC 3339). Must be paired with `start_time`.
+    pub end_time: Option<DateTime<Utc>>,
 }
 
 // ── GenAI-specific DTOs ─────────────────────────────────────────────
@@ -240,7 +379,7 @@ fn discovery_window(
     (start, end)
 }
 
-fn parse_attributes(s: &str) -> BTreeMap<String, String> {
+pub(super) fn parse_attributes(s: &str) -> BTreeMap<String, String> {
     s.split(',')
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
@@ -470,6 +609,15 @@ pub async fn list_metric_label_values(
 }
 
 /// Query trace spans with optional filters.
+///
+/// Each returned span has a `duration_ms` field (float, milliseconds) — this is
+/// the ONLY field guaranteed to be in milliseconds. Spans also carry an
+/// `attributes` map of raw key/value pairs exactly as reported by the
+/// instrumenting library: numeric attribute values may be seconds, milliseconds,
+/// microseconds, or nanoseconds depending on that library's convention, and
+/// nothing in this response labels the unit. Never assume an attribute's
+/// numeric value shares `duration_ms`'s unit, and never state a duration in
+/// milliseconds unless it came from a `duration_ms` field.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -484,6 +632,8 @@ pub async fn list_metric_label_values(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("attributes" = Option<String>, Query, description = "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\""),
+        ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("limit" = Option<u64>, Query, description = "Max spans to return (default: 100, max: 1000)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -528,6 +678,7 @@ pub async fn query_traces(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        root_only: false,
         // Sorting only applies to the trace-summaries list, not raw span queries.
         sort_by: TraceSortField::default(),
         sort_order: SortOrder::default(),
@@ -557,9 +708,11 @@ pub async fn query_traces(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("attributes" = Option<String>, Query, description = "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\""),
         ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("sort_by" = Option<String>, Query, description = "Sort field: 'start_time' (default) or 'duration'"),
         ("sort_order" = Option<String>, Query, description = "Sort direction: 'asc' or 'desc' (default)"),
+        ("include_total" = Option<bool>, Query, description = "Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -604,6 +757,7 @@ pub async fn query_trace_summaries(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        root_only: false,
         sort_by: params
             .sort_by
             .as_deref()
@@ -618,15 +772,24 @@ pub async fn query_trace_summaries(
         offset: params.offset,
     };
 
-    // Clone query for the count call (which ignores limit/offset)
-    let count_query = TraceQuery {
-        limit: None,
-        offset: None,
-        ..query.clone()
+    // The page and the total are independent aggregations over the same
+    // window, so issue them concurrently rather than paying for both in
+    // series. `include_total=false` skips the second one entirely.
+    let (mut data, total) = if params.include_total.unwrap_or(true) {
+        // Clone query for the count call (which ignores limit/offset)
+        let count_query = TraceQuery {
+            limit: None,
+            offset: None,
+            ..query.clone()
+        };
+        let (data, total) = tokio::try_join!(
+            state.otel_service.query_trace_summaries(query),
+            state.otel_service.count_traces(count_query),
+        )?;
+        (data, Some(total))
+    } else {
+        (state.otel_service.query_trace_summaries(query).await?, None)
     };
-
-    let mut data = state.otel_service.query_trace_summaries(query).await?;
-    let total = state.otel_service.count_traces(count_query).await?;
 
     // Name cross-project trace rows whose root span lives in a sibling project:
     // when this project holds only child spans, the summary has no root and would
@@ -662,7 +825,252 @@ pub async fn query_trace_summaries(
     Ok(Json(TraceSummariesResponse { data, total }))
 }
 
+/// Rank operations by latency, volume, or inconsistency.
+///
+/// Groups spans by `(project, service, span name)` over a bounded window and
+/// returns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,
+/// and two variability ratios per operation. Sorting is what makes it useful:
+///
+/// - `sort_by=total_time` (default) — where the wall-clock actually goes.
+/// - `sort_by=p95` / `p99` — what users actually feel.
+/// - `sort_by=variability` or `tail_ratio` — operations whose *spread* is the
+///   problem: the ones that take 40ms most of the time and 4s the rest.
+/// - `span_name=payments.charge` — the worst this one operation ever got, in
+///   `max_duration_ms`.
+///
+/// Pair the variability sorts with `min_count` — a ratio computed from three
+/// samples is noise, and without a floor it outranks every real signal.
+///
+/// Two bounds are enforced rather than clamped, so a result never claims to
+/// cover more than it does: at most 50 projects, and a window no wider than
+/// 31 days. Both return 400. Unlike the trace list this report has no early
+/// exit — it aggregates every span in the window before it can rank anything.
+#[utoipa::path(
+    tag = "Traces",
+    get,
+    path = "/otel/span-stats",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Single project to report on"),
+        ("project_ids" = Option<String>, Query, description = "Comma-separated project ids, e.g. `4,5,6` (max 50)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+        ("service_name" = Option<String>, Query, description = "Restrict to one service"),
+        ("span_name" = Option<String>, Query, description = "Restrict to one operation by exact span name"),
+        ("name_pattern" = Option<String>, Query, description = "Case-insensitive substring match on the span name"),
+        ("kind" = Option<String>, Query, description = "server | client | internal | producer | consumer"),
+        ("status" = Option<String>, Query, description = "ok | error | unset"),
+        ("environment_id" = Option<i32>, Query, description = "Restrict to one environment"),
+        ("deployment_id" = Option<i32>, Query, description = "Restrict to one deployment"),
+        ("attributes" = Option<String>, Query, description = "Comma-separated key=value span attribute filters"),
+        ("min_duration_ms" = Option<f64>, Query, description = "Ignore spans faster than this"),
+        ("min_count" = Option<u64>, Query, description = "Drop operations with fewer samples than this"),
+        ("sort_by" = Option<String>, Query, description = "total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio"),
+        ("sort_order" = Option<String>, Query, description = "asc | desc (default)"),
+        ("limit" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
+        ("offset" = Option<u64>, Query, description = "Page offset"),
+    ),
+    responses(
+        (status = 200, description = "Per-operation latency statistics", body = SpanStatsResponse),
+        (status = 400, description = "Invalid query (no project, empty window)", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn query_span_stats(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<SpanStatsQueryParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    let (start_time, end_time) =
+        discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let project_ids = if params.project_id.is_none() && params.project_ids.is_none() {
+        let mut hidden = Vec::new();
+        if !auth.is_deployment_token() && !auth.is_instance_admin() {
+            if let Some(checker) = &state.project_access_checker {
+                let user = auth.user_id_opt().ok_or_else(|| {
+                    temps_core::error_builder::forbidden()
+                        .title("Project access denied")
+                        .build()
+                })?;
+                hidden = checker
+                    .hidden_project_ids(user)
+                    .await
+                    .map_err(|_| {
+                        temps_core::error_builder::internal_server_error()
+                            .title("Project access check failed")
+                            .build()
+                    })?
+                    .unwrap_or_default();
+            }
+        }
+        state
+            .telemetry_write_modes
+            .global_trace_scopes(auth.project_id(), &hidden, start_time, end_time)
+            .await
+            .map_err(|_| {
+                temps_core::error_builder::internal_server_error()
+                    .title("Could not resolve operation scopes")
+                    .build()
+            })?
+            .0
+            .into_iter()
+            .map(|s| s.project_id)
+            .collect()
+    } else {
+        let ids = parse_project_ids(&params)?;
+        for id in &ids {
+            project_scope_guard!(auth, *id);
+            project_access_guard!(auth, *id, state.project_access_checker);
+        }
+        ids
+    };
+
+    if project_ids.is_empty() {
+        return Ok(Json(SpanStatsResponse {
+            data: Vec::new(),
+            total: 0,
+            start_time,
+            end_time,
+        }));
+    }
+    let query = SpanStatsQuery {
+        project_ids,
+        start_time,
+        end_time,
+        service_name: params.service_name.clone(),
+        span_name: params.span_name.clone(),
+        name_pattern: params.name_pattern.clone().filter(|p| !p.is_empty()),
+        kind: params.kind.as_deref().and_then(parse_span_kind_param),
+        status: params.status.as_deref().and_then(parse_span_status_param),
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
+        attributes: params
+            .attributes
+            .as_deref()
+            .map(parse_attributes)
+            .filter(|m| !m.is_empty()),
+        min_duration_ms: params.min_duration_ms,
+        min_count: params.min_count.unwrap_or(1).max(1),
+        sort_by: params
+            .sort_by
+            .as_deref()
+            .map(SpanStatsSortField::parse)
+            .unwrap_or_default(),
+        sort_order: params
+            .sort_order
+            .as_deref()
+            .map(SortOrder::parse)
+            .unwrap_or_default(),
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    // The count ignores limit/offset but must keep every other filter, or the
+    // total disagrees with the page.
+    let count_query = SpanStatsQuery {
+        limit: None,
+        offset: None,
+        ..query.clone()
+    };
+
+    let (data, total) = tokio::try_join!(
+        state.otel_service.query_span_stats(query),
+        state.otel_service.count_span_stats(count_query),
+    )?;
+
+    Ok(Json(SpanStatsResponse {
+        data,
+        total,
+        start_time,
+        end_time,
+    }))
+}
+
+/// Resolve the requested projects from `project_ids` (preferred) or the
+/// single-project `project_id`.
+///
+/// Rejects an empty selection with a 400 rather than silently reporting on
+/// nothing: a typo in `project_ids` would otherwise return an empty table that
+/// looks exactly like "this project has no traces".
+fn parse_project_ids(params: &SpanStatsQueryParams) -> Result<Vec<i32>, Problem> {
+    let mut ids: Vec<i32> = match params.project_ids.as_deref() {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i32>().map_err(|_| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Project Ids")
+                        .with_detail(format!("'{s}' in project_ids is not an integer"))
+                })
+            })
+            .collect::<Result<Vec<i32>, Problem>>()?,
+        None => params.project_id.into_iter().collect(),
+    };
+    ids.sort_unstable();
+    ids.dedup();
+
+    if ids.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Project Required")
+            .with_detail(
+                "Provide project_id, or project_ids as a comma-separated list of project ids",
+            ));
+    }
+    // Rejected here, before the per-project access checks run, so an oversized
+    // list costs one string parse rather than one authorization round-trip per
+    // id. The service re-checks the same bound for non-HTTP callers.
+    if ids.len() > SPAN_STATS_MAX_PROJECTS {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Too Many Projects")
+            .with_detail(format!(
+                "span-stats accepts at most {} projects per query, got {}",
+                SPAN_STATS_MAX_PROJECTS,
+                ids.len()
+            )));
+    }
+    Ok(ids)
+}
+
+/// Parse a span-kind query token. Unknown → `None` (no filter).
+fn parse_span_kind_param(s: &str) -> Option<SpanKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "server" => Some(SpanKind::Server),
+        "client" => Some(SpanKind::Client),
+        "internal" => Some(SpanKind::Internal),
+        "producer" => Some(SpanKind::Producer),
+        "consumer" => Some(SpanKind::Consumer),
+        "unspecified" => Some(SpanKind::Unspecified),
+        _ => None,
+    }
+}
+
+/// Parse a span-status query token. Unknown → `None` (no filter).
+fn parse_span_status_param(s: &str) -> Option<SpanStatusCode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ok" => Some(SpanStatusCode::Ok),
+        "error" => Some(SpanStatusCode::Error),
+        "unset" => Some(SpanStatusCode::Unset),
+        _ => None,
+    }
+}
+
 /// Get all spans for a specific trace.
+///
+/// Each span has a `duration_ms` field (float, milliseconds) — the ONLY field
+/// guaranteed to be in milliseconds — plus an `attributes` map of raw
+/// key/value pairs exactly as the instrumenting library reported them.
+/// Numeric attribute values (e.g. connection-pool wait times, queue delays)
+/// may be in seconds, milliseconds, microseconds, or nanoseconds depending on
+/// that library's own convention; this response never labels the unit. When
+/// explaining what a span spent time on, only quote milliseconds from
+/// `duration_ms` (or from `start_time`/`end_time` deltas) — never assume a raw
+/// attribute number is already in milliseconds.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -875,6 +1283,44 @@ pub async fn get_quota(
     Ok(Json(QuotaResponse { quota }))
 }
 
+/// Whether a project has ever received at least one trace span.
+///
+/// A pure existence check for onboarding/setup UI (e.g. "has this project
+/// set up OpenTelemetry yet?"). Deliberately not `/otel/trace-summaries`
+/// with `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,
+/// `argMax`) and, without a time bound, that aggregation runs over every
+/// span the project has ever ingested. This endpoint answers the same
+/// yes/no question in O(1) — see `OtelStorage::has_traces`.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/has-traces/{project_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    responses(
+        (status = 200, description = "Trace existence check", body = HasTracesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn has_traces(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let has_traces = state.otel_service.has_traces(project_id).await?;
+    Ok(Json(HasTracesResponse { has_traces }))
+}
+
 /// Get OTel pipeline statistics (admin/system view).
 #[utoipa::path(
     tag = "OTel",
@@ -897,9 +1343,216 @@ pub async fn get_pipeline_stats(
     Ok(Json(PipelineStatsResponse { stats }))
 }
 
+/// Resolve `(from, to, step)` from either an explicit `[start_time, end_time]`
+/// pair or a preset `range`.
+///
+/// Mirrors `resolve_range_window` in `temps-providers`' node-metrics handler
+/// (same presets, same `duration_to_step` derivation, same width cap) so both
+/// time-series endpoints answer identically to the same query string. It is
+/// duplicated rather than shared because that helper is private to a crate
+/// this one does not — and should not — depend on.
+///
+/// `step` is always server-derived: a caller cannot ask for 1-minute buckets
+/// over a 7-day window and pull 10,080 points onto a 4 GB box.
+fn resolve_pipeline_window(
+    params: &PipelineHistoryQuery,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, chrono::Duration), Problem> {
+    match (params.start_time, params.end_time) {
+        (Some(start), Some(end)) => {
+            if start >= end {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Time Range")
+                    .with_detail("start_time must be before end_time"));
+            }
+            let span = end - start;
+            let max = chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS);
+            if span > max {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Time Range Too Wide")
+                    .with_detail(format!(
+                        "Requested time range spans {} days, which exceeds the {}-day \
+                         maximum for this endpoint. Older data is still available — \
+                         request it {} days at a time by moving start_time/end_time back.",
+                        span.num_days().max(1),
+                        temps_core::time_window::MAX_WINDOW_DAYS,
+                        temps_core::time_window::MAX_WINDOW_DAYS
+                    )));
+            }
+            Ok((start, end, temps_metrics::duration_to_step(span)))
+        }
+        (None, None) => {
+            let (window, step) = temps_metrics::range_to_step(
+                params.range.as_deref().unwrap_or(DEFAULT_HISTORY_RANGE),
+            );
+            let now = Utc::now();
+            Ok((now - window, now, step))
+        }
+        _ => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Time Range")
+            .with_detail("start_time and end_time must both be provided")),
+    }
+}
+
+/// Default window for `/otel/pipeline-history`.
+///
+/// 24h rather than the node endpoint's 1h: the sampler writes one point per
+/// minute, so an hour is only 60 samples — enough to see a spike in progress
+/// but not enough to tell whether it is unusual.
+const DEFAULT_HISTORY_RANGE: &str = "24h";
+
+/// Chart the OTel pipeline counters over time.
+///
+/// `/otel/pipeline-stats` gives lifetime totals and `/otel/ingest-errors`
+/// gives failure reasons; this gives the shape over time — whether drops are a
+/// past incident that already recovered or an ongoing bleed, which a
+/// cumulative counter can never show.
+///
+/// Reads the delta series the background sampler writes to the shared metrics
+/// store (`SourceKind::Node`, node 0). Values are **mean deltas per sample
+/// interval**, not bucket totals — `sample_interval_seconds` in the response
+/// carries the unit so the client can label them.
+///
+/// System-scoped like the other two pipeline endpoints: these counters are
+/// process-wide, so there is no project parameter to scope by.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/pipeline-history",
+    params(
+        ("range" = Option<String>, Query, description = "Preset window: 1h | 6h | 24h | 7d (default 24h). Ignored when start_time and end_time are both set."),
+        ("start_time" = Option<String>, Query, description = "Explicit window start (RFC 3339); must be paired with end_time"),
+        ("end_time" = Option<String>, Query, description = "Explicit window end (RFC 3339); must be paired with start_time"),
+    ),
+    responses(
+        (status = 200, description = "Pipeline counter history", body = PipelineHistoryResponse),
+        (status = 400, description = "Invalid time range", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 503, description = "Metrics store not available", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pipeline_history(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<PipelineHistoryQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    // Validate the caller's own input BEFORE checking server capability.
+    // Reversing these hides a fixable mistake behind an unrelated one: on a
+    // server without metric collection, a malformed range would answer
+    // "Metrics Unavailable" and the caller would never learn their start_time
+    // was after their end_time.
+    let (from, to, step) = resolve_pipeline_window(&params)?;
+
+    // Metric collection is optional. Say so explicitly rather than returning
+    // an empty chart, which would read as "nothing was dropped".
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Metrics Unavailable")
+            .with_detail(
+                "Metric collection is not enabled on this server, so pipeline history \
+                 is not being recorded. Live counters are still available at \
+                 /otel/pipeline-stats.",
+            )
+    })?;
+
+    let mut series = Vec::with_capacity(crate::plugin::OTEL_PIPELINE_STAT_COUNT);
+    for name in crate::plugin::OTEL_PIPELINE_METRIC_NAMES {
+        let query = temps_metrics::RangeQuery {
+            source_kind: temps_metrics::SourceKind::Node,
+            source_id: crate::plugin::CONTROL_PLANE_NODE_ID,
+            name: name.to_string(),
+            from,
+            to,
+            step,
+            // The sampler already writes per-cycle deltas, so there is nothing
+            // to LAG-difference at read time. Treating these as cumulative
+            // would subtract successive deltas and render mostly zeros.
+            monotonic: false,
+        };
+
+        // Queried sequentially rather than with a join_all fan-out: 13
+        // concurrent connections from one dashboard poll is a meaningful
+        // fraction of the pool on the small boxes this targets, and each
+        // query is a bounded aggregate over at most MAX_SERIES_POINTS rows.
+        let points = store.query_range(query).await.map_err(|e| {
+            warn!(metric = %name, error = %e, "Failed to query OTel pipeline history");
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Metrics Unavailable")
+                .with_detail(format!("Failed to query pipeline history for '{name}'"))
+        })?;
+
+        series.push(PipelineSeries {
+            name: name.to_string(),
+            points: points
+                .into_iter()
+                .map(|(time, value)| PipelineHistoryPoint {
+                    time: time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    value,
+                })
+                .collect(),
+        });
+    }
+
+    Ok(Json(PipelineHistoryResponse {
+        series,
+        start_time: from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        end_time: to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        step_seconds: step.num_seconds(),
+        sample_interval_seconds: crate::plugin::OTEL_STATS_SAMPLE_INTERVAL_SECS as i64,
+    }))
+}
+
+/// List recent OTel ingest failures, grouped by signal and error class.
+///
+/// The companion to `/otel/pipeline-stats`: that endpoint reports *how many*
+/// records were dropped, this one reports *why*, so an operator can tell a
+/// ClickHouse outage from a schema mismatch without reading server logs.
+///
+/// Read-only and system-scoped (no project parameter), matching
+/// `get_pipeline_stats` — the counters it explains are process-wide.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/ingest-errors",
+    params(
+        ("limit" = Option<u32>, Query, description = "Max groups to return (default 20, max 100)")
+    ),
+    responses(
+        (status = 200, description = "Recent ingest failure groups", body = IngestErrorsResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_ingest_errors(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<IngestErrorsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    // `0`/absent both mean "unspecified"; the storage layer clamps into
+    // 1..=100 so an oversized limit can't turn into an unbounded scan.
+    let errors = state
+        .otel_service
+        .recent_ingest_errors(params.limit.unwrap_or(0))
+        .await?;
+
+    Ok(Json(IngestErrorsResponse { errors }))
+}
+
 // ── GenAI Agent Activity Handlers ──────────────────────────────────
 
 /// Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
@@ -976,6 +1629,11 @@ pub async fn query_genai_traces(
 }
 
 /// Get GenAI span details for a specific trace.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
@@ -1032,21 +1690,24 @@ pub async fn get_genai_trace(
 /// The match is exhaustive with no catch-all arm per CLAUDE.md rules.
 impl From<CrossProjectTraceError> for Problem {
     fn from(error: CrossProjectTraceError) -> Self {
-        let detail = error.to_string();
         match error {
             CrossProjectTraceError::InvalidTraceId { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Trace ID")
-                    .with_detail(detail)
+                    .with_detail(error.to_string())
             }
-            CrossProjectTraceError::RecordHint { .. }
-            | CrossProjectTraceError::QuerySiblings { .. }
+            CrossProjectTraceError::QuerySiblings { .. }
             | CrossProjectTraceError::QueryProjects { .. }
             | CrossProjectTraceError::Database(_)
             | CrossProjectTraceError::Storage(_) => {
+                // Log the real error server-side only — DB/storage error text
+                // can contain schema/table names or paths that must not reach
+                // the caller. Same pattern as `ingest_handler`'s
+                // `From<OtelError> for Problem`.
+                warn!(error = %error, "Cross-project trace query internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(detail)
+                    .with_detail("An internal error occurred")
             }
         }
     }
@@ -1100,6 +1761,103 @@ pub struct CrossProjectSiblingsParams {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+/// Projects out of `project_ids` the caller is entitled to read telemetry for.
+///
+/// A trace id is not an authorization boundary — it travels in `traceparent`
+/// headers, appears in logs and client-visible integrations, and an attacker
+/// can make an instrumented endpoint record a trace id of their choosing. So
+/// both cross-project endpoints intersect their results with the caller's
+/// actual project access instead of trusting the id.
+///
+/// Instance-wide Admin/PlatformAdmin bypass, matching the documented contract
+/// of [`temps_core::ProjectAccessChecker`]. With no checker registered (plain
+/// OSS) every project is readable, which is the documented
+/// fail-open-when-unconfigured behaviour of the extension point — there is no
+/// team model in OSS to scope against. Infrastructure errors from the checker
+/// drop the project (fail closed) rather than disclosing its spans.
+async fn readable_project_ids(
+    auth: &temps_auth::AuthContext,
+    state: &OtelAppState,
+    project_ids: impl IntoIterator<Item = i32>,
+) -> std::collections::HashSet<i32> {
+    let project_ids: std::collections::HashSet<i32> = project_ids.into_iter().collect();
+
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return project_ids;
+    }
+    let Some(checker) = state.project_access_checker.as_deref() else {
+        return project_ids;
+    };
+
+    let mut readable = std::collections::HashSet::new();
+    for project_id in project_ids {
+        match checker
+            .user_can_access_project(auth.user_id(), project_id)
+            .await
+        {
+            Ok(true) => {
+                readable.insert(project_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    project_id,
+                    error = %error,
+                    "Project access check failed while scoping a cross-project trace; \
+                     excluding the project"
+                );
+            }
+        }
+    }
+    readable
+}
+
+/// Drop everything in `unified` that belongs to a project outside `readable`,
+/// and recompute the trace-level aggregates over what remains.
+///
+/// Mirrors the sharing-opt-out redaction the service already performs: the
+/// response still describes the same trace, it just stops carrying spans (and
+/// project names/ids) the caller may not see. `has_redacted_spans` is set so
+/// the UI can say the waterfall is partial rather than implying the trace was
+/// this short. Pure so the arithmetic is testable without storage.
+fn redact_unreadable_projects(
+    unified: &mut UnifiedTrace,
+    readable: &std::collections::HashSet<i32>,
+) {
+    let projects_before = unified.projects.len();
+    let spans_before = unified.spans.len();
+    let truncated_before = unified.truncated_projects.len();
+
+    unified
+        .projects
+        .retain(|project| readable.contains(&project.project_id));
+    unified
+        .spans
+        .retain(|span| readable.contains(&span.project_id));
+    unified
+        .truncated_projects
+        .retain(|project_id| readable.contains(project_id));
+
+    // Only claim redaction when something was actually removed. This function
+    // is now called on every trace, and flagging a fully-readable one would
+    // tell the UI that spans are missing when none are.
+    unified.has_redacted_spans = unified.projects.len() != projects_before
+        || unified.spans.len() != spans_before
+        || unified.truncated_projects.len() != truncated_before;
+    unified.start_time = unified.spans.iter().map(|a| a.span.start_time).min();
+    unified.end_time = unified.spans.iter().map(|a| a.span.end_time).max();
+    unified.total_duration_ms = match (unified.start_time, unified.end_time) {
+        (Some(start), Some(end)) if end >= start => (end - start).num_milliseconds().max(0) as f64,
+        _ => 0.0,
+    };
+    unified.span_count = unified.spans.len();
+    unified.error_count = unified
+        .spans
+        .iter()
+        .filter(|a| matches!(a.span.status_code, crate::types::SpanStatusCode::Error))
+        .count();
+}
 
 /// Discover sibling projects that share the same `trace_id` (Phase 1 banner).
 ///
@@ -1171,8 +1929,13 @@ pub async fn get_cross_project_trace_siblings(
         .await
         .map_err(Problem::from)?;
 
+    // Scope to what the caller may actually read — the trace id alone proves
+    // nothing about entitlement, and the sibling list discloses project
+    // names/slugs as well as topology.
+    let readable = readable_project_ids(&auth, &state, siblings.iter().map(|s| s.project_id)).await;
     let siblings: Vec<CrossProjectSiblingRef> = siblings
         .into_iter()
+        .filter(|sibling| readable.contains(&sibling.project_id))
         .map(CrossProjectSiblingRef::from)
         .collect();
 
@@ -1240,11 +2003,33 @@ pub async fn get_unified_trace(
         );
     }
 
-    let unified: UnifiedTrace = state
+    let mut unified: UnifiedTrace = state
         .cross_project_service
         .get_unified_trace(&trace_id)
         .await
         .map_err(Problem::from)?;
+
+    // Over the union of both id sources, not just `projects`.
+    //
+    // `truncated_projects` is populated *before* fan-out, from projects dropped
+    // at the cap, so those ids never appear in `projects`. Deriving the readable
+    // set from `projects` alone meant a truncated id could never be in it, and
+    // the `len() != len()` short-circuit then skipped redaction altogether — so
+    // a caller who could read every project that contributed spans still got
+    // the ids of the ones that were dropped.
+    let readable = readable_project_ids(
+        &auth,
+        &state,
+        unified
+            .projects
+            .iter()
+            .map(|project| project.project_id)
+            .chain(unified.truncated_projects.iter().copied()),
+    )
+    .await;
+    // Unconditional: the short-circuit above was the bug, and redaction on an
+    // already-fully-readable trace is a no-op.
+    redact_unreadable_projects(&mut unified, &readable);
 
     Ok(Json(unified))
 }
@@ -1252,6 +2037,411 @@ pub async fn get_unified_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::services::cross_project::{AnnotatedSpan, ProjectRef};
+    use crate::types::{SpanKind, SpanRecord, SpanStatusCode};
+    use std::collections::{BTreeMap, HashSet};
+
+    fn span_for(project_id: i32, offset_ms: i64, status: SpanStatusCode) -> AnnotatedSpan {
+        let start_time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp")
+            + chrono::Duration::milliseconds(offset_ms);
+        AnnotatedSpan {
+            project_id,
+            project_name: format!("project-{project_id}"),
+            span: SpanRecord {
+                project_id,
+                deployment_id: None,
+                resource: crate::types::ResourceInfo {
+                    service_name: "svc".to_string(),
+                    service_version: None,
+                    deployment_environment: None,
+                    attributes: BTreeMap::new(),
+                },
+                trace_id: "a".repeat(32),
+                span_id: format!("span-{project_id}-{offset_ms}"),
+                parent_span_id: None,
+                name: "op".to_string(),
+                kind: SpanKind::Server,
+                start_time,
+                end_time: start_time + chrono::Duration::milliseconds(100),
+                duration_ms: 100.0,
+                status_code: status,
+                status_message: String::new(),
+                attributes: BTreeMap::new(),
+                events: Vec::new(),
+            },
+        }
+    }
+
+    fn unified_fixture() -> UnifiedTrace {
+        UnifiedTrace {
+            trace_id: "a".repeat(32),
+            projects: vec![
+                ProjectRef {
+                    project_id: 1,
+                    project_name: "project-1".to_string(),
+                    project_slug: "project-1".to_string(),
+                },
+                ProjectRef {
+                    project_id: 2,
+                    project_name: "project-2".to_string(),
+                    project_slug: "project-2".to_string(),
+                },
+            ],
+            spans: vec![
+                span_for(1, 0, SpanStatusCode::Ok),
+                span_for(2, 500, SpanStatusCode::Error),
+            ],
+            start_time: None,
+            end_time: None,
+            total_duration_ms: 600.0,
+            span_count: 2,
+            error_count: 1,
+            has_redacted_spans: false,
+            truncated: false,
+            truncated_projects: vec![2],
+        }
+    }
+
+    // ── Pipeline history endpoint ───────────────────────────────────────
+
+    fn history_query(
+        range: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> PipelineHistoryQuery {
+        PipelineHistoryQuery {
+            range: range.map(str::to_string),
+            start_time: start,
+            end_time: end,
+        }
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// An absent range must resolve to the documented 24h default, not the
+    /// node endpoint's 1h — 60 samples is too few to judge a spike.
+    #[test]
+    fn pipeline_window_defaults_to_24h() {
+        let (from, to, step) =
+            resolve_pipeline_window(&history_query(None, None, None)).expect("resolves");
+        let span = to - from;
+        assert_eq!(span.num_hours(), 24);
+        // 24h → 15m buckets per the shared duration_to_step presets.
+        assert_eq!(step.num_minutes(), 15);
+    }
+
+    #[test]
+    fn pipeline_window_honours_presets() {
+        for (range, hours) in [("1h", 1), ("6h", 6), ("24h", 24), ("7d", 168)] {
+            let (from, to, _) = resolve_pipeline_window(&history_query(Some(range), None, None))
+                .expect("preset resolves");
+            assert_eq!((to - from).num_hours(), hours, "range {range}");
+        }
+    }
+
+    /// Explicit bounds win over the preset, and the step is derived from the
+    /// actual span rather than the ignored `range`.
+    #[test]
+    fn pipeline_window_explicit_bounds_override_range() {
+        let start = at(1_700_000_000);
+        let end = start + chrono::Duration::hours(6);
+        let (from, to, step) =
+            resolve_pipeline_window(&history_query(Some("7d"), Some(start), Some(end)))
+                .expect("resolves");
+        assert_eq!(from, start);
+        assert_eq!(to, end);
+        assert_eq!(step.num_minutes(), 5, "6h span → 5m buckets");
+    }
+
+    #[test]
+    fn pipeline_window_rejects_inverted_bounds() {
+        let start = at(1_700_000_000);
+        let end = start - chrono::Duration::hours(1);
+        let err = resolve_pipeline_window(&history_query(None, Some(start), Some(end)))
+            .expect_err("inverted range must be rejected");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    /// One bound without the other is ambiguous — reject rather than silently
+    /// substituting "now" for the missing side.
+    #[test]
+    fn pipeline_window_rejects_a_half_specified_range() {
+        let start = at(1_700_000_000);
+        assert_eq!(
+            resolve_pipeline_window(&history_query(None, Some(start), None))
+                .expect_err("start alone must be rejected")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            resolve_pipeline_window(&history_query(None, None, Some(start)))
+                .expect_err("end alone must be rejected")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The width cap protects a 4 GB box from an unbounded scan; it must be
+    /// enforced on explicit bounds, which are the only way to exceed it.
+    #[test]
+    fn pipeline_window_rejects_a_span_wider_than_the_cap() {
+        let start = at(1_700_000_000);
+        let end = start
+            + chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS)
+            + chrono::Duration::hours(1);
+        let err = resolve_pipeline_window(&history_query(None, Some(start), Some(end)))
+            .expect_err("over-wide range must be rejected");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    /// Every preset must stay under the series-point cap, so no preset can
+    /// ever return an unbounded number of buckets.
+    #[test]
+    fn every_preset_stays_under_the_series_point_cap() {
+        for range in ["1h", "6h", "24h", "7d"] {
+            let (from, to, step) = resolve_pipeline_window(&history_query(Some(range), None, None))
+                .expect("preset resolves");
+            let buckets = temps_core::time_window::bucket_count(
+                (to - from).num_seconds(),
+                step.num_seconds(),
+            );
+            assert!(
+                buckets <= temps_core::time_window::MAX_SERIES_POINTS,
+                "range {range} would emit {buckets} buckets"
+            );
+        }
+    }
+
+    /// An unknown range must fall back to a valid window rather than erroring
+    /// or producing a zero-width span.
+    #[test]
+    fn pipeline_window_unknown_range_falls_back() {
+        let (from, to, _) = resolve_pipeline_window(&history_query(Some("nonsense"), None, None))
+            .expect("unknown range falls back rather than failing");
+        assert!(to > from);
+    }
+
+    /// The response must carry the sample interval: a bucket is a mean delta
+    /// per sample, so a value is meaningless without its unit.
+    #[test]
+    fn pipeline_history_response_serializes_with_units_and_iso_timestamps() {
+        let json = serde_json::to_value(PipelineHistoryResponse {
+            series: vec![PipelineSeries {
+                name: "otel.spans_dropped".to_string(),
+                points: vec![PipelineHistoryPoint {
+                    time: at(1_700_000_000).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    value: 12.0,
+                }],
+            }],
+            start_time: at(1_700_000_000).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            end_time: at(1_700_003_600).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            step_seconds: 900,
+            sample_interval_seconds: 60,
+        })
+        .expect("serializes");
+
+        assert_eq!(json["series"][0]["name"], "otel.spans_dropped");
+        assert_eq!(json["series"][0]["points"][0]["value"], 12.0);
+        assert_eq!(json["step_seconds"], 900);
+        assert_eq!(json["sample_interval_seconds"], 60);
+        for field in ["start_time", "end_time"] {
+            let ts = json[field].as_str().unwrap_or_default();
+            assert!(
+                ts.ends_with('Z'),
+                "{field} must be ISO-8601 UTC, got {ts:?}"
+            );
+        }
+        let point_ts = json["series"][0]["points"][0]["time"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(point_ts.ends_with('Z'), "point time must be UTC");
+    }
+
+    /// A counter with no samples yet must serialize as an empty array, so the
+    /// client renders an empty chart rather than dropping the panel.
+    #[test]
+    fn pipeline_history_empty_series_serializes_as_array() {
+        let json = serde_json::to_value(PipelineSeries {
+            name: "otel.logs_dropped".to_string(),
+            points: vec![],
+        })
+        .expect("serializes");
+        assert!(json["points"].is_array());
+        assert_eq!(json["points"].as_array().map(Vec::len), Some(0));
+    }
+
+    // ── Ingest errors endpoint ──────────────────────────────────────────
+
+    fn ingest_error_fixture() -> IngestErrorSummary {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp");
+        IngestErrorSummary {
+            signal_type: "spans".to_string(),
+            error_class: "clickhouse_network".to_string(),
+            sample_message: "ClickHouse store_spans failed: network error".to_string(),
+            count: 7,
+            first_seen: ts,
+            last_seen: ts + chrono::Duration::seconds(60),
+        }
+    }
+
+    /// The response must expose the fields the dashboard needs, with ISO-8601
+    /// `Z` timestamps per the workspace date convention.
+    #[test]
+    fn ingest_errors_response_serializes_the_expected_shape() {
+        let json = serde_json::to_value(IngestErrorsResponse {
+            errors: vec![ingest_error_fixture()],
+        })
+        .expect("serializes");
+
+        let entry = &json["errors"][0];
+        assert_eq!(entry["signal_type"], "spans");
+        assert_eq!(entry["error_class"], "clickhouse_network");
+        assert_eq!(entry["count"], 7);
+        assert!(entry["sample_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("network error")));
+
+        for field in ["first_seen", "last_seen"] {
+            let ts = entry[field].as_str().unwrap_or_default();
+            assert!(
+                ts.ends_with('Z'),
+                "{field} must be ISO-8601 UTC, got {ts:?}"
+            );
+        }
+    }
+
+    /// An empty report must serialize as `[]`, never `null` — a client doing
+    /// `errors.map(...)` should not have to null-guard a healthy pipeline.
+    #[test]
+    fn ingest_errors_response_serializes_empty_as_array() {
+        let json =
+            serde_json::to_value(IngestErrorsResponse { errors: vec![] }).expect("serializes");
+        assert!(json["errors"].is_array());
+        assert_eq!(json["errors"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// An absent `limit` must deserialize to `None`, which the handler maps to
+    /// "unspecified" (→ default page) rather than zero results.
+    #[test]
+    fn ingest_errors_query_limit_is_optional() {
+        let empty: IngestErrorsQuery = serde_json::from_str("{}").expect("absent limit is valid");
+        assert_eq!(empty.limit, None);
+
+        let explicit: IngestErrorsQuery =
+            serde_json::from_str(r#"{"limit":50}"#).expect("valid query");
+        assert_eq!(explicit.limit, Some(50));
+    }
+
+    /// A trace id is not an authorization boundary — it travels in
+    /// `traceparent` headers. Spans, project identities and the aggregates
+    /// computed from them must all be scoped to what the caller can read.
+    #[test]
+    fn unreadable_projects_are_stripped_from_a_unified_trace() {
+        let mut unified = unified_fixture();
+        redact_unreadable_projects(&mut unified, &HashSet::from([1]));
+
+        assert_eq!(unified.spans.len(), 1);
+        assert_eq!(unified.spans[0].project_id, 1);
+        assert!(unified.projects.iter().all(|p| p.project_id == 1));
+        assert!(
+            unified.truncated_projects.is_empty(),
+            "truncated_projects must not disclose a project the caller cannot read"
+        );
+        assert!(unified.has_redacted_spans);
+
+        // Aggregates are recomputed over the remaining spans, not carried
+        // over from the full trace.
+        assert_eq!(unified.span_count, 1);
+        assert_eq!(unified.error_count, 0);
+        assert_eq!(unified.total_duration_ms, 100.0);
+    }
+
+    /// Nothing readable at all must yield an empty, self-consistent trace
+    /// rather than the original aggregates.
+    #[test]
+    fn redaction_of_every_project_leaves_an_empty_trace() {
+        let mut unified = unified_fixture();
+        redact_unreadable_projects(&mut unified, &HashSet::new());
+
+        assert!(unified.spans.is_empty());
+        assert!(unified.projects.is_empty());
+        assert_eq!(unified.span_count, 0);
+        assert_eq!(unified.error_count, 0);
+        assert_eq!(unified.total_duration_ms, 0.0);
+        assert!(unified.start_time.is_none());
+        assert!(unified.end_time.is_none());
+    }
+
+    /// `include_total=false` must OMIT the key rather than report 0. A client
+    /// that reads `total ?? 0` would otherwise render "0 traces" over a full
+    /// page of results.
+    #[test]
+    fn trace_summaries_response_omits_total_when_not_requested() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: None,
+        })
+        .expect("serialize");
+
+        assert!(
+            json.get("total").is_none(),
+            "absent total must mean 'not computed', never zero: {json}"
+        );
+    }
+
+    #[test]
+    fn trace_summaries_response_includes_total_when_computed() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: Some(0),
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            json.get("total").and_then(|t| t.as_u64()),
+            Some(0),
+            "a genuinely-zero total must still be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn cross_project_trace_error_internal_variants_do_not_leak_db_error_text() {
+        let err = CrossProjectTraceError::Database(sea_orm::DbErr::Custom(
+            "column \"trace_id\" not found in table \"cross_project_trace_refs\"".into(),
+        ));
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(detail, "An internal error occurred");
+        assert!(
+            !detail.contains("cross_project_trace_refs"),
+            "detail leaked: {detail}"
+        );
+    }
+
+    #[test]
+    fn cross_project_trace_error_invalid_trace_id_keeps_user_facing_detail() {
+        let err = CrossProjectTraceError::InvalidTraceId {
+            trace_id: "not-hex".into(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("not-hex"), "detail: {detail}");
+    }
 
     #[test]
     fn test_parse_attributes_single_pair() {

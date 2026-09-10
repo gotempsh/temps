@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker log collector service
 //!
 //! Opens a streaming log connection to the Docker daemon for each running container.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { AnalyticsOptions, SessionRecordingConfig } from "@temps-sdk/analytics-core";
 import { init } from "./index";
 
@@ -17,7 +20,9 @@ function readDataset(): AnalyticsOptions {
   if (typeof document === "undefined") return {};
   const script = (document.currentScript as HTMLScriptElement | null)
     ?? document.querySelector<HTMLScriptElement>("script[data-temps]")
-    ?? Array.from(document.scripts).reverse().find((s) => !!s.dataset?.domain || !!s.dataset?.basePath)
+    ?? Array.from(document.scripts)
+      .reverse()
+      .find((s) => !!s.dataset?.domain || !!s.dataset?.basePath || !!s.dataset?.ingestKey)
     ?? null;
   if (!script) return {};
 
@@ -26,6 +31,9 @@ function readDataset(): AnalyticsOptions {
   const recording: SessionRecordingConfig = {};
 
   if (ds.basePath) opts.basePath = ds.basePath;
+  // `data-ingest-key="pa_…"`. Needed when the page is not served by Temps, so
+  // there is no Host-based route-table entry to attribute the events with.
+  if (ds.ingestKey) opts.ingestKey = ds.ingestKey;
   if (ds.domain) opts.domain = ds.domain;
   if (ds.disabled) opts.disabled = ds.disabled === "true";
   if (ds.ignoreLocalhost) opts.ignoreLocalhost = ds.ignoreLocalhost === "true";

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::config::*;
 use crate::service::lb_service::LbService;
 use crate::traits::*;
@@ -5,7 +8,7 @@ use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 const ROUTE_PREFIX_OTEL: &str = "/api/otel";
@@ -158,7 +161,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
         }
 
         // No route found - route to console address as default
-        warn!(
+        debug!(
             "No route found in table for host: {}, routing to console (route_count={})",
             host,
             self.route_table.len()
@@ -205,6 +208,10 @@ impl UpstreamResolver for UpstreamResolverImpl {
     async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
         Some("round_robin".to_string())
     }
+
+    fn console_address(&self) -> &str {
+        &self.server_config.console_address
+    }
 }
 
 /// Implementation of ProjectContextResolver trait
@@ -216,20 +223,38 @@ impl ProjectContextResolverImpl {
     pub fn new(route_table: Arc<CachedPeerTable>) -> Self {
         Self { route_table }
     }
-}
 
-#[async_trait]
-impl ProjectContextResolver for ProjectContextResolverImpl {
-    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
-        // Get route info from O(1) route table lookup with cached models
+    fn project_context_from_route(&self, host: &str) -> Option<ProjectContext> {
         let route_info = self.route_table.get_route(host)?;
-
-        // Return cached models directly - no database queries!
         Some(ProjectContext {
             project: route_info.project?,
             environment: route_info.environment?,
             deployment: route_info.deployment?,
         })
+    }
+}
+
+#[async_trait]
+impl ProjectContextResolver for ProjectContextResolverImpl {
+    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
+        if let Some(context) = self.project_context_from_route(host) {
+            return Some(context);
+        }
+
+        // Upstream selection waits for the first route load before retrying.
+        // Context resolution must do the same or request filters can observe no
+        // project and skip project-scoped protections for a route that becomes
+        // available moments later in the same request.
+        if !self.route_table.has_loaded() {
+            debug!(
+                "Route table not loaded yet; waiting up to {:?} before resolving project context (host: {})",
+                FIRST_LOAD_WAIT, host
+            );
+            self.route_table.wait_until_loaded(FIRST_LOAD_WAIT).await;
+            return self.project_context_from_route(host);
+        }
+
+        None
     }
 
     async fn is_static_deployment(&self, host: &str) -> bool {

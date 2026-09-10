@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests that PROVE router replay enforces auth / permissions.
 //!
 //! Each test builds a small `axum::Router` whose handlers read `AuthContext`
@@ -25,7 +28,7 @@ mod tests {
         OpenApiBuilder, RefOr, Required, Schema,
     };
 
-    use crate::{ApiCallScope, InternalApiCaller};
+    use crate::{ApiCallScope, InternalApiCaller, ProjectSelectorScope};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -44,6 +47,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -174,7 +178,7 @@ mod tests {
         let auth = auth_with_role(42, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let response = caller
@@ -190,12 +194,13 @@ mod tests {
         );
     }
 
-    /// `guarded` with Admin role → 200 (has ProjectsRead).
+    /// `guarded` with Admin role → 200 (has ProjectsRead), even when the chat
+    /// carries a project context and the operation itself is global.
     ///
     /// Proves that the permission check inside the handler evaluates the
     /// injected `AuthContext` — a caller with the right role passes.
     #[tokio::test]
-    async fn test_guarded_allows_admin() {
+    async fn test_global_guarded_operation_allows_user_with_permission() {
         let router = test_router();
         let openapi = test_openapi();
         let caller = InternalApiCaller::new(router, &openapi, vec![]);
@@ -203,7 +208,7 @@ mod tests {
         let auth = auth_with_role(1, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Allowed(vec![7]),
         };
 
         // Admin has ProjectsRead → the handler returns 200.
@@ -217,13 +222,14 @@ mod tests {
     }
 
     /// `guarded` with a Custom role that has NO permissions → the handler
-    /// returns 403, which `InternalApiCaller` maps to `ApiToolError::Upstream`.
+    /// returns 403 even when the same global operation is invoked from a chat
+    /// carrying a project context. The context cannot grant platform access.
     ///
     /// This is the core security proof: the router's permission check (not any
     /// code in this crate) enforces authz; a caller lacking the permission
     /// cannot reach the protected response.
     #[tokio::test]
-    async fn test_guarded_rejects_caller_without_permission() {
+    async fn test_global_guarded_operation_rejects_user_without_permission() {
         let router = test_router();
         let openapi = test_openapi();
         let caller = InternalApiCaller::new(router, &openapi, vec![]);
@@ -239,7 +245,7 @@ mod tests {
         );
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Allowed(vec![7]),
         };
 
         let err = caller
@@ -265,7 +271,7 @@ mod tests {
         let auth = auth_with_role(1, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let err = caller
@@ -291,7 +297,7 @@ mod tests {
         let auth = auth_with_role(1, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let err = caller
@@ -322,7 +328,7 @@ mod tests {
         let auth = auth_with_role(1, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let results = caller.search("guarded", &scope);

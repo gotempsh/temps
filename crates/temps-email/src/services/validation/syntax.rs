@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email address syntax validation.
 //!
 //! Pragmatic RFC 5321/5322 parsing — strict enough to reject the addresses
@@ -16,6 +19,9 @@ pub struct ParsedEmail {
 /// domain. Returns `None` if the address is not syntactically valid.
 pub fn parse_email(email: &str) -> Option<ParsedEmail> {
     let email = email.trim();
+    if email.len() > 254 {
+        return None;
+    }
 
     // Exactly one '@', and it must not be at either end.
     let at = email.find('@')?;
@@ -193,5 +199,18 @@ mod tests {
         assert!(parse_email(&format!("{long_local}@example.com")).is_none());
         let ok_local = "a".repeat(64);
         assert!(parse_email(&format!("{ok_local}@example.com")).is_some());
+    }
+
+    #[test]
+    fn test_total_address_length_limit() {
+        let long_domain = format!(
+            "{}.{}.{}.com",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63)
+        );
+        let email = format!("{}@{long_domain}", "d".repeat(64));
+        assert!(email.len() > 254);
+        assert!(parse_email(&email).is_none());
     }
 }

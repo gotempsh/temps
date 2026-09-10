@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Worker-pooled HTTP load generator. Fires a fixed number of requests (or runs
  * for a fixed duration) at a target URL with bounded concurrency, then reports

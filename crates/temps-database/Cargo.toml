@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-database"
 version.workspace = true
@@ -14,6 +17,7 @@ temps-entities = { path = "../temps-entities" }
 temps-migrations = { path = "../temps-migrations" }
 sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
 sea-orm-migration = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 testcontainers = { workspace = true }

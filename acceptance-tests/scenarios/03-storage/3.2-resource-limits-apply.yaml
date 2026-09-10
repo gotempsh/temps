@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 id: "3.2"
 title: Apply CPU + memory cap on a running container, live update
 section: 03-storage

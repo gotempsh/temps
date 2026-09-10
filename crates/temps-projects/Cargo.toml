@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-projects"
 version.workspace = true
@@ -39,6 +42,10 @@ axum-macros = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
 slug = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
+zip = { workspace = true }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState, useMemo, type ReactNode } from 'react'
 import { CodeBlock } from '@/components/ui/code-block'
 import { cn } from '@/lib/utils'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -5,6 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
+import { httpStatusClass } from '@/lib/http-status-class'
 import { Button } from '@/components/ui/button'
 import {
   Select,
@@ -34,12 +38,26 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 
 interface ProxyLogsListProps {
   project: ProjectResponse
-  onRowClick?: (logId: number, projectId: number, timestamp: string) => void
+  onRowClick?: (requestId: string, projectId: number, timestamp: string) => void
   showEnvironmentFilter?: boolean
+}
+
+const STATUS_BADGE_CLASSES: Record<
+  ReturnType<typeof httpStatusClass>,
+  string
+> = {
+  '1xx': 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
+  '2xx': 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+  '3xx':
+    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+  '4xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  '5xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  unknown:
+    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
 }
 
 export default function ProxyLogsList({
@@ -77,8 +95,13 @@ export default function ProxyLogsList({
   const [environment, setEnvironment] = useState<string>(() => {
     return searchParams.get('environment') || 'all'
   })
+  // Default to showing all traffic: this page's whole purpose is a complete
+  // request log, and a project whose traffic is mostly programmatic API
+  // callers (not human pageloads) would otherwise silently render as near-
+  // empty, since "Hide bots" was previously the default and API/service
+  // clients are routinely bot-classified (curl, SDKs, monitoring probes).
   const [showBots, setShowBots] = useState<string>(() => {
-    return searchParams.get('show_bots') || 'no'
+    return searchParams.get('show_bots') || 'all'
   })
   // AI / path context, set by the analytics drill-downs (AI Agents card, AI
   // Agents detail page, Page detail). When present we scope the table to that
@@ -207,7 +230,7 @@ export default function ProxyLogsList({
       newParams.set('status_code', statusCode)
     }
 
-    if (showBots && showBots !== 'no') {
+    if (showBots && showBots !== 'all') {
       newParams.set('show_bots', showBots)
     }
 
@@ -290,7 +313,7 @@ export default function ProxyLogsList({
     if (method !== 'all') n += 1
     if (statusCode !== 'all') n += 1
     if (environment !== 'all') n += 1
-    if (showBots !== 'no') n += 1
+    if (showBots !== 'all') n += 1
     return n
   }, [timeRange, method, statusCode, environment, showBots])
 
@@ -299,17 +322,17 @@ export default function ProxyLogsList({
     setMethod('all')
     setStatusCode('all')
     setEnvironment('all')
-    setShowBots('no')
+    setShowBots('all')
     setPage(1)
   }
 
   const handleRowClick = (
-    logId: number,
+    requestId: string,
     logProjectId: number,
     timestamp: string
   ) => {
     if (onRowClick) {
-      onRowClick(logId, logProjectId, timestamp)
+      onRowClick(requestId, logProjectId, timestamp)
     }
   }
 
@@ -667,7 +690,7 @@ export default function ProxyLogsList({
                         ))
                       : logs?.logs.map((log) => (
                           <TableRow
-                            key={log.id}
+                            key={log.request_id}
                             className={
                               onRowClick
                                 ? 'cursor-pointer hover:bg-muted/50'
@@ -677,7 +700,7 @@ export default function ProxyLogsList({
                               onRowClick &&
                               log.project_id &&
                               handleRowClick(
-                                log.id,
+                                log.request_id,
                                 log.project_id,
                                 log.timestamp
                               )
@@ -714,14 +737,7 @@ export default function ProxyLogsList({
                             </TableCell>
                             <TableCell>
                               <span
-                                className={`rounded-full px-2 py-1 text-xs font-medium ${
-                                  log.status_code >= 200 &&
-                                  log.status_code < 300
-                                    ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                                    : log.status_code >= 400
-                                      ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
-                                      : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
-                                }`}
+                                className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_BADGE_CLASSES[httpStatusClass(log.status_code)]}`}
                               >
                                 {log.status_code}
                               </span>

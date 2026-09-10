@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
@@ -315,7 +318,7 @@ mod tests {
         let model = temps_entities::oidc_providers::Model {
             id: 7,
             name: "okta".into(),
-            issuer_url: "https://gala.okta.com".into(),
+            issuer_url: "https://example.okta.com".into(),
             client_id: "client".into(),
             client_secret_encrypted: "ciphertext".into(),
             scopes: "openid email profile".into(),

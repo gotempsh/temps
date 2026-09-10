@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::DnsAppState;
 use crate::services::domain_delivery::*;
 use axum::{
@@ -42,8 +45,8 @@ impl AuditOperation for DeliveryAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -84,7 +87,7 @@ pub async fn get_delivery_capabilities(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
     Ok(Json(state.domain_delivery_service.capabilities().await?))
 }
 #[utoipa::path(get,path="/delivery-profiles",tag="Traffic Delivery",responses((status=200,body=Vec<DeliveryProfileResponse>)),security(("bearer_auth"=[])))]
@@ -92,7 +95,7 @@ pub async fn list_delivery_profiles(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
     Ok(Json(state.domain_delivery_service.list_profiles().await?))
 }
 #[utoipa::path(post,path="/delivery-profiles",tag="Traffic Delivery",request_body=CreateDeliveryProfileRequest,responses((status=201,body=DeliveryProfileResponse)),security(("bearer_auth"=[])))]
@@ -102,7 +105,8 @@ pub async fn create_delivery_profile(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<CreateDeliveryProfileRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
     let profile = state
         .domain_delivery_service
         .create_profile(req.name, req.provider_kind)
@@ -125,7 +129,8 @@ pub async fn delete_delivery_profile(
     Extension(metadata): Extension<RequestMetadata>,
     Path(profile_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
     state
         .domain_delivery_service
         .delete_profile(profile_id)
@@ -206,7 +211,8 @@ pub async fn preview_domain_delivery_binding(
     Path(project_id): Path<i32>,
     Json(req): Json<PreviewDomainDeliveryBindingRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
     project_permission_guard!(
         auth,
         ProjectsWrite,
@@ -228,7 +234,8 @@ pub async fn apply_domain_delivery_binding(
     Path(project_id): Path<i32>,
     Json(req): Json<ApplyDomainDeliveryBindingRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
     project_permission_guard!(
         auth,
         ProjectsWrite,
@@ -263,7 +270,8 @@ pub async fn delete_domain_delivery_binding(
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, binding_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
     project_permission_guard!(
         auth,
         ProjectsWrite,

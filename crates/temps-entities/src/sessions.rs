@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -16,6 +19,16 @@ pub struct Model {
     /// `verify_mfa_challenge` may consume them, and `verify_session` filters
     /// them out. A fully authenticated session has this set to false.
     pub mfa_pending: bool,
+    /// Until this instant the session may perform sensitive actions. `NULL`
+    /// means the session has not completed recent step-up verification.
+    pub step_up_expires_at: Option<DBDateTime>,
+    /// Which login method created this pending MFA challenge (e.g.
+    /// `"password"`, `"oidc"`, `"saml"`). Only ever set while `mfa_pending`
+    /// is true -- a fully authenticated session leaves this `NULL`. Lets SSO
+    /// enforcement distinguish a password-originated challenge (must stay
+    /// blocked) from an SSO-originated one (already completed at the IdP,
+    /// must be allowed to finish `verify-mfa`).
+    pub mfa_pending_origin: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

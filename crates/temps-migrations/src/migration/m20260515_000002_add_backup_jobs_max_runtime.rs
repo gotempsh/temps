@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration that adds `max_runtime_secs` to `backup_jobs`.
 //!
 //! Before this migration the runner used a single hard-coded constant
@@ -39,7 +42,10 @@ ALTER TABLE backup_jobs
 
         db.execute_unprepared(
             r#"
-ALTER TABLE backup_jobs DROP COLUMN IF EXISTS max_runtime_secs;
+-- IF EXISTS on the table too: m20260517_000002 drops backup_jobs with a
+-- no-op down(), so a full rollback reaches this migration with the table
+-- already gone.
+ALTER TABLE IF EXISTS backup_jobs DROP COLUMN IF EXISTS max_runtime_secs;
             "#,
         )
         .await?;

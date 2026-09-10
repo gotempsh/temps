@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps node` subcommand — manage cluster worker nodes via the HTTP API.
 //!
 //! Provides CLI commands for listing, draining, and removing worker nodes.
@@ -6,6 +9,8 @@
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Deserialize;
+
+use super::api_url::management_api_url;
 
 /// Worker node management commands
 #[derive(Args)]
@@ -161,8 +166,7 @@ struct ProblemDetail {
 // ── Helpers ──
 
 fn api_url(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    format!("{}/api/internal{}", base, path)
+    management_api_url(base, &format!("/internal{}", path))
 }
 
 fn make_client() -> reqwest::Client {

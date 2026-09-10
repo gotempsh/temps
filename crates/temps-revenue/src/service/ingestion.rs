@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Ingestion service: verifies, persists, and projects webhook events.
 //!
 //! Flow for each inbound webhook:

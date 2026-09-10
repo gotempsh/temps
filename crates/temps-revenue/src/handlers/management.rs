@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Authenticated HTTP handlers for managing revenue integrations and
 //! reading dashboard metrics. Mounted under `/api/v1/...`.
 //!
@@ -364,6 +367,7 @@ fn revenue_error_to_problem(err: RevenueError) -> Problem {
         }
         RevenueError::EncryptionFailed { .. }
         | RevenueError::DecryptionFailed { .. }
+        | RevenueError::RandomnessFailed { .. }
         | RevenueError::Database(_) => {
             error!("revenue internal error: {}", err);
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)

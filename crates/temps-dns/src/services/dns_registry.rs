@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Internal DNS registry — authoritative store for `*.temps.local` records.
 //!
 //! See ADR-011. This service is the **only** writer to `service_endpoints`
@@ -34,7 +37,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement,
     TransactionTrait,
 };
 use std::net::IpAddr;
@@ -43,7 +46,7 @@ use std::sync::Arc;
 use temps_core::DBDateTime;
 use temps_entities::{node_dns_state, service_endpoints};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Allowed DNS record types in the internal zone.
 ///
@@ -300,8 +303,6 @@ pub struct ZoneSnapshot {
 /// returning a full snapshot instead. Picked to keep a single response
 /// well under typical body limits while still letting agents catch up
 /// from short outages without re-snapshotting.
-const SNAPSHOT_THRESHOLD: usize = 1_000;
-
 #[derive(Clone)]
 pub struct DnsRegistry {
     db: Arc<DatabaseConnection>,
@@ -443,6 +444,28 @@ impl DnsRegistry {
         Ok(res.rows_affected)
     }
 
+    /// Every record currently published for one owner, newest generation
+    /// first. Read-only companion to [`Self::replace_endpoints_for_owner`].
+    ///
+    /// Callers use this to answer "is this name actually resolvable?"
+    /// *before* handing an address to a workload. Without it the only way
+    /// to find out an FQDN was never published is a connection timeout
+    /// inside the user's container, which is exactly the silent failure
+    /// this method exists to prevent.
+    pub async fn list_by_owner(
+        &self,
+        owner_kind: OwnerKind,
+        owner_id: i64,
+    ) -> Result<Vec<service_endpoints::Model>, DnsRegistryError> {
+        service_endpoints::Entity::find()
+            .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(service_endpoints::Column::OwnerId.eq(owner_id))
+            .order_by_desc(service_endpoints::Column::Generation)
+            .all(self.db.as_ref())
+            .await
+            .map_err(DnsRegistryError::Database)
+    }
+
     /// Hourly janitor: delete `service_endpoints` rows whose owner has
     /// vanished from `service_members` (Tier 2 GC) or `external_services`
     /// (Tier 3 GC). Returns the number of orphan records deleted.
@@ -545,16 +568,14 @@ impl DnsRegistry {
         Ok(out)
     }
 
-    /// Long-poll diff. Returns records with `generation > since` plus
-    /// (separately) the IDs of any records the agent should drop.
+    /// Return DNS changes since `since`.
     ///
-    /// Note: with the current "delete-old, insert-new" replace semantics,
-    /// removed records leave no row behind we can hand back as a tombstone.
-    /// Step 2 (the resolver crate) handles this by replacing the entire
-    /// zone whenever it observes a generation jump it can't account for —
-    /// for now we always return `removed_ids = []` and let the resolver
-    /// reconcile by name. If the diff is large or `since=0`, the response
-    /// is a full snapshot instead.
+    /// A changed generation is currently returned as an authoritative full
+    /// snapshot. Endpoint replacement is implemented as delete-old +
+    /// insert-new, and deleted rows leave no tombstone behind. Sending only
+    /// the new rows would therefore make workers retain the old row IDs and
+    /// eventually serve stale or duplicate answers. Full snapshots preserve
+    /// correctness until the registry has durable deletion tombstones.
     pub async fn get_changes_since(&self, since: i64) -> Result<ChangeSet, DnsRegistryError> {
         let current = current_generation(self.db.as_ref()).await?;
         if since <= 0 || current <= since {
@@ -577,32 +598,11 @@ impl DnsRegistry {
             });
         }
 
-        let records = service_endpoints::Entity::find()
-            .filter(service_endpoints::Column::Generation.gt(since))
-            .order_by_asc(service_endpoints::Column::Generation)
-            .order_by_asc(service_endpoints::Column::Id)
-            .limit((SNAPSHOT_THRESHOLD as u64) + 1)
-            .all(self.db.as_ref())
-            .await?;
-
-        if records.len() > SNAPSHOT_THRESHOLD {
-            warn!(
-                since,
-                current, "diff exceeds snapshot threshold; returning full zone instead"
-            );
-            let snap = self.get_full_zone().await?;
-            return Ok(ChangeSet {
-                generation: snap.generation,
-                full_snapshot: true,
-                records: snap.records,
-                removed_ids: vec![],
-            });
-        }
-
+        let snap = self.get_full_zone().await?;
         Ok(ChangeSet {
-            generation: current,
-            full_snapshot: false,
-            records,
+            generation: snap.generation,
+            full_snapshot: true,
+            records: snap.records,
             removed_ids: vec![],
         })
     }
@@ -682,6 +682,20 @@ impl DnsRegistry {
             .one(self.db.as_ref())
             .await?;
         Ok(row)
+    }
+
+    /// Total number of records currently in the `*.temps.local` zone, across
+    /// every owner and node. Used by the cluster DNS status endpoint
+    /// (`GET /api/cluster/dns/status`) to give an operator a cluster-wide
+    /// number alongside each node's per-resolver `record_count`.
+    pub async fn total_record_count(&self) -> Result<i64, DnsRegistryError> {
+        let count = service_endpoints::Entity::find()
+            .count(self.db.as_ref())
+            .await?;
+        // `count()` returns u64; the zone is bounded by cluster size and
+        // container count, nowhere near i64::MAX, but saturate rather than
+        // wrap on the (impossible in practice) overflow case.
+        Ok(i64::try_from(count).unwrap_or(i64::MAX))
     }
 }
 
@@ -965,5 +979,71 @@ mod tests {
         assert_eq!(rows.len(), 1, "upsert keeps one row per (fqdn, type, ip)");
         assert_eq!(rows[0].owner_id, 200, "newest owner wins");
         assert_eq!(rows[0].generation, g2, "row carries the newest generation");
+    }
+
+    #[tokio::test]
+    async fn test_total_record_count() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            0,
+            "a fresh zone has no records"
+        );
+
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Deployment,
+                300,
+                &[
+                    EndpointDraft {
+                        fqdn: "count-a.echo.temps.local".into(),
+                        record_type: RecordType::A,
+                        target_ip: Some("172.20.0.10".into()),
+                        target_port: Some(80),
+                        ttl: 10,
+                        owner_kind: OwnerKind::Deployment,
+                        owner_id: 300,
+                        node_id: None,
+                    },
+                    EndpointDraft {
+                        fqdn: "count-b.echo.temps.local".into(),
+                        record_type: RecordType::A,
+                        target_ip: Some("172.20.0.11".into()),
+                        target_port: Some(80),
+                        ttl: 10,
+                        owner_kind: OwnerKind::Deployment,
+                        owner_id: 300,
+                        node_id: None,
+                    },
+                ],
+            )
+            .await
+            .expect("publish should succeed");
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            2,
+            "count reflects every record across owners"
+        );
+
+        registry
+            .delete_by_owner(OwnerKind::Deployment, 300)
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(
+            registry.total_record_count().await.unwrap(),
+            0,
+            "count drops back to zero once records are removed"
+        );
     }
 }

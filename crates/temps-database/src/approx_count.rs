@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Fast row-count helpers for large append-only hypertables.
 //!
 //! Listing endpoints paginate with a `total` so the UI can render

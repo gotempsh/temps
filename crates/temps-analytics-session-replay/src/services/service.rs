@@ -1,12 +1,15 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::user_agent::BrowserInfo;
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,7 +19,67 @@ use temps_core::UtcDateTime;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-use temps_entities::{ip_geolocations, session_replay_events, session_replay_sessions, visitor};
+use temps_entities::{
+    ip_geolocations, session_replay_events, session_replay_ingest_batches, session_replay_sessions,
+    visitor,
+};
+
+/// How many `session_replay_events` rows to write per `INSERT`.
+///
+/// Bounded by PostgreSQL's 65535 bind-parameter ceiling: each row binds 5
+/// columns (`id` is generated), so the hard maximum is 13107 rows per
+/// statement. 1000 stays far below that while keeping a single statement's
+/// payload modest — rrweb full-snapshot events can each be tens of kilobytes.
+const EVENT_INSERT_CHUNK_SIZE: usize = 1000;
+
+/// Longest accepted client-supplied `batch_id`.
+///
+/// The SDK emits a UUID (36 chars) or a `batch_<ts>_<9 chars>` fallback, so
+/// this is generous. A bound is required rather than optional: the value is
+/// unauthenticated, lands in a unique btree index — whose ~2704-byte tuple
+/// limit would otherwise turn a long id into a guaranteed 500 — and is echoed
+/// into logs.
+const MAX_BATCH_ID_LEN: usize = 128;
+
+/// Largest payload a single ingest request may decompress to.
+///
+/// zlib expands roughly 1000:1 on repetitive input, so the request body limit
+/// alone does not bound the work: this is what stops an attacker choosing how
+/// much this endpoint allocates and inserts. Generous next to a real flush,
+/// where a full-snapshot batch runs to a few megabytes at most.
+const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most rrweb events one ingest request may carry.
+///
+/// Checked before the transaction opens so the pooled connection is never held
+/// for an attacker-chosen number of inserts.
+const MAX_EVENTS_PER_BATCH: usize = 20_000;
+
+/// Whether a client-supplied batch id is one the SDK could have produced.
+///
+/// Deliberately strict: UUIDs and the SDK's fallback id use only these
+/// characters, so anything else is either a bug or an attempt to smuggle
+/// newlines or control characters into the logs.
+fn batch_id_rejection_reason(batch_id: &str) -> Option<String> {
+    if batch_id.is_empty() {
+        return Some("must not be empty".to_string());
+    }
+    if batch_id.len() > MAX_BATCH_ID_LEN {
+        return Some(format!(
+            "must be at most {MAX_BATCH_ID_LEN} characters, got {}",
+            batch_id.len()
+        ));
+    }
+    if let Some(bad) = batch_id
+        .chars()
+        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | ':' | '-'))
+    {
+        return Some(format!(
+            "may only contain letters, digits and '.', '_', ':', '-' (found {bad:?})"
+        ));
+    }
+    None
+}
 
 #[derive(Error, Debug)]
 pub enum SessionReplayError {
@@ -55,6 +118,27 @@ pub enum SessionReplayError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// The client-supplied batch id is not something the SDK could have
+    /// produced. It reaches an unauthenticated route and lands in a unique
+    /// index and the logs, so it is validated rather than trusted.
+    #[error("Invalid batch id for session {session_replay_id}: {reason}")]
+    InvalidBatchId {
+        session_replay_id: String,
+        reason: String,
+    },
+
+    /// The batch decompressed to more data, or more events, than a single
+    /// ingest request is allowed to write.
+    #[error(
+        "Session replay batch for {session_replay_id} exceeds the ingest limit: {actual} {unit} (max {limit})"
+    )]
+    BatchTooLarge {
+        session_replay_id: String,
+        unit: &'static str,
+        actual: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +347,17 @@ pub struct SessionReplayWithEvents {
     pub events: Vec<SessionEvent>,
 }
 
+/// Translate `visitor.environment_id`'s legacy `0` sentinel into `None`.
+///
+/// `visitor.environment_id` is `NOT NULL` with no foreign key, so the analytics
+/// ingest path encodes "no environment" there as a magic `0`
+/// (`events_service.rs`). `session_replay_sessions.environment_id` *does* have
+/// a foreign key, so copying the sentinel across would FK-violate. Making that
+/// column nullable is only half the fix; this is the other half.
+fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
+    (visitor_environment_id != 0).then_some(visitor_environment_id)
+}
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
 }
@@ -284,9 +379,15 @@ impl SessionReplayService {
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
 
-        // Look up visitor by visitor_id GUID
+        // Look up visitor by visitor_id GUID, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would bind (and let a caller mutate) another
+        // project's visitor row for any client-supplied visitor_id on the
+        // keyed ingest path (ADR-040 §3).
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
+            .filter(visitor::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
             .await?;
 
@@ -328,8 +429,11 @@ impl SessionReplayService {
             session_replay_id: Set(session_id.to_string()),
             visitor_id: Set(visitor_id_int),
             project_id: Set(project_id),
-            environment_id: Set(environment_id.unwrap_or(0)),
-            deployment_id: Set(deployment_id.unwrap_or(0)),
+            // NULL, never a `0` sentinel: there is no `environments.id = 0`
+            // or `deployments.id = 0`, so `unwrap_or(0)` FK-violated on every
+            // host that resolved to a project without a live deployment.
+            environment_id: Set(environment_id),
+            deployment_id: Set(deployment_id),
             created_at: Set(created_at),
             user_agent: Set(Some(metadata.user_agent)),
             browser: Set(browser_info.browser),
@@ -360,13 +464,32 @@ impl SessionReplayService {
     /// session exists but belongs to a different project, `CrossProjectAccess`
     /// is returned so that the handler can surface a 404 — preventing
     /// cross-tenant event injection and avoiding existence disclosure.
+    ///
+    /// `batch_id`, when supplied, makes the call idempotent: a batch already
+    /// recorded for this session is discarded and `Ok(0)` returned. The browser
+    /// SDK resends a failed batch verbatim under a stable id, so without this a
+    /// single timed-out request appends its events again on every retry. It is
+    /// optional because older SDKs do not send one; those clients keep the old
+    /// at-least-once behaviour.
     pub async fn add_session_events(
         &self,
         project_id: i32,
         session_id: &str,
         events_base64: &str,
+        batch_id: Option<&str>,
     ) -> Result<usize, SessionReplayError> {
         info!("Adding events to session: {}", session_id);
+
+        // Validate before touching the database: this route is unauthenticated,
+        // so the cheapest rejection has to come first.
+        if let Some(batch_id) = batch_id {
+            if let Some(reason) = batch_id_rejection_reason(batch_id) {
+                return Err(SessionReplayError::InvalidBatchId {
+                    session_replay_id: session_id.to_string(),
+                    reason,
+                });
+            }
+        }
 
         // Verify session exists by session_replay_id AND project_id to prevent
         // cross-tenant injection: an attacker who guesses another tenant's
@@ -393,37 +516,137 @@ impl SessionReplayService {
             });
         }
 
-        // Decode and decompress events
+        // Decode and decompress events.
+        //
+        // Read one byte past the limit rather than trusting the stream: zlib
+        // expands roughly 1000:1 on repetitive input, so the request body cap
+        // does not bound what this allocates. Overshooting by a byte is what
+        // makes "hit the limit" distinguishable from "exactly at the limit".
         let compressed = STANDARD.decode(events_base64)?;
-        let mut decoder = ZlibDecoder::new(&compressed[..]);
+        let decoder = ZlibDecoder::new(&compressed[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).map_err(|e| {
-            SessionReplayError::DecompressionError(format!("Failed to decompress events: {}", e))
-        })?;
+        decoder
+            .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+            .read_to_string(&mut decompressed)
+            .map_err(|e| {
+                SessionReplayError::DecompressionError(format!(
+                    "Failed to decompress events: {}",
+                    e
+                ))
+            })?;
+
+        if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+            return Err(SessionReplayError::BatchTooLarge {
+                session_replay_id: session_id.to_string(),
+                unit: "decompressed bytes",
+                actual: decompressed.len(),
+                limit: MAX_DECOMPRESSED_BYTES,
+            });
+        }
 
         let events: Value = serde_json::from_str(&decompressed)?;
 
-        let mut event_count = 0;
-
         // Extract events handling both formats
         let events_to_store = self.extract_events_from_json(&events)?;
+        let event_count = events_to_store.len();
 
-        for event in &events_to_store {
-            let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
-            let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
+        if event_count > MAX_EVENTS_PER_BATCH {
+            return Err(SessionReplayError::BatchTooLarge {
+                session_replay_id: session_id.to_string(),
+                unit: "events",
+                actual: event_count,
+                limit: MAX_EVENTS_PER_BATCH,
+            });
+        }
 
-            let event_model = session_replay_events::ActiveModel {
+        // A batch with nothing in it must not reach the transaction. Claiming a
+        // marker for it would write a row per request while storing no events —
+        // an unauthenticated client could grow the dedup table using empty
+        // payloads. There is also nothing to deduplicate.
+        if event_count == 0 {
+            debug!(
+                session_replay_id = %session_id,
+                "Ignoring session replay batch that carried no events"
+            );
+            return Ok(0);
+        }
+
+        // The marker and the events go in together. Claiming the batch outside
+        // a transaction would let a failed event insert leave the marker
+        // behind, and the client's retry would then be discarded as a
+        // duplicate — turning a retryable error into permanent data loss.
+        let txn = self.db.begin().await?;
+
+        if let Some(batch_id) = batch_id {
+            let marker = session_replay_ingest_batches::ActiveModel {
                 id: sea_orm::NotSet,
                 session_id: Set(session.id),
-                data: Set(event.to_string()),
-                timestamp: Set(timestamp),
-                r#type: Set(event_type),
-                is_active: Set(true),
+                batch_id: Set(batch_id.to_string()),
+                event_count: Set(event_count as i32),
+                received_at: Set(Utc::now().into()),
             };
 
-            event_model.insert(self.db.as_ref()).await?;
-            event_count += 1;
+            // Claiming the batch *is* the duplicate check: the unique index on
+            // (session_id, batch_id) decides it, so two concurrent retries of
+            // the same batch cannot both win the way a read-then-write check
+            // would allow.
+            let claimed = session_replay_ingest_batches::Entity::insert(marker)
+                .on_conflict(
+                    OnConflict::columns([
+                        session_replay_ingest_batches::Column::SessionId,
+                        session_replay_ingest_batches::Column::BatchId,
+                    ])
+                    .do_nothing()
+                    .to_owned(),
+                )
+                .exec_without_returning(&txn)
+                .await?;
+
+            if claimed == 0 {
+                txn.rollback().await?;
+                // `?batch_id` (Debug) rather than `%` — the value is
+                // client-supplied, and Debug escapes control characters so a
+                // crafted id cannot forge lines in an operator's log.
+                debug!(
+                    session_replay_id = %session_id,
+                    ?batch_id,
+                    "Discarded duplicate session replay batch"
+                );
+                return Ok(0);
+            }
         }
+
+        // Insert in batches rather than one round-trip per event. rrweb emits
+        // hundreds to thousands of events per flush (mousemove/scroll sampling
+        // dominates), so a row-at-a-time loop costs one network round-trip per
+        // event: a few thousand events at even 10-20ms each exceeds the
+        // proxy's upstream read timeout, the browser's retry then re-sends the
+        // same batch, and the retries stack until the endpoint collapses under
+        // its own queue. Batching turns that into a handful of statements.
+        for chunk in events_to_store.chunks(EVENT_INSERT_CHUNK_SIZE) {
+            let models = chunk.iter().map(|event| {
+                let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+                let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
+
+                session_replay_events::ActiveModel {
+                    id: sea_orm::NotSet,
+                    session_id: Set(session.id),
+                    data: Set(event.to_string()),
+                    timestamp: Set(timestamp),
+                    r#type: Set(event_type),
+                    is_active: Set(true),
+                }
+            });
+
+            // `exec_without_returning` skips the RETURNING clause — the
+            // generated ids are not used, and not shipping them back keeps
+            // the response for a 1000-row batch small.
+            session_replay_events::Entity::insert_many(models)
+                .exec_without_returning(&txn)
+                .await?;
+        }
+
+        txn.commit().await?;
 
         // Recompute duration from ALL stored events (not just this batch)
         if event_count > 0 {
@@ -439,7 +662,7 @@ impl SessionReplayService {
     pub async fn store_packed_session_replay(
         &self,
         packed_data: PackedEvents,
-        deployment_id: i32,
+        deployment_id: Option<i32>,
     ) -> Result<String, SessionReplayError> {
         info!(
             "Storing packed session replay for session: {}",
@@ -463,7 +686,7 @@ impl SessionReplayService {
 
         let visitor_id_int = visitor.id;
         let project_id = visitor.project_id;
-        let environment_id = visitor.environment_id;
+        let environment_id = environment_id_from_visitor(visitor.environment_id);
 
         // Unpack the events
         let unpacked = self.unpack_events(&packed_data)?;
@@ -553,7 +776,7 @@ impl SessionReplayService {
         visitor_id: i32,
         packed_data: String,
         metadata: Option<SessionMetadata>,
-        deployment_id: i32,
+        deployment_id: Option<i32>,
     ) -> Result<String, SessionReplayError> {
         info!(
             "Store or update session replay for session: {}, visitor: {}",
@@ -575,7 +798,7 @@ impl SessionReplayService {
                 .ok_or_else(|| SessionReplayError::VisitorNotFound(visitor_id.to_string()))?;
 
             let project_id = visitor.project_id;
-            let environment_id = visitor.environment_id;
+            let environment_id = environment_id_from_visitor(visitor.environment_id);
 
             // Parse user agent if available
             let browser_info = if let Some(meta) = metadata.as_ref() {
@@ -776,19 +999,24 @@ impl SessionReplayService {
         // Build filtered base for total count. Exclude replays with no
         // measurable duration: both 0ms and NULL (never-finalized sessions,
         // typically single-burst bot traffic) have nothing to play back.
+        // Also exclude soft-deleted sessions (is_active=false) — otherwise a
+        // deleted replay keeps showing up here forever, since delete_session_replay
+        // only flips the flag and no read path ever checked it.
         let mut count_select = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::ProjectId.eq(project_id))
-            .filter(session_replay_sessions::Column::Duration.gt(0));
+            .filter(session_replay_sessions::Column::Duration.gt(0))
+            .filter(session_replay_sessions::Column::IsActive.eq(true));
         if let Some(env_id) = environment_id {
             count_select =
                 count_select.filter(session_replay_sessions::Column::EnvironmentId.eq(env_id));
         }
         let total_count: u64 = count_select.count(self.db.as_ref()).await?;
 
-        // Same duration filter as the count query above — must stay in sync.
+        // Same duration/is_active filters as the count query above — must stay in sync.
         let mut query = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::ProjectId.eq(project_id))
             .filter(session_replay_sessions::Column::Duration.gt(0))
+            .filter(session_replay_sessions::Column::IsActive.eq(true))
             .inner_join(visitor::Entity)
             .join(
                 sea_orm::JoinType::LeftJoin,
@@ -982,7 +1210,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.visitor_id = $1 AND s.duration > 0
+            WHERE s.visitor_id = $1 AND s.duration > 0 AND s.is_active = true
             ORDER BY s.created_at DESC
             LIMIT {} OFFSET {}
             "#,
@@ -1126,7 +1354,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.id = $1
+            WHERE s.id = $1 AND s.is_active = true
         "#;
 
         let statement = sea_orm::Statement::from_sql_and_values(
@@ -1146,6 +1374,7 @@ impl SessionReplayService {
 
         let events = session_replay_events::Entity::find()
             .filter(session_replay_events::Column::SessionId.eq(row.id))
+            .filter(session_replay_events::Column::IsActive.eq(true))
             .order_by_asc(session_replay_events::Column::Timestamp)
             .limit(MAX_REPLAY_EVENTS)
             .all(self.db.as_ref())
@@ -1248,7 +1477,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.id = $1
+            WHERE s.id = $1 AND s.is_active = true
         "#;
 
         let statement = sea_orm::Statement::from_sql_and_values(
@@ -1510,6 +1739,53 @@ impl SessionReplayService {
 
         Ok(session.project_id)
     }
+
+    // -----------------------------------------------------------------
+    // Authorization lookups
+    //
+    // Most read/write handlers on this crate are keyed by session or
+    // visitor id rather than project id, so there is no project_id in the
+    // path for `project_access_guard!` to check. These resolve one so the
+    // guard can run. They deliberately do NOT filter on `is_active`: an
+    // authorization decision must be made for the row that exists, not
+    // only for currently-live sessions, or ended sessions would fall out
+    // of scoping entirely.
+    // -----------------------------------------------------------------
+
+    /// Project owning the session with this numeric primary key.
+    pub async fn project_id_for_session_pk(
+        &self,
+        session_pk: i32,
+    ) -> Result<i32, SessionReplayError> {
+        let session = session_replay_sessions::Entity::find_by_id(session_pk)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_pk.to_string()))?;
+        Ok(session.project_id)
+    }
+
+    /// Project owning the session with this `session_replay_id` string,
+    /// regardless of whether it is still active.
+    pub async fn project_id_for_session_replay_id(
+        &self,
+        session_replay_id: &str,
+    ) -> Result<i32, SessionReplayError> {
+        let session = session_replay_sessions::Entity::find()
+            .filter(session_replay_sessions::Column::SessionReplayId.eq(session_replay_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_replay_id.to_string()))?;
+        Ok(session.project_id)
+    }
+
+    /// Project the visitor belongs to.
+    pub async fn project_id_for_visitor(&self, visitor_id: i32) -> Result<i32, SessionReplayError> {
+        let visitor = temps_entities::visitor::Entity::find_by_id(visitor_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(format!("visitor {visitor_id}")))?;
+        Ok(visitor.project_id)
+    }
 }
 
 #[cfg(test)]
@@ -1527,8 +1803,8 @@ mod tests {
             session_replay_id: session_replay_id.to_string(),
             visitor_id: 1,
             project_id,
-            environment_id: 1,
-            deployment_id: 1,
+            environment_id: Some(1),
+            deployment_id: Some(1),
             created_at: None,
             user_agent: None,
             browser: None,
@@ -1564,7 +1840,7 @@ mod tests {
 
         // Caller claims to be project 2
         let result = service
-            .add_session_events(2, "session-abc", "dGVzdA==") // "test" in base64
+            .add_session_events(2, "session-abc", "dGVzdA==", None) // "test" in base64
             .await;
 
         assert!(result.is_err());
@@ -1593,13 +1869,507 @@ mod tests {
         let service = SessionReplayService::new(Arc::new(db));
 
         let result = service
-            .add_session_events(1, "does-not-exist", "dGVzdA==")
+            .add_session_events(1, "does-not-exist", "dGVzdA==", None)
             .await;
 
         assert!(result.is_err());
         assert!(
             matches!(result.unwrap_err(), SessionReplayError::SessionNotFound(ref s) if s == "does-not-exist"),
             "Expected SessionNotFound"
+        );
+    }
+
+    fn make_visitor_model(environment_id: i32) -> visitor::Model {
+        let now = chrono::Utc::now();
+        visitor::Model {
+            id: 5,
+            visitor_id: "visitor-abc".to_string(),
+            project_id: 7,
+            environment_id,
+            first_seen: now,
+            last_seen: now,
+            user_agent: None,
+            ip_address_id: None,
+            is_crawler: false,
+            crawler_name: None,
+            custom_data: None,
+            has_activity: true,
+            first_referrer: None,
+            first_referrer_hostname: None,
+            first_channel: None,
+            first_utm_source: None,
+            first_utm_medium: None,
+            first_utm_campaign: None,
+        }
+    }
+
+    fn make_session_metadata() -> SessionMetadata {
+        SessionMetadata {
+            visitor_id: "visitor-abc".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+            language: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            screen: Screen {
+                width: 1920,
+                height: 1080,
+                color_depth: 24,
+            },
+            viewport: Viewport {
+                width: 1280,
+                height: 720,
+            },
+            timestamp: "2026-08-31T00:00:00Z".to_string(),
+            url: "https://app.example.com/".to_string(),
+        }
+    }
+
+    /// Regression test for the live FK-violation fixed alongside ADR-040:
+    /// `initialize_session` used to write `environment_id.unwrap_or(0)` /
+    /// `deployment_id.unwrap_or(0)`. There is no `environments.id = 0` or
+    /// `deployments.id = 0`, so `/api/_temps/session-replay/init` 500'd for
+    /// every host that resolved to a project without a live deployment. The
+    /// insert must bind NULL.
+    #[tokio::test]
+    async fn initialize_session_writes_null_scope_not_zero_sentinel() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. visitor lookup
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                // 2. existing-session lookup (none)
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                // 3. the insert
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        let result = service
+            .initialize_session("session-abc", make_session_metadata(), 7, None, None)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a project without a deployment must still open a replay session: {:?}",
+            result.err()
+        );
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        assert!(
+            insert.contains("INSERT INTO") && insert.contains("session_replay_sessions"),
+            "expected an insert into session_replay_sessions, got: {insert}"
+        );
+        assert!(
+            !insert.contains("Int(Some(0))"),
+            "the `0` sentinel must never reach an FK column: {insert}"
+        );
+        assert!(
+            insert.contains("Int(None)"),
+            "environment_id/deployment_id must be bound as NULL: {insert}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_session_preserves_concrete_scope() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        let result = service
+            .initialize_session("session-abc", make_session_metadata(), 7, Some(3), Some(11))
+            .await;
+
+        assert!(result.is_ok());
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        assert!(
+            insert.contains("Int(Some(3))") && insert.contains("Int(Some(11))"),
+            "a fully resolved route must keep its attribution: {insert}"
+        );
+    }
+
+    /// `visitor.environment_id` is `NOT NULL` with no FK, so the analytics
+    /// ingest path still encodes "no environment" there as a magic `0`. That
+    /// sentinel must not be copied into `session_replay_sessions`, whose
+    /// `environment_id` *does* have an FK.
+    #[test]
+    fn environment_id_from_visitor_maps_zero_sentinel_to_none() {
+        assert_eq!(environment_id_from_visitor(0), None);
+        assert_eq!(environment_id_from_visitor(3), Some(3));
+    }
+
+    /// Build the wire payload the browser SDK sends: zlib-compressed JSON,
+    /// base64 encoded.
+    fn encode_events(events: &[Value]) -> String {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let json = serde_json::to_string(events).expect("serialize events");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json.as_bytes()).expect("compress events");
+        STANDARD.encode(encoder.finish().expect("finish compression"))
+    }
+
+    fn make_events(count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": 3,
+                    "timestamp": 1_700_000_000_000i64 + i as i64,
+                    "data": { "source": 1, "positions": [{ "x": i, "y": i }] }
+                })
+            })
+            .collect()
+    }
+
+    /// Count the INSERT statements issued against `session_replay_events`.
+    fn count_event_inserts(log: &[sea_orm::Transaction]) -> usize {
+        log.iter()
+            .flat_map(|t| t.statements())
+            .filter(|stmt| {
+                let sql = &stmt.sql;
+                sql.starts_with("INSERT INTO") && sql.contains("session_replay_events")
+            })
+            .count()
+    }
+
+    /// Drive `add_session_events` against a mock DB and return the statement log.
+    async fn insert_log_for(event_count: usize) -> Vec<sea_orm::Transaction> {
+        let session = make_session_model(42, "session-batch", 1);
+
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1. session lookup
+            .append_query_results(vec![vec![session]]);
+
+        // 2. one exec result per expected INSERT chunk (extra results are
+        //    harmless; too few would surface as a DB error).
+        let chunks = event_count.div_ceil(EVENT_INSERT_CHUNK_SIZE);
+        mock = mock.append_exec_results(
+            (0..chunks)
+                .map(|i| sea_orm::MockExecResult {
+                    last_insert_id: (i + 1) as u64,
+                    rows_affected: EVENT_INSERT_CHUNK_SIZE as u64,
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // 3. duration recompute aggregate — empty result means MIN/MAX are
+        //    NULL, so the follow-up session UPDATE is skipped.
+        mock = mock.append_query_results(vec![Vec::<
+            std::collections::BTreeMap<String, sea_orm::Value>,
+        >::new()]);
+
+        let db = Arc::new(mock.into_connection());
+        let service = SessionReplayService::new(db.clone());
+
+        let payload = encode_events(&make_events(event_count));
+        let result = service
+            .add_session_events(1, "session-batch", &payload, None)
+            .await;
+        assert_eq!(
+            result.expect("add_session_events should succeed"),
+            event_count,
+            "should report every event as stored"
+        );
+
+        drop(service);
+        Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log()
+    }
+
+    /// Regression: rrweb flushes hundreds of events per request. Storing them
+    /// one INSERT at a time cost one DB round-trip per event, which pushed a
+    /// single ingest request past the proxy's upstream read timeout and made
+    /// the endpoint 503 while the browser retried into the backlog.
+    ///
+    /// 250 events must cost exactly ONE INSERT, not 250.
+    ///
+    /// Note on the pre-fix failure mode: the old per-event loop used
+    /// `ActiveModel::insert`, which on Postgres issues `INSERT ... RETURNING`
+    /// — a *query*, not an exec. Against this mock it therefore fails on the
+    /// first event with `RecordNotFound`, rather than reaching the count
+    /// assertion below. Either way the test goes red on a reintroduced loop,
+    /// which is what matters.
+    #[tokio::test]
+    async fn add_events_batches_inserts_into_single_statement() {
+        let log = insert_log_for(250).await;
+        let inserts = count_event_inserts(&log);
+
+        assert_eq!(
+            inserts, 1,
+            "250 rrweb events must be written in 1 batched INSERT, got {inserts} \
+             (a per-event insert loop regressed)"
+        );
+    }
+
+    /// Batches larger than the chunk size are split, so a single statement
+    /// never approaches PostgreSQL's 65535 bind-parameter ceiling.
+    #[tokio::test]
+    async fn add_events_chunks_batches_above_the_limit() {
+        let event_count = EVENT_INSERT_CHUNK_SIZE * 2 + 1;
+        let log = insert_log_for(event_count).await;
+        let inserts = count_event_inserts(&log);
+
+        assert_eq!(
+            inserts, 3,
+            "{event_count} events must be split into 3 chunked INSERT statements, got {inserts}"
+        );
+    }
+
+    /// Count `INSERT` statements against the batch-marker table.
+    fn count_marker_inserts(log: &[sea_orm::Transaction]) -> usize {
+        log.iter()
+            .flat_map(|t| t.statements())
+            .filter(|stmt| {
+                stmt.sql.starts_with("INSERT INTO")
+                    && stmt.sql.contains("session_replay_ingest_batches")
+            })
+            .count()
+    }
+
+    /// Regression: the browser SDK resends a failed batch verbatim under the
+    /// same `batch_id`. When the marker insert conflicts, the batch has
+    /// already been stored and its events must NOT be appended again — that
+    /// duplication is what made an idle visitor accumulate the same events
+    /// over and over whenever ingest was slow enough to trigger retries.
+    #[tokio::test]
+    async fn add_events_discards_a_batch_that_was_already_ingested() {
+        let session = make_session_model(42, "session-dupe", 1);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            // Marker insert conflicts: ON CONFLICT DO NOTHING affects 0 rows.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(10));
+
+        let stored = service
+            .add_session_events(1, "session-dupe", &payload, Some("batch-1"))
+            .await
+            .expect("a duplicate batch is not an error");
+
+        assert_eq!(stored, 0, "a replayed batch must store no events");
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_event_inserts(&log),
+            0,
+            "no event rows may be written for a batch that already landed"
+        );
+    }
+
+    /// The first delivery of a batch claims the marker and stores its events.
+    #[tokio::test]
+    async fn add_events_stores_a_batch_seen_for_the_first_time() {
+        let session = make_session_model(42, "session-fresh", 1);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .append_exec_results(vec![
+                // Marker claimed.
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+                // Event batch insert.
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 10,
+                },
+            ])
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(10));
+
+        let stored = service
+            .add_session_events(1, "session-fresh", &payload, Some("batch-2"))
+            .await
+            .expect("a fresh batch should store");
+
+        assert_eq!(stored, 10);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            1,
+            "the batch must be claimed once"
+        );
+        assert_eq!(count_event_inserts(&log), 1, "events must still be batched");
+    }
+
+    /// Clients that predate batch ids keep working: no marker is written and
+    /// the events are stored exactly as before.
+    #[tokio::test]
+    async fn add_events_without_a_batch_id_skips_the_marker_entirely() {
+        let log = insert_log_for(10).await;
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            0,
+            "omitting batchId must not touch the dedup table"
+        );
+        assert_eq!(count_event_inserts(&log), 1);
+    }
+
+    /// A batch id the SDK could never have produced is rejected before the
+    /// service touches the database. The value is unauthenticated, lands in a
+    /// unique btree index and is echoed into logs, so it is validated rather
+    /// than trusted.
+    #[tokio::test]
+    async fn add_events_rejects_malformed_batch_ids() {
+        // Over the 128-char bound; a long enough id would otherwise blow the
+        // btree tuple limit and 500 inside the transaction.
+        let too_long = "a".repeat(MAX_BATCH_ID_LEN + 1);
+        // Newline: the log-forgery vector.
+        let cases = [
+            ("", "empty"),
+            (too_long.as_str(), "over length"),
+            ("batch\nINFO forged log line", "newline"),
+            ("batch\u{1b}[31m", "ansi escape"),
+            ("batch'; DROP TABLE--", "quote"),
+        ];
+
+        for (bad_id, label) in cases {
+            // No query results queued: reaching the DB at all would error
+            // differently, which is itself the assertion.
+            let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+            let service = SessionReplayService::new(Arc::new(db));
+            let payload = encode_events(&make_events(1));
+
+            let err = service
+                .add_session_events(1, "session-x", &payload, Some(bad_id))
+                .await
+                .expect_err(&format!("{label} batch id must be rejected"));
+
+            assert!(
+                matches!(err, SessionReplayError::InvalidBatchId { .. }),
+                "{label} batch id should be InvalidBatchId, got {err:?}"
+            );
+        }
+    }
+
+    /// Ids the SDK actually emits must survive validation.
+    #[test]
+    fn batch_id_validation_accepts_what_the_sdk_emits() {
+        // crypto.randomUUID()
+        assert_eq!(
+            batch_id_rejection_reason("3f8a1c2e-9b4d-4a7f-8e11-2c5d6a7b8c90"),
+            None
+        );
+        // the SDK's non-secure-context fallback
+        assert_eq!(
+            batch_id_rejection_reason("batch_1787127505294_k3j2h1g0f"),
+            None
+        );
+        assert_eq!(
+            batch_id_rejection_reason(&"a".repeat(MAX_BATCH_ID_LEN)),
+            None
+        );
+    }
+
+    /// Regression: an empty batch used to claim a marker row while storing no
+    /// events, giving an unauthenticated client a way to grow the dedup table
+    /// with empty payloads. It must not reach the transaction at all.
+    #[tokio::test]
+    async fn add_events_ignores_an_empty_batch_without_claiming_a_marker() {
+        let session = make_session_model(42, "session-empty", 1);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&[]);
+
+        let stored = service
+            .add_session_events(1, "session-empty", &payload, Some("batch-empty"))
+            .await
+            .expect("an empty batch is not an error");
+        assert_eq!(stored, 0);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+
+        assert_eq!(
+            count_marker_inserts(&log),
+            0,
+            "an empty batch must not write a dedup marker"
+        );
+        assert_eq!(count_event_inserts(&log), 0);
+    }
+
+    /// The event-count cap is applied before the transaction opens, so the
+    /// pooled connection is never held for an attacker-chosen number of
+    /// inserts.
+    #[tokio::test]
+    async fn add_events_rejects_a_batch_over_the_event_cap() {
+        let session = make_session_model(42, "session-huge", 1);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let service = SessionReplayService::new(db.clone());
+        let payload = encode_events(&make_events(MAX_EVENTS_PER_BATCH + 1));
+
+        let err = service
+            .add_session_events(1, "session-huge", &payload, Some("batch-huge"))
+            .await
+            .expect_err("an oversized batch must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                SessionReplayError::BatchTooLarge { unit: "events", .. }
+            ),
+            "expected BatchTooLarge, got {err:?}"
+        );
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log();
+        assert_eq!(
+            count_event_inserts(&log),
+            0,
+            "nothing may be written for a rejected batch"
         );
     }
 
@@ -1655,6 +2425,53 @@ mod tests {
         assert!(
             msg.contains("42"),
             "error message must include project_id, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Authorization lookups (added with the project-scoping fix)
+    //
+    // These resolve the project that owns a session/visitor so the
+    // handlers can run `project_access_guard!`. If they ever stop
+    // returning the owning project, the guard silently checks the wrong
+    // project — so pin the behaviour.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_returns_owning_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_session_model(7, "sess-x", 42)]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(svc.project_id_for_session_pk(7).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_errors_when_missing() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<session_replay_sessions::Model>::new()])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert!(svc.project_id_for_session_pk(999).await.is_err());
+    }
+
+    /// Deliberately does NOT filter on `is_active`: an authorization
+    /// decision has to be made for the row that exists, or an ended
+    /// session falls out of scoping entirely and becomes readable by
+    /// anyone.
+    #[tokio::test]
+    async fn project_id_for_session_replay_id_resolves_inactive_sessions() {
+        let mut inactive = make_session_model(7, "sess-x", 42);
+        inactive.is_active = false;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![inactive]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(
+            svc.project_id_for_session_replay_id("sess-x")
+                .await
+                .unwrap(),
+            42
         );
     }
 }

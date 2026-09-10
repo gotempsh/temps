@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
@@ -38,7 +41,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { useMemo, useState, useRef } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! SQLite-backed persistence for Lighthouse audit results.
 //!
 //! Uses Sea-ORM with a local SQLite file in the plugin's data directory.

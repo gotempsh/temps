@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! On-demand environment manager (scale-to-zero)
 //!
 //! Tracks idle environments and coordinates wake-on-request.
@@ -1468,6 +1471,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers query
@@ -1546,6 +1550,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers query
@@ -1715,6 +1720,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers
@@ -1787,6 +1793,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             .into_connection();
@@ -1863,6 +1870,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers (3 replicas)
@@ -2245,6 +2253,7 @@ mod tests {
             protected: false,
             sleeping: true,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2350,6 +2359,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2467,6 +2477,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2567,6 +2578,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }

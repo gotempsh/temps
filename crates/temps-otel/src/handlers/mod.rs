@@ -1,15 +1,38 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for OTLP ingest and query endpoints.
 
 pub mod audit;
+pub mod cloud_backfill_handler;
+/// The operator path onto the bulk Cloud-telemetry activation engine
+/// (ADR-042 §9).
+pub mod cloud_bulk_activation_handler;
+/// Per-project telemetry write mode and the instance aggregate (ADR-041 §9).
+pub mod cloud_telemetry_handler;
 pub mod dashboard_handler;
+pub mod facet_handler;
+pub mod global_traces;
 pub mod ingest_handler;
 pub mod metric_alert_handler;
 pub mod query_handler;
 
-use axum::routing::{get, post};
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{delete, get, post};
 use axum::Router;
 
+use crate::ingest::decode::MAX_DECOMPRESSED_SIZE;
 use crate::OtelAppState;
+
+/// Cap on the *compressed* request body for OTLP ingest routes, applied
+/// before Axum buffers anything. `MAX_DECOMPRESSED_SIZE` plus a margin for
+/// payloads that don't compress well (e.g. already-compressed or
+/// high-entropy data sent as `Content-Encoding: zstd`/`gzip`, which can come
+/// out slightly *larger* than the input). This also closes the gap where an
+/// uncompressed request (`Content-Encoding` absent) had no size check of its
+/// own — `decode::decompress` returns it unmodified — and previously relied
+/// solely on Axum's implicit 2 MiB default.
+pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 
 /// Configure all OTel routes.
 ///
@@ -28,14 +51,40 @@ use crate::OtelAppState;
 ///   GET /otel/metric-names
 ///   GET /otel/traces
 ///   GET /otel/traces/{trace_id}
+///   GET /otel/span-stats
 ///   GET /otel/logs
 ///   GET /otel/insights
 ///   GET /otel/health
 ///   GET /otel/quota
+///   GET /otel/has-traces/{project_id}
 ///   GET /otel/pipeline-stats
+///   GET /otel/ingest-errors
+///   GET /otel/pipeline-history
+///   GET /otel/cloud-telemetry/backfill/{project_id}
+///   GET /otel/cloud-telemetry/status
+///   GET   /otel/cloud-telemetry/projects/{project_id}
+///   PATCH /otel/cloud-telemetry/projects/{project_id}
+///
+/// Bulk Cloud telemetry activation (ADR-042 §9, instance administrator):
+///   POST /otel/cloud-telemetry/bulk-jobs/estimate
+///   POST /otel/cloud-telemetry/bulk-jobs
+///   GET  /otel/cloud-telemetry/bulk-jobs/current
+///   GET  /otel/cloud-telemetry/bulk-jobs/{batch_id}
+///   POST /otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel
 pub fn configure_routes() -> Router<OtelAppState> {
-    Router::new()
+    // OTLP ingest endpoints are split into their own sub-router so
+    // `DefaultBodyLimit` applies only to them, not to the query/dashboard
+    // routes below.
+    let ingest_routes = Router::new()
         // OTLP ingest endpoints (header-based auth)
+        .route(
+            "/otel/global/trace-summaries",
+            get(global_traces::query_global_trace_summaries),
+        )
+        .route(
+            "/otel/global/spans",
+            get(global_traces::query_global_traces),
+        )
         .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
         .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
         .route("/otel/v1/logs", post(ingest_handler::ingest_logs))
@@ -52,6 +101,9 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
             post(ingest_handler::ingest_logs_by_path),
         )
+        .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT));
+
+    let query_routes = Router::new()
         // Query endpoints
         .route("/otel/metrics", get(query_handler::query_metrics))
         .route(
@@ -71,6 +123,9 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/trace-summaries",
             get(query_handler::query_trace_summaries),
         )
+        // Registered before `/otel/traces/{project_id}/{trace_id}` for
+        // readability only — matchit prefers static segments regardless.
+        .route("/otel/span-stats", get(query_handler::query_span_stats))
         .route(
             "/otel/traces/{project_id}/{trace_id}",
             get(query_handler::get_trace),
@@ -82,9 +137,65 @@ pub fn configure_routes() -> Router<OtelAppState> {
         )
         .route("/otel/health/{project_id}", get(query_handler::get_health))
         .route("/otel/quota/{project_id}", get(query_handler::get_quota))
+        // ADR-040 §1: read-only status of the out-of-process Cloud telemetry
+        // backfill, so the Console can show a run the CLI is driving.
+        .route(
+            "/otel/cloud-telemetry/backfill/{project_id}",
+            get(cloud_backfill_handler::get_cloud_backfill_status),
+        )
+        // ADR-041 §9: the per-project write-mode control and the instance
+        // aggregate. Both answer on an unlinked instance — the control must
+        // onboard rather than disappear, which is impossible if the endpoint
+        // 404s when Cloud is not set up.
+        //
+        // The static `/status` path is registered before the parameterised
+        // `/projects/{project_id}` for readability only; matchit prefers static
+        // segments regardless.
+        .route(
+            "/otel/cloud-telemetry/status",
+            get(cloud_telemetry_handler::get_cloud_telemetry_status),
+        )
+        .route(
+            "/otel/cloud-telemetry/projects/{project_id}",
+            get(cloud_telemetry_handler::get_project_cloud_telemetry)
+                .patch(cloud_telemetry_handler::update_project_cloud_telemetry),
+        )
+        // ADR-042 §9: the operator path onto the bulk activation engine.
+        // `/estimate` and `/current` are registered before the parameterised
+        // `{batch_id}` for readability only; matchit prefers static segments
+        // regardless, so neither can be captured as a job id.
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/estimate",
+            post(cloud_bulk_activation_handler::estimate_bulk_activation),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/current",
+            get(cloud_bulk_activation_handler::get_current_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs",
+            post(cloud_bulk_activation_handler::create_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/{batch_id}",
+            get(cloud_bulk_activation_handler::get_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel",
+            post(cloud_bulk_activation_handler::cancel_bulk_activation_job),
+        )
+        .route(
+            "/otel/has-traces/{project_id}",
+            get(query_handler::has_traces),
+        )
         .route(
             "/otel/pipeline-stats",
             get(query_handler::get_pipeline_stats),
+        )
+        .route("/otel/ingest-errors", get(query_handler::get_ingest_errors))
+        .route(
+            "/otel/pipeline-history",
+            get(query_handler::get_pipeline_history),
         )
         // GenAI agent activity endpoints
         .route("/otel/genai/traces", get(query_handler::query_genai_traces))
@@ -102,6 +213,16 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route(
             "/otel/global/traces/{trace_id}",
             get(query_handler::get_unified_trace),
+        )
+        // Span attribute facets (platform-global fast-filter registration)
+        .route(
+            "/otel/facets",
+            get(facet_handler::list_facets).post(facet_handler::create_facet),
+        )
+        .route("/otel/facets/{key}", delete(facet_handler::delete_facet))
+        .route(
+            "/otel/facets/{key}/retry",
+            post(facet_handler::retry_facet_backfill),
         )
         // Metric dashboards (per-project saved dashboard CRUD)
         .route(
@@ -130,5 +251,7 @@ pub fn configure_routes() -> Router<OtelAppState> {
             get(metric_alert_handler::get_alert)
                 .patch(metric_alert_handler::update_alert)
                 .delete(metric_alert_handler::delete_alert),
-        )
+        );
+
+    ingest_routes.merge(query_routes)
 }

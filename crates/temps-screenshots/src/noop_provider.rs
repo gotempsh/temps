@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! No-op Screenshot Provider
 //!
 //! A provider that does nothing - useful for environments where screenshots
@@ -48,10 +51,10 @@ impl ScreenshotProvider for NoopScreenshotProvider {
         "noop"
     }
 
-    async fn is_available(&self) -> bool {
+    async fn check_availability(&self) -> ScreenshotResult<()> {
         // Always available since it doesn't do anything
-        debug!("NoopScreenshotProvider: is_available() returning true (noop mode)");
-        true
+        debug!("NoopScreenshotProvider: check_availability() returning Ok (noop mode)");
+        Ok(())
     }
 }
 

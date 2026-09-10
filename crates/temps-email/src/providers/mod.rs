@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email provider abstractions and implementations
 
 mod scaleway;
@@ -8,10 +11,13 @@ mod traits;
 #[cfg(test)]
 pub mod mock;
 
+pub(crate) use scaleway::verify_scaleway_credentials;
 pub use scaleway::{ScalewayCredentials, ScalewayProvider};
+pub(crate) use ses::verify_ses_credentials;
+pub(crate) use ses::DEFAULT_CONFIGURATION_SET;
 pub use ses::{SesCredentials, SesProvider};
 pub use smtp::{SmtpCredentials, SmtpEncryption, SmtpProvider};
 pub use traits::*;
 
 #[cfg(test)]
-pub use mock::MockEmailProvider;
+pub use mock::{MockEmailProvider, MockSendResult};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Container health monitoring loop
 //!
 //! Periodically inspects all active deployment containers to detect:
@@ -304,7 +307,7 @@ impl ContainerHealthMonitor {
         };
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -364,6 +367,23 @@ impl ContainerHealthMonitor {
                     return;
                 }
 
+                // Skip alarm if the deployment was intentionally paused by the
+                // user — `pause_deployment` stops containers on purpose, so
+                // this exit is expected, not a crash. Re-read the deployment
+                // live rather than trusting `deployment.state`: that value is
+                // a snapshot batch-loaded once at the start of the current
+                // poll cycle (see `check_all_containers`), so a pause that
+                // commits mid-cycle — after the snapshot was taken but before
+                // this container is reached — would otherwise still look
+                // unpaused here.
+                if self.is_deployment_paused(deployment.id).await {
+                    debug!(
+                        "Container {} ({}) is {} but deployment {} is paused, skipping alarm",
+                        container.id, container.container_name, status_str, deployment.id
+                    );
+                    return;
+                }
+
                 warn!(
                     "Container {} ({}) is in '{}' state (reason: {})",
                     container.id,
@@ -387,7 +407,7 @@ impl ContainerHealthMonitor {
                     .unwrap_or_else(|| status_str.clone());
 
                 let request = FireAlarmRequest {
-                    project_id: deployment.project_id,
+                    project_id: Some(deployment.project_id),
                     environment_id: Some(deployment.environment_id),
                     deployment_id: Some(deployment.id),
                     container_id: Some(container.id),
@@ -482,6 +502,20 @@ impl ContainerHealthMonitor {
         }
     }
 
+    /// Check if a deployment is currently paused. Always a live read (never
+    /// cached or batch-snapshotted) since this feeds an alarm-suppression
+    /// decision that must reflect `pause_deployment`'s state at the moment
+    /// the alarm would fire, not at the start of the poll cycle.
+    async fn is_deployment_paused(&self, deployment_id: i32) -> bool {
+        deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
+    }
+
     /// Check CPU and memory usage against thresholds
     async fn check_resource_usage(
         &self,
@@ -508,15 +542,21 @@ impl ContainerHealthMonitor {
         // `stats.cpu_percent` is the raw Docker number where 100% == one core, so
         // a container *allowed* 2 cores can hit 200% while only being 100%
         // utilised. We must compare the threshold against utilisation relative to
-        // the container's CPU limit — otherwise a 2-core container fires at ~95%
-        // raw (≈47% of its limit), nowhere near saturation. `cpu_used_cores`
-        // (= raw% / 100) is surfaced alongside so the alarm is actionable.
+        // the CPU the container is allowed to use — its explicit limit when it
+        // has one (otherwise a 2-core container fires at ~95% raw, ≈47% of its
+        // limit), and the host's core count when it doesn't (otherwise an
+        // uncapped container using 1 of 8 cores fires at "100%" on an idle host).
+        // `cpu_used_cores` (= raw% / 100) is surfaced alongside so the alarm is
+        // actionable.
         let cpu_utilization = stats.cpu_utilization_percent();
         let cpu_used_cores = stats.cpu_percent / 100.0;
         if cpu_utilization > self.config.cpu_threshold_percent {
-            let limit_label = match stats.cpu_limit_cores {
-                Some(cores) if cores > 0.0 => format!("{cores:.2} core limit"),
-                _ => "no limit (per-core)".to_string(),
+            let capacity_label = match (stats.cpu_limit_cores, stats.online_cpus) {
+                (Some(cores), _) if cores > 0.0 => format!("its {cores:.2}-core limit"),
+                (_, Some(cpus)) if cpus > 0 => {
+                    format!("the {cpus} cores on this host (no CPU limit set)")
+                }
+                _ => "one core (no CPU limit set, host core count unknown)".to_string(),
             };
             self.handle_resource_threshold(
                 container,
@@ -524,25 +564,29 @@ impl ContainerHealthMonitor {
                 AlarmType::HighCpu,
                 AlarmSeverity::Warning,
                 format!(
-                    "Container '{}' CPU at {:.0}% of limit",
+                    "Container '{}' CPU at {:.0}% of available capacity",
                     container.container_name, cpu_utilization
                 ),
                 format!(
-                    "Container '{}' CPU usage is at {:.0}% of its {} ({:.2} cores in use), above the {:.0}% threshold.",
+                    "Container '{}' is using {:.2} cores — {:.0}% of {}, above the {:.0}% threshold.",
                     container.container_name,
-                    cpu_utilization,
-                    limit_label,
                     cpu_used_cores,
+                    cpu_utilization,
+                    capacity_label,
                     self.config.cpu_threshold_percent,
                 ),
                 serde_json::json!({
                     "container_name": container.container_name,
-                    // Utilisation relative to the CPU limit — what the threshold is compared against.
+                    // Utilisation relative to the CPU the container may use — what
+                    // the threshold is compared against.
                     "cpu_utilization_percent": cpu_utilization,
                     // Raw Docker percentage (100% == one core) and the cores it maps to.
                     "cpu_percent": stats.cpu_percent,
                     "cpu_used_cores": cpu_used_cores,
                     "cpu_limit_cores": stats.cpu_limit_cores,
+                    // Host cores — the ceiling used when no limit is configured.
+                    "online_cpus": stats.online_cpus,
+                    "cpu_ceiling_cores": stats.cpu_ceiling_cores(),
                     "threshold_percent": self.config.cpu_threshold_percent,
                 }),
             )
@@ -653,7 +697,8 @@ impl ContainerHealthMonitor {
                 stats.cpu_percent,
                 MetricKind::Gauge,
             ),
-            // CPU usage relative to the container's CPU limit (100% == limit
+            // CPU usage relative to the CPU the container may use — its limit
+            // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
             // against — see `container_default_seeds()` in the evaluator.
             make_point(
@@ -761,7 +806,7 @@ impl ContainerHealthMonitor {
         }
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -885,6 +930,15 @@ mod tests {
 
         async fn set_cpu_percent(&self, percent: f64) {
             self.stats.lock().await.cpu_percent = percent;
+        }
+
+        /// Set the raw Docker CPU percentage together with the CPU the
+        /// container is allowed to use (limit if any, plus the host's cores).
+        async fn set_cpu(&self, percent: f64, limit_cores: Option<f64>, online_cpus: u32) {
+            let mut stats = self.stats.lock().await;
+            stats.cpu_percent = percent;
+            stats.cpu_limit_cores = limit_cores;
+            stats.online_cpus = Some(online_cpus);
         }
 
         async fn set_memory_percent(&self, percent: f64) {
@@ -1062,7 +1116,7 @@ mod tests {
         // DB calls: cooldown check (count=0) + insert alarm
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1077,6 +1131,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1159,7 +1214,7 @@ mod tests {
 
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1174,6 +1229,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1198,6 +1254,89 @@ mod tests {
         // Should fire alarm for exited container
         monitor
             .check_container_status(&container, &deployment, &info)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_check_container_status_exited_skips_alarm_when_paused() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let container = make_container_model(1);
+        let deployment = deployments::Model {
+            state: "paused".to_string(),
+            ..make_deployment_model()
+        };
+
+        // Query order: `is_on_demand_sleeping` reads `environments` first (not
+        // found here, so it reports "not sleeping"), then `is_deployment_paused`
+        // reads `deployments` live and must see `state == "paused"` — this is
+        // the live re-read added after PR #835 review found the deployment
+        // model passed into `check_container_status` can be a stale snapshot
+        // batch-loaded once per poll cycle. No alarm-related DB calls
+        // (cooldown check / insert) should happen after that: if the paused
+        // check were skipped, the monitor would try to query for them and
+        // this MockDatabase (with no further results queued) would surface it.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::environments::Model>::new()])
+            .append_query_results(vec![vec![deployment.clone()]])
+            .into_connection();
+        let db = Arc::new(db);
+        let alarm_service = make_alarm_service(db.clone());
+
+        let monitor = ContainerHealthMonitor::new(
+            db,
+            deployer.clone(),
+            alarm_service,
+            ContainerHealthConfig::default(),
+        );
+
+        let info = deployer.get_container_info("abc123").await.unwrap();
+        monitor
+            .check_container_status(&container, &deployment, &info)
+            .await;
+    }
+
+    /// Regression test: `check_all_containers` batch-loads its deployments
+    /// map once per poll cycle, so the `deployment` snapshot passed into
+    /// `check_container_status` can be stale by the time a specific
+    /// container is reached — e.g. a pause that commits mid-cycle, after the
+    /// snapshot was taken. The alarm decision must be driven by a live read,
+    /// not by `deployment.state` on the passed-in snapshot: here the
+    /// snapshot still says "ready" (not paused) but the live DB row is
+    /// "paused", and the alarm must still be skipped.
+    #[tokio::test]
+    async fn test_check_container_status_uses_live_state_not_stale_snapshot() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let container = make_container_model(1);
+        let stale_snapshot = deployments::Model {
+            state: "ready".to_string(),
+            ..make_deployment_model()
+        };
+        let live_paused_row = deployments::Model {
+            state: "paused".to_string(),
+            ..make_deployment_model()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::environments::Model>::new()])
+            .append_query_results(vec![vec![live_paused_row]])
+            .into_connection();
+        let db = Arc::new(db);
+        let alarm_service = make_alarm_service(db.clone());
+
+        let monitor = ContainerHealthMonitor::new(
+            db,
+            deployer.clone(),
+            alarm_service,
+            ContainerHealthConfig::default(),
+        );
+
+        let info = deployer.get_container_info("abc123").await.unwrap();
+        // Passing the stale, still-"ready" snapshot: if the implementation
+        // regressed to reading `stale_snapshot.state` instead of doing a
+        // live lookup, it would try to fire an alarm here and hit
+        // unmocked DB calls this MockDatabase has no results queued for.
+        monitor
+            .check_container_status(&container, &stale_snapshot, &info)
             .await;
     }
 
@@ -1227,6 +1366,68 @@ mod tests {
     }
 
     // ── Resource threshold tests ──────────────────────────────────────
+
+    /// Build a monitor over a mock deployer, with no metrics store.
+    fn make_monitor(deployer: Arc<MockDeployer>) -> ContainerHealthMonitor {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let alarm_service = make_alarm_service(db.clone());
+        ContainerHealthMonitor::new(
+            db,
+            deployer,
+            alarm_service,
+            ContainerHealthConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_uncapped_container_does_not_breach_at_one_core_of_many() {
+        // Regression: with no CPU limit, one saturated core used to normalise to
+        // 100% and trip the 90% threshold — on a host with 7 idle cores.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(100.0, None, 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert!(
+            counters.get(&(1, "high_cpu")).is_none(),
+            "uncapped container using 1 of 8 cores must not count as a CPU breach"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uncapped_container_breaches_when_it_saturates_the_host() {
+        // 7.8 of 8 cores == 97.5% of what it's allowed: a real breach.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(780.0, None, 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert_eq!(*counters.get(&(1, "high_cpu")).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_capped_container_breaches_against_its_own_limit() {
+        // 0.48 cores against a 0.5-core cap == 96%, even though the 8-core host
+        // is almost entirely idle.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(48.0, Some(0.5), 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert_eq!(*counters.get(&(1, "high_cpu")).unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn test_resource_counter_increments_before_alarm() {

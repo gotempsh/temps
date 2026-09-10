@@ -1,4 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
+import { aiHarnessName } from '@/components/ui/ai-harness-brand'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -16,7 +21,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   getAgentOptions,
@@ -31,6 +36,7 @@ import type {
   AgentConfigResponse,
   UpsertAgentRequest,
 } from '@/api/client/types.gen'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 
 export interface TriggerConfig {
   error?: { new_issue?: boolean; regression?: boolean }
@@ -58,7 +64,11 @@ export function AgentEditPage({ project }: AgentEditPageProps) {
   const { agentSlug } = useParams<{ agentSlug: string }>()
   const backHref = `/projects/${project.slug}/agents/detail/${agentSlug ?? ''}`
 
-  const { data: agentRaw, isLoading, error } = useQuery({
+  const {
+    data: agentRaw,
+    isLoading,
+    error,
+  } = useQuery({
     ...getAgentOptions({
       path: { project_id: project.id, slug: agentSlug! },
     }),
@@ -125,38 +135,48 @@ function AgentEditForm({
   const [aiModel, setAiModel] = useState<string>(agent.ai_model ?? '')
   const [prompt, setPrompt] = useState(agent.prompt ?? '')
   const [maxTurns, setMaxTurns] = useState(agent.max_turns ?? 25)
-  const [timeoutSeconds, setTimeoutSeconds] = useState(agent.timeout_seconds ?? 600)
-  const [dailyBudgetCents, setDailyBudgetCents] = useState(agent.daily_budget_cents ?? 500)
-  const [cooldownMinutes, setCooldownMinutes] = useState(agent.cooldown_minutes ?? 30)
-  const [branchPrefix, setBranchPrefix] = useState(agent.branch_prefix ?? 'agents/')
-  const [deliverable, setDeliverable] = useState(agent.deliverable ?? 'pull_request')
-  const [configRepoUrl, setConfigRepoUrl] = useState(agent.config_repo_url ?? '')
-  const [configRepoBranch, setConfigRepoBranch] = useState(agent.config_repo_branch ?? '')
-  const [selectedSkills, setSelectedSkills] = useState<string[]>(agent.skills_config ?? [])
-  const [selectedMcps, setSelectedMcps] = useState<string[]>(agent.mcp_servers_config ?? [])
+  const [timeoutSeconds, setTimeoutSeconds] = useState(
+    agent.timeout_seconds ?? 600
+  )
+  const [dailyBudgetCents, setDailyBudgetCents] = useState(
+    agent.daily_budget_cents ?? 500
+  )
+  const [cooldownMinutes, setCooldownMinutes] = useState(
+    agent.cooldown_minutes ?? 30
+  )
+  const [branchPrefix, setBranchPrefix] = useState(
+    agent.branch_prefix ?? 'agents/'
+  )
+  const [deliverable, setDeliverable] = useState(
+    agent.deliverable ?? 'pull_request'
+  )
+  const [configRepoUrl, setConfigRepoUrl] = useState(
+    agent.config_repo_url ?? ''
+  )
+  const [configRepoBranch, setConfigRepoBranch] = useState(
+    agent.config_repo_branch ?? ''
+  )
+  const [selectedSkills, setSelectedSkills] = useState<string[]>(
+    agent.skills_config ?? []
+  )
+  const [selectedMcps, setSelectedMcps] = useState<string[]>(
+    agent.mcp_servers_config ?? []
+  )
   const [triggerNewIssue, setTriggerNewIssue] = useState(
-    agent.trigger_config?.error?.new_issue ?? false,
+    agent.trigger_config?.error?.new_issue ?? false
   )
   const [triggerRegression, setTriggerRegression] = useState(
-    agent.trigger_config?.error?.regression ?? false,
+    agent.trigger_config?.error?.regression ?? false
   )
-  const [triggerManual, setTriggerManual] = useState(agent.trigger_config?.manual ?? false)
-  const [triggerCron, setTriggerCron] = useState(agent.trigger_config?.schedule?.cron ?? '')
+  const [triggerManual, setTriggerManual] = useState(
+    agent.trigger_config?.manual ?? false
+  )
+  const [triggerCron, setTriggerCron] = useState(
+    agent.trigger_config?.schedule?.cron ?? ''
+  )
 
   const { data: providerCatalog } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: async () => {
-      const res = await fetch('/api/settings/ai-providers')
-      if (!res.ok) return null
-      return res.json() as Promise<{
-        default_provider: string
-        providers: Array<{
-          id: string
-          models: string[]
-          default_model: string | null
-        }>
-      }>
-    },
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,
   })
   const availableModels =
@@ -171,7 +191,7 @@ function AgentEditForm({
   const availableSkills = [
     ...projectSkills,
     ...globalSkills.filter(
-      (g) => !projectSkills.some((p) => p.slug === g.slug),
+      (g) => !projectSkills.some((p) => p.slug === g.slug)
     ),
   ]
 
@@ -188,11 +208,11 @@ function AgentEditForm({
 
   const toggleSkill = (slug: string) =>
     setSelectedSkills((prev) =>
-      prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug],
+      prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug]
     )
   const toggleMcp = (slug: string) =>
     setSelectedMcps((prev) =>
-      prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug],
+      prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug]
     )
 
   const updateMutation = useMutation({
@@ -300,8 +320,8 @@ function AgentEditForm({
             <code className="bg-muted rounded px-1">
               .temps/agents/{agent.slug}.yaml
             </code>
-            . Saving here updates the live config, but the next deploy will
-            sync the YAML file back and overwrite your changes.
+            . Saving here updates the live config, but the next deploy will sync
+            the YAML file back and overwrite your changes.
           </p>
         </div>
       )}
@@ -341,7 +361,7 @@ function AgentEditForm({
                 Enabled
               </Label>
               <p className="text-muted-foreground text-xs">
-                When off, the workflow won't run on any trigger.
+                When off, the workflow won’t run on any trigger.
               </p>
             </div>
             <Switch
@@ -388,7 +408,7 @@ function AgentEditForm({
         <div>
           <h2 className="text-base font-semibold">Triggers</h2>
           <p className="text-muted-foreground mt-1 text-sm">
-            When this workflow runs. Disabled triggers aren't saved to the
+            When this workflow runs. Disabled triggers aren’t saved to the
             workflow config.
           </p>
         </div>
@@ -470,12 +490,18 @@ function AgentEditForm({
               }}
             >
               <SelectTrigger id="ai-provider">
-                <SelectValue />
+                <AiHarnessLogo providerId={aiProvider} size={22} />
+                <SelectValue>{aiHarnessName(aiProvider)}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="claude_cli">Claude Code</SelectItem>
-                <SelectItem value="opencode">OpenCode</SelectItem>
-                <SelectItem value="codex_cli">Codex</SelectItem>
+                {['claude_cli', 'opencode', 'codex_cli'].map((providerId) => (
+                  <SelectItem key={providerId} value={providerId}>
+                    <span className="flex items-center gap-2">
+                      <AiHarnessLogo providerId={providerId} size={22} />
+                      <span>{aiHarnessName(providerId)}</span>
+                    </span>
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
             {providerCatalog &&
@@ -497,9 +523,7 @@ function AgentEditForm({
               <Label htmlFor="ai-model">Model</Label>
               <Select
                 value={aiModel === '' ? '__default__' : aiModel}
-                onValueChange={(v) =>
-                  setAiModel(v === '__default__' ? '' : v)
-                }
+                onValueChange={(v) => setAiModel(v === '__default__' ? '' : v)}
               >
                 <SelectTrigger id="ai-model">
                   <SelectValue />
@@ -516,7 +540,7 @@ function AgentEditForm({
                 </SelectContent>
               </Select>
               <p className="text-muted-foreground text-xs">
-                Overrides the provider's default model. Passed as{' '}
+                Overrides the provider’s default model. Passed as{' '}
                 <code className="bg-muted rounded px-1">--model</code> to the
                 CLI.
               </p>
@@ -543,9 +567,10 @@ function AgentEditForm({
         <div>
           <h2 className="text-base font-semibold">Config repository</h2>
           <p className="text-muted-foreground mt-1 text-sm">
-            Private repo with a <code className="bg-muted rounded px-1">.claude/</code>{' '}
-            directory containing skills, MCP servers, and settings. Overlaid
-            into the sandbox at runtime.
+            Private repo with a{' '}
+            <code className="bg-muted rounded px-1">.claude/</code> directory
+            containing skills, MCP servers, and settings. Overlaid into the
+            sandbox at runtime.
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-[2fr_1fr]">
@@ -622,9 +647,7 @@ function AgentEditForm({
           </div>
         ) : (
           <div className="rounded-md border border-dashed p-6 text-center">
-            <p className="text-muted-foreground text-sm">
-              No skills defined.
-            </p>
+            <p className="text-muted-foreground text-sm">No skills defined.</p>
             <p className="text-muted-foreground mt-1 text-xs">
               Create skills in project or platform settings.
             </p>
@@ -695,7 +718,7 @@ function AgentEditForm({
         <div>
           <h2 className="text-base font-semibold">Limits</h2>
           <p className="text-muted-foreground mt-1 text-sm">
-            Guard rails so a stuck workflow can't burn the budget.
+            Guard rails so a stuck workflow can’t burn the budget.
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -720,9 +743,7 @@ function AgentEditForm({
               min={0}
               className="tabular-nums"
               value={timeoutSeconds}
-              onChange={(e) =>
-                setTimeoutSeconds(parseInt(e.target.value) || 0)
-              }
+              onChange={(e) => setTimeoutSeconds(parseInt(e.target.value) || 0)}
             />
           </div>
           <div className="space-y-1.5">

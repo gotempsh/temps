@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -51,12 +54,19 @@ pub struct GitPushEventJob {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DeployImageRequestedJob {
     pub project_id: i32,
+    /// Restrict the deployment to one environment. `None` preserves the
+    /// project-wide template/import behavior for older queued jobs.
+    #[serde(default)]
+    pub target_environment_id: Option<i32>,
     /// Docker image reference to pull and run (e.g. "ghcr.io/org/app:latest").
     pub image_ref: String,
     /// Optional HTTP health-check path probed after the container starts.
     /// Must start with '/'. Defaults to "/" when absent.
     #[serde(default)]
     pub health_check_path: Option<String>,
+    /// Optional command passed to the image entrypoint.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -243,7 +253,8 @@ pub struct StatusCheckCompletedJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmFiredJob {
     pub alarm_id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project.
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub alarm_type: String,
@@ -268,7 +279,8 @@ pub struct AutopilotTriggerJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmResolvedJob {
     pub alarm_id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project.
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub alarm_type: String,
@@ -334,6 +346,18 @@ pub struct BackupRequestedJob {
     /// Wall-clock timeout for this backup. The processor wraps the
     /// container's exit in `tokio::time::timeout` with this duration.
     pub max_runtime_secs: i64,
+}
+
+/// Result event published by the backup processor when a backup transitions
+/// to `running`, before the engine actually executes. Lets a listener (e.g.
+/// Cloud's lifecycle notifier) learn a backup is in flight without waiting
+/// for it to finish — the sole purpose is a fast "this is happening" signal,
+/// not a durable record; `BackupCompleted`/`BackupFailed` remain the source
+/// of truth for outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupStartedJob {
+    pub backup_id: i32,
+    pub engine: String,
 }
 
 /// Result event published by the backup processor after a successful run.
@@ -432,6 +456,7 @@ pub enum Job {
     // the `BackupJobProcessor` consumes it and runs the engine in a
     // one-shot container, then publishes BackupCompleted or BackupFailed.
     BackupRequested(BackupRequestedJob),
+    BackupStarted(BackupStartedJob),
     BackupCompleted(BackupCompletedJob),
     BackupFailed(BackupFailedJob),
     BackupCancelRequested(BackupCancelRequestedJob),
@@ -486,10 +511,11 @@ impl fmt::Display for Job {
             Job::StatusCheckCompleted(job) => write!(f, "StatusCheckCompleted(monitor: {}, status: {})", job.monitor_id, job.status),
             Job::RouteTableUpdated(job) => write!(f, "RouteTableUpdated(env: {:?}, deployment: {:?}, routes: {})", job.environment_id, job.deployment_id, job.route_count),
             Job::ForceRouteReload(job) => write!(f, "ForceRouteReload(env: {:?}, deployment: {:?})", job.environment_id, job.deployment_id),
-            Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
-            Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
+            Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {:?}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
+            Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
+            Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),

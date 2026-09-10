@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Deployer - Abstract container building and deployment
 //!
 //! This crate provides a unified interface for:
@@ -14,6 +17,14 @@ use std::pin::Pin;
 use temps_core::UtcDateTime;
 use thiserror::Error;
 
+/// Backpressure-aware byte stream used when importing an OCI image.
+///
+/// Keeping this at the trait boundary lets remote agents forward an upload
+/// directly to Docker instead of first materializing the complete archive in
+/// a temporary file (and charging that file's page cache to the agent cgroup).
+pub type ImageImportStream =
+    Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+
 pub mod compose;
 
 /// Callback function type for processing build logs in real-time
@@ -21,10 +32,20 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod metadata_egress;
+pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
+pub mod static_ingestion;
+pub mod traefik_discovery;
+pub mod traefik_labels;
+
+pub use platform::{
+    canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,
+    normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
+};
 
 #[derive(Error, Debug)]
 pub enum BuilderError {
@@ -138,14 +159,29 @@ pub struct DeployRequest {
     pub container_name: String,
     pub environment_vars: HashMap<String, String>,
     /// Secret values (plaintext, already decrypted by the caller) to mount as
-    /// files under `/run/secrets/<KEY>` inside the container. Each file is
-    /// mode 0400, root-owned, stored on a tmpfs volume, not visible via
-    /// `docker inspect`. Total tmpfs size is capped; per-secret plaintext
-    /// must be <= 1 MiB (enforced upstream in `SecretService`).
+    /// files under `/run/secrets/<KEY>` inside the container, and never
+    /// injected as environment variables — so they do not appear in
+    /// `docker inspect`. Per-secret plaintext must be <= 1 MiB (enforced
+    /// upstream in `SecretService`).
+    ///
+    /// Delivery is a read-only bind mount of a per-container directory under
+    /// `$TEMPS_DATA_DIR/secrets`, each file mode 0400 and chowned to the uid
+    /// resolved from the image's `USER`. **Not** a tmpfs: `/tmp` is tmpfs on
+    /// most distributions, so a tmpfs-backed mount would point at an empty
+    /// directory after a host reboot and every container would come back with
+    /// no secrets until someone redeployed. The tradeoff is that plaintext
+    /// lives on host disk for the container's lifetime; the threat this
+    /// addresses is read access to the Docker API, not host root.
     #[serde(default)]
     pub secrets: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
     pub network_name: Option<String>,
+    /// Additional Docker networks that this container must join before it
+    /// starts. Use this for host-local dependency networks, such as a
+    /// self-hosted database Compose network, where a successful deploy is not
+    /// useful unless service DNS is available at application boot.
+    #[serde(default)]
+    pub extra_networks: Vec<String>,
     pub resource_limits: ResourceLimits,
     pub restart_policy: RestartPolicy,
     #[schema(value_type = String)]
@@ -210,6 +246,12 @@ pub struct PortMapping {
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: Protocol,
+    /// Optional host interface for this published port. When omitted, the
+    /// runtime's configured bind address is used. Remote app deployments set
+    /// this to the node's private address so candidate ports never bind the
+    /// public interface directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -328,12 +370,20 @@ pub struct ContainerStats {
     /// Raw Docker CPU usage percentage, where **100% == one full core**.
     /// A container saturating 2 cores reads `200.0`, 4 cores `400.0`, etc.
     /// This is NOT bounded to 0-100 — to compare against a threshold you must
-    /// normalise against the CPU limit; use [`ContainerStats::cpu_utilization_percent`].
+    /// normalise against the CPU the container is allowed to use; use
+    /// [`ContainerStats::cpu_utilization_percent`].
     pub cpu_percent: f64,
     /// CPU limit applied to the container, in whole cores (e.g. `1.0`).
     /// None if no limit is set. Lets the UI render "0.5 / 1.0 cores".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cpu_limit_cores: Option<f64>,
+    /// Number of CPU cores Docker reported as online on the host at sample
+    /// time. This is the real ceiling for an *uncapped* container — without it
+    /// there is no way to tell "using 1 of 1 core" (saturated) from "using 1 of
+    /// 8 cores" (idle host). None when the counter is absent (e.g. stats from a
+    /// worker agent predating this field).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub online_cpus: Option<u32>,
     /// Memory usage in bytes
     pub memory_bytes: u64,
     /// Memory limit in bytes (if set)
@@ -364,6 +414,7 @@ impl Default for ContainerStats {
             container_name: String::new(),
             cpu_percent: 0.0,
             cpu_limit_cores: None,
+            online_cpus: None,
             memory_bytes: 0,
             memory_limit_bytes: None,
             memory_percent: None,
@@ -388,18 +439,29 @@ impl ContainerStats {
     /// limit) — well below saturation.
     ///
     /// When the container has an explicit limit (`cpu_limit_cores`), the ceiling
-    /// is `limit * 100` raw percent. With no limit set there is no fixed ceiling,
-    /// so we normalise per-core (ceiling = 100% raw = one core saturated); this
-    /// keeps the threshold meaningful for uncapped containers without firing the
-    /// instant a container exceeds a single core's worth of legitimate work —
-    /// callers that want host-relative behaviour should special-case `None`.
+    /// is `limit * 100` raw percent. When it has **no** limit the container may
+    /// legitimately use every core on the box, so the ceiling is the host's core
+    /// count (`online_cpus`) — using one core as the ceiling would report a
+    /// container quietly using 1 of 8 cores as "100% utilised" and fire a
+    /// high-CPU alarm on an idle host.
+    ///
+    /// Only when neither is known (no limit *and* no core count, e.g. stats from
+    /// an older worker agent) do we fall back to a one-core ceiling.
     pub fn cpu_utilization_percent(&self) -> f64 {
-        let ceiling_cores = match self.cpu_limit_cores {
+        self.cpu_percent / self.cpu_ceiling_cores()
+    }
+
+    /// Cores the container is allowed to use: its explicit limit, else every
+    /// core on the host, else one core when neither is known.
+    pub fn cpu_ceiling_cores(&self) -> f64 {
+        match self.cpu_limit_cores {
             Some(cores) if cores > 0.0 => cores,
-            // No (or invalid) limit: treat one core as the reference ceiling.
-            _ => 1.0,
-        };
-        self.cpu_percent / ceiling_cores
+            // Uncapped: the whole host is fair game.
+            _ => match self.online_cpus {
+                Some(cpus) if cpus > 0 => f64::from(cpus),
+                _ => 1.0,
+            },
+        }
     }
 }
 
@@ -530,6 +592,60 @@ pub trait ImageBuilder: Send + Sync {
     /// Import an image from a tar archive
     async fn import_image(&self, image_path: PathBuf, tag: &str) -> Result<String, BuilderError>;
 
+    /// Import an image from a backpressure-aware byte stream.
+    ///
+    /// Implementations that accept remote uploads should override this. The
+    /// default preserves compatibility for builders that only support files.
+    async fn import_image_stream(
+        &self,
+        mut stream: ImageImportStream,
+        tag: &str,
+    ) -> Result<String, BuilderError> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        // File-only builders keep their previous behavior. DockerRuntime
+        // overrides this method and forwards chunks directly to dockerd, so
+        // worker image transfers do not take this compatibility path.
+        let archive = tempfile::NamedTempFile::new().map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to create temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        let archive_file = archive.reopen().map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to open temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        let mut archive_file = tokio::fs::File::from_std(archive_file);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| {
+                BuilderError::IoError(std::io::Error::new(
+                    source.kind(),
+                    format!("Failed while receiving image archive for '{tag}': {source}"),
+                ))
+            })?;
+            archive_file.write_all(&chunk).await.map_err(|source| {
+                BuilderError::IoError(std::io::Error::new(
+                    source.kind(),
+                    format!("Failed to write temporary image archive for '{tag}': {source}"),
+                ))
+            })?;
+        }
+        archive_file.flush().await.map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to flush temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        drop(archive_file);
+
+        self.import_image(archive.path().to_path_buf(), tag).await
+    }
+
     /// Export (save) an image to a tar archive file.
     /// Equivalent to `docker save <image_name> -o <output_path>`.
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError>;
@@ -552,7 +668,37 @@ pub trait ImageBuilder: Send + Sync {
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
+    ///
+    /// May be a *fallback* — the architecture this binary was compiled for —
+    /// when the daemon's platform hasn't been discovered. Callers that must
+    /// not act on a guess should use [`Self::discovered_platform`] instead.
     fn get_native_platform(&self) -> String;
+
+    /// The platform this runtime **confirmed** with its Docker daemon, or
+    /// `None` when discovery hasn't succeeded.
+    ///
+    /// The distinction matters wherever a wrong answer is worse than no
+    /// answer: with a cross-architecture `DOCKER_HOST`, `get_native_platform`
+    /// reports this process's architecture until discovery lands, and treating
+    /// that as authoritative would pick the wrong image for the control plane.
+    ///
+    /// Defaults to `None` so an implementation that can't tell the difference
+    /// is treated as "unknown" rather than as a confirmation.
+    fn discovered_platform(&self) -> Option<String> {
+        None
+    }
+
+    /// Confirm the daemon's platform, querying it if that hasn't happened yet.
+    ///
+    /// [`Self::discovered_platform`] only reports what is already known, which
+    /// leaves callers on paths that never build — image uploads, external
+    /// images — permanently unable to tell a matching image from a mismatched
+    /// one. This lets them ask, at the cost of one `docker info`.
+    ///
+    /// Still `None` when the daemon can't be reached: unknown, never a guess.
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.discovered_platform()
+    }
 
     /// Validate that an image's architecture matches the target platform
     /// Returns Ok(()) if compatible, or Err(BuilderError::PlatformMismatch) if not
@@ -695,6 +841,19 @@ mod tests {
         }
     }
 
+    fn stats_with_cpu_on_host(
+        cpu_percent: f64,
+        cpu_limit_cores: Option<f64>,
+        online_cpus: u32,
+    ) -> ContainerStats {
+        ContainerStats {
+            cpu_percent,
+            cpu_limit_cores,
+            online_cpus: Some(online_cpus),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_cpu_utilization_with_limit() {
         // 2-core limit, container using 1.8 cores (180% raw) -> 90% of its limit.
@@ -720,8 +879,34 @@ mod tests {
     }
 
     #[test]
-    fn test_cpu_utilization_no_limit_is_per_core() {
-        // No limit -> one core is the reference ceiling, so raw% == utilisation%.
+    fn test_cpu_utilization_no_limit_is_relative_to_host_cores() {
+        // The bug this guards: an uncapped container saturating one core on an
+        // 8-core host is at 12.5% of what it's allowed, NOT 100%. Normalising
+        // per-core fired a high-CPU alarm on an essentially idle host.
+        let stats = stats_with_cpu_on_host(100.0, None, 8);
+        assert!((stats.cpu_utilization_percent() - 12.5).abs() < 1e-9);
+
+        // Only when it saturates every core does it read 100%.
+        let stats = stats_with_cpu_on_host(800.0, None, 8);
+        assert!((stats.cpu_utilization_percent() - 100.0).abs() < 1e-9);
+
+        // Single-core host: uncapped and pinned really is 100%.
+        let stats = stats_with_cpu_on_host(100.0, None, 1);
+        assert!((stats.cpu_utilization_percent() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cpu_utilization_explicit_limit_wins_over_host_cores() {
+        // A 0.5-core cap on an 8-core host: the cap is the ceiling, so half a
+        // core in use is full saturation.
+        let stats = stats_with_cpu_on_host(50.0, Some(0.5), 8);
+        assert!((stats.cpu_utilization_percent() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cpu_utilization_unknown_host_cores_falls_back_to_one_core() {
+        // No limit and no core count (older worker agent) -> one-core ceiling,
+        // so raw% == utilisation%.
         let stats = stats_with_cpu(95.0, None);
         assert!((stats.cpu_utilization_percent() - 95.0).abs() < 1e-9);
 
@@ -730,14 +915,29 @@ mod tests {
     }
 
     #[test]
-    fn test_cpu_utilization_zero_or_invalid_limit_falls_back_to_one_core() {
-        // A zero/negative limit is treated as "no limit" (one-core ceiling)
+    fn test_cpu_utilization_zero_or_invalid_limit_falls_back_to_host_cores() {
+        // A zero/negative limit is treated as "no limit" (host-core ceiling)
         // rather than dividing by zero.
+        let stats = stats_with_cpu_on_host(120.0, Some(0.0), 4);
+        assert!((stats.cpu_utilization_percent() - 30.0).abs() < 1e-9);
+
+        let stats = stats_with_cpu_on_host(120.0, Some(-1.0), 4);
+        assert!((stats.cpu_utilization_percent() - 30.0).abs() < 1e-9);
+
+        // ...and to one core when the host core count is unknown too.
         let stats = stats_with_cpu(120.0, Some(0.0));
         assert!((stats.cpu_utilization_percent() - 120.0).abs() < 1e-9);
+    }
 
-        let stats = stats_with_cpu(120.0, Some(-1.0));
-        assert!((stats.cpu_utilization_percent() - 120.0).abs() < 1e-9);
+    #[test]
+    fn test_cpu_utilization_zero_online_cpus_is_not_a_divide_by_zero() {
+        let stats = ContainerStats {
+            cpu_percent: 50.0,
+            cpu_limit_cores: None,
+            online_cpus: Some(0),
+            ..Default::default()
+        };
+        assert!((stats.cpu_utilization_percent() - 50.0).abs() < 1e-9);
     }
 
     #[test]
@@ -778,6 +978,7 @@ mod tests {
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         }];
 
         let request = DeployRequest {
@@ -787,6 +988,7 @@ mod tests {
             secrets: HashMap::new(),
             port_mappings,
             network_name: Some("test-network".to_string()),
+            extra_networks: vec!["dependency-network".to_string()],
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path,
@@ -803,6 +1005,7 @@ mod tests {
         assert_eq!(request.port_mappings[0].container_port, 3000);
         assert!(matches!(request.port_mappings[0].protocol, Protocol::Tcp));
         assert_eq!(request.network_name.as_ref().unwrap(), "test-network");
+        assert_eq!(request.extra_networks, vec!["dependency-network"]);
         assert_eq!(request.command.as_ref().unwrap().len(), 2);
         assert_eq!(request.command.as_ref().unwrap()[0], "node");
         assert_eq!(request.command.as_ref().unwrap()[1], "server.js");
@@ -846,11 +1049,21 @@ mod tests {
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
 
         assert_eq!(mapping.host_port, 8080);
         assert_eq!(mapping.container_port, 80);
         assert!(matches!(mapping.protocol, Protocol::Tcp));
+
+        let private_mapping = PortMapping {
+            host_ip: Some("10.20.0.8".to_string()),
+            ..mapping
+        };
+        let encoded = serde_json::to_string(&private_mapping).expect("serialize port mapping");
+        let decoded: PortMapping =
+            serde_json::from_str(&encoded).expect("deserialize port mapping");
+        assert_eq!(decoded.host_ip.as_deref(), Some("10.20.0.8"));
     }
 
     #[test]
@@ -869,6 +1082,7 @@ mod tests {
                 host_port: 8080,
                 container_port: 3000,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             }],
             environment_vars: env_vars,
             restart_count: Some(0),
@@ -1057,16 +1271,19 @@ CMD ["echo", "Hello from container"]
                 host_port: 8080,
                 container_port: 80,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 8443,
                 container_port: 443,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 9090,
                 container_port: 9090,
                 protocol: Protocol::Udp,
+                host_ip: None,
             },
         ];
 
@@ -1094,6 +1311,7 @@ CMD ["echo", "Hello from container"]
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path: temp_dir.path().join("deploy.log"),
@@ -1140,6 +1358,7 @@ CMD ["echo", "Hello from container"]
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
         assert_eq!(port_mapping.host_port, 8080);
 

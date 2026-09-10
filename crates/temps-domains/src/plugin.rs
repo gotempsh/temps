@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,10 +60,6 @@ impl TempsPlugin for DomainsPlugin {
                 repository.clone(),
             ));
 
-            // Try to get notification service (optional)
-            let notification_service =
-                context.get_service::<dyn temps_core::notifications::NotificationService>();
-
             // Required so background renewals can read `letsencrypt.email` (see
             // `TlsService::get_acme_email`) -- without this, auto-renewal always fails
             // with "User email is required" regardless of what's configured.
@@ -70,6 +69,9 @@ impl TempsPlugin for DomainsPlugin {
             // wired into the TLS service so DNS-01 background renewals can auto-publish
             // the challenge TXT record when a DNS provider manages the domain's zone.
             let dns_provider_service = context.require_service::<DnsProviderService>();
+            let dns_automation_gate =
+                context.require_service::<temps_core::DnsAutomationGateSlot>();
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
             // Create domain service first so the TLS service can drive the order-based
             // ACME flow during background HTTP-01 renewals (keeps auto-renewals
@@ -81,9 +83,13 @@ impl TempsPlugin for DomainsPlugin {
                 repository.clone(),
                 encryption_service.clone(),
             ));
+            // Register DomainService so the serve wiring layer can construct the
+            // DiscoveredHostTlsProvisioner adapter (ADR-041 §8) without
+            // introducing a direct temps-domains dependency in temps-deployments.
+            context.register_service(domain_service.clone());
 
             // Create TLS service
-            let mut tls_service = TlsServiceBuilder::new()
+            let tls_service = TlsServiceBuilder::new()
                 .with_repository(repository.clone())
                 .with_cert_provider(cert_provider.clone())
                 .build()
@@ -93,18 +99,13 @@ impl TempsPlugin for DomainsPlugin {
                 })?
                 .with_domain_service(domain_service.clone())
                 .with_config_service(config_service.clone())
-                .with_dns_provider_service(dns_provider_service.clone());
+                .with_dns_provider_service(dns_provider_service.clone())
+                .with_dns_automation_gate(dns_automation_gate)
+                .with_audit_logger(audit_service.clone());
 
-            // Add notification service if available
-            if let Some(notif_service) = notification_service {
-                tls_service = tls_service.with_notification_service(notif_service);
-                tracing::debug!("Notification service integrated with TLS service");
-            } else {
-                tracing::debug!(
-                    "No notification service available - renewal notifications will be skipped"
-                );
-            }
-
+            // AlarmService isn't registered yet at this point (Monitoring
+            // registers after Domains) — wired in via `initialize_plugin_services`
+            // once every plugin's Phase 1 has completed.
             let tls_service = Arc::new(tls_service);
             context.register_service(tls_service.clone());
 
@@ -112,8 +113,6 @@ impl TempsPlugin for DomainsPlugin {
             // The scheduler handles both initial check and daily scheduled checks
 
             // Get audit service
-            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
-
             // Get telemetry reporter (optional — default to noop so domains never hard-fail
             // if the telemetry plugin isn't registered)
             let telemetry = context
@@ -121,6 +120,11 @@ impl TempsPlugin for DomainsPlugin {
                 .unwrap_or_else(|| {
                     std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
                 });
+
+            // Central sensitive-action policy (MFA step-up), used to gate
+            // destructive domain operations like delete.
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
             // Create DomainAppState for handlers
             let domain_app_state = create_domain_app_state_with_dns(
@@ -130,6 +134,7 @@ impl TempsPlugin for DomainsPlugin {
                 dns_provider_service,
                 audit_service,
                 telemetry,
+                sensitive_action_authorizer,
             );
             context.register_service(domain_app_state);
 
@@ -138,9 +143,43 @@ impl TempsPlugin for DomainsPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(alarm_service) =
+                context.get_service::<temps_monitoring::alarm_service::AlarmService>()
+            {
+                let tls_service = context.require_service::<crate::tls::TlsService>();
+                tls_service.set_alarm_service(alarm_service);
+                tracing::debug!("AlarmService wired into TLS service");
+            } else {
+                tracing::warn!(
+                    "AlarmService not available - certificate renewal alarms will be skipped"
+                );
+            }
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the DomainAppState
         let domain_app_state = context.require_service::<DomainAppState>();
+
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let domain_app_state = Arc::new(DomainAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*domain_app_state).clone()
+        });
 
         // Configure routes
         let domains_routes = handlers::configure_routes().with_state(domain_app_state);

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -42,6 +45,33 @@ export interface SessionRecordingConfig {
   batchSize?: number;
   /** Interval in ms to flush events. Defaults to 5000. */
   flushInterval?: number;
+  /**
+   * Milliseconds of no user interaction after which recording pauses. A paused
+   * recorder detaches rrweb entirely, so a passive tab stops producing events
+   * instead of recording page-driven DOM churn forever. Interaction resumes it
+   * with a fresh full snapshot, on the same session. Set to `0` to never pause.
+   * Defaults to 60000 (1 minute).
+   */
+  idleTimeout?: number;
+  /**
+   * Pause recording while the document is hidden (background tab). Defaults to
+   * true. Independent of `idleTimeout` — a hidden tab pauses immediately.
+   */
+  pauseOnHidden?: boolean;
+  /**
+   * Force a full DOM snapshot every N milliseconds. Snapshots make replay
+   * seeking cheap but are by far the largest events, so raising this trades
+   * seek granularity for ingest volume. Defaults to 30000.
+   */
+  checkoutEveryNms?: number;
+  /** Force a full DOM snapshot every N events. Defaults to 200. */
+  checkoutEveryNth?: number;
+  /**
+   * Upper bound on events buffered while the server is unreachable. Past this
+   * the oldest events are dropped, so a persistent ingest outage costs bounded
+   * memory rather than growing until the tab dies. Defaults to 5000.
+   */
+  maxBufferedEvents?: number;
 }
 
 export interface AnalyticsClientOptions {
@@ -53,6 +83,26 @@ export interface AnalyticsClientOptions {
   ignoreLocalhost?: boolean;
   /** Custom domain to use for analytics. Defaults to window.location.hostname. */
   domain?: string;
+  /**
+   * Analytics ingest key (`pa_…`), minted per project in the Temps Console
+   * (Project → Analytics → Setup) or with
+   * `bunx @temps-sdk/cli analytics keys create`.
+   *
+   * Only needed when Temps neither serves nor proxies the app. Without a
+   * Temps-managed deployment there is no `Host` entry in the proxy route
+   * table, so the server cannot tell which project an event belongs to and
+   * rejects ingest outright. Presenting the key resolves project and
+   * environment scope directly and the `Host` header stops being consulted
+   * for attribution. Leave it unset for apps deployed by Temps — that path is
+   * unchanged and remains the default.
+   *
+   * The key is **public by design**: it ships in your browser bundle and
+   * appears in request URLs on the `sendBeacon` path. It grants analytics
+   * ingest and nothing else. Never put a `tk_` API key, a `dt_` deployment
+   * token or an `si_` service ingest token here — those are secrets and do
+   * not work on this endpoint.
+   */
+  ingestKey?: string;
 }
 
 export interface AnalyticsOptions extends AnalyticsClientOptions {
@@ -81,6 +131,14 @@ export interface AnalyticsOptions extends AnalyticsClientOptions {
 export interface AnalyticsApi {
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
+  /**
+   * The ingest key this instance was configured with, if any. Framework
+   * hooks that send their own beacons outside the plugin instance (e.g.
+   * `usePageLeave`'s unload handler) read this as their default so a
+   * cross-origin setup only has to configure the key once, on the plugin —
+   * not again on every hook that bypasses it.
+   */
+  readonly ingestKey?: string;
   /** Send a custom event. */
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */

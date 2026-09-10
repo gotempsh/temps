@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
@@ -8,7 +11,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
 use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::permissions::Permission;
+use temps_auth::{AuthContext, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use utoipa::{OpenApi, ToSchema};
 
@@ -295,6 +299,66 @@ fn parse_time_range(
     Ok((from, to))
 }
 
+/// Resolve the scope a caller is authorized to query: `Ok(None)` means the
+/// caller (a `SystemAdmin`) may run instance-wide queries; `Ok(Some(id))`
+/// pins the caller to their own `user_id`. Errors if the credential has no
+/// user identity to scope to (e.g. a deployment token) and isn't an admin.
+fn resolve_caller_scope(auth: &AuthContext) -> Result<Option<i32>, Problem> {
+    if auth.has_permission(&Permission::SystemAdmin) {
+        return Ok(None);
+    }
+
+    let Some(caller_id) = auth.user_id_opt() else {
+        return Err(temps_core::error_builder::ErrorBuilder::new(
+            ::axum::http::StatusCode::FORBIDDEN,
+        )
+        .type_("https://temps.sh/probs/ai-usage-scope-required")
+        .title("AI Usage Scope Required")
+        .detail(
+            "This credential cannot query instance-wide AI usage; authenticate as a user or an instance administrator",
+        )
+        .permission_denial(
+            temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+            Some(Permission::SystemAdmin.to_string()),
+        )
+        .build());
+    };
+
+    Ok(Some(caller_id))
+}
+
+/// Confine AI usage queries so ordinary callers cannot read instance-wide or
+/// cross-user aggregates. Mirrors unscoped proxy-log authorization: only
+/// `SystemAdmin` may omit a user scope; everyone else is pinned to their own
+/// `user_id` (and cannot request someone else's).
+fn scope_usage_filter_for_caller(
+    auth: &AuthContext,
+    filter: &mut UsageFilter,
+) -> Result<(), Problem> {
+    let Some(caller_id) = resolve_caller_scope(auth)? else {
+        return Ok(());
+    };
+
+    match filter.user_id {
+        Some(requested) if requested != caller_id => Err(
+            temps_core::error_builder::ErrorBuilder::new(::axum::http::StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/cross-user-ai-usage-denied")
+                .title("Cross-User AI Usage Denied")
+                .detail("You may only query AI usage for your own account")
+                .permission_denial(
+                    temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                    None,
+                )
+                .build(),
+        ),
+        Some(_) => Ok(()),
+        None => {
+            filter.user_id = Some(caller_id);
+            Ok(())
+        }
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -323,7 +387,8 @@ async fn get_usage_summary(
     permission_guard!(auth, AiGatewayRead);
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let summary = app_state
         .usage_service
         .get_summary_filtered(from, to, &filter)
@@ -356,7 +421,8 @@ async fn get_usage_by_provider(
     permission_guard!(auth, AiGatewayRead);
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let usage = app_state
         .usage_service
         .get_by_provider_filtered(from, to, &filter)
@@ -391,7 +457,8 @@ async fn get_usage_timeseries(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let bucket = params.bucket.as_deref().unwrap_or("day");
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let timeseries = app_state
         .usage_service
         .get_timeseries_filtered(from, to, bucket, &filter)
@@ -426,7 +493,8 @@ async fn get_usage_top_models(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let limit = std::cmp::min(params.limit.unwrap_or(10), 100);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let models = app_state
         .usage_service
         .get_top_models_filtered(from, to, limit, &filter)
@@ -470,7 +538,8 @@ async fn get_usage_recent(
 
     let limit = params.resolved_limit();
     let offset = params.offset.unwrap_or(0);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let page = app_state
         .usage_service
         .get_recent_filtered(limit, offset, &filter)
@@ -508,7 +577,8 @@ async fn get_conversations(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let limit = std::cmp::min(params.limit.unwrap_or(50), 100);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let conversations = app_state
         .usage_service
         .get_conversations(from, to, &filter, limit)
@@ -540,10 +610,11 @@ async fn get_conversation_detail(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayRead);
 
+    let caller_scope = resolve_caller_scope(&auth)?;
     let limit = std::cmp::min(params.limit.unwrap_or(100), 500);
     let entries = app_state
         .usage_service
-        .get_conversation_detail(&conversation_id, limit)
+        .get_conversation_detail(&conversation_id, limit, caller_scope)
         .await?;
 
     Ok(Json(entries))
@@ -704,5 +775,126 @@ mod tests {
         let params: UsageQueryParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.from.as_deref(), Some("2025-01-01T00:00:00Z"));
         assert_eq!(params.to.as_deref(), Some("2025-01-31T23:59:59Z"));
+    }
+
+    use axum::http::StatusCode;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    fn test_auth(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            users::Model {
+                id: 42,
+                name: "AI Usage Tester".to_string(),
+                email: "ai-usage-tester@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    #[test]
+    fn ordinary_user_unscoped_usage_query_is_pinned_to_self() {
+        let auth = test_auth(Role::User);
+        let mut filter = UsageFilter::default();
+        scope_usage_filter_for_caller(&auth, &mut filter).expect("user may query own usage");
+        assert_eq!(filter.user_id, Some(42));
+    }
+
+    #[test]
+    fn ordinary_user_cannot_query_another_users_usage() {
+        let auth = test_auth(Role::User);
+        let mut filter = UsageFilter {
+            user_id: Some(99),
+            ..Default::default()
+        };
+        let err = scope_usage_filter_for_caller(&auth, &mut filter)
+            .expect_err("cross-user usage must be denied");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            filter.user_id,
+            Some(99),
+            "rejected filter must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn ordinary_user_may_query_own_usage_explicitly() {
+        let auth = test_auth(Role::User);
+        let mut filter = UsageFilter {
+            user_id: Some(42),
+            ..Default::default()
+        };
+        scope_usage_filter_for_caller(&auth, &mut filter).expect("own user_id is allowed");
+        assert_eq!(filter.user_id, Some(42));
+    }
+
+    #[test]
+    fn system_admin_may_run_unscoped_usage_query() {
+        let auth = test_auth(Role::Admin);
+        let mut filter = UsageFilter::default();
+        scope_usage_filter_for_caller(&auth, &mut filter).expect("admin may query instance-wide");
+        assert!(filter.user_id.is_none());
+    }
+
+    #[test]
+    fn deployment_token_cannot_run_unscoped_usage_query() {
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+        let auth = AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "tok".to_string(),
+            vec![DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let mut filter = UsageFilter::default();
+        let err = scope_usage_filter_for_caller(&auth, &mut filter)
+            .expect_err("deployment tokens lack a user scope");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn resolve_caller_scope_pins_ordinary_user_to_self() {
+        let auth = test_auth(Role::User);
+        let scope = resolve_caller_scope(&auth).expect("ordinary user has a scope");
+        assert_eq!(scope, Some(42));
+    }
+
+    #[test]
+    fn resolve_caller_scope_is_unscoped_for_admin() {
+        let auth = test_auth(Role::Admin);
+        let scope = resolve_caller_scope(&auth).expect("admin may query instance-wide");
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn resolve_caller_scope_denies_deployment_token() {
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+        let auth = AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "tok".to_string(),
+            vec![DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let err = resolve_caller_scope(&auth).expect_err("deployment tokens lack a user scope");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 }

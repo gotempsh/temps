@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 "use client";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef } from "react";
 import type { AnalyticsContextValue, TempsAnalyticsProviderProps } from "./types";
@@ -25,6 +28,7 @@ export function TempsAnalyticsProvider({
   enableSessionRecording = false,
   sessionRecordingConfig = {},
   domain,
+  ingestKey,
   children,
 }: TempsAnalyticsProviderProps) {
   const enabled = useMemo(() => {
@@ -45,10 +49,11 @@ export function TempsAnalyticsProvider({
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: domain || window.location.hostname,
+        language: navigator.language,
         event_data: data,
-      }, "POST", basePath);
+      }, "POST", basePath, ingestKey);
     },
-    [enabled, basePath, domain]
+    [enabled, basePath, domain, ingestKey]
   );
 
   const trackPageview = useCallback<AnalyticsContextValue["trackPageview"]>(
@@ -59,14 +64,15 @@ export function TempsAnalyticsProvider({
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: domain || window.location.hostname,
+        language: navigator.language,
         event_data: {
           referrer: document.referrer,
           userAgent: navigator.userAgent,
           timestamp: new Date().toISOString(),
         },
-      }, "POST", basePath);
+      }, "POST", basePath, ingestKey);
     },
-    [enabled, basePath, domain]
+    [enabled, basePath, domain, ingestKey]
   );
 
   const identify = useCallback<AnalyticsContextValue["identify"]>(async () => {
@@ -164,6 +170,7 @@ export function TempsAnalyticsProvider({
     if (autoTrackEngagement) {
       const tracker = new EngagementTracker({
         basePath,
+        ingestKey,
         domain,
         heartbeatInterval,
         inactivityTimeout,
@@ -190,13 +197,14 @@ export function TempsAnalyticsProvider({
           request_query: window.location.search,
           request_path: window.location.pathname,
           domain: domain || window.location.hostname,
+          language: navigator.language,
           event_data: {
             time_on_page_ms: timeOnPage,
             timestamp: new Date().toISOString(),
             url: window.location.href,
             referrer: document.referrer,
           },
-        }, basePath);
+        }, basePath, ingestKey);
       };
 
       // Use pagehide as primary (most reliable), with beforeunload as fallback
@@ -212,11 +220,12 @@ export function TempsAnalyticsProvider({
         window.removeEventListener("beforeunload", handlePageLeave);
       };
     }
-  }, [autoTrackPageLeave, autoTrackEngagement, enabled, pageLeaveEventName, domain, basePath, heartbeatInterval, inactivityTimeout, engagementThreshold]);
+  }, [autoTrackPageLeave, autoTrackEngagement, enabled, pageLeaveEventName, domain, basePath, ingestKey, heartbeatInterval, inactivityTimeout, engagementThreshold]);
 
   // Speed analytics tracking
   useSpeedAnalytics({
     basePath,
+    ingestKey,
     disabled: !enabled || !autoTrackSpeedAnalytics,
   });
 
@@ -235,6 +244,7 @@ export function TempsAnalyticsProvider({
         {enabled && (
           <SessionRecorder
             basePath={basePath}
+            ingestKey={ingestKey}
             domain={domain}
             enabled={isRecordingEnabled}
             excludedPaths={sessionRecordingConfig.excludedPaths}

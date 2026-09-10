@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * MonitoringCard — per-service metrics, live stats, chart, and alert-rule management.
  *
@@ -5,7 +8,12 @@
  */
 
 import { Button } from '@/components/ui/button'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  TOOLTIP_CONTENT_STYLE,
+  TOOLTIP_LABEL_STYLE,
+  formatChartTick,
+  formatChartTooltipLabel,
+} from '@/lib/chart-tooltip'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -62,7 +70,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   LineChart,
@@ -73,6 +81,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
+import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -88,7 +97,18 @@ type MetricLatest = {
 /** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
  *  plain strings; these constrain the UI selects to the supported values. */
 type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
-type Severity = 'info' | 'warning' | 'critical'
+type Severity = 'warning' | 'critical'
+
+/** The API validates `comparator` against the literal symbols (`>`, `<`,
+ *  `>=`, `<=`), not the `Comparator` union's keys — see
+ *  `validate_comparator` in `crates/temps-providers/src/handlers/metrics_handlers.rs`.
+ *  Sending the union key directly (e.g. `"gt"`) fails validation with a 400. */
+const COMPARATOR_SYMBOLS: Record<Comparator, string> = {
+  gt: '>',
+  lt: '<',
+  gte: '>=',
+  lte: '<=',
+}
 
 /** Map the human range selector (hours) to the API's `range` query value. */
 const HOURS_TO_RANGE: Record<number, string> = {
@@ -161,6 +181,20 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_objects_total',
   ],
 }
+
+// Container resource metrics — CPU/memory of the docker container(s) backing
+// the service, sampled every ~30s by the health monitor. Engine-agnostic:
+// shown for every engine ahead of the engine-specific stats.
+const CONTAINER_STAT_METRICS = [
+  'container.cpu_percent',
+  'container.memory_used_bytes',
+]
+
+const CONTAINER_METRICS = [
+  'container.cpu_percent',
+  'container.memory_used_bytes',
+  'container.memory_percent',
+]
 
 const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   postgres: 'pg.connections',
@@ -327,7 +361,15 @@ function formatMetricValue(name: string, value: number): string {
   return value.toFixed(2)
 }
 
+const METRIC_LABELS: Record<string, string> = {
+  // Docker CLI convention: 100% == one core fully used.
+  'container.cpu_percent': 'CPU',
+  'container.memory_used_bytes': 'Memory',
+  'container.memory_percent': 'Memory %',
+}
+
 function labelForMetric(name: string): string {
+  if (METRIC_LABELS[name]) return METRIC_LABELS[name]
   // Strip engine prefix (e.g. "pg.", "redis.", "mongo.", "s3.")
   const bare = name.replace(/^[a-z0-9]+\./, '')
   return bare.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
@@ -365,8 +407,9 @@ function AddAlertRuleDialog({
   engine,
   onSuccess,
 }: AddAlertRuleDialogProps) {
+  const alertMetrics = [...CONTAINER_METRICS, ...KNOWN_METRICS[engine]]
   const [name, setName] = useState('')
-  const [metricName, setMetricName] = useState(KNOWN_METRICS[engine][0] ?? '')
+  const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
   const [comparator, setComparator] = useState<Comparator>('gt')
   const [severity, setSeverity] = useState<Severity>('warning')
@@ -409,7 +452,7 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {KNOWN_METRICS[engine].map((m) => (
+                {alertMetrics.map((m) => (
                   <SelectItem key={m} value={m}>
                     {labelForMetric(m)}
                   </SelectItem>
@@ -454,7 +497,6 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="info">Info</SelectItem>
                 <SelectItem value="warning">Warning</SelectItem>
                 <SelectItem value="critical">Critical</SelectItem>
               </SelectContent>
@@ -472,7 +514,7 @@ function AddAlertRuleDialog({
                 body: {
                   name,
                   metric_name: metricName,
-                  comparator,
+                  comparator: COMPARATOR_SYMBOLS[comparator],
                   threshold: parseFloat(threshold),
                   severity,
                 },
@@ -771,7 +813,12 @@ type LiveMetricsProps = {
 const CHART_LINE_COLOR = '#0070f3'
 
 function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
-  const statMetrics = ENGINE_STAT_METRICS[engine]
+  // Container CPU/memory first — resource saturation is the first thing an
+  // operator checks — then the engine-specific headline stats.
+  const statMetrics = [
+    ...CONTAINER_STAT_METRICS,
+    ...ENGINE_STAT_METRICS[engine],
+  ]
   const [selectedMetric, setSelectedMetric] = useState(
     DEFAULT_CHART_METRIC[engine]
   )
@@ -805,10 +852,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
   })
 
   const chartData = (rangeData ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
+    time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
@@ -831,7 +875,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
       )}
 
       {/* Stat row */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         {statMetrics.map((name) => {
           const latest = latestByName.get(name)
           const isSelected = name === selectedMetric
@@ -895,10 +939,12 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
               >
                 <XAxis
                   dataKey="time"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
                   tickLine={false}
                   axisLine={false}
-                  interval="preserveStartEnd"
+                  tickFormatter={formatChartTick}
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -923,6 +969,9 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                   labelStyle={TOOLTIP_LABEL_STYLE}
                   itemStyle={{ color: CHART_LINE_COLOR }}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
+                  labelFormatter={(label) =>
+                    formatChartTooltipLabel(Number(label))
+                  }
                   formatter={(v) => [
                     formatMetricValue(selectedMetric, Number(v)),
                     labelForMetric(selectedMetric),
@@ -1025,6 +1074,11 @@ export function MonitoringCard({
     refetchInterval: 30_000,
   })
   const lastReceivedAt = statusData?.last_received_at ?? null
+  const freshnessSummary = telemetryFreshnessSummary(
+    normalEngine,
+    latestMetrics?.map((metric) => metric.name) ?? [],
+    lastReceivedAt ? formatRelativeTime(lastReceivedAt) : null
+  )
 
   const enableMonitoring = useMutation({
     ...externalServiceMetricsToggleMutation(),
@@ -1155,9 +1209,9 @@ export function MonitoringCard({
           <span className="flex items-center gap-2">
             <Activity className="h-4 w-4" />
             Monitoring
-            {lastReceivedAt && (
+            {freshnessSummary && (
               <span className="text-xs font-normal text-muted-foreground">
-                · last received {formatRelativeTime(lastReceivedAt)}
+                · {freshnessSummary}
               </span>
             )}
           </span>

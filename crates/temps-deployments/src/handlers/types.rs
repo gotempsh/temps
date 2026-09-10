@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::sync::Arc;
 
 use crate::services::database_cron_service::DatabaseCronConfigService;
@@ -57,10 +60,22 @@ pub struct AppState {
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
     pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
+    /// Optional metrics store, present only when metrics collection is
+    /// enabled. Serves container CPU/memory history (written by the
+    /// container health monitor under `source_kind = container`).
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Builds and sends deploy-failure reports (redacted trace, user-edited,
+    /// sent on request) -- see [`crate::services::failure_report_service`].
+    pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Central policy evaluator for sensitive mutations (e.g. draining a
+    /// node) -- challenges with MFA step-up when the acting user has one
+    /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 use crate::services::types::Deployment;
 use serde::{Deserialize, Serialize};
+use utoipa::IntoParams;
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]
@@ -68,6 +83,12 @@ pub struct GetDeploymentsParams {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
     pub environment_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ManagedEnvironmentVariablesQuery {
+    /// Framework preset used to select public browser variable names.
+    pub preset: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -193,6 +214,32 @@ pub struct DeploymentListResponse {
     pub total: i64,
     pub page: i64,
     pub per_page: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LatestDeploymentMediaResponseItem {
+    pub project_id: i32,
+    pub latest_attempt_status: String,
+    pub url: Option<String>,
+    pub screenshot_location: Option<String>,
+}
+
+impl From<crate::services::types::LatestDeploymentMedia> for LatestDeploymentMediaResponseItem {
+    fn from(media: crate::services::types::LatestDeploymentMedia) -> Self {
+        Self {
+            project_id: media.project_id,
+            latest_attempt_status: media.latest_attempt_status,
+            url: media.url,
+            screenshot_location: media.screenshot_location,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LatestDeploymentMediaResponse {
+    /// Latest deployment media keyed by project ID. Projects with no
+    /// deployments are omitted.
+    pub projects: std::collections::HashMap<String, LatestDeploymentMediaResponseItem>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -410,45 +457,6 @@ pub struct UpdateGitHubRepoRequest {
 pub struct UpdateAutomaticDeployRequest {
     pub automatic_deploy: bool,
 }
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateEnvVar {
-    pub name: String,
-    pub example: String,
-    pub default: Option<String>,
-}
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Template {
-    pub name: String,
-    pub github: Option<TemplateGitHub>,
-    pub description: Option<String>,
-    pub features: Option<Vec<String>>,
-    pub services: Option<Vec<String>>,
-    pub image: Option<String>,
-    pub preset: Option<String>,
-    pub env: Option<Vec<TemplateEnvVar>>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateGitHub {
-    pub owner: String,
-    pub repo: String,
-    pub path: Option<String>,
-    pub r#ref: String,
-}
-
-// Add this new struct with the request schema
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
 // Add query parameters struct
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerLogsQuery {
@@ -615,10 +623,45 @@ pub struct DeploymentJobResponse {
     pub finished_at: Option<i64>,
     pub log_id: String,
     pub error_message: Option<String>,
+    /// Internal workflow configuration is intentionally redacted. It can
+    /// contain legacy plaintext secrets or encrypted secret envelopes.
     pub job_config: Option<serde_json::Value>,
     pub outputs: Option<serde_json::Value>,
     pub dependencies: Option<serde_json::Value>,
     pub execution_order: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct FailureReportPreviewResponse {
+    /// Redacted, editable draft of the failure trace. Shown in a textarea the
+    /// user can edit before sending — nothing is sent without their review.
+    pub redacted_log: String,
+    pub error_message: Option<String>,
+    /// Whether "send to Temps" should be offered. False when the operator
+    /// opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+    pub reporting_enabled: bool,
+    pub failed_job_type: String,
+    pub github_issue_title: String,
+    pub github_issue_body: String,
+}
+
+impl From<crate::services::FailureReportPreview> for FailureReportPreviewResponse {
+    fn from(preview: crate::services::FailureReportPreview) -> Self {
+        Self {
+            redacted_log: preview.redacted_log,
+            error_message: preview.error_message,
+            reporting_enabled: preview.reporting_enabled,
+            failed_job_type: preview.failed_job_type,
+            github_issue_title: preview.github_issue_title,
+            github_issue_body: preview.github_issue_body,
+        }
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SendFailureReportRequest {
+    /// The report text as reviewed (and possibly edited) by the user.
+    pub report_text: String,
 }
 
 impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
@@ -637,7 +680,10 @@ impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
             finished_at: job.finished_at.map(|t| t.timestamp_millis()),
             log_id: job.log_id,
             error_message: job.error_message,
-            job_config: job.job_config,
+            // Job configuration is executor-internal. Returning it here would
+            // expose legacy plaintext secrets and encrypted envelopes to roles
+            // that only have deployment-read access.
+            job_config: None,
             outputs: job.outputs,
             dependencies: job.dependencies,
             execution_order: job.execution_order,
@@ -738,6 +784,11 @@ impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
 pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerEnvironmentVariableValueResponse {
+    pub value: String,
 }
 
 /// Detailed container information with environment variables and metrics
@@ -847,6 +898,78 @@ pub struct ContainerMetricsResponse {
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
+}
+
+/// Query parameters for the container metrics history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerMetricsHistoryQuery {
+    /// Dotted metric name, e.g. `container.cpu_percent` or
+    /// `container.memory_used_bytes`.
+    pub metric: String,
+    /// Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+    #[serde(default = "default_metrics_range")]
+    pub range: String,
+}
+
+fn default_metrics_range() -> String {
+    "1h".to_string()
+}
+
+/// One bucketed data point of a container resource metric time series.
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricHistoryPoint {
+    /// Bucket timestamp (ISO 8601 with `Z` suffix).
+    #[schema(example = "2025-10-12T12:15:00+00:00")]
+    pub time: String,
+    /// Averaged metric value for the bucket.
+    pub value: f64,
+}
+
+/// One container that has ever run for an environment — current or replaced
+/// by a later redeploy. `id` is the internal row ID to pass as the
+/// `container_id` path segment when calling the metrics/history endpoint for
+/// this specific container generation (its docker `container_id` also works
+/// since the history handler now resolves either).
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryEntry {
+    pub id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    #[schema(nullable = true)]
+    pub service_name: Option<String>,
+    pub deployment_id: i32,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub deployed_at: String,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub finished_at: Option<String>,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub deleted_at: Option<String>,
+    /// True if this row is the environment's currently-active container
+    /// (deleted_at is null) — false for containers replaced by a later
+    /// redeploy.
+    pub is_current: bool,
+}
+
+/// Query parameters for the environment container-history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerHistoryQuery {
+    /// Only return containers belonging to this deployment. Omit to list
+    /// containers across every deployment the environment has ever had.
+    pub deployment_id: Option<i32>,
+    /// Maximum number of *replaced* container rows to return, most recently
+    /// replaced first (default 20, max 100). Every currently-running
+    /// container is always included and does not count against this limit —
+    /// it only bounds how much historical (replaced-by-redeploy) context
+    /// comes back alongside them.
+    pub limit: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryListResponse {
+    pub containers: Vec<ContainerHistoryEntry>,
+    /// Total number of container rows matching the filter, before `limit`
+    /// was applied — lets the client show "20 of 627".
+    pub total_count: u64,
 }
 
 /// Response indicating success of container state change

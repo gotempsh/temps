@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sentry Event Mapper
 //!
 //! Converts Sentry SDK events (via relay-event-schema) to our internal error tracking format.

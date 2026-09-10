@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../../lib/api-client.js'
 import { resolveProjectSlug } from '../../config/resolve-project.js'
@@ -22,8 +25,9 @@ import {
   box,
 } from '../../ui/output.js'
 import { spawn } from 'node:child_process'
-import { existsSync, createWriteStream, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, createWriteStream, writeFileSync, mkdirSync, createReadStream } from 'node:fs'
 import { unlink } from 'node:fs/promises'
+import { Readable } from 'node:stream'
 import { resolve, basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -356,12 +360,13 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
       ? `${uploadUrl}?${queryParams.toString()}`
       : uploadUrl
 
-    const file = Bun.file(tempFilePath)
     const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
 
-    const boundary = `----BunFormBoundary${Date.now().toString(16)}`
+    const boundary = `----TempsFormBoundary${Date.now().toString(16)}`
 
-    const fileStream = file.stream()
+    // The published CLI is bundled for Node (see docs.ts), so this must use
+    // Node's fs streaming rather than Bun.file, which is undefined there.
+    const fileStream = Readable.toWeb(createReadStream(tempFilePath)) as unknown as ReadableStream<Uint8Array>
 
     const header = [
       `--${boundary}`,
@@ -618,7 +623,7 @@ async function dockerSaveToFile(
   })
 }
 
-function formatFileSize(bytes: number): string {
+export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -745,10 +750,11 @@ async function tryGenerateDockerfile(
 }
 
 /**
- * Detect the package manager by checking for lockfiles in the current directory.
+ * Detect the package manager by checking for lockfiles in the given directory
+ * (defaults to the current directory). Checked in priority order because a
+ * repo can accumulate more than one lockfile.
  */
-function detectLocalPackageManager(): string {
-  const cwd = process.cwd()
+export function detectLocalPackageManager(cwd: string = process.cwd()): string {
   if (existsSync(join(cwd, 'pnpm-lock.yaml'))) return 'pnpm'
   if (existsSync(join(cwd, 'yarn.lock'))) return 'yarn'
   if (existsSync(join(cwd, 'bun.lockb')) || existsSync(join(cwd, 'bun.lock'))) return 'bun'

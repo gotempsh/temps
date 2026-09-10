@@ -1,12 +1,39 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::{Database, DatabaseConnection};
 #[cfg(test)]
 use std::sync::Arc;
 use temps_entities::upstream_config::UpstreamList;
 use temps_migrations::{Migrator, MigratorTrait};
 use testcontainers::{
-    core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
 };
 use uuid::Uuid;
+
+/// Attempts made by [`connect_with_retries`]; see its call site for why this is
+/// only a backstop rather than the primary readiness mechanism.
+const DB_CONNECT_ATTEMPTS: u32 = 15;
+const DB_CONNECT_RETRY_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
+async fn connect_with_retries(database_url: &str) -> anyhow::Result<DatabaseConnection> {
+    let mut last_err = None;
+    for _ in 0..DB_CONNECT_ATTEMPTS {
+        match Database::connect(database_url).await {
+            Ok(db) => return Ok(db),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(DB_CONNECT_RETRY_DELAY).await;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Failed to connect to database after {DB_CONNECT_ATTEMPTS} attempts: {}",
+        last_err.expect("at least one attempt was made")
+    ))
+}
 
 /// Test database setup with unique container per test
 pub struct TestDatabase {
@@ -27,11 +54,40 @@ impl TestDatabase {
         );
 
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            // Without a readiness condition, `start()` returns as soon as the
+            // container is running — long before PostgreSQL accepts clients —
+            // and the fixed sleep that used to stand in for it lost the race on
+            // loaded CI runners, failing tests with `error communicating with
+            // database: Connection reset by peer (os error 104)`.
+            //
+            // The stream matters. The `timescaledb-ha` entrypoint boots a
+            // *temporary* server for initdb, stops it, then starts the real
+            // one, and each logs this line once. Verified against
+            // `timescale/timescaledb-ha:pg18`, the temporary server logs to
+            // **stdout** and the real server to **stderr**, so matching on
+            // stderr targets the real server. Do not "fix" this by matching
+            // stdout or by waiting for two occurrences — each stream only ever
+            // carries one.
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_env_var("POSTGRES_DB", "test_db")
             .with_env_var("POSTGRES_USER", "test_user")
             .with_env_var("POSTGRES_PASSWORD", "test_password")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            // The background-worker launcher polls independently of the test
+            // and is pure noise here (it floods the log with "out of background
+            // workers" and can compress chunks mid-test).
+            .with_cmd(vec![
+                "postgres",
+                "-c",
+                "timescaledb.max_background_workers=0",
+            ])
+            // testcontainers' default is 60s; this repository runs many
+            // Docker-backed tests concurrently, so give real headroom under
+            // contention instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -42,26 +98,10 @@ impl TestDatabase {
             port
         );
 
-        // Wait for the database to be ready, then connect with retries
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        let mut retries = 5;
-        let db = loop {
-            match Database::connect(&database_url).await {
-                Ok(db) => break db,
-                Err(e) if retries > 0 => {
-                    retries -= 1;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    if retries == 0 {
-                        return Err(anyhow::anyhow!(
-                            "Failed to connect to database after retries: {}",
-                            e
-                        ));
-                    }
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to connect to database: {}", e)),
-            }
-        };
+        // Backstop only — the wait condition above is what removes the race.
+        // This covers the brief window between the server logging readiness and
+        // the mapped port accepting connections.
+        let db = connect_with_retries(&database_url).await?;
 
         // Run migrations
         Migrator::up(&db, None).await?;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Add more visitors on top of existing data. Does NOT delete anything.
  * Usage: DATABASE_URL=postgres://postgres:password@localhost:5432/temps_demo bun run add-visitors.ts

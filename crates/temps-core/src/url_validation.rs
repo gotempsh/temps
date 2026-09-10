@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! URL validation utilities for preventing SSRF attacks
 //!
 //! This module provides comprehensive URL validation to prevent Server-Side Request Forgery (SSRF)
@@ -38,6 +41,9 @@ pub enum UrlValidationError {
 
     #[error("Unspecified addresses are not allowed")]
     UnspecifiedIp,
+
+    #[error("Reserved or non-global addresses are not allowed")]
+    ReservedIp,
 
     #[error("DNS resolution failed: {0}")]
     DnsResolutionFailed(String),
@@ -268,6 +274,21 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
         return Err(UrlValidationError::UnspecifiedIp);
     }
 
+    // Reject special-use ranges that may be routed internally by the host,
+    // cloud provider, VPN, or container network. These are not globally
+    // reachable destinations and must never be accepted by an external-only
+    // SSRF allowlist.
+    let octets = ip.octets();
+    let is_reserved = octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1])) // RFC 6598 CGNAT
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocols
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // deprecated 6to4 relay
+        || (octets[0] == 198 && (18..=19).contains(&octets[1])) // benchmarking
+        || octets[0] >= 240; // reserved for future use
+    if is_reserved {
+        return Err(UrlValidationError::ReservedIp);
+    }
+
     Ok(())
 }
 
@@ -281,6 +302,14 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
 /// - Unspecified (::)
 /// - IPv6 cloud metadata (fd00:ec2::254 for AWS)
 pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
+    // IPv4-compatible and IPv4-mapped IPv6 addresses are routed through the
+    // embedded IPv4 destination by operating systems. Validate that embedded
+    // address with the IPv4 policy so forms such as ::ffff:127.0.0.1 cannot
+    // bypass loopback/private/cloud-metadata checks.
+    if let Some(ipv4) = ip.to_ipv4() {
+        return validate_ipv4(&ipv4);
+    }
+
     // Check for cloud metadata (AWS IPv6)
     if is_cloud_metadata_ipv6(ip) {
         return Err(UrlValidationError::CloudMetadata);
@@ -301,6 +330,12 @@ pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
         return Err(UrlValidationError::PrivateIp);
     }
 
+    // Deprecated site-local addresses (fec0::/10) may still be routed by
+    // internal networks and are never valid external destinations.
+    if (ip.segments()[0] & 0xffc0) == 0xfec0 {
+        return Err(UrlValidationError::ReservedIp);
+    }
+
     // Check for multicast (ff00::/8)
     if ip.is_multicast() {
         return Err(UrlValidationError::MulticastIp);
@@ -309,6 +344,22 @@ pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
     // Check for unspecified (::)
     if ip.is_unspecified() {
         return Err(UrlValidationError::UnspecifiedIp);
+    }
+
+    // External SMTP destinations must be globally routable unicast addresses.
+    // Today those allocations live in 2000::/3. Keep this as an allowlist so
+    // special-use prefixes such as NAT64, discard-only, benchmarking, and
+    // future local allocations cannot become SSRF targets merely because the
+    // host happens to route them internally.
+    let segments = ip.segments();
+    let is_global_unicast = (segments[0] & 0xe000) == 0x2000;
+    let is_ietf_special = segments[0] == 0x2001 && segments[1] <= 0x01ff; // 2001::/23
+    let is_documentation_2001 = segments[0] == 0x2001 && segments[1] == 0x0db8; // 2001:db8::/32
+    let is_6to4 = segments[0] == 0x2002; // deprecated transition prefix
+    let is_documentation = segments[0] == 0x3fff && (segments[1] & 0xf000) == 0; // 3fff::/20
+    if !is_global_unicast || is_ietf_special || is_documentation_2001 || is_6to4 || is_documentation
+    {
+        return Err(UrlValidationError::ReservedIp);
     }
 
     Ok(())
@@ -399,20 +450,119 @@ pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
     if parsed.scheme() != "https" {
         return Err(UrlValidationError::InvalidScheme);
     }
+    // Git credentials belong in the provider/token fields, never URL userinfo.
+    // Apart from being easy to leak through libgit2 errors, a username can
+    // itself be the token when no password is present.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(UrlValidationError::InvalidFormat(
+            "credentials embedded in Git URLs are not allowed".to_string(),
+        ));
+    }
     // Reuse the external-URL validator for the host/IP checks.
     validate_external_url(url)
 }
 
-/// Redact the password portion of a URL so it is safe to include in
+/// Database connection schemes an importer may be pointed at.
+const ALLOWED_DATABASE_SCHEMES: &[&str] = &[
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "mongodb+srv",
+    "redis",
+    "rediss",
+];
+
+/// Validate a **database** connection URL that came from an untrusted source
+/// (e.g. a remote platform's API response during an import).
+///
+/// [`validate_external_url`] only accepts `http`/`https`, so it cannot be used
+/// for connection strings. This applies the identical host/IP rules —
+/// rejecting loopback, RFC 1918, link-local, cloud-metadata, multicast,
+/// broadcast and other reserved addresses — while allowing database schemes.
+///
+/// This matters because the importer starts an official database client
+/// container with `network_mode=host` and passes the URL straight to
+/// `pg_dump`/`mariadb-dump`/`mongodump`. A source platform that reports
+/// `external_db_url: postgres://…@127.0.0.1:5432/…` would otherwise make Temps
+/// connect to a control-plane-internal database from the Docker host network
+/// and copy its contents into a project the caller owns.
+///
+/// Like `validate_external_url`, a non-literal hostname is only checked for
+/// obvious loopback names here; callers that can afford it should also await
+/// [`validate_domain_async`] on the host.
+///
+/// # Examples
+///
+/// ```
+/// use temps_core::url_validation::validate_external_database_url;
+///
+/// assert!(validate_external_database_url("postgres://u:p@db.example.com:5432/app").is_ok());
+/// assert!(validate_external_database_url("postgres://u:p@127.0.0.1:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@10.0.0.5:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@169.254.169.254/app").is_err());
+/// assert!(validate_external_database_url("file:///etc/passwd").is_err());
+/// ```
+pub fn validate_external_database_url(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed =
+        Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
+
+    if !ALLOWED_DATABASE_SCHEMES.contains(&parsed.scheme()) {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+
+    // NOTE: do not use `parsed.host()` here. The `url` crate only parses hosts
+    // into `Host::Ipv4`/`Host::Ipv6` for *special* schemes (http, https, ws,
+    // wss, ftp, file). Database schemes are not special, so
+    // `postgres://u:p@127.0.0.1/app` yields `Host::Domain("127.0.0.1")` and an
+    // IP-shaped host would sail straight past the domain branch. Parse the
+    // host string as an address ourselves.
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
+    };
+
+    // `[::1]` — strip the brackets the URL form requires before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => validate_ipv4(&ip)?,
+        Ok(IpAddr::V6(ip)) => validate_ipv6(&ip)?,
+        Err(_) => {
+            let lower = bare.to_lowercase();
+            if lower.is_empty() {
+                return Err(UrlValidationError::InvalidFormat(
+                    "database URL must have a valid host".to_string(),
+                ));
+            }
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                return Err(UrlValidationError::LoopbackIp);
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// Redact the userinfo portion of a URL so it is safe to include in
 /// error messages and structured logs (Fix #12 — credentials in errors).
 ///
 /// Examples:
-/// - `https://user:secret@host/repo` → `https://user:***@host/repo`
+/// - `https://user:secret@host/repo` → `https://***:***@host/repo`
+/// - `https://token@host/repo`       → `https://***@host/repo`
 /// - `https://host/repo`             → `https://host/repo`
 /// - non-URL strings are returned unchanged
 pub fn redact_url_password(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("***");
+            }
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("***"));
             }
@@ -444,45 +594,150 @@ pub fn redact_url_password(url: &str) -> String {
 /// }
 /// ```
 pub async fn validate_domain_async(domain: &str) -> Result<(), UrlValidationError> {
-    // Resolve DNS to get all IP addresses
-    let lookup_result = tokio::net::lookup_host(format!("{}:443", domain)).await;
+    resolve_and_validate_domain(domain, 443).await.map(|_| ())
+}
 
-    let addrs = match lookup_result {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            return Err(UrlValidationError::DnsResolutionFailed(format!(
-                "Failed to resolve {}: {}",
-                domain, e
-            )));
-        }
+/// Async counterpart to [`validate_external_database_url`]: same checks, plus
+/// DNS resolution of a non-literal host.
+///
+/// The sync version can only reject IP *literals* and `localhost`. That is not
+/// enough when the URL comes from a remote platform the attacker controls,
+/// because they also control their own DNS: one A record pointing
+/// `db.attacker.tld` at `127.0.0.1` or `169.254.169.254` walks straight past a
+/// literal-only check. Any caller that can afford a DNS lookup — i.e. anything
+/// not on a request hot path — should use this instead.
+///
+/// A resolution failure is an error, not a pass: an unresolvable host cannot be
+/// dialled anyway, and treating "we could not check" as "it is fine" is how the
+/// literal-only gap got here.
+pub async fn validate_external_database_url_async(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed = validate_external_database_url(url)?;
+
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
     };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
 
-    // Validate all resolved IP addresses
-    let mut has_valid_ip = false;
-    for addr in addrs {
-        let validation_result = match addr.ip() {
-            IpAddr::V4(ip) => validate_ipv4(&ip),
-            IpAddr::V6(ip) => validate_ipv6(&ip),
-        };
-
-        match validation_result {
-            Ok(()) => {
-                has_valid_ip = true;
-            }
-            Err(_) => {
-                // If any resolved IP is blocked, reject the entire domain
-                return Err(UrlValidationError::DomainResolvesToBlockedIp);
-            }
-        }
+    // A literal was already fully validated above; only a name needs resolving.
+    if bare.parse::<IpAddr>().is_err() {
+        // Port is irrelevant to the address check — `resolve_and_validate_domain`
+        // needs one only to form a socket address.
+        resolve_and_validate_domain(bare, parsed.port().unwrap_or(443)).await?;
     }
 
-    if !has_valid_ip {
+    Ok(parsed)
+}
+
+/// Resolve `domain:port` and return the socket addresses, **rejecting the whole
+/// domain if any resolved IP is non-public** (loopback, RFC1918, link-local,
+/// etc.).
+///
+/// Unlike [`validate_domain_async`], this returns the validated addresses so a
+/// caller can pin its HTTP client to them. Pinning closes the DNS-rebinding
+/// window: without it, a hostname validated as public here can re-resolve to
+/// `127.0.0.1` / `169.254.169.254` / an RFC1918 address by the time the client
+/// dials it. Dialing the exact addresses validated here removes that gap.
+pub async fn resolve_and_validate_domain(
+    domain: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, UrlValidationError> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", domain, port))
+        .await
+        .map_err(|e| {
+            UrlValidationError::DnsResolutionFailed(format!("Failed to resolve {}: {}", domain, e))
+        })?
+        .collect();
+
+    if addrs.is_empty() {
         return Err(UrlValidationError::DnsResolutionFailed(
             "No valid IP addresses found for domain".to_string(),
         ));
     }
 
-    Ok(())
+    for addr in &addrs {
+        let validation_result = match addr.ip() {
+            IpAddr::V4(ip) => validate_ipv4(&ip),
+            IpAddr::V6(ip) => validate_ipv6(&ip),
+        };
+        if validation_result.is_err() {
+            // If any resolved IP is blocked, reject the entire domain.
+            return Err(UrlValidationError::DomainResolvesToBlockedIp);
+        }
+    }
+
+    Ok(addrs)
+}
+
+#[cfg(test)]
+mod database_url_tests {
+    use super::validate_external_database_url;
+
+    /// The importer starts a database client container with
+    /// `network_mode=host` and hands it this URL, so an address the control
+    /// plane can reach but the public internet cannot is exactly the SSRF the
+    /// guard exists to stop.
+    #[test]
+    fn rejects_internal_targets() {
+        for url in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@localhost:5432/app",
+            "postgres://u:p@db.localhost:5432/app",
+            "postgres://u:p@10.1.2.3:5432/app",
+            "postgres://u:p@172.16.0.9:5432/app",
+            "postgres://u:p@192.168.1.10:5432/app",
+            "postgres://u:p@169.254.169.254:5432/app",
+            "mysql://u:p@127.0.0.1:3306/app",
+            "mongodb://u:p@10.0.0.1:27017/app",
+            "postgres://u:p@[::1]:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_database_endpoints() {
+        for url in [
+            "postgres://u:p@db.example.com:5432/app",
+            "postgresql://u:p@db.example.com/app",
+            "mysql://u:p@db.example.com:3306/app",
+            "mariadb://u:p@db.example.com:3306/app",
+            "mongodb://u:p@db.example.com:27017/app",
+            "mongodb+srv://u:p@cluster.example.com/app",
+            "redis://u:p@cache.example.com:6379",
+            "postgres://u:p@93.184.216.34:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_ok(),
+                "{url} must be accepted"
+            );
+        }
+    }
+
+    /// Non-database schemes must not slip through — `file://` would make the
+    /// dump container read the host filesystem.
+    #[test]
+    fn rejects_non_database_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "http://example.com",
+            "https://example.com",
+            "gopher://example.com",
+            "not a url",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +874,15 @@ mod tests {
 
         // Invalid unspecified
         assert!(validate_ipv4(&Ipv4Addr::new(0, 0, 0, 0)).is_err());
+
+        // Invalid special-use/non-global ranges
+        assert!(validate_ipv4(&Ipv4Addr::new(0, 1, 2, 3)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(100, 64, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(100, 127, 255, 254)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(192, 0, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(192, 88, 99, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(198, 18, 0, 1)).is_err());
+        assert!(validate_ipv4(&Ipv4Addr::new(240, 0, 0, 1)).is_err());
     }
 
     #[test]
@@ -638,6 +902,35 @@ mod tests {
         // Invalid unique local (fc00::/7)
         assert!(validate_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()).is_err());
         assert!(validate_ipv6(&"fd00::1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // IPv4-mapped/compatible forms must inherit the IPv4 policy.
+        assert!(validate_ipv6(&"::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:10.0.0.5".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(validate_ipv6(&"::ffff:100.64.0.1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // Deprecated site-local addresses are internal-only.
+        assert!(validate_ipv6(&"fec0::1".parse::<Ipv6Addr>().unwrap()).is_err());
+
+        // Every special-use prefix stays outside the external-address
+        // allowlist, including translation ranges that an internal router may
+        // map to IPv4 services.
+        for address in [
+            "64:ff9b::1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            let ip = address.parse::<Ipv6Addr>().unwrap();
+            assert!(
+                validate_ipv6(&ip).is_err(),
+                "special-use IPv6 address {address} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -665,12 +958,58 @@ mod tests {
         );
     }
 
+    // Regression for security review finding #8 (SSRF via DNS rebinding). The
+    // delivery path re-resolves and pins to the addresses this returns; a
+    // hostname that resolves to a loopback/internal IP must be rejected, and the
+    // returned addresses (used for pinning) must be exactly the resolved ones.
+    #[tokio::test]
+    async fn resolve_and_validate_domain_rejects_loopback() {
+        // localhost always resolves to 127.0.0.1 / ::1 — the rebinding target.
+        assert!(matches!(
+            resolve_and_validate_domain("localhost", 443).await,
+            Err(UrlValidationError::DomainResolvesToBlockedIp)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_domain_returns_addrs_for_public_host() {
+        let addrs = resolve_and_validate_domain("example.com", 443)
+            .await
+            .expect("example.com resolves to public IPs");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.port() == 443));
+    }
+
     // ── validate_git_url: only https:// is accepted ──────────────────────
 
     #[test]
     fn test_validate_git_url_accepts_https() {
         assert!(validate_git_url("https://github.com/foo/bar.git").is_ok());
         assert!(validate_git_url("https://gitlab.example.com/team/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_embedded_credentials() {
+        for url in [
+            "https://token:secret@github.com/foo/bar.git",
+            "https://token@github.com/foo/bar.git",
+        ] {
+            assert!(matches!(
+                validate_git_url(url),
+                Err(UrlValidationError::InvalidFormat(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_redact_url_password_masks_all_userinfo() {
+        let with_password = redact_url_password("https://token:secret@github.com/foo/bar.git");
+        assert!(!with_password.contains("token"));
+        assert!(!with_password.contains("secret"));
+
+        let username_only = redact_url_password("https://token@github.com/foo/bar.git");
+        assert!(!username_only.contains("token"));
+        assert!(username_only.contains("***"));
     }
 
     #[test]
@@ -722,5 +1061,41 @@ mod tests {
         // https + private IP must still be rejected via the IP host check.
         assert!(validate_git_url("https://169.254.169.254/repo.git").is_err());
         assert!(validate_git_url("https://localhost/repo.git").is_err());
+    }
+    /// Regression: the literal-only check is not enough when the attacker
+    /// controls the DNS for the hostname they hand us — which is exactly the
+    /// importer's threat model, where `source_url` comes out of the remote
+    /// platform's own API response.
+    #[tokio::test]
+    async fn async_database_url_validation_rejects_a_name_resolving_to_loopback() {
+        // `localhost` is the one name every machine resolves to loopback, so
+        // this exercises the resolution path without depending on the network.
+        // The sync check rejects this name by string match; force resolution to
+        // be the thing under test by using a form the string check misses.
+        let err =
+            validate_external_database_url_async("postgres://u:p@localhost.localdomain:5432/app")
+                .await;
+        // Either it resolved to loopback (rejected) or the name does not exist
+        // on this host (also rejected) — both are the safe outcome, and a pass
+        // would mean an unresolved name was treated as public.
+        assert!(
+            err.is_err(),
+            "a name that resolves to loopback (or not at all) must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_database_url_validation_still_rejects_literals_and_schemes() {
+        for hostile in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@10.0.0.5:5432/app",
+            "postgres://u:p@169.254.169.254/app",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_external_database_url_async(hostile).await.is_err(),
+                "{hostile} must be rejected"
+            );
+        }
     }
 }

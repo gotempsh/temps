@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Proxy - Pingora-based reverse proxy with advanced features
 //!
 //! This crate provides a high-performance reverse proxy built on Pingora
@@ -10,7 +13,10 @@
 
 pub mod ai_agent_detector;
 pub mod branded_404;
+pub mod bunny_ips;
+pub mod cloudflare_ips;
 pub mod config;
+mod connection_limiter;
 pub mod crawler_detector;
 pub mod handler;
 pub mod metrics;
@@ -19,12 +25,15 @@ pub mod on_demand_cert;
 pub mod plugin;
 pub mod preview_auth;
 pub mod proxy;
+pub mod redaction;
 pub mod server;
 pub mod service;
 pub mod services;
+mod static_file_serving;
 pub mod storage;
 pub mod tls_cert_loader;
 pub mod tls_fingerprint;
+pub mod traffic_aggregation;
 pub mod traits;
 pub use crawler_detector::CrawlerDetector;
 pub use handler::*;

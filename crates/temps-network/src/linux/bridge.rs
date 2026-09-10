@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Linux bridge management via rtnetlink.
 
 use crate::config::{NetworkConfig, NodeAlloc};
@@ -97,7 +100,7 @@ pub async fn remove(handle: &Handle, name: &str) -> crate::Result<()> {
 /// Look up a link's interface index by name. Returns `Ok(None)` when the
 /// link does not exist.
 pub async fn link_index_by_name(handle: &Handle, name: &str) -> crate::Result<Option<u32>> {
-    let mut links = handle.link().get().match_name(name.into()).execute();
+    let mut links = handle.link().get().match_name(name).execute();
     match links.try_next().await {
         Ok(Some(msg)) => Ok(Some(msg.header.index)),
         Ok(None) => Ok(None),
@@ -105,6 +108,47 @@ pub async fn link_index_by_name(handle: &Handle, name: &str) -> crate::Result<Op
         Err(e) => Err(NetworkError::Netlink {
             op: "get_link_by_name",
             link: name.into(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Read a link's configured MTU by interface name.
+pub async fn link_mtu_by_name(handle: &Handle, name: &str) -> crate::Result<Option<u32>> {
+    use netlink_packet_route::link::LinkAttribute;
+
+    let mut links = handle.link().get().match_name(name).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(msg.attributes.iter().find_map(|attr| match attr {
+            LinkAttribute::Mtu(mtu) => Some(*mtu),
+            _ => None,
+        })),
+        Ok(None) => Ok(None),
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ENODEV => Ok(None),
+        Err(e) => Err(NetworkError::Netlink {
+            op: "get_link_mtu",
+            link: name.into(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Look up a link's name by interface index. Returns `Ok(None)` when the
+/// link does not exist.
+pub async fn link_name_by_index(handle: &Handle, index: u32) -> crate::Result<Option<String>> {
+    use netlink_packet_route::link::LinkAttribute;
+
+    let mut links = handle.link().get().match_index(index).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(msg.attributes.iter().find_map(|attr| match attr {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        })),
+        Ok(None) => Ok(None),
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ENODEV => Ok(None),
+        Err(e) => Err(NetworkError::Netlink {
+            op: "get_link_by_index",
+            link: format!("index {}", index),
             reason: e.to_string(),
         }),
     }

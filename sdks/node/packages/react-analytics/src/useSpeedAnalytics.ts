@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 "use client";
 import { useEffect } from "react";
 import { onCLS, onFID, onLCP, onTTFB, onFCP, onINP, type Metric } from "web-vitals";
@@ -7,12 +10,17 @@ import type { SpeedMetric, WebVitalMetric, JsonValue } from "./types";
 export interface UseSpeedAnalyticsOptions {
   /** Base endpoint path. Defaults to `/_temps`. */
   basePath?: string;
+  /**
+   * Analytics ingest key (`pa_…`). Required only when Temps does not serve or
+   * proxy the app. See `AnalyticsClientOptions.ingestKey`.
+   */
+  ingestKey?: string;
   /** Set to true to disable speed analytics. Defaults to false. */
   disabled?: boolean;
 }
 
 export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
-  const { basePath = "/_temps", disabled = false } = options;
+  const { basePath = "/_temps", ingestKey, disabled = false } = options;
 
   useEffect(() => {
     if (disabled || typeof window === "undefined") return;
@@ -33,7 +41,7 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
           pathname: window.location.pathname,
           query: window.location.search,
         } as Record<string, JsonValue>;
-        sendAnalytics("speed", metricsPayload, "POST", basePath);
+        sendAnalytics("speed", metricsPayload, "POST", basePath, ingestKey);
       }
     };
 
@@ -43,7 +51,7 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
         pathname: window.location.pathname,
         query: window.location.search,
       } as Record<string, JsonValue>;
-      sendAnalytics("speed", payload, "POST", basePath);
+      sendAnalytics("speed", payload, "POST", basePath, ingestKey);
     };
 
     // Track metrics that can be gathered quickly
@@ -77,5 +85,5 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
       lateMetrics.INP = { value: metric.value, rating: metric.rating };
       sendLateMetric("inp", metric.value);
     });
-  }, [basePath, disabled]);
+  }, [basePath, ingestKey, disabled]);
 }

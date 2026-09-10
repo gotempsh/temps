@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
 @import 'tailwindcss';
 @plugin '@tailwindcss/typography';
 
@@ -123,9 +126,12 @@
   --success-foreground: oklch(0.985 0 0);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
-  /* gray-200 borders (#2e2e2e) */
-  --border: oklch(0.269 0 0);
-  --input: oklch(0.269 0 0);
+  /* gray-300 (#3a3a3a) — matches --accent; restores the pre-Geist-palette
+     border/input contrast against --card (0.205) that the Vercel rewrite
+     (6b4859637) collapsed from a 0.144 lightness delta down to 0.064,
+     washing out unchecked switches and outlined/disabled buttons */
+  --border: oklch(0.322 0 0);
+  --input: oklch(0.322 0 0);
   /* Vercel blue ring (#0070f3) */
   --ring: oklch(0.59 0.2032 256.82);
   /* Vercel signature accent colors for charts */
@@ -473,8 +479,74 @@ body {
   animation: log-fade-in 120ms ease-out both;
 }
 
+/* Small pixel-wave used by the AI workspace while a harness or one of its
+   tools is working. Semantic colours keep it legible in either console theme;
+   the reduced-motion block below leaves a quiet, static grid instead. */
+@keyframes ai-activity-pixel {
+  0%,
+  100% {
+    opacity: 0.16;
+  }
+  48% {
+    opacity: 1;
+  }
+}
+
+@keyframes ai-activity-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.ai-activity-pixel {
+  animation: ai-activity-pixel 650ms ease-in-out infinite;
+}
+
+.ai-activity-shimmer {
+  animation: ai-activity-shimmer 1.4s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .log-fresh-line {
+  .log-fresh-line,
+  .ai-activity-pixel,
+  .ai-activity-shimmer {
     animation: none;
   }
+}
+
+/* Shiki syntax highlighting.
+   The docs site (temps-landing) compiles its MDX with the same github-light /
+   github-dark pair and `defaultColor: false`, which makes shiki emit both
+   colours as custom properties on every token instead of baking one theme in.
+   Mapping them here is what lets a snippet follow the console's theme toggle
+   with no re-highlight — and keeps console snippets visually identical to the
+   ones in the documentation. */
+[style*='--shiki-light'] {
+  color: var(--shiki-light);
+}
+
+.dark [style*='--shiki-dark'] {
+  color: var(--shiki-dark);
+}
+
+/* Shiki emits one <span class="line"> per source line, separated by real
+   newlines. The wrapping <pre> already preserves those, so the line spans
+   stay inline — making them blocks would render every break twice and
+   double-space the whole snippet. */
+
+/* Line numbers via a counter rather than injected text, so copying the block
+   never picks the numbers up. */
+.shiki-code.shiki-line-numbers {
+  counter-reset: shiki-line;
+}
+
+.shiki-code.shiki-line-numbers .line::before {
+  counter-increment: shiki-line;
+  content: counter(shiki-line);
+  display: inline-block;
+  min-width: 3ch;
+  padding-right: 1rem;
+  text-align: right;
+  color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
+  user-select: none;
 }

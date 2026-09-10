@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import {
@@ -30,16 +33,47 @@ interface SandboxStatus {
   image_ready: boolean
   image_name: string
   error: string | null
+  firecracker_available: boolean
 }
 
 const RUNTIME_PRESETS = [
-  { value: 'node', label: 'Node.js', description: 'Node.js 20, npm, npx', stacks: 'Next.js, Vite, Express, any JS/TS' },
-  { value: 'bun', label: 'Bun', description: 'Bun runtime', stacks: 'Bun-based projects' },
-  { value: 'python', label: 'Python', description: 'Python 3.12, pip, uv', stacks: 'Django, FastAPI, Flask' },
-  { value: 'rust', label: 'Rust', description: 'Rust stable, cargo', stacks: 'Rust projects' },
+  {
+    value: 'node',
+    label: 'Node.js',
+    description: 'Node.js 20, npm, npx',
+    stacks: 'Next.js, Vite, Express, any JS/TS',
+  },
+  {
+    value: 'bun',
+    label: 'Bun',
+    description: 'Bun runtime',
+    stacks: 'Bun-based projects',
+  },
+  {
+    value: 'python',
+    label: 'Python',
+    description: 'Python 3.12, pip, uv',
+    stacks: 'Django, FastAPI, Flask',
+  },
+  {
+    value: 'rust',
+    label: 'Rust',
+    description: 'Rust stable, cargo',
+    stacks: 'Rust projects',
+  },
   { value: 'go', label: 'Go', description: 'Go 1.23', stacks: 'Go projects' },
-  { value: 'full', label: 'Full', description: 'Node, Python, Go, uv', stacks: 'Multi-language projects' },
-  { value: 'custom', label: 'Custom Image', description: 'Your own Docker image', stacks: 'Any stack you pre-build' },
+  {
+    value: 'full',
+    label: 'Full',
+    description: 'Node, Python, Go, uv',
+    stacks: 'Multi-language projects',
+  },
+  {
+    value: 'custom',
+    label: 'Custom Image',
+    description: 'Your own Docker image',
+    stacks: 'Any stack you pre-build',
+  },
 ]
 
 const RESOURCE_PRESETS = [
@@ -49,8 +83,21 @@ const RESOURCE_PRESETS = [
   { label: 'Custom', cpu: 0, memory: 0 },
 ]
 
+const DEFAULT_WORKSPACE_FILE_LIMITS = {
+  max_files_per_upload: 32,
+  max_file_size_mb: 16,
+  max_upload_size_mb: 32,
+  max_workspace_size_mb: 256,
+  max_workspace_entries: 5_000,
+  max_text_preview_kb: 256,
+  max_image_preview_size_mb: 8,
+  max_download_size_mb: 32,
+}
+
 function getResourcePresetLabel(cpu: number, memory: number): string {
-  const match = RESOURCE_PRESETS.find((p) => p.cpu === cpu && p.memory === memory)
+  const match = RESOURCE_PRESETS.find(
+    (p) => p.cpu === cpu && p.memory === memory
+  )
   return match ? match.label : 'Custom'
 }
 
@@ -67,6 +114,10 @@ export function AgentSandboxSandboxPage() {
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
+  const [sandboxBackend, setSandboxBackend] = useState('docker')
+  const [workspaceFileLimits, setWorkspaceFileLimits] = useState(
+    DEFAULT_WORKSPACE_FILE_LIMITS
+  )
   const [isDirty, setIsDirty] = useState(false)
 
   const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null)
@@ -97,10 +148,17 @@ export function AgentSandboxSandboxPage() {
       setCpuLimit(s.cpu_limit)
       setMemoryLimitMb(s.memory_limit_mb)
       setResourcePreset(getResourcePresetLabel(s.cpu_limit, s.memory_limit_mb))
+      setSandboxBackend(s.sandbox_backend || 'docker')
     }
     if (settings?.ai_config) {
       setGlobalConfigRepo(settings.ai_config.config_repo || '')
       setGlobalConfigRepoBranch(settings.ai_config.config_repo_branch || 'main')
+    }
+    if (settings?.ai_workspace_file_limits) {
+      setWorkspaceFileLimits({
+        ...DEFAULT_WORKSPACE_FILE_LIMITS,
+        ...settings.ai_workspace_file_limits,
+      })
     }
   }, [settings])
 
@@ -114,7 +172,9 @@ export function AgentSandboxSandboxPage() {
     try {
       // TODO(sdk-regen): migrate once /settings/sandbox-rebuild (streaming SSE)
       // endpoint is added to the generated SDK.
-      const response = await fetch('/api/settings/sandbox-rebuild', { method: 'POST' })
+      const response = await fetch('/api/settings/sandbox-rebuild', {
+        method: 'POST',
+      })
       if (!response.ok || !response.body) {
         toast.error('Failed to start image rebuild')
         setRebuilding(false)
@@ -137,7 +197,8 @@ export function AgentSandboxSandboxPage() {
             try {
               const parsed = JSON.parse(data)
               if (parsed.type === 'done') {
-                if (parsed.success) toast.success(`Image rebuilt: ${parsed.image_name}`)
+                if (parsed.success)
+                  toast.success(`Image rebuilt: ${parsed.image_name}`)
                 else toast.error(parsed.error || 'Build failed')
                 continue
               }
@@ -188,17 +249,21 @@ export function AgentSandboxSandboxPage() {
           api_key_saved: settings?.agent_sandbox?.api_key_saved ?? false,
           auth_type: settings?.agent_sandbox?.auth_type ?? '',
           providers: settings?.agent_sandbox?.providers ?? {},
+          sandbox_backend: sandboxBackend,
         },
         ai_config: {
           ...(settings?.ai_config ?? {}),
           config_repo: globalConfigRepo,
           config_repo_branch: globalConfigRepoBranch,
         },
+        ai_workspace_file_limits: workspaceFileLimits,
       })
       setIsDirty(false)
       toast.success('Workflow sandbox settings saved')
-    } catch {
-      toast.error('Failed to save settings')
+    } catch (cause) {
+      toast.error(
+        cause instanceof Error ? cause.message : 'Failed to save settings'
+      )
     }
   }
 
@@ -222,8 +287,9 @@ export function AgentSandboxSandboxPage() {
               Workflow Sandbox
             </CardTitle>
             <CardDescription>
-              When sandbox is enabled, workflows run inside isolated Docker containers.
-              Code changes are contained and can't affect your server.
+              When sandbox is enabled, workflows run inside isolated Docker
+              containers. Code changes are contained and can't affect your
+              server.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -253,7 +319,9 @@ export function AgentSandboxSandboxPage() {
                     )}
                     <span>
                       Docker:{' '}
-                      {sandboxStatus.docker_available ? 'connected' : 'not available'}
+                      {sandboxStatus.docker_available
+                        ? 'connected'
+                        : 'not available'}
                     </span>
                   </div>
                   {sandboxStatus.docker_available && (
@@ -272,7 +340,9 @@ export function AgentSandboxSandboxPage() {
                     </div>
                   )}
                   {sandboxStatus.error && (
-                    <p className="text-xs text-red-400 mt-1">{sandboxStatus.error}</p>
+                    <p className="text-xs text-red-400 mt-1">
+                      {sandboxStatus.error}
+                    </p>
                   )}
                   {sandboxStatus.docker_available && (
                     <div className="space-y-2 mt-2">
@@ -295,7 +365,9 @@ export function AgentSandboxSandboxPage() {
                             <div key={i}>{line}</div>
                           ))}
                           {rebuilding && (
-                            <div className="animate-pulse text-green-300">...</div>
+                            <div className="animate-pulse text-green-300">
+                              ...
+                            </div>
                           )}
                         </div>
                       )}
@@ -311,10 +383,128 @@ export function AgentSandboxSandboxPage() {
               <AlertTriangle className="h-4 w-4" />
               <AlertDescription>
                 Agents always run in an isolated Docker container — there is no
-                host-execution mode. Docker must be available for any session
-                to start.
+                host-execution mode. Docker must be available for any session to
+                start.
               </AlertDescription>
             </Alert>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Workspace file limits</CardTitle>
+            <CardDescription>
+              Bound uploads, downloads, and previews handled by the Temps
+              control plane. Existing persistent files are not removed when
+              these limits change.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {[
+              ['max_files_per_upload', 'Files per upload', 1, 100],
+              ['max_file_size_mb', 'File size (MB)', 1, 32],
+              ['max_upload_size_mb', 'Upload batch (MB)', 1, 32],
+              ['max_workspace_size_mb', 'Workspace size (MB)', 1, 2048],
+              ['max_workspace_entries', 'Workspace entries', 1, 50000],
+              ['max_text_preview_kb', 'Text preview (KB)', 1, 1024],
+              ['max_image_preview_size_mb', 'Image preview (MB)', 1, 16],
+              ['max_download_size_mb', 'Download size (MB)', 1, 32],
+            ].map(([key, label, min, max]) => (
+              <div className="space-y-2" key={key}>
+                <Label htmlFor={`workspace-limit-${key}`}>{label}</Label>
+                <Input
+                  id={`workspace-limit-${key}`}
+                  max={max}
+                  min={min}
+                  onChange={(event) => {
+                    const value = Number.parseInt(event.target.value, 10)
+                    setWorkspaceFileLimits((current) => ({
+                      ...current,
+                      [key]: Number.isFinite(value)
+                        ? Math.min(
+                            max as number,
+                            Math.max(min as number, value)
+                          )
+                        : min,
+                    }))
+                    setIsDirty(true)
+                  }}
+                  type="number"
+                  value={
+                    workspaceFileLimits[key as keyof typeof workspaceFileLimits]
+                  }
+                />
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              A file must fit both the per-file and upload-batch limit. Raster
+              image previews support PNG, JPEG, GIF, and WebP; SVG remains a
+              downloadable file and is never rendered inline.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Isolation Backend</CardTitle>
+            <CardDescription>
+              Default sandbox isolation technology for new workflow runs.
+              Firecracker provides stronger isolation via KVM microVMs; Docker
+              is the standard default.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                onClick={() => {
+                  setSandboxBackend('docker')
+                  setIsDirty(true)
+                }}
+                className={`rounded-lg border p-3 text-left transition-colors ${
+                  sandboxBackend === 'docker'
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border hover:border-primary/50'
+                }`}
+              >
+                <p className="text-sm font-medium">Docker</p>
+                <p className="text-xs text-muted-foreground">
+                  Container-based isolation — available on all hosts with
+                  Docker.
+                </p>
+              </button>
+              <div
+                title={
+                  sandboxStatus && !sandboxStatus.firecracker_available
+                    ? 'Firecracker is not yet available — run `temps firecracker setup` to provision this host'
+                    : undefined
+                }
+              >
+                <button
+                  onClick={() => {
+                    if (!sandboxStatus || sandboxStatus.firecracker_available) {
+                      setSandboxBackend('firecracker')
+                      setIsDirty(true)
+                    }
+                  }}
+                  disabled={
+                    sandboxStatus != null &&
+                    !sandboxStatus.firecracker_available
+                  }
+                  className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                    sandboxBackend === 'firecracker'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <p className="text-sm font-medium">Firecracker</p>
+                  <p className="text-xs text-muted-foreground">
+                    {sandboxStatus && !sandboxStatus.firecracker_available
+                      ? 'Not available — run `temps firecracker setup`'
+                      : 'KVM microVM isolation — stronger security boundary.'}
+                  </p>
+                </button>
+              </div>
+            </div>
           </CardContent>
         </Card>
 
@@ -323,7 +513,8 @@ export function AgentSandboxSandboxPage() {
             <CardTitle className="text-base">Runtime</CardTitle>
             <CardDescription>
               Choose the runtime environment for sandbox containers. Each preset
-              includes the language toolchain, git, and Claude CLI pre-installed.
+              includes the language toolchain, git, and Claude CLI
+              pre-installed.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -342,7 +533,9 @@ export function AgentSandboxSandboxPage() {
                   }`}
                 >
                   <p className="text-sm font-medium">{preset.label}</p>
-                  <p className="text-xs text-muted-foreground">{preset.description}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {preset.description}
+                  </p>
                 </button>
               ))}
             </div>
@@ -360,10 +553,14 @@ export function AgentSandboxSandboxPage() {
                   }}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Custom images must have <code className="text-xs bg-muted px-1 rounded">git</code>{' '}
-                  and <code className="text-xs bg-muted px-1 rounded">claude</code> (Claude CLI)
-                  installed. The repository is mounted at{' '}
-                  <code className="text-xs bg-muted px-1 rounded">/workspace</code>.
+                  Custom images must have{' '}
+                  <code className="text-xs bg-muted px-1 rounded">git</code> and{' '}
+                  <code className="text-xs bg-muted px-1 rounded">claude</code>{' '}
+                  (Claude CLI) installed. The repository is mounted at{' '}
+                  <code className="text-xs bg-muted px-1 rounded">
+                    /workspace
+                  </code>
+                  .
                 </p>
               </div>
             )}
@@ -450,12 +647,14 @@ export function AgentSandboxSandboxPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Global Config Repository</CardTitle>
+            <CardTitle className="text-base">
+              Global Config Repository
+            </CardTitle>
             <CardDescription>
-              A shared config repository applied to all workflow runs. Contains a{' '}
-              <code className="text-xs bg-muted px-1 rounded">.claude/</code> directory
-              with skills, MCP servers, and settings. Per-workflow config repos
-              override conflicting files.
+              A shared config repository applied to all workflow runs. Contains
+              a <code className="text-xs bg-muted px-1 rounded">.claude/</code>{' '}
+              directory with skills, MCP servers, and settings. Per-workflow
+              config repos override conflicting files.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -471,8 +670,8 @@ export function AgentSandboxSandboxPage() {
                 }}
               />
               <p className="text-xs text-muted-foreground">
-                GitHub repo path. The repo must be accessible via the project's git
-                provider connection. Leave empty to disable.
+                GitHub repo path. The repo must be accessible via the project's
+                git provider connection. Leave empty to disable.
               </p>
             </div>
             <div className="space-y-2">
@@ -496,11 +695,15 @@ export function AgentSandboxSandboxPage() {
           and auto-dismisses when the user saves successfully. */}
       {isDirty && (
         <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg z-30">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
+          <div className="w-full px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
             <p className="text-sm text-muted-foreground">
               You have unsaved sandbox changes.
             </p>
-            <Button onClick={handleSave} disabled={updateSettings.isPending} size="sm">
+            <Button
+              onClick={handleSave}
+              disabled={updateSettings.isPending}
+              size="sm"
+            >
               {updateSettings.isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
               ) : (

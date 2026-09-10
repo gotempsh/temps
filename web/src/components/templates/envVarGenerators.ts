@@ -1,7 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Frontend-side default-value generators for template environment variables.
  *
- * Templates can declare `default_generator` per env var (see `temps-core/templates.yaml`).
+ * Templates can declare `default_generator` per env var (see `temps-core/templates/`).
  * The Configurator uses this to (a) auto-fill empty values once the user has typed a
  * repository name and (b) render a "Generate" button on the value field.
  */
@@ -31,29 +34,23 @@ export type GeneratorContext = {
 }
 
 /**
- * Generates a hex string of the requested byte length using the Web Crypto API.
- * Falls back to `Math.random` only when crypto is unavailable (very old browsers).
+ * Generates a hex string with Web Crypto. Secret generation fails closed when
+ * the browser cannot provide a cryptographically secure random source.
  */
-function randomHex(byteLength: number): string {
+function randomHex(byteLength: number): string | null {
   const buf = new Uint8Array(byteLength)
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(buf)
-  } else {
-    for (let i = 0; i < byteLength; i++) buf[i] = Math.floor(Math.random() * 256)
-  }
+  if (typeof crypto === 'undefined' || !crypto.getRandomValues) return null
+  crypto.getRandomValues(buf)
   return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 /**
  * Generates a base64-url-safe random string of the requested byte length.
  */
-function randomBase64(byteLength: number): string {
+function randomBase64(byteLength: number): string | null {
   const buf = new Uint8Array(byteLength)
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(buf)
-  } else {
-    for (let i = 0; i < byteLength; i++) buf[i] = Math.floor(Math.random() * 256)
-  }
+  if (typeof crypto === 'undefined' || !crypto.getRandomValues) return null
+  crypto.getRandomValues(buf)
   let binary = ''
   for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i])
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -75,7 +72,9 @@ function isLocalHost(host: string): boolean {
  * Parses `external_url` into its scheme, hostname, and (optional) port.
  * Returns `null` for empty / malformed input.
  */
-function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null {
+function parseExternalUrl(
+  externalUrl?: string | null
+): DeploymentUrlBase | null {
   const trimmed = externalUrl?.trim()
   if (!trimmed) return null
   try {
@@ -102,6 +101,9 @@ function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null
  *      also set, we inherit its **scheme** and **port** so dev installs
  *      like `external_url=http://localhost:8080` + `preview_domain=*.localho.st`
  *      generate `http://my-app.localho.st:8080` instead of dropping the port.
+ *      When `external_url` is unset, `proxyPort` (from `AppSettingsResponse.proxy_port`)
+ *      fills the port instead — this is the exact fallback the backend itself
+ *      uses in `compute_environment_url`/`compute_deployment_url`.
  *   2. The full URL parts of `external_url` (scheme, host, port) when
  *      `preview_domain` is empty — generated URLs at least reach the same
  *      origin the user is configured to use.
@@ -112,9 +114,13 @@ function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null
 export function resolveDeploymentUrlBase(opts?: {
   previewDomain?: string | null
   externalUrl?: string | null
+  /** `AppSettingsResponse.proxy_port` — the real Pingora listener port, used
+   * only when `externalUrl` doesn't already supply one. */
+  proxyPort?: number | null
 }): DeploymentUrlBase {
   const externalUrlBase = parseExternalUrl(opts?.externalUrl)
   const previewDomain = opts?.previewDomain?.trim()
+  const proxyPort = opts?.proxyPort ? String(opts.proxyPort) : undefined
 
   if (previewDomain) {
     const host = previewDomain.replace(/^\*\./, '')
@@ -129,7 +135,10 @@ export function resolveDeploymentUrlBase(opts?: {
         port: externalUrlBase.port,
       }
     }
-    return { scheme: 'https', host }
+    // Matches the backend's own fallback (`compute_environment_url` /
+    // `compute_deployment_url` in temps-deployments): no `external_url`
+    // configured means the proxy is serving plain HTTP on `proxy_port()`.
+    return { scheme: 'http', host, port: proxyPort }
   }
 
   if (externalUrlBase) return externalUrlBase
@@ -158,15 +167,19 @@ export function formatDeploymentUrlBase(base: DeploymentUrlBase): string {
  * Computes the deployment URL for a given repository slug. Returns `null` if
  * the repo name is empty (the URL would be invalid until the user types one).
  *
- * Format: `{scheme}://{slug}.{host}[:port]` — port preserved verbatim from
- * `external_url` so non-default ports (8080, 9000, …) survive the round-trip.
+ * Format: `{scheme}://{slug}-production.{host}[:port]` — the same
+ * `{project_slug}-{environment_slug}` subdomain the backend actually assigns
+ * a project's first environment (see `format!("{}-{}", project.slug, env.slug)`
+ * in temps-deployments/temps-projects), not just the bare project slug. Port
+ * is preserved verbatim from `external_url` so non-default ports (8080,
+ * 9000, …) survive the round-trip.
  */
 export function generateAppUrl(ctx: GeneratorContext): string | null {
   const slug = ctx.repositoryName?.trim()
   if (!slug) return null
   const base = ctx.base || resolveDeploymentUrlBase()
   const portPart = base.port ? `:${base.port}` : ''
-  return `${base.scheme}://${slug}.${base.host}${portPart}`
+  return `${base.scheme}://${slug}-production.${base.host}${portPart}`
 }
 
 /**
@@ -195,6 +208,8 @@ export function runGenerator(
  * name. Used to decide whether to re-run the generator when the repo or the
  * resolved deployment-URL base changes.
  */
-export function generatorDependsOnRepoName(generator: string | null | undefined): boolean {
+export function generatorDependsOnRepoName(
+  generator: string | null | undefined
+): boolean {
   return generator === 'app_url'
 }

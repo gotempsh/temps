@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,14 +15,41 @@ use tracing::{info, warn};
 
 use super::shutdown::CtrlCShutdownSignal;
 
+/// Keep HTTP serving available when optional Docker-backed features cannot be
+/// initialized. Both combined and split proxy composition roots use this gate,
+/// so an unavailable socket cannot accidentally become a startup failure in
+/// one mode only.
+pub(crate) fn optional_docker_feature<T>(
+    result: anyhow::Result<T>,
+    disabled_features: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warn!(
+                "Docker not available — {} will be disabled: {}",
+                disabled_features, error
+            );
+            None
+        }
+    }
+}
+
 /// Adapter bridging `temps_deployer::ContainerDeployer` to `temps_proxy::on_demand::ContainerLifecycle`.
 pub(crate) struct ContainerLifecycleAdapter {
     deployer: Arc<dyn ContainerDeployer>,
+    runtime_context: Arc<temps_core::RuntimeContext>,
 }
 
 impl ContainerLifecycleAdapter {
-    pub fn new(deployer: Arc<dyn ContainerDeployer>) -> Self {
-        Self { deployer }
+    pub fn new(
+        deployer: Arc<dyn ContainerDeployer>,
+        runtime_context: Arc<temps_core::RuntimeContext>,
+    ) -> Self {
+        Self {
+            deployer,
+            runtime_context,
+        }
     }
 }
 
@@ -65,12 +95,17 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
         use temps_deployer::readiness::{check_accepting_requests, ReadinessCheck};
 
         // 2s per-request timeout matches the historical inline probe.
-        let check = check_accepting_requests(&self.deployer, container_id, Duration::from_secs(2))
-            .await
-            .map_err(|e| OnDemandError::ContainerOperation {
-                container_id: container_id.to_string(),
-                reason: e.to_string(),
-            })?;
+        let check = check_accepting_requests(
+            &self.deployer,
+            container_id,
+            Duration::from_secs(2),
+            self.runtime_context.as_ref(),
+        )
+        .await
+        .map_err(|e| OnDemandError::ContainerOperation {
+            container_id: container_id.to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(matches!(check, ReadinessCheck::Ready))
     }
@@ -91,10 +126,26 @@ pub fn start_proxy_server(
     on_demand_manager: Option<Arc<OnDemandManager>>,
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
+    project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
-    // Create tokio runtime to fetch preview_domain from config service
-    let rt = tokio::runtime::Runtime::new()?;
+    // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
+    // enabled, the long-lived home of `OnDemandCertManager`'s issuance consumer
+    // (`OnDemandCertManager::new` calls `tokio::spawn` on whatever runtime is
+    // current). It therefore has to outlive this fetch and it has to stay
+    // multi-threaded: on a `current_thread` runtime, a thread parked by Pingora
+    // would leave the consumer unpolled and silently break issuance.
+    //
+    // `Runtime::new()` sizes itself to the host (one worker per core), which on
+    // a big box means ~24 idle worker threads costing ~100 kB of anonymous RSS
+    // each for a runtime whose entire steady-state workload is one consumer
+    // task draining a bounded channel. Two workers keep the "a blocked thread
+    // can't stall the consumer" property at a fixed cost.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("temps-proxy-ctl")
+        .enable_all()
+        .build()?;
 
     // Fetch settings once: we need `preview_domain` for routing AND the full
     // `AppSettings` to decide whether to wire ADR-018 on-demand TLS.
@@ -231,6 +282,7 @@ pub fn start_proxy_server(
         on_demand_manager,
         admin_gate,
         retention_resolver,
+        project_ip_gate,
     ) {
         Ok(_) => {
             info!("Proxy server exited");
@@ -246,6 +298,16 @@ pub fn start_proxy_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_docker_disables_optional_features_without_failing_startup() {
+        let result = optional_docker_feature::<()>(
+            Err(anyhow::anyhow!("Docker socket is unavailable")),
+            "on-demand test features",
+        );
+
+        assert!(result.is_none());
+    }
     use std::collections::HashMap;
     use temps_deployer::{
         ContainerInfo, ContainerStats, ContainerStatus, DeployRequest, DeployResult, DeployerError,
@@ -259,13 +321,11 @@ mod tests {
         info: ContainerInfo,
     }
 
-    /// Build a `ContainerInfo` pointed at a test listener. The readiness probe
-    /// resolves its URL via `DeploymentMode::build_container_url`, which yields
-    /// `(container_name, container_port)` in Docker mode and `("127.0.0.1",
-    /// host_port)` in baremetal mode. Using `container_name = "127.0.0.1"` and
+    /// Build a `ContainerInfo` pointed at a test listener. The injected Host
+    /// runtime context resolves it to `("127.0.0.1", host_port)`. Using
+    /// `container_name = "127.0.0.1"` and
     /// `container_port == host_port` makes both modes resolve to
-    /// `http://127.0.0.1:{port}/`, so these tests don't depend on the ambient
-    /// `DEPLOYMENT_MODE`.
+    /// `http://127.0.0.1:{port}/`.
     fn container_info(status: ContainerStatus, ports: Vec<u16>) -> ContainerInfo {
         ContainerInfo {
             container_id: "c1".to_string(),
@@ -279,6 +339,7 @@ mod tests {
                     host_port,
                     container_port: host_port,
                     protocol: Protocol::Tcp,
+                    host_ip: None,
                 })
                 .collect(),
             environment_vars: HashMap::new(),
@@ -344,7 +405,10 @@ mod tests {
     }
 
     fn adapter_for(info: ContainerInfo) -> ContainerLifecycleAdapter {
-        ContainerLifecycleAdapter::new(Arc::new(MockDeployer { info }))
+        ContainerLifecycleAdapter::new(
+            Arc::new(MockDeployer { info }),
+            Arc::new(temps_core::RuntimeContext::host()),
+        )
     }
 
     /// Spawn a minimal HTTP/1.1 server on a loopback port that answers `200 OK`

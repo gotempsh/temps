@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use arc_swap::ArcSwap;
 use ipnetwork::IpNetwork;
 use sea_orm::*;
@@ -65,7 +68,8 @@ impl From<ip_access_control::Model> for IpAccessControlResponse {
 /// Request to create an IP access control rule
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateIpAccessControlRequest {
-    /// IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+    /// IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+    /// "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
     #[schema(example = "192.168.1.100")]
     pub ip_address: String,
     /// Action to take: "block" or "allow"
@@ -423,45 +427,12 @@ impl IpAccessControlService {
         Ok(())
     }
 
-    /// Basic IP/CIDR validation (can be improved with proper IP parsing library)
+    /// Validates an IP address or CIDR range for either IPv4 or IPv6, using the
+    /// same `IpNetwork` parser `refresh_blocklist`/`is_blocked` rely on — so
+    /// nothing accepted here is later silently skipped as unparsable when the
+    /// hot-path snapshot is built.
     fn is_valid_ip_or_cidr(ip: &str) -> bool {
-        // Allow IPv4 addresses and CIDR notation
-        // This is a simple validation - PostgreSQL inet type will do final validation
-        if ip.contains('/') {
-            // CIDR notation
-            let parts: Vec<&str> = ip.split('/').collect();
-            if parts.len() != 2 {
-                return false;
-            }
-            // Check if prefix length is valid
-            if let Ok(prefix) = parts[1].parse::<u8>() {
-                if prefix > 32 {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            // Validate the IP part
-            Self::is_valid_ipv4(parts[0])
-        } else {
-            // Single IP address
-            Self::is_valid_ipv4(ip)
-        }
-    }
-
-    /// Basic IPv4 validation
-    fn is_valid_ipv4(ip: &str) -> bool {
-        let parts: Vec<&str> = ip.split('.').collect();
-        if parts.len() != 4 {
-            return false;
-        }
-        for part in parts {
-            // parse::<u8>() already validates 0-255 range
-            if part.parse::<u8>().is_err() {
-                return false;
-            }
-        }
-        true
+        ip.parse::<IpNetwork>().is_ok()
     }
 }
 
@@ -472,16 +443,6 @@ mod tests {
     // NOTE: Database tests are disabled because MockDatabase doesn't support
     // PostgreSQL-specific inet operators (::inet casting and <<= operator).
     // These require integration tests with a real PostgreSQL database.
-
-    #[test]
-    fn test_is_valid_ipv4() {
-        assert!(IpAccessControlService::is_valid_ipv4("192.168.1.1"));
-        assert!(IpAccessControlService::is_valid_ipv4("10.0.0.1"));
-        assert!(IpAccessControlService::is_valid_ipv4("255.255.255.255"));
-        assert!(!IpAccessControlService::is_valid_ipv4("256.1.1.1"));
-        assert!(!IpAccessControlService::is_valid_ipv4("192.168.1"));
-        assert!(!IpAccessControlService::is_valid_ipv4("invalid"));
-    }
 
     #[tokio::test]
     async fn test_is_blocked_matches_in_memory_snapshot() {
@@ -522,6 +483,14 @@ mod tests {
         assert!(!IpAccessControlService::is_valid_ip_or_cidr("10.0.0.0/33"));
         assert!(!IpAccessControlService::is_valid_ip_or_cidr("256.1.1.1/24"));
         assert!(!IpAccessControlService::is_valid_ip_or_cidr("invalid"));
+
+        // IPv6: bare address, CIDR range, and out-of-range prefix
+        assert!(IpAccessControlService::is_valid_ip_or_cidr("2001:db8::1"));
+        assert!(IpAccessControlService::is_valid_ip_or_cidr("2001:db8::/32"));
+        assert!(IpAccessControlService::is_valid_ip_or_cidr("::1"));
+        assert!(!IpAccessControlService::is_valid_ip_or_cidr(
+            "2001:db8::1/129"
+        ));
     }
 
     // Database tests are commented out because MockDatabase doesn't support PostgreSQL-specific features

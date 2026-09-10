@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Database Cron Configuration Service
 //!
 //! Implements cron job configuration using the database
@@ -555,7 +558,7 @@ impl DatabaseCronConfigService {
         // Pick a random container if there's more than one, otherwise use the first
         // Use deployment ID as seed for consistent selection per deployment
         let container = if containers.len() > 1 {
-            use rand::seq::SliceRandom;
+            use rand::prelude::IndexedRandom;
             use rand::SeedableRng;
             let mut rng = rand::rngs::StdRng::seed_from_u64(deployment.id as u64);
             containers.choose(&mut rng)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps join` subcommand — joins a worker node to an existing cluster.
 //!
 //! Supports two modes:
@@ -8,6 +11,8 @@
 //! Run `temps agent` separately to start the worker.
 
 use clap::Args;
+
+use super::api_url::management_api_url;
 
 /// Join this machine to a Temps cluster as a worker node
 #[derive(Args)]
@@ -47,12 +52,29 @@ pub struct JoinCommand {
     /// its own CA (ADR-020 WS-2.2).
     #[arg(long)]
     pub ca_fingerprint: Option<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Defaults to auto-detecting the device
+    /// carrying this host's IPv4 default route — set this only when the
+    /// default route doesn't point at the interface that should carry
+    /// overlay traffic (e.g. a private network on a VLAN sub-interface).
+    #[arg(long)]
+    pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the selected underlay. Normally the agent
+    /// detects this from the interface. Set it only when the real path MTU is
+    /// lower than the interface reports.
+    #[arg(long)]
+    pub underlay_mtu: Option<u32>,
 }
 
 /// Response body from the control plane registration endpoint.
 #[derive(serde::Deserialize)]
 struct RegisterResponse {
     id: i32,
+    /// Whether the control plane requires this node to serve mTLS.
+    #[serde(default)]
+    mtls_required: bool,
     /// Signed per-node leaf cert (PEM) for mTLS — present when we sent a CSR.
     #[serde(default)]
     cert_pem: Option<String>,
@@ -67,74 +89,173 @@ struct NodeTlsMaterial {
     csr_pem: String,
 }
 
+fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
+    let config_path = crate::commands::agent::agent_data_dir().join("agent.json");
+    let data = std::fs::read_to_string(config_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn prior_token_for_reenrollment(
+    saved: Option<&temps_agent::AgentConfig>,
+    node_name: &str,
+    control_plane_url: &str,
+) -> Option<String> {
+    let saved = saved?;
+    let same_control_plane =
+        saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/');
+    (saved.node_name == node_name && same_control_plane).then(|| saved.token.clone())
+}
+
+/// Extract the port `temps agent` will listen on from `--agent-address`.
+/// Uses `SocketAddr::from_str` rather than a manual `.split(':').next_back()`
+/// so a bracketed IPv6 address with no port (e.g. "[::1]") doesn't glue the
+/// closing bracket onto the extracted "port" -- falls back to the default
+/// agent port only when `agent_address` isn't a parsable socket address at
+/// all.
+fn agent_listen_port(agent_address: &str) -> u16 {
+    agent_address
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(3100)
+}
+
+/// Build a "host:port" URL authority, bracketing IPv6 the way
+/// `SocketAddr`'s `Display` does ("[fc00::1]:3100") -- a bare
+/// "{ip}:{port}" is unparsable for IPv6 since nothing marks where the
+/// address ends and the port begins. Falls back to the unbracketed form
+/// only if `ip` isn't itself a parsable IP address (shouldn't happen for a
+/// validated `private_address`, but this must never produce a *worse*
+/// address than the naive concatenation it replaces).
+fn socket_authority(ip: &str, port: u16) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
+}
+
 /// Generate a per-node keypair + CSR. The private key never leaves this host.
 /// `ip` is the address the control plane will connect to (the node's
 /// private/WG IP) and MUST be a SAN, or the CP's server-cert hostname check
 /// fails (ADR-020 WS-2.1).
-fn generate_node_tls_material(node_name: &str, ip: &str) -> Option<NodeTlsMaterial> {
+fn generate_node_tls_material(node_name: &str, ip: &str) -> anyhow::Result<NodeTlsMaterial> {
     let sans = vec![ip.to_string(), node_name.to_string()];
-    match temps_core::node_pki::generate_node_keypair_csr(node_name, &sans) {
-        Ok(csr) => Some(NodeTlsMaterial {
+    temps_core::node_pki::generate_node_keypair_csr(node_name, &sans)
+        .map(|csr| NodeTlsMaterial {
             key_pem: csr.key_pem,
             csr_pem: csr.csr_pem,
-        }),
-        Err(e) => {
-            eprintln!("Warning: could not generate node TLS material ({e}); joining without mTLS.");
-            None
-        }
-    }
+        })
+        .map_err(|e| anyhow::anyhow!("could not generate the node mTLS key and CSR: {e}"))
 }
 
 /// Write the node key + leaf cert + cluster CA to the agent data dir (key 0600)
-/// and return their paths for the agent config. Best-effort: on any IO error we
-/// warn and return None so the node still joins (over plaintext HTTP).
+/// and return their paths for the agent config. Any failure is fatal: once the
+/// control plane records an HTTPS agent address, silently serving HTTP would
+/// leave a broken node and weaken the operator's intended transport policy.
 fn write_node_certs(
     key_pem: &str,
     cert_pem: &str,
     ca_cert_pem: &str,
-) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
     let dir = crate::commands::agent::agent_data_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("Warning: could not create agent data dir for certs: {e}");
-        return None;
-    }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::anyhow!(
+            "could not create agent certificate directory '{}': {e}",
+            dir.display()
+        )
+    })?;
     let key_path = dir.join("node.key.pem");
     let cert_path = dir.join("node.cert.pem");
     let ca_path = dir.join("cluster-ca.pem");
 
-    if let Err(e) = std::fs::write(&key_path, key_pem) {
-        eprintln!("Warning: could not write node key: {e}");
-        return None;
-    }
+    std::fs::write(&key_path, key_pem)
+        .map_err(|e| anyhow::anyhow!("could not write node key '{}': {e}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| anyhow::anyhow!("could not restrict node key '{}': {e}", key_path.display()),
+        )?;
     }
-    if let Err(e) = std::fs::write(&cert_path, cert_pem) {
-        eprintln!("Warning: could not write node cert: {e}");
-        return None;
-    }
-    if let Err(e) = std::fs::write(&ca_path, ca_cert_pem) {
-        eprintln!("Warning: could not write cluster CA: {e}");
-        return None;
-    }
-    Some((cert_path, key_path, ca_path))
+    std::fs::write(&cert_path, cert_pem).map_err(|e| {
+        anyhow::anyhow!(
+            "could not write node certificate '{}': {e}",
+            cert_path.display()
+        )
+    })?;
+    std::fs::write(&ca_path, ca_cert_pem)
+        .map_err(|e| anyhow::anyhow!("could not write cluster CA '{}': {e}", ca_path.display()))?;
+    Ok((cert_path, key_path, ca_path))
 }
 
 /// Persist the signed leaf + cluster CA from the register response, returning
-/// the `(cert, key, ca)` paths for the agent config. Returns `None` (so the
-/// node serves plaintext HTTP) when no CSR was sent or the CP did not sign one.
+/// the `(cert, key, ca)` paths for the agent config. A control plane that says
+/// mTLS is required must return both certificates; otherwise enrollment fails.
 fn persist_tls(
-    material: &Option<NodeTlsMaterial>,
+    material: &NodeTlsMaterial,
     response: &RegisterResponse,
-) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-    let material = material.as_ref()?;
-    let cert_pem = response.cert_pem.as_ref()?;
-    let ca_cert_pem = response.ca_cert_pem.as_ref()?;
+) -> anyhow::Result<Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>> {
+    if !response.mtls_required {
+        return Ok(None);
+    }
+    let cert_pem = response.cert_pem.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("control plane requires mTLS but returned no signed node certificate")
+    })?;
+    let ca_cert_pem = response.ca_cert_pem.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("control plane requires mTLS but returned no cluster CA certificate")
+    })?;
     let paths = write_node_certs(&material.key_pem, cert_pem, ca_cert_pem)?;
     println!("mTLS certificate provisioned — the agent will serve TLS.");
-    Some(paths)
+    Ok(Some(paths))
+}
+
+/// Detect the container platform this machine will run workloads on.
+///
+/// Reads it from the local Docker daemon: that is the architecture which
+/// decides whether an image can run here, and it differs from this binary's
+/// whenever `DOCKER_HOST` points at another machine or an emulated daemon.
+///
+/// Returns `None` when the daemon can't be reached. Reporting the CLI's own
+/// architecture instead would register a *confidently wrong* platform, and the
+/// control plane trusts what a node reports — it would schedule on that value
+/// and transfer an image the node cannot execute. An absent architecture is
+/// handled safely (the node is scheduled as unverified) and the agent fills it
+/// in on its first successful heartbeat.
+async fn detect_local_platform() -> Option<String> {
+    let docker = match bollard::Docker::connect_with_defaults() {
+        Ok(docker) => docker,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not connect to Docker ({}). Registering without a container \
+                 platform; the agent reports it once the daemon is reachable.",
+                e
+            );
+            return None;
+        }
+    };
+
+    match docker.info().await {
+        Ok(info) => {
+            let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+            match info.architecture {
+                Some(arch) => Some(temps_deployer::platform::normalize_platform(&os, &arch)),
+                None => {
+                    eprintln!(
+                        "Warning: the Docker daemon reported no architecture. Registering \
+                         without a container platform; the agent reports it later."
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read Docker info ({}). Registering without a container \
+                 platform; the agent reports it once the daemon is reachable.",
+                e
+            );
+            None
+        }
+    }
 }
 
 impl JoinCommand {
@@ -156,20 +277,29 @@ impl JoinCommand {
 
         println!("Joining Temps cluster as '{}'...", node_name);
 
+        // Report the container platform at join time so the control plane can
+        // schedule correctly from the very first deploy, instead of waiting up
+        // to 30s for the first heartbeat to reveal the architecture.
+        let platform = detect_local_platform().await;
+        match platform.as_deref() {
+            Some(platform) => println!("Container platform: {}", platform),
+            None => println!("Container platform: unknown (will be reported by the agent)"),
+        }
+
         if let Some(private_addr) = self.private_address.clone() {
-            self.join_direct(&node_name, &private_addr, &labels).await?;
+            self.join_direct(&node_name, &private_addr, &labels, platform.as_deref())
+                .await?;
         } else {
-            self.join_via_relay(&node_name, &labels).await?;
+            self.join_via_relay(&node_name, &labels, platform.as_deref())
+                .await?;
         }
 
         Ok(())
     }
 
-    /// Save agent config to `~/.temps/agent.json` with restrictive permissions (0600).
+    /// Save agent config to the agent data directory with restrictive permissions (0600).
     fn save_agent_config(&self, config: &temps_agent::AgentConfig) -> anyhow::Result<()> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let temps_dir = home.join(".temps");
+        let temps_dir = crate::commands::agent::agent_data_dir();
         std::fs::create_dir_all(&temps_dir)?;
 
         // Set directory permissions to 0700 (owner only)
@@ -200,7 +330,23 @@ impl JoinCommand {
         node_name: &str,
         private_address: &str,
         labels: &serde_json::Value,
+        platform: Option<&str>,
     ) -> anyhow::Result<()> {
+        // Reject dangerous ranges up front, and normalize to a bare IP: the
+        // "address" field built below appends its own port
+        // (`https://{private_address}:{agent_port}`), and the control plane
+        // does the same when constructing proxy backend addresses from the
+        // stored `nodes.private_address` -- a port-suffixed value here would
+        // corrupt both, independent of the server's own validation.
+        let private_address = temps_deployments::handlers::nodes::validate_node_private_address(
+            private_address.trim(),
+        )
+        .map(|ip| ip.to_string())
+        .map_err(|error| {
+            anyhow::anyhow!("--private-address '{private_address}' is invalid: {error}")
+        })?;
+        let private_address = private_address.as_str();
+
         println!(
             "Using direct mode with private address: {}",
             private_address
@@ -218,21 +364,33 @@ impl JoinCommand {
         // opt-in does NOT apply to CLI binaries on purpose.
         let client = reqwest::Client::builder().build()?;
 
-        let register_url = format!("{}/api/internal/nodes/register", self.target);
+        let register_url = management_api_url(&self.target, "/internal/nodes/register");
 
         // Generate per-node mTLS material; send the CSR so the control plane
         // can sign a leaf for us (ADR-020 WS-2.1). The leaf must be valid for
         // the private address the CP connects to.
-        let tls_material = generate_node_tls_material(node_name, private_address.trim());
+        let tls_material = generate_node_tls_material(node_name, private_address.trim())?;
+        let saved_config = load_saved_agent_config();
+        let prior_token =
+            prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
+
+        let agent_port = agent_listen_port(&self.agent_address);
+        let agent_url_host = socket_authority(private_address, agent_port);
 
         let register_body = serde_json::json!({
             "name": node_name,
             "token": agent_token,
             "join_token": self.token,
-            "address": format!("http://{}:{}", private_address.trim(), self.agent_address.split(':').next_back().unwrap_or("3100").trim()),
+            // Modern joins always carry a CSR and advertise the TLS endpoint.
+            // The control plane may still accept an old CSR-less HTTP worker
+            // during migration, but a newly enrolled worker must never be
+            // persisted as plaintext.
+            "address": format!("https://{}", agent_url_host),
             "private_address": private_address,
             "labels": labels,
-            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
+            "architecture": platform,
+            "csr_pem": tls_material.csr_pem.clone(),
+            "prior_token": prior_token,
         });
 
         let response = client
@@ -258,30 +416,11 @@ impl JoinCommand {
             register_response.id
         );
 
-        // Verify the cluster CA out of band before trusting it (ADR-020 WS-2.2):
-        // if the operator passed the expected fingerprint, the CA the control
-        // plane returned must match it, or a MITM could have swapped its own CA.
-        if let Some(expected) = self.ca_fingerprint.as_deref() {
-            match register_response.ca_cert_pem.as_deref() {
-                Some(ca_pem) => {
-                    let actual = temps_core::node_pki::ca_fingerprint_sha256(ca_pem)
-                        .map_err(|e| anyhow::anyhow!("could not fingerprint received CA: {e}"))?;
-                    if !actual.eq_ignore_ascii_case(expected.trim()) {
-                        anyhow::bail!(
-                            "Cluster CA fingerprint mismatch — expected {expected}, got {actual}. \
-                             Aborting join (possible man-in-the-middle)."
-                        );
-                    }
-                    println!("Cluster CA fingerprint verified.");
-                }
-                None => anyhow::bail!(
-                    "--ca-fingerprint was provided but the control plane returned no CA certificate."
-                ),
-            }
-        }
+        // Verify the cluster CA out of band before trusting it (ADR-020 WS-2.2).
+        self.verify_ca_fingerprint(&register_response)?;
 
         // Persist the signed leaf + cluster CA so `temps agent` can serve mTLS.
-        let tls_paths = persist_tls(&tls_material, &register_response);
+        let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
         let config = temps_agent::AgentConfig {
@@ -295,6 +434,10 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            require_mtls: register_response.mtls_required,
+            underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
+            private_address: Some(private_address.trim().to_string()),
         };
         self.save_agent_config(&config)?;
 
@@ -309,6 +452,7 @@ impl JoinCommand {
         &self,
         node_name: &str,
         labels: &serde_json::Value,
+        platform: Option<&str>,
     ) -> anyhow::Result<()> {
         println!("Using relay mode via {}...", self.relay_url);
 
@@ -359,8 +503,6 @@ impl JoinCommand {
             control_plane_ip: String,
             control_plane_url: String,
             agent_token: String,
-            #[serde(default)]
-            node_id: i32,
         }
 
         let relay_response: RelayJoinResponse = response.json().await?;
@@ -392,9 +534,9 @@ impl JoinCommand {
         // hijack worker registration.
         let register_client = reqwest::Client::builder().build()?;
 
-        let register_url = format!(
-            "{}/api/internal/nodes/register",
-            relay_response.control_plane_url
+        let register_url = management_api_url(
+            &relay_response.control_plane_url,
+            "/internal/nodes/register",
         );
 
         let agent_port = self
@@ -406,18 +548,26 @@ impl JoinCommand {
 
         // Generate per-node mTLS material and send the CSR (ADR-020 WS-2.1).
         // The leaf must be valid for the WG IP the CP connects to.
-        let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip);
+        let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip)?;
+        let saved_config = load_saved_agent_config();
+        let prior_token = prior_token_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            relay_response.control_plane_url.as_str(),
+        );
 
         let register_body = serde_json::json!({
             "name": node_name,
             "token": relay_response.agent_token,
             "join_token": self.token,
-            "address": format!("http://{}:{}", relay_response.assigned_ip, agent_port),
+            "address": format!("https://{}:{}", relay_response.assigned_ip, agent_port),
             "private_address": relay_response.assigned_ip,
             "wg_public_key": keypair.public_key,
             "public_endpoint": public_endpoint,
             "labels": labels,
-            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
+            "architecture": platform,
+            "csr_pem": tls_material.csr_pem.clone(),
+            "prior_token": prior_token,
         });
 
         let response = register_client
@@ -436,24 +586,24 @@ impl JoinCommand {
             );
         }
 
-        // Parse the register response (node_id + signed certs); fall back to the
-        // relay-provided node_id if the body can't be parsed.
-        let register_response: RegisterResponse = match response.json().await {
-            Ok(r) => r,
-            Err(_) => RegisterResponse {
-                id: relay_response.node_id,
-                cert_pem: None,
-                ca_cert_pem: None,
-            },
-        };
+        // The response carries the signed identity and trust root. Treat an
+        // invalid response as a failed enrollment: falling back to the relay's
+        // node ID would silently configure a plaintext agent.
+        let register_response: RegisterResponse = response.json().await.map_err(|error| {
+            anyhow::anyhow!("control plane returned an invalid mTLS enrollment response: {error}")
+        })?;
         let node_id = register_response.id;
+
+        // Pin the CA *before* persisting any of it: `persist_tls` writes the
+        // returned CA to disk and `temps agent` then trusts it for mTLS.
+        self.verify_ca_fingerprint(&register_response)?;
 
         println!(
             "Registered with control plane successfully (node_id={}).",
             node_id
         );
 
-        let tls_paths = persist_tls(&tls_material, &register_response);
+        let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
         let config = temps_agent::AgentConfig {
@@ -467,6 +617,10 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            require_mtls: register_response.mtls_required,
+            underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
+            private_address: Some(relay_response.assigned_ip.clone()),
         };
         self.save_agent_config(&config)?;
 
@@ -474,6 +628,40 @@ impl JoinCommand {
         println!("Run 'temps agent' to start the worker.");
 
         Ok(())
+    }
+
+    /// Check the cluster CA the control plane returned against the
+    /// out-of-band fingerprint the operator passed with `--ca-fingerprint`.
+    ///
+    /// Called from **both** join paths. It used to live inline in
+    /// `join_direct` only, so an operator following the documented enrollment
+    /// flow could run `temps join --ca-fingerprint ...` in the default relay
+    /// mode and still silently persist whatever CA a malicious relay or a
+    /// MITM'd registration endpoint returned — exactly the pinning the flag
+    /// exists to provide. A missing CA is a hard failure too: "no certificate
+    /// returned" must not be quietly treated as "nothing to verify".
+    fn verify_ca_fingerprint(&self, register_response: &RegisterResponse) -> anyhow::Result<()> {
+        let Some(expected) = self.ca_fingerprint.as_deref() else {
+            return Ok(());
+        };
+
+        match register_response.ca_cert_pem.as_deref() {
+            Some(ca_pem) => {
+                let actual = temps_core::node_pki::ca_fingerprint_sha256(ca_pem)
+                    .map_err(|e| anyhow::anyhow!("could not fingerprint received CA: {e}"))?;
+                if !actual.eq_ignore_ascii_case(expected.trim()) {
+                    anyhow::bail!(
+                        "Cluster CA fingerprint mismatch — expected {expected}, got {actual}. \
+                         Aborting join (possible man-in-the-middle)."
+                    );
+                }
+                println!("Cluster CA fingerprint verified.");
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "--ca-fingerprint was provided but the control plane returned no CA certificate."
+            ),
+        }
     }
 
     fn parse_labels(&self) -> serde_json::Value {
@@ -506,9 +694,9 @@ fn gethostname() -> Option<String> {
 
 /// Generate a random authentication token.
 fn generate_token() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
     hex::encode(bytes)
 }
 
@@ -530,4 +718,113 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
     }
 
     Some(format!("{}:{}", public_ip, wg_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{agent_listen_port, prior_token_for_reenrollment, socket_authority};
+
+    #[test]
+    fn agent_listen_port_reads_ipv4_socket_addr() {
+        assert_eq!(agent_listen_port("127.0.0.1:3100"), 3100);
+    }
+
+    #[test]
+    fn agent_listen_port_reads_bracketed_ipv6_socket_addr() {
+        assert_eq!(agent_listen_port("[::1]:8080"), 8080);
+    }
+
+    #[test]
+    fn agent_listen_port_falls_back_when_bracketed_ipv6_has_no_port() {
+        // Regression guard: a naive `.split(':').next_back()` on "[::1]"
+        // (no port) would glue the closing bracket onto the extracted
+        // "port" instead of recognizing there isn't one.
+        assert_eq!(agent_listen_port("[::1]"), 3100);
+    }
+
+    #[test]
+    fn socket_authority_brackets_ipv6() {
+        assert_eq!(socket_authority("fc00::1", 3100), "[fc00::1]:3100");
+    }
+
+    #[test]
+    fn socket_authority_leaves_ipv4_unbracketed() {
+        assert_eq!(socket_authority("10.0.5.20", 3100), "10.0.5.20:3100");
+    }
+
+    fn saved_config() -> temps_agent::AgentConfig {
+        temps_agent::AgentConfig {
+            listen_address: "0.0.0.0:3100".to_string(),
+            token: "existing-agent-token".to_string(),
+            node_name: "worker-1".to_string(),
+            control_plane_url: "https://control.example.com/".to_string(),
+            node_id: 7,
+            labels: serde_json::json!({}),
+            dns_data_dir: std::path::PathBuf::from("/tmp/temps-dns"),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cluster_ca_path: None,
+            require_mtls: false,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: Some("10.100.0.7".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_reenrollment_proves_existing_matching_node_identity() {
+        let saved = saved_config();
+        assert_eq!(
+            prior_token_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
+                .as_deref(),
+            Some("existing-agent-token")
+        );
+    }
+
+    #[test]
+    fn test_reenrollment_never_leaks_token_to_another_identity_or_control_plane() {
+        let saved = saved_config();
+        assert!(prior_token_for_reenrollment(
+            Some(&saved),
+            "another-worker",
+            "https://control.example.com"
+        )
+        .is_none());
+        assert!(prior_token_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://attacker.example.com"
+        )
+        .is_none());
+    }
+
+    /// The registration body must omit the architecture rather than assert
+    /// this binary's. The control plane trusts a reported platform: a wrong
+    /// one is scheduled on and gets an incompatible image transferred, whereas
+    /// an absent one is handled as unverified until the agent reports for real.
+    #[test]
+    fn test_registration_body_omits_an_unknown_platform() {
+        let with_platform = serde_json::json!({
+            "name": "worker-1",
+            "architecture": Some("linux/arm64"),
+        });
+        assert_eq!(with_platform["architecture"], "linux/arm64");
+
+        let unknown: Option<&str> = None;
+        let without_platform = serde_json::json!({
+            "name": "worker-1",
+            "architecture": unknown,
+        });
+        // `null` is what the control plane's `Option<String>` reads as "not
+        // reported", which leaves any stored value untouched.
+        assert!(
+            without_platform["architecture"].is_null(),
+            "unknown platform must not be sent as a value: {without_platform}"
+        );
+        assert_ne!(
+            without_platform["architecture"],
+            serde_json::json!(temps_deployer::platform::native_platform()),
+            "the CLI binary's architecture must never stand in for the daemon's"
+        );
+    }
 }

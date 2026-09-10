@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Read TEMPS_API_KEY without depending on @types/node. The openapi-ts
 // CLI runs in node/bun, so `globalThis.process` is always available here;
 // the cast just keeps the editor's TS service happy.
@@ -9,11 +12,19 @@ export default {
   client: '@hey-api/client-fetch',
   // input: 'https://app.localup.dev/api-docs/openapi.json',
   input: {
-    path: env.TEMPS_OPENAPI_URL ?? 'http://localhost:8080/api/api-docs/openapi.json',
+    path:
+      env.TEMPS_OPENAPI_URL ??
+      'http://localhost:8080/api/api-docs/openapi.json',
     fetch: {
-      headers: env.TEMPS_API_KEY
-        ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
-        : undefined,
+      headers:
+        env.TEMPS_API_KEY || env.TEMPS_API_COOKIE
+          ? {
+              ...(env.TEMPS_API_KEY
+                ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
+                : {}),
+              ...(env.TEMPS_API_COOKIE ? { Cookie: env.TEMPS_API_COOKIE } : {}),
+            }
+          : undefined,
     },
   },
   output: 'src/api/client',
@@ -32,7 +43,7 @@ export default {
         // consumer yet; exclude until real SSE consumption is built and
         // this can be revisited.
         exclude: [
-          'POST /projects/{project_id}/ai/conversations/{public_id}/messages',
+          'POST /projects/{project_id}/ai/structured-output/stream',
           'POST /settings/sandbox-rebuild',
         ],
       },

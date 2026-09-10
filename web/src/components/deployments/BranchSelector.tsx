@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getRepositoryBranchesOptions,
   getPublicBranchesOptions,
@@ -21,7 +24,7 @@ import {
 } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { cn } from '@/lib/utils'
+import { cn, withMinDuration } from '@/lib/utils'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -35,19 +38,12 @@ import {
 } from 'lucide-react'
 import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
-import { Link } from 'react-router-dom'
-
-/** Detect git provider from a git URL */
-function detectProviderFromUrl(gitUrl: string): 'github' | 'gitlab' | null {
-  if (gitUrl.includes('github.com') || gitUrl.includes('github'))
-    return 'github'
-  if (gitUrl.includes('gitlab.com') || gitUrl.includes('gitlab'))
-    return 'gitlab'
-  return null
-}
+import { Link } from 'react-router'
+import { toast } from 'sonner'
+import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 
 /** Normalized branch shape the combobox renders, regardless of source. */
-interface ResolvedBranch {
+export interface ResolvedBranch {
   name: string
   commit_sha?: string
   protected?: boolean
@@ -66,9 +62,15 @@ interface BranchSelectorProps {
   onChange: (branch: string) => void
   onError?: (error: string | null) => void
   onBranchesLoaded?: (branches: string[]) => void
+  onBranchDetailsLoaded?: (branches: ResolvedBranch[]) => void
   disabled?: boolean
   /** Pre-loaded branches (for public repos or when already fetched) */
-  branches?: Array<{ name: string; is_default?: boolean }>
+  branches?: Array<{
+    name: string
+    is_default?: boolean
+    commit_sha?: string
+    protected?: boolean
+  }>
   /** Git URL for public repos without a provider connection */
   gitUrl?: string | null
 }
@@ -82,6 +84,7 @@ export function BranchSelector({
   onChange,
   onError,
   onBranchesLoaded,
+  onBranchDetailsLoaded,
   disabled = false,
   branches: providedBranches,
   gitUrl,
@@ -89,13 +92,16 @@ export function BranchSelector({
   const queryClient = useQueryClient()
 
   // Detect if this is a public repo (no connection but has gitUrl)
-  const publicProvider = useMemo(() => {
+  const publicRepository = useMemo(() => {
     if (connectionId) return null
-    if (gitUrl) return detectProviderFromUrl(gitUrl)
+    if (gitUrl) return parsePublicRepositoryUrl(gitUrl)
     // Default to github if we have owner/name but no connection
-    if (repoOwner && repoName) return 'github' as const
+    if (repoOwner && repoName) {
+      return { provider: 'github' as const, owner: repoOwner, name: repoName }
+    }
     return null
   }, [connectionId, gitUrl, repoOwner, repoName])
+  const publicProvider = publicRepository?.provider ?? null
 
   // Fetch branches from authenticated API (when connectionId exists)
   const branchesQuery = useQuery({
@@ -121,6 +127,7 @@ export function BranchSelector({
         owner: repoOwner,
         repo: repoName,
       },
+      query: { base_url: publicRepository?.instanceUrl },
     }),
     enabled:
       !providedBranches &&
@@ -134,46 +141,67 @@ export function BranchSelector({
   // Merge the two queries
   const effectiveQuery = connectionId ? branchesQuery : publicBranchesQuery
 
-  const handleRefresh = async () => {
-    if (connectionId) {
-      // Refresh authenticated branches
-      const freshData = await queryClient.fetchQuery({
-        ...getRepositoryBranchesOptions({
-          path: {
-            owner: repoOwner,
-            repo: repoName,
-          },
-          query: {
-            connection_id: connectionId,
-            fresh: true,
-          },
-        }),
-      })
+  // The authenticated-branches refresh below fetches a *different* query key
+  // (fresh: true) than the one this component observes (fresh: false), so
+  // `branchesQuery.isFetching` never flips true for it — track it ourselves
+  // so the refresh button actually shows a spinner instead of doing nothing
+  // visible while it's in flight.
+  const [isRefreshing, setIsRefreshing] = useState(false)
 
-      queryClient.setQueryData(
-        getRepositoryBranchesOptions({
-          path: {
-            owner: repoOwner,
-            repo: repoName,
-          },
-          query: {
-            connection_id: connectionId,
-            fresh: false,
-          },
-        }).queryKey,
-        freshData
-      )
-    } else if (publicProvider) {
-      // Refresh public branches
-      await queryClient.invalidateQueries({
-        queryKey: getPublicBranchesOptions({
-          path: {
-            provider: publicProvider,
-            owner: repoOwner,
-            repo: repoName,
-          },
-        }).queryKey,
+  const handleRefresh = async () => {
+    setIsRefreshing(true)
+    try {
+      await withMinDuration(async () => {
+        if (connectionId) {
+          // Refresh authenticated branches
+          const freshData = await queryClient.fetchQuery({
+            ...getRepositoryBranchesOptions({
+              path: {
+                owner: repoOwner,
+                repo: repoName,
+              },
+              query: {
+                connection_id: connectionId,
+                fresh: true,
+              },
+            }),
+          })
+
+          queryClient.setQueryData(
+            getRepositoryBranchesOptions({
+              path: {
+                owner: repoOwner,
+                repo: repoName,
+              },
+              query: {
+                connection_id: connectionId,
+                fresh: false,
+              },
+            }).queryKey,
+            freshData
+          )
+        } else if (publicProvider) {
+          // Refresh public branches
+          await queryClient.invalidateQueries({
+            queryKey: getPublicBranchesOptions({
+              path: {
+                provider: publicProvider,
+                owner: repoOwner,
+                repo: repoName,
+              },
+              query: { base_url: publicRepository?.instanceUrl },
+            }).queryKey,
+          })
+        }
       })
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? `Failed to refresh branches: ${error.message}`
+          : 'Failed to refresh branches'
+      )
+    } finally {
+      setIsRefreshing(false)
     }
   }
 
@@ -183,12 +211,17 @@ export function BranchSelector({
     [branchesQuery.error]
   )
 
-  // The repo's default branch — prefer the explicit prop, fall back to an
-  // `is_default` flag on pre-loaded branches.
+  // The repo's default branch. The live `is_default` marker on fetched
+  // branches is authoritative (it reflects the provider's current default,
+  // e.g. after a `master` -> `main` rename); the `defaultBranch` prop is
+  // often sourced from stored repository metadata that can lag behind, so
+  // it's only a fallback for before that data has loaded.
   const effectiveDefaultName = useMemo(() => {
-    if (defaultBranch) return defaultBranch
-    return providedBranches?.find((b) => b.is_default)?.name
-  }, [defaultBranch, providedBranches])
+    const liveDefault =
+      effectiveQuery.data?.branches.find((b) => b.is_default)?.name ??
+      providedBranches?.find((b) => b.is_default)?.name
+    return liveDefault ?? defaultBranch
+  }, [defaultBranch, providedBranches, effectiveQuery.data])
 
   // Sort branches: default first, then common main branches, then alphabetical.
   const sortedBranches = useMemo<ResolvedBranch[]>(() => {
@@ -238,9 +271,9 @@ export function BranchSelector({
 
   // Notify parent when branches are loaded
   useEffect(() => {
-    if (sortedBranches.length > 0 && onBranchesLoaded) {
-      onBranchesLoaded(sortedBranches.map((b) => b.name))
-    }
+    if (sortedBranches.length === 0) return
+    onBranchesLoaded?.(sortedBranches.map((b) => b.name))
+    onBranchDetailsLoaded?.(sortedBranches)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sortedBranches])
 
@@ -325,11 +358,14 @@ export function BranchSelector({
         size="icon"
         className="shrink-0"
         onClick={handleRefresh}
-        disabled={effectiveQuery.isFetching || disabled}
+        disabled={effectiveQuery.isFetching || isRefreshing || disabled}
         title="Refresh branches"
       >
         <RefreshCw
-          className={cn('h-4 w-4', effectiveQuery.isFetching && 'animate-spin')}
+          className={cn(
+            'h-4 w-4',
+            (effectiveQuery.isFetching || isRefreshing) && 'animate-spin'
+          )}
         />
       </Button>
     </div>
@@ -406,6 +442,9 @@ function BranchCombobox({
   const firstItemValue =
     (pinned[0] ?? rest[0])?.name ?? (showCustom ? customValue : '')
   useEffect(() => {
+    // cmdk keeps its own active-item state; synchronize it when our manually
+    // ranked result head changes so Enter follows the visible highlight.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveValue(firstItemValue)
   }, [firstItemValue])
 

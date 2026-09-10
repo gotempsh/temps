@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-backup-core"
 version.workspace = true
@@ -31,5 +34,6 @@ futures = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true, features = ["mock"] }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

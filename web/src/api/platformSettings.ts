@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getSettings, updateSettings } from '@/api/client'
 import type {
+  AppSettings,
   AppSettingsResponse,
   LetsEncryptSettings,
   ScreenshotSettings,
@@ -78,6 +82,7 @@ export interface AgentSandboxSettings {
   cpu_limit: number
   memory_limit_mb: number
   network_mode: string
+  sandbox_backend?: string
 }
 
 export interface PreviewGatewaySettings {
@@ -123,6 +128,24 @@ export interface MonitoringSettings {
   clickhouse_url?: string | null
 }
 
+export interface ObservabilityCompressionSettings {
+  /** Compress immutable proxy-log chunks after this many hours. */
+  proxy_logs_after_hours: number
+  /** Compress immutable OpenTelemetry span chunks after this many hours. */
+  otel_spans_after_hours: number
+}
+
+export interface ObservabilityRetentionSettings {
+  /** Raw proxy request-log retention in days. */
+  proxy_logs_days: number
+  /** OpenTelemetry span/trace retention in days. */
+  otel_spans_days: number
+  /** OpenTelemetry log-event retention in days. */
+  otel_logs_days: number
+  /** OpenTelemetry metric-point retention in days. */
+  otel_metrics_days: number
+}
+
 /** Per-managed-domain hostname layout (configured under DNS providers, not here). */
 export type PublicHostnameStrategy = 'standard' | 'flat'
 
@@ -140,8 +163,13 @@ export interface PlatformSettings extends AppSettingsResponse {
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
-  attack_mode?: boolean
   build_limits: BuildLimitsSettings
+  /** Enabled, running services included in the metrics scrape cycle. */
+  monitored_services_count: number | null
+  observability_compression: ObservabilityCompressionSettings
+  observability_retention: ObservabilityRetentionSettings
+  /** Effective backend for proxy logs and OTel spans. */
+  effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
    * The web onboarding wizard checks this and skips itself when true. */
   setup_complete: boolean
@@ -167,8 +195,8 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
     throw new Error('Settings endpoint returned no data')
   }
 
-  // Cast to include extended fields not yet present in generated OpenAPI types.
-  // The server contract guarantees these are populated.
+  // OpenAPI represents Rust `Option<T>` response fields as optional, while the
+  // settings handler serializes this complete response object on every read.
   return response.data as PlatformSettings
 }
 
@@ -185,24 +213,7 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const body: any = {
-    dns_provider: updated.dns_provider,
-    external_url: updated.external_url,
-    internal_url: updated.internal_url,
-    letsencrypt: updated.letsencrypt,
-    preview_domain: updated.preview_domain,
-    edge_target: updated.edge_target,
-    screenshots: updated.screenshots,
-    security_headers: updated.security_headers,
-    rate_limiting: updated.rate_limiting,
-    disk_space_alert: updated.disk_space_alert,
-    agent_sandbox: updated.agent_sandbox,
-    ai_config: updated.ai_config,
-    attack_mode: updated.attack_mode,
-    build_limits: updated.build_limits,
-    monitoring: updated.monitoring,
-  }
+  const body = buildPlatformSettingsUpdateBody(updated)
   const result = await updateSettings({ body })
   if (result.error) {
     // The generated client resolves (rather than throws) on non-2xx
@@ -214,9 +225,74 @@ export async function updatePlatformSettings(
     throw new Error(detail)
   }
 
-  // The PATCH endpoint returns only an ack message, so we hand back our
+  // The PUT endpoint returns only an ack message, so we hand back our
   // merged view. Callers that need the absolute server state should refetch.
   return updated
+}
+
+export function buildPlatformSettingsUpdateBody(
+  updated: PlatformSettings
+): AppSettings {
+  return {
+    dns_provider: updated.dns_provider,
+    external_url: updated.external_url,
+    internal_url: updated.internal_url,
+    letsencrypt: updated.letsencrypt,
+    preview_domain: updated.preview_domain,
+    edge_target: updated.edge_target,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting this would silently reset the console's HTTPS policy back to
+    // "automatic" whenever any other settings page is saved.
+    console_force_https: updated.console_force_https,
+    screenshots: updated.screenshots,
+    security_headers: updated.security_headers,
+    rate_limiting: updated.rate_limiting,
+    // The settings endpoint replaces the full AppSettings document. Omitting
+    // this field makes serde restore DockerRegistrySettings::default(), so a
+    // successful save immediately clears the registry configuration.
+    docker_registry: updated.docker_registry,
+    // Same reasoning: omitting this would silently clear the configured
+    // registry-mirror prefix on every unrelated settings save.
+    registry_mirror_prefix: updated.registry_mirror_prefix,
+    disk_space_alert: updated.disk_space_alert,
+    // The response replaces encrypted provider credentials with masked status
+    // fields. The server restores those omitted secrets from storage on PUT.
+    agent_sandbox:
+      updated.agent_sandbox as unknown as AppSettings['agent_sandbox'],
+    ai_config: updated.ai_config,
+    build_limits: updated.build_limits,
+    ai_chat_limits: updated.ai_chat_limits,
+    ai_workspace_file_limits: updated.ai_workspace_file_limits,
+    request_timeouts: updated.request_timeouts,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting these would silently reset the operator's connection cap and
+    // override ceilings to "unlimited" on every unrelated settings save.
+    connection_limits: updated.connection_limits,
+    tenant_resource_ceilings: updated.tenant_resource_ceilings,
+    monitoring: updated.monitoring,
+    observability_compression: updated.observability_compression,
+    observability_retention: updated.observability_retention,
+    // Must be sent on every save: the server deserializes `AppSettings` with
+    // `#[serde(default)]`, so omitting this field would silently re-enable
+    // console updates whenever any other settings page is saved.
+    self_update: updated.self_update,
+    // Same reasoning: omitting this would silently reset cluster DNS back to
+    // disabled on every unrelated settings save.
+    cluster_dns: updated.cluster_dns,
+    // Same reasoning, and the one block with real money attached: omitting
+    // this would reset the Cloud destination and outbox ceiling (ADR-041) and
+    // both bulk-activation spend guards (ADR-042) to their build-time defaults
+    // on every unrelated settings save. `updated` is the server's own GET
+    // response merged with the caller's patch, so this is the stored `cloud`
+    // block round-tripped, not form state — there is no UI control for these
+    // fields yet, and this send path must not depend on one appearing.
+    // The server also preserves unsent `cloud` fields, but a client that knows
+    // the values should not rely on that.
+    cloud: updated.cloud,
+    // Same reasoning: omitting this would silently disable the MCP server on
+    // every unrelated settings save.
+    mcp_server: updated.mcp_server,
+  }
 }
 
 /**

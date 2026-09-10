@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   changePasswordSelfMutation,
   disableMfaMutation,
@@ -35,16 +38,23 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2 } from 'lucide-react'
+import { Check, Loader2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
 import { useAuth } from '@/contexts/AuthContext'
+import { cn } from '@/lib/utils'
+import {
+  PASSWORD_REQUIREMENTS,
+  passwordRequirementResults,
+  passwordSchema as passwordPolicySchema,
+} from '@/lib/password-policy'
 
 const formSchema = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters'),
@@ -60,16 +70,14 @@ type FormValues = z.infer<typeof formSchema>
 const passwordSchema = z
   .object({
     current_password: z.string().min(1, 'Current password is required'),
-    new_password: z
-      .string()
-      .min(8, 'Password must be at least 8 characters'),
+    new_password: passwordPolicySchema,
     confirm_password: z.string().min(1, 'Please confirm your new password'),
     mfa_code: z
       .string()
       .optional()
       .refine(
         (v) => !v || /^\d{6}$/.test(v) || v.length >= 8,
-        'Enter a 6-digit TOTP code or a recovery code',
+        'Enter a 6-digit TOTP code or a recovery code'
       ),
     revoke_other_sessions: z.boolean(),
   })
@@ -96,6 +104,15 @@ const mfaDisableSchema = z.object({
 
 type MfaDisableValues = z.infer<typeof mfaDisableSchema>
 
+// Current-password confirmation gate for MFA enrollment.
+// Accounts with no password set (SSO-only) may leave this blank;
+// the server skips the check for those accounts.
+const mfaSetupPasswordSchema = z.object({
+  current_password: z.string().optional(),
+})
+
+type MfaSetupPasswordValues = z.infer<typeof mfaSetupPasswordSchema>
+
 export function Account() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
@@ -104,11 +121,14 @@ export function Account() {
     ...getCurrentUserOptions(),
   })
   const { refetch } = useAuth()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [showMfaDialog, setShowMfaDialog] = useState(false)
   const [mfaSetupData, setMfaSetupData] = useState<MfaSetupResponse | null>(
     null
   )
   const [showDisableMfaDialog, setShowDisableMfaDialog] = useState(false)
+  const [showMfaPasswordDialog, setShowMfaPasswordDialog] = useState(false)
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -132,6 +152,17 @@ export function Account() {
       toast.success('Account updated successfully')
       refetch()
     },
+    onError: (error, variables) => {
+      // Only email changes are step-up gated server-side, but it's safe to
+      // intercept unconditionally — this only fires on an actual 428.
+      if (handleSensitiveActionError(error, () => updateUser(variables))) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to update account'
+      )
+    },
   })
 
   // Change-password form. Server requires current_password as the re-auth
@@ -149,17 +180,21 @@ export function Account() {
       revoke_other_sessions: false,
     },
   })
+  const newPassword = passwordForm.watch('new_password')
+  const requirementResults = passwordRequirementResults(newPassword)
 
-  const { mutate: changePassword, isPending: isChangingPassword } = useMutation({
-    ...changePasswordSelfMutation(),
-    meta: {
-      errorTitle: 'Failed to change password',
-    },
-    onSuccess: () => {
-      toast.success('Password changed successfully')
-      passwordForm.reset()
-    },
-  })
+  const { mutate: changePassword, isPending: isChangingPassword } = useMutation(
+    {
+      ...changePasswordSelfMutation(),
+      meta: {
+        errorTitle: 'Failed to change password',
+      },
+      onSuccess: () => {
+        toast.success('Password changed successfully')
+        passwordForm.reset()
+      },
+    }
+  )
 
   const mfaForm = useForm<MfaVerifyValues>({
     resolver: zodResolver(mfaVerifySchema),
@@ -175,9 +210,19 @@ export function Account() {
     },
     onSuccess: (data) => {
       setMfaSetupData(data)
+      setShowMfaPasswordDialog(false)
+      mfaSetupPasswordForm.reset()
       setShowMfaDialog(true)
     },
   })
+
+  const onStartMfaSetup = (data: MfaSetupPasswordValues) => {
+    setupMfa({
+      body: {
+        current_password: data.current_password || null,
+      },
+    })
+  }
 
   const { mutate: verifyMfa, isPending: isVerifyingMfa } = useMutation({
     ...verifyAndEnableMfaMutation(),
@@ -195,6 +240,13 @@ export function Account() {
     resolver: zodResolver(mfaDisableSchema),
     defaultValues: {
       code: '',
+    },
+  })
+
+  const mfaSetupPasswordForm = useForm<MfaSetupPasswordValues>({
+    resolver: zodResolver(mfaSetupPasswordSchema),
+    defaultValues: {
+      current_password: '',
     },
   })
 
@@ -258,6 +310,7 @@ export function Account() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
+      {verificationDialog}
       <Card>
         <CardHeader>
           <CardTitle>Account Settings</CardTitle>
@@ -300,7 +353,9 @@ export function Account() {
                 <div className="space-y-2">
                   <FormLabel>Role</FormLabel>
                   <div className="flex items-center gap-2">
-                    <Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>
+                    <Badge
+                      variant={user.role === 'admin' ? 'default' : 'secondary'}
+                    >
                       {user.role}
                     </Badge>
                     <span className="text-xs text-muted-foreground">
@@ -349,6 +404,7 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="current-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
@@ -366,10 +422,38 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="new-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
                     <FormMessage />
+                    <ul
+                      role="list"
+                      className="grid gap-1.5 pt-2 sm:grid-cols-2"
+                    >
+                      {PASSWORD_REQUIREMENTS.map((requirement, index) => {
+                        const met =
+                          requirementResults[index]?.met ?? false
+                        return (
+                          <li
+                            key={requirement.id}
+                            className={cn(
+                              'flex items-center gap-1.5 text-xs transition-colors',
+                              met
+                                ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                : 'text-rose-500 font-medium'
+                            )}
+                          >
+                            {met ? (
+                              <Check className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
+                            ) : (
+                              <X className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
+                            )}
+                            <span>{requirement.label}</span>
+                          </li>
+                        )
+                      })}
+                    </ul>
                   </FormItem>
                 )}
               />
@@ -383,6 +467,7 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="new-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
@@ -402,6 +487,7 @@ export function Account() {
                           inputMode="numeric"
                           autoComplete="one-time-code"
                           placeholder="6-digit TOTP or recovery code"
+                          disabled={isChangingPassword}
                           {...field}
                         />
                       </FormControl>
@@ -419,6 +505,7 @@ export function Account() {
                       <Checkbox
                         checked={field.value}
                         onCheckedChange={field.onChange}
+                        disabled={isChangingPassword}
                       />
                     </FormControl>
                     <div className="space-y-0.5 leading-none">
@@ -475,7 +562,10 @@ export function Account() {
               </Button>
             </div>
           ) : (
-            <Button onClick={() => setupMfa({})} disabled={isSettingUpMfa}>
+            <Button
+              onClick={() => setShowMfaPasswordDialog(true)}
+              disabled={isSettingUpMfa}
+            >
               {isSettingUpMfa && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
@@ -484,6 +574,71 @@ export function Account() {
           )}
         </CardContent>
       </Card>
+
+      {/* Current-password confirmation before generating a new MFA secret.
+          SSO-only accounts (no local password) may leave the field empty;
+          the server skips the check when no password hash is set. */}
+      <Dialog
+        open={showMfaPasswordDialog}
+        onOpenChange={(open) => {
+          setShowMfaPasswordDialog(open)
+          if (!open) mfaSetupPasswordForm.reset()
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Identity to Setup 2FA</DialogTitle>
+            <DialogDescription>
+              Enter your current password to begin two-factor authentication
+              setup. If your account uses SSO and has no local password, leave
+              this field empty.
+            </DialogDescription>
+          </DialogHeader>
+          <Form {...mfaSetupPasswordForm}>
+            <form
+              onSubmit={mfaSetupPasswordForm.handleSubmit(onStartMfaSetup)}
+              className="space-y-4"
+            >
+              <FormField
+                control={mfaSetupPasswordForm.control}
+                name="current_password"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Current Password</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="password"
+                        placeholder="Enter current password"
+                        autoComplete="current-password"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setShowMfaPasswordDialog(false)
+                    mfaSetupPasswordForm.reset()
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={isSettingUpMfa}>
+                  {isSettingUpMfa && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Continue
+                </Button>
+              </div>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={showMfaDialog} onOpenChange={setShowMfaDialog}>
         <DialogContent>
@@ -511,6 +666,25 @@ export function Account() {
                 {mfaSetupData?.secret_key}
               </code>
             </div>
+            {mfaSetupData?.recovery_codes?.length ? (
+              <div className="space-y-2 text-sm">
+                <div className="font-medium">Recovery codes</div>
+                <p className="text-muted-foreground">
+                  Save these somewhere secure before enabling MFA. Each code can
+                  be used once.
+                </p>
+                <div className="grid grid-cols-2 gap-2 rounded-md bg-muted p-3 font-mono">
+                  {mfaSetupData.recovery_codes.map((code) => (
+                    <code key={code}>{code}</code>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-destructive">
+                Recovery codes could not be prepared. Close this dialog and
+                restart MFA setup.
+              </p>
+            )}
             <Form {...mfaForm}>
               <form
                 onSubmit={mfaForm.handleSubmit(onVerifyMfa)}
@@ -530,7 +704,12 @@ export function Account() {
                   )}
                 />
                 <div className="flex justify-end">
-                  <Button type="submit" disabled={isVerifyingMfa}>
+                  <Button
+                    type="submit"
+                    disabled={
+                      isVerifyingMfa || !mfaSetupData?.recovery_codes?.length
+                    }
+                  >
                     {isVerifyingMfa && (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     )}

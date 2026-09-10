@@ -1,11 +1,15 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState } from 'react'
 import { RepositoryList } from './RepositoryList'
 import { RepositoryResponse } from '@/api/client'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { GitBranch, Check, X } from 'lucide-react'
+import { Check, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { RepositoryAvatar } from './RepositoryAvatar'
 
 interface RepositorySelectorProps {
   connectionId: number
@@ -15,6 +19,9 @@ interface RepositorySelectorProps {
   description?: string
   className?: string
   showAsCard?: boolean
+  compactMode?: boolean
+  itemsPerPage?: number
+  providerType?: string | null
 }
 
 export function RepositorySelector({
@@ -25,21 +32,26 @@ export function RepositorySelector({
   description,
   className,
   showAsCard = true,
+  compactMode = false,
+  itemsPerPage = 12,
+  providerType,
 }: RepositorySelectorProps) {
-  const [isSelecting, setIsSelecting] = useState(!selectedRepository)
+  const [forceSelecting, setForceSelecting] = useState(false)
+  const isSelecting = forceSelecting || !selectedRepository
 
   const handleRepositorySelect = (repo: RepositoryResponse) => {
     onSelect(repo)
-    setIsSelecting(false)
+    setForceSelecting(false)
   }
 
   const handleClearSelection = () => {
     onSelect(null)
-    setIsSelecting(true)
+    setForceSelecting(true)
   }
 
   const handleChangeSelection = () => {
-    setIsSelecting(true)
+    onSelect(null)
+    setForceSelecting(true)
   }
 
   if (isSelecting) {
@@ -57,9 +69,10 @@ export function RepositorySelector({
               connectionId={connectionId}
               onRepositorySelect={handleRepositorySelect}
               showSelection={false}
-              itemsPerPage={12}
+              itemsPerPage={itemsPerPage}
               showHeader={true}
-              compactMode={false}
+              compactMode={compactMode}
+              providerType={providerType}
             />
           </CardContent>
         </Card>
@@ -72,9 +85,10 @@ export function RepositorySelector({
           connectionId={connectionId}
           onRepositorySelect={handleRepositorySelect}
           showSelection={false}
-          itemsPerPage={12}
+          itemsPerPage={itemsPerPage}
           showHeader={true}
-          compactMode={false}
+          compactMode={compactMode}
+          providerType={providerType}
         />
       </div>
     )
@@ -92,10 +106,15 @@ export function RepositorySelector({
         </div>
       )}
 
-      <div className="flex items-center justify-between p-4 border rounded-lg bg-primary/5 border-primary">
-        <div className="flex items-center gap-3">
-          <GitBranch className="h-5 w-5 text-muted-foreground" />
-          <div>
+      <div className="flex items-center justify-between rounded-lg border border-primary bg-primary/5 p-3">
+        <div className="flex min-w-0 items-center gap-3">
+          {selectedRepository && (
+            <RepositoryAvatar
+              repository={selectedRepository}
+              providerType={providerType}
+            />
+          )}
+          <div className="min-w-0">
             <div className="font-medium">
               {selectedRepository?.owner}/{selectedRepository?.name}
             </div>

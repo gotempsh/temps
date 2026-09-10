@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Capture Source Maps Job
 //!
 //! Extracts source map files (.map) from the built Docker image and uploads them
@@ -10,8 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::ImageBuilder;
-use temps_error_tracking::services::SourceMapService;
+use temps_error_tracking::services::{SourceMapService, MAX_SOURCE_MAP_BYTES};
 use temps_logs::{LogLevel, LogService};
+use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use crate::jobs::ImageOutput;
@@ -22,6 +27,68 @@ pub struct CaptureSourceMapsOutput {
     pub source_maps_captured: u32,
     pub total_size_bytes: u64,
     pub release: String,
+}
+
+#[derive(Debug, Error)]
+enum SourceMapFileReadError {
+    #[error("Failed to {operation} source map '{path}': {source}")]
+    Io {
+        path: String,
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Source map '{path}' is {size_bytes} bytes, exceeding the {limit_bytes} byte limit")]
+    TooLarge {
+        path: String,
+        size_bytes: u64,
+        limit_bytes: usize,
+    },
+}
+
+async fn read_source_map_bounded(path: &Path) -> Result<Vec<u8>, SourceMapFileReadError> {
+    let path_display = path.display().to_string();
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| SourceMapFileReadError::Io {
+            path: path_display.clone(),
+            operation: "open",
+            source,
+        })?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|source| SourceMapFileReadError::Io {
+            path: path_display.clone(),
+            operation: "inspect",
+            source,
+        })?;
+    if metadata.len() > MAX_SOURCE_MAP_BYTES as u64 {
+        return Err(SourceMapFileReadError::TooLarge {
+            path: path_display,
+            size_bytes: metadata.len(),
+            limit_bytes: MAX_SOURCE_MAP_BYTES,
+        });
+    }
+
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    let mut bounded_file = file.take(MAX_SOURCE_MAP_BYTES as u64 + 1);
+    bounded_file
+        .read_to_end(&mut data)
+        .await
+        .map_err(|source| SourceMapFileReadError::Io {
+            path: path.display().to_string(),
+            operation: "read",
+            source,
+        })?;
+    if data.len() > MAX_SOURCE_MAP_BYTES {
+        return Err(SourceMapFileReadError::TooLarge {
+            path: path.display().to_string(),
+            size_bytes: data.len() as u64,
+            limit_bytes: MAX_SOURCE_MAP_BYTES,
+        });
+    }
+    Ok(data)
 }
 
 /// Job that extracts source maps from the built image and stores them
@@ -218,19 +285,29 @@ impl WorkflowTask for CaptureSourceMapsJob {
                     search_path.trim_start_matches('/')
                 )
             };
-            // Create temporary directory for extraction
-            let temp_dir =
-                std::env::temp_dir().join(format!("temps-sourcemaps-{}", uuid::Uuid::new_v4()));
+            // Acquire first so reverse drop order removes the private
+            // directory before releasing capacity to another extraction.
+            let _extraction_permit = super::acquire_archive_extraction_permit().await?;
 
-            if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-                warn!(
-                    "Failed to create temp directory for source map extraction: {}",
-                    e
-                );
-                self.log(format!("⚠️ Failed to create temp directory: {}", e))
+            // Source maps are private artifacts. Keep their extraction in an
+            // owner-only RAII directory that is removed on every exit path.
+            let temp_dir = match tempfile::Builder::new()
+                .prefix("temps-sourcemaps-")
+                .tempdir()
+            {
+                Ok(temp_dir) => temp_dir,
+                Err(error) => {
+                    warn!(
+                        "Failed to create secure temp directory for source map extraction: {}",
+                        error
+                    );
+                    self.log(format!(
+                        "⚠️ Failed to create secure temp directory: {error}"
+                    ))
                     .await?;
-                continue;
-            }
+                    continue;
+                }
+            };
 
             // Extract files from the container image
             self.log(format!(
@@ -239,16 +316,16 @@ impl WorkflowTask for CaptureSourceMapsJob {
             ))
             .await?;
 
-            match self
+            let extraction_result = self
                 .image_builder
-                .extract_from_image(image_tag, &absolute_search_path, &temp_dir)
-                .await
-            {
+                .extract_from_image(image_tag, &absolute_search_path, temp_dir.path())
+                .await;
+            match extraction_result {
                 Ok(()) => {
                     debug!(
                         "Extracted files from {} to {}",
                         absolute_search_path,
-                        temp_dir.display()
+                        temp_dir.path().display()
                     );
                 }
                 Err(e) => {
@@ -262,15 +339,12 @@ impl WorkflowTask for CaptureSourceMapsJob {
                         absolute_search_path, e
                     ))
                     .await?;
-
-                    // Clean up temp dir
-                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                     continue;
                 }
             }
 
             // Find all .map files
-            let map_files = self.find_source_maps(&temp_dir).await;
+            let map_files = self.find_source_maps(temp_dir.path()).await;
 
             if map_files.is_empty() {
                 self.log(format!(
@@ -278,7 +352,6 @@ impl WorkflowTask for CaptureSourceMapsJob {
                     absolute_search_path
                 ))
                 .await?;
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 continue;
             }
 
@@ -292,7 +365,7 @@ impl WorkflowTask for CaptureSourceMapsJob {
             // Upload each source map
             for map_path in &map_files {
                 // Compute the file path relative to the search path
-                let relative_path = map_path.strip_prefix(&temp_dir).unwrap_or(map_path);
+                let relative_path = map_path.strip_prefix(temp_dir.path()).unwrap_or(map_path);
 
                 // Build the ~ prefixed path for storage
                 // search_path is relative (e.g., ".next/static") and gets path rewrites applied
@@ -320,7 +393,7 @@ impl WorkflowTask for CaptureSourceMapsJob {
                     .unwrap_or(&file_path)
                     .to_string();
 
-                let source_map_data = match tokio::fs::read(map_path).await {
+                let source_map_data = match read_source_map_bounded(map_path).await {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
@@ -360,11 +433,6 @@ impl WorkflowTask for CaptureSourceMapsJob {
                             .await?;
                     }
                 }
-            }
-
-            // Clean up temp directory
-            if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
-                warn!("Failed to clean up temp directory: {}", e);
             }
         }
 
@@ -424,6 +492,48 @@ impl WorkflowTask for CaptureSourceMapsJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_sparse_source_map_is_rejected_before_reading() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let map_path = temp_dir.path().join("private.js.map");
+        let file = tokio::fs::File::create(&map_path)
+            .await
+            .expect("create sparse source map");
+        file.set_len(MAX_SOURCE_MAP_BYTES as u64 + 1)
+            .await
+            .expect("set sparse source map length");
+
+        let error = read_source_map_bounded(&map_path)
+            .await
+            .expect_err("oversized source map must be rejected from metadata");
+        assert!(matches!(
+            error,
+            SourceMapFileReadError::TooLarge {
+                size_bytes,
+                limit_bytes: MAX_SOURCE_MAP_BYTES,
+                ..
+            } if size_bytes == MAX_SOURCE_MAP_BYTES as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn private_source_map_temp_directory_is_removed_on_scope_exit() {
+        let extraction_path;
+        {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("temps-sourcemaps-test-")
+                .tempdir()
+                .expect("create private extraction directory");
+            extraction_path = temp_dir.path().to_path_buf();
+            std::fs::write(
+                temp_dir.path().join("private.js.map"),
+                b"private source map",
+            )
+            .expect("write private test artifact");
+        }
+        assert!(!extraction_path.exists());
+    }
 
     #[test]
     fn test_detect_log_level() {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { createClient, createConfig } from './client/client';
 import type { Client } from './client/client';
 import * as sdk from './client/sdk.gen';
@@ -5,6 +8,11 @@ import * as sdk from './client/sdk.gen';
 export * from './client/types.gen';
 export * from './client/sdk.gen';
 export * as ErrorTracking from './errors';
+
+// Feature flags. Lives in this package rather than a separate one: it shares
+// the deployment-token bootstrap and would otherwise duplicate it.
+export * as Flags from './flags';
+export { FlagsClient, flags } from './flags';
 
 export interface TempsClientConfig {
   baseUrl: string;
@@ -453,6 +461,15 @@ class Email {
   verifyDomain = (options: Parameters<typeof sdk.verifyDomain>[0]) =>
     sdk.verifyDomain({ ...options, client: this.client });
 
+  listAuthorizedProjects = (options: Parameters<typeof sdk.listEmailDomainProjects>[0]) =>
+    sdk.listEmailDomainProjects({ ...options, client: this.client });
+
+  authorizeProject = (options: Parameters<typeof sdk.authorizeEmailDomainProject>[0]) =>
+    sdk.authorizeEmailDomainProject({ ...options, client: this.client });
+
+  revokeProject = (options: Parameters<typeof sdk.revokeEmailDomainProject>[0]) =>
+    sdk.revokeEmailDomainProject({ ...options, client: this.client });
+
   // Emails
   send = (options: Parameters<typeof sdk.sendEmail>[0]) =>
     sdk.sendEmail({ ...options, client: this.client });
@@ -839,6 +856,15 @@ class Projects {
 
   updateSettings = (options: Parameters<typeof sdk.updateProjectSettings>[0]) =>
     sdk.updateProjectSettings({ ...options, client: this.client });
+
+  getServiceTemplate = (options: Parameters<typeof sdk.getProjectServiceTemplate>[0]) =>
+    sdk.getProjectServiceTemplate({ ...options, client: this.client });
+
+  updateServiceRuntime = (options: Parameters<typeof sdk.updateServiceTemplateRuntime>[0]) =>
+    sdk.updateServiceTemplateRuntime({ ...options, client: this.client });
+
+  upgradeServiceTemplate = (options: Parameters<typeof sdk.upgradeProjectServiceTemplate>[0]) =>
+    sdk.upgradeProjectServiceTemplate({ ...options, client: this.client });
 
   // Deployments
   getDeployments = (options: Parameters<typeof sdk.getProjectDeployments>[0]) =>

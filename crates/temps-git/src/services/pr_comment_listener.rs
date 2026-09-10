@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Background listener that turns deployment lifecycle events into
 //! sticky PR/MR preview comments.
 //!

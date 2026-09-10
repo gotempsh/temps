@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for ADR-026 per-series ("dynamic") metric alerting, driving
 //! the real fire -> resolve loop against a Docker-backed TimescaleDB.
 //!
@@ -168,6 +171,8 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     };
@@ -184,6 +189,7 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         storage.clone(),
         auth_service,
         rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
     ));
     let alert_service = Arc::new(MetricAlertService::new(db.clone()));
 
@@ -603,6 +609,8 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     }
@@ -674,6 +682,14 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         ctx.db.clone(),
         Arc::new(TimescaleDbStorage::new(ctx.db.clone(), None)),
     ));
+    let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::new(),
+    ));
+    let facet_service = Arc::new(temps_otel::services::FacetService::new(
+        ctx.db.clone(),
+        None,
+        facet_cache,
+    ));
     let app_state = OtelAppState {
         otel_service: ctx.otel_service.clone(),
         metrics_store: None,
@@ -684,7 +700,27 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        otel_relay_tx: None,
         project_access_checker: None,
+        facet_service,
+        cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
+            ctx.db.clone(),
+        )),
+        // ADR-041: no Cloud link here, so every project resolves to `local` and
+        // span reads go to the local store — the deployment shape this test is
+        // asserting.
+        telemetry_write_modes: Arc::new(temps_otel::services::TelemetryWriteModeService::new(
+            ctx.db.clone(),
+        )),
+        cloud_link: None,
+        // ADR-042: the activation service is always present so the endpoints
+        // can answer "no job is running" on an instance that never linked
+        // Cloud; the span source and worker are the parts that need a link.
+        bulk_activation: Arc::new(temps_otel::services::CloudBulkActivationService::new(
+            ctx.db.clone(),
+        )),
+        cloud_backfill_source: None,
+        plan_signing_key: Arc::new([0u8; 32]),
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

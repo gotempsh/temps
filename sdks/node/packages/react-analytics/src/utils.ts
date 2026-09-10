@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 "use client";
 export {
   getRequestId,
@@ -5,4 +8,6 @@ export {
   isTestEnvironment,
   sendAnalytics,
   sendAnalyticsReliable,
+  ingestKeyHeaders,
+  withIngestKey,
 } from "@temps-sdk/analytics-core";

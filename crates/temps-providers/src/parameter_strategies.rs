@@ -1,4 +1,11 @@
-use crate::externalsvc::{mariadb::MariaDbSizeProfile, ServiceResourceLimits};
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use crate::externalsvc::{
+    mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
+    rustfs::DEFAULT_RUSTFS_IMAGE,
+    ServiceResourceLimits,
+};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 
@@ -247,6 +254,34 @@ fn reject_internal_only_keys(
     Ok(())
 }
 
+fn reject_non_loopback_host(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    let Some(host) = params.get("host").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(format!(
+        "'host' must target the managed service on loopback, got '{host}'"
+    ))
+}
+
+fn reject_known_cross_engine_image(
+    params: &HashMap<String, JsonValue>,
+    incompatible_marker: &str,
+    expected_engine: &str,
+) -> Result<(), String> {
+    let Some(image) = params.get("docker_image").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    if image.to_ascii_lowercase().contains(incompatible_marker) {
+        return Err(format!(
+            "Docker image '{image}' is incompatible with {expected_engine}; choose an image that implements the {expected_engine} server command contract"
+        ));
+    }
+    Ok(())
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -284,6 +319,7 @@ pub struct PostgresParameterStrategy;
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
         }
@@ -416,6 +452,20 @@ pub struct MariaDbParameterStrategy;
 impl ParameterStrategy for MariaDbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
+        // Absent/empty is fine here -- `auto_generate_missing` (which runs
+        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, same as every
+        // other optional field on this strategy. Only a caller-supplied
+        // image is held to the immutable-digest bar: our own default is a
+        // known-safe, logical-backup-only image we control, not something
+        // that needs pinning against drift.
+        if let Some(image) = params
+            .get("docker_image")
+            .and_then(JsonValue::as_str)
+            .filter(|image| !image.trim().is_empty())
+        {
+            validate_immutable_mariadb_image(image)?;
+        }
         validate_mariadb_credentials(params)?;
         mariadb_size_profile_from_params(params)?;
         validate_service_resource_limits(params)?;
@@ -447,7 +497,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("mariadb:lts".to_string()),
+                JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()),
             );
         }
 
@@ -492,6 +542,12 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                     self.updateable_keys().join(", ")
                 ));
             }
+        }
+        if let Some(image) = updates.get("docker_image") {
+            let image = image.as_str().ok_or_else(|| {
+                "MariaDB docker_image must be a string containing an immutable digest".to_string()
+            })?;
+            validate_immutable_mariadb_image(image)?;
         }
         Ok(())
     }
@@ -562,8 +618,8 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., mariadb:lts)",
-                    "default": "mariadb:lts"
+                    "description": "MariaDB image (updateable). Defaults to a plain upstream tag; set an immutable repository@sha256:<64-hex-digest> reference to enable continuous archiving (mariadb_physical backups).",
+                    "default": MARIADB_DEFAULT_IMAGE
                 },
                 "size_profile": {
                     "type": "string",
@@ -572,6 +628,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                     "enum": ["small", "standard", "dedicated"]
                 }
             },
+            "required": ["docker_image"],
             "readonly": ["host", "database", "username", "password", "root_password", "size_profile", "resources"]
         }))
     }
@@ -587,6 +644,7 @@ pub struct RedisParameterStrategy;
 impl ParameterStrategy for RedisParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         // Redis doesn't require parameters for creation
         Ok(())
     }
@@ -690,6 +748,8 @@ impl ParameterStrategy for S3ParameterStrategy {
             params,
             &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
         )?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
         Ok(())
     }
 
@@ -723,7 +783,7 @@ impl ParameterStrategy for S3ParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+                JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
             );
         }
 
@@ -804,8 +864,8 @@ impl ParameterStrategy for S3ParameterStrategy {
             "properties": {
                 "backend": {
                     "type": "string",
-                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage and MinIO are available backend selectors.",
-                    "enum": ["rustfs", "garage", "minio"],
+                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage is reserved for external provider support.",
+                    "enum": ["rustfs", "garage"],
                     "default": "rustfs"
                 },
                 "access_key": {
@@ -841,7 +901,7 @@ impl ParameterStrategy for S3ParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "rustfs/rustfs:1.0.0-alpha.98"
+                    "default": DEFAULT_RUSTFS_IMAGE
                 }
             },
             "readonly": ["backend", "access_key", "secret_key", "host", "region"]
@@ -859,6 +919,8 @@ pub struct MinioParameterStrategy;
 impl ParameterStrategy for MinioParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "rustfs", "MinIO")?;
         // MinIO doesn't require parameters for creation
         Ok(())
     }
@@ -879,19 +941,19 @@ impl ParameterStrategy for MinioParameterStrategy {
             );
         }
 
-        // Auto-generate access_key if not provided
+        // Never fall back to MinIO's well-known root credentials.
         if is_empty_value(params.get("access_key")) {
             params.insert(
                 "access_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_access_key()),
             );
         }
 
-        // Auto-generate secret_key if not provided
+        // Generate an independent secret for every managed instance.
         if is_empty_value(params.get("secret_key")) {
             params.insert(
                 "secret_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_secret_key()),
             );
         }
 
@@ -940,13 +1002,13 @@ impl ParameterStrategy for MinioParameterStrategy {
             "properties": {
                 "access_key": {
                     "type": "string",
-                    "description": "Access key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
                 },
                 "secret_key": {
                     "type": "string",
-                    "description": "Secret key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
                 },
                 "port": {
                     "type": "integer",
@@ -977,6 +1039,8 @@ impl ParameterStrategy for RustfsParameterStrategy {
             params,
             &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
         )?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
         Ok(())
     }
 
@@ -1010,7 +1074,7 @@ impl ParameterStrategy for RustfsParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+                JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
             );
         }
 
@@ -1122,7 +1186,7 @@ impl ParameterStrategy for RustfsParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "rustfs/rustfs:1.0.0-alpha.98"
+                    "default": DEFAULT_RUSTFS_IMAGE
                 }
             },
             "readonly": ["access_key", "secret_key", "host", "region"]
@@ -1140,6 +1204,7 @@ pub struct MongodbParameterStrategy;
 impl ParameterStrategy for MongodbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for MongoDB".to_string());
         }
@@ -1304,8 +1369,8 @@ fn is_empty_value(value: Option<&JsonValue>) -> bool {
 use crate::externalsvc::port_util::find_available_port;
 
 fn generate_secure_password() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     // Charset must be a subset of what `is_valid_pg_password` accepts.
     // `$` is intentionally excluded because the cluster startup script
     // uses shell expansion on env-injected passwords — see the matching
@@ -1314,27 +1379,27 @@ fn generate_secure_password() -> String {
     let charset: &[u8] =
         b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*_-+=";
     (0..32)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate an S3-style access key (20 uppercase alphanumeric characters)
 fn generate_access_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     (0..20)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate an S3-style secret key (40 alphanumeric characters with special chars)
 fn generate_secret_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let charset: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
     (0..40)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
@@ -1420,10 +1485,15 @@ mod tests {
     fn test_mariadb_generates_defaults() {
         let strategy = MariaDbParameterStrategy;
         let mut params = HashMap::new();
+        let image = "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String(image.to_string()),
+        );
 
         strategy
             .validate_for_creation(&params)
-            .expect("empty MariaDB params should use defaults");
+            .expect("digest-pinned MariaDB image is accepted");
         strategy
             .auto_generate_missing(&mut params)
             .expect("defaults should generate");
@@ -1438,7 +1508,7 @@ mod tests {
         );
         assert_eq!(
             params.get("docker_image"),
-            Some(&JsonValue::String("mariadb:lts".to_string()))
+            Some(&JsonValue::String(image.to_string()))
         );
         assert_eq!(
             params.get("size_profile"),
@@ -1459,6 +1529,40 @@ mod tests {
             .get("root_password")
             .and_then(|v| v.as_str())
             .is_some());
+    }
+
+    #[test]
+    fn test_mariadb_missing_image_defaults_instead_of_failing() {
+        // A caller who names no image at all gets the safe, mutable
+        // MARIADB_DEFAULT_IMAGE from auto_generate_missing -- creation must
+        // not require every caller to already know about WAL-G pinning.
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        strategy
+            .validate_for_creation(&params)
+            .expect("missing image defers to auto_generate_missing, not an error");
+        strategy
+            .auto_generate_missing(&mut params)
+            .expect("defaults should generate");
+        assert_eq!(
+            params.get("docker_image"),
+            Some(&JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_mariadb_rejects_explicit_mutable_image() {
+        // A caller who *does* name an image is still held to the immutable
+        // bar -- only our own known-safe default is exempt.
+        let strategy = MariaDbParameterStrategy;
+        let params = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("ghcr.io/gotempsh/mariadb-walg:11.4".to_string()),
+        )]);
+        let mutable = strategy
+            .validate_for_creation(&params)
+            .expect_err("mutable image tag must fail closed");
+        assert!(mutable.contains("must be immutable"));
     }
 
     #[test]
@@ -1760,6 +1864,31 @@ mod tests {
     }
 
     #[test]
+    fn managed_s3_and_rustfs_defaults_use_the_provider_image() {
+        for strategy in [
+            &S3ParameterStrategy as &dyn ParameterStrategy,
+            &RustfsParameterStrategy as &dyn ParameterStrategy,
+        ] {
+            let mut params = HashMap::new();
+            strategy
+                .auto_generate_missing(&mut params)
+                .expect("managed defaults must be generated");
+            assert_eq!(
+                params.get("docker_image").and_then(JsonValue::as_str),
+                Some(DEFAULT_RUSTFS_IMAGE)
+            );
+            assert_eq!(
+                strategy.get_schema().and_then(|schema| {
+                    schema["properties"]["docker_image"]["default"]
+                        .as_str()
+                        .map(str::to_owned)
+                }),
+                Some(DEFAULT_RUSTFS_IMAGE.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn minio_rejects_client_supplied_container_name() {
         let strategy = MinioParameterStrategy;
         let mut params = HashMap::new();
@@ -1775,6 +1904,86 @@ mod tests {
     }
 
     #[test]
+    fn storage_engines_reject_known_cross_engine_images() {
+        let rustfs_image = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+        )]);
+        let minio_image = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("minio/minio:latest".to_string()),
+        )]);
+
+        assert!(MinioParameterStrategy
+            .validate_for_creation(&rustfs_image)
+            .is_err());
+        assert!(RustfsParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_err());
+        assert!(S3ParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_err());
+        assert!(MinioParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_ok());
+        assert!(RustfsParameterStrategy
+            .validate_for_creation(&rustfs_image)
+            .is_ok());
+    }
+
+    #[test]
+    fn managed_creation_accepts_loopback_host_and_rejects_remote_targets() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let parameters =
+                HashMap::from([("host".to_string(), JsonValue::String(host.to_string()))]);
+            assert!(reject_non_loopback_host(&parameters).is_ok());
+        }
+
+        let parameters = HashMap::from([(
+            "host".to_string(),
+            JsonValue::String("169.254.169.254".to_string()),
+        )]);
+        assert!(reject_non_loopback_host(&parameters).is_err());
+    }
+
+    #[test]
+    fn minio_generates_unique_s3_style_credentials() {
+        let strategy = MinioParameterStrategy;
+        let mut first = HashMap::new();
+        let mut second = HashMap::new();
+
+        strategy
+            .auto_generate_missing(&mut first)
+            .expect("first MinIO credentials should generate");
+        strategy
+            .auto_generate_missing(&mut second)
+            .expect("second MinIO credentials should generate");
+
+        let first_access = first
+            .get("access_key")
+            .and_then(JsonValue::as_str)
+            .expect("access key should be generated");
+        let first_secret = first
+            .get("secret_key")
+            .and_then(JsonValue::as_str)
+            .expect("secret key should be generated");
+        assert_ne!(first_access, "minioadmin");
+        assert_ne!(first_secret, "minioadmin");
+        assert_eq!(first_access.len(), 20);
+        assert_eq!(first_secret.len(), 40);
+        assert!(first_access
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit()));
+        assert!(first_secret
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '+'
+                || character == '/'));
+        assert_ne!(first.get("access_key"), second.get("access_key"));
+        assert_ne!(first.get("secret_key"), second.get("secret_key"));
+    }
+
+    #[test]
     fn rustfs_rejects_client_supplied_container_name() {
         let strategy = RustfsParameterStrategy;
         let mut params = HashMap::new();
@@ -1787,6 +1996,31 @@ mod tests {
             err.contains("container_name"),
             "error should mention 'container_name', got: {err}"
         );
+    }
+
+    #[test]
+    fn managed_s3_and_rustfs_defaults_use_the_otel_capable_image() {
+        for strategy in [
+            &S3ParameterStrategy as &dyn ParameterStrategy,
+            &RustfsParameterStrategy as &dyn ParameterStrategy,
+        ] {
+            let mut params = HashMap::new();
+            strategy
+                .auto_generate_missing(&mut params)
+                .expect("managed defaults must be generated");
+            assert_eq!(
+                params.get("docker_image").and_then(JsonValue::as_str),
+                Some(DEFAULT_RUSTFS_IMAGE)
+            );
+            assert_eq!(
+                strategy
+                    .get_schema()
+                    .and_then(|schema| schema["properties"]["docker_image"]["default"]
+                        .as_str()
+                        .map(str::to_owned)),
+                Some(DEFAULT_RUSTFS_IMAGE.to_string())
+            );
+        }
     }
 
     #[test]

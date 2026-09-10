@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Events table: derived analytical replica of Postgres `events`.
 -- ReplacingMergeTree dedupes on the sort key (event_id is the last
 -- component) using `_version`, so retries from the outbox worker are safe.

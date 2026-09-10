@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -9,7 +12,9 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub user_id: i32,
+    /// `None` when the acting user account has since been deleted; the
+    /// serialized `data` payload still carries the original actor context.
+    pub user_id: Option<i32>,
     pub user_agent: String,
     pub operation_type: String,
     pub ip_address_id: Option<i32>,

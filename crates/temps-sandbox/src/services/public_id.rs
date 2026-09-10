@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Opaque public IDs for sandboxes. Format: `sbx_` + 16 hex chars (8 bytes
 //! of randomness). Chosen to be short enough to type in a URL but large
 //! enough that guessing is infeasible.
@@ -6,15 +9,22 @@
 //! an `i32` primary key which is what the underlying `SandboxProvider`
 //! indexes by. Never expose the numeric id in responses.
 
-use rand::RngCore;
+use rand::Rng;
 
 pub const PUBLIC_ID_PREFIX: &str = "sbx_";
 
 /// Generate a new opaque public sandbox ID.
 pub fn generate() -> String {
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     format!("{}{}", PUBLIC_ID_PREFIX, hex::encode(bytes))
+}
+
+/// Generate a new opaque public ID with a custom prefix (e.g. `snap_`).
+pub fn generate_with_prefix(prefix: &str) -> String {
+    let mut bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("{}_{}", prefix, hex::encode(bytes))
 }
 
 /// Returns true iff `s` has the expected `sbx_` prefix and hex suffix.

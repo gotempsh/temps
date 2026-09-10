@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Multi-turn, streaming chat types for the AI foundation (ADR-023).
 //!
 //! Where [`crate::AiService::complete`] is a single request→response,
@@ -5,10 +8,15 @@
 //! the assistant's reply token-by-token — the substrate for persistent,
 //! resumable debugging conversations.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 
+use futures::future::BoxFuture;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::service::AiError;
 
@@ -37,6 +45,30 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// Request-scoped executor for tools advertised to an AI harness. The caller
+/// owns authorization and project scoping; providers receive no platform
+/// credential and can only invoke this opaque callback for the current turn.
+pub type ToolExecutor =
+    Arc<dyn Fn(ToolCall) -> BoxFuture<'static, Result<String, AiError>> + Send + Sync>;
+
+/// Request-scoped bridge for provider-initiated user interactions (questions,
+/// plan approval, or other normalized permission prompts). The runtime owns
+/// persistence and authorization; adapters only await the returned decision.
+pub type InteractionExecutor = Arc<
+    dyn Fn(PermissionRequest) -> BoxFuture<'static, Result<PermissionDecision, AiError>>
+        + Send
+        + Sync,
+>;
+
+/// Common per-turn services supplied to every provider adapter. Adding a new
+/// provider never creates a new chat entry point: adapters receive the same
+/// scoped tools and interaction channel through this value.
+#[derive(Clone, Default)]
+pub struct TurnServices {
+    pub tools: Option<ToolExecutor>,
+    pub interactions: Option<InteractionExecutor>,
 }
 
 /// One turn of a conversation. Deliberately flat so it is provider-agnostic and
@@ -89,24 +121,137 @@ impl ChatMessage {
     }
 }
 
-/// A multi-turn request. The caller supplies the *full* replayed history (our DB
-/// is the source of truth — see ADR-023); the provider is stateless. When
-/// `tools` is non-empty the model may answer with tool calls instead of text
-/// (see [`crate::AiService::chat`]).
+/// A multi-turn request. The caller supplies the *full* replayed history because
+/// our database remains the source of truth (see ADR-023). Stateful harnesses
+/// may continue their provider-owned session and send only the newest user turn;
+/// stateless providers replay `messages` in full. When `tools` is non-empty the
+/// model may answer with tool calls instead of text (see [`crate::AiService::chat`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnRequest {
+    /// Stable opaque id used only to correlate latency and lifecycle telemetry
+    /// across chat orchestration, sandbox setup, and the harness adapter.
+    pub trace_id: Option<String>,
     /// Short tag for logging / usage attribution, e.g. `"deploy.debug_chat"`.
     pub purpose: String,
     /// Governance + usage scope.
     pub project_id: Option<i32>,
+    /// Authenticated user who initiated this server-owned turn. This is never
+    /// accepted from an HTTP payload; it binds ephemeral sandbox capabilities
+    /// to the audited principal that caused them to be issued.
+    pub principal_id: Option<i32>,
+    /// Provider pinned by the caller for this conversation. `gateway` selects
+    /// BYOK routing; an agent CLI catalog id selects that host CLI.
+    pub provider: Option<String>,
     /// Full conversation history, oldest first (system prompt usually first).
     pub messages: Vec<ChatMessage>,
     /// Tools the model may call this turn. Empty = plain chat.
     pub tools: Vec<ChatTool>,
     /// Override the configured default model.
     pub model: Option<String>,
+    /// Provider-specific reasoning/thinking option selected when the
+    /// conversation was created (for example `high`).
+    pub thinking_level: Option<String>,
+    /// Provider-specific execution permission mode selected when the
+    /// conversation was created (for example `auto` or `full-access`).
+    pub permission_mode: Option<String>,
+    /// Provider-owned session to continue for a development-harness turn.
+    ///
+    /// The chat service reads this opaque value from its conversation record;
+    /// HTTP clients cannot provide it. Harness adapters translate it to their
+    /// native continuation protocol (`--resume`, `exec resume`, or `--session`).
+    /// The full `messages` collection is retained as the server-owned recovery
+    /// source if native session state is ever unavailable.
+    pub resume_session_id: Option<String>,
+    /// Explicit, Temps-managed workspace for a development-harness turn.
+    ///
+    /// This is intentionally absent for API-gateway requests. Harness
+    /// adapters must reject a request without this value rather than falling
+    /// back to a host scratch directory: an application thread is always
+    /// executed in a Temps sandbox against its durable workspace.
+    pub harness_workspace: Option<HarnessWorkspace>,
+    /// Secret runtime variables scoped to the sandbox's attached project and
+    /// default environment. Server-side orchestration populates these; HTTP
+    /// clients cannot. The wrapper redacts values from Debug output.
+    pub sandbox_environment: SensitiveEnvironment,
+    /// Short-lived, turn-scoped MCP endpoint for platform operations from a
+    /// managed development sandbox. The endpoint is created by the chat
+    /// service from the initiating user's authenticated context and disappears
+    /// when the turn ends. It is never a reusable Temps API credential.
+    pub harness_mcp_server: Option<HarnessMcpServer>,
+    /// Resolve the provider-owned title for the newly created harness session.
+    /// Enabled only for the first user turn so adapters never scan session
+    /// metadata on routine follow-ups.
+    pub capture_session_title: bool,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SensitiveEnvironment(HashMap<String, String>);
+
+impl SensitiveEnvironment {
+    pub fn new(variables: HashMap<String, String>) -> Self {
+        Self(variables)
+    }
+
+    pub fn redaction_values(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().filter_map(|(name, value)| {
+            let upper = name.to_ascii_uppercase();
+            (!value.is_empty()
+                && ["PASSWORD", "TOKEN", "SECRET", "KEY", "URL", "DSN"]
+                    .iter()
+                    .any(|marker| upper.contains(marker)))
+            .then_some(value)
+        })
+    }
+
+    pub fn into_inner(self) -> HashMap<String, String> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut variable_names = self.0.keys().collect::<Vec<_>>();
+        variable_names.sort();
+        formatter
+            .debug_struct("SensitiveEnvironment")
+            .field("variable_names", &variable_names)
+            .finish()
+    }
+}
+
+/// Connection details for one turn's scoped platform-tool bridge.
+///
+/// The bearer is intentionally redacted from `Debug`: chat requests can be
+/// logged while diagnosing provider failures and this capability must never
+/// appear in logs. The bridge itself still re-checks the captured user/project
+/// authorization for every tool call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HarnessMcpServer {
+    pub url: String,
+    pub authorization_token: String,
+}
+
+impl std::fmt::Debug for HarnessMcpServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HarnessMcpServer")
+            .field("url", &self.url)
+            .field("authorization_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A durable, Temps-owned workspace mounted into a development sandbox.
+///
+/// `sandbox_label` is an opaque, validated identifier used only to recover a
+/// persistent sandbox. `host_work_dir` is never supplied by an HTTP client;
+/// the application workspace service derives it beneath `TEMPS_DATA_DIR`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessWorkspace {
+    pub sandbox_label: String,
+    pub host_work_dir: PathBuf,
 }
 
 /// A single non-streaming turn result: either assistant text, or a set of tool
@@ -122,6 +267,59 @@ pub struct ChatTurnResponse {
 /// to append; the stream ends when the reply is complete. Errors are terminal.
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<String, AiError>> + Send>>;
 
+/// Kind of permission the Claude CLI is requesting via `--permission-prompt-tool stdio`
+/// (ADR-038 Phase 2). Used to drive the correct UI card (`ToolApproval` → allow/deny
+/// buttons; `Question` → answer form; `PlanApproval` → approve/reject-with-feedback).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    /// A tool invocation (`can_use_tool` subtype — Bash, Edit, Write, etc.).
+    ToolApproval,
+    /// The model wants to ask the user a question (`AskUserQuestion` tool).
+    Question,
+    /// The model wants the user to approve a plan (`ExitPlanMode` tool).
+    PlanApproval,
+}
+
+/// A permission request emitted by `run_interactive` when the Claude CLI blocks
+/// on a `control_request` frame.  Passed to the UI via an SSE event so the user
+/// can respond before the subprocess continues.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PermissionRequest {
+    /// The CLI's own `request_id` (UUID); used as the key in the pending-permission
+    /// registry and as `{permission_id}` in the resolve endpoint.
+    pub id: String,
+    /// What kind of interaction is required.
+    pub kind: PermissionKind,
+    /// The tool name from `request.tool_name` (e.g. `"Bash"`, `"AskUserQuestion"`).
+    pub tool_name: String,
+    /// Raw `request.input` from the CLI — passed through to the UI verbatim so
+    /// each milestone's card can render the relevant fields without requiring the
+    /// service layer to know about tool-specific schemas.
+    pub input: serde_json::Value,
+}
+
+/// The user's decision for a pending permission request.  Serialized as a tagged
+/// JSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`
+/// carry an optional human-readable reason that is forwarded to the CLI's
+/// `control_response` (never stored).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// Allow the tool to run as requested (milestone 3).
+    AllowTool,
+    /// Deny the tool, with an optional explanation for the model (milestone 3).
+    DenyTool { reason: Option<String> },
+    /// Answer an `AskUserQuestion` prompt (milestone 4).  `answers` is a JSON
+    /// object mapping the literal question text to the chosen option label or
+    /// free-text answer, per the confirmed wire protocol.
+    AnswerQuestion { answers: serde_json::Value },
+    /// Approve an `ExitPlanMode` plan (milestone 5).
+    ApprovePlan,
+    /// Reject an `ExitPlanMode` plan with optional feedback (milestone 5).
+    RejectPlan { feedback: Option<String> },
+}
+
 /// One delta from a streaming *agentic* turn ([`crate::AiService::chat_stream_turn`]).
 /// A single provider pass can interleave assistant text and tool calls: the
 /// OpenAI/Anthropic streaming APIs emit tool-call argument fragments inline, so
@@ -135,7 +333,210 @@ pub enum ChatStreamDelta {
     Text(String),
     /// A fully-assembled tool call the model decided to make this turn.
     ToolCall(ToolCall),
+    /// Result returned by a provider-native tool harness (for example an MCP
+    /// call made inside a CLI process). Gateway providers never emit this: the
+    /// outer conversation loop executes their `ToolCall` values itself.
+    ToolResult { call: ToolCall, result: String },
+    /// The interactive CLI subprocess is waiting for the user to approve or deny
+    /// a tool/question/plan (ADR-038 Phase 2, milestone 3+).  The SSE handler
+    /// emits this as a `permission_requested` event; the user resolves it via
+    /// `POST .../permissions/{id}/resolve`, which unblocks the subprocess.
+    PermissionRequested(PermissionRequest),
+    /// Provider-owned session identity discovered from the harness protocol.
+    ///
+    /// Harnesses do not agree on the wire shape (`session_id`, `thread_id`,
+    /// etc.), so adapters normalize it here. A title is optional because some
+    /// providers publish it only to their local session index after the turn.
+    /// Conversation orchestration may use a bounded first-prompt fallback when
+    /// the provider exposes the id but no separate title.
+    SessionMetadata {
+        session_id: Option<String>,
+        title: Option<String>,
+    },
 }
 
 /// A stream of [`ChatStreamDelta`]s for one agentic turn. Errors are terminal.
 pub type ChatTurnStream = Pin<Box<dyn Stream<Item = Result<ChatStreamDelta, AiError>> + Send>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- PermissionKind serde ---
+
+    #[test]
+    fn test_permission_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PermissionKind::ToolApproval).unwrap(),
+            r#""tool_approval""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionKind::Question).unwrap(),
+            r#""question""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionKind::PlanApproval).unwrap(),
+            r#""plan_approval""#
+        );
+    }
+
+    #[test]
+    fn test_permission_kind_round_trips() {
+        for kind in [
+            PermissionKind::ToolApproval,
+            PermissionKind::Question,
+            PermissionKind::PlanApproval,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: PermissionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    // --- PermissionRequest serde ---
+
+    #[test]
+    fn test_permission_request_round_trip() {
+        let req = PermissionRequest {
+            id: "req-123".to_string(),
+            kind: PermissionKind::ToolApproval,
+            tool_name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls -la"}),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: PermissionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, req.id);
+        assert_eq!(back.kind, req.kind);
+        assert_eq!(back.tool_name, req.tool_name);
+        assert_eq!(back.input, req.input);
+    }
+
+    // --- PermissionDecision serde ---
+
+    #[test]
+    fn test_decision_allow_tool_round_trip() {
+        let d = PermissionDecision::AllowTool;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""type":"allow_tool""#), "got: {json}");
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, PermissionDecision::AllowTool));
+    }
+
+    #[test]
+    fn test_decision_deny_tool_with_reason_round_trip() {
+        let d = PermissionDecision::DenyTool {
+            reason: Some("not permitted".to_string()),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""type":"deny_tool""#), "got: {json}");
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            PermissionDecision::DenyTool { reason: Some(ref r) } if r == "not permitted"
+        ));
+    }
+
+    #[test]
+    fn test_decision_deny_tool_without_reason_round_trip() {
+        let d = PermissionDecision::DenyTool { reason: None };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            PermissionDecision::DenyTool { reason: None }
+        ));
+    }
+
+    #[test]
+    fn test_decision_answer_question_round_trip() {
+        let answers = serde_json::json!({"Do you want to proceed?": "Yes"});
+        let d = PermissionDecision::AnswerQuestion {
+            answers: answers.clone(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""type":"answer_question""#), "got: {json}");
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            &back,
+            PermissionDecision::AnswerQuestion { answers: a } if *a == answers
+        ));
+    }
+
+    #[test]
+    fn test_decision_approve_plan_round_trip() {
+        let d = PermissionDecision::ApprovePlan;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""type":"approve_plan""#), "got: {json}");
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, PermissionDecision::ApprovePlan));
+    }
+
+    #[test]
+    fn test_decision_reject_plan_round_trip() {
+        let d = PermissionDecision::RejectPlan {
+            feedback: Some("not ready yet".to_string()),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""type":"reject_plan""#), "got: {json}");
+        let back: PermissionDecision = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            PermissionDecision::RejectPlan { feedback: Some(ref f) } if f == "not ready yet"
+        ));
+    }
+
+    #[test]
+    fn harness_mcp_debug_redacts_the_turn_capability() {
+        let server = HarnessMcpServer {
+            url: "http://internal/api/ai/sandbox-tools/id/mcp".to_string(),
+            authorization_token: "tmcp_must_not_appear".to_string(),
+        };
+
+        let rendered = format!("{server:?}");
+
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("tmcp_must_not_appear"));
+    }
+
+    #[test]
+    fn sensitive_environment_debug_never_contains_values() {
+        let environment = SensitiveEnvironment::new(HashMap::from([
+            (
+                "REDIS_URL".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ),
+            ("PGHOST".to_string(), "postgres-internal".to_string()),
+        ]));
+
+        let rendered = format!("{environment:?}");
+
+        assert!(rendered.contains("PGHOST"));
+        assert!(rendered.contains("REDIS_URL"));
+        assert!(!rendered.contains("redis://user:secret@redis:6379"));
+        assert!(!rendered.contains("postgres-internal"));
+    }
+
+    #[test]
+    fn sensitive_environment_redacts_credential_bearing_values_from_streams() {
+        let environment = SensitiveEnvironment::new(HashMap::from([
+            (
+                "REDIS_URL".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ),
+            ("PGPASSWORD".to_string(), "database-password".to_string()),
+            ("PGHOST".to_string(), "postgres-internal".to_string()),
+            ("EMPTY_TOKEN".to_string(), String::new()),
+        ]));
+
+        let mut values = environment.redaction_values().cloned().collect::<Vec<_>>();
+        values.sort();
+
+        assert_eq!(
+            values,
+            vec![
+                "database-password".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ]
+        );
+    }
+}

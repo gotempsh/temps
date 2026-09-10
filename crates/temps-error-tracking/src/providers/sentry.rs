@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sentry Error Provider Implementation
 
 use async_trait::async_trait;
@@ -40,6 +43,7 @@ impl ErrorProvider for SentryProvider {
             project_id: dsn.project_id,
             environment_id: dsn.environment_id,
             deployment_id: dsn.deployment_id,
+            rate_limit_per_minute: dsn.rate_limit_per_minute,
         })
     }
 
@@ -110,12 +114,11 @@ impl ErrorProvider for SentryProvider {
             }
         }
 
-        if parsed_events.is_empty() {
-            return Err(ProviderError::Validation(
-                "No valid events found in envelope".to_string(),
-            ));
-        }
-
+        // An envelope containing only unmapped item types (client_report, session,
+        // session aggregates, span, transaction) is not an error — real Sentry
+        // relays accept these and return 200. Erroring here made every
+        // client_report-only envelope (which SDKs send periodically to report
+        // dropped/sampled events) look like a transport failure in SDK logs.
         Ok(parsed_events)
     }
 

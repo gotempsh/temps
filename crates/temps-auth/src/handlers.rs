@@ -1,12 +1,17 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::AuthState;
 use crate::audit::{
-    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LogoutAudit, MfaDisabledAudit,
-    MfaEnabledAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
+    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit,
+    MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
+    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
     UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
-use crate::user_service::UserServiceError;
+use crate::permissions::Permission;
+use crate::user_service::{normalize_user_email, UserServiceError};
 use crate::{permission_guard, RequireAuth};
 use axum::extract::Path;
 use axum::http::header::SET_COOKIE;
@@ -35,9 +40,150 @@ use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
     MfaSetupResponse, MfaVerificationRequest, RouteRole, RouteUser, RouteUserWithRoles,
-    TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest, UserResponse, VerifyMfaRequest,
+    SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest,
+    UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
+
+const MAX_LOGIN_EMAIL_BYTES: usize = 254;
+
+fn bounded_audit_identity(identity: &str) -> String {
+    let normalized = identity.to_lowercase();
+    if normalized.len() <= MAX_LOGIN_EMAIL_BYTES {
+        return normalized;
+    }
+
+    let mut boundary = MAX_LOGIN_EMAIL_BYTES;
+    while !normalized.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    normalized[..boundary].to_string()
+}
+
+fn normalized_login_email(email: &str) -> Option<String> {
+    normalize_user_email(email)
+}
+
+fn parse_user_roles(role_names: &[String]) -> Result<Vec<RoleType>, UserServiceError> {
+    role_names
+        .iter()
+        .map(|role| {
+            RoleType::from_str(role).map_err(|_| {
+                UserServiceError::Validation(format!(
+                    "Unsupported role '{role}'. Expected one of: admin, user"
+                ))
+            })
+        })
+        .collect()
+}
+
+async fn record_login_failure(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: Option<i32>,
+    attempted_email: &str,
+    login_method: &'static str,
+    reason: &'static str,
+) {
+    if let Err(error) = state
+        .audit_service
+        .create_audit_log(&LoginFailedAudit {
+            user_id,
+            attempted_email: bounded_audit_identity(attempted_email),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+            login_method: login_method.to_string(),
+            reason: reason.to_string(),
+        })
+        .await
+    {
+        error!(
+            user_id,
+            reason, "Failed to record login failure audit event: {}", error
+        );
+    }
+}
+
+async fn record_mfa_rejection(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: Option<i32>,
+    reason: &'static str,
+) {
+    if let Err(error) = state
+        .audit_service
+        .create_audit_log(&MfaVerificationFailedAudit {
+            user_id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+            reason: reason.to_string(),
+        })
+        .await
+    {
+        error!(
+            user_id,
+            reason, "Failed to record MFA rejection audit event: {}", error
+        );
+    }
+}
+
+async fn record_pending_login(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    login_method: &'static str,
+) {
+    if let Err(error) = state
+        .audit_service
+        .create_audit_log(&LoginAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            success: true,
+            login_method: login_method.to_string(),
+        })
+        .await
+    {
+        error!(
+            user_id,
+            login_method, "Failed to record pending login audit event: {}", error
+        );
+    }
+}
+
+fn invalid_mfa_problem() -> Problem {
+    problem_new(StatusCode::UNAUTHORIZED)
+        .with_title("MFA Verification Failed")
+        .with_detail("The verification code is incorrect or has expired. Please try again with a new code from your authenticator app.")
+}
+
+async fn record_step_up_verification_audit(
+    auth_state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    session_id: i32,
+    success: bool,
+    reason: Option<&str>,
+) {
+    let audit = StepUpVerificationAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        success,
+        reason: reason.map(str::to_string),
+    };
+    if let Err(error) = auth_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id,
+            session_id, %error,
+            "Failed to record sensitive-action verification audit"
+        );
+    }
+}
 
 #[utoipa::path(
     get,
@@ -165,25 +311,42 @@ pub async fn verify_mfa_challenge(
             } else {
                 None
             }
-        })
-        .ok_or(
-            problem_new(StatusCode::UNAUTHORIZED)
+        });
+    let encrypted_mfa_session = match encrypted_mfa_session {
+        Some(session) => session,
+        None => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                None,
+                "missing_session_cookie",
+            )
+            .await;
+            return Err(problem_new(StatusCode::UNAUTHORIZED)
                 .with_title("MFA Session Required")
                 .with_detail(
                     "No MFA session found. Please log in first to start the MFA verification flow.",
-                ),
-        )?;
+                ));
+        }
+    };
 
     // Decrypt the MFA session cookie
-    let mfa_session = auth_state
-        .cookie_crypto
-        .decrypt(&encrypted_mfa_session)
-        .map_err(|e| {
-            tracing::error!("Failed to decrypt MFA session cookie: {}", e);
-            problem_new(StatusCode::UNAUTHORIZED)
+    let mfa_session = match auth_state.cookie_crypto.decrypt(&encrypted_mfa_session) {
+        Ok(session) => session,
+        Err(error) => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                None,
+                "invalid_session_cookie",
+            )
+            .await;
+            tracing::error!("Failed to decrypt MFA session cookie: {}", error);
+            return Err(problem_new(StatusCode::UNAUTHORIZED)
                 .with_title("MFA Session Expired")
-                .with_detail("Your MFA session has expired or is invalid. Please log in again.")
-        })?;
+                .with_detail("Your MFA session has expired or is invalid. Please log in again."));
+        }
+    };
 
     tracing::debug!("MFA session decrypted successfully");
 
@@ -225,16 +388,24 @@ pub async fn verify_mfa_challenge(
                     }
                 };
 
-            let session_token = auth_state
-                .auth_service
-                .create_session(user.id)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create session after MFA verification: {}", e);
-                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+            let session_token = match auth_state.auth_service.create_session(user.id).await {
+                Ok(session_token) => session_token,
+                Err(error) => {
+                    error!("Failed to create session after MFA verification: {}", error);
+                    record_login_failure(
+                        auth_state.as_ref(),
+                        &metadata,
+                        Some(user.id),
+                        &user.email,
+                        "password-mfa",
+                        "session_creation_failed",
+                    )
+                    .await;
+                    return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                         .with_title("Session Creation Failed")
-                        .with_detail("Could not create session. Please try logging in again.")
-                })?;
+                        .with_detail("Could not create session. Please try logging in again."));
+                }
+            };
 
             if existing_active_sessions > 0 {
                 if let Err(e) = auth_state
@@ -257,6 +428,15 @@ pub async fn verify_mfa_challenge(
                 Ok(enc) => enc,
                 Err(e) => {
                     error!("Failed to encrypt session token: {}", e);
+                    record_login_failure(
+                        auth_state.as_ref(),
+                        &metadata,
+                        Some(user.id),
+                        &user.email,
+                        "password-mfa",
+                        "session_encryption_failed",
+                    )
+                    .await;
                     return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                         .with_title("Session Error")
                         .with_detail("Could not secure your session. Please try again."));
@@ -275,15 +455,186 @@ pub async fn verify_mfa_challenge(
                 .same_site(cookie::SameSite::Strict)
                 .secure(metadata.is_secure)
                 .build();
-            response_headers.append(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
+            let clear_cookie_header = match clear_mfa_cookie.to_string().parse() {
+                Ok(cookie_header) => cookie_header,
+                Err(error) => {
+                    error!("Failed to create MFA clear-cookie header: {}", error);
+                    record_login_failure(
+                        auth_state.as_ref(),
+                        &metadata,
+                        Some(user.id),
+                        &user.email,
+                        "password-mfa",
+                        "session_cookie_creation_failed",
+                    )
+                    .await;
+                    return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Session Error")
+                        .with_detail("Could not finalize your session. Please try again."));
+                }
+            };
+            response_headers.append(SET_COOKIE, clear_cookie_header);
 
             Ok((StatusCode::NO_CONTENT, response_headers))
         }
-        Err(e) => {
-            error!("MFA verification failed: {}", e);
-            Err(problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("MFA Verification Failed")
-                .with_detail("The verification code is incorrect or has expired. Please try again with a new code from your authenticator app."))
+        Err(crate::auth_service::MfaChallengeError::InvalidOrExpiredSession) => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                None,
+                "invalid_or_expired_session",
+            )
+            .await;
+            Err(invalid_mfa_problem())
+        }
+        Err(crate::auth_service::MfaChallengeError::InvalidCode { user_id }) => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                Some(user_id),
+                "invalid_code",
+            )
+            .await;
+            Err(invalid_mfa_problem())
+        }
+        Err(error) => {
+            error!("MFA verification infrastructure failed: {}", error);
+            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("MFA Verification Error")
+                .with_detail("MFA verification could not be completed. Please try again."))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/step-up",
+    request_body = VerifyStepUpRequest,
+    responses(
+        (status = 200, description = "Session elevated for sensitive actions", body = StepUpResponse),
+        (status = 400, description = "Verification code is empty"),
+        (status = 401, description = "Invalid code or expired session"),
+        (status = 403, description = "Browser session required"),
+        (status = 429, description = "Too many verification attempts"),
+        (status = 428, description = "MFA setup required"),
+        (status = 500, description = "Verification infrastructure failed")
+    ),
+    tag = "Authentication",
+    security(("session_token" = []))
+)]
+pub async fn verify_step_up(
+    State(auth_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<VerifyStepUpRequest>,
+) -> Result<Json<StepUpResponse>, Problem> {
+    let code = request.code.trim();
+    if code.is_empty() {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Verification Code Required")
+            .detail("Provide a TOTP code or recovery code")
+            .value("error_code", "STEP_UP_CODE_REQUIRED")
+            .build());
+    }
+
+    let session_id = auth.session_id().ok_or_else(|| {
+        temps_core::error_builder::forbidden()
+            .title("Browser Session Required")
+            .detail("Sensitive-action verification is available only to browser sessions")
+            .value("error_code", "STEP_UP_SESSION_REQUIRED")
+            .build()
+    })?;
+    let user_id = auth.user_id();
+    let rate_limit_key = format!("user:{user_id}:session:{session_id}");
+    if auth_state
+        .step_up_rate_limiter
+        .check(&rate_limit_key)
+        .await
+        .is_err()
+    {
+        record_step_up_verification_audit(
+            &auth_state,
+            &metadata,
+            user_id,
+            session_id,
+            false,
+            Some("rate_limited"),
+        )
+        .await;
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Too Many Verification Attempts")
+                .detail("Wait before trying another verification code")
+                .value("error_code", "STEP_UP_RATE_LIMITED")
+                .build(),
+        );
+    }
+
+    let result = auth_state
+        .step_up_service
+        .verify_and_elevate(user_id, session_id, code)
+        .await;
+
+    let (success, reason) = match &result {
+        Ok(_) => (true, None),
+        Err(crate::StepUpError::SessionRequired) => (false, Some("session_required")),
+        Err(crate::StepUpError::MfaNotConfigured { .. }) => (false, Some("mfa_not_configured")),
+        Err(crate::StepUpError::InvalidCode { .. }) => (false, Some("invalid_code")),
+        Err(crate::StepUpError::UserNotFound { .. }) => (false, Some("user_not_found")),
+        Err(crate::StepUpError::SessionNotFound { .. }) => (false, Some("session_not_found")),
+        Err(crate::StepUpError::Verification { .. }) => (false, Some("verification_failed")),
+        Err(crate::StepUpError::Database { .. }) => (false, Some("database_failed")),
+    };
+    record_step_up_verification_audit(&auth_state, &metadata, user_id, session_id, success, reason)
+        .await;
+
+    match result {
+        Ok(expires_at) => Ok(Json(StepUpResponse {
+            expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        })),
+        Err(crate::StepUpError::SessionRequired) => Err(temps_core::error_builder::forbidden()
+            .title("Browser Session Required")
+            .detail("Sensitive-action verification is available only to browser sessions")
+            .value("error_code", "STEP_UP_SESSION_REQUIRED")
+            .build()),
+        Err(crate::StepUpError::MfaNotConfigured { .. }) => Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::PRECONDITION_REQUIRED)
+                .type_("https://temps.sh/probs/mfa-setup-required")
+                .title("MFA Setup Required")
+                .detail("Configure MFA before performing sensitive actions")
+                .value("error_code", "MFA_SETUP_REQUIRED")
+                .build(),
+        ),
+        Err(crate::StepUpError::InvalidCode { .. }) => {
+            Err(temps_core::error_builder::unauthorized()
+                .title("Invalid Verification Code")
+                .detail("The TOTP or recovery code is invalid")
+                .value("error_code", "STEP_UP_CODE_INVALID")
+                .build())
+        }
+        Err(crate::StepUpError::SessionNotFound { .. })
+        | Err(crate::StepUpError::UserNotFound { .. }) => {
+            Err(temps_core::error_builder::unauthorized()
+                .title("Session Expired")
+                .detail("The authenticated browser session is no longer active")
+                .value("error_code", "STEP_UP_SESSION_EXPIRED")
+                .build())
+        }
+        Err(crate::StepUpError::Verification { user_id, reason }) => {
+            error!(user_id, %reason, "Sensitive-action MFA verification failed");
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Verification Failed")
+                .detail("The verification service could not complete the request")
+                .value("error_code", "STEP_UP_VERIFICATION_FAILED")
+                .build())
+        }
+        Err(error @ crate::StepUpError::Database { .. }) => {
+            error!(%error, "Sensitive-action verification database failure");
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Verification Failed")
+                .detail("The verification service could not complete the request")
+                .value("error_code", "STEP_UP_VERIFICATION_FAILED")
+                .build())
         }
     }
 }
@@ -294,13 +645,13 @@ pub async fn verify_mfa_challenge(
         get_current_user,
         logout,
         verify_mfa_challenge,
+        verify_step_up,
         register,
         login,
         email_status,
-        request_magic_link,
-        verify_magic_link,
         request_password_reset,
         reset_password,
+        change_required_password,
         verify_email,
         list_users,
         create_user,
@@ -333,8 +684,10 @@ pub async fn verify_mfa_challenge(
             MfaRequiredResponse,
             RegisterRequest,
             LoginRequest,
-            MagicLinkRequest,
+            EmailRequest,
             ResetPasswordRequest,
+            RequiredPasswordChangeRequest,
+            RequiredPasswordChangeResponse,
             AuthResponse,
             EmailStatusResponse,
             crate::oidc_types::OidcProviderSummary,
@@ -347,6 +700,8 @@ pub async fn verify_mfa_challenge(
             UpdateSelfRequest,
             ChangePasswordRequest,
             VerifyMfaRequest,
+            VerifyStepUpRequest,
+            StepUpResponse,
             MfaSetupResponse,
             DisableMfaRequest,
             crate::cli_device_handler::CliDeviceStartRequest,
@@ -362,7 +717,7 @@ pub async fn verify_mfa_challenge(
         title = "Authentication & User Management API",
         description = "Complete API for authentication, authorization, and user management. \
         Includes login/logout, MFA, user CRUD operations, role management, \
-        magic links, password reset, and email verification.",
+        password reset and email verification.",
         version = "1.0.0"
     ),
     tags(
@@ -382,6 +737,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
     let rate_limited_auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verify_mfa_challenge))
+        .route("/auth/step-up", post(verify_step_up))
         .route(
             "/auth/cli/device/start",
             post(crate::cli_device_handler::cli_device_start),
@@ -390,10 +746,12 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/cli/device/poll",
             post(crate::cli_device_handler::cli_device_poll),
         )
-        .route("/auth/magic-link/request", post(request_magic_link))
-        .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
+        .route(
+            "/auth/password-change-required",
+            post(change_required_password),
+        )
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
@@ -459,14 +817,20 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Request body carrying just an email address (password-reset request).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MagicLinkRequest {
+pub struct EmailRequest {
     pub email: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ResetPasswordRequest {
     pub token: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RequiredPasswordChangeRequest {
     pub new_password: String,
 }
 
@@ -490,12 +854,6 @@ impl From<LoginRequest> for crate::auth_service::LoginRequest {
     }
 }
 
-impl From<MagicLinkRequest> for crate::auth_service::MagicLinkRequest {
-    fn from(req: MagicLinkRequest) -> Self {
-        crate::auth_service::MagicLinkRequest { email: req.email }
-    }
-}
-
 impl From<ResetPasswordRequest> for crate::auth_service::ResetPasswordRequest {
     fn from(req: ResetPasswordRequest) -> Self {
         crate::auth_service::ResetPasswordRequest {
@@ -511,12 +869,23 @@ pub struct AuthResponse {
     pub message: String,
     pub user_id: Option<i32>,
     pub mfa_required: bool,
+    pub mfa_enrollment_required: bool,
+    pub mfa_setup: Option<MfaSetupResponse>,
+    pub password_change_required: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RequiredPasswordChangeResponse {
+    pub success: bool,
+    pub message: String,
+    pub user_id: i32,
+    pub mfa_enrollment_required: bool,
+    pub mfa_setup: Option<MfaSetupResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EmailStatusResponse {
     pub email_configured: bool,
-    pub magic_link_available: bool,
     pub password_reset_available: bool,
     pub oidc_providers: Vec<crate::oidc_types::OidcProviderSummary>,
 }
@@ -582,6 +951,9 @@ pub async fn register(
                     message: "User created successfully".to_string(),
                     user_id: Some(user.id),
                     mfa_required: false,
+                    mfa_enrollment_required: false,
+                    mfa_setup: None,
+                    password_change_required: false,
                 }),
             ))
         }
@@ -612,26 +984,140 @@ pub async fn register(
 pub async fn login(
     State(state): State<Arc<AuthState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<LoginRequest>,
+    Json(mut request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    // Capture email before `request` is moved into the service call so we
-    // can log it (lowercased) on internal errors without leaking password.
-    let login_email = request.email.to_lowercase();
+    // Bound the identity before it reaches the database or durable audit
+    // storage. The client still gets the same generic credential response,
+    // so validation does not become an account-discovery oracle.
+    let Some(login_email) = normalized_login_email(&request.email) else {
+        record_login_failure(
+            state.as_ref(),
+            &metadata,
+            None,
+            &request.email,
+            "password",
+            "invalid_identifier",
+        )
+        .await;
+        return Err(problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Credentials")
+            .with_detail("Invalid email or password."));
+    };
+    request.email.clone_from(&login_email);
+
     match state.auth_service.login(request.into()).await {
         Ok(user) => {
+            if user.must_change_password {
+                let reset_token = state
+                    .auth_service
+                    .create_required_password_change_token(user.id)
+                    .await
+                    .map_err(|error| {
+                        error!(
+                            user_id = user.id,
+                            error = %error,
+                            "Failed to create required password-change session"
+                        );
+                        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Authentication Error")
+                            .with_detail(
+                                "Could not start the required password change. Please try again.",
+                            )
+                    })?;
+
+                let encrypted_token =
+                    state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
+                        error!(
+                            user_id = user.id,
+                            error = %error,
+                            "Failed to encrypt required password-change session"
+                        );
+                        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Authentication Error")
+                            .with_detail(
+                                "Could not secure the required password change. Please try again.",
+                            )
+                    })?;
+
+                let password_change_cookie =
+                    Cookie::build(("password_change_session", encrypted_token))
+                        .http_only(true)
+                        .path("/")
+                        .max_age(cookie::time::Duration::minutes(15))
+                        .same_site(cookie::SameSite::Strict)
+                        .secure(metadata.is_secure)
+                        .build();
+                let cookie_header =
+                    password_change_cookie
+                        .to_string()
+                        .parse()
+                        .map_err(|error| {
+                            error!(
+                                user_id = user.id,
+                                error = %error,
+                                "Failed to create required password-change cookie header"
+                            );
+                            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Authentication Error")
+                        .with_detail(
+                            "Could not secure the required password change. Please try again.",
+                        )
+                        })?;
+                let mut headers = HeaderMap::new();
+                headers.insert(SET_COOKIE, cookie_header);
+
+                record_pending_login(
+                    state.as_ref(),
+                    &metadata,
+                    user.id,
+                    "password-change-required",
+                )
+                .await;
+
+                return Ok((
+                    headers,
+                    Json(AuthResponse {
+                        success: false,
+                        message: "Password change required".to_string(),
+                        user_id: Some(user.id),
+                        mfa_required: false,
+                        mfa_enrollment_required: false,
+                        mfa_setup: None,
+                        password_change_required: true,
+                    }),
+                ));
+            }
+
             // Check if user has MFA enabled
             if user.mfa_enabled {
                 // Create temporary MFA session
-                match state.auth_service.create_mfa_session(user.id).await {
+                match state
+                    .auth_service
+                    .create_mfa_session(user.id, "password")
+                    .await
+                {
                     Ok(mfa_token) => {
                         // Encrypt the MFA token
-                        let encrypted_token =
-                            state.cookie_crypto.encrypt(&mfa_token).map_err(|e| {
-                                error!("Failed to encrypt MFA token: {}", e);
-                                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        let encrypted_token = match state.cookie_crypto.encrypt(&mfa_token) {
+                            Ok(encrypted_token) => encrypted_token,
+                            Err(error) => {
+                                error!("Failed to encrypt MFA token: {}", error);
+                                record_login_failure(
+                                    state.as_ref(),
+                                    &metadata,
+                                    Some(user.id),
+                                    &login_email,
+                                    "password",
+                                    "mfa_session_encryption_failed",
+                                )
+                                .await;
+                                return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                                     .with_title("Authentication Error")
-                                    .with_detail("Could not process MFA session. Please try again.")
-                            })?;
+                                    .with_detail(
+                                        "Could not process MFA session. Please try again.",
+                                    ));
+                            }
+                        };
 
                         // Use the pre-calculated secure flag from metadata
 
@@ -644,7 +1130,27 @@ pub async fn login(
                             .same_site(cookie::SameSite::Strict)
                             .secure(metadata.is_secure)
                             .build();
-                        headers.insert(SET_COOKIE, mfa_cookie.to_string().parse().unwrap());
+                        let cookie_header = match mfa_cookie.to_string().parse() {
+                            Ok(cookie_header) => cookie_header,
+                            Err(error) => {
+                                error!("Failed to create MFA cookie header: {}", error);
+                                record_login_failure(
+                                    state.as_ref(),
+                                    &metadata,
+                                    Some(user.id),
+                                    &login_email,
+                                    "password",
+                                    "mfa_cookie_creation_failed",
+                                )
+                                .await;
+                                return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .with_title("Authentication Error")
+                                    .with_detail(
+                                        "Could not process MFA session. Please try again.",
+                                    ));
+                            }
+                        };
+                        headers.insert(SET_COOKIE, cookie_header);
 
                         Ok((
                             headers,
@@ -653,11 +1159,23 @@ pub async fn login(
                                 message: "MFA authentication required".to_string(),
                                 user_id: None,
                                 mfa_required: true,
+                                mfa_enrollment_required: false,
+                                mfa_setup: None,
+                                password_change_required: false,
                             }),
                         ))
                     }
                     Err(e) => {
                         error!("Failed to create MFA session: {}", e);
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "mfa_session_creation_failed",
+                        )
+                        .await;
                         Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                             .with_title("Authentication Error")
                             .with_detail("Could not initiate MFA verification. Please try again."))
@@ -684,13 +1202,26 @@ pub async fn login(
                 match state.auth_service.create_session(user.id).await {
                     Ok(session_token) => {
                         // Encrypt the session token
-                        let encrypted_token =
-                            state.cookie_crypto.encrypt(&session_token).map_err(|e| {
-                                error!("Failed to encrypt session token: {}", e);
-                                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        let encrypted_token = match state.cookie_crypto.encrypt(&session_token) {
+                            Ok(encrypted_token) => encrypted_token,
+                            Err(error) => {
+                                error!("Failed to encrypt session token: {}", error);
+                                record_login_failure(
+                                    state.as_ref(),
+                                    &metadata,
+                                    Some(user.id),
+                                    &login_email,
+                                    "password",
+                                    "session_encryption_failed",
+                                )
+                                .await;
+                                return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                                     .with_title("Authentication Error")
-                                    .with_detail("Could not secure your session. Please try again.")
-                            })?;
+                                    .with_detail(
+                                        "Could not secure your session. Please try again.",
+                                    ));
+                            }
+                        };
 
                         // Use the pre-calculated secure flag from metadata
 
@@ -737,25 +1268,25 @@ pub async fn login(
                                 message: "Login successful".to_string(),
                                 user_id: Some(user.id),
                                 mfa_required: false,
+                                mfa_enrollment_required: false,
+                                mfa_setup: None,
+                                password_change_required: false,
                             }),
                         ))
                     }
                     Err(e) => {
-                        if let Err(e) = state
-                            .audit_service
-                            .create_audit_log(&LoginAudit {
-                                context: AuditContext {
-                                    user_id: 0,
-                                    ip_address: Some(metadata.ip_address.to_string()),
-                                    user_agent: metadata.user_agent.as_str().to_string(),
-                                },
-                                success: false,
-                                login_method: "password".to_string(),
-                            })
-                            .await
-                        {
-                            error!("Failed to create audit log: {}", e);
-                        }
+                        // The credentials were already verified, so the actor
+                        // is known here. (This previously logged user_id 0,
+                        // which the audit FK rejected -- the row never landed.)
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "session_creation_failed",
+                        )
+                        .await;
                         error!("Failed to create session: {}", e);
                         Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                             .with_title("Login Failed")
@@ -767,25 +1298,46 @@ pub async fn login(
         Err(e) => match e {
             crate::auth_service::UserAuthError::InvalidCredentials
             | crate::auth_service::UserAuthError::UserNotFound => {
+                // Record the rejected attempt so credential probing leaves a
+                // trail. The account may not exist, so the actor is optional;
+                // the attempted email preserves the claimed identity either
+                // way. Volume is bounded by the login rate limiter.
+                record_login_failure(
+                    state.as_ref(),
+                    &metadata,
+                    None,
+                    &login_email,
+                    "password",
+                    "invalid_credentials",
+                )
+                .await;
                 Err(problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
             }
             crate::auth_service::UserAuthError::MfaRequiredForRole { user_id, role } => {
-                // Deliberately the *same* status/title/detail as
-                // InvalidCredentials above -- this error is only reachable
-                // after the password has already been verified correct, so
-                // a distinguishable response here would let an attacker use
-                // login attempts as an oracle to confirm a guessed admin
-                // password (and that the account holds the Admin role)
-                // without ever completing a login. The real reason is only
-                // ever surfaced server-side via this log line.
+                // This branch is reached after a valid password for an elevated
+                // account, so do not start MFA enrollment or disclose setup
+                // material here. Enrollment must happen from an already
+                // authenticated/trusted path; otherwise a stolen password could
+                // claim attacker-controlled MFA and complete admin login. Return
+                // the same response as invalid credentials to avoid making the
+                // role/MFA policy observable to password-guessing callers.
                 warn!(
                     user_id,
                     role = %role,
                     email = %login_email,
-                    "Login blocked: MFA is required for this role but is not enrolled"
+                    "Blocking password login for role requiring pre-enrolled MFA"
                 );
+                record_login_failure(
+                    state.as_ref(),
+                    &metadata,
+                    Some(user_id),
+                    &login_email,
+                    "password",
+                    "mfa_required_for_role",
+                )
+                .await;
                 Err(problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
@@ -798,136 +1350,20 @@ pub async fn login(
                     error = %e,
                     "Authentication system error during login"
                 );
+                record_login_failure(
+                    state.as_ref(),
+                    &metadata,
+                    None,
+                    &login_email,
+                    "password",
+                    "internal_error",
+                )
+                .await;
                 Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Authentication Error")
                     .with_detail("Authentication system error. Please try again later."))
             }
         },
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/auth/magic-link/request",
-    request_body = MagicLinkRequest,
-    responses(
-        (status = 200, description = "Magic link sent if email exists", body = AuthResponse),
-        (status = 400, description = "Bad request"),
-        (status = 503, description = "Email service not configured")
-    ),
-    tag = "Authentication"
-)]
-pub async fn request_magic_link(
-    State(state): State<Arc<AuthState>>,
-    Json(request): Json<MagicLinkRequest>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    if !state.auth_service.is_email_configured().await {
-        return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
-            .with_title("Email Service Not Configured")
-            .with_detail(
-                "Magic link authentication is not available without email configuration",
-            ));
-    }
-
-    match state
-        .auth_service
-        .send_magic_link(request.clone().into())
-        .await
-    {
-        Ok(_) => Ok(Json(AuthResponse {
-            success: true,
-            message: "If an account exists with this email, a magic link has been sent".to_string(),
-            user_id: None,
-            mfa_required: false,
-        })),
-        Err(_) => {
-            warn!("Failed to send magic link to email: {}", request.email);
-            // Always return success to prevent email enumeration
-            Ok(Json(AuthResponse {
-                success: true,
-                message: "If an account exists with this email, a magic link has been sent"
-                    .to_string(),
-                user_id: None,
-                mfa_required: false,
-            }))
-        }
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/auth/magic-link/verify",
-    params(
-        ("token" = String, Query, description = "Magic link token")
-    ),
-    responses(
-        (status = 200, description = "Magic link verified, session cookie set", body = AuthResponse),
-        (status = 400, description = "Invalid or expired token"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "Authentication"
-)]
-pub async fn verify_magic_link(
-    State(state): State<Arc<AuthState>>,
-    Query(query): Query<VerifyTokenQuery>,
-    Extension(metadata): Extension<RequestMetadata>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    match state.auth_service.verify_magic_link(&query.token).await {
-        Ok(user) => {
-            // Create session
-            match state.auth_service.create_session(user.id).await {
-                Ok(session_token) => {
-                    // Encrypt the session token
-                    let encrypted_token = state.cookie_crypto.encrypt(&session_token)?;
-
-                    // Create session cookie headers using pre-calculated secure flag
-                    let headers = state
-                        .auth_service
-                        .create_session_cookie(&encrypted_token, metadata.is_secure);
-
-                    // Create audit log for successful magic link login
-                    if let Err(e) = state
-                        .audit_service
-                        .create_audit_log(&LoginAudit {
-                            context: AuditContext {
-                                user_id: user.id,
-                                ip_address: Some(metadata.ip_address.to_string()),
-                                user_agent: metadata.user_agent.as_str().to_string(),
-                            },
-                            success: true,
-                            login_method: "magic_link".to_string(),
-                        })
-                        .await
-                    {
-                        error!("Failed to create audit log: {}", e);
-                    }
-
-                    Ok((
-                        headers,
-                        Json(AuthResponse {
-                            success: true,
-                            message: "Login successful".to_string(),
-                            user_id: Some(user.id),
-                            mfa_required: false,
-                        }),
-                    ))
-                }
-                Err(e) => {
-                    error!("Failed to create session after magic link: {}", e);
-                    Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("Session Error")
-                        .with_detail("Could not create your session. Please try again."))
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Magic link verification failed: {}", e);
-            Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid or Expired Link")
-                .with_detail(
-                    "This magic link is invalid or has expired. Please request a new one.",
-                ))
-        }
     }
 }
 
@@ -950,7 +1386,6 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 
     Json(EmailStatusResponse {
         email_configured,
-        magic_link_available: email_configured,
         password_reset_available: email_configured,
         oidc_providers,
     })
@@ -959,7 +1394,7 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 #[utoipa::path(
     post,
     path = "/auth/password-reset/request",
-    request_body = MagicLinkRequest,
+    request_body = EmailRequest,
     responses(
         (status = 200, description = "Reset email sent if account exists", body = AuthResponse),
         (status = 503, description = "Email service not configured")
@@ -968,7 +1403,7 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 )]
 pub async fn request_password_reset(
     State(state): State<Arc<AuthState>>,
-    Json(body): Json<MagicLinkRequest>,
+    Json(body): Json<EmailRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     if !state.auth_service.is_email_configured().await {
         return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
@@ -988,6 +1423,9 @@ pub async fn request_password_reset(
                         .to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
     }
@@ -1037,12 +1475,175 @@ pub async fn reset_password(
                     .to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
-        Err(e) => Err(problem_new(StatusCode::BAD_REQUEST)
-            .with_title("Password Reset Failed")
-            .with_detail(e.to_string())),
+        Err(crate::auth_service::UserAuthError::InvalidToken) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Password Reset Failed")
+                .with_detail("The password reset link is invalid or expired."))
+        }
+        Err(crate::auth_service::UserAuthError::WeakPassword(message)) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Password Requirements Not Met")
+                .with_detail(message))
+        }
+        Err(crate::auth_service::UserAuthError::SamePassword) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Choose a Different Password")
+                .with_detail("Your new password must differ from the temporary password."))
+        }
+        Err(error) => {
+            error!(error = %error, "Password reset failed internally");
+            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Password Reset Failed")
+                .with_detail("Could not reset the password. Please try again."))
+        }
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/password-change-required",
+    request_body = RequiredPasswordChangeRequest,
+    responses(
+        (status = 200, description = "Required password change completed", body = RequiredPasswordChangeResponse),
+        (status = 400, description = "Password does not meet requirements"),
+        (status = 401, description = "Password-change session is missing or expired"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Authentication"
+)]
+pub async fn change_required_password(
+    State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+    Json(request): Json<RequiredPasswordChangeRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    let encrypted_token = headers
+        .get_all("Cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookie_header| Cookie::split_parse(cookie_header).filter_map(Result::ok))
+        .find_map(|cookie| {
+            (cookie.name() == "password_change_session").then(|| cookie.value().to_string())
+        })
+        .ok_or_else(|| {
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Required")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    let token = state
+        .cookie_crypto
+        .decrypt(&encrypted_token)
+        .map_err(|error| {
+            warn!(error = %error, "Rejected invalid required password-change cookie");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Expired")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    let pending_user = state
+        .auth_service
+        .required_password_change_user(&token)
+        .await
+        .map_err(|error| {
+            error!(error = %error, "Failed to resolve required password-change session");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Expired")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    // Prepare the response cookie before changing the password. If header
+    // construction fails, the temporary credential remains usable and the
+    // user can safely retry instead of being locked out.
+    let clear_cookie = Cookie::build(("password_change_session", ""))
+        .http_only(true)
+        .path("/")
+        .max_age(cookie::time::Duration::seconds(0))
+        .same_site(cookie::SameSite::Strict)
+        .secure(metadata.is_secure)
+        .build();
+    let cookie_header = clear_cookie.to_string().parse().map_err(|error| {
+        error!(error = %error, "Failed to clear required password-change cookie");
+        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Password Change Failed")
+            .with_detail("Could not prepare the password change. Please try again.")
+    })?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.append(SET_COOKIE, cookie_header);
+
+    let requires_mfa_enrollment = state
+        .auth_service
+        .requires_mfa_enrollment(pending_user.id)
+        .await
+        .map_err(|error| {
+            error!(user_id = pending_user.id, error = %error, "Failed to evaluate MFA enrollment policy");
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Password Change Failed")
+                .with_detail("Could not prepare required MFA enrollment. Please try again.")
+        })?;
+
+    let user = state
+        .auth_service
+        .reset_required_password(crate::auth_service::ResetPasswordRequest {
+            token,
+            new_password: request.new_password,
+        })
+        .await
+        .map_err(|error| match error {
+            crate::auth_service::UserAuthError::WeakPassword(message) => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Password Requirements Not Met")
+                    .with_detail(message)
+            }
+            crate::auth_service::UserAuthError::SamePassword => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Choose a Different Password")
+                    .with_detail("Your new password must differ from the temporary password.")
+            }
+            crate::auth_service::UserAuthError::InvalidToken => {
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Password Change Session Expired")
+                    .with_detail("Log in again to restart the required password change.")
+            }
+            internal_error => {
+                error!(error = %internal_error, "Required password change failed internally");
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Password Change Failed")
+                    .with_detail("Could not change the password. Please try again.")
+            }
+        })?;
+
+    let audit = PasswordResetAudit {
+        context: AuditContext {
+            user_id: user.id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        username: user.name,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!(user_id = user.id, error = %error, "Failed to audit required password change");
+    }
+
+    Ok((
+        response_headers,
+        Json(RequiredPasswordChangeResponse {
+            success: true,
+            message: if requires_mfa_enrollment {
+                "Password changed. Log in to set up multi-factor authentication.".to_string()
+            } else {
+                "Password changed. Log in with your new password.".to_string()
+            },
+            user_id: user.id,
+            mfa_enrollment_required: requires_mfa_enrollment,
+            mfa_setup: None,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -1091,6 +1692,9 @@ pub async fn verify_email(
                 message: "Email verified successfully. You can now login.".to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
         Err(e) => Err(problem_new(StatusCode::BAD_REQUEST)
@@ -1126,6 +1730,12 @@ impl From<UserServiceError> for Problem {
             UserServiceError::MfaNotSetup(user_id) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("MFA not setup")
                 .with_detail(format!("MFA is not setup for user {}", user_id)),
+            UserServiceError::MfaAlreadyEnabled(user_id) => problem_new(StatusCode::CONFLICT)
+                .with_title("MFA already enabled")
+                .with_detail(format!(
+                    "MFA is already enabled for user {}. Disable it with current MFA verification before setting it up again.",
+                    user_id
+                )),
             UserServiceError::AlreadyDeleted(user_id) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("User already deleted")
                 .with_detail(format!("User {} is already deleted", user_id)),
@@ -1172,6 +1782,16 @@ impl From<UserServiceError> for Problem {
                     .with_title("Internal Error")
                     .with_detail("An unexpected error occurred. Please try again.")
             }
+            UserServiceError::CurrentPasswordRequired { .. } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Current Password Required")
+                    .with_detail("Provide your current password to enroll MFA.")
+            }
+            UserServiceError::InvalidCurrentPassword { .. } => {
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Current Password")
+                    .with_detail("The current password you entered is incorrect.")
+            }
         }
     }
 }
@@ -1192,7 +1812,7 @@ impl From<UserServiceError> for Problem {
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -1243,9 +1863,10 @@ async fn list_users(
 /// Reason a role-assignment request was denied by [`authorize_role_assignment`].
 #[derive(Debug, PartialEq, Eq)]
 enum RoleChangeDenied {
-    /// Caller is not an admin. `UsersWrite` alone (held by non-admin roles such
-    /// as `PlatformAdmin`) must not be sufficient to grant roles.
-    NotAdmin,
+    /// The presented credential lacks the `users:manage` permission. `UsersWrite`
+    /// alone (held by non-admin roles such as `PlatformAdmin`) is not sufficient
+    /// to grant roles.
+    MissingPermission,
     /// The path `user_id` and the body `user_id` disagree, leaving the target
     /// ambiguous. Historically the self-modification guard checked the path id
     /// while the mutation acted on the body id, so a mismatched pair bypassed it.
@@ -1254,26 +1875,29 @@ enum RoleChangeDenied {
     SelfModification,
 }
 
-/// Reason an admin-only mutation of another user was denied.
+/// Reason a `users:manage`-gated mutation of another user was denied.
 #[derive(Debug, PartialEq, Eq)]
 enum AdminTargetDenied {
-    /// The presented credential is not currently acting as an admin.
-    NotAdmin,
+    /// The presented credential lacks the `users:manage` permission.
+    MissingPermission,
     /// The credential owner attempted to mutate their own account or roles.
     SelfModification,
 }
 
-/// Authorize an admin-only mutation against another user.
+/// Authorize a `users:manage`-gated mutation against another user.
 ///
-/// This deliberately checks the presented credential's effective role. Looking
-/// up the owning user's database roles would let an admin-owned, restricted API
-/// key escape its `PlatformAdmin` or custom permission ceiling.
+/// The check is permission-based, not role-based: the capability can be carried
+/// either by a role that includes `users:manage` (only `Admin`) or by an API key
+/// explicitly granted it. It reads the presented credential's *effective*
+/// permissions, so an admin-owned key restricted below `users:manage` (e.g. a
+/// `PlatformAdmin`-scoped or custom `UsersWrite` key) is correctly rejected
+/// without consulting the owner's database roles.
 fn authorize_admin_target(
     auth: &AuthContext,
     target_user_id: i32,
 ) -> Result<(), AdminTargetDenied> {
-    if !auth.is_admin() {
-        return Err(AdminTargetDenied::NotAdmin);
+    if !auth.has_permission(&Permission::UsersManage) {
+        return Err(AdminTargetDenied::MissingPermission);
     }
     if target_user_id == auth.user_id() {
         return Err(AdminTargetDenied::SelfModification);
@@ -1286,15 +1910,15 @@ fn authorize_admin_target(
 /// This is the security precondition for the `assign_role` endpoint, factored
 /// out so every bypass path can be unit-tested without a full HTTP harness. It
 /// mirrors the guards on the sibling `remove_role`/`delete_user` handlers
-/// (admin-only, no self-modification) and additionally requires the path and
-/// body target ids to agree so there is exactly one, unambiguous target.
+/// (`users:manage` required, no self-modification) and additionally requires the
+/// path and body target ids to agree so there is exactly one, unambiguous target.
 fn authorize_role_assignment(
     auth: &AuthContext,
     path_user_id: i32,
     body_user_id: i32,
 ) -> Result<i32, RoleChangeDenied> {
-    if !auth.is_admin() {
-        return Err(RoleChangeDenied::NotAdmin);
+    if !auth.has_permission(&Permission::UsersManage) {
+        return Err(RoleChangeDenied::MissingPermission);
     }
     if path_user_id != body_user_id {
         return Err(RoleChangeDenied::TargetMismatch);
@@ -1334,17 +1958,15 @@ async fn assign_role(
     Path(user_id): Path<i32>,
     Json(assign_req): Json<AssignRoleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Assigning role {} to user {}",
         assign_req.role_type, assign_req.user_id
     );
 
-    // Authorize and resolve the single target: role mutation requires the admin
-    // role (UsersWrite alone is not enough, matching remove_role/delete_user),
-    // the path and body target ids must agree, and callers may not change their
-    // own roles.
+    // Authorize and resolve the single target: role mutation requires the
+    // `users:manage` permission (UsersWrite alone is not enough, matching
+    // remove_role/delete_user), the path and body target ids must agree, and
+    // callers may not change their own roles.
     let target_user_id =
         authorize_role_assignment(&auth, user_id, assign_req.user_id).map_err(|denied| {
             error!(
@@ -1356,11 +1978,18 @@ async fn assign_role(
                 RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
                     .detail("Path user_id and body user_id must match".to_string())
                     .build(),
-                RoleChangeDenied::NotAdmin | RoleChangeDenied::SelfModification => {
+                RoleChangeDenied::MissingPermission | RoleChangeDenied::SelfModification => {
                     temps_core::error_builder::forbidden().build()
                 }
             }
         })?;
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::AssignRole { user_id },
+    )
+    .await?;
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
@@ -1428,7 +2057,12 @@ async fn create_user(
     Extension(metadata): Extension<RequestMetadata>,
     Json(create_req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Creating a user (and assigning its roles) is gated on `users:manage`, not
+    // the broader `UsersWrite`: the latter is also held by `PlatformAdmin`, which
+    // must not be able to mint a brand-new `admin` account. There is no existing
+    // target here, so this is a plain permission gate rather than
+    // authorize_admin_target.
+    permission_guard!(auth, UsersManage);
 
     info!(
         "Creating new user with username: {} and email: {}",
@@ -1443,12 +2077,9 @@ async fn create_user(
         warn!("No password provided for new user - user will not be able to login with password!");
     }
 
-    // Convert role strings to RoleTypes
-    let roles: Vec<RoleType> = create_req
-        .roles
-        .iter()
-        .filter_map(|r| RoleType::from_str(r).ok())
-        .collect();
+    // Reject the entire request if any role is unknown. Silently discarding a
+    // role can create a different account than the administrator approved.
+    let roles = parse_user_roles(&create_req.roles)?;
 
     let user = app_state
         .user_service
@@ -1457,6 +2088,7 @@ async fn create_user(
             create_req.email.clone().unwrap_or("".to_string()),
             create_req.password.clone(),
             roles.clone(),
+            create_req.must_change_password,
         )
         .await?;
 
@@ -1472,7 +2104,7 @@ async fn create_user(
     let user_audit = UserCreatedAudit {
         context: audit_context,
         target_user_id: user.user.id,
-        username: create_req.username.clone(),
+        username: user.user.name.clone(),
         assigned_roles: roles.iter().map(|r| r.to_string()).collect(),
     };
 
@@ -1509,14 +2141,13 @@ async fn delete_user(
     Extension(metadata): Extension<RequestMetadata>,
     Path(user_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Request to delete user {} by user {}",
         user_id,
         auth.user_id()
     );
 
+    // `users:manage` gate (+ no self-deletion) lives in authorize_admin_target.
     if let Err(denied) = authorize_admin_target(&auth, user_id) {
         error!(
             "Denied user deletion by user {} for target {}: {:?}",
@@ -1577,14 +2208,13 @@ async fn remove_role(
     Extension(metadata): Extension<RequestMetadata>,
     Path((user_id, role_type)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Request to remove role {} from user {} by user {}",
         role_type,
         user_id,
         auth.user_id()
     );
+    // `users:manage` gate (+ no self-modification) lives in authorize_admin_target.
     if let Err(denied) = authorize_admin_target(&auth, user_id) {
         error!(
             "Denied role removal by user {} for target {}: {:?}",
@@ -1668,6 +2298,18 @@ async fn update_self(
             .build());
     }
 
+    // Email change is security-sensitive: it redirects account recovery and
+    // notification email. Require a step-up challenge when the request
+    // contains a new email address. Name-only edits are safe without it.
+    if update_req.email.is_some() {
+        crate::require_sensitive_action(
+            app_state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            temps_core::SensitiveAction::UpdateAccountEmail,
+        )
+        .await?;
+    }
+
     let updated_user = app_state
         .user_service
         .update_user(
@@ -1731,10 +2373,19 @@ async fn update_user(
     Path(user_id): Path<i32>,
     Json(update_req): Json<UpdateUserRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Check authentication
-    permission_guard!(auth, UsersWrite);
-
-    permission_guard!(auth, UsersWrite);
+    // Editing another user's account is gated on `users:manage` (+ no
+    // self-modification via authorize_admin_target); callers use PATCH /users/me
+    // to change their own details. UsersWrite alone (held by PlatformAdmin) is
+    // not sufficient.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied user update by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
 
     info!("Admin {} updating user {}", auth.user_id(), user_id);
 
@@ -1799,8 +2450,18 @@ async fn restore_user(
     Extension(metadata): Extension<RequestMetadata>,
     Path(user_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-    permission_guard!(auth, UsersWrite);
+    // Restoring a soft-deleted user is gated on `users:manage`, matching
+    // delete_user/remove_role. UsersWrite alone (held by PlatformAdmin) is not
+    // sufficient.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied user restore by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
 
     info!("Request to restore user {}", user_id);
 
@@ -1832,9 +2493,12 @@ async fn restore_user(
     tag = "Users",
     post,
     path = "/users/me/mfa/setup",
+    request_body = SetupMfaRequest,
     responses(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
-        (status = 401, description = "Unauthorized"),
+        (status = 400, description = "Current password is required but was not provided"),
+        (status = 401, description = "Unauthorized or current password is incorrect"),
+        (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -1844,10 +2508,14 @@ async fn restore_user(
 async fn setup_mfa(
     State(app_state): State<Arc<AuthState>>,
     RequireAuth(auth): RequireAuth,
+    Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
-    let setup_data = app_state.user_service.setup_mfa(auth.user_id()).await?;
+    let setup_data = app_state
+        .user_service
+        .setup_mfa(auth.user_id(), req.current_password.as_deref())
+        .await?;
     Ok(Json(MfaSetupResponse {
         secret_key: setup_data.secret_key,
         qr_code: setup_data.qr_code,
@@ -1865,7 +2533,7 @@ async fn setup_mfa(
         (status = 204, description = "Password updated"),
         (status = 400, description = "Validation error (weak password, same as current, MFA missing)"),
         (status = 401, description = "Current password incorrect or MFA code invalid"),
-        (status = 403, description = "Account has no password set (SSO/magic-link only)"),
+        (status = 403, description = "Account has no password set (SSO only)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1952,9 +2620,7 @@ async fn change_password_self(
             }
             crate::auth_service::AuthError::NoPasswordSet => problem_new(StatusCode::FORBIDDEN)
                 .with_title("No Password On Account")
-                .with_detail(
-                    "This account uses SSO or magic-link login and has no password to change.",
-                ),
+                .with_detail("This account uses SSO login and has no password to change."),
             other => {
                 error!("Password change failed: {}", other);
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -2075,33 +2741,43 @@ async fn disable_mfa(
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_role, authorize_admin_target, authorize_role_assignment, delete_user, remove_role,
-        AdminTargetDenied, AssignRoleRequest, RoleChangeDenied,
+        assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
+        create_user, delete_user, login, normalized_login_email, parse_user_roles,
+        record_pending_login, remove_role, restore_user, update_user, verify_mfa_challenge,
+        AdminTargetDenied, AssignRoleRequest, CreateUserRequest, LoginRequest, RoleChangeDenied,
+        UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
     use crate::permissions::{Permission, Role};
     use crate::state::AuthState;
+    use crate::types::MfaVerificationRequest;
+    use crate::user_service::UserServiceError;
     use crate::RequireAuth;
     use async_trait::async_trait;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::{Extension, Json};
     use chrono::Utc;
-    use sea_orm::{DatabaseBackend, MockDatabase};
-    use std::sync::Arc;
+    use sea_orm::{DatabaseBackend, DatabaseConnection, DbErr, MockDatabase};
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
     use temps_core::notifications::{
         EmailMessage, NotificationData, NotificationError, NotificationService,
     };
     use temps_core::{AuditLogger, RequestMetadata};
-    use temps_entities::{roles, user_roles, users};
+    use temps_entities::types::RoleType;
+    use temps_entities::{roles, sessions, user_roles, users};
 
-    // Regression tests for the `assign_role` privilege-escalation hole
-    // (security review finding #2). Two defects combined: (a) the handler only
-    // checked `UsersWrite`, never `is_admin()`, so a non-admin `PlatformAdmin`
-    // could grant the `admin` role; and (b) the self-modification guard checked
-    // the path id while the mutation used the body id, so a mismatched pair
-    // bypassed it. `authorize_role_assignment` is the extracted precondition.
+    // Regression tests for the user-management privilege-escalation hole. The
+    // handlers checked only `UsersWrite`, which `PlatformAdmin` (and admin-owned
+    // restricted API keys) also hold, so a non-admin could grant the `admin`
+    // role or mint an `admin` account; and `assign_role`'s self-modification
+    // guard checked the path id while the mutation used the body id, so a
+    // mismatched pair bypassed it. The fix gates these operations on the
+    // dedicated `users:manage` permission (held only by `Role::Admin`, or
+    // grantable directly to an API key). `authorize_role_assignment` /
+    // `authorize_admin_target` are the extracted, permission-based preconditions.
 
     fn test_user(id: i32) -> users::Model {
         let now = Utc::now();
@@ -2115,6 +2791,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -2149,6 +2826,58 @@ mod tests {
             _operation: &dyn temps_core::audit::AuditOperation,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedAudit {
+        operation_type: String,
+        user_id: Option<i32>,
+        data: Value,
+    }
+
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        events: Mutex<Vec<RecordedAudit>>,
+    }
+
+    impl RecordingAuditLogger {
+        fn events(&self) -> Vec<RecordedAudit> {
+            self.events
+                .lock()
+                .expect("recorded audit mutex is not poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            let data = serde_json::from_str(&operation.serialize()?)?;
+            self.events
+                .lock()
+                .expect("recorded audit mutex is not poisoned")
+                .push(RecordedAudit {
+                    operation_type: operation.operation_type(),
+                    user_id: operation.user_id(),
+                    data,
+                });
+            Ok(())
+        }
+    }
+
+    struct FailingAuditLogger;
+
+    #[async_trait]
+    impl AuditLogger for FailingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("audit storage unavailable")
         }
     }
 
@@ -2208,6 +2937,22 @@ mod tests {
         ))
     }
 
+    fn auth_state_with_audit(
+        db: DatabaseConnection,
+        audit: Arc<dyn AuditLogger>,
+    ) -> Arc<AuthState> {
+        Arc::new(AuthState::new(
+            Arc::new(db),
+            audit,
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "handler-regression-test",
+            )),
+            Arc::new(temps_core::CookieCrypto::from_bytes(&[7; 32])),
+            Arc::new(NoopNotificationService),
+            Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+        ))
+    }
+
     fn request_metadata() -> RequestMetadata {
         RequestMetadata {
             ip_address: "127.0.0.1".to_string(),
@@ -2226,6 +2971,285 @@ mod tests {
         assert_eq!(problem.status_code, expected);
     }
 
+    fn expect_problem<T>(
+        result: Result<T, temps_core::problemdetails::Problem>,
+        message: &str,
+    ) -> temps_core::problemdetails::Problem {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(problem) => problem,
+        }
+    }
+
+    #[test]
+    fn login_identifier_is_normalized_and_bounded_before_auditing() {
+        assert_eq!(
+            normalized_login_email("User@Example.COM"),
+            Some("user@example.com".to_string())
+        );
+        assert_eq!(normalized_login_email("not-an-email"), None);
+
+        let oversized = format!("{}@example.com", "é".repeat(300));
+        let bounded = bounded_audit_identity(&oversized);
+        assert!(bounded.len() <= 254);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn create_user_roles_are_strictly_validated() {
+        assert_eq!(
+            parse_user_roles(&["user".to_string(), "admin".to_string()])
+                .expect("known roles should parse"),
+            vec![RoleType::User, RoleType::Admin]
+        );
+
+        let result = parse_user_roles(&["user".to_string(), "administrator".to_string()]);
+        assert!(matches!(result, Err(UserServiceError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn invalid_login_identifier_is_audited_without_querying_the_database() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            audit.clone(),
+        );
+        let oversized = format!("{}@example.com", "x".repeat(500));
+
+        let result = login(
+            State(state),
+            Extension(request_metadata()),
+            Json(LoginRequest {
+                email: oversized,
+                password: "irrelevant".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "invalid identifier must be rejected"),
+            StatusCode::UNAUTHORIZED,
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, "LOGIN_FAILURE");
+        assert_eq!(events[0].user_id, None);
+        assert_eq!(events[0].data["reason"], "invalid_identifier");
+        assert!(
+            events[0].data["attempted_email"]
+                .as_str()
+                .expect("attempted email is a string")
+                .len()
+                <= 254
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_does_not_change_login_rejection() {
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            Arc::new(FailingAuditLogger),
+        );
+
+        let result = login(
+            State(state),
+            Extension(request_metadata()),
+            Json(LoginRequest {
+                email: "not-an-email".to_string(),
+                password: "irrelevant".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(
+                result,
+                "invalid identifier must remain rejected when auditing fails",
+            ),
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_password_and_mfa_logins_are_durably_audited() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            audit.clone(),
+        );
+        let metadata = request_metadata();
+
+        record_pending_login(state.as_ref(), &metadata, 41, "password-change-required").await;
+        record_pending_login(
+            state.as_ref(),
+            &metadata,
+            42,
+            "password-mfa-enrollment-pending",
+        )
+        .await;
+
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[0].user_id, Some(41));
+        assert_eq!(events[0].data["login_method"], "password-change-required");
+        assert_eq!(events[1].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[1].user_id, Some(42));
+        assert_eq!(
+            events[1].data["login_method"],
+            "password-mfa-enrollment-pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_login_audit_failure_does_not_block_authentication_progress() {
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            Arc::new(FailingAuditLogger),
+        );
+
+        record_pending_login(
+            state.as_ref(),
+            &request_metadata(),
+            41,
+            "password-change-required",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_are_audited_with_normalized_identity() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<users::Model>::new()])
+            .into_connection();
+        let state = auth_state_with_audit(db, audit.clone());
+
+        let result = login(
+            State(state),
+            Extension(request_metadata()),
+            Json(LoginRequest {
+                email: "Nobody@Example.COM".to_string(),
+                password: "incorrect".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "invalid credentials must be rejected"),
+            StatusCode::UNAUTHORIZED,
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, "LOGIN_FAILURE");
+        assert_eq!(events[0].user_id, None);
+        assert_eq!(events[0].data["attempted_email"], "nobody@example.com");
+        assert_eq!(events[0].data["reason"], "invalid_credentials");
+    }
+
+    fn mfa_headers(state: &AuthState, session_token: &str) -> HeaderMap {
+        let encrypted = state
+            .cookie_crypto
+            .encrypt(session_token)
+            .expect("test MFA session encrypts");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("mfa_session={encrypted}")
+                .parse()
+                .expect("test cookie header is valid"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn missing_mfa_cookie_is_recorded_as_a_rejection() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            audit.clone(),
+        );
+
+        let result = verify_mfa_challenge(
+            State(state),
+            Extension(request_metadata()),
+            HeaderMap::new(),
+            Json(MfaVerificationRequest {
+                code: "123456".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "missing MFA cookie must be rejected"),
+            StatusCode::UNAUTHORIZED,
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, "MFA_VERIFICATION_FAILED");
+        assert_eq!(events[0].user_id, None);
+        assert_eq!(events[0].data["reason"], "missing_session_cookie");
+    }
+
+    #[tokio::test]
+    async fn expired_mfa_session_is_recorded_as_a_rejection() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<sessions::Model>::new()])
+            .into_connection();
+        let state = auth_state_with_audit(db, audit.clone());
+        let headers = mfa_headers(state.as_ref(), "expired-session");
+
+        let result = verify_mfa_challenge(
+            State(state),
+            Extension(request_metadata()),
+            headers,
+            Json(MfaVerificationRequest {
+                code: "123456".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "expired MFA session must be rejected"),
+            StatusCode::UNAUTHORIZED,
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_type, "MFA_VERIFICATION_FAILED");
+        assert_eq!(events[0].user_id, None);
+        assert_eq!(events[0].data["reason"], "invalid_or_expired_session");
+    }
+
+    #[tokio::test]
+    async fn mfa_database_failure_is_not_recorded_as_a_bad_code() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("database unavailable".to_string())])
+            .into_connection();
+        let state = auth_state_with_audit(db, audit.clone());
+        let headers = mfa_headers(state.as_ref(), "pending-session");
+
+        let result = verify_mfa_challenge(
+            State(state),
+            Extension(request_metadata()),
+            headers,
+            Json(MfaVerificationRequest {
+                code: "123456".to_string(),
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "database failure must be internal"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(
+            audit.events().is_empty(),
+            "an infrastructure error must not become a false MFA rejection audit"
+        );
+    }
+
     #[test]
     fn admin_assigning_to_another_user_is_allowed() {
         // caller=1 (admin) assigns to user 2, path and body agree.
@@ -2242,11 +3266,11 @@ mod tests {
         assert!(!auth.is_admin());
         assert_eq!(
             authorize_role_assignment(&auth, 2, 2),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
             authorize_admin_target(&auth, 2),
-            Err(AdminTargetDenied::NotAdmin)
+            Err(AdminTargetDenied::MissingPermission)
         );
     }
 
@@ -2257,11 +3281,11 @@ mod tests {
         assert!(!auth.is_admin());
         assert_eq!(
             authorize_role_assignment(&auth, 2, 2),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
             authorize_admin_target(&auth, 2),
-            Err(AdminTargetDenied::NotAdmin)
+            Err(AdminTargetDenied::MissingPermission)
         );
     }
 
@@ -2271,6 +3295,28 @@ mod tests {
         assert!(auth.is_admin());
         assert_eq!(authorize_role_assignment(&auth, 2, 2), Ok(2));
         assert_eq!(authorize_admin_target(&auth, 2), Ok(()));
+    }
+
+    #[test]
+    fn api_key_granted_users_manage_permission_is_authorized() {
+        // The point of gating on a permission rather than a role: a key that is
+        // NOT an admin role but was explicitly granted `users:manage` may manage
+        // users, while a key holding only the broader `UsersWrite` may not.
+        let manage_key = api_key_auth(None, Some(vec![Permission::UsersManage]));
+        assert!(!manage_key.is_admin());
+        assert!(manage_key.has_permission(&Permission::UsersManage));
+        assert_eq!(authorize_role_assignment(&manage_key, 2, 2), Ok(2));
+        assert_eq!(authorize_admin_target(&manage_key, 2), Ok(()));
+
+        let write_only_key = api_key_auth(None, Some(vec![Permission::UsersWrite]));
+        assert_eq!(
+            authorize_role_assignment(&write_only_key, 2, 2),
+            Err(RoleChangeDenied::MissingPermission)
+        );
+        assert_eq!(
+            authorize_admin_target(&write_only_key, 2),
+            Err(AdminTargetDenied::MissingPermission)
+        );
     }
 
     #[test]
@@ -2305,7 +3351,7 @@ mod tests {
         let auth = session_auth(Role::PlatformAdmin);
         assert_eq!(
             authorize_role_assignment(&auth, 2, 1),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
     }
 
@@ -2406,6 +3452,81 @@ mod tests {
 
             match result {
                 Ok(_) => panic!("restricted API key unexpectedly removed a role"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = create_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Json(CreateUserRequest {
+                    username: "provisioned-user".to_string(),
+                    email: Some("provisioned@example.com".to_string()),
+                    password: Some("a-valid-passphrase".to_string()),
+                    // Requesting the admin role is the case the gate must stop a
+                    // restricted credential from performing.
+                    roles: vec!["admin".to_string()],
+                    must_change_password: true,
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly created a user"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = update_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Path(2),
+                Json(UpdateUserRequest {
+                    email: Some("changed@example.com".to_string()),
+                    name: None,
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly updated a user"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = restore_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly restored a user"),
                 Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
             }
         }

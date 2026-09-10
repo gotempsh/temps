@@ -1,7 +1,15 @@
-use chrono::Utc;
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use crate::traffic_aggregation::{
+    TrafficAggregationRequest, TrafficAggregationResponse, MAX_TRAFFIC_PAGE_SIZE,
+};
+use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use temps_core::UtcDateTime;
 use temps_entities::proxy_logs;
 use thiserror::Error;
@@ -9,11 +17,34 @@ use utoipa::ToSchema;
 
 #[derive(Error, Debug)]
 pub enum ProxyLogServiceError {
-    #[error("Database error")]
+    #[error("Database error: {0}")]
     DatabaseError(#[from] sea_orm::DbErr),
 
     #[error("Invalid filter parameters: {0}")]
     InvalidFilter(String),
+
+    #[error("Traffic aggregation rate limit exceeded: {reason}")]
+    TrafficAggregationRateLimited { reason: &'static str },
+
+    #[error("Traffic aggregation exceeded its {timeout_seconds}-second execution deadline")]
+    TrafficAggregationTimeout { timeout_seconds: u64 },
+
+    /// The grouping produced more distinct groups than the storage backend will
+    /// aggregate (ClickHouse `max_rows_to_group_by` with
+    /// `group_by_overflow_mode = throw`).
+    ///
+    /// This is the ceiling that the old blanket 7-day cap on high-cardinality
+    /// dimensions was standing in for. Reporting it directly is strictly better:
+    /// it fires only for the projects that actually exceed the limit, and it can
+    /// say what to change. Grouping by raw `path` is the usual trigger, since
+    /// paths are not template-normalized and `/users/1` and `/users/2` count as
+    /// two groups.
+    #[error(
+        "Traffic aggregation grouped by {dimensions} produced more than {max_groups} \
+         distinct groups over this time range. Narrow the range, add a filter, or \
+         group by fewer dimensions."
+    )]
+    TrafficAggregationTooManyGroups { dimensions: String, max_groups: u64 },
 
     /// A ClickHouse operation failed. `operation` names the storage method
     /// (e.g. `list_with_filters`, `write_batch`) so logs/responses can identify
@@ -59,6 +90,39 @@ pub struct ProxyLogResponse {
     pub request_size_bytes: Option<i64>,
     pub response_size_bytes: Option<i64>,
     pub cache_status: Option<String>,
+    /// Inbound request headers, credential values already replaced with
+    /// `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+    /// predates header capture or was written by a path that doesn't record
+    /// them; an empty map means "captured, but no headers", which is different
+    /// and worth being able to tell apart.
+    ///
+    /// A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+    /// typed and the UI gets a stable alphabetical ordering for free.
+    pub request_headers: Option<BTreeMap<String, String>>,
+    /// Upstream response headers, redacted on the same terms as
+    /// [`Self::request_headers`].
+    pub response_headers: Option<BTreeMap<String, String>>,
+}
+
+/// Convert a stored header blob into a typed, sorted map.
+///
+/// Headers are persisted as a flat JSON object. A non-object blob yields `None`
+/// rather than being surfaced half-parsed — a malformed blob is a storage-layer
+/// bug, and rendering fragments of it in the console would be misleading.
+/// Non-string values shouldn't occur (the proxy writes `HashMap<String,
+/// String>`) but are stringified rather than dropped, so a surprise is visible
+/// instead of silently missing.
+fn headers_from_json(value: Option<serde_json::Value>) -> Option<BTreeMap<String, String>> {
+    let object = value?.as_object()?.clone();
+    Some(
+        object
+            .into_iter()
+            .map(|(name, value)| match value {
+                serde_json::Value::String(text) => (name, text),
+                other => (name, other.to_string()),
+            })
+            .collect(),
+    )
 }
 
 impl From<proxy_logs::Model> for ProxyLogResponse {
@@ -97,6 +161,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             request_size_bytes: model.request_size_bytes,
             response_size_bytes: model.response_size_bytes,
             cache_status: model.cache_status,
+            request_headers: headers_from_json(model.request_headers),
+            response_headers: headers_from_json(model.response_headers),
         }
     }
 }
@@ -166,6 +232,58 @@ pub struct ProxyLogService {
     /// [`crate::storage::TimescaleDbProxyLogStore`] holds internally as its read
     /// relay, so the TimescaleDB trait impl never recurses back into a dispatch.
     storage: Option<Arc<dyn crate::storage::ProxyLogStorage>>,
+    aggregate_slots: Arc<tokio::sync::Semaphore>,
+    aggregate_limits: moka::future::Cache<i32, Arc<AggregateLimitState>>,
+}
+
+const MAX_CONCURRENT_TRAFFIC_AGGREGATIONS: usize = 4;
+const MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE: usize = 60;
+const TRAFFIC_AGGREGATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct AggregateLimitState {
+    recent_requests: Mutex<VecDeque<Instant>>,
+}
+
+impl AggregateLimitState {
+    fn record_request(&self, now: Instant) -> bool {
+        let mut requests = self
+            .recent_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = now - Duration::from_secs(60);
+        while requests.front().is_some_and(|started| *started <= cutoff) {
+            requests.pop_front();
+        }
+        if requests.len() >= MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE {
+            return false;
+        }
+        requests.push_back(now);
+        true
+    }
+}
+
+fn aggregate_limit_cache() -> moka::future::Cache<i32, Arc<AggregateLimitState>> {
+    moka::future::Cache::builder()
+        .max_capacity(1_024)
+        .time_to_idle(Duration::from_secs(10 * 60))
+        .build()
+}
+
+/// The ±1-day lookup window around a row's event time, used to bound
+/// hypertable/partition scans in the single-row lookups. Uses checked
+/// arithmetic and saturates at the representable range so a hostile or absurd
+/// `timestamp` query parameter (e.g. `+262142-12-31`) can never panic the
+/// handler on overflow — a bare `ts + Duration::days(1)` would `expect()`.
+fn day_window(ts: UtcDateTime) -> (UtcDateTime, UtcDateTime) {
+    let day = chrono::Duration::days(1);
+    let lo = ts
+        .checked_sub_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+    let hi = ts
+        .checked_add_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    (lo, hi)
 }
 
 impl ProxyLogService {
@@ -175,6 +293,10 @@ impl ProxyLogService {
             db,
             ip_service,
             storage: None,
+            aggregate_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRAFFIC_AGGREGATIONS,
+            )),
+            aggregate_limits: aggregate_limit_cache(),
         }
     }
 
@@ -192,7 +314,51 @@ impl ProxyLogService {
             db,
             ip_service,
             storage: Some(storage),
+            aggregate_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRAFFIC_AGGREGATIONS,
+            )),
+            aggregate_limits: aggregate_limit_cache(),
         }
+    }
+
+    pub async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+        request.validate()?;
+        let project_limit = self
+            .aggregate_limits
+            .get_with(project_id, async {
+                Arc::new(AggregateLimitState::default())
+            })
+            .await;
+        if !project_limit.record_request(Instant::now()) {
+            return Err(ProxyLogServiceError::TrafficAggregationRateLimited {
+                reason: "project request budget exhausted",
+            });
+        }
+        let _permit = self.aggregate_slots.try_acquire().map_err(|_| {
+            ProxyLogServiceError::TrafficAggregationRateLimited {
+                reason: "server aggregation capacity exhausted",
+            }
+        })?;
+
+        let query = async {
+            if let Some(storage) = &self.storage {
+                return storage.aggregate_traffic(project_id, request).await;
+            }
+            let storage = crate::storage::TimescaleDbProxyLogStore::new(
+                self.db.clone(),
+                self.ip_service.clone(),
+            );
+            crate::storage::ProxyLogStorage::aggregate_traffic(&storage, project_id, request).await
+        };
+        tokio::time::timeout(TRAFFIC_AGGREGATION_TIMEOUT, query)
+            .await
+            .map_err(|_| ProxyLogServiceError::TrafficAggregationTimeout {
+                timeout_seconds: TRAFFIC_AGGREGATION_TIMEOUT.as_secs(),
+            })?
     }
 
     /// Create a new proxy log entry asynchronously
@@ -200,6 +366,12 @@ impl ProxyLogService {
         &self,
         mut request: CreateProxyLogRequest,
     ) -> Result<proxy_logs::Model, ProxyLogServiceError> {
+        // Strip credentials before anything is written. The batched hot path
+        // redacts in `send_or_drop`; this is the other way a row reaches the
+        // table, so it redacts too — a caller must not be able to persist a
+        // `Cookie` header or an OAuth `?code=` by picking this entry point.
+        crate::redaction::redact_log_entry(&mut request);
+
         let now = Utc::now();
         let created_date = now.date_naive();
 
@@ -295,20 +467,17 @@ impl ProxyLogService {
     }
 
     /// Get proxy logs with filters and pagination
-    pub async fn list_with_filters(
-        &self,
+    /// Build the filtered + sorted Sea-ORM select for the proxy-log list.
+    ///
+    /// Returns the query plus whether any narrowing predicate was applied
+    /// (drives the planner-stats approximate-count fast path in
+    /// [`Self::list_with_filters`]). Shared by the counted pagination path and
+    /// the count-free [`Self::list_page`] feed path so the two can never drift.
+    fn build_list_query(
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         filters: crate::handler::proxy_logs::ProxyLogsQuery,
-        page: u64,
-        page_size: u64,
-    ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
-        if let Some(storage) = &self.storage {
-            return storage
-                .list_with_filters(start_date, end_date, filters, page, page_size)
-                .await;
-        }
-
+    ) -> (sea_orm::Select<proxy_logs::Entity>, bool) {
         let mut query = proxy_logs::Entity::find();
 
         // Whether any narrowing predicate is set. When nothing is filtered,
@@ -328,7 +497,9 @@ impl ProxyLogService {
             || filters.method.is_some()
             || filters.host.is_some()
             || filters.path.is_some()
+            || filters.path_exact.is_some()
             || filters.client_ip.is_some()
+            || filters.exclude_synthetic == Some(true)
             || filters.status_code.is_some()
             || filters.response_time_min.is_some()
             || filters.response_time_max.is_some()
@@ -340,6 +511,7 @@ impl ProxyLogService {
             || filters.operating_system.is_some()
             || filters.device_type.is_some()
             || filters.is_bot.is_some()
+            || filters.exclude_bots == Some(true)
             || filters.bot_name.is_some()
             || filters.ai_provider.is_some()
             || filters.ai_agent.is_some()
@@ -375,7 +547,17 @@ impl ProxyLogService {
             query = query.filter(proxy_logs::Column::Timestamp.gte(start_date));
         }
         if let Some(end_date) = end_date {
-            query = query.filter(proxy_logs::Column::Timestamp.lte(end_date));
+            query = query.filter(proxy_logs::Column::Timestamp.lt(end_date));
+        }
+
+        if filters.exclude_synthetic == Some(true) {
+            query = query
+                .filter(proxy_logs::Column::RequestSource.ne("temps_monitor"))
+                .filter(
+                    Condition::any()
+                        .add(proxy_logs::Column::UserAgent.is_null())
+                        .add(proxy_logs::Column::UserAgent.not_like("Temps-Status-Monitor/%")),
+                );
         }
 
         // Request filters
@@ -387,6 +569,9 @@ impl ProxyLogService {
         }
         if let Some(path) = filters.path {
             query = query.filter(proxy_logs::Column::Path.contains(&path));
+        }
+        if let Some(path) = filters.path_exact {
+            query = query.filter(proxy_logs::Column::Path.eq(path));
         }
         if let Some(ip) = filters.client_ip {
             query = query.filter(proxy_logs::Column::ClientIp.eq(ip));
@@ -431,6 +616,15 @@ impl ProxyLogService {
         // Bot filters
         if let Some(is_bot) = filters.is_bot {
             query = query.filter(proxy_logs::Column::IsBot.eq(is_bot));
+        }
+        if filters.exclude_bots == Some(true) {
+            // Tri-state exclusion: drop detected bots but keep rows whose
+            // is_bot is NULL (older rows without detection metadata).
+            query = query.filter(
+                proxy_logs::Column::IsBot
+                    .eq(false)
+                    .or(proxy_logs::Column::IsBot.is_null()),
+            );
         }
         if let Some(bot_name) = filters.bot_name {
             query = query.filter(proxy_logs::Column::BotName.contains(&bot_name));
@@ -544,6 +738,141 @@ impl ProxyLogService {
             _ => query.order_by_desc(sort_col),
         };
 
+        (query, has_filters)
+    }
+
+    /// Resolve a caller-supplied range into a bounded, capped window.
+    ///
+    /// Delegates to [`temps_core::time_window`], which owns the contract shared
+    /// by every high-volume read endpoint: a default lower bound so omitting a
+    /// date never means "scan the retention window", and a maximum span so a
+    /// single request cannot ask for a query that takes tens of seconds. See
+    /// that module for the measurements behind both numbers.
+    ///
+    /// `project_scoped` selects which cap applies — pass `true` only when the
+    /// caller's OWN filters already narrow to one `project_id`. A query with no
+    /// project filter scans every project's rows and must stay on the tighter
+    /// unscoped cap no matter what the caller intends to do with the result.
+    ///
+    /// Returns the window as the `(start, end)` pair the storage layer takes,
+    /// so callers stay unchanged apart from the `?`.
+    fn resolve_window(
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        project_scoped: bool,
+    ) -> Result<(Option<UtcDateTime>, Option<UtcDateTime>), ProxyLogServiceError> {
+        let max_days = if project_scoped {
+            temps_core::time_window::MAX_WINDOW_DAYS_SCOPED
+        } else {
+            temps_core::time_window::MAX_WINDOW_DAYS
+        };
+        let window = temps_core::time_window::resolve_with_max(
+            start_date,
+            end_date,
+            chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
+            chrono::Duration::days(max_days),
+        )
+        .map_err(|e| ProxyLogServiceError::InvalidFilter(e.to_string()))?;
+        Ok((Some(window.start), window.end))
+    }
+
+    /// Reject a range wider than the applicable cap (see [`Self::resolve_window`]
+    /// for how `project_scoped` is chosen).
+    ///
+    /// The stats endpoints take a REQUIRED range, so there is nothing to
+    /// default — only the width needs enforcing. These are GROUP BY scans
+    /// rather than sorted pages, so they are cheaper per row, but an unscoped
+    /// one still reads every row in the window and a month-wide request is
+    /// seconds of work on a 150M-row table.
+    fn enforce_window_span(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        project_scoped: bool,
+    ) -> Result<(), ProxyLogServiceError> {
+        Self::resolve_window(Some(start_time), Some(end_time), project_scoped).map(|_| ())
+    }
+
+    /// Reject a `bucket_interval` that would emit more than
+    /// [`temps_core::time_window::MAX_SERIES_POINTS`] buckets over `[start, end)`.
+    ///
+    /// Window-width caps alone are not enough: `1 minute` over 7 days is a
+    /// legal interval string and a legal window, but ~10k `time_bucket_gapfill`
+    /// buckets. The UI already coarsens with window size; this is the API
+    /// backstop for a crafted query.
+    fn enforce_bucket_count(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+    ) -> Result<(), ProxyLogServiceError> {
+        if !Self::is_valid_interval(bucket_interval) {
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            )));
+        }
+        let step_secs = Self::interval_to_seconds(bucket_interval).ok_or_else(|| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            ))
+        })?;
+        let span_secs = (end_time - start_time).num_seconds().max(1);
+        let buckets = temps_core::time_window::bucket_count(span_secs, step_secs);
+        let max = temps_core::time_window::MAX_SERIES_POINTS;
+        if buckets > max {
+            let min_step_secs = temps_core::time_window::min_step_secs(span_secs);
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "bucket_interval '{bucket_interval}' would produce {buckets} buckets over this window, which exceeds the {max}-point maximum. Use an interval of at least {min_step_secs} seconds."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Convert a validated `"N unit"` interval into seconds for the bucket-count
+    /// cap. Sub-second units collapse to 1-second buckets (same floor as the
+    /// ClickHouse path). Months/years are approximated; charts never request them.
+    pub(crate) fn interval_to_seconds(interval: &str) -> Option<i64> {
+        let parts: Vec<&str> = interval.split_whitespace().collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let n: i64 = parts[0].parse().ok()?;
+        let unit_secs: i64 = match parts[1] {
+            "microsecond" | "microseconds" | "millisecond" | "milliseconds" | "second"
+            | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 3_600,
+            "day" | "days" => 86_400,
+            "week" | "weeks" => 604_800,
+            "month" | "months" => 2_592_000,
+            "year" | "years" => 31_536_000,
+            _ => return None,
+        };
+        Some(n.saturating_mul(unit_secs).max(1))
+    }
+
+    pub async fn list_with_filters(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: crate::handler::proxy_logs::ProxyLogsQuery,
+        page: u64,
+        page_size: u64,
+    ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
+        // Bound the window before dispatching so BOTH storage backends get the
+        // same treatment — the TimescaleDB hypertable needs chunk exclusion for
+        // the same reason ClickHouse needs partition pruning.
+        let (start_date, end_date) =
+            Self::resolve_window(start_date, end_date, filters.project_id.is_some())?;
+
+        if let Some(storage) = &self.storage {
+            return storage
+                .list_with_filters(start_date, end_date, filters, page, page_size)
+                .await;
+        }
+
+        let (query, has_filters) = Self::build_list_query(start_date, end_date, filters);
+
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let (total, _) = temps_database::count_for_pagination(
             self.db.as_ref(),
@@ -555,6 +884,36 @@ impl ProxyLogService {
         let items = paginator.fetch_page(page - 1).await?;
 
         Ok((items, total))
+    }
+
+    /// Newest-first page of proxy logs WITHOUT the pagination total.
+    ///
+    /// [`Self::list_with_filters`] always computes the total (an exact
+    /// `COUNT(*)` over the filtered hypertable range when any predicate
+    /// narrows the set; a merge-on-read `count() FINAL` on ClickHouse).
+    /// Feed-style callers — the unified Observe stream — render a page and
+    /// discard the total, so this path skips the aggregate entirely and does
+    /// a single LIMIT'd, index-friendly select.
+    pub async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: crate::handler::proxy_logs::ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        // Same bounding as list_with_filters — this is the count-free variant
+        // the Observe feed uses, not a laxer one. The Observe feed always sets
+        // `project_id`, so its requests get the scoped cap here too.
+        let (start_date, end_date) =
+            Self::resolve_window(start_date, end_date, filters.project_id.is_some())?;
+
+        if let Some(storage) = &self.storage {
+            return storage
+                .list_page(start_date, end_date, filters, limit)
+                .await;
+        }
+        let (query, _has_filters) = Self::build_list_query(start_date, end_date, filters);
+        Ok(query.limit(limit).all(self.db.as_ref()).await?)
     }
 
     /// Legacy method - kept for backward compatibility
@@ -580,7 +939,9 @@ impl ProxyLogService {
             method: None,
             host: None,
             path: None,
+            path_exact: None,
             client_ip: None,
+            exclude_synthetic: None,
             status_code,
             response_time_min: None,
             response_time_max: None,
@@ -592,6 +953,7 @@ impl ProxyLogService {
             operating_system: None,
             device_type: None,
             is_bot: None,
+            exclude_bots: None,
             bot_name: None,
             ai_provider: None,
             ai_agent: None,
@@ -623,7 +985,8 @@ impl ProxyLogService {
     /// Get a single proxy log by ID.
     ///
     /// `proxy_logs` is a TimescaleDB hypertable partitioned by `timestamp`
-    /// (1-day chunks, compressed after 7 days), so a bare `WHERE id = $1`
+    /// (1-day chunks, compressed after 24 hours by default), so a bare
+    /// `WHERE id = $1`
     /// cannot exclude any chunk and must decompress every compressed chunk —
     /// observed as multi-second lookups. When the caller knows the row's event
     /// time (the list endpoint returns it), a ±1-day bound reduces the lookup
@@ -640,19 +1003,20 @@ impl ProxyLogService {
         }
 
         if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
             let log = proxy_logs::Entity::find()
                 .filter(proxy_logs::Column::Id.eq(id))
-                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
-                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
                 .one(self.db.as_ref())
                 .await?;
             return Ok(log);
         }
 
-        // Compression policy compresses chunks older than 7 days; probing the
+        // Compression defaults to chunks older than 24 hours; probing that
         // uncompressed window first keeps the common case (recent log, no
         // timestamp supplied) off the decompression path.
-        let recent_cutoff = Utc::now() - chrono::Duration::days(7);
+        let recent_cutoff = Utc::now() - chrono::Duration::hours(24);
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::Id.eq(id))
             .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
@@ -668,16 +1032,54 @@ impl ProxyLogService {
         Ok(log)
     }
 
-    /// Get proxy logs by request ID (for tracing)
+    /// Get proxy logs by request ID (for tracing).
+    ///
+    /// Same hypertable caveat as [`Self::get_by_id`]: a bare
+    /// `WHERE request_id = $1` cannot exclude any chunk. When the caller knows
+    /// the row's event time (the list endpoint returns it per row), a ±1-day
+    /// bound reduces the lookup to the couple of chunks that can contain the
+    /// row; otherwise the recent uncompressed window is probed first and the
+    /// unbounded scan only runs as a last resort so bare deep-links keep
+    /// resolving.
     pub async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
         if let Some(storage) = &self.storage {
-            return storage.get_by_request_id(request_id).await;
+            return storage.get_by_request_id(request_id, timestamp).await;
         }
+
+        // request_id has no unique index (a hypertable can't enforce uniqueness
+        // without the partitioning column), so on the off chance of a collision
+        // pick the newest row — matching the ClickHouse backend's
+        // `ORDER BY timestamp DESC LIMIT 1`.
+        if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
+            let log = proxy_logs::Entity::find()
+                .filter(proxy_logs::Column::RequestId.eq(request_id))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
+                .order_by_desc(proxy_logs::Column::Timestamp)
+                .one(self.db.as_ref())
+                .await?;
+            return Ok(log);
+        }
+
+        let recent_cutoff = Utc::now() - chrono::Duration::hours(24);
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::RequestId.eq(request_id))
+            .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
+            .order_by_desc(proxy_logs::Column::Timestamp)
+            .one(self.db.as_ref())
+            .await?;
+        if log.is_some() {
+            return Ok(log);
+        }
+
+        let log = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq(request_id))
+            .order_by_desc(proxy_logs::Column::Timestamp)
             .one(self.db.as_ref())
             .await?;
         Ok(log)
@@ -714,18 +1116,16 @@ impl ProxyLogService {
         bucket_interval: String, // e.g., "1 hour", "1 day", "5 minutes"
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
+        let project_scoped = filters.as_ref().is_some_and(|f| f.project_id.is_some());
+        Self::enforce_window_span(start_time, end_time, project_scoped)?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
                 .await;
         }
-        // Validate bucket interval
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
-        }
+        // Interval already checked by enforce_bucket_count.
 
         // Serve from the 1-minute continuous aggregate when it can answer
         // this query: every set filter is a grouping column of the aggregate
@@ -736,9 +1136,23 @@ impl ProxyLogService {
             && Self::is_minute_multiple_interval(&bucket_interval)
             && self.stats_cagg_exists().await
         {
-            return self
-                .get_time_bucket_stats_from_cagg(start_time, end_time, bucket_interval, filters)
-                .await;
+            let mut stats = self
+                .get_time_bucket_stats_from_cagg(
+                    start_time,
+                    end_time,
+                    bucket_interval.clone(),
+                    filters.clone(),
+                )
+                .await?;
+            self.attach_response_time_percentiles(
+                &mut stats,
+                start_time,
+                end_time,
+                &bucket_interval,
+                filters.as_ref(),
+            )
+            .await?;
+            return Ok(stats);
         }
 
         // Build the base WHERE clause for filters
@@ -763,6 +1177,7 @@ impl ProxyLogService {
             SELECT
                 bucket::timestamptz as bucket,
                 COALESCE(count, 0) as request_count,
+                COALESCE(latency_count, 0)::bigint as latency_count,
                 COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0) as error_count,
                 COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
@@ -771,6 +1186,7 @@ impl ProxyLogService {
                 SELECT
                     time_bucket_gapfill(${}::interval, timestamp) AS bucket,
                     COUNT(*) as count,
+                    COUNT(response_time_ms) as latency_count,
                     AVG(response_time_ms) as avg_response_time,
                     SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as error_count,
                     SUM(request_size_bytes) as total_request_bytes,
@@ -796,13 +1212,22 @@ impl ProxyLogService {
         }
 
         // Add bucket_interval as parameterized value
-        values.push(bucket_interval.into());
+        values.push(bucket_interval.clone().into());
 
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
 
         let results = self.db.query_all(stmt).await?;
 
-        Ok(Self::rows_to_time_bucket_stats(&results, start_time))
+        let mut stats = Self::rows_to_time_bucket_stats(&results, start_time);
+        self.attach_response_time_percentiles(
+            &mut stats,
+            start_time,
+            end_time,
+            &bucket_interval,
+            filters.as_ref(),
+        )
+        .await?;
+        Ok(stats)
     }
 
     /// [`Self::get_time_bucket_stats`] served from the `proxy_logs_stats_1m`
@@ -838,6 +1263,7 @@ impl ProxyLogService {
             SELECT
                 bucket::timestamptz as bucket,
                 COALESCE(count, 0)::bigint as request_count,
+                COALESCE(latency_count, 0)::bigint as latency_count,
                 COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0)::bigint as error_count,
                 COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
@@ -846,6 +1272,7 @@ impl ProxyLogService {
                 SELECT
                     time_bucket_gapfill(${}::interval, bucket) AS bucket,
                     SUM(request_count) as count,
+                    SUM(response_time_count) as latency_count,
                     SUM(sum_response_time_ms)::float8
                         / NULLIF(SUM(response_time_count), 0)::float8 as avg_response_time,
                     SUM(error_4xx_plus_count) as error_count,
@@ -888,6 +1315,7 @@ impl ProxyLogService {
                 let bucket: chrono::DateTime<Utc> =
                     row.try_get("", "bucket").unwrap_or(fallback_bucket);
                 let request_count: i64 = row.try_get("", "request_count").unwrap_or(0);
+                let latency_count: i64 = row.try_get("", "latency_count").unwrap_or(0);
                 let avg_response_time_ms: f64 =
                     row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
                 let error_count: i64 = row.try_get("", "error_count").unwrap_or(0);
@@ -898,13 +1326,104 @@ impl ProxyLogService {
                 TimeBucketStats {
                     bucket: bucket.to_rfc3339(),
                     request_count,
+                    latency_count,
                     avg_response_time_ms,
+                    p50_response_time_ms: 0.0,
+                    p95_response_time_ms: 0.0,
+                    p99_response_time_ms: 0.0,
                     error_count,
                     total_request_bytes,
                     total_response_bytes,
                 }
             })
             .collect()
+    }
+
+    /// Overlay p50/p95/p99 from the raw `proxy_logs` table onto already-bucketed
+    /// count/avg/byte stats.
+    ///
+    /// Counts come from the continuous aggregate when it can answer (sums roll
+    /// up losslessly). Percentiles cannot be reconstructed from those sums, so
+    /// this is a second, project-scoped scan of `response_time_ms` — the same
+    /// index the dashboard already uses, and only the timing column.
+    async fn attach_response_time_percentiles(
+        &self,
+        stats: &mut [TimeBucketStats],
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+        filters: Option<&StatsFilters>,
+    ) -> Result<(), ProxyLogServiceError> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+
+        let mut where_clauses = vec!["timestamp >= $1".to_string(), "timestamp < $2".to_string()];
+        let mut param_index = 3;
+        if let Some(f) = filters {
+            Self::build_filter_sql(f, &mut param_index, &mut where_clauses);
+        }
+        let where_clause = format!("WHERE {}", where_clauses.join(" AND "));
+        let bucket_param_index = param_index;
+
+        let sql = format!(
+            r#"
+            SELECT
+                bucket::timestamptz as bucket,
+                COALESCE(p50, 0)::float8 as p50_response_time_ms,
+                COALESCE(p95, 0)::float8 as p95_response_time_ms,
+                COALESCE(p99, 0)::float8 as p99_response_time_ms
+            FROM (
+                SELECT
+                    time_bucket(${}::interval, timestamp) AS bucket,
+                    percentile_cont(0.50) WITHIN GROUP (ORDER BY response_time_ms) as p50,
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY response_time_ms) as p95,
+                    percentile_cont(0.99) WITHIN GROUP (ORDER BY response_time_ms) as p99
+                FROM proxy_logs
+                {}
+                GROUP BY bucket
+            ) sub
+            "#,
+            bucket_param_index, where_clause
+        );
+
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        if let Some(f) = filters {
+            Self::add_filter_values(&mut values, f);
+        }
+        values.push(bucket_interval.to_string().into());
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let rows = self.db.query_all(stmt).await?;
+
+        let mut by_epoch: HashMap<i64, (f64, f64, f64)> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let bucket: DateTime<Utc> = row.try_get("", "bucket").unwrap_or(start_time);
+            let p50: f64 = row.try_get("", "p50_response_time_ms").unwrap_or(0.0);
+            let p95: f64 = row.try_get("", "p95_response_time_ms").unwrap_or(0.0);
+            let p99: f64 = row.try_get("", "p99_response_time_ms").unwrap_or(0.0);
+            by_epoch.insert(bucket.timestamp(), (p50, p95, p99));
+        }
+
+        for bucket in stats.iter_mut() {
+            let Some(ts) = DateTime::parse_from_rfc3339(&bucket.bucket)
+                .ok()
+                .map(|d| d.timestamp())
+            else {
+                continue;
+            };
+            if let Some((p50, p95, p99)) = by_epoch.get(&ts) {
+                bucket.p50_response_time_ms = *p50;
+                bucket.p95_response_time_ms = *p95;
+                bucket.p99_response_time_ms = *p99;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get health summaries for multiple projects in a single query
@@ -915,6 +1434,11 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         is_bot: Option<bool>,
     ) -> Result<Vec<ProjectHealthSummary>, ProxyLogServiceError> {
+        // The handler validates `project_ids` non-empty (and caps it at 100),
+        // so this is always scoped to an explicit project list, never "every
+        // project" — the scoped cap applies.
+        Self::enforce_window_span(start_time, end_time, !project_ids.is_empty())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_projects_health_summary(project_ids, start_time, end_time, is_bot)
@@ -950,8 +1474,10 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(SUM(request_count), 0)::bigint as total_requests,
-                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as total_errors,
+                    date_trunc('hour', bucket) AS hour,
+                    COALESCE(SUM(request_count), 0)::bigint as request_count,
+                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as error_count,
+                    COALESCE(SUM(response_time_count), 0)::bigint as latency_count,
                     COALESCE(
                         SUM(sum_response_time_ms)::float8
                             / NULLIF(SUM(response_time_count), 0)::float8,
@@ -960,8 +1486,10 @@ impl ProxyLogService {
                 FROM proxy_logs_stats_1m
                 WHERE bucket >= $1
                   AND bucket < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', bucket)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -970,14 +1498,18 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(COUNT(*), 0) as total_requests,
-                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
+                    date_trunc('hour', timestamp) AS hour,
+                    COALESCE(COUNT(*), 0) as request_count,
+                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as error_count,
+                    COUNT(response_time_ms) as latency_count,
                     COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
                 FROM proxy_logs
                 WHERE timestamp >= $1
                   AND timestamp < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', timestamp)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -995,57 +1527,67 @@ impl ProxyLogService {
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
         let results = self.db.query_all(stmt).await?;
 
-        // Build a map from query results
+        // Build each summary and its hourly request-count series from the same
+        // grouped query. This keeps the dashboard batch endpoint at one
+        // telemetry query regardless of the number of projects requested.
         let mut summaries: std::collections::HashMap<i32, ProjectHealthSummary> =
             std::collections::HashMap::new();
 
-        for row in &results {
-            let project_id: i32 = row.try_get("", "project_id").unwrap_or(0);
-            let total_requests: i64 = row.try_get("", "total_requests").unwrap_or(0);
-            let total_errors: i64 = row.try_get("", "total_errors").unwrap_or(0);
-            let avg_response_time_ms: f64 = row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
+        for row in results {
+            let project_id: i32 = row.try_get("", "project_id").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode project_id in projects health query: {error}"
+                )))
+            })?;
+            let hour: DateTime<Utc> = row.try_get("", "hour").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode hourly bucket for project {project_id}: {error}"
+                )))
+            })?;
+            let request_count: i64 = row.try_get("", "request_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode request count for project {project_id}: {error}"
+                )))
+            })?;
+            let error_count: i64 = row.try_get("", "error_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode error count for project {project_id}: {error}"
+                )))
+            })?;
+            let latency_count: i64 = row.try_get("", "latency_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode latency count for project {project_id}: {error}"
+                )))
+            })?;
+            let bucket_avg_response_time_ms: f64 =
+                row.try_get("", "avg_response_time_ms").map_err(|error| {
+                    ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                        "Failed to decode average response time for project {project_id}: {error}"
+                    )))
+                })?;
 
-            let error_rate = if total_requests > 0 {
-                (total_errors as f64 / total_requests as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let status = if total_requests == 0 {
-                "unknown".to_string()
-            } else if error_rate > 50.0 {
-                "down".to_string()
-            } else if error_rate > 10.0 {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            };
-
-            summaries.insert(
-                project_id,
-                ProjectHealthSummary {
-                    project_id,
-                    total_requests,
-                    total_errors,
-                    avg_response_time_ms: (avg_response_time_ms * 10.0).round() / 10.0,
-                    error_rate: (error_rate * 10.0).round() / 10.0,
-                    status,
-                },
-            );
+            let summary = summaries
+                .entry(project_id)
+                .or_insert_with(|| ProjectHealthSummary::empty(project_id));
+            summary.total_requests += request_count;
+            summary.total_errors += error_count;
+            summary.latency_count += latency_count;
+            summary.weighted_response_time_ms += bucket_avg_response_time_ms * latency_count as f64;
+            summary.hourly_requests.push(ProjectHourlyRequestCount {
+                bucket: hour.to_rfc3339(),
+                request_count,
+            });
         }
 
         // Include projects with no data as "unknown"
         let result: Vec<ProjectHealthSummary> = project_ids
             .iter()
             .map(|&id| {
-                summaries.remove(&id).unwrap_or(ProjectHealthSummary {
-                    project_id: id,
-                    total_requests: 0,
-                    total_errors: 0,
-                    avg_response_time_ms: 0.0,
-                    error_rate: 0.0,
-                    status: "unknown".to_string(),
-                })
+                let mut summary = summaries
+                    .remove(&id)
+                    .unwrap_or_else(|| ProjectHealthSummary::empty(id));
+                summary.finish_aggregation(start_time, end_time);
+                summary
             })
             .collect();
 
@@ -1095,6 +1637,14 @@ impl ProxyLogService {
         }
         if let Some(device_type) = filters.device_type {
             query = query.filter(proxy_logs::Column::DeviceType.eq(device_type));
+        }
+        if filters.exclude_synthetic {
+            query = query.filter(proxy_logs::Column::RequestSource.ne("temps_monitor"));
+            query = query.filter(
+                Condition::any()
+                    .add(proxy_logs::Column::UserAgent.is_null())
+                    .add(proxy_logs::Column::UserAgent.not_like("Temps-Status-Monitor/%")),
+            );
         }
         query
     }
@@ -1166,6 +1716,11 @@ impl ProxyLogService {
                 "project_id IS NULL".to_string()
             });
             // no parameterized value — the predicate is fully in SQL
+        }
+        if filters.exclude_synthetic {
+            where_clauses.push("request_source <> 'temps_monitor'".to_string());
+            where_clauses
+                .push("COALESCE(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string());
         }
         String::new()
     }
@@ -1275,7 +1830,8 @@ impl ProxyLogService {
 
     /// True when every set filter dimension is a grouping column of
     /// `proxy_logs_stats_1m` (`project_id`, `environment_id`, `is_bot`,
-    /// `has_project`). Any other filter forces the raw-table path.
+    /// `is_system_request`, `has_project`). Any other filter forces the
+    /// raw-table path.
     fn cagg_serves_filters(filters: Option<&StatsFilters>) -> bool {
         let Some(f) = filters else { return true };
         f.method.is_none()
@@ -1287,6 +1843,7 @@ impl ProxyLogService {
             && f.routing_status.is_none()
             && f.request_source.is_none()
             && f.device_type.is_none()
+            && !f.exclude_synthetic
     }
 
     /// True for intervals that are whole multiples of the aggregate's
@@ -1332,6 +1889,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_breakdown(
@@ -1462,6 +2021,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiPageBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_page_breakdown(
@@ -1569,6 +2130,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentPageRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         let known = crate::ai_agent_detector::known_agents();
         if !known.iter().any(|(_, m)| m.agent == agent) {
             return Ok(vec![]);
@@ -1655,6 +2218,9 @@ impl ProxyLogService {
         bucket_interval: String,
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_timeline(
@@ -1666,12 +2232,6 @@ impl ProxyLogService {
                     group_by,
                 )
                 .await;
-        }
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
         }
 
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
@@ -1849,7 +2409,7 @@ impl ProxyLogService {
     /// HTTP status-class breakdown for AI-agent traffic.
     ///
     /// Same pre-filter as the AI agent breakdown (`is_bot = true AND bot_name IN
-    /// (known)`), grouped by status class (`2xx`, `3xx`, `4xx`, `5xx`, `other`).
+    /// (known)`), grouped by status class (`1xx`, `2xx`, `3xx`, `4xx`, `5xx`, `other`).
     /// Surfaces whether crawlers are getting served (`2xx`) or hitting broken /
     /// blocked pages (`4xx`/`5xx`) — a content-health signal the request tables
     /// don't make obvious.
@@ -1860,6 +2420,8 @@ impl ProxyLogService {
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<Vec<AiStatusBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_status_breakdown(project_id, environment_id, start_time, end_time)
@@ -1904,6 +2466,7 @@ impl ProxyLogService {
             r#"
             SELECT
                 CASE
+                    WHEN status_code >= 100 AND status_code < 200 THEN '1xx'
                     WHEN status_code >= 200 AND status_code < 300 THEN '2xx'
                     WHEN status_code >= 300 AND status_code < 400 THEN '3xx'
                     WHEN status_code >= 400 AND status_code < 500 THEN '4xx'
@@ -1951,6 +2514,292 @@ impl ProxyLogService {
     }
 }
 
+fn analytics_storage_error(
+    operation: &'static str,
+    error: ProxyLogServiceError,
+) -> temps_analytics::types::analytics::AnalyticsError {
+    temps_analytics::types::analytics::AnalyticsError::Other(format!(
+        "API traffic {operation} failed in the configured request-log backend: {error}"
+    ))
+}
+
+async fn aggregate_traffic_offset(
+    service: &ProxyLogService,
+    project_id: i32,
+    mut request: TrafficAggregationRequest,
+    limit: u64,
+    offset: u64,
+) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+    const STORAGE_PAGE_SIZE: u64 = MAX_TRAFFIC_PAGE_SIZE;
+    request.page_size = STORAGE_PAGE_SIZE;
+    request.page = offset / STORAGE_PAGE_SIZE + 1;
+
+    let first = service
+        .aggregate_traffic(project_id, request.clone())
+        .await?;
+    let total_groups = first.total_groups;
+    let total_pages = total_groups.div_ceil(limit);
+    let mut rows = first
+        .rows
+        .into_iter()
+        .skip((offset % STORAGE_PAGE_SIZE) as usize)
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+
+    if rows.len() < limit as usize && request.page < first.total_pages {
+        request.page += 1;
+        let remaining = limit as usize - rows.len();
+        let next = service
+            .aggregate_traffic(project_id, request.clone())
+            .await?;
+        rows.extend(next.rows.into_iter().take(remaining));
+    }
+
+    Ok(TrafficAggregationResponse {
+        rows,
+        total_groups,
+        page: offset / limit + 1,
+        page_size: limit,
+        total_pages,
+        dimensions: request.dimensions,
+        metrics: request.metrics,
+        synthetic_excluded: !request.include_synthetic,
+    })
+}
+
+#[async_trait::async_trait]
+impl temps_analytics::api_traffic::ApiTrafficDataSource for ProxyLogService {
+    async fn get_timeseries(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        bucket_interval: String,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiTimeseriesResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use temps_analytics::types::api_traffic::{ApiTimeseriesPoint, ApiTimeseriesResponse};
+
+        let stats_filters = StatsFilters {
+            project_id: Some(project_id),
+            environment_id,
+            exclude_synthetic: true,
+            ..Default::default()
+        };
+        let rollup_request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: Vec::new(),
+            metrics: vec![
+                crate::traffic_aggregation::TrafficMetric::Requests,
+                crate::traffic_aggregation::TrafficMetric::Errors,
+                crate::traffic_aggregation::TrafficMetric::ErrorRate,
+                crate::traffic_aggregation::TrafficMetric::LatencyAvg,
+            ],
+            filters: Vec::new(),
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 1,
+        };
+        let (buckets, rollup) = tokio::try_join!(
+            self.get_time_bucket_stats(
+                start_date,
+                end_date,
+                bucket_interval.clone(),
+                Some(stats_filters),
+            ),
+            self.aggregate_traffic(project_id, rollup_request),
+        )
+        .map_err(|error| analytics_storage_error("timeseries query", error))?;
+
+        let points = buckets
+            .into_iter()
+            .map(|bucket| {
+                let timestamp = DateTime::parse_from_rfc3339(&bucket.bucket)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|error| {
+                        temps_analytics::types::analytics::AnalyticsError::Other(format!(
+                            "API traffic backend returned invalid bucket timestamp '{}': {error}",
+                            bucket.bucket
+                        ))
+                    })?;
+                let error_rate = if bucket.request_count > 0 {
+                    bucket.error_count as f64 / bucket.request_count as f64
+                } else {
+                    0.0
+                };
+                Ok(ApiTimeseriesPoint {
+                    timestamp,
+                    request_count: bucket.request_count,
+                    error_count: bucket.error_count,
+                    error_rate,
+                    avg_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.avg_response_time_ms),
+                    p95_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.p95_response_time_ms),
+                    p99_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.p99_response_time_ms),
+                })
+            })
+            .collect::<Result<Vec<_>, temps_analytics::types::analytics::AnalyticsError>>()?;
+        let metrics = rollup.rows.first().map(|row| &row.metrics);
+        let total_requests = metrics.and_then(|value| value.requests).unwrap_or(0);
+        let total_errors = metrics.and_then(|value| value.errors).unwrap_or(0);
+
+        Ok(ApiTimeseriesResponse {
+            points,
+            total_requests,
+            total_errors,
+            overall_error_rate: metrics.and_then(|value| value.error_rate).unwrap_or(0.0),
+            overall_avg_latency_ms: metrics.and_then(|value| value.latency_avg_ms),
+            bucket_interval,
+        })
+    }
+
+    async fn get_top_routes(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiRoutesResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use crate::traffic_aggregation::{
+            TrafficDimension, TrafficMetric, TrafficOrderBy, TrafficOrderField,
+            TrafficSortDirection,
+        };
+        use temps_analytics::types::api_traffic::{ApiRouteEntry, ApiRoutesResponse};
+
+        let request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: vec![TrafficDimension::Method, TrafficDimension::Path],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LatencyAvg,
+            ],
+            filters: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: MAX_TRAFFIC_PAGE_SIZE,
+        };
+        let response = aggregate_traffic_offset(
+            self,
+            project_id,
+            request,
+            limit.clamp(1, 100) as u64,
+            offset.clamp(0, 10_000) as u64,
+        )
+        .await
+        .map_err(|error| analytics_storage_error("route aggregation", error))?;
+        let routes = response
+            .rows
+            .into_iter()
+            .map(|row| ApiRouteEntry {
+                method: row
+                    .dimensions
+                    .first()
+                    .and_then(|value| value.value.clone())
+                    .unwrap_or_default(),
+                path: row
+                    .dimensions
+                    .get(1)
+                    .and_then(|value| value.value.clone())
+                    .unwrap_or_default(),
+                request_count: row.metrics.requests.unwrap_or(0),
+                avg_latency_ms: row.metrics.latency_avg_ms,
+                error_rate: row.metrics.error_rate.unwrap_or(0.0),
+            })
+            .collect();
+        Ok(ApiRoutesResponse {
+            routes,
+            total_routes: i64::try_from(response.total_groups).unwrap_or(i64::MAX),
+        })
+    }
+
+    async fn get_top_callers(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiCallersResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use crate::traffic_aggregation::{
+            TrafficDimension, TrafficFilter, TrafficFilterOperator, TrafficMetric, TrafficOrderBy,
+            TrafficOrderField, TrafficSortDirection,
+        };
+        use temps_analytics::types::api_traffic::{ApiCallerEntry, ApiCallersResponse};
+
+        let request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: vec![TrafficDimension::ClientIp],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LastSeen,
+            ],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::ClientIp,
+                operator: TrafficFilterOperator::NotEq,
+                values: vec![String::new()],
+            }],
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: MAX_TRAFFIC_PAGE_SIZE,
+        };
+        let response = aggregate_traffic_offset(
+            self,
+            project_id,
+            request,
+            limit.clamp(1, 100) as u64,
+            offset.clamp(0, 10_000) as u64,
+        )
+        .await
+        .map_err(|error| analytics_storage_error("caller aggregation", error))?;
+        let callers = response
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(ApiCallerEntry {
+                    client_ip: row.dimensions.first()?.value.clone()?,
+                    request_count: row.metrics.requests.unwrap_or(0),
+                    error_rate: row.metrics.error_rate.unwrap_or(0.0),
+                    last_seen: row.metrics.last_seen?,
+                })
+            })
+            .collect();
+        Ok(ApiCallersResponse {
+            callers,
+            total_callers: i64::try_from(response.total_groups).unwrap_or(i64::MAX),
+        })
+    }
+}
+
 /// Filters for statistics queries
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct StatsFilters {
@@ -1970,6 +2819,10 @@ pub struct StatsFilters {
     /// When true, only count requests that matched a project (project_id IS NOT NULL).
     /// Used by the health dashboard so totals match the per-project cards.
     pub has_project: Option<bool>,
+    /// Exclude Temps status-monitor traffic, including legacy rows written
+    /// before monitor requests received their own `request_source` value.
+    #[serde(default)]
+    pub exclude_synthetic: bool,
 }
 
 /// Time bucket statistics response
@@ -1980,8 +2833,16 @@ pub struct TimeBucketStats {
     pub bucket: String,
     /// Total number of requests in this bucket
     pub request_count: i64,
+    /// Number of requests in this bucket that recorded a latency value.
+    pub latency_count: i64,
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
+    /// p50 response time in milliseconds (0 when the bucket has no timings)
+    pub p50_response_time_ms: f64,
+    /// p95 response time in milliseconds (0 when the bucket has no timings)
+    pub p95_response_time_ms: f64,
+    /// p99 response time in milliseconds (0 when the bucket has no timings)
+    pub p99_response_time_ms: f64,
     /// Number of errors (status >= 400)
     pub error_count: i64,
     /// Total request bytes
@@ -2068,7 +2929,7 @@ pub struct AiAgentTimelineRow {
 }
 
 /// One row in the AI-agent HTTP status breakdown: the request count for a
-/// status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+/// status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AiStatusBreakdownRow {
     /// Status class label.
@@ -2077,7 +2938,16 @@ pub struct AiStatusBreakdownRow {
     pub request_count: i64,
 }
 
-/// Health summary for a single project (last 1 hour)
+/// One hourly request-count point in a project health summary.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectHourlyRequestCount {
+    /// Start of the UTC hour in RFC 3339 format.
+    #[schema(example = "2026-08-16T12:00:00Z")]
+    pub bucket: String,
+    pub request_count: i64,
+}
+
+/// Health summary for a single project over the requested time range.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProjectHealthSummary {
     pub project_id: i32,
@@ -2091,11 +2961,214 @@ pub struct ProjectHealthSummary {
     pub error_rate: f64,
     /// Health status: "healthy", "degraded", "down", "unknown"
     pub status: String,
+    /// Hourly request counts ordered by bucket start.
+    pub hourly_requests: Vec<ProjectHourlyRequestCount>,
+    /// Internal accumulator used to combine hourly latency averages without a
+    /// second query. It is never part of API serialization or OpenAPI.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) weighted_response_time_ms: f64,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) latency_count: i64,
+}
+
+impl ProjectHealthSummary {
+    pub(crate) fn empty(project_id: i32) -> Self {
+        Self {
+            project_id,
+            total_requests: 0,
+            total_errors: 0,
+            avg_response_time_ms: 0.0,
+            error_rate: 0.0,
+            status: "unknown".to_string(),
+            hourly_requests: Vec::new(),
+            weighted_response_time_ms: 0.0,
+            latency_count: 0,
+        }
+    }
+
+    pub(crate) fn finish_aggregation(&mut self, start_time: UtcDateTime, end_time: UtcDateTime) {
+        let observed = std::mem::take(&mut self.hourly_requests)
+            .into_iter()
+            .map(|point| (point.bucket, point.request_count))
+            .collect::<HashMap<_, _>>();
+        let mut bucket_seconds = start_time.timestamp().div_euclid(3_600) * 3_600;
+        while bucket_seconds < end_time.timestamp() {
+            let Some(bucket) = DateTime::<Utc>::from_timestamp(bucket_seconds, 0) else {
+                break;
+            };
+            let bucket = bucket.to_rfc3339();
+            self.hourly_requests.push(ProjectHourlyRequestCount {
+                request_count: observed.get(&bucket).copied().unwrap_or(0),
+                bucket,
+            });
+            bucket_seconds += 3_600;
+        }
+
+        if self.total_requests == 0 {
+            return;
+        }
+        if self.latency_count > 0 {
+            self.avg_response_time_ms =
+                ((self.weighted_response_time_ms / self.latency_count as f64) * 10.0).round()
+                    / 10.0;
+        }
+        self.error_rate =
+            ((self.total_errors as f64 / self.total_requests as f64) * 1_000.0).round() / 10.0;
+        self.status = if self.error_rate > 50.0 {
+            "down".to_string()
+        } else if self.error_rate > 10.0 {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_class_range_includes_1xx() {
+        // 101 Switching Protocols (and other informational codes) must map to
+        // the `1xx` bucket, not be excluded/misrouted into an error range.
+        assert_eq!(ProxyLogService::status_class_range("1xx"), Some((100, 200)));
+        assert_eq!(ProxyLogService::status_class_range("2xx"), Some((200, 300)));
+        assert_eq!(ProxyLogService::status_class_range("3xx"), Some((300, 400)));
+        assert_eq!(ProxyLogService::status_class_range("4xx"), Some((400, 500)));
+        assert_eq!(ProxyLogService::status_class_range("5xx"), Some((500, 600)));
+        assert_eq!(ProxyLogService::status_class_range("other"), None);
+    }
+
+    #[test]
+    fn project_health_uses_latency_sample_count_and_gapfills_24_hours() {
+        let start = DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .expect("valid start")
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::hours(24);
+        let mut summary = ProjectHealthSummary::empty(7);
+        summary.total_requests = 12;
+        summary.total_errors = 1;
+        summary.latency_count = 2;
+        summary.weighted_response_time_ms = 300.0;
+        summary.hourly_requests = vec![ProjectHourlyRequestCount {
+            bucket: (start + chrono::Duration::hours(5)).to_rfc3339(),
+            request_count: 12,
+        }];
+
+        summary.finish_aggregation(start, end);
+
+        assert_eq!(summary.avg_response_time_ms, 150.0);
+        assert_eq!(summary.hourly_requests.len(), 24);
+        assert_eq!(summary.hourly_requests[5].request_count, 12);
+        assert_eq!(
+            summary
+                .hourly_requests
+                .iter()
+                .filter(|point| point.request_count == 0)
+                .count(),
+            23
+        );
+    }
+
+    #[test]
+    fn traffic_aggregation_project_budget_is_bounded_and_recovers() {
+        let state = AggregateLimitState::default();
+        let start = Instant::now();
+        for _ in 0..MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE {
+            assert!(state.record_request(start));
+        }
+        assert!(!state.record_request(start));
+        assert!(state.record_request(start + Duration::from_secs(61)));
+    }
+
+    // ── Listing window ────────────────────────────────────────────────────
+    // `GET /proxy-logs` must never issue an unbounded scan (on a 100M-row
+    // deployment that means considering the whole retention window to return 20
+    // rows) and must never accept a window so wide the query takes tens of
+    // seconds. The rules themselves live in temps_core::time_window and are
+    // tested there; these cover the SERVICE's contract — that it applies them,
+    // and that a violation surfaces as a 400-mapped InvalidFilter rather than
+    // an opaque 500.
+
+    #[test]
+    fn resolve_window_bounds_an_open_request() {
+        let lookback = chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS);
+        let before = chrono::Utc::now();
+        let (start, end) =
+            ProxyLogService::resolve_window(None, None, false).expect("open request is bounded");
+        let after = chrono::Utc::now();
+
+        let start = start.expect("a lower bound is always produced");
+        assert!(
+            start >= before - lookback && start <= after - lookback,
+            "expected ~{}h before now, got {start}",
+            temps_core::time_window::DEFAULT_LOOKBACK_HOURS
+        );
+        assert_eq!(end, None, "an open upper bound stays open");
+    }
+
+    #[test]
+    fn resolve_window_preserves_an_explicit_range_within_the_cap() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        // Widening past the default is exactly how the UI's range picker works.
+        assert_eq!(
+            ProxyLogService::resolve_window(Some(start), Some(end), false).expect("within cap"),
+            (Some(start), Some(end))
+        );
+    }
+
+    #[test]
+    fn resolve_window_rejects_a_range_wider_than_the_unscoped_cap_as_a_bad_request() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let err = ProxyLogService::resolve_window(Some(start), Some(end), false)
+            .expect_err("30 days exceeds the unscoped 7-day cap");
+
+        // InvalidFilter is the variant the handler maps to 400; anything else
+        // would surface a client mistake as a server error.
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        // The detail reaches the client verbatim, so it must stay actionable.
+        assert!(msg.contains("7-day maximum"), "{msg}");
+        assert!(msg.contains("still"), "must name the workaround: {msg}");
+    }
+
+    /// The exact regression this cap once caused: the Observe feed and the
+    /// Project Analytics AI Agents tab both ship a "Last 30 Days" option that
+    /// always scopes to one project (`ObserveFilterBar.tsx`,
+    /// `useAnalyticsDateRange.ts`). A project-scoped request for the same 30
+    /// days the previous test rejects must be ALLOWED, or those existing menu
+    /// items 400 instead of loading.
+    #[test]
+    fn resolve_window_allows_the_same_span_when_project_scoped() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            ProxyLogService::resolve_window(Some(start), Some(end), true)
+                .expect("30 days is within the scoped cap"),
+            (Some(start), Some(end))
+        );
+    }
 
     #[test]
     fn test_is_valid_interval_valid_formats() {
@@ -2150,6 +3223,60 @@ mod tests {
         // Invalid: special characters
         assert!(!ProxyLogService::is_valid_interval("1; DROP TABLE"));
         assert!(!ProxyLogService::is_valid_interval("1' OR '1'='1"));
+    }
+
+    fn fixture_range(start: &str, end: &str) -> (UtcDateTime, UtcDateTime) {
+        let start = chrono::DateTime::parse_from_rfc3339(start)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(end)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        (start, end)
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_1m_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 minute")
+            .expect_err("1m over 7d exceeds MAX_SERIES_POINTS");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!(
+                "{}-point maximum",
+                temps_core::time_window::MAX_SERIES_POINTS
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("1 minute"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("7d at 1h is 168 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_30d_scoped() {
+        // Project-scoped windows may be 30d; the UI uses 1h buckets (720 points).
+        let (start, end) = fixture_range("2026-07-14T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("30d at 1h is 720 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_malformed_interval() {
+        let (start, end) = fixture_range("2026-08-13T00:00:00Z", "2026-08-13T01:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 fortnight")
+            .expect_err("unknown unit");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter, got {err:?}");
+        };
+        assert!(msg.contains("Invalid bucket interval"), "{msg}");
     }
 
     #[test]
@@ -2219,6 +3346,7 @@ mod tests {
             is_bot: Some(false),
             device_type: Some("desktop".to_string()),
             has_project: None,
+            exclude_synthetic: false,
         };
         let mut where_clauses = Vec::new();
         let mut param_index = 1;
@@ -2286,6 +3414,7 @@ mod tests {
             is_bot: Some(false),
             device_type: Some("desktop".to_string()),
             has_project: None,
+            exclude_synthetic: false,
         };
         let mut values: Vec<sea_orm::Value> = vec![];
 
@@ -2392,6 +3521,10 @@ mod tests {
                 device_type: Some("mobile".to_string()),
                 ..Default::default()
             },
+            StatsFilters {
+                exclude_synthetic: true,
+                ..Default::default()
+            },
         ];
         for f in &raw_only {
             assert!(
@@ -2468,12 +3601,17 @@ mod tests {
         async fn insert_log(
             db: &DatabaseConnection,
             ts: chrono::DateTime<Utc>,
-            n: i32,
             project_id: i32,
             status: i16,
             rt_ms: i32,
             is_bot: bool,
+            is_system_request: bool,
         ) {
+            let request_source = if is_system_request {
+                "temps_monitor"
+            } else {
+                "proxy"
+            };
             let stmt = sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"INSERT INTO proxy_logs
@@ -2481,15 +3619,18 @@ mod tests {
                      request_source, is_system_request, routing_status, project_id,
                      request_id, is_bot, request_size_bytes, response_size_bytes,
                      created_date)
-                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, 'proxy', false,
-                           'routed', $4, $5, $6, 100, 200, $7)"#,
+                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, $7, $8,
+                           'routed', $4, $5, $6, 100, 200, $9)"#,
                 vec![
                     ts.into(),
                     status.into(),
                     rt_ms.into(),
                     project_id.into(),
-                    format!("cagg-test-{n}").into(),
+                    format!("cagg-test-{project_id}-{status}-{rt_ms}-{is_bot}-{is_system_request}")
+                        .into(),
                     is_bot.into(),
+                    request_source.into(),
+                    is_system_request.into(),
                     ts.date_naive().into(),
                 ],
             );
@@ -2500,11 +3641,12 @@ mod tests {
         // by real-time aggregation (the refresh policy hasn't materialized
         // them yet — exactly the state right after deploy).
         let ts = Utc::now() - chrono::Duration::minutes(5);
-        insert_log(&db, ts, 1, 1, 200, 100, false).await;
-        insert_log(&db, ts, 2, 1, 404, 50, false).await;
-        insert_log(&db, ts, 3, 1, 500, 30, false).await;
-        insert_log(&db, ts, 4, 1, 200, 20, true).await; // bot row
-        insert_log(&db, ts, 5, 2, 200, 10, false).await;
+        insert_log(&db, ts, 1, 200, 100, false, false).await;
+        insert_log(&db, ts, 1, 404, 50, false, false).await;
+        insert_log(&db, ts, 1, 500, 30, false, false).await;
+        insert_log(&db, ts, 1, 200, 20, true, false).await; // bot row
+        insert_log(&db, ts, 2, 200, 10, false, false).await;
+        insert_log(&db, ts, 1, 500, 900, false, true).await; // Temps monitor
 
         let start = Utc::now() - chrono::Duration::hours(1);
         let end = Utc::now() + chrono::Duration::minutes(1);
@@ -2517,6 +3659,8 @@ mod tests {
         assert_eq!(health.len(), 3);
 
         let p1 = health.iter().find(|h| h.project_id == 1).expect("p1");
+        // The dashboard summary excludes Temps' own status checks while still
+        // retaining ordinary crawler traffic unless is_bot is requested.
         assert_eq!(p1.total_requests, 4);
         assert_eq!(p1.total_errors, 1); // only the 500 counts (>= 500)
         assert!((p1.avg_response_time_ms - 50.0).abs() < 1e-9); // (100+50+30+20)/4
@@ -2575,10 +3719,14 @@ mod tests {
             })
         };
         let (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes) = sum(&via_cagg);
-        assert_eq!(cagg_reqs, 4);
-        assert_eq!(cagg_errs, 2); // 404 + 500 (time-bucket errors are >= 400)
-        assert_eq!(cagg_req_bytes, 400);
-        assert_eq!(cagg_resp_bytes, 800);
+        // Generic time-bucket queries include system traffic unless callers
+        // explicitly request synthetic exclusion. This keeps the aggregate
+        // and raw backends equivalent; project health summaries above apply
+        // their own trusted-system exclusion.
+        assert_eq!(cagg_reqs, 5);
+        assert_eq!(cagg_errs, 3); // 404 + both 500s
+        assert_eq!(cagg_req_bytes, 500);
+        assert_eq!(cagg_resp_bytes, 1000);
         assert_eq!(
             sum(&via_raw),
             (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes)
@@ -2593,7 +3741,197 @@ mod tests {
             .iter()
             .find(|b| b.request_count > 0)
             .expect("populated raw bucket");
-        assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.avg_response_time_ms - 220.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
+
+        // Percentiles are computed from raw response_time_ms on both paths
+        // ([20, 30, 50, 100, 900] → p50=50, p95=740, p99=868 via percentile_cont).
+        assert!((cagg_busy.p50_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - 740.0).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - 868.0).abs() < 1e-9);
+        assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);
+    }
+
+    /// A `101 Switching Protocols` response (e.g. a WebSocket/SSE upgrade) must
+    /// be bucketed as `1xx`, not silently dropped into the `other` catch-all
+    /// which the frontend renders identically to an unrecognized/broken
+    /// status. Regression test for the AI status-breakdown SQL CASE
+    /// statement missing a `1xx` branch. Skips gracefully when no test
+    /// Postgres is available, per the repo's Docker-test convention.
+    #[tokio::test]
+    async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Test database not available, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock GeoIpService for tests"));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        let service = ProxyLogService::new(db.clone(), ip_service);
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, \
+             main_branch, preset, created_at, updated_at, slug) \
+             VALUES (1, 'ai-status-p1', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'ai-status-p1')",
+            vec![],
+        );
+        db.execute(stmt).await.expect("insert project row");
+
+        async fn insert_ai_log(db: &DatabaseConnection, status: i16, request_id: &str) {
+            let stmt = sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"INSERT INTO proxy_logs
+                    (timestamp, method, path, host, status_code, response_time_ms,
+                     request_source, is_system_request, routing_status, project_id,
+                     request_id, is_bot, bot_name, request_size_bytes,
+                     response_size_bytes, created_date)
+                   VALUES (now(), 'GET', '/', 'test.local', $1, 10,
+                           'proxy', false, 'routed', 1, $2, true, 'GPTBot', 100, 200,
+                           now()::date)"#,
+                vec![status.into(), request_id.into()],
+            );
+            db.execute(stmt).await.expect("insert proxy_logs row");
+        }
+
+        insert_ai_log(&db, 101, "ai-status-101").await;
+        insert_ai_log(&db, 200, "ai-status-200").await;
+
+        let start = Utc::now() - chrono::Duration::hours(1);
+        let end = Utc::now() + chrono::Duration::minutes(1);
+
+        let breakdown = service
+            .get_ai_status_breakdown(Some(1), None, start, end)
+            .await
+            .expect("ai status breakdown");
+
+        let class_1xx = breakdown
+            .iter()
+            .find(|r| r.status_class == "1xx")
+            .expect("101 response must be classified as 1xx, not folded into 'other'");
+        assert_eq!(class_1xx.request_count, 1);
+
+        assert!(
+            breakdown.iter().all(|r| r.status_class != "other"),
+            "no row should fall into the 'other' catch-all: {breakdown:?}"
+        );
+    }
+
+    fn sample_proxy_log_model(request_id: &str) -> proxy_logs::Model {
+        let timestamp = Utc::now();
+        proxy_logs::Model {
+            id: 1,
+            timestamp,
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: None,
+            host: "example.test".to_string(),
+            status_code: 200,
+            response_time_ms: Some(5),
+            request_source: "proxy".to_string(),
+            is_system_request: false,
+            routing_status: "routed".to_string(),
+            project_id: Some(1),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            upstream_host: None,
+            error_message: None,
+            client_ip: None,
+            user_agent: None,
+            referrer: None,
+            request_id: request_id.to_string(),
+            ip_geolocation_id: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            device_type: None,
+            is_bot: None,
+            bot_name: None,
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: None,
+            request_headers: None,
+            response_headers: None,
+            created_date: timestamp.date_naive(),
+            session_id: None,
+            visitor_id: None,
+            trace_id: None,
+            error_group_id: None,
+        }
+    }
+
+    fn service_with_mock_db(db: sea_orm::DatabaseConnection) -> ProxyLogService {
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let db = Arc::new(db);
+        let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock geoip"));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        ProxyLogService::new(db, ip_service)
+    }
+
+    /// Happy-path smoke test: with a timestamp supplied the lookup takes the
+    /// single-query bounded branch and maps the row back. (MockDatabase returns
+    /// queued rows regardless of the WHERE clause, so it can't assert the ±1-day
+    /// bounds themselves; the bounding is covered structurally by the code and
+    /// the overflow test below.)
+    #[tokio::test]
+    async fn get_by_request_id_with_timestamp_maps_row() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_proxy_log_model("req-abc")]])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let found = service
+            .get_by_request_id("req-abc", Some(Utc::now()))
+            .await
+            .expect("lookup succeeds")
+            .expect("row found");
+        assert_eq!(found.request_id, "req-abc");
+    }
+
+    /// A hostile/absurd timestamp (near chrono's max) must not panic on the
+    /// `ts + 1 day` overflow — the window saturates instead.
+    #[tokio::test]
+    async fn get_by_request_id_extreme_timestamp_does_not_panic() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<proxy_logs::Model>::new()])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let result = service
+            .get_by_request_id("req-x", Some(chrono::DateTime::<Utc>::MAX_UTC))
+            .await
+            .expect("saturating window, no overflow panic");
+        assert!(result.is_none());
+    }
+
+    /// Without a timestamp the recent uncompressed window is probed first;
+    /// only when that misses does the unbounded scan run, so a bare deep-link
+    /// still resolves an old row.
+    #[tokio::test]
+    async fn get_by_request_id_without_timestamp_falls_back_to_unbounded_scan() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<proxy_logs::Model>::new(),
+                vec![sample_proxy_log_model("req-old")],
+            ])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let found = service
+            .get_by_request_id("req-old", None)
+            .await
+            .expect("lookup succeeds")
+            .expect("row found via fallback scan");
+        assert_eq!(found.request_id, "req-old");
     }
 }

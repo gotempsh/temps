@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { list } from './list.js'
 import { create } from './create.js'
 import { show } from './show.js'
 import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
+import { projectSourceAction } from './source.js'
+import { registerProjectSecretsCommands } from './secrets.js'
 
 export function registerProjectsCommands(program: Command): void {
   const projects = program
@@ -11,6 +16,8 @@ export function registerProjectsCommands(program: Command): void {
     .alias('project')
     .alias('p')
     .description('Manage projects')
+
+  registerProjectSecretsCommands(projects)
 
   projects
     .command('list')
@@ -27,7 +34,7 @@ export function registerProjectsCommands(program: Command): void {
     .description('Create a new project (git-based or manual deployment)')
     .option('-n, --name <name>', 'Project name')
     .option('-d, --description <description>', 'Project description')
-    .option('--repo <repository>', 'Repository in owner/name format')
+    .option('--repo <repository>', 'Repository in owner/name format (nested groups supported: group/subgroup/name)')
     .option('--branch <branch>', 'Git branch')
     .option('--directory <directory>', 'Root directory (relative to repo)')
     .option('--preset <preset>', 'Build preset (e.g., nextjs, nodejs, static, docker)')
@@ -63,13 +70,31 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('settings')
-    .description('Update project settings (slug, attack mode, preview environments)')
+    .description('Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
     .option('-p, --project <project>', 'Project slug or ID')
+    .option('--name <name>', 'Project display name (does not change the URL)')
     .option('--slug <slug>', 'Project URL slug')
     .option('--attack-mode', 'Enable attack mode (CAPTCHA protection)')
     .option('--no-attack-mode', 'Disable attack mode')
     .option('--preview-envs', 'Enable preview environments')
     .option('--no-preview-envs', 'Disable preview environments')
+    .option(
+      '--vulnerability-scanning',
+      'Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily)'
+    )
+    .option(
+      '--no-vulnerability-scanning',
+      'Disable vulnerability scanning'
+    )
+    .option(
+      '--image-retention-hours <hours>',
+      'Hours to keep built images before nightly cleanup removes them (1-8760). ' +
+        'Images are needed to roll back, so this is the project rollback window'
+    )
+    .option(
+      '--reset-image-retention',
+      'Clear the per-project image retention override and use the system default'
+    )
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts (for automation)')
     .action(updateSettingsAction)
@@ -83,9 +108,20 @@ export function registerProjectsCommands(program: Command): void {
     .option('--branch <branch>', 'Main branch')
     .option('--directory <directory>', 'App directory path')
     .option('--preset <preset>', 'Build preset (auto, nextjs, nodejs, static, docker, rust, go, python)')
+    .option('--connection <id>', 'Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged)')
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts, use provided/existing values (for automation)')
     .action(updateGitAction)
+
+  projects
+    .command('source')
+    .description('Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--type <type>', 'Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git)')
+    .option('--allow-alternate', 'Also accept an uploaded source archive from `drop`, keeping the current source as default')
+    .option('--no-allow-alternate', 'Only deploy from the configured source')
+    .option('--json', 'Output in JSON format')
+    .action(projectSourceAction)
 
   projects
     .command('config')
@@ -96,6 +132,9 @@ export function registerProjectsCommands(program: Command): void {
     .option('--memory-limit <limit>', 'Memory limit in MB')
     .option('--auto-deploy', 'Enable automatic deployments')
     .option('--no-auto-deploy', 'Disable automatic deployments')
+    .option('--request-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
+    .option('--sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
+    .option('--websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts (for automation)')
     .action(updateConfigAction)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration: partial index on root spans for the Observe feed.
 //!
 //! The unified Observe feed lists only ROOT spans (`parent_span_id IS NULL`) —

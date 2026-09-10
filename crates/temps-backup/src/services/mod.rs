@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 mod alerts;
 mod backup;
+mod capability;
 mod notifier;
 mod reconcile;
 mod restore;
@@ -9,15 +13,18 @@ mod restore;
 pub(crate) mod s3_lifecycle;
 pub use alerts::{sweep_backup_alerts, SweepStats, OVERDUE_GRACE};
 pub use backup::{
-    BackupError, BackupService, BackupTriggerParams, ChildBackupEntry, EnqueuedJob,
-    RetentionCleanupFailure, RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry,
-    ScheduleRunListResponse, ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary,
-    ScheduleRunSummaryList, ServiceBackupEntry, TriggerSource,
+    BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
+    BackupScheduleAccessScope, BackupService, BackupTriggerParams, BackupWithAccessScope,
+    ChildBackupEntry, EnqueuedJob, RecoverySetPublication, RetentionCleanupFailure,
+    RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse,
+    ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList,
+    ServiceBackupEntry, ServiceProjectScope, TriggerSource,
 };
+pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;
 pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
-    BackupSelector, PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode,
-    RestoreRunView, RestoreService,
+    BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
+    RestorePlan, RestoreRequestMode, RestoreRunView, RestoreService, RestoreServiceIdentity,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};

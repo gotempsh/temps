@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Re-export OSS UI primitives — no fork, no duplicate components.
 export { cn } from '../../../src/lib/utils'
 export { useIsMobile } from '../../../src/components/hooks/use-mobile'

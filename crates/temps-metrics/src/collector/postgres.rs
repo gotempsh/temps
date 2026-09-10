@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! PostgreSQL metric collector.
 //!
 //! Connects to a Postgres instance using `tokio-postgres` with a 5-second

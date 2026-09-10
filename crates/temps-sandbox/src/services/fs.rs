@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Filesystem operations against a standalone sandbox.
 //!
 //! `read_file` / `write_file` go through the typed `SandboxProvider` trait
@@ -45,8 +48,8 @@ impl SandboxService {
         path: &str,
     ) -> Result<Vec<u8>, SandboxError> {
         validate_absolute(path, "read")?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)
@@ -78,8 +81,8 @@ impl SandboxService {
         mode: u32,
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "write")?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)
@@ -107,8 +110,8 @@ impl SandboxService {
         path: &str,
     ) -> Result<StatInfo, SandboxError> {
         validate_absolute(path, "stat")?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)
@@ -211,8 +214,8 @@ impl SandboxService {
         if files.is_empty() {
             return Ok(0);
         }
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)
@@ -246,8 +249,8 @@ impl SandboxService {
         path: &str,
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "mkdir")?;
-        let (_row, internal_id) = self.resolve_id(public_id, user_id).await?;
-        self.touch(internal_id).await;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        self.touch(internal_id, row.timeout_secs).await;
         let handle = self
             .registry()
             .get(internal_id, public_id)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Branded 404 page rendered by the proxy when no app is routed to a host.
 //!
 //! Used by the admin gate when an unknown host hits a non-admin client IP:

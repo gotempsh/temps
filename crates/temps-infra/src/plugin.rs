@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Infrastructure Plugin implementation for the Temps plugin system
 //!
 //! This plugin provides infrastructure and platform information functionality including:

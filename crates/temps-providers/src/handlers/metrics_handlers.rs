@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for the unified metrics API.
 //!
 //! Exposes time-series metric queries, latest-value lookups, and alert-rule
@@ -37,50 +40,29 @@ use axum::{
     routing::{get, patch, put},
     Json, Router,
 };
-use chrono::{Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use chrono::{DateTime, Duration, Utc};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use temps_auth::Permission;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found, ErrorBuilder},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
+    UtcDateTime,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
-use temps_metrics::{LatestByLabelQuery, LatestQuery, RangeQuery, SourceKind};
-use tracing::error;
+use temps_metrics::{
+    duration_to_step, is_monotonic_counter, range_to_step, LatestByLabelQuery, LatestQuery,
+    RangeQuery, SourceKind,
+};
+use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use super::types::AppState;
 
-// ---------------------------------------------------------------------------
-// Helper: convert a `range` string to `(window_duration, bucket_step)`.
-// ---------------------------------------------------------------------------
-
-/// Returns `true` when a metric should be treated as a cumulative monotonic
-/// counter for query purposes — i.e. the raw values must be LAG-differenced
-/// to produce a meaningful rate-of-change chart.
-///
-/// OTLP cumulative Sum metrics (RustFS, etc.) are stored as raw Gauge values
-/// in `service_metrics` to avoid double-delta corruption. This flag tells the
-/// query layer to apply the LAG window function at read time.
-fn is_monotonic_counter(metric_name: &str) -> bool {
-    // OpenMetrics/Prometheus convention: _total suffix = cumulative counter.
-    // Also match common patterns from OTLP exporters.
-    metric_name.ends_with("_total")
-        || metric_name.ends_with(".total")
-        || metric_name.ends_with("_count")
-        || metric_name.ends_with(".count")
-}
-
-fn range_to_step(range: &str) -> (Duration, Duration) {
-    match range {
-        "1h" => (Duration::hours(1), Duration::minutes(1)),
-        "6h" => (Duration::hours(6), Duration::minutes(5)),
-        "24h" => (Duration::hours(24), Duration::minutes(15)),
-        "7d" => (Duration::days(7), Duration::hours(1)),
-        _ => (Duration::hours(1), Duration::minutes(1)),
-    }
-}
+// `is_monotonic_counter` / `range_to_step` live in `temps_metrics` (shared
+// with the deployment container metrics handlers) — imported below.
 
 // ---------------------------------------------------------------------------
 // Helper: Prometheus-compatible histogram_quantile (linear interpolation).
@@ -135,15 +117,64 @@ pub struct MetricsRangeQuery {
     /// Metric name, e.g. `"pg.connections_active"`.
     pub metric: String,
     /// Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+    /// Ignored when `start_time` and `end_time` are both set.
     #[serde(default = "default_range")]
     pub range: String,
     /// Optional histogram percentile (0–100).  When provided, the endpoint
     /// fetches histogram buckets and computes the requested quantile.
     pub percentile: Option<f64>,
+    /// Explicit window start (ISO 8601). Must be paired with `end_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T00:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub start_time: Option<UtcDateTime>,
+    /// Explicit window end (ISO 8601). Must be paired with `start_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T12:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub end_time: Option<UtcDateTime>,
 }
 
 fn default_range() -> String {
     "1h".to_string()
+}
+
+/// Resolve `(from, to, step)` from either an explicit `[start_time, end_time]`
+/// pair or a preset `range`. Explicit bounds win when both are present.
+///
+/// `step` is always server-derived via `duration_to_step` — callers cannot
+/// request 1-minute buckets over a 7-day window.
+fn resolve_range_window(
+    params: &MetricsRangeQuery,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, Duration), Problem> {
+    match (params.start_time, params.end_time) {
+        (Some(start), Some(end)) => {
+            if start >= end {
+                return Err(bad_request()
+                    .detail("start_time must be before end_time")
+                    .build());
+            }
+            let span = end - start;
+            let max = Duration::days(temps_core::time_window::MAX_WINDOW_DAYS);
+            if span > max {
+                return Err(bad_request()
+                    .detail(format!(
+                        "Requested time range spans {} days, which exceeds the {}-day maximum for this endpoint. Older data is still available — request it {} days at a time by moving start_time/end_time back.",
+                        span.num_days().max(1),
+                        temps_core::time_window::MAX_WINDOW_DAYS,
+                        temps_core::time_window::MAX_WINDOW_DAYS
+                    ))
+                    .build());
+            }
+            Ok((start, end, duration_to_step(span)))
+        }
+        (None, None) => {
+            let (window, step) = range_to_step(&params.range);
+            let now = Utc::now();
+            Ok((now - window, now, step))
+        }
+        _ => Err(bad_request()
+            .detail("start_time and end_time must both be provided")
+            .build()),
+    }
 }
 
 /// A single `(timestamp, value)` data point in a metric series.
@@ -185,6 +216,10 @@ pub struct AlertRuleResponse {
     pub id: i32,
     pub service_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    /// Node the rule is scoped to. `0` is the synthetic control-plane node
+    /// (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+    /// rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+    pub node_id: Option<i32>,
     pub name: String,
     pub metric_name: String,
     pub threshold: f64,
@@ -201,6 +236,7 @@ impl From<monitoring_alert_rules::Model> for AlertRuleResponse {
             id: m.id,
             service_id: m.service_id,
             deployment_id: m.deployment_id,
+            node_id: m.node_id,
             name: m.name,
             metric_name: m.metric_name,
             threshold: m.threshold,
@@ -296,9 +332,7 @@ async fn get_service_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Database,
@@ -306,7 +340,7 @@ async fn get_service_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 
@@ -947,6 +981,30 @@ pub(crate) async fn provision_otlp_ingest_key(
     service: &external_services::Model,
     user_id: i32,
 ) {
+    // Services placed on a worker node are created there by
+    // `initialize_service_remote`. `store_and_apply_ingest_key`, however,
+    // builds a *local* service instance and calls `apply_ingest_key`, which
+    // stops/removes/creates a container through the control plane's own
+    // Docker client — so provisioning a key for a remote service would also
+    // pull and run its image (attacker-selectable via the `docker_image`
+    // service parameter) on the control-plane host, defeating the worker
+    // placement boundary entirely.
+    //
+    // Skip provisioning rather than silently running it locally. The service
+    // still works; only OTLP push is unconfigured, and the operator is told
+    // why instead of being left to wonder.
+    if let Some(node_id) = service.node_id {
+        tracing::warn!(
+            service_id = service.id,
+            service_name = %service.name,
+            node_id,
+            "Skipping OTLP ingest-key provisioning: this service runs on a remote worker node, \
+             and applying the key would create its container on the control-plane host. \
+             Configure metrics ingestion for this service from the worker node."
+        );
+        return;
+    }
+
     // Generate the si_ key tied to this service.
     let ingest_key = match state
         .api_key_service
@@ -1033,9 +1091,7 @@ async fn get_deployment_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Deployment,
@@ -1043,7 +1099,7 @@ async fn get_deployment_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 
@@ -1204,9 +1260,7 @@ async fn get_node_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Node,
@@ -1214,7 +1268,7 @@ async fn get_node_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 
@@ -1234,6 +1288,171 @@ async fn get_node_metrics_range(
         .collect();
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+// ---------------------------------------------------------------------------
+// Nodes — alert rules
+// ---------------------------------------------------------------------------
+
+/// List the monitoring alert rules scoped to a node.
+///
+/// Node `0` is the synthetic control-plane node, which owns the seeded
+/// `proxy.*` (error rate, p99 latency) and `node.*` (file-descriptor /
+/// socket exhaustion) defaults. Without this endpoint those rules exist only
+/// in the database and the operator has no way to see that they are watching,
+/// let alone retune or silence them.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/alert-rules",
+    operation_id = "NodeMetricsGetAlertRules",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "List of node alert rules", body = Vec<AlertRuleResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_node_alert_rules(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // Node metrics are platform-level, not project-scoped — same guard as
+    // `get_node_metrics_range`.
+    permission_guard!(auth, SettingsRead);
+
+    let rules = monitoring_alert_rules::Entity::find()
+        .filter(monitoring_alert_rules::Column::NodeId.eq(id))
+        .order_by_asc(monitoring_alert_rules::Column::MetricName)
+        .all(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(node_id = id, error = %e, "Failed to list node alert rules");
+            internal_server_error()
+                .detail(format!("Failed to list node alert rules: {}", e))
+                .build()
+        })?;
+
+    let response: Vec<AlertRuleResponse> = rules.into_iter().map(AlertRuleResponse::from).collect();
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Update a node-scoped monitoring alert rule.
+///
+/// Deliberately update-only: there is no delete. The control-plane defaults
+/// are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted
+/// rule would silently reappear on the next restart, whereas `enabled: false`
+/// survives re-seeding — disabling is the operation that actually means
+/// "stop alerting on this".
+#[utoipa::path(
+    patch,
+    path = "/nodes/{id}/metrics/alert-rules/{rule_id}",
+    operation_id = "NodeMetricsUpdateAlertRule",
+    tag = "Metrics",
+    request_body = UpdateAlertRuleRequest,
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+        ("rule_id" = i32, Path, description = "Alert rule ID"),
+    ),
+    responses(
+        (status = 200, description = "Updated alert rule", body = AlertRuleResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alert rule not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_node_alert_rule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((id, rule_id)): Path<(i32, i32)>,
+    Json(request): Json<UpdateAlertRuleRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    if let Some(ref comp) = request.comparator {
+        validate_comparator(comp)?;
+    }
+    if let Some(ref sev) = request.severity {
+        validate_severity(sev)?;
+    }
+    // SECURITY(metrics-security-1): validate updated metric_name if provided —
+    // metric names reach the metrics store's query builder.
+    if let Some(ref mn) = request.metric_name {
+        temps_metrics::store::timescale::validate_metric_name(mn).map_err(|_| {
+            bad_request()
+                .detail(format!(
+                    "metric_name '{}' contains invalid characters; \
+                     only [a-zA-Z0-9_.:−] are allowed",
+                    mn
+                ))
+                .build()
+        })?;
+    }
+
+    let rule = monitoring_alert_rules::Entity::find_by_id(rule_id)
+        .filter(monitoring_alert_rules::Column::NodeId.eq(id))
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(rule_id, node_id = id, error = %e, "Failed to load node alert rule");
+            internal_server_error()
+                .detail(format!("Failed to load node alert rule: {}", e))
+                .build()
+        })?
+        .ok_or_else(|| {
+            not_found()
+                .detail(format!("Alert rule {rule_id} not found on node {id}"))
+                .build()
+        })?;
+
+    let mut active: monitoring_alert_rules::ActiveModel = rule.into();
+    if let Some(name) = request.name {
+        active.name = Set(name);
+    }
+    if let Some(metric_name) = request.metric_name {
+        active.metric_name = Set(metric_name);
+    }
+    if let Some(threshold) = request.threshold {
+        active.threshold = Set(threshold);
+    }
+    if let Some(comparator) = request.comparator {
+        active.comparator = Set(comparator);
+    }
+    if let Some(severity) = request.severity {
+        active.severity = Set(severity);
+    }
+    if let Some(for_duration_secs) = request.for_duration_secs {
+        active.for_duration_secs = Set(for_duration_secs);
+    }
+    if let Some(enabled) = request.enabled {
+        active.enabled = Set(enabled);
+    }
+
+    let updated = active.update(state.db.as_ref()).await.map_err(|e| {
+        error!(rule_id, node_id = id, error = %e, "Failed to update node alert rule");
+        internal_server_error()
+            .detail(format!("Failed to update node alert rule: {}", e))
+            .build()
+    })?;
+
+    info!(
+        rule_id,
+        node_id = id,
+        metric_name = %updated.metric_name,
+        threshold = updated.threshold,
+        enabled = updated.enabled,
+        "Node alert rule updated"
+    );
+
+    Ok((StatusCode::OK, Json(AlertRuleResponse::from(updated))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,19 +1489,25 @@ fn validate_severity(sev: &str) -> Result<(), Problem> {
 /// permission can fetch metrics for any service ID — including services owned
 /// by other projects/tenants.  This violates row-level access control.
 ///
-/// The check joins `project_services` against the service ID.  If no row
-/// matches, it means either:
-/// - The service does not exist (return 404), or
-/// - The service exists but is not linked to the user's project (return 404
-///   — do not distinguish these cases to avoid leaking service existence).
+/// The check joins `project_services` against the service ID. A session caller
+/// may also access an unlinked service while its authenticated creator marker
+/// belongs to that caller; this is the bootstrap window between creating a
+/// database and selecting it for a project. Linking consumes that marker.
 ///
-/// For session-based users, the user's project is identified via the
-/// `project_services` table — the user must have a project that owns the
-/// service.  For deployment tokens, the token's `project_id` is used.
+/// For deployment tokens, the token's bound `project_id` is checked directly
+/// against `project_services`. For session/API-key/CLI callers there is no
+/// single bound project, so ownership is expressed through team-based access:
+/// the caller must be able to access at least one of the projects the
+/// service is linked to, via the [`temps_core::ProjectAccessChecker`]
+/// extension point (ADR-028) — a no-op in OSS (no team-access concept
+/// exists), real enforcement in EE when a team-access checker is registered.
+/// This mirrors [`require_service_parameter_project_access`] in
+/// `handlers.rs`, which enforces the same rule for the credential-reveal
+/// endpoint.
 ///
 /// Returns `Ok(())` if the caller may access the service, or `Err(Problem)`
-/// with a 404 response (does not distinguish "not found" from "forbidden"
-/// to avoid leaking the existence of services in other projects).
+/// with a 404 (service not found / not linked to caller's project) or 403
+/// (linked, but caller's team has no grant on any of its projects).
 pub(crate) async fn assert_service_owned_by_caller(
     service_id: i32,
     auth: &temps_auth::AuthContext,
@@ -1312,30 +1537,194 @@ pub(crate) async fn assert_service_owned_by_caller(
         return Ok(());
     }
 
-    // For session users: check that the service exists at all (the user may
-    // have access to all projects on this server).
+    // Session/API-key/CLI caller: verify the service exists (same check as
+    // before this fix), then resolve which projects it's linked to for the
+    // access decision below.
     //
-    // FIXME(metrics-security-6): When multi-tenancy (teams/projects) is fully
-    // enforced, this must check that the user is a member of at least one
-    // project that owns this service.  For the current single-project model,
-    // any session user with the appropriate permission may access any service.
-    // A strict multi-tenant check would be:
-    //   SELECT 1 FROM project_services ps
-    //   JOIN project_members pm ON pm.project_id = ps.project_id
-    //   WHERE ps.service_id = $service_id AND pm.user_id = $user_id
-    let service_exists = state
+    // Deliberately a direct `project_services` query, not
+    // `ExternalServiceManager::list_service_projects` — that also fetches
+    // full project metadata with a `projects` table lookup per linked row,
+    // which is unneeded N+1 cost here (only the IDs matter) on a path now
+    // shared by every session/API-key/CLI request across 30+ handlers.
+    let service = state
         .external_service_manager
         .get_service(service_id)
         .await
-        .is_ok();
+        .map_err(|error| match error {
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => not_found()
+                .detail(format!("External service {} not found", service_id))
+                .build(),
+            error => {
+                tracing::error!(service_id, error = %error, "assert_service_owned: service lookup failed");
+                internal_server_error()
+                    .detail("Failed to verify service ownership")
+                    .build()
+            }
+        })?;
 
-    if !service_exists {
-        return Err(not_found()
-            .detail(format!("External service {} not found", service_id))
+    let project_ids: Vec<i32> = project_services::Entity::find()
+        .filter(project_services::Column::ServiceId.eq(service_id))
+        .all(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(service_id, error = %e, "assert_service_owned: failed to resolve linked projects");
+            internal_server_error()
+                .detail("Failed to verify service ownership")
+                .build()
+        })?
+        .into_iter()
+        .map(|link| link.project_id)
+        .collect();
+
+    if unlinked_service_creator_may_access(auth.user_id(), &project_ids, service.created_by_user_id)
+    {
+        return Ok(());
+    }
+
+    session_caller_may_access_linked_projects(
+        auth,
+        &project_ids,
+        state.project_access_checker.as_deref(),
+    )
+    .await
+}
+
+fn unlinked_service_creator_may_access(
+    user_id: i32,
+    project_ids: &[i32],
+    created_by_user_id: Option<i32>,
+) -> bool {
+    project_ids.is_empty() && created_by_user_id == Some(user_id)
+}
+
+/// Pure authorization decision for the session/API-key/CLI branch of
+/// [`assert_service_owned_by_caller`]: given the projects a service is
+/// linked to, may this caller access it?
+///
+/// * Instance-wide Admin/PlatformAdmin bypasses, matching the documented
+///   contract of [`temps_core::ProjectAccessChecker`] (implementations are
+///   not required to duplicate that check themselves).
+/// * No checker registered (plain OSS, or EE before any team-access grant
+///   exists) → allow. This "fail-open-when-unconfigured" behaviour is a
+///   documented property of the extension point, not a bug: it's what keeps
+///   an EE binary with no grants configured yet behaving identically to OSS.
+/// * Checker registered → allow iff the caller can access at least one of
+///   the linked projects.
+///
+/// Extracted as its own function — taking already-resolved data instead of
+/// `AppState` — so the decision is unit-testable without a database round
+/// trip, the same reasoning as [`deployment_visible_to_caller`] below.
+async fn session_caller_may_access_linked_projects(
+    auth: &temps_auth::AuthContext,
+    project_ids: &[i32],
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    match checker {
+        Some(checker) => {
+            require_access_to_any_linked_project(auth.user_id(), project_ids, checker).await
+        }
+        None => Ok(()),
+    }
+}
+
+/// Require a project-scoped permission on at least one project linked to the
+/// service. Installations without scoped project roles retain the existing
+/// membership behavior, while configured roles cannot use an instance-level
+/// permission to mutate a service outside their effective project grants.
+#[cfg(test)]
+async fn session_caller_has_permission_on_linked_projects(
+    auth: &temps_auth::AuthContext,
+    project_ids: &[i32],
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+    required: &Permission,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    let required = required.to_string();
+    for &project_id in project_ids {
+        let effective = checker
+            .effective_project_permissions(auth.user_id(), project_id)
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Could not verify project permissions for external service access: {error}"
+                    ))
+                    .build()
+            })?;
+        match effective {
+            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
+                return Ok(());
+            }
+            Some(_) => {}
+            None => {
+                let is_member = checker
+                    .user_can_access_project(auth.user_id(), project_id)
+                    .await
+                    .map_err(|error| {
+                        internal_server_error()
+                            .detail(format!(
+                                "Could not verify project access for external service: {error}"
+                            ))
+                            .build()
+                    })?;
+                if is_member {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(forbidden()
+        .detail(format!(
+            "The external service is not linked to a project where you have the {required} permission"
+        ))
+        .build())
+}
+
+/// Allow iff `user_id` can access at least one of `project_ids`, per the
+/// registered [`temps_core::ProjectAccessChecker`]. Fails closed (denies) on
+/// any infrastructure error from the checker — a checker that can't verify
+/// access must never be treated as "access granted".
+///
+/// Shared with the credential-reveal path
+/// (`handlers::require_service_parameter_project_access`), which enforces
+/// the identical rule for a different endpoint.
+pub(crate) async fn require_access_to_any_linked_project(
+    user_id: i32,
+    project_ids: &[i32],
+    checker: &dyn temps_core::ProjectAccessChecker,
+) -> Result<(), Problem> {
+    let mut infrastructure_error = None;
+    for project_id in project_ids {
+        match checker.user_can_access_project(user_id, *project_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => infrastructure_error = Some(error),
+        }
+    }
+
+    if let Some(error) = infrastructure_error {
+        error!(user_id, error = %error, "Project access check failed");
+        return Err(internal_server_error()
+            .title("Project Access Check Failed")
+            .detail("Could not verify project access; please try again")
             .build());
     }
 
-    Ok(())
+    Err(forbidden()
+        .title("Project Access Denied")
+        .detail("Your team membership does not include access to this service")
+        .build())
 }
 
 /// Pure authorization policy: may a caller see/act on a deployment?
@@ -1401,6 +1790,28 @@ async fn assert_deployment_owned_by_caller(
             .build());
     }
 
+    // Session/API-key/CLI caller: `deployment_visible_to_caller` only binds
+    // deployment *tokens* to their project, so on its own it let any holder of
+    // `DeploymentsRead`/`DeploymentsWrite` read or mutate monitoring state on
+    // another tenant's deployment by changing the URL id. Apply the same
+    // team-access rule the external-service path already uses — a no-op in OSS
+    // where no checker is registered, real enforcement once one is (ADR-028).
+    if auth.project_id().is_none() {
+        session_caller_may_access_linked_projects(
+            auth,
+            &[deployment.project_id],
+            state.project_access_checker.as_deref(),
+        )
+        .await
+        .map_err(|_| {
+            // Mirror the 404 above: don't confirm that a deployment with this
+            // id exists in a project the caller cannot see.
+            not_found()
+                .detail(format!("Deployment {} not found", deployment_id))
+                .build()
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1454,6 +1865,14 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         )
         // Node metrics
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
+        .route(
+            "/nodes/{id}/metrics/alert-rules",
+            get(list_node_alert_rules),
+        )
+        .route(
+            "/nodes/{id}/metrics/alert-rules/{rule_id}",
+            patch(update_node_alert_rule),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1895,8 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_deployment_metrics_latest,
         toggle_deployment_metrics,
         get_node_metrics_range,
+        list_node_alert_rules,
+        update_node_alert_rule,
     ),
     components(schemas(
         MetricDataPoint,
@@ -1506,27 +1927,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_range_to_step_1h() {
-        let (window, step) = range_to_step("1h");
-        assert_eq!(window, Duration::hours(1));
-        assert_eq!(step, Duration::minutes(1));
-    }
-
-    #[test]
-    fn test_range_to_step_7d() {
-        let (window, step) = range_to_step("7d");
-        assert_eq!(window, Duration::days(7));
-        assert_eq!(step, Duration::hours(1));
-    }
-
-    #[test]
-    fn test_range_to_step_unknown_defaults_to_1h() {
-        let (window, step) = range_to_step("30d");
-        assert_eq!(window, Duration::hours(1));
-        assert_eq!(step, Duration::minutes(1));
-    }
-
-    #[test]
     fn test_histogram_quantile_p50() {
         // Simple 3-bucket histogram: [0,1), [1,2), [2,3)
         let bounds = vec![1.0, 2.0, 3.0];
@@ -1550,6 +1950,38 @@ mod tests {
     fn test_histogram_quantile_all_zero_counts_returns_nan() {
         let result = histogram_quantile(0.5, &[1.0, 2.0], &[0, 0]);
         assert!(result.is_nan());
+    }
+
+    fn range_query(start: DateTime<Utc>, end: DateTime<Utc>) -> MetricsRangeQuery {
+        MetricsRangeQuery {
+            metric: "node.cpu_percent".into(),
+            range: "1h".into(),
+            percentile: None,
+            start_time: Some(start),
+            end_time: Some(end),
+        }
+    }
+
+    #[test]
+    fn custom_seven_day_window_uses_hourly_step() {
+        let start = DateTime::parse_from_rfc3339("2026-08-06T00:00:00Z")
+            .expect("valid fixture")
+            .with_timezone(&Utc);
+        let end = start + Duration::days(7);
+        let (_, _, step) = resolve_range_window(&range_query(start, end)).expect("within cap");
+        assert_eq!(step, Duration::hours(1));
+        let points = (end - start).num_seconds() / step.num_seconds().max(1);
+        assert!(points <= temps_core::time_window::MAX_SERIES_POINTS);
+    }
+
+    #[test]
+    fn custom_one_hour_window_uses_minute_step() {
+        let start = DateTime::parse_from_rfc3339("2026-08-13T11:00:00Z")
+            .expect("valid fixture")
+            .with_timezone(&Utc);
+        let end = start + Duration::hours(1);
+        let (_, _, step) = resolve_range_window(&range_query(start, end)).expect("within cap");
+        assert_eq!(step, Duration::minutes(1));
     }
 
     #[test]
@@ -1606,5 +2038,313 @@ mod tests {
         // single-project model, regardless of the deployment's project.
         assert!(deployment_visible_to_caller(1, None));
         assert!(deployment_visible_to_caller(999, None));
+    }
+
+    // ── session-caller project access (SECURITY metrics-security-6) ────────
+    //
+    // `session_caller_may_access_linked_projects` is the pure policy behind
+    // the session/API-key/CLI branch of `assert_service_owned_by_caller`.
+    // Unlike deployment tokens (checked above via a direct project_services
+    // row match), these callers have no single bound project, so ownership
+    // is expressed through the `ProjectAccessChecker` EE extension point —
+    // a no-op in OSS, real team-based enforcement in EE.
+
+    #[test]
+    fn creator_access_only_applies_while_service_is_unlinked() {
+        assert!(unlinked_service_creator_may_access(42, &[], Some(42)));
+        assert!(!unlinked_service_creator_may_access(42, &[], Some(7)));
+        assert!(!unlinked_service_creator_may_access(42, &[9], Some(42)));
+        assert!(!unlinked_service_creator_may_access(42, &[], None));
+    }
+
+    struct TestProjectAccessChecker {
+        allowed_project_ids: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for TestProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("checker infrastructure failure".into());
+            }
+            Ok(self.allowed_project_ids.contains(&project_id))
+        }
+    }
+
+    struct EffectiveServicePermissionChecker {
+        permissions: Option<Vec<String>>,
+        member: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for EffectiveServicePermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.member)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.permissions.clone())
+        }
+    }
+
+    fn test_session_auth(role: temps_auth::Role) -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[tokio::test]
+    async fn session_user_allowed_with_no_checker_registered() {
+        // OSS has no team-access concept: an unregistered checker must
+        // fail open, identical to the pre-fix behaviour (existence-only).
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_admin_bypasses_a_denying_checker() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![],
+            fail: false,
+        };
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::Admin),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_user_denied_when_checker_grants_no_linked_project() {
+        // This is the actual EE-enforced fix: a non-admin member whose team
+        // has no grant on any project the service is linked to is denied,
+        // instead of the pre-fix behaviour of "any session user may access
+        // any service that exists".
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![99],
+            fail: false,
+        };
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await
+        .expect_err("no linked project is accessible — must deny");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_is_denied_when_project_role_removes_write_permission() {
+        let checker = EffectiveServicePermissionChecker {
+            permissions: Some(vec![Permission::ExternalServicesRead.to_string()]),
+            member: true,
+        };
+
+        let problem = session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[99],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect_err("coarse membership must not authorize a service mutation");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_falls_back_to_membership_without_scoped_permissions() {
+        let checker = EffectiveServicePermissionChecker {
+            permissions: None,
+            member: true,
+        };
+
+        session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[99],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect("unconfigured project roles preserve coarse membership semantics");
+    }
+
+    #[tokio::test]
+    async fn session_user_allowed_when_checker_grants_one_linked_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![11],
+            fail: false,
+        };
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    // ── OpenAPI registration ───────────────────────────────────────────────
+    //
+    // `MetricsApiDoc` is NOT the document the server serves. The plugin
+    // contributes `ExternalServiceApiDoc` (handlers.rs), which re-lists every
+    // metrics operation by hand. A handler added to `MetricsApiDoc` alone
+    // compiles, routes, and answers requests — but is absent from
+    // `/api-docs/openapi.json`, so `bun run openapi-ts` generates no binding
+    // for it and neither the console nor the CLI can call it. That is a silent
+    // failure with no compile error and no runtime error; these tests are the
+    // only thing that catches it.
+
+    /// `operation_id`s declared by an OpenAPI document, keyed by the path they
+    /// sit on so a failure message points at the endpoint, not just the name.
+    fn operation_keys(doc: &utoipa::openapi::OpenApi) -> std::collections::BTreeSet<String> {
+        doc.paths
+            .paths
+            .iter()
+            .flat_map(|(path, item)| {
+                [
+                    &item.get,
+                    &item.put,
+                    &item.post,
+                    &item.delete,
+                    &item.patch,
+                    &item.head,
+                    &item.options,
+                    &item.trace,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(move |op| op.operation_id.as_ref().map(|id| format!("{id} ({path})")))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn served_openapi_doc_declares_every_metrics_operation() {
+        use utoipa::OpenApi as _;
+
+        let metrics = operation_keys(&MetricsApiDoc::openapi());
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+
+        let missing: Vec<_> = metrics.difference(&served).cloned().collect();
+        assert!(
+            missing.is_empty(),
+            "these metrics operations are routed but absent from the served OpenAPI \
+             document (ExternalServiceApiDoc in handlers.rs), so no SDK binding is \
+             generated for them: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn node_alert_rule_endpoints_are_in_the_served_openapi_doc() {
+        use utoipa::OpenApi as _;
+
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+        for expected in [
+            "NodeMetricsGetAlertRules (/nodes/{id}/metrics/alert-rules)",
+            "NodeMetricsUpdateAlertRule (/nodes/{id}/metrics/alert-rules/{rule_id})",
+        ] {
+            assert!(
+                served.contains(expected),
+                "{expected} missing from the served OpenAPI document; \
+                 declared operations: {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_user_denied_when_checker_infrastructure_fails() {
+        // Fail-closed: a checker that cannot verify access must never be
+        // treated as "access granted".
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![],
+            fail: true,
+        };
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10],
+            Some(&checker),
+        )
+        .await
+        .expect_err("checker infrastructure failure must deny, not allow");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Deployment metrics used the same team-access rule only for deployment
+    /// tokens; a session user with `DeploymentsRead` could read or toggle
+    /// monitoring on any deployment id (IDOR). The session path now runs
+    /// through the checker too, so a member with no grant on the deployment's
+    /// project is denied.
+    #[tokio::test]
+    async fn session_user_denied_for_deployment_in_unreachable_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![7],
+            fail: false,
+        };
+        // The deployment lives in project 42, which this member cannot reach.
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[42],
+            Some(&checker),
+        )
+        .await
+        .expect_err("deployment's project is not accessible — must deny");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The pure visibility rule still binds deployment tokens to their own
+    /// project, and (by itself) says nothing about session users — which is
+    /// exactly why the session path needs the checker above.
+    #[test]
+    fn deployment_token_is_bound_to_its_own_project() {
+        assert!(deployment_visible_to_caller(42, Some(42)));
+        assert!(!deployment_visible_to_caller(42, Some(7)));
+        assert!(
+            deployment_visible_to_caller(42, None),
+            "session users are not constrained by this fn — the checker is"
+        );
     }
 }

@@ -1,10 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Provider catalog — single source of truth for how each AI CLI is
 //! installed, authenticated, and seeded inside a sandbox container.
 //!
-//! Adding a new provider only requires:
-//!   1. Append a `ProviderCatalogEntry` to [`PROVIDER_CATALOG`].
-//!   2. Implement `AiCliProvider` in a new module under `ai_cli/`.
-//!   3. Register it in [`super::create_provider`].
+//! Adding a new provider requires implementing [`super::AiCliProvider`] and
+//! appending one self-contained registration to [`PROVIDER_CATALOG`]. Runtime
+//! construction and shared UI metadata are both derived from that registration.
 //!
 //! No DB migrations, no UI changes, no schema bumps.
 
@@ -24,6 +26,22 @@ pub enum CredentialFormat {
     /// Arbitrary file body (OpenCode's `auth.json`, future providers' config
     /// files). Decrypted bytes are written verbatim to `seed_path`.
     ConfigFile,
+}
+
+pub type ProviderFactory = fn() -> Box<dyn super::AiCliProvider>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAccessRequirement {
+    AiGatewayWrite,
+    SystemAdmin,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderOption {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub requires_system_admin: bool,
 }
 
 /// Single auth flavor a provider supports. Most providers expose just one;
@@ -81,12 +99,29 @@ pub struct ProviderCatalogEntry {
     /// Auth flavors this provider supports, in display order. The first entry
     /// is the recommended default for new installs.
     pub auth_flavors: &'static [AuthFlavor],
-    /// Model identifiers this provider accepts, in display order. The first
-    /// entry is the recommended default. Empty when the provider doesn't
-    /// expose model selection (e.g. OpenCode delegates model choice to its
-    /// own per-session config). The settings UI renders these in the model
-    /// dropdown for the *active* provider only.
+    /// Verified provider-native model identifiers that remain safe to offer
+    /// when live harness discovery is unavailable, in display order. The
+    /// first entry is the recommended default. Keep this empty when the
+    /// harness owns an account-aware catalog: callers must not invent model
+    /// identifiers when its metadata probe fails.
     pub models: &'static [&'static str],
+    /// Provider-native modes translated into the common capability contract.
+    /// Authorization remains enforced by Temps' Tool Broker; these values only
+    /// control the provider process itself.
+    pub permission_modes: &'static [ProviderOption],
+    pub default_permission_mode_id: &'static str,
+    /// Minimum Temps permission required to run this host process at all.
+    pub host_access_requirement: HostAccessRequirement,
+    pub text_streaming: bool,
+    pub reasoning_streaming: bool,
+    pub user_interactions: bool,
+    /// Whether this adapter has a secure, turn-scoped model relay for running
+    /// inside a persistent Temps workspace. Host authentication alone is not
+    /// enough: workspace harnesses never receive reusable provider tokens.
+    pub workspace_chat_supported: bool,
+    /// Constructs the adapter. Keeping this beside the metadata eliminates the
+    /// second provider-id match that previously had to be updated separately.
+    pub factory: ProviderFactory,
 }
 
 impl ProviderCatalogEntry {
@@ -136,17 +171,43 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Model IDs the Claude CLI accepts. Short aliases (`sonnet`/`opus`/
-        // `haiku`) always pin to the latest release in that tier; the dated
-        // IDs let users opt into a specific snapshot.
-        models: &[
-            "sonnet",
-            "opus",
-            "haiku",
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
-            "claude-haiku-4-5",
+        // Claude Code's control initialization response is the only source of
+        // selectable models. Its account-aware aliases and concrete versions
+        // change independently of Temps, so a failed probe must stay empty.
+        models: &[],
+        permission_modes: &[
+            ProviderOption {
+                id: "default",
+                name: "Ask each time",
+                description: "Ask before sensitive provider-native actions",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "accept-edits",
+                name: "Accept edits",
+                description: "Allow provider-native edits when that surface is enabled",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "plan",
+                name: "Plan",
+                description: "Plan without making provider-native changes",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "full-access",
+                name: "Auto",
+                description: "Run provider-native actions automatically inside the Temps sandbox",
+                requires_system_admin: true,
+            },
         ],
+        default_permission_mode_id: "default",
+        host_access_requirement: HostAccessRequirement::AiGatewayWrite,
+        text_streaming: true,
+        reasoning_streaming: false,
+        user_interactions: true,
+        workspace_chat_supported: true,
+        factory: || Box::new(super::claude::ClaudeCliProvider),
     },
     ProviderCatalogEntry {
         id: "codex_cli",
@@ -172,14 +233,11 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Model IDs the Codex CLI exposes via its `Select Model and Effort`
-        // picker (run `codex` then `/model`). Verified against the CLI's
-        // interactive menu — GPT-5.4 is the current frontier family, with
-        // the `-codex` variants tuned for coding and `-max` trading latency
-        // for depth. The `5.1` family is kept as a cheaper/faster fallback.
-        // `gpt-5-codex` is kept as a legacy option but fails on many
-        // ChatGPT accounts ("model not supported"), so it's not the default.
+        // Bootstrap fallback when account-aware app-server discovery fails.
         models: &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5.4",
             "gpt-5.4-codex",
             "gpt-5.4-codex-max",
@@ -188,6 +246,33 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
             "gpt-5.1-codex-mini",
             "gpt-5-codex",
         ],
+        permission_modes: &[
+            ProviderOption {
+                id: "auto",
+                name: "Default permissions",
+                description: "Use Codex's governed workspace sandbox",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "auto-review",
+                name: "Auto-review",
+                description: "Review provider-native actions automatically",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "full-access",
+                name: "Full access",
+                description: "Disable the provider sandbox and approval prompts",
+                requires_system_admin: true,
+            },
+        ],
+        default_permission_mode_id: "auto",
+        host_access_requirement: HostAccessRequirement::SystemAdmin,
+        text_streaming: false,
+        reasoning_streaming: false,
+        user_interactions: false,
+        workspace_chat_supported: false,
+        factory: || Box::new(super::codex::CodexCliProvider),
     },
     ProviderCatalogEntry {
         id: "opencode",
@@ -208,6 +293,27 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         // settings UI to hide the model dropdown for OpenCode and surface a
         // hint that model selection lives in the OpenCode config instead.
         models: &[],
+        permission_modes: &[
+            ProviderOption {
+                id: "build",
+                name: "Build",
+                description: "Use OpenCode's build agent",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "plan",
+                name: "Plan",
+                description: "Use OpenCode's planning agent",
+                requires_system_admin: false,
+            },
+        ],
+        default_permission_mode_id: "build",
+        host_access_requirement: HostAccessRequirement::AiGatewayWrite,
+        text_streaming: false,
+        reasoning_streaming: false,
+        user_interactions: false,
+        workspace_chat_supported: false,
+        factory: || Box::new(super::opencode::OpenCodeCliProvider),
     },
 ];
 
@@ -236,6 +342,14 @@ mod tests {
             assert!(
                 !entry.auth_flavors.is_empty(),
                 "provider {} has no auth flavors",
+                entry.id
+            );
+            assert!(
+                entry
+                    .permission_modes
+                    .iter()
+                    .any(|mode| mode.id == entry.default_permission_mode_id),
+                "provider {} has an invalid default permission mode",
                 entry.id
             );
             for flavor in entry.auth_flavors {
@@ -275,6 +389,34 @@ mod tests {
     fn claude_subscription_is_first_flavor() {
         let claude = find_provider("claude_cli").expect("claude_cli in catalog");
         assert_eq!(claude.default_flavor().id, "subscription");
+    }
+
+    #[test]
+    fn claude_models_are_never_synthesized_by_the_static_catalog() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        assert!(
+            claude.models.is_empty(),
+            "Claude model choices must come from the installed harness"
+        );
+    }
+
+    #[test]
+    fn claude_permission_labels_explain_runtime_behavior() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        let ask = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "default")
+            .expect("default Claude permission mode");
+        let automatic = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "full-access")
+            .expect("automatic Claude permission mode");
+
+        assert_eq!(ask.name, "Ask each time");
+        assert_eq!(automatic.name, "Auto");
+        assert!(automatic.requires_system_admin);
     }
 
     #[test]

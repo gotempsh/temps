@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse, SessionEventDto } from '@/api/client'
 import {
   getSessionReplayEventsOptions,
@@ -41,7 +44,7 @@ import {
   User,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 
 // Type definitions for event data
 interface IncrementalSnapshotData {

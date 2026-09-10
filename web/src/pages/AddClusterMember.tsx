@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { adminListNodesOptions, getServiceOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -29,7 +32,7 @@ import {
   Server,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 // Mirror of `member_provisioning_step` in temps-providers/src/services.rs.

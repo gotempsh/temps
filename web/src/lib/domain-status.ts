@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Domain status helpers — keep in sync with the backend's
 // `temps_entities::domains` status constants (CERT_SERVING_STATUSES).
 

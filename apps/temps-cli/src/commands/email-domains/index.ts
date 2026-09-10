@@ -1,17 +1,24 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listEmailDomains,
   createEmailDomain,
+  importEmailDomain,
   getDomain as getEmailDomain,
   deleteEmailDomain,
   getDomainByName as getEmailDomainByName,
   getDomainDnsRecords as getEmailDomainDnsRecords,
   setupDns as setupEmailDns,
   verifyDomain as verifyEmailDomain,
+  listEmailDomainProjects,
+  authorizeEmailDomainProject,
+  revokeEmailDomainProject,
 } from '../../api/sdk.gen.js'
-import type { EmailDomainResponse, DnsRecordResponse } from '../../api/types.gen.js'
+import type { AuthorizedEmailDomainProjectResponse, EmailDomainResponse, DnsRecordResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
@@ -23,6 +30,13 @@ import {
 interface CreateOptions {
   domain?: string
   providerId?: string
+  yes?: boolean
+}
+
+interface ImportOptions {
+  domain?: string
+  providerId?: string
+  providerIdentityId?: string
   yes?: boolean
 }
 
@@ -56,6 +70,13 @@ interface VerifyOptions {
   id: string
 }
 
+interface ProjectAuthorizationOptions {
+  id: string
+  projectId: string
+  force?: boolean
+  yes?: boolean
+}
+
 export function registerEmailDomainsCommands(program: Command): void {
   const emailDomains = program
     .command('email-domains')
@@ -77,6 +98,21 @@ export function registerEmailDomainsCommands(program: Command): void {
     .option('--provider-id <id>', 'Email provider ID')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createDomainAction)
+
+  emailDomains
+    .command('import')
+    .description(
+      'Import an existing domain identity that was already provisioned in the provider console. ' +
+      'Fetches the current verification state without re-creating the identity.'
+    )
+    .option('-d, --domain <domain>', 'Domain name (e.g., mail.example.com)')
+    .option('--provider-id <id>', 'Email provider ID')
+    .option(
+      '--provider-identity-id <id>',
+      'Provider-internal identity UUID (required for Scaleway; omit for SES)'
+    )
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .action(importDomainAction)
 
   emailDomains
     .command('show')
@@ -120,6 +156,122 @@ export function registerEmailDomainsCommands(program: Command): void {
     .description('Verify an email domain DNS configuration')
     .requiredOption('--id <id>', 'Email domain ID')
     .action(verifyDomainAction)
+
+  emailDomains
+    .command('projects')
+    .description('List projects authorized to send through an email domain')
+    .requiredOption('--id <id>', 'Email domain ID')
+    .option('--json', 'Output in JSON format')
+    .action(listAuthorizedProjectsAction)
+
+  emailDomains
+    .command('authorize-project')
+    .description('Authorize a project to send through an email domain')
+    .requiredOption('--id <id>', 'Email domain ID')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .action(authorizeProjectAction)
+
+  emailDomains
+    .command('revoke-project')
+    .description('Revoke a project\'s permission to send through an email domain')
+    .requiredOption('--id <id>', 'Email domain ID')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
+    .action(revokeProjectAction)
+}
+
+function parseAuthorizationIds(options: { id: string; projectId: string }): { domainId: number; projectId: number } | undefined {
+  const domainId = parsePositiveSafeInteger(options.id)
+  const projectId = parsePositiveSafeInteger(options.projectId)
+  if (domainId === undefined || projectId === undefined) {
+    warning('Domain ID and project ID must both be positive integers')
+    return undefined
+  }
+  return { domainId, projectId }
+}
+
+function parsePositiveSafeInteger(value: string): number | undefined {
+  if (!/^[1-9]\d*$/.test(value)) return undefined
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
+async function listAuthorizedProjectsAction(options: { id: string; json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const domainId = parsePositiveSafeInteger(options.id)
+  if (domainId === undefined) {
+    warning('Domain ID must be a positive integer')
+    return
+  }
+
+  const projects = await withSpinner('Fetching authorized projects...', async () => {
+    const { data, error } = await listEmailDomainProjects({ client, path: { id: domainId } })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  if (options.json) {
+    json(projects)
+    return
+  }
+
+  newline()
+  header(`${icons.key} Authorized Projects (${projects.length})`)
+  if (projects.length === 0) {
+    info('No projects can send through this email domain yet')
+    info(`Run: temps email-domains authorize-project --id ${domainId} --project-id <id>`)
+    newline()
+    return
+  }
+  const columns: TableColumn<AuthorizedEmailDomainProjectResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'Project', key: 'name', color: (value) => colors.bold(value) },
+    { header: 'Slug', key: 'slug', color: (value) => colors.muted(value) },
+  ]
+  printTable(projects, columns, { style: 'minimal' })
+  newline()
+}
+
+async function authorizeProjectAction(options: ProjectAuthorizationOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const ids = parseAuthorizationIds(options)
+  if (!ids) return
+  await withSpinner('Authorizing project...', async () => {
+    const { error } = await authorizeEmailDomainProject({
+      client,
+      path: { id: ids.domainId, project_id: ids.projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+  success(`Project ${ids.projectId} can now send through email domain ${ids.domainId}`)
+}
+
+async function revokeProjectAction(options: ProjectAuthorizationOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const ids = parseAuthorizationIds(options)
+  if (!ids) return
+  if (!options.force && !options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Revoke project ${ids.projectId} from email domain ${ids.domainId}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+  await withSpinner('Revoking project authorization...', async () => {
+    const { error } = await revokeEmailDomainProject({
+      client,
+      path: { id: ids.domainId, project_id: ids.projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+  success(`Project ${ids.projectId} can no longer send through email domain ${ids.domainId}`)
 }
 
 async function listDomainsAction(options: { json?: boolean }): Promise<void> {
@@ -222,6 +374,88 @@ async function createDomainAction(options: CreateOptions): Promise<void> {
     newline()
     info(`Run "temps email-domains setup-dns --id ${result.domain.id}" to auto-configure DNS`)
     info(`Run "temps email-domains verify --id ${result.domain.id}" after DNS is configured`)
+  }
+}
+
+async function importDomainAction(options: ImportOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  let domain: string
+  let providerId: number
+  let providerIdentityId: string | undefined
+
+  const isAutomation = options.yes && options.domain && options.providerId
+
+  if (isAutomation) {
+    domain = options.domain!
+    providerId = parseInt(options.providerId!, 10)
+    if (isNaN(providerId)) {
+      warning('Invalid provider ID')
+      return
+    }
+    providerIdentityId = options.providerIdentityId
+  } else {
+    domain = options.domain || await promptText({
+      message: 'Domain name to import (e.g., mail.example.com)',
+      required: true,
+    })
+
+    const providerIdStr = options.providerId || await promptText({
+      message: 'Email provider ID',
+      required: true,
+    })
+    providerId = parseInt(providerIdStr, 10)
+    if (isNaN(providerId)) {
+      warning('Invalid provider ID')
+      return
+    }
+
+    providerIdentityId = options.providerIdentityId || await promptText({
+      message: 'Provider identity ID (leave blank for SES, required for Scaleway)',
+      required: false,
+    }) || undefined
+  }
+
+  newline()
+  info(`Importing email domain ${colors.bold(domain)} from provider ${providerId}`)
+
+  const result = await withSpinner('Importing email domain...', async () => {
+    const { data, error } = await importEmailDomain({
+      client,
+      body: {
+        domain,
+        provider_id: providerId,
+        provider_identity_id: providerIdentityId ?? null,
+      },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  newline()
+  success(`Email domain ${domain} imported`)
+
+  if (result?.domain) {
+    const d = result.domain
+    keyValue('ID', d.id)
+    keyValue('Status', statusBadge(d.status === 'verified' ? 'active' : d.status))
+    if (d.last_verified_at) {
+      keyValue('Last Verified', formatDate(d.last_verified_at))
+    }
+    if (d.verification_error) {
+      keyValue('Verification Error', colors.error(d.verification_error))
+    }
+  }
+
+  if (result?.dns_records && result.dns_records.length > 0) {
+    newline()
+    info('DNS records (configure if not already set):')
+    for (const record of result.dns_records) {
+      keyValue(`${record.record_type}`, `${record.name} -> ${record.value}`)
+    }
+    newline()
+    info(`Run "temps email-domains verify --id ${result.domain.id}" to refresh verification status`)
   }
 }
 

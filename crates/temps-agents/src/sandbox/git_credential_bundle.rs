@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Files for the in-sandbox `temps-git-credential-helper` and
 //! `temps-git-credential-daemon` binaries, embedded at compile time.
 //! The Dockerfile's `git-credential-builder` stage compiles from these

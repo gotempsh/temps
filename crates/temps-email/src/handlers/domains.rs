@@ -1,30 +1,38 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email domain handlers
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth, Role};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::{self, Problem},
     AuditContext, RequestMetadata,
 };
 use temps_dns::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest};
 use tracing::{error, info, warn};
 
-use super::audit::{EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainVerifiedAudit};
+use super::audit::{
+    EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainImportedAudit,
+    EmailDomainProjectAuthorizedAudit, EmailDomainProjectChangeRequestedAudit,
+    EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
+};
 use super::types::{
-    AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
-    EmailDomainResponse, EmailDomainWithDnsResponse, SetupDnsRequest, SetupDnsResponse,
+    AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DeleteDomainQuery,
+    DnsRecordResponse, DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse,
+    ImportEmailDomainRequest, ListDomainsQuery, SetupDnsRequest, SetupDnsResponse,
 };
 use crate::errors::EmailError;
-use crate::services::CreateDomainRequest;
+use crate::services::{CreateDomainRequest, ImportDomainRequest};
 
 /// Map every EmailError variant to its correct HTTP status + real error message.
 ///
@@ -37,12 +45,25 @@ impl From<EmailError> for Problem {
         match error {
             EmailError::DomainNotFound(_)
             | EmailError::ProviderNotFound(_)
-            | EmailError::EmailNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
+            | EmailError::EmailNotFound(_)
+            | EmailError::ProjectNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
 
             EmailError::DomainNotVerified(_) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Domain Not Verified")
+                .with_detail(error.to_string()),
+
+            EmailError::DomainAlreadyExists { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Already Exists")
+                .with_detail(error.to_string()),
+
+            EmailError::DomainNotAuthorized { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Sender Domain Not Authorized")
+                .with_detail(error.to_string()),
+
+            EmailError::IdempotencyConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Idempotency Key Conflict")
                 .with_detail(error.to_string()),
 
             EmailError::Validation(_) | EmailError::InvalidProviderType(_) => {
@@ -51,16 +72,58 @@ impl From<EmailError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            // The provider's API definitively rejected the credentials supplied
+            // by the operator — this is a client input problem, not an internal
+            // error. 422 Unprocessable Entity is the appropriate status: the
+            // request was well-formed but the server cannot process it because
+            // the credentials were checked and found invalid.
+            EmailError::InvalidCredentials { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Invalid Provider Credentials")
+                    .with_detail(error.to_string())
+            }
+
+            // A network-level failure reaching the provider — the credentials
+            // may well be correct. 502 Bad Gateway signals "upstream problem"
+            // and distinguishes this from an InvalidCredentials rejection.
+            EmailError::ProviderUnreachable { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("Provider Unreachable")
+                .with_detail(error.to_string()),
+
+            // The domain's Temps-side record is already gone by the time this
+            // is returned — 502 signals "the request mostly succeeded, but an
+            // upstream cleanup step failed" rather than "nothing happened".
+            EmailError::ProviderCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Provider Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+
+            // The service layer (`ProviderService::list_provider_domains`)
+            // is expected to catch this and turn it into a typed
+            // `supported: false` response instead of propagating it here —
+            // present only as a defensive fallback so an unhandled case
+            // still fails loud with an accurate status instead of a bare
+            // 500.
+            EmailError::UnsupportedOperation { .. } => {
+                problemdetails::new(StatusCode::NOT_IMPLEMENTED)
+                    .with_title("Operation Not Supported")
+                    .with_detail(error.to_string())
+            }
+
             EmailError::Database(_)
             | EmailError::ProviderError(_)
+            | EmailError::ProviderDeliveryUnknown(_)
             | EmailError::Encryption(_)
             | EmailError::Decryption(_)
             | EmailError::Configuration(_)
             | EmailError::AwsSes(_)
             | EmailError::Scaleway(_)
+            | EmailError::ScalewayClientBuild { .. }
             | EmailError::Smtp(_)
             | EmailError::Serialization(_)
-            | EmailError::TrackingRewrite { .. } => {
+            | EmailError::TrackingRewrite { .. }
+            | EmailError::SendFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
@@ -76,6 +139,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/email-domains",
             post(create_email_domain).get(list_email_domains),
         )
+        // Static segments must come before the `{id}` wildcard so that Axum
+        // matches "/email-domains/import" and "/email-domains/by-domain/…"
+        // before falling through to the ID-based routes.
+        .route("/email-domains/import", post(import_email_domain))
         .route("/email-domains/by-domain/{domain}", get(get_domain_by_name))
         .route(
             "/email-domains/{id}",
@@ -87,6 +154,364 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/email-domains/{id}/verify", post(verify_domain))
         .route("/email-domains/{id}/setup-dns", post(setup_dns))
+        .route(
+            "/email-domains/{id}/projects",
+            get(list_email_domain_projects),
+        )
+        .route(
+            "/email-domains/{id}/projects/{project_id}",
+            post(authorize_email_domain_project).delete(revoke_email_domain_project),
+        )
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    get,
+    path = "/email-domains/{id}/projects",
+    params(("id" = i32, Path, description = "Email domain ID")),
+    responses(
+        (status = 200, description = "Projects authorized to use this sender domain", body = [AuthorizedEmailDomainProjectResponse]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Project visibility or database check failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_email_domain_projects(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<Json<Vec<AuthorizedEmailDomainProjectResponse>>, Problem> {
+    permission_guard!(auth, EmailDomainsRead);
+    let mut projects = state
+        .domain_service
+        .list_authorized_projects(id)
+        .await
+        .map_err(Problem::from)?;
+    if !(auth.is_admin() || auth.has_role(&Role::PlatformAdmin)) {
+        if let (Some(checker), Some(user_id)) =
+            (state.project_access_checker.as_ref(), auth.user_id_opt())
+        {
+            let hidden = checker.hidden_project_ids(user_id).await.map_err(|error| {
+                error!(
+                    user_id,
+                    domain_id = id,
+                    error = %error,
+                    "Project visibility check failed while listing email-domain grants"
+                );
+                internal_server_error()
+                    .title("Project Access Check Failed")
+                    .detail(format!(
+                        "Could not verify project visibility for email domain {id}"
+                    ))
+                    .build()
+            })?;
+            if let Some(hidden) = hidden {
+                let hidden = hidden.into_iter().collect::<std::collections::HashSet<_>>();
+                projects.retain(|project| !hidden.contains(&project.id));
+            }
+        }
+    }
+
+    Ok(Json(projects.into_iter().map(Into::into).collect()))
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/{id}/projects/{project_id}",
+    params(
+        ("id" = i32, Path, description = "Email domain ID"),
+        ("project_id" = i32, Path, description = "Project allowed to send from this domain")
+    ),
+    responses(
+        (status = 204, description = "Project authorized"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only an instance or platform administrator may change global sender-domain grants"),
+        (status = 404, description = "Domain or project not found"),
+        (status = 500, description = "Project access, audit, or database check failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn authorize_email_domain_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path((id, project_id)): Path<(i32, i32)>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+    require_global_sender_domain_authority(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    require_same_origin_session(&auth, &metadata)?;
+    let correlation_id = require_domain_project_change_audit(
+        state.as_ref(),
+        &auth,
+        &metadata,
+        id,
+        project_id,
+        "authorize",
+    )
+    .await?;
+    let result = state.domain_service.authorize_project(id, project_id).await;
+    let audit = EmailDomainProjectAuthorizedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        correlation_id,
+        domain_id: id,
+        project_id,
+        success: result.is_ok(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to audit email-domain project authorization: {error}");
+    }
+    result.map_err(Problem::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    tag = "Email Domains",
+    delete,
+    path = "/email-domains/{id}/projects/{project_id}",
+    params(
+        ("id" = i32, Path, description = "Email domain ID"),
+        ("project_id" = i32, Path, description = "Project whose authorization is revoked")
+    ),
+    responses(
+        (status = 204, description = "Project authorization revoked"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only an instance or platform administrator may change global sender-domain grants"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Project access, audit, or database check failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revoke_email_domain_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path((id, project_id)): Path<(i32, i32)>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+    require_global_sender_domain_authority(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    require_same_origin_session(&auth, &metadata)?;
+    let correlation_id = require_domain_project_change_audit(
+        state.as_ref(),
+        &auth,
+        &metadata,
+        id,
+        project_id,
+        "revoke",
+    )
+    .await?;
+    let result = state.domain_service.revoke_project(id, project_id).await;
+    let audit = EmailDomainProjectRevokedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        correlation_id,
+        domain_id: id,
+        project_id,
+        success: result.is_ok(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to audit email-domain project revocation: {error}");
+    }
+    result.map_err(Problem::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sender domains are instance-global resources. Project membership proves a
+/// caller may operate a project, but it does not prove authority over an
+/// arbitrary verified sender domain. Until domains have an explicit owner,
+/// only an instance administrator may change domain-to-project grants.
+fn require_global_sender_domain_authority(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    Err(forbidden()
+        .title("Sender Domain Authority Required")
+        .detail(
+            "Only an instance or platform administrator may change project access to a global sender domain",
+        )
+        .build())
+}
+
+async fn require_domain_project_change_audit(
+    state: &AppState,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    domain_id: i32,
+    project_id: i32,
+    action: &str,
+) -> Result<uuid::Uuid, Problem> {
+    let correlation_id = uuid::Uuid::new_v4();
+    let audit = EmailDomainProjectChangeRequestedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        correlation_id,
+        domain_id,
+        project_id,
+        action: action.to_string(),
+    };
+
+    state
+        .audit_service
+        .create_audit_log(&audit)
+        .await
+        .map_err(|error| {
+            error!(
+                "Refusing unaudited email-domain project {action} for domain {domain_id}, project {project_id}: {error}"
+            );
+            internal_server_error()
+                .title("Audit Log Unavailable")
+                .detail("The sender-domain change was not applied because its audit record could not be stored")
+                .build()
+        })?;
+
+    Ok(correlation_id)
+}
+
+/// Browser sessions carry ambient cookie credentials, so unsafe requests must
+/// originate from the exact console origin. A sibling deployment such as
+/// `attacker.example.com` is same-site and can receive `SameSite=Strict`
+/// cookies, but it is not same-origin. Bearer-authenticated API/CLI clients do
+/// not use ambient credentials and therefore do not need browser origin
+/// headers.
+fn require_same_origin_session(
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+) -> Result<(), Problem> {
+    if !auth.is_session() || request_is_same_origin(metadata) {
+        return Ok(());
+    }
+
+    Err(forbidden()
+        .detail("Browser session requests that change email-domain project access must originate from this Temps console")
+        .build())
+}
+
+fn request_is_same_origin(metadata: &RequestMetadata) -> bool {
+    let expected_origin = metadata.base_url.trim_end_matches('/');
+    if metadata
+        .headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin.trim_end_matches('/') == expected_origin)
+    {
+        return true;
+    }
+
+    metadata
+        .headers
+        .get("referer")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|referer| {
+            referer == expected_origin
+                || referer
+                    .strip_prefix(expected_origin)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+}
+
+/// Import an already-provisioned email domain from the provider
+///
+/// Use this endpoint when the domain identity was created directly in the email
+/// provider's console or API. Temps will fetch its current verification state
+/// rather than registering a new identity, preventing duplicate or conflicting
+/// provider-side entries.
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/import",
+    request_body = ImportEmailDomainRequest,
+    responses(
+        (status = 201, description = "Domain imported successfully", body = EmailDomainWithDnsResponse),
+        (status = 400, description = "Invalid request or provider lookup failed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 409, description = "Domain already registered for this provider"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn import_email_domain(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Json(request): Json<ImportEmailDomainRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsCreate);
+
+    let import_request = ImportDomainRequest {
+        provider_id: request.provider_id,
+        domain: request.domain.clone(),
+        provider_identity_id: request.provider_identity_id,
+    };
+
+    let result = state
+        .domain_service
+        .import(import_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to import email domain: {}", e);
+            Problem::from(e)
+        })?;
+
+    // Audit log
+    let audit = EmailDomainImportedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: result.domain.id,
+        domain: result.domain.domain.clone(),
+        provider_id: result.domain.provider_id,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for domain import: {}", e);
+    }
+
+    let response = EmailDomainWithDnsResponse {
+        domain: EmailDomainResponse {
+            id: result.domain.id,
+            provider_id: result.domain.provider_id,
+            domain: result.domain.domain,
+            status: result.domain.status,
+            last_verified_at: result.domain.last_verified_at.map(|dt| dt.to_rfc3339()),
+            verification_error: result.domain.verification_error,
+            created_at: result.domain.created_at.to_rfc3339(),
+            updated_at: result.domain.updated_at.to_rfc3339(),
+        },
+        dns_records: result
+            .dns_records
+            .into_iter()
+            .map(|r| DnsRecordResponse {
+                record_type: r.record_type,
+                name: r.name,
+                value: r.value,
+                priority: r.priority,
+                status: r.status.into(),
+            })
+            .collect(),
+    };
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// Create a new email domain
@@ -176,6 +601,7 @@ pub async fn create_email_domain(
     tag = "Email Domains",
     get,
     path = "/email-domains",
+    params(ListDomainsQuery),
     responses(
         (status = 200, description = "List of email domains", body = Vec<EmailDomainResponse>),
         (status = 401, description = "Unauthorized"),
@@ -187,10 +613,15 @@ pub async fn create_email_domain(
 pub async fn list_email_domains(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Query(query): Query<ListDomainsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailDomainsRead);
 
-    let domains = state.domain_service.list().await.map_err(|e| {
+    let domains = match query.provider_id {
+        Some(provider_id) => state.domain_service.list_by_provider(provider_id).await,
+        None => state.domain_service.list().await,
+    }
+    .map_err(|e| {
         error!("Failed to list email domains: {}", e);
         internal_server_error()
             .detail("Failed to list domains")
@@ -465,19 +896,28 @@ pub async fn verify_domain(
 }
 
 /// Delete an email domain
+///
+/// By default this only removes the Temps-side record; the domain identity
+/// on the provider (Scaleway/SES) is left intact, since it may be shared
+/// with other tools against that provider account. Pass
+/// `delete_from_provider=true` to also remove it on the provider's side. In
+/// either case, the local record is deleted regardless of whether that
+/// provider-side deletion succeeds — an unreachable provider never blocks
+/// removing the domain from Temps.
 #[utoipa::path(
     tag = "Email Domains",
     delete,
     path = "/email-domains/{id}",
+    params(
+        ("id" = i32, Path, description = "Domain ID"),
+        DeleteDomainQuery
+    ),
     responses(
         (status = 204, description = "Domain deleted"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
-        (status = 500, description = "Internal server error")
-    ),
-    params(
-        ("id" = i32, Path, description = "Domain ID")
+        (status = 500, description = "Internal server error (includes provider-side cleanup failure; the local record is still deleted)")
     ),
     security(("bearer_auth" = []))
 )]
@@ -486,6 +926,7 @@ pub async fn delete_email_domain(
     State(state): State<Arc<AppState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(id): Path<i32>,
+    Query(query): Query<DeleteDomainQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailDomainsDelete);
 
@@ -495,14 +936,14 @@ pub async fn delete_email_domain(
         not_found().detail("Domain not found").build()
     })?;
 
-    state.domain_service.delete(id).await.map_err(|e| {
-        error!("Failed to delete email domain: {}", e);
-        internal_server_error()
-            .detail("Failed to delete domain")
-            .build()
-    })?;
+    let delete_result = state
+        .domain_service
+        .delete(id, query.delete_from_provider)
+        .await;
 
-    // Create audit log
+    // The domain's Temps-side row is gone in both the success case and the
+    // ProviderCleanupFailed case (see DomainService::delete) -- audit the
+    // deletion either way, before propagating a cleanup failure below.
     let audit = EmailDomainDeletedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -511,11 +952,14 @@ pub async fn delete_email_domain(
         },
         domain_id: domain.id,
         domain: domain.domain,
+        delete_from_provider: query.delete_from_provider,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
+
+    delete_result?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -564,7 +1008,45 @@ pub async fn setup_dns(
             not_found().detail("Email domain not found").build()
         })?;
 
-    // Get the DNS provider
+    // Bind use of the provider credentials to an active, verified zone that
+    // authoritatively covers this email domain. The provider ID is caller
+    // input and must not grant access to unrelated DNS credentials.
+    let email_domain = &domain_with_dns.domain.domain;
+    let verified_zone = dns_provider_service
+        .find_verified_zone_for_provider(request.dns_provider_id, email_domain)
+        .await
+        .map_err(|error| {
+            error!(
+                provider_id = request.dns_provider_id,
+                domain = %email_domain,
+                %error,
+                "Failed to verify DNS provider authorization"
+            );
+            internal_server_error()
+                .detail("Failed to verify DNS provider authorization for this domain")
+                .build()
+        })?;
+    let Some(verified_zone) = verified_zone else {
+        warn!(
+            provider_id = request.dns_provider_id,
+            domain = %email_domain,
+            "Rejected email DNS setup through an unrelated provider"
+        );
+        return Err(bad_request()
+            .detail(format!(
+                "DNS provider {} is not authorized to manage {}",
+                request.dns_provider_id, email_domain
+            ))
+            .build());
+    };
+    let base_domain = verified_zone
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches("*.")
+        .to_ascii_lowercase();
+
+    // The authorization query above also requires this provider to be active.
     let dns_provider = dns_provider_service
         .get(request.dns_provider_id)
         .await
@@ -583,13 +1065,29 @@ pub async fn setup_dns(
                 .build()
         })?;
 
-    // Extract the base domain (e.g., "example.com" from "mail.example.com")
-    let email_domain = &domain_with_dns.domain.domain;
-    let base_domain = extract_base_domain(email_domain);
+    // `email_domain` and `base_domain` are already in scope from the
+    // provider-authorization check above (derived from the caller-verified
+    // DNS zone, not re-derived here) — do not shadow them.
+
+    // Create each DNS record — except DMARC. Unlike SPF/DKIM/MX, DMARC isn't
+    // additive: publishing `_dmarc.<root-domain>` sets a `p=quarantine`
+    // policy for the *entire* domain, which can affect mail from senders
+    // other than Temps (e.g. the company's regular Google Workspace/M365
+    // mail) if their SPF/DKIM alignment isn't already clean. Bundling that
+    // into the same "create all records" click as the purely-additive
+    // records would be exactly the kind of silent-on-the-user's-behalf
+    // change CLAUDE.md's operator-control rule warns against, so DMARC stays
+    // informational-only here — surfaced for the operator to add manually
+    // once they've confirmed it's safe for their domain.
+    let auto_creatable_records: Vec<_> = domain_with_dns
+        .dns_records
+        .iter()
+        .filter(|r| !r.name.starts_with("_dmarc."))
+        .collect();
 
     info!(
         "Setting up {} DNS records for {} using provider {}",
-        domain_with_dns.dns_records.len(),
+        auto_creatable_records.len(),
         email_domain,
         dns_provider.name
     );
@@ -597,8 +1095,7 @@ pub async fn setup_dns(
     let mut results = Vec::new();
     let mut records_created: u32 = 0;
 
-    // Create each DNS record
-    for dns_record in &domain_with_dns.dns_records {
+    for dns_record in auto_creatable_records {
         let result = create_dns_record(provider_instance.as_ref(), &base_domain, dns_record).await;
 
         if result.success {
@@ -608,7 +1105,7 @@ pub async fn setup_dns(
         results.push(result);
     }
 
-    let total_records = domain_with_dns.dns_records.len() as u32;
+    let total_records = results.len() as u32;
     let all_success = records_created == total_records;
 
     let message = if all_success {
@@ -634,16 +1131,6 @@ pub async fn setup_dns(
     };
 
     Ok(Json(response))
-}
-
-/// Extract the base domain from a full domain name
-fn extract_base_domain(domain: &str) -> String {
-    let parts: Vec<&str> = domain.split('.').collect();
-    if parts.len() >= 2 {
-        parts[parts.len() - 2..].join(".")
-    } else {
-        domain.to_string()
-    }
 }
 
 /// Create a single DNS record using the provider
@@ -731,5 +1218,126 @@ async fn create_dns_record(
                 message: format!("Failed to create record: {}", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{request_is_same_origin, require_global_sender_domain_authority};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use temps_auth::{AuthContext, Role};
+    use temps_core::RequestMetadata;
+
+    fn auth_with_role(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            temps_entities::users::Model {
+                id: 42,
+                name: "Domain Operator".to_string(),
+                email: "operator@example.test".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    fn metadata_with_header(name: &'static str, value: &'static str) -> RequestMetadata {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, HeaderValue::from_static(value));
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "test".to_string(),
+            headers,
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://app.example.com".to_string(),
+            scheme: "https".to_string(),
+            host: "app.example.com".to_string(),
+            is_secure: true,
+        }
+    }
+
+    #[test]
+    fn accepts_exact_console_origin() {
+        let metadata = metadata_with_header("origin", "https://app.example.com");
+        assert!(request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn rejects_same_site_sibling_origin() {
+        let metadata = metadata_with_header("origin", "https://attacker.example.com");
+        assert!(!request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn accepts_same_origin_referer_fallback() {
+        let metadata = metadata_with_header(
+            "referer",
+            "https://app.example.com/settings/email/domains/7",
+        );
+        assert!(request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn rejects_missing_browser_origin_evidence() {
+        let metadata = metadata_with_header("accept", "application/json");
+        assert!(!request_is_same_origin(&metadata));
+    }
+
+    #[test]
+    fn only_instance_or_platform_admin_can_change_global_sender_domain_grants() {
+        assert!(require_global_sender_domain_authority(&auth_with_role(Role::Admin)).is_ok());
+        assert!(
+            require_global_sender_domain_authority(&auth_with_role(Role::PlatformAdmin)).is_ok()
+        );
+        let denied = require_global_sender_domain_authority(&auth_with_role(Role::User))
+            .expect_err("project membership must not confer authority over a global domain");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    // ========== Tests for From<EmailError> for Problem HTTP status codes ==========
+    //
+    // These tests cover the two new error variants added for credential
+    // verification. They call `Into::<Problem>::into(err)` which exercises the
+    // exhaustive `From<EmailError> for Problem` impl defined in this module.
+
+    #[test]
+    fn invalid_credentials_maps_to_422_unprocessable_entity() {
+        use crate::errors::EmailError;
+        use temps_core::problemdetails::Problem;
+
+        let err = EmailError::InvalidCredentials {
+            provider_type: "scaleway".to_string(),
+            reason: "the API key was rejected (HTTP 401)".to_string(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn provider_unreachable_maps_to_502_bad_gateway() {
+        use crate::errors::EmailError;
+        use temps_core::problemdetails::Problem;
+
+        let err = EmailError::ProviderUnreachable {
+            provider_type: "ses".to_string(),
+            reason: "could not connect to AWS SES".to_string(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
     }
 }

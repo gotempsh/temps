@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { test, expect, describe, mock, beforeEach, afterEach } from 'bun:test'
 import { VercelAdapter } from './vercel.js'
 import type { ProjectSnapshot, PlatformCredentials } from '../types.js'

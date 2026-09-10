@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-deployments"
 version.workspace = true
@@ -14,18 +17,22 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
+temps-dns = { path = "../temps-dns" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-entities = { path = "../temps-entities" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-file-store = { path = "../temps-file-store" }
 temps-git = { path = "../temps-git" }
 temps-logs = { path = "../temps-logs" }
+temps-metrics = { path = "../temps-metrics" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network", features = ["control_plane"] }
+temps-otel = { path = "../temps-otel" }
 ipnet = "2.10"
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -53,18 +60,26 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
-cron = "0.15"
+cron = "0.17"
 flate2 = { workspace = true }
 zip = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }
 urlencoding = { workspace = true }
 tokio-tungstenite = { workspace = true }
+regex = { workspace = true }
 # mTLS for the terminal WebSocket proxy (ADR-020 WS-2.1): build a rustls
 # ClientConfig presenting the CP's cluster-CA-signed identity.
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+# ADR-041 §5: X.509 leaf parsing for certificate import validation.
+x509-parser = "0.18.0"
+# ADR-041 §5: rustls key types for CryptoProvider-based sign/verify.
+rustls-pki-types = "1.12.0"
+base64 = "0.23"
 
 [dev-dependencies]
 testcontainers = { workspace = true }
@@ -72,7 +87,14 @@ tokio-test = "0.4"
 mockall = "0.15"
 tower = { workspace = true }
 env_logger = "0.11"
-tempfile = "3.8"
+serial_test = "4.0"
+# ADR-041 tests: generate self-signed certs for cert_validator unit tests.
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
+# Key re-encoding for SEC1 (EC) and PKCS#1 (RSA) coverage (ADR-041 verification table).
+# All three crates are already vendored as transitive dependencies; adding them here
+# only exposes their encoding APIs to the test binary, without new network downloads.
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
 
 [features]
 default = []

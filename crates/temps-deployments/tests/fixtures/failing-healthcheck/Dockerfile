@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dockerfile that builds successfully but fails health checks
 # The container starts but doesn't listen on any port
 

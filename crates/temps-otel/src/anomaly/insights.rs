@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Insight generation from correlated anomalies.
 //!
 //! Correlates co-occurring anomalies on the same service within a 5-minute

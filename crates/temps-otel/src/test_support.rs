@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Test support: MockOtelStorage and helper builders.
 //!
 //! Provides an in-memory storage backend for unit and integration tests,
@@ -7,9 +10,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::error::OtelError;
+use crate::error::{OtelError, StorageErrorKind};
 use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
 use crate::types::*;
+
+/// Cross-project trace refs: `(trace_id, project_id)` → `first_seen`.
+pub type TraceRefMap = HashMap<(String, i32), chrono::DateTime<chrono::Utc>>;
 
 /// In-memory storage backend for tests.
 ///
@@ -23,9 +29,47 @@ pub struct MockOtelStorage {
     pub archived_logs: Arc<Mutex<Vec<LogRecord>>>,
     pub insights: Arc<Mutex<Vec<Insight>>>,
     pub health_summaries: Arc<Mutex<Vec<HealthSummary>>>,
+    /// Cross-project trace refs keyed by `(trace_id, project_id)` — value is
+    /// the `first_seen` of the FIRST recording (later re-recordings are no-ops).
+    pub trace_refs: Arc<Mutex<TraceRefMap>>,
     pub next_insight_id: Arc<Mutex<i64>>,
     /// If set, store_spans will return this error instead.
     pub fail_store_spans: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_spans`
+    /// error. `None` defaults to a terminal kind, so a test that only sets
+    /// `fail_store_spans` gets a fail-fast, no-sleep failure.
+    pub fail_store_spans_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// How many *leading* `store_spans` calls the injected failure applies to.
+    /// `None` means "every call" — the original behaviour. `Some(n)` fails the
+    /// first `n` calls and then succeeds, which is how a transient blip that
+    /// heals on retry is simulated.
+    pub fail_store_spans_times: Arc<Mutex<Option<u32>>>,
+    /// Total number of `store_spans` invocations, including failed ones, so
+    /// tests can assert how many retry attempts actually happened.
+    pub store_spans_calls: Arc<Mutex<u32>>,
+    /// If set, `store_metrics` will return this error instead. Mirrors
+    /// `fail_store_spans` for the metrics ingest retry-failure-injection tests.
+    pub fail_store_metrics: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_metrics`
+    /// error. `None` defaults to a terminal kind, mirroring
+    /// `fail_store_spans_kind`.
+    pub fail_store_metrics_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// How many *leading* `store_metrics` calls the injected failure applies
+    /// to. `None` means "every call". Mirrors `fail_store_spans_times`.
+    pub fail_store_metrics_times: Arc<Mutex<Option<u32>>>,
+    /// Total number of `store_metrics` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_metrics_calls: Arc<Mutex<u32>>,
+    /// If set, `store_logs` will return this error instead. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: even a terminal DB
+    /// error must not fail the overall `ingest_logs` call, because the S3
+    /// archive path is attempted regardless.
+    pub fail_store_logs: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_logs` error.
+    pub fail_store_logs_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// Total number of `store_logs` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_logs_calls: Arc<Mutex<u32>>,
     /// If set, archive_logs will return this error.
     pub fail_archive_logs: Arc<Mutex<Option<String>>>,
     /// Counts calls to `get_storage_quota`, so tests can assert on
@@ -34,6 +78,14 @@ pub struct MockOtelStorage {
     /// Overrides `get_storage_quota`'s `usage_pct`/`total_bytes`/`limit_bytes`
     /// for tests that need to simulate a project over its quota.
     pub quota_override: Arc<Mutex<Option<StorageQuota>>>,
+    /// Recorded ingest-failure groups, keyed `(signal_type, error_class)` —
+    /// mirrors the real backend's unique constraint so the mock aggregates
+    /// the same way rather than appending duplicates.
+    pub ingest_errors: Arc<Mutex<Vec<IngestErrorSummary>>>,
+    /// If set, `record_ingest_error` returns this error. Models the realistic
+    /// case where the backend recording the failure is itself the thing that
+    /// is down.
+    pub fail_record_ingest_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MockOtelStorage {
@@ -65,21 +117,297 @@ impl MockOtelStorage {
     pub fn get_storage_quota_call_count(&self) -> u32 {
         *self.get_storage_quota_calls.lock().unwrap()
     }
+
+    /// Number of times `store_spans` has been called (failures included).
+    pub fn store_spans_call_count(&self) -> u32 {
+        *self.store_spans_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_metrics` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_metrics_call_count(&self) -> u32 {
+        *self.store_metrics_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_logs` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_logs_call_count(&self) -> u32 {
+        *self.store_logs_calls.lock().unwrap()
+    }
+
+    /// Ingest-failure groups recorded so far.
+    pub fn recorded_ingest_errors(&self) -> Vec<IngestErrorSummary> {
+        self.ingest_errors.lock().unwrap().clone()
+    }
+
+    /// Make `store_spans` fail with a **transient** storage error on its first
+    /// `times` calls, then succeed. `times: None` fails every call forever.
+    pub fn fail_store_spans_transiently(&self, message: &str, times: Option<u32>) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseNetwork);
+        *self.fail_store_spans_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_spans` fail with a specific [`StorageErrorKind`] on its
+    /// first `times` calls (`None` = every call), for tests that assert on the
+    /// retry decision for one particular kind.
+    pub fn fail_store_spans_with(&self, message: &str, kind: StorageErrorKind, times: Option<u32>) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(kind);
+        *self.fail_store_spans_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_spans` fail with a **terminal** storage error on every call.
+    pub fn fail_store_spans_fatally(&self, message: &str) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+        *self.fail_store_spans_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_metrics` fail with a **transient** storage error on its
+    /// first `times` calls, then succeed. `times: None` fails every call
+    /// forever. Mirrors `fail_store_spans_transiently`.
+    pub fn fail_store_metrics_transiently(&self, message: &str, times: Option<u32>) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseNetwork);
+        *self.fail_store_metrics_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_metrics` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`.
+    pub fn fail_store_metrics_fatally(&self, message: &str) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+        *self.fail_store_metrics_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_logs` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: `ingest_logs` must
+    /// still return `Ok(count)` even when this fires, because the S3 archive
+    /// path is attempted regardless of the DB write's outcome.
+    pub fn fail_store_logs_fatally(&self, message: &str) {
+        *self.fail_store_logs.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_logs_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+    }
+
+    /// Aggregate the stored spans exactly as a real backend would: filter,
+    /// group by `(project, service, span name)`, apply the `min_count` floor,
+    /// then sort. Shared by `query_span_stats` and `count_span_stats` so the
+    /// mock cannot report a total that disagrees with its own rows.
+    fn aggregate_span_stats(&self, query: &SpanStatsQuery) -> Vec<SpanStats> {
+        let spans = self.spans.lock().unwrap();
+
+        let mut groups: HashMap<(i32, String, String), Vec<SpanRecord>> = HashMap::new();
+        for span in spans.iter() {
+            if !query.project_ids.contains(&span.project_id) {
+                continue;
+            }
+            if span.start_time < query.start_time || span.start_time > query.end_time {
+                continue;
+            }
+            if let Some(ref svc) = query.service_name {
+                if &span.resource.service_name != svc {
+                    continue;
+                }
+            }
+            if let Some(ref name) = query.span_name {
+                if &span.name != name {
+                    continue;
+                }
+            }
+            if let Some(ref pattern) = query.name_pattern {
+                if !span.name.to_lowercase().contains(&pattern.to_lowercase()) {
+                    continue;
+                }
+            }
+            if let Some(kind) = query.kind {
+                if span.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(status) = query.status {
+                if span.status_code != status {
+                    continue;
+                }
+            }
+            if let Some(min_dur) = query.min_duration_ms {
+                if span.duration_ms < min_dur {
+                    continue;
+                }
+            }
+            groups
+                .entry((
+                    span.project_id,
+                    span.resource.service_name.clone(),
+                    span.name.clone(),
+                ))
+                .or_default()
+                .push(span.clone());
+        }
+
+        let mut rows: Vec<SpanStats> = groups
+            .into_iter()
+            .filter(|(_, members)| members.len() as u64 >= query.min_count)
+            .map(|((project_id, service_name, span_name), members)| {
+                let mut durations: Vec<f64> = members.iter().map(|s| s.duration_ms).collect();
+                durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let count = durations.len() as i64;
+                let total: f64 = durations.iter().sum();
+                let avg = total / count as f64;
+                // Sample standard deviation; a single sample has no spread.
+                let stddev = if count > 1 {
+                    (durations.iter().map(|d| (d - avg).powi(2)).sum::<f64>()
+                        / (count as f64 - 1.0))
+                        .sqrt()
+                } else {
+                    0.0
+                };
+                let error_count = members
+                    .iter()
+                    .filter(|s| s.status_code == SpanStatusCode::Error)
+                    .count() as i64;
+                let last_seen = members
+                    .iter()
+                    .map(|s| s.start_time)
+                    .max()
+                    .unwrap_or_else(chrono::Utc::now);
+                let kind = members.last().map(|s| s.kind).unwrap_or(SpanKind::Internal);
+
+                build_span_stats(
+                    SpanStatsGroup {
+                        project_id,
+                        service_name,
+                        span_name,
+                        kind,
+                        count,
+                        error_count,
+                    },
+                    SpanDurationStats {
+                        total_ms: total,
+                        min_ms: durations.first().copied().unwrap_or(0.0),
+                        max_ms: durations.last().copied().unwrap_or(0.0),
+                        avg_ms: avg,
+                        stddev_ms: stddev,
+                        p50_ms: percentile(&durations, 0.50),
+                        p95_ms: percentile(&durations, 0.95),
+                        p99_ms: percentile(&durations, 0.99),
+                    },
+                    last_seen,
+                )
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            let key = |s: &SpanStats| match query.sort_by {
+                SpanStatsSortField::TotalDurationMs => s.total_duration_ms,
+                SpanStatsSortField::P50DurationMs => s.p50_duration_ms,
+                SpanStatsSortField::P95DurationMs => s.p95_duration_ms,
+                SpanStatsSortField::P99DurationMs => s.p99_duration_ms,
+                SpanStatsSortField::MaxDurationMs => s.max_duration_ms,
+                SpanStatsSortField::AvgDurationMs => s.avg_duration_ms,
+                SpanStatsSortField::StddevDurationMs => s.stddev_duration_ms,
+                SpanStatsSortField::Count => s.count as f64,
+                SpanStatsSortField::ErrorCount => s.error_count as f64,
+                SpanStatsSortField::ErrorRate => s.error_rate,
+                SpanStatsSortField::CoefficientOfVariation => s.coefficient_of_variation,
+                SpanStatsSortField::TailRatio => s.tail_ratio,
+            };
+            let ordering = key(a)
+                .partial_cmp(&key(b))
+                .unwrap_or(std::cmp::Ordering::Equal);
+            let ordering = match query.sort_order {
+                SortOrder::Asc => ordering,
+                SortOrder::Desc => ordering.reverse(),
+            };
+            // Same deterministic tie-breaker the SQL backends use.
+            ordering
+                .then_with(|| a.project_id.cmp(&b.project_id))
+                .then_with(|| a.service_name.cmp(&b.service_name))
+                .then_with(|| a.span_name.cmp(&b.span_name))
+        });
+
+        rows
+    }
+}
+
+/// Linear-interpolated percentile over a pre-sorted slice, matching
+/// PostgreSQL's `percentile_cont`.
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = q * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+    sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - lower as f64)
 }
 
 #[async_trait]
 impl OtelStorage for MockOtelStorage {
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
+        let call_index = {
+            let mut calls = self.store_metrics_calls.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+
+        if let Some(msg) = self.fail_store_metrics.lock().unwrap().as_ref() {
+            // `fail_store_metrics_times = Some(n)` fails only the first n
+            // calls, letting a test model a blip that heals on retry —
+            // mirrors `store_spans`.
+            let still_failing = match *self.fail_store_metrics_times.lock().unwrap() {
+                Some(times) => call_index < times,
+                None => true,
+            };
+            if still_failing {
+                return Err(OtelError::Storage {
+                    message: msg.clone(),
+                    kind: self
+                        .fail_store_metrics_kind
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(StorageErrorKind::ClickHouseSchema),
+                });
+            }
+        }
         let count = points.len() as u64;
         self.metrics.lock().unwrap().extend(points);
         Ok(count)
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
+        let call_index = {
+            let mut calls = self.store_spans_calls.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+
         if let Some(msg) = self.fail_store_spans.lock().unwrap().as_ref() {
-            return Err(OtelError::Storage {
-                message: msg.clone(),
-            });
+            // `fail_store_spans_times = Some(n)` fails only the first n calls,
+            // letting a test model a blip that heals on retry.
+            let still_failing = match *self.fail_store_spans_times.lock().unwrap() {
+                Some(times) => call_index < times,
+                None => true,
+            };
+            if still_failing {
+                return Err(OtelError::Storage {
+                    message: msg.clone(),
+                    kind: self
+                        .fail_store_spans_kind
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(StorageErrorKind::ClickHouseSchema),
+                });
+            }
         }
         let count = spans.len() as u64;
         self.spans.lock().unwrap().extend(spans);
@@ -87,9 +415,85 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
+        *self.store_logs_calls.lock().unwrap() += 1;
+
+        if let Some(msg) = self.fail_store_logs.lock().unwrap().as_ref() {
+            return Err(OtelError::Storage {
+                message: msg.clone(),
+                kind: self
+                    .fail_store_logs_kind
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(StorageErrorKind::ClickHouseSchema),
+            });
+        }
         let count = records.len() as u64;
         self.logs.lock().unwrap().extend(records);
         Ok(count)
+    }
+
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()> {
+        if let Some(msg) = self.fail_record_ingest_error.lock().unwrap().as_ref() {
+            return Err(OtelError::Storage {
+                message: msg.clone(),
+                kind: StorageErrorKind::PostgresConn,
+            });
+        }
+
+        let sample = crate::storage::truncate_sample_message(message);
+        let now = chrono::Utc::now();
+        let mut groups = self.ingest_errors.lock().unwrap();
+
+        // Same upsert semantics as the Postgres implementation: bump the
+        // existing group rather than appending a second row for the same pair.
+        match groups
+            .iter_mut()
+            .find(|g| g.signal_type == signal_type && g.error_class == error_class)
+        {
+            Some(existing) => {
+                existing.count += 1;
+                existing.last_seen = now;
+                existing.sample_message = sample;
+            }
+            None => groups.push(IngestErrorSummary {
+                signal_type: signal_type.to_string(),
+                error_class: error_class.to_string(),
+                sample_message: sample,
+                count: 1,
+                first_seen: now,
+                last_seen: now,
+            }),
+        }
+
+        Ok(())
+    }
+
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
+        let limit = crate::storage::clamp_ingest_error_limit(limit);
+        // Match the real TimescaleDB backend's `WHERE last_seen > NOW() -
+        // INTERVAL '{INGEST_ERROR_WINDOW_DAYS} days'` filter (see
+        // `timescaledb::record_ingest_error`'s doc comment) — without this, a
+        // unit test built on this mock would get a false-green on window
+        // filtering, since the real backend excludes stale groups and this
+        // one didn't.
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(crate::storage::INGEST_ERROR_WINDOW_DAYS as i64);
+        let mut groups: Vec<IngestErrorSummary> = self
+            .ingest_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.last_seen > cutoff)
+            .cloned()
+            .collect();
+        groups.sort_by_key(|g| std::cmp::Reverse(g.last_seen));
+        groups.truncate(limit as usize);
+        Ok(groups)
     }
 
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
@@ -224,6 +628,17 @@ impl OtelStorage for MockOtelStorage {
         Ok(filtered)
     }
 
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let all = self.aggregate_span_stats(&query);
+        let offset = query.effective_offset() as usize;
+        let limit = query.effective_limit() as usize;
+        Ok(all.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        Ok(self.aggregate_span_stats(&query).len() as u64)
+    }
+
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>> {
         let logs = self.logs.lock().unwrap();
         let filtered: Vec<LogRecord> = logs
@@ -247,6 +662,34 @@ impl OtelStorage for MockOtelStorage {
             .cloned()
             .collect();
         Ok(filtered)
+    }
+
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        let mut refs = self.trace_refs.lock().unwrap();
+        for tid in trace_ids {
+            // First write per (trace_id, project_id) wins, matching both
+            // production backends.
+            refs.entry((tid.clone(), project_id))
+                .or_insert_with(chrono::Utc::now);
+        }
+        Ok(trace_ids.len() as u64)
+    }
+
+    async fn get_trace_ref_projects(
+        &self,
+        trace_id: &str,
+    ) -> StorageResult<Vec<crate::storage::TraceRefProject>> {
+        let refs = self.trace_refs.lock().unwrap();
+        Ok(refs
+            .iter()
+            .filter(|((tid, _), _)| tid == trace_id)
+            .map(
+                |((_, project_id), first_seen)| crate::storage::TraceRefProject {
+                    project_id: *project_id,
+                    first_seen: *first_seen,
+                },
+            )
+            .collect())
     }
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
@@ -494,6 +937,11 @@ impl OtelStorage for MockOtelStorage {
         };
 
         Ok(count as u64)
+    }
+
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let spans = self.spans.lock().unwrap();
+        Ok(spans.iter().any(|span| span.project_id == project_id))
     }
 
     async fn apply_retention(&self, _project_id: i32) -> StorageResult<u64> {

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-migrations"
 version.workspace = true
@@ -12,6 +15,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 sea-orm-migration = { workspace = true }
 sea-orm = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }

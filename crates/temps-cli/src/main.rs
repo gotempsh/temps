@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps CLI - Single entrypoint for all services
 //!
 //! This binary delegates to `temps_cli::run` (defined in `lib.rs`) so the

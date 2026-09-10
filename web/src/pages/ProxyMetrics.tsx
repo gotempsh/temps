@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * ProxyMetrics — charts for proxy hot-path traffic.
  *
@@ -7,9 +10,8 @@
  *   - "All projects" (default): process-wide proxy.* node metrics on the
  *     control-plane node (id 0). These have no project dimension by design.
  *   - Project/environment filtered: proxy-log-derived time buckets from
- *     GET /proxy-logs/stats/time-buckets (request/error counts, avg latency,
- *     bandwidth). Logs carry no percentiles, so the latency-percentile panel
- *     is replaced by a bandwidth panel in filtered mode.
+ *     GET /proxy-logs/stats/time-buckets (request/error counts, avg + p50/p95/p99
+ *     latency, bandwidth).
  *
  * All data comes from generated SDK bindings — never hand-rolled fetch.
  */
@@ -23,6 +25,8 @@ import {
   nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TimeBucketStats } from '@/api/client/types.gen'
+import { Link } from 'react-router'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -31,6 +35,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { DateRangePicker } from '@/components/ui/date-range-picker'
 import {
   Select,
   SelectContent,
@@ -50,8 +55,20 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  formatProxyTimeLabel,
+  PROXY_MAX_WINDOW_DAYS,
+  PROXY_MAX_WINDOW_DAYS_SCOPED,
+  PROXY_RANGE_PRESETS,
+  proxyWindowTooWide,
+  resolveProxyWindow,
+  type ProxyRangeValue,
+  type ResolvedProxyWindow,
+} from '@/lib/proxy-metrics-window'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { DateRange } from 'react-day-picker'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
   CartesianGrid,
   Line,
@@ -68,30 +85,6 @@ import {
 
 /** The control-plane node always has id 0. */
 const CONTROL_PLANE_NODE_ID = 0
-
-const RANGE_OPTIONS = [
-  { value: '1h', label: '1h' },
-  { value: '6h', label: '6h' },
-  { value: '24h', label: '24h' },
-  { value: '7d', label: '7d' },
-] as const
-
-type RangeValue = (typeof RANGE_OPTIONS)[number]['value']
-
-const RANGE_SECONDS: Record<RangeValue, number> = {
-  '1h': 3_600,
-  '6h': 21_600,
-  '24h': 86_400,
-  '7d': 604_800,
-}
-
-/** Bucket steps matching the node-metric endpoint's per-range resolution. */
-const RANGE_BUCKET_INTERVAL: Record<RangeValue, string> = {
-  '1h': '1 minute',
-  '6h': '5 minutes',
-  '24h': '15 minutes',
-  '7d': '1 hour',
-}
 
 /** One line in a chart panel: data key + display label + stroke color. */
 type SeriesDef = {
@@ -229,7 +222,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Backend latency percentiles',
     description:
-      'Upstream duration p50 / p95 / p99 (proxied requests only: connect + processing + TTFB)',
+      'Upstream duration p50 / p95 / p99 (proxied requests only: connect + processing + TTFB). Includes WebSocket/SSE sessions, whose time-to-first-header is a real backend latency even though their total duration is not',
     series: [
       {
         metric: 'proxy.upstream_duration_p50_ms',
@@ -255,7 +248,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Latency breakdown',
     description:
-      'Mean request duration per interval, split into backend time and proxy overhead (proxied requests only for the split)',
+      'Mean request duration per interval, split into backend time and proxy overhead (proxied requests only for the split). Excludes WebSocket/SSE sessions, whose duration is a connection lifetime rather than a latency — see the streaming panel below',
     series: [
       {
         metric: 'proxy.request_duration_avg_ms',
@@ -278,6 +271,114 @@ const NODE_PANELS: NodePanelDef[] = [
     ],
     valueFormatter: formatMs,
   },
+  {
+    title: 'Proxy overhead percentiles',
+    description:
+      'Proxy self time p50 / p95 / p99. Read these alongside the mean above: a mean that moves while the percentiles stay flat is a handful of outlier requests, not a broad latency regression',
+    series: [
+      {
+        metric: 'proxy.self_duration_p50_ms',
+        dataKey: 'proxy.self_duration_p50_ms',
+        label: 'p50',
+        color: '#16a34a',
+      },
+      {
+        metric: 'proxy.self_duration_p95_ms',
+        dataKey: 'proxy.self_duration_p95_ms',
+        label: 'p95',
+        color: '#d97706',
+      },
+      {
+        metric: 'proxy.self_duration_p99_ms',
+        dataKey: 'proxy.self_duration_p99_ms',
+        label: 'p99',
+        color: '#dc2626',
+      },
+    ],
+    valueFormatter: formatMs,
+  },
+  {
+    title: 'Streaming sessions',
+    description:
+      'WebSocket tunnels and SSE streams that closed, averaged per collection interval (not a total for the bucket). These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
+    series: [
+      {
+        metric: 'proxy.streaming_sessions',
+        dataKey: 'proxy.streaming_sessions',
+        label: 'Sessions closed',
+        color: '#7c3aed',
+      },
+    ],
+    valueFormatter: formatCount,
+  },
+  {
+    title: 'Streaming session lifetime',
+    description: 'Mean time a WebSocket/SSE session stayed open before closing',
+    series: [
+      {
+        metric: 'proxy.streaming_duration_avg_ms',
+        dataKey: 'proxy.streaming_duration_avg_ms',
+        label: 'Mean lifetime',
+        color: '#7c3aed',
+      },
+    ],
+    valueFormatter: formatMs,
+  },
+]
+
+/**
+ * File-descriptor panels — the socket-exhaustion signal.
+ *
+ * Every socket the proxy holds is a file descriptor, so these two series are
+ * how close the machine is to refusing new connections. They are separate from
+ * NODE_PANELS because they describe the host rather than proxy traffic, and
+ * they are what the seeded `node.fd_percent` / `node.process_fd_percent` alert
+ * rules watch.
+ *
+ * Linux-only: both are read from `/proc`, so a macOS dev box shows the empty
+ * state rather than a broken chart.
+ */
+const FD_PANELS: NodePanelDef[] = [
+  {
+    title: 'File descriptors in use',
+    description:
+      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the temps binary against its own RLIMIT_NOFILE',
+    series: [
+      {
+        metric: 'node.fd_percent',
+        dataKey: 'node.fd_percent',
+        label: 'System-wide',
+        color: '#dc2626',
+      },
+      {
+        metric: 'node.process_fd_percent',
+        dataKey: 'node.process_fd_percent',
+        label: 'This process',
+        color: '#d97706',
+      },
+    ],
+    valueFormatter: formatPercent,
+  },
+  {
+    title: 'Open file descriptors',
+    description:
+      'Absolute counts, for capacity planning. The process count is always reported; its percentage only exists when RLIMIT_NOFILE is finite',
+    series: [
+      {
+        metric: 'node.fd_allocated',
+        dataKey: 'node.fd_allocated',
+        label: 'System-wide',
+        color: '#2563eb',
+      },
+      {
+        metric: 'node.process_open_fds',
+        dataKey: 'node.process_open_fds',
+        label: 'This process',
+        color: '#16a34a',
+      },
+    ],
+    valueFormatter: formatCount,
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -298,21 +399,18 @@ function isMetricsUnavailable(err: unknown): boolean {
   return msg.includes('not available') || msg.includes('unavailable')
 }
 
-/** Time-axis label — include the date on multi-day ranges. */
-function formatTimeLabel(iso: string, range: RangeValue): string {
-  const d = new Date(iso)
-  if (range === '7d') {
-    return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
-  }
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
 /** Shared query options for one proxy metric series on the CP node. */
-function proxySeriesQuery(metric: string, range: RangeValue) {
+function proxySeriesQuery(metric: string, window: ResolvedProxyWindow) {
   return {
     ...nodeMetricsGetRangeOptions({
       path: { id: CONTROL_PLANE_NODE_ID },
-      query: { metric, range },
+      query: window.rangeParam
+        ? { metric, range: window.rangeParam }
+        : {
+            metric,
+            start_time: window.startIso,
+            end_time: window.endIso,
+          },
     }),
     staleTime: 15_000,
     refetchInterval: 30_000,
@@ -321,29 +419,27 @@ function proxySeriesQuery(metric: string, range: RangeValue) {
 }
 
 /** Memoized window bounds for the selected range (stable query keys). */
-function useWindowBounds(range: RangeValue) {
-  return useMemo(() => {
-    const end = new Date()
-    const start = new Date(end.getTime() - RANGE_SECONDS[range] * 1000)
-    return {
-      startIso: start.toISOString(),
-      endIso: end.toISOString(),
-    }
-  }, [range])
+function useResolvedWindow(
+  range: ProxyRangeValue,
+  custom: DateRange | undefined
+) {
+  return useMemo(
+    () => resolveProxyWindow(range, custom, new Date()),
+    [range, custom]
+  )
 }
 
 /**
  * Proxy-log time buckets for the filtered view. Identical options across the
  * stat cards and every chart panel, so React Query dedupes to one request.
  */
-function useBucketStats(range: RangeValue, filter: ProxyFilter) {
-  const { startIso, endIso } = useWindowBounds(range)
+function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
   return useQuery({
     ...getTimeBucketStatsOptions({
       query: {
-        start_time: startIso,
-        end_time: endIso,
-        bucket_interval: RANGE_BUCKET_INTERVAL[range],
+        start_time: window.startIso,
+        end_time: window.endIso,
+        bucket_interval: window.bucketInterval,
         project_id: filter.projectId ?? undefined,
         environment_id: filter.environmentId ?? undefined,
       },
@@ -474,13 +570,15 @@ function ChartPanel({
 
 function NodeMetricPanel({
   panel,
-  range,
+  window,
+  emptyText = 'No proxy metrics yet — data appears within a minute of traffic',
 }: {
   panel: NodePanelDef
-  range: RangeValue
+  window: ResolvedProxyWindow
+  emptyText?: string
 }) {
   const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, range)),
+    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window)),
   })
 
   const isPending = results.some((r) => r.isPending)
@@ -500,7 +598,7 @@ function NodeMetricPanel({
     for (const p of r.data ?? []) {
       const row = rows.get(p.time) ?? {
         time: p.time,
-        label: formatTimeLabel(p.time, range),
+        label: formatProxyTimeLabel(p.time, window.showDate),
       }
       row[key] = p.value
       rows.set(p.time, row)
@@ -519,7 +617,7 @@ function NodeMetricPanel({
       valueFormatter={panel.valueFormatter}
       isPending={isPending}
       errorText={errorText}
-      emptyText="No proxy metrics yet — data appears within a minute of traffic"
+      emptyText={emptyText}
     />
   )
 }
@@ -528,30 +626,36 @@ function NodeMetricPanel({
 // Filtered charts (proxy-log time buckets)
 // ---------------------------------------------------------------------------
 
-function bucketChartRows(stats: TimeBucketStats[], range: RangeValue) {
+function bucketChartRows(
+  stats: TimeBucketStats[],
+  window: ResolvedProxyWindow
+) {
   return stats.map((b) => ({
     time: b.bucket,
-    label: formatTimeLabel(b.bucket, range),
+    label: formatProxyTimeLabel(b.bucket, window.showDate),
     request_count: b.request_count,
     error_count: b.error_count,
     error_rate:
       b.request_count > 0 ? (b.error_count / b.request_count) * 100 : 0,
     avg_response_time_ms: b.avg_response_time_ms,
+    p50_response_time_ms: b.p50_response_time_ms,
+    p95_response_time_ms: b.p95_response_time_ms,
+    p99_response_time_ms: b.p99_response_time_ms,
     total_request_bytes: b.total_request_bytes,
     total_response_bytes: b.total_response_bytes,
   }))
 }
 
 function FilteredCharts({
-  range,
+  window,
   filter,
 }: {
-  range: RangeValue
+  window: ResolvedProxyWindow
   filter: ProxyFilter
 }) {
-  const q = useBucketStats(range, filter)
+  const q = useBucketStats(window, filter)
   const stats = q.data?.stats ?? []
-  const data = bucketChartRows(stats, range)
+  const data = bucketChartRows(stats, window)
 
   const shared = {
     data,
@@ -561,62 +665,80 @@ function FilteredCharts({
   }
 
   return (
-    <div className="space-y-2">
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <ChartPanel
-          title="Requests"
-          description="Requests and errors (status ≥ 400) per interval, from proxy logs"
-          series={[
-            { dataKey: 'request_count', label: 'Requests', color: '#2563eb' },
-            { dataKey: 'error_count', label: 'Errors', color: '#dc2626' },
-          ]}
-          valueFormatter={formatCount}
-          {...shared}
-        />
-        <ChartPanel
-          title="Error rate"
-          description="Errors (status ≥ 400) as a share of requests per interval"
-          series={[
-            { dataKey: 'error_rate', label: 'Error rate', color: '#dc2626' },
-          ]}
-          valueFormatter={formatPercent}
-          {...shared}
-        />
-        <ChartPanel
-          title="Average duration"
-          description="Mean response time per interval, from proxy logs"
-          series={[
-            {
-              dataKey: 'avg_response_time_ms',
-              label: 'avg',
-              color: '#2563eb',
-            },
-          ]}
-          valueFormatter={formatMs}
-          {...shared}
-        />
-        <ChartPanel
-          title="Bandwidth"
-          description="Request and response bytes per interval"
-          series={[
-            {
-              dataKey: 'total_request_bytes',
-              label: 'Request bytes',
-              color: '#16a34a',
-            },
-            {
-              dataKey: 'total_response_bytes',
-              label: 'Response bytes',
-              color: '#2563eb',
-            },
-          ]}
-          valueFormatter={formatBytesShort}
-          {...shared}
-        />
-      </div>
-      <p className="text-xs text-muted-foreground">
-        Percentile latency is only available for all traffic.
-      </p>
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <ChartPanel
+        title="Requests"
+        description="Requests and errors (status ≥ 400) per interval, from proxy logs"
+        series={[
+          { dataKey: 'request_count', label: 'Requests', color: '#2563eb' },
+          { dataKey: 'error_count', label: 'Errors', color: '#dc2626' },
+        ]}
+        valueFormatter={formatCount}
+        {...shared}
+      />
+      <ChartPanel
+        title="Error rate"
+        description="Errors (status ≥ 400) as a share of requests per interval"
+        series={[
+          { dataKey: 'error_rate', label: 'Error rate', color: '#dc2626' },
+        ]}
+        valueFormatter={formatPercent}
+        {...shared}
+      />
+      <ChartPanel
+        title="Latency percentiles"
+        description="Request duration p50 / p95 / p99, from proxy logs"
+        series={[
+          {
+            dataKey: 'p50_response_time_ms',
+            label: 'p50',
+            color: '#16a34a',
+          },
+          {
+            dataKey: 'p95_response_time_ms',
+            label: 'p95',
+            color: '#d97706',
+          },
+          {
+            dataKey: 'p99_response_time_ms',
+            label: 'p99',
+            color: '#dc2626',
+          },
+        ]}
+        valueFormatter={formatMs}
+        {...shared}
+      />
+      <ChartPanel
+        title="Average duration"
+        description="Mean response time per interval, from proxy logs"
+        series={[
+          {
+            dataKey: 'avg_response_time_ms',
+            label: 'avg',
+            color: '#2563eb',
+          },
+        ]}
+        valueFormatter={formatMs}
+        {...shared}
+      />
+      <ChartPanel
+        title="Bandwidth"
+        description="Request and response bytes per interval"
+        series={[
+          {
+            dataKey: 'total_request_bytes',
+            label: 'Request bytes',
+            color: '#16a34a',
+          },
+          {
+            dataKey: 'total_response_bytes',
+            label: 'Response bytes',
+            color: '#2563eb',
+          },
+        ]}
+        valueFormatter={formatBytesShort}
+        {...shared}
+      />
     </div>
   )
 }
@@ -660,19 +782,19 @@ function StatCard({ title, value, isPending, sub }: StatCardProps) {
 }
 
 /** Unfiltered stats — computed from the process-wide node metric series. */
-function NodeSummaryStats({ range }: { range: RangeValue }) {
+function NodeSummaryStats({ window }: { window: ResolvedProxyWindow }) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
   const [requests, errors5xx, p95, destProject, destConsole, destOther] =
     useQueries({
       queries: [
-        proxySeriesQuery('proxy.requests', range),
-        proxySeriesQuery('proxy.requests_5xx', range),
-        proxySeriesQuery('proxy.request_duration_p95_ms', range),
+        proxySeriesQuery('proxy.requests', window),
+        proxySeriesQuery('proxy.requests_5xx', window),
+        proxySeriesQuery('proxy.request_duration_p95_ms', window),
         // Destination split — same options the "Requests by destination"
         // panel uses, so React Query dedupes the fetches.
-        proxySeriesQuery('proxy.requests_project', range),
-        proxySeriesQuery('proxy.requests_console', range),
-        proxySeriesQuery('proxy.requests_other', range),
+        proxySeriesQuery('proxy.requests_project', window),
+        proxySeriesQuery('proxy.requests_console', window),
+        proxySeriesQuery('proxy.requests_other', window),
       ],
     })
 
@@ -713,7 +835,7 @@ function NodeSummaryStats({ range }: { range: RangeValue }) {
         isPending={requests.isPending}
         value={
           hasRequests
-            ? `${(totalRequests / RANGE_SECONDS[range]).toFixed(2)}/s`
+            ? `${(totalRequests / window.durationSeconds).toFixed(2)}/s`
             : null
         }
       />
@@ -743,25 +865,20 @@ function NodeSummaryStats({ range }: { range: RangeValue }) {
 
 /** Filtered stats — computed from the proxy-log time buckets. */
 function FilteredSummaryStats({
-  range,
+  window,
   filter,
 }: {
-  range: RangeValue
+  window: ResolvedProxyWindow
   filter: ProxyFilter
 }) {
-  const q = useBucketStats(range, filter)
+  const q = useBucketStats(window, filter)
   const stats = q.data?.stats ?? []
 
   const totalRequests = stats.reduce((acc, b) => acc + b.request_count, 0)
   const totalErrors = stats.reduce((acc, b) => acc + b.error_count, 0)
-  // Weighted average of per-bucket means by request count.
-  const weightedAvg =
-    totalRequests > 0
-      ? stats.reduce(
-          (acc, b) => acc + b.avg_response_time_ms * b.request_count,
-          0
-        ) / totalRequests
-      : null
+  const latestP95 = [...stats]
+    .reverse()
+    .find((b) => b.request_count > 0)?.p95_response_time_ms
 
   const ok = !q.isPending && !q.isError
 
@@ -771,7 +888,7 @@ function FilteredSummaryStats({
         title="Requests/s"
         isPending={q.isPending}
         value={
-          ok ? `${(totalRequests / RANGE_SECONDS[range]).toFixed(2)}/s` : null
+          ok ? `${(totalRequests / window.durationSeconds).toFixed(2)}/s` : null
         }
       />
       <StatCard
@@ -789,9 +906,9 @@ function FilteredSummaryStats({
         }
       />
       <StatCard
-        title="Avg latency"
+        title="p95 latency"
         isPending={q.isPending}
-        value={ok && weightedAvg != null ? formatMs(weightedAvg) : null}
+        value={ok && latestP95 != null ? formatMs(latestP95) : null}
       />
     </div>
   )
@@ -810,10 +927,6 @@ function FilterBar({
   filter: ProxyFilter
   onChange: (f: ProxyFilter) => void
 }) {
-  const projectsQ = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
-    staleTime: 60_000,
-  })
   const environmentsQ = useQuery({
     ...getEnvironmentsOptions({
       path: { project_id: filter.projectId ?? 0 },
@@ -822,34 +935,16 @@ function FilterBar({
     staleTime: 60_000,
   })
 
-  const projects = projectsQ.data?.projects ?? []
   const environments = environmentsQ.data ?? []
 
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-      <Select
-        value={
-          filter.projectId != null ? String(filter.projectId) : ALL_SENTINEL
+      <ProjectSelect
+        value={filter.projectId}
+        onValueChange={(projectId) =>
+          onChange({ projectId, environmentId: null })
         }
-        onValueChange={(v) =>
-          onChange({
-            projectId: v === ALL_SENTINEL ? null : Number(v),
-            environmentId: null,
-          })
-        }
-      >
-        <SelectTrigger className="w-full sm:w-[200px]">
-          <SelectValue placeholder="All projects" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value={ALL_SENTINEL}>All projects</SelectItem>
-          {projects.map((p) => (
-            <SelectItem key={p.id} value={String(p.id)}>
-              {p.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      />
       {filter.projectId != null && (
         <Select
           value={
@@ -943,16 +1038,16 @@ function StatusBadge({ status }: { status: string }) {
 const TRAFFIC_PAGE_SIZE = 20
 
 function TrafficByProject({
-  range,
+  window,
   filter,
 }: {
-  range: RangeValue
+  window: ResolvedProxyWindow
   filter: ProxyFilter
 }) {
   const [sortKey, setSortKey] = useState<TrafficSortKey>('total_requests')
   const [sortDesc, setSortDesc] = useState(true)
   const [page, setPage] = useState(1)
-  const { startIso, endIso } = useWindowBounds(range)
+  const { startIso, endIso } = window
 
   // Defer fetching until the card is actually scrolled into view — on the
   // unfiltered view it sits below the node metrics panels, so a page load
@@ -1182,11 +1277,18 @@ function TrafficByProject({
 
 export default function ProxyMetrics() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [range, setRange] = useState<RangeValue>('1h')
+  const [range, setRange] = useState<ProxyRangeValue>('1h')
+  const [customRange, setCustomRange] = useState<DateRange | undefined>()
   const [filter, setFilter] = useState<ProxyFilter>({
     projectId: null,
     environmentId: null,
   })
+  const resolved = useResolvedWindow(range, customRange)
+  const isFiltered = filter.projectId != null
+  const tooWide = proxyWindowTooWide(resolved, isFiltered)
+  const maxDays = isFiltered
+    ? PROXY_MAX_WINDOW_DAYS_SCOPED
+    : PROXY_MAX_WINDOW_DAYS
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Proxy' }])
@@ -1194,59 +1296,101 @@ export default function ProxyMetrics() {
 
   usePageTitle('Proxy')
 
-  const isFiltered = filter.projectId != null
-
-  // Full-width like Monitoring.tsx — the app layout wrapper supplies the
-  // outer padding, so no container/max-w here.
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-2xl font-bold tracking-tight">Proxy</h2>
-            <p className="text-muted-foreground">
-              Hot-path traffic and latency metrics for the control-plane proxy
-            </p>
-          </div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <FilterBar filter={filter} onChange={setFilter} />
-            <div className="flex items-center gap-1">
-              {RANGE_OPTIONS.map((opt) => (
+      <PageContainer innerClassName="space-y-6">
+        <PageHeader
+          title="Proxy"
+          description="Hot-path traffic and latency metrics for the control-plane proxy"
+          actions={
+            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <FilterBar filter={filter} onChange={setFilter} />
+              <div className="flex items-center gap-1">
+                {PROXY_RANGE_PRESETS.map((opt) => (
+                  <Button
+                    key={opt.value}
+                    variant={range === opt.value ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setRange(opt.value)}
+                  >
+                    {opt.label}
+                  </Button>
+                ))}
                 <Button
-                  key={opt.value}
-                  variant={range === opt.value ? 'default' : 'outline'}
+                  variant={range === 'custom' ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setRange(opt.value)}
+                  onClick={() => setRange('custom')}
                 >
-                  {opt.label}
+                  Custom
                 </Button>
-              ))}
+              </div>
+              {range === 'custom' && (
+                <DateRangePicker
+                  date={customRange}
+                  onDateChange={setCustomRange}
+                  showTime
+                  className="w-full sm:w-[300px]"
+                />
+              )}
             </div>
-          </div>
-        </div>
+          }
+        />
 
-        {isFiltered ? (
+        {tooWide ? (
+          <p className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
+            Custom range exceeds the {maxDays}-day maximum
+            {isFiltered ? ' for a project' : ''}. Narrow the window, or request
+            older data {maxDays} days at a time.
+          </p>
+        ) : isFiltered ? (
           <>
-            <FilteredSummaryStats range={range} filter={filter} />
-            <FilteredCharts range={range} filter={filter} />
+            <FilteredSummaryStats window={resolved} filter={filter} />
+            <FilteredCharts window={resolved} filter={filter} />
           </>
         ) : (
           <>
-            <NodeSummaryStats range={range} />
+            <NodeSummaryStats window={resolved} />
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {NODE_PANELS.map((panel) => (
                 <NodeMetricPanel
                   key={panel.title}
                   panel={panel}
-                  range={range}
+                  window={resolved}
                 />
               ))}
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold tracking-tight">
+                Sockets &amp; file descriptors
+              </h3>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Sockets are file descriptors, so descriptor exhaustion is how
+                the proxy stops accepting connections. Collected on Linux only.
+                Temps alerts on these automatically —{' '}
+                <Link
+                  to="/monitoring/rules"
+                  className="underline underline-offset-2 hover:text-foreground"
+                >
+                  tune the thresholds in Monitoring settings
+                </Link>
+                .
+              </p>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                {FD_PANELS.map((panel) => (
+                  <NodeMetricPanel
+                    key={panel.title}
+                    panel={panel}
+                    window={resolved}
+                    emptyText="No file-descriptor samples in this window. These are read from /proc, so they are only collected when temps runs on Linux."
+                  />
+                ))}
+              </div>
             </div>
           </>
         )}
 
-        <TrafficByProject range={range} filter={filter} />
-      </div>
+        {!tooWide && <TrafficByProject window={resolved} filter={filter} />}
+      </PageContainer>
     </div>
   )
 }

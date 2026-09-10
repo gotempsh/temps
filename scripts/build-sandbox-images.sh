@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Build and push all sandbox images to GHCR (ghcr.io/gotempsh/).
 # Requires: docker buildx, logged in to GHCR (`docker login ghcr.io`).
 # Usage:   ./scripts/build-sandbox-images.sh [runtime...]

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+pub mod cluster_ca;
 pub mod disk_status;
 pub mod enrollment_tokens;
 mod handler;
@@ -11,4 +15,7 @@ pub use disk_status::{
 pub use enrollment_tokens::{EnrollmentError, EnrollmentTokenService, MintParams};
 pub use handler::{configure_routes, SettingsApiDoc, SettingsState};
 pub use plugin::ConfigPlugin;
-pub use service::{ConfigService, ConfigServiceError, ServerConfig};
+pub use service::{
+    ClusterCaRotationResult, ClusterNetworkState, ConfigService, ConfigServiceError,
+    EffectiveTelemetryPolicies, ServerConfig,
+};

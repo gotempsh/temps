@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sentry CLI-compatible API endpoints
 //!
 //! Provides endpoints that match the Sentry API format used by `sentry-cli sourcemaps upload`.
@@ -123,14 +126,15 @@ pub struct SentryChunkUploadResponse {
 /// rely on authentication alone to prevent abuse. The outer body limit rejects
 /// oversized uploads before they reach the multipart reader. A per-field inline
 /// check (`MAX_SOURCE_MAP_BYTES`) provides additional defense-in-depth.
-pub const SENTRY_UPLOAD_BODY_LIMIT: usize = 50 * 1024 * 1024;
+pub const SENTRY_UPLOAD_BODY_LIMIT: usize =
+    crate::services::source_map_service::MAX_SOURCE_MAP_BYTES;
 
 /// Maximum size for a single source map file field (50 MiB).
 ///
 /// Applied after the compressed body has been received. This is a second line
 /// of defense: the outer `DefaultBodyLimit` cap fires first, but if multiple
 /// small files add up the per-field check catches any single oversized field.
-const MAX_SOURCE_MAP_BYTES: usize = 50 * 1024 * 1024;
+use crate::services::source_map_service::MAX_SOURCE_MAP_BYTES;
 
 pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
     // Fix #4: the upload route gets its own sub-router with a 50 MiB body limit.

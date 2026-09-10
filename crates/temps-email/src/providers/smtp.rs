@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Generic SMTP relay provider.
 //!
 //! Unlike the SES/Scaleway providers, SMTP cannot create/verify domain identities
@@ -9,7 +12,9 @@
 use async_trait::async_trait;
 use lettre::{
     message::{header::ContentType, Mailbox, MultiPart, SinglePart},
-    transport::smtp::{authentication::Credentials, client::TlsParametersBuilder},
+    transport::smtp::{
+        authentication::Credentials, client::TlsParametersBuilder, Error as SmtpError,
+    },
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use serde::{Deserialize, Serialize};
@@ -17,8 +22,8 @@ use tracing::{debug, error};
 use utoipa::ToSchema;
 
 use super::traits::{
-    DomainIdentity, DomainIdentityDetails, EmailProvider, EmailProviderType, SendEmailRequest,
-    SendEmailResponse, VerificationStatus,
+    DomainIdentity, DomainIdentityDetails, EmailProvider, EmailProviderType,
+    ProviderDomainIdentity, SendEmailRequest, SendEmailResponse, VerificationStatus,
 };
 use crate::errors::EmailError;
 
@@ -137,6 +142,39 @@ impl BuilderExt for lettre::transport::smtp::AsyncSmtpTransportBuilder {
     }
 }
 
+/// Classify a lettre SMTP transport error into a typed `EmailError` with
+/// retryability information.
+///
+/// - `is_permanent()` (5xx SMTP reply): the server definitively rejected the
+///   message — non-retryable.
+/// - `is_transient()` (4xx SMTP reply): the server signalled a temporary
+///   failure (e.g. mailbox busy, service unavailable) — retryable.
+/// - All other variants (connection dropped, DNS failure, TLS error, response
+///   parse error): genuinely ambiguous — we do not know whether the server
+///   received the message, so we return `ProviderDeliveryUnknown` to prevent
+///   automatic retry and possible duplicate delivery.
+fn classify_smtp_send_error(error: &SmtpError) -> EmailError {
+    if error.is_permanent() {
+        EmailError::SendFailed {
+            provider: "smtp".to_string(),
+            retryable: false,
+            message: format!("SMTP server permanently rejected: {error}"),
+        }
+    } else if error.is_transient() {
+        EmailError::SendFailed {
+            provider: "smtp".to_string(),
+            retryable: true,
+            message: format!("SMTP transient error (4xx): {error}"),
+        }
+    } else {
+        // Connection, network, TLS, or response-parsing errors are ambiguous:
+        // the TCP frame may have reached the server before the failure.
+        EmailError::ProviderDeliveryUnknown(format!(
+            "SMTP transport failed with ambiguous outcome: {error}"
+        ))
+    }
+}
+
 /// Parse `"name <addr@host>"` or `"addr@host"` into a lettre `Mailbox`.
 fn parse_mailbox(address: &str, name: Option<&str>) -> Result<Mailbox, EmailError> {
     let parsed = address
@@ -169,13 +207,18 @@ impl EmailProvider for SmtpProvider {
 
     /// Imported SMTP domains have no records we can probe via the provider, so
     /// we report them as verified. The user is responsible for DNS upstream.
-    async fn verify_identity(&self, _domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         Ok(VerificationStatus::Verified)
     }
 
     async fn get_identity_details(
         &self,
         _domain: &str,
+        _provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         Ok(DomainIdentityDetails {
             overall_status: VerificationStatus::Verified,
@@ -183,11 +226,21 @@ impl EmailProvider for SmtpProvider {
             dkim_records: Vec::new(),
             mx_record: None,
             mail_from_subdomain: None,
+            // SMTP has no domain-management API and no records to probe, so
+            // an empty spf_record/dkim_records here means "not applicable",
+            // not "not yet configured" -- the required-record gate must
+            // treat this identity as verified rather than permanently
+            // pending. See `resolve_verification_status`'s doc comment.
+            manages_dns_records: false,
         })
     }
 
     /// Nothing to delete upstream — caller still removes the row locally.
-    async fn delete_identity(&self, _domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         Ok(())
     }
 
@@ -227,6 +280,20 @@ impl EmailProvider for SmtpProvider {
         }
         if let Some(headers) = &email.headers {
             for (name, value) in headers {
+                let is_application_metadata = name.len() > "X-Temps-".len()
+                    && name
+                        .get(.."X-Temps-".len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("X-Temps-"))
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && !value.bytes().any(|byte| byte == b'\r' || byte == b'\n');
+                if !is_application_metadata {
+                    return Err(EmailError::Smtp(
+                        "A custom header is not allowed; only single-line X-Temps-* metadata headers are accepted"
+                            .to_string(),
+                    ));
+                }
                 // lettre rejects malformed header names with an Err — surface that
                 // as a typed SMTP error instead of swallowing.
                 let header_name = lettre::message::header::HeaderName::new_from_ascii(name.clone())
@@ -279,7 +346,7 @@ impl EmailProvider for SmtpProvider {
 
         self.transport.send(message).await.map_err(|e| {
             error!("Failed to send email via SMTP: {}", e);
-            EmailError::Smtp(format!("Failed to send email: {}", e))
+            classify_smtp_send_error(&e)
         })?;
 
         debug!("Email sent via SMTP, message_id: {}", message_id);
@@ -289,11 +356,29 @@ impl EmailProvider for SmtpProvider {
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Smtp
     }
+
+    /// SMTP has no domain-management API to list registered domains
+    /// against — see the trait doc comment for how callers must handle this.
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        Err(EmailError::UnsupportedOperation {
+            provider_type: "smtp".to_string(),
+            operation: "listing registered domains".to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NOTE: `lettre::transport::smtp::Error` constructors (e.g. `code(...)`,
+    // `network(...)`, `connection(...)`) are `pub(crate)` inside the lettre
+    // crate and cannot be invoked from external code. Direct unit tests for
+    // `classify_smtp_send_error` with specific SMTP reply codes require either
+    // a live SMTP server or lettre's internal test helpers. The logic is
+    // correct (it delegates to `error.is_permanent()` / `error.is_transient()`
+    // which are part of lettre's public API) and is covered end-to-end when
+    // SmtpProvider::send() is exercised against a real relay.
 
     #[test]
     fn test_smtp_credentials_serialization_roundtrip() {
@@ -382,18 +467,21 @@ mod tests {
         assert!(identity.mx_record.is_none());
 
         assert!(matches!(
-            provider.verify_identity("example.com").await.unwrap(),
+            provider.verify_identity("example.com", None).await.unwrap(),
             VerificationStatus::Verified
         ));
 
-        let details = provider.get_identity_details("example.com").await.unwrap();
+        let details = provider
+            .get_identity_details("example.com", None)
+            .await
+            .unwrap();
         assert!(matches!(
             details.overall_status,
             VerificationStatus::Verified
         ));
         assert!(details.dkim_records.is_empty());
 
-        provider.delete_identity("example.com").await.unwrap();
+        provider.delete_identity("example.com", None).await.unwrap();
     }
 
     #[tokio::test]
@@ -450,6 +538,40 @@ mod tests {
         match err {
             EmailError::Smtp(msg) => assert!(msg.contains("body")),
             other => panic!("expected Smtp body error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_protected_custom_headers_before_delivery() {
+        let creds = SmtpCredentials {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            encryption: SmtpEncryption::Starttls,
+            accept_invalid_certs: false,
+        };
+        let provider = SmtpProvider::new(&creds).unwrap();
+        let req = SendEmailRequest {
+            from: "authorized@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "x".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: Some(std::collections::HashMap::from([(
+                "From".to_string(),
+                "attacker@example.test".to_string(),
+            )])),
+        };
+
+        let err = provider.send(&req).await.unwrap_err();
+        match err {
+            EmailError::Smtp(message) => assert!(message.contains("not allowed")),
+            other => panic!("expected protected-header error, got {other:?}"),
         }
     }
 }

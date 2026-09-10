@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -57,6 +60,11 @@ interface LinkCertOptions {
   projectId: string
   domainId: string
   certificateId: string
+}
+
+/** Custom-domain API timestamps are epoch milliseconds. */
+export function customDomainTimestamp(timestampMillis: number): Date {
+  return new Date(timestampMillis)
 }
 
 export function registerCustomDomainsCommands(program: Command): void {
@@ -168,7 +176,7 @@ async function listCustomDomains(options: ListOptions): Promise<void> {
     { header: 'Environment', accessor: (d) => d.environment?.name ?? '-' },
     { header: 'Branch', accessor: (d) => d.branch ?? '-' },
     { header: 'Redirect', accessor: (d) => d.redirect_to ?? '-', color: (v) => colors.muted(v) },
-    { header: 'Created', accessor: (d) => new Date(d.created_at * 1000).toLocaleDateString(), color: (v) => colors.muted(v) },
+    { header: 'Created', accessor: (d) => customDomainTimestamp(d.created_at).toLocaleDateString(), color: (v) => colors.muted(v) },
   ]
 
   printTable(domainsData, columns, { style: 'minimal' })
@@ -292,17 +300,47 @@ async function showCustomDomain(options: ShowOptions): Promise<void> {
     keyValue('Linked Domain ID', domain.domain_id)
   }
   if (domain.expiration_time) {
-    keyValue('Certificate Expires', new Date(domain.expiration_time * 1000).toLocaleString())
+    keyValue('Certificate Expires', customDomainTimestamp(domain.expiration_time).toLocaleString())
   }
   if (domain.last_renewed) {
-    keyValue('Last Renewed', new Date(domain.last_renewed * 1000).toLocaleString())
+    keyValue('Last Renewed', customDomainTimestamp(domain.last_renewed).toLocaleString())
   }
   if (domain.message) {
     keyValue('Message', domain.message)
   }
-  keyValue('Created', new Date(domain.created_at * 1000).toLocaleString())
-  keyValue('Updated', new Date(domain.updated_at * 1000).toLocaleString())
+  keyValue('Created', customDomainTimestamp(domain.created_at).toLocaleString())
+  keyValue('Updated', customDomainTimestamp(domain.updated_at).toLocaleString())
   newline()
+}
+
+// Only includes a field when the caller actually passed the flag, so an
+// omitted option never overwrites existing state via a sparse PATCH. An
+// explicitly empty `--branch ''`/`--redirect-to ''` clears the field (sent as
+// `null`) rather than being dropped, which is the only way to unset it.
+export function buildCustomDomainUpdateBody(options: {
+  domain?: string
+  environmentId?: string
+  branch?: string
+  redirectTo?: string
+  statusCode?: string
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {}
+  if (options.domain) {
+    body.domain = options.domain
+  }
+  if (options.environmentId) {
+    body.environment_id = parseInt(options.environmentId, 10)
+  }
+  if (options.branch !== undefined) {
+    body.branch = options.branch || null
+  }
+  if (options.redirectTo !== undefined) {
+    body.redirect_to = options.redirectTo || null
+  }
+  if (options.statusCode) {
+    body.status_code = parseInt(options.statusCode, 10)
+  }
+  return body
 }
 
 async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
@@ -321,23 +359,7 @@ async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
     return
   }
 
-  // Build update body from provided options
-  const body: Record<string, unknown> = {}
-  if (options.domain) {
-    body.domain = options.domain
-  }
-  if (options.environmentId) {
-    body.environment_id = parseInt(options.environmentId, 10)
-  }
-  if (options.branch !== undefined) {
-    body.branch = options.branch || null
-  }
-  if (options.redirectTo !== undefined) {
-    body.redirect_to = options.redirectTo || null
-  }
-  if (options.statusCode) {
-    body.status_code = parseInt(options.statusCode, 10)
-  }
+  const body = buildCustomDomainUpdateBody(options)
 
   if (Object.keys(body).length === 0) {
     warning('No update options provided')

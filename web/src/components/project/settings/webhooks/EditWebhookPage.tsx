@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   getWebhookOptions,
@@ -32,7 +35,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, Loader2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { Alert, AlertDescription } from '@/components/ui/alert'

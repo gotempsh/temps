@@ -1,8 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   DeploymentJobResponse,
   DeploymentResponse,
   ProjectResponse,
-  updateProjectSettings,
 } from '@/api/client'
 import { getDeploymentJobsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -33,7 +35,6 @@ import {
   XCircle,
 } from 'lucide-react'
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { toast } from 'sonner'
 import { useAiAssistant } from '../ai/AiAssistantContext'
 import { ElapsedTime } from '../global/ElapsedTime'
 
@@ -394,6 +395,17 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
         </div>
       </div>
 
+      {connectionStatus === 'error' && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          Log stream disconnected. Existing lines are preserved while Temps
+          reconnects.
+        </div>
+      )}
+
       {/* Log Viewer */}
       <div className="relative group">
         {/* Copy Button - CodeBlock Style */}
@@ -435,7 +447,11 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
           <div className="text-xs font-mono p-4 w-max min-w-full">
             {logs.length === 0 ? (
               <div className="text-muted-foreground">
-                Connecting to log stream...
+                {connectionStatus === 'error'
+                  ? 'Could not connect to the log stream. Retrying…'
+                  : connectionStatus === 'connected'
+                    ? 'Connected. Waiting for log output…'
+                    : 'Connecting to log stream…'}
               </div>
             ) : filteredLogs.length === 0 ? (
               <div className="text-muted-foreground">
@@ -477,7 +493,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
 // First, let's memoize the LogViewer component
 const MemoizedLogViewer = memo(LogViewer)
 
-// Config Modal Component
+// Stage details modal
 interface ConfigModalProps {
   isOpen: boolean
   onClose: () => void
@@ -494,7 +510,6 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
       job_id: stage.job_id,
       status: stage.status,
       execution_order: stage.execution_order,
-      job_config: stage.job_config,
       dependencies: stage.dependencies,
       outputs: stage.outputs,
       started_at: stage.started_at,
@@ -508,9 +523,9 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col gap-4 p-6">
         <DialogHeader>
-          <DialogTitle>Stage Configuration</DialogTitle>
+          <DialogTitle>Stage Details</DialogTitle>
           <DialogDescription>
-            Configuration details for{' '}
+            Execution details for{' '}
             <span className="font-mono">{stage.name}</span>
           </DialogDescription>
         </DialogHeader>
@@ -565,36 +580,7 @@ export function DeploymentStages({
   // AI debugging chat (ADR-023), opened from a failed stage into the persistent
   // app-level dock. The chat is scoped to the whole deployment.
   const { open: openAiAssistant } = useAiAssistant()
-  // Read-only AI chat is safe, so we don't hide the "Debug with AI" affordance
-  // when it's off — we enable it inline (one click) and then open the chat,
-  // rather than sending the user to Settings. Local state so the button reflects
-  // enablement without refetching the project prop.
-  const [chatEnabled, setChatEnabled] = useState(
-    project.ai_debug_chat_enabled === true ||
-      project.ai_write_actions_enabled === true
-  )
-  const [enablingChat, setEnablingChat] = useState(false)
-
-  const debugWithAi = async () => {
-    if (!chatEnabled) {
-      setEnablingChat(true)
-      try {
-        const { error } = await updateProjectSettings({
-          path: { project_id: project.id },
-          body: { ai_debug_chat_enabled: true },
-        })
-        if (error) throw error
-        setChatEnabled(true)
-        toast.success('AI chat enabled')
-      } catch {
-        toast.error(
-          "Couldn't enable AI chat — you may need project admin permission."
-        )
-        setEnablingChat(false)
-        return
-      }
-      setEnablingChat(false)
-    }
+  const debugWithAi = () => {
     openAiAssistant({
       projectId: project.id,
       context: {
@@ -757,23 +743,14 @@ export function DeploymentStages({
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={enablingChat}
                     className="h-8 gap-1.5 border-primary/30 text-primary hover:bg-primary/10 hover:text-primary"
                     onClick={(e) => {
                       e.stopPropagation()
-                      void debugWithAi()
+                      debugWithAi()
                     }}
-                    title={
-                      chatEnabled
-                        ? 'Debug this failure with AI'
-                        : 'Enable AI chat and debug this failure'
-                    }
+                    title="Debug this failure with AI"
                   >
-                    {enablingChat ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="h-4 w-4" />
-                    )}
+                    <Sparkles className="h-4 w-4" />
                     <span className="hidden sm:inline">Debug with AI</span>
                   </Button>
                 )}
@@ -789,7 +766,7 @@ export function DeploymentStages({
                     e.stopPropagation()
                     setConfigModalStage(stage)
                   }}
-                  title="View stage configuration"
+                  title="View stage details"
                 >
                   <Settings className="h-4 w-4" />
                 </Button>
@@ -820,7 +797,7 @@ export function DeploymentStages({
         ))}
       </div>
 
-      {/* Config Modal */}
+      {/* Stage details modal */}
       {configModalStage && (
         <ConfigModal
           isOpen={!!configModalStage}

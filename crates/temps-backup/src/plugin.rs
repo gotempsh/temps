@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,7 +9,7 @@ use temps_backup_core::BackupExecutorBuilder;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -62,8 +65,8 @@ impl TempsPlugin for BackupPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
-            let notification_service =
-                context.require_service::<temps_notifications::NotificationService>();
+            let alarm_service =
+                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
@@ -71,7 +74,7 @@ impl TempsPlugin for BackupPlugin {
             let backup_service = Arc::new(BackupService::new(
                 db.clone(),
                 external_service_manager.clone(),
-                notification_service.clone(),
+                alarm_service.clone(),
                 config_service.clone(),
                 encryption_service.clone(),
             ));
@@ -114,13 +117,9 @@ impl TempsPlugin for BackupPlugin {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
 
-            // Cast Arc<temps_notifications::NotificationService> to
-            // Arc<dyn temps_core::notifications::NotificationService> so the
-            // adapter accepts it.
-            let core_notif_svc: Arc<dyn temps_core::notifications::NotificationService> =
-                notification_service.clone();
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> =
-                Arc::new(BackupNotificationAdapter::new(core_notif_svc, db.clone()));
+            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+                BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
+            );
 
             // Shared workspace JobQueue. Producers (BackupService) publish
             // Job::BackupRequested here; the BackupJobProcessor subscribes
@@ -204,6 +203,101 @@ impl TempsPlugin for BackupPlugin {
                 info!("BackupJobProcessor started");
             }
 
+            // Completion events are broadcast hints for publishing the
+            // aggregate recovery set consumed by `temps backup restore`.
+            // The finalizer re-reads every sibling from the database and only
+            // publishes when the entire fan-out succeeded. It also reconciles
+            // unpublished completed runs at startup and after receiver lag so
+            // an in-memory event loss cannot strand a valid recovery set.
+            {
+                let recovery_service = Arc::clone(&backup_service);
+                let mut receiver = job_queue.subscribe();
+                tokio::spawn(async move {
+                    if let Err(error) = recovery_service.reconcile_completed_recovery_sets().await {
+                        warn!(
+                            error = %error,
+                            "Initial native recovery-set reconciliation failed"
+                        );
+                    }
+                    let mut reconciliation =
+                        tokio::time::interval(std::time::Duration::from_secs(300));
+                    reconciliation.tick().await;
+
+                    loop {
+                        let event = tokio::select! {
+                            event = receiver.recv() => Some(event),
+                            _ = reconciliation.tick() => None,
+                        };
+                        let Some(event) = event else {
+                            if let Err(error) =
+                                recovery_service.reconcile_completed_recovery_sets().await
+                            {
+                                warn!(
+                                    error = %error,
+                                    "Periodic native recovery-set reconciliation failed"
+                                );
+                            }
+                            continue;
+                        };
+                        let backup_id = match event {
+                            Ok(temps_core::Job::BackupCompleted(event)) => Some(event.backup_id),
+                            Ok(temps_core::Job::BackupFailed(event)) => Some(event.backup_id),
+                            Ok(_) => None,
+                            Err(temps_core::QueueError::ChannelClosed) => {
+                                info!("Native recovery-set finalizer stopped: queue closed");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "Native recovery-set finalizer lagged; reconciling durable state"
+                                );
+                                if let Err(reconcile_error) =
+                                    recovery_service.reconcile_completed_recovery_sets().await
+                                {
+                                    warn!(
+                                        error = %reconcile_error,
+                                        "Native recovery-set reconciliation after queue lag failed"
+                                    );
+                                }
+                                None
+                            }
+                        };
+
+                        let Some(backup_id) = backup_id else {
+                            continue;
+                        };
+                        match recovery_service
+                            .publish_recovery_set_if_complete(backup_id)
+                            .await
+                        {
+                            Ok(crate::services::RecoverySetPublication::Published {
+                                schedule_run_id,
+                                backup_id,
+                            }) => info!(
+                                schedule_run_id,
+                                backup_id, "Published native whole-instance recovery set"
+                            ),
+                            Ok(crate::services::RecoverySetPublication::Incomplete {
+                                schedule_run_id,
+                                failed_backup_ids,
+                            }) => warn!(
+                                schedule_run_id,
+                                ?failed_backup_ids,
+                                "Schedule run is incomplete; native recovery set was not published"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => error!(
+                                backup_id,
+                                error = %error,
+                                "Failed to finalize native recovery set"
+                            ),
+                        }
+                    }
+                });
+                info!("Native recovery-set finalizer started");
+            }
+
             let telemetry = context
                 .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
                 .unwrap_or_else(|| {
@@ -214,6 +308,9 @@ impl TempsPlugin for BackupPlugin {
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.
             pg_upgrade_service.set_telemetry(Arc::clone(&telemetry));
 
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             let backup_app_state_inner = create_backup_app_state(
                 backup_service,
                 restore_service,
@@ -222,6 +319,8 @@ impl TempsPlugin for BackupPlugin {
                 db.clone(),
                 Arc::clone(&executor),
                 telemetry,
+                context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                sensitive_action_authorizer,
             );
 
             context.register_service(backup_app_state_inner);
@@ -305,27 +404,38 @@ impl TempsPlugin for BackupPlugin {
                 }
             });
 
-            // S3 lifecycle drift reconciler. Walks every S3 source hourly
-            // and re-pushes lifecycle rules so manual edits in the AWS
-            // console (or missed event-driven reconciles) eventually
-            // converge to the desired state. App-side `enforce_retention`
-            // is still the primary cleanup path; this only handles drift
-            // on the storage provider side.
+            // S3 lifecycle drift reconciler. Walks S3 sources that are
+            // actually in scope for Temps-managed lifecycle rules — those
+            // with at least one enabled backup schedule, plus Cloud's own
+            // managed bucket — hourly, and re-pushes lifecycle rules so
+            // manual edits in the AWS console (or missed event-driven
+            // reconciles) eventually converge to the desired state.
+            // App-side `enforce_retention` is still the primary cleanup
+            // path; this only handles drift on the storage provider side.
+            //
+            // Deliberately excludes sources with no enabled schedule,
+            // `managed_by_cloud = false`, and no pending retry: those are
+            // buckets the operator configured with their own credentials
+            // but never attached to a Temps backup schedule (e.g. an
+            // unrelated production bucket), so `reconcile_bucket` has never
+            // had anything to apply for them and a
+            // `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
+            // call against them is pure waste — paid API operations on
+            // infrastructure Temps doesn't manage. A source with a failed
+            // reconcile attempt stays in scope regardless of schedule state
+            // (see `S3LifecycleService::sources_in_scope`) so this sweep is
+            // also the retry path for a transient failure at disable time.
             let lifecycle_db = db.clone();
             let lifecycle_enc = encryption_service.clone();
             tokio::spawn(async move {
-                use sea_orm::EntityTrait;
                 // First tick is one interval out — give the rest of the
                 // server time to settle before hammering S3.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
                 tick.tick().await;
-                let svc = S3LifecycleService::new(lifecycle_db.clone(), lifecycle_enc);
+                let svc = S3LifecycleService::new(lifecycle_db, lifecycle_enc);
                 loop {
                     tick.tick().await;
-                    let sources = match temps_entities::s3_sources::Entity::find()
-                        .all(lifecycle_db.as_ref())
-                        .await
-                    {
+                    let sources = match svc.sources_in_scope().await {
                         Ok(s) => s,
                         Err(e) => {
                             error!(
@@ -402,6 +512,21 @@ impl TempsPlugin for BackupPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let backup_app_state = context.require_service::<BackupAppState>();
+
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let backup_app_state = Arc::new(BackupAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*backup_app_state).clone()
+        });
+
         let routes = handlers::configure_routes()
             .merge(handlers::pg_upgrade_handler::configure_routes())
             .merge(handlers::restore_handler::configure_routes())

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 "use client";
 import { useState, useEffect, useCallback, createContext, useContext, useMemo } from "react";
 import type React from "react";

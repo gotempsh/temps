@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email plugin for Temps
 
 use std::future::Future;
@@ -13,8 +16,8 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, AppState, EmailApiDoc};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-    ValidationService,
+    DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+    TrackingSetupService, ValidationConfig, ValidationService,
 };
 use temps_dns::services::DnsProviderService;
 
@@ -58,24 +61,39 @@ impl TempsPlugin for EmailPlugin {
 
             // Create TrackingService — uses ConfigService to get external URL dynamically
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let tracking_service = Arc::new(TrackingService::new(db.clone(), config_service));
+            let tracking_service =
+                Arc::new(TrackingService::new(db.clone(), config_service.clone()));
             context.register_service(tracking_service.clone());
 
-            // Create EmailService with tracking support
+            // Create SuppressionService — bounce/complaint do-not-send list
+            let suppression_service = Arc::new(SuppressionService::new(db.clone()));
+            context.register_service(suppression_service.clone());
+
+            // Create EmailService with tracking + suppression support
             let email_service = Arc::new(EmailService::new(
                 db.clone(),
                 provider_service.clone(),
                 domain_service.clone(),
                 tracking_service.clone(),
+                suppression_service.clone(),
             ));
             context.register_service(email_service.clone());
 
-            // Create ValidationService with default config
+            // API callers cannot choose a control-plane network path.
             let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
             context.register_service(validation_service.clone());
 
+            // AWS-side auto-setup for SES event tracking
+            let tracking_setup_service = Arc::new(TrackingSetupService::new(
+                provider_service.clone(),
+                db.clone(),
+            ));
+            context.register_service(tracking_setup_service.clone());
+
             // Get AuditService dependency from other plugins
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let project_access_checker =
+                context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
             // Try to get DnsProviderService if available (optional dependency)
             let dns_provider_service = context.get_service::<DnsProviderService>();
@@ -94,8 +112,11 @@ impl TempsPlugin for EmailPlugin {
                 validation_service,
                 tracking_service,
                 audit_service,
+                project_access_checker,
                 dns_provider_service,
                 telemetry,
+                tracking_setup_service,
+                config_service,
             });
             context.register_service(app_state);
 

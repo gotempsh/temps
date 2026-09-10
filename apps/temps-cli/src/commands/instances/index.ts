@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import {
   listInstances,
@@ -51,13 +54,15 @@ async function listAction(options: { json?: boolean }): Promise<void> {
   const columns: TableColumn<TempsInstanceDisplay>[] = [
     {
       header: '',
-      accessor: (i) => i.isDefault ? colors.success('●') : colors.muted('○'),
+      accessor: (i) => i.isDefault ? '●' : '○',
+      color: (value, i) => i.isDefault ? colors.success(value) : colors.muted(value),
     },
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
     { header: 'URL', key: 'url', color: (v) => colors.primary(v) },
     {
       header: 'Email',
-      accessor: (i) => i.email ?? colors.muted('-'),
+      accessor: (i) => i.email ?? '-',
+      color: (value, i) => i.email ? value : colors.muted(value),
     },
   ]
 

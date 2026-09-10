@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Follow-up columns closing three ADR-026 Phase 3 gaps on `metric_alert_rules`.
 //!
 //! - `grouped_notification_threshold` (int, default 5): promotes the previously

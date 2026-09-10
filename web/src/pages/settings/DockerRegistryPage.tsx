@@ -1,6 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { DockerRegistrySettings } from '@/components/settings/DockerRegistrySettings'
+import { RegistryMirrorSettings } from '@/components/settings/RegistryMirrorSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
@@ -18,6 +22,7 @@ interface DockerRegistryFormData {
     tls_verify: boolean
     ca_certificate: string | null
   }
+  registry_mirror_prefix: string | null
 }
 
 export function DockerRegistryPage() {
@@ -42,10 +47,15 @@ export function DockerRegistryPage() {
         tls_verify: true,
         ca_certificate: null,
       },
+      registry_mirror_prefix: null,
     },
   })
 
   const dockerRegistry = useWatch({ control, name: 'docker_registry' })
+  const registryMirrorPrefix = useWatch({
+    control,
+    name: 'registry_mirror_prefix',
+  })
 
   useEffect(() => {
     setBreadcrumbs([
@@ -67,6 +77,7 @@ export function DockerRegistryPage() {
           tls_verify: true,
           ca_certificate: null,
         },
+        registry_mirror_prefix: settings.registry_mirror_prefix ?? null,
       })
     }
   }, [settings, reset])
@@ -106,6 +117,10 @@ export function DockerRegistryPage() {
         register={register}
         setValue={setValue}
         dockerRegistry={dockerRegistry}
+      />
+      <RegistryMirrorSettings
+        prefixField={register('registry_mirror_prefix')}
+        currentPrefix={registryMirrorPrefix}
       />
       {isDirty && (
         <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">

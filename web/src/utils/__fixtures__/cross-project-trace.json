@@ -1,0 +1,300 @@
+{
+  "_comment": "Captured cross-project trace, anonymised. Kept verbatim in shape because its value is exactly what a synthetic fixture would smooth away: the API serialises span start times at millisecond resolution while durations keep nanosecond precision, so many siblings tie on start_time and can only be ordered by their (sub-millisecond) end.",
+  "trace_id": "197b167fbef0e7e815af927a9e16514e",
+  "spans": [
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "7f6d3810e9678f3c",
+      "parent_span_id": "e26e7c76e40d0fb9",
+      "name": "gateway.proxy",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.000Z",
+      "end_time": "2026-01-15T09:30:00.225Z",
+      "duration_ms": 224.802304,
+      "status_code": "UNSET",
+      "resource": {
+        "service_name": "api-gateway"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "e26e7c76e40d0fb9",
+      "parent_span_id": null,
+      "name": "POST",
+      "kind": "SERVER",
+      "start_time": "2026-01-15T09:30:00.000Z",
+      "end_time": "2026-01-15T09:30:00.225Z",
+      "duration_ms": 224.845824,
+      "status_code": "UNSET",
+      "resource": {
+        "service_name": "api-gateway"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "8c0590af245fba61",
+      "parent_span_id": "59dadab9e3da61d3",
+      "name": "dispatch.evaluate",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.001Z",
+      "end_time": "2026-01-15T09:30:00.224Z",
+      "duration_ms": 223.454208,
+      "status_code": "UNSET",
+      "resource": {
+        "service_name": "orders-api"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "00edba9473e06b80",
+      "parent_span_id": "7f6d3810e9678f3c",
+      "name": "POST /api/{group}/{resource}/{action}",
+      "kind": "SERVER",
+      "start_time": "2026-01-15T09:30:00.001Z",
+      "end_time": "2026-01-15T09:30:00.224Z",
+      "duration_ms": 223.717888,
+      "status_code": "UNSET",
+      "resource": {
+        "service_name": "orders-api"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "59dadab9e3da61d3",
+      "parent_span_id": "00edba9473e06b80",
+      "name": "orders-api.dispatch",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.001Z",
+      "end_time": "2026-01-15T09:30:00.224Z",
+      "duration_ms": 223.650304,
+      "status_code": "UNSET",
+      "resource": {
+        "service_name": "orders-api"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "418e3c6d1754bbc7",
+      "parent_span_id": "8c0590af245fba61",
+      "name": "LedgerContract:FetchPendingTransfersByAccount",
+      "kind": "SERVER",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.013Z",
+      "duration_ms": 8.343552,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "e7c815535fee25d8",
+      "parent_span_id": "418e3c6d1754bbc7",
+      "name": "LedgerTransaction.EVALUATE",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.012Z",
+      "duration_ms": 7.129344,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "6e6bf7dc95adc650",
+      "parent_span_id": "418e3c6d1754bbc7",
+      "name": "runtime.beforeTransaction",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.005Z",
+      "duration_ms": 0.012544,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "280424c208d6af59",
+      "parent_span_id": "e7c815535fee25d8",
+      "name": "handler.invoke",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.011Z",
+      "duration_ms": 6.630912,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "e4ff806be4ac31bf",
+      "parent_span_id": "e7c815535fee25d8",
+      "name": "handler.authorize",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.005Z",
+      "duration_ms": 0.124672,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "61cffa658991b6b6",
+      "parent_span_id": "280424c208d6af59",
+      "name": "state.getObjectsByPartialKeyWithPagination",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.007Z",
+      "duration_ms": 2.108928,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "f0c12d4b2231276b",
+      "parent_span_id": "e4ff806be4ac31bf",
+      "name": "auth.check",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.005Z",
+      "end_time": "2026-01-15T09:30:00.005Z",
+      "duration_ms": 0.008192,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "6cfd6129ef670fdf",
+      "parent_span_id": "6b3e37387b999588",
+      "name": "state.getObjectByKey",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.008Z",
+      "end_time": "2026-01-15T09:30:00.008Z",
+      "duration_ms": 0.76544,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "6b3e37387b999588",
+      "parent_span_id": "280424c208d6af59",
+      "name": "state.getObjectsByKeys",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.008Z",
+      "end_time": "2026-01-15T09:30:00.008Z",
+      "duration_ms": 0.872704,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "56f77d45cd6eae4d",
+      "parent_span_id": "6cfd6129ef670fdf",
+      "name": "store.get",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.008Z",
+      "end_time": "2026-01-15T09:30:00.008Z",
+      "duration_ms": 0.537088,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "0ad9674689ade7d1",
+      "parent_span_id": "edfa7b0e27df14d5",
+      "name": "store.get",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.009Z",
+      "end_time": "2026-01-15T09:30:00.010Z",
+      "duration_ms": 1.09696,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "edfa7b0e27df14d5",
+      "parent_span_id": "280424c208d6af59",
+      "name": "state.getObjectByKey",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.009Z",
+      "end_time": "2026-01-15T09:30:00.010Z",
+      "duration_ms": 1.623296,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "a2154f17b6566f7b",
+      "parent_span_id": "d3d9e1ff24273b20",
+      "name": "store.get",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.011Z",
+      "end_time": "2026-01-15T09:30:00.011Z",
+      "duration_ms": 0.6976,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "d3d9e1ff24273b20",
+      "parent_span_id": "280424c208d6af59",
+      "name": "state.getObjectByKey",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.011Z",
+      "end_time": "2026-01-15T09:30:00.011Z",
+      "duration_ms": 0.90624,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "9dc5a5433e1b3cbc",
+      "parent_span_id": "a9ab7075d4ed5528",
+      "name": "store.flush",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.012Z",
+      "end_time": "2026-01-15T09:30:00.012Z",
+      "duration_ms": 0.009472,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    },
+    {
+      "trace_id": "197b167fbef0e7e815af927a9e16514e",
+      "span_id": "a9ab7075d4ed5528",
+      "parent_span_id": "418e3c6d1754bbc7",
+      "name": "runtime.afterTransaction",
+      "kind": "INTERNAL",
+      "start_time": "2026-01-15T09:30:00.012Z",
+      "end_time": "2026-01-15T09:30:00.012Z",
+      "duration_ms": 0.58112,
+      "status_code": "OK",
+      "resource": {
+        "service_name": "ledger-worker"
+      }
+    }
+  ]
+}

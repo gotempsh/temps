@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { CreateOidcProviderRequest, OidcProviderResponse } from '@/api/client/types.gen'
 import type { OidcProviderFormValues } from '@/components/settings/OidcProviderForm'
 

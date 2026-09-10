@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tokenization abstraction for error messages and text processing
 //!
 //! This module provides a trait-based abstraction for tokenization that allows

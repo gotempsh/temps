@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `telemetry_milestones` table.
 //!
 //! Backs the once-per-instance guard for "first-touch" anonymous telemetry

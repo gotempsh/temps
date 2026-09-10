@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Deterministic step executors. Each export takes a parsed step and a run
  * context, runs the action, and returns a `StepResult` capturing what

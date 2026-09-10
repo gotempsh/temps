@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for ownership-guarded managed DNS records (ADR-031)
 //!
 //! These endpoints power the domain UI's per-record state and the
@@ -216,8 +219,8 @@ macro_rules! impl_audit_operation {
             fn operation_type(&self) -> String {
                 $op.to_string()
             }
-            fn user_id(&self) -> i32 {
-                self.context.user_id
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
             }
             fn ip_address(&self) -> Option<String> {
                 self.context.ip_address.clone()
@@ -268,7 +271,7 @@ pub(super) async fn get_record_ownership(
     State(state): State<Arc<DnsAppState>>,
     Query(query): Query<ManagedRecordQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let ownership = state
         .managed_record_service
@@ -300,7 +303,8 @@ pub(super) async fn set_managed_record(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<SetManagedRecordRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
 
     let record = state
         .managed_record_service
@@ -361,7 +365,8 @@ pub(super) async fn remove_managed_record(
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<ManagedRecordQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
 
     state
         .managed_record_service
@@ -405,7 +410,8 @@ pub(super) async fn import_managed_record(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<ImportManagedRecordRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    permission_check!(auth, Permission::DnsAutomationWrite);
 
     let marker = state
         .managed_record_service

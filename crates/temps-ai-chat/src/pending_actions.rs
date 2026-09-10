@@ -1,21 +1,29 @@
-//! Service for AI pending-action lifecycle management (propose → confirm/reject).
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Durable records for approval-gated AI platform actions.
 //!
-//! The AI NEVER executes a mutation. When the model proposes a write, this
-//! service inserts a `proposed` row in `ai_pending_actions`. A human later
-//! calls the confirm endpoint, which is the ONLY place execution runs. The
-//! confirming user's `AuthContext` is used — never anything the model supplied.
+//! The model can prepare a mutation but cannot authorize it. The chat runtime
+//! stores an encrypted `awaiting_inline_approval` row, pauses the tool call on an inline human
+//! approval, then calls this service with the resolving user's current
+//! `AuthContext`. The actual success, rejection, or sanitized failure is
+//! returned to the same model turn. Legacy confirm/reject endpoints remain for
+//! actions created before the inline lifecycle was introduced.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 
-use temps_ai_api_tools::{ApiCallScope, WriteApiToolsHandle};
+use temps_ai_api_tools::{ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
 use temps_entities::ai_pending_actions;
+
+use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -39,9 +47,6 @@ pub enum PendingActionError {
     #[error("permission '{permission}' is required to confirm this action")]
     PermissionDenied { permission: String },
 
-    #[error("AI write actions are disabled for project {project_id}")]
-    Disabled { project_id: i32 },
-
     #[error("write action feature is not available (write caller not yet wired)")]
     Unavailable,
 
@@ -53,21 +58,37 @@ pub enum PendingActionError {
 
     #[error("database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("failed to {operation} protected pending-action parameters: {reason}")]
+    Encryption {
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
-/// Manages the lifecycle of AI-proposed write actions (propose → confirm/reject).
+/// Manages both legacy detached proposals and live inline write approvals.
+#[derive(Clone)]
 pub struct PendingActionService {
     db: Arc<DatabaseConnection>,
     write_handle: Arc<WriteApiToolsHandle>,
+    encryption: Arc<temps_core::EncryptionService>,
 }
 
 impl PendingActionService {
-    pub fn new(db: Arc<DatabaseConnection>, write_handle: Arc<WriteApiToolsHandle>) -> Self {
-        Self { db, write_handle }
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        write_handle: Arc<WriteApiToolsHandle>,
+        encryption: Arc<temps_core::EncryptionService>,
+    ) -> Self {
+        Self {
+            db,
+            write_handle,
+            encryption,
+        }
     }
 
     /// Insert a new `proposed` pending action row.
@@ -77,10 +98,53 @@ impl PendingActionService {
     pub async fn create(
         &self,
         conversation_id: i64,
-        project_id: i32,
+        project_id: Option<i32>,
         prepared: &temps_ai_api_tools::PreparedWrite,
         required_permission: Option<String>,
-        created_by: Option<i32>,
+        created_by: i32,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        self.create_with_status(
+            conversation_id,
+            project_id,
+            prepared,
+            required_permission,
+            created_by,
+            "proposed",
+        )
+        .await
+    }
+
+    /// Store an action whose only valid resolution path is the live permission
+    /// waiter that created it. Legacy pending-action HTTP endpoints deliberately
+    /// accept only `proposed`, so an abandoned inline action cannot be executed
+    /// later through a detached confirmation surface.
+    pub async fn create_inline(
+        &self,
+        conversation_id: i64,
+        project_id: Option<i32>,
+        prepared: &temps_ai_api_tools::PreparedWrite,
+        required_permission: Option<String>,
+        created_by: i32,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        self.create_with_status(
+            conversation_id,
+            project_id,
+            prepared,
+            required_permission,
+            created_by,
+            "awaiting_inline_approval",
+        )
+        .await
+    }
+
+    async fn create_with_status(
+        &self,
+        conversation_id: i64,
+        project_id: Option<i32>,
+        prepared: &temps_ai_api_tools::PreparedWrite,
+        required_permission: Option<String>,
+        created_by: i32,
+        status: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         let public_id = uuid::Uuid::new_v4().simple().to_string();
         let now = Utc::now();
@@ -92,9 +156,16 @@ impl PendingActionService {
             operation_id: Set(prepared.operation_id.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
-            params: Set(prepared.params.clone()),
+            params: Set(
+                encrypt_value(self.encryption.as_ref(), &prepared.params).map_err(|reason| {
+                    PendingActionError::Encryption {
+                        operation: "encrypt",
+                        reason,
+                    }
+                })?,
+            ),
             required_permission: Set(required_permission),
-            status: Set("proposed".to_string()),
+            status: Set(status.to_string()),
             result: Set(None),
             error: Set(None),
             created_by: Set(created_by),
@@ -119,14 +190,61 @@ impl PendingActionService {
     pub async fn create_plan(
         &self,
         conversation_id: i64,
-        project_id: i32,
+        project_id: Option<i32>,
         steps: &[(temps_ai_api_tools::PreparedWrite, Option<String>)],
-        created_by: Option<i32>,
+        created_by: i32,
     ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
+        self.create_plan_with_status(conversation_id, project_id, steps, created_by, "proposed")
+            .await
+    }
+
+    /// Transactionally store a plan that is resolvable only by its active
+    /// inline permission waiter.
+    pub async fn create_inline_plan(
+        &self,
+        conversation_id: i64,
+        project_id: Option<i32>,
+        steps: &[(temps_ai_api_tools::PreparedWrite, Option<String>)],
+        created_by: i32,
+    ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
+        self.create_plan_with_status(
+            conversation_id,
+            project_id,
+            steps,
+            created_by,
+            "awaiting_inline_approval",
+        )
+        .await
+    }
+
+    async fn create_plan_with_status(
+        &self,
+        conversation_id: i64,
+        project_id: Option<i32>,
+        steps: &[(temps_ai_api_tools::PreparedWrite, Option<String>)],
+        created_by: i32,
+        status: &str,
+    ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
+        // Encrypt before opening the transaction so a local encryption failure
+        // cannot leave even a transient partial plan in the database.
+        let encrypted_steps = steps
+            .iter()
+            .map(|(prepared, required_permission)| {
+                encrypt_value(self.encryption.as_ref(), &prepared.params)
+                    .map(|params| (prepared, required_permission, params))
+                    .map_err(|reason| PendingActionError::Encryption {
+                        operation: "encrypt",
+                        reason,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transaction = self.db.begin().await?;
         let plan_public_id = uuid::Uuid::new_v4().simple().to_string();
         let now = Utc::now();
         let mut created = Vec::with_capacity(steps.len());
-        for (idx, (prepared, required_permission)) in steps.iter().enumerate() {
+        for (idx, (prepared, required_permission, encrypted_params)) in
+            encrypted_steps.into_iter().enumerate()
+        {
             let public_id = uuid::Uuid::new_v4().simple().to_string();
             let model = ai_pending_actions::ActiveModel {
                 public_id: Set(public_id),
@@ -138,9 +256,9 @@ impl PendingActionService {
                 operation_id: Set(prepared.operation_id.clone()),
                 method: Set(prepared.method.clone()),
                 summary: Set(prepared.summary.clone()),
-                params: Set(prepared.params.clone()),
+                params: Set(encrypted_params),
                 required_permission: Set(required_permission.clone()),
-                status: Set("proposed".to_string()),
+                status: Set(status.to_string()),
                 result: Set(None),
                 error: Set(None),
                 created_by: Set(created_by),
@@ -150,10 +268,12 @@ impl PendingActionService {
                 executed_at: Set(None),
                 ..Default::default()
             }
-            .insert(self.db.as_ref())
-            .await?;
+            .insert(&transaction)
+            .await
+            .map_err(PendingActionError::Database)?;
             created.push(model);
         }
+        transaction.commit().await?;
         Ok(created)
     }
 
@@ -186,12 +306,35 @@ impl PendingActionService {
     /// 404 when not found OR when the `project_id` does not match (scoping guard).
     pub async fn get(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        let query = ai_pending_actions::Entity::find()
+            .filter(ai_pending_actions::Column::PublicId.eq(public_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id));
+        let query = match project_id {
+            Some(project_id) => query.filter(ai_pending_actions::Column::ProjectId.eq(project_id)),
+            None => query.filter(ai_pending_actions::Column::ProjectId.is_null()),
+        };
+        query
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| PendingActionError::NotFound {
+                public_id: public_id.to_string(),
+            })
+    }
+
+    /// Load an action by owner without treating its optional project context
+    /// as an authorization boundary.
+    pub async fn get_owned(
+        &self,
+        user_id: i32,
         public_id: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::PublicId.eq(public_id))
-            .filter(ai_pending_actions::Column::ProjectId.eq(project_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| PendingActionError::NotFound {
@@ -206,11 +349,28 @@ impl PendingActionService {
     /// a different project if they constructed the request manually.
     pub async fn list_for_conversation(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
+        user_id: i32,
+        conversation_id: i64,
+    ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
+        let query = ai_pending_actions::Entity::find()
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
+            .filter(ai_pending_actions::Column::ConversationId.eq(conversation_id))
+            .order_by_desc(ai_pending_actions::Column::CreatedAt);
+        let query = match project_id {
+            Some(project_id) => query.filter(ai_pending_actions::Column::ProjectId.eq(project_id)),
+            None => query.filter(ai_pending_actions::Column::ProjectId.is_null()),
+        };
+        Ok(query.all(self.db.as_ref()).await?)
+    }
+
+    pub async fn list_owned_for_conversation(
+        &self,
+        user_id: i32,
         conversation_id: i64,
     ) -> Result<Vec<ai_pending_actions::Model>, PendingActionError> {
         Ok(ai_pending_actions::Entity::find()
-            .filter(ai_pending_actions::Column::ProjectId.eq(project_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::ConversationId.eq(conversation_id))
             .order_by_desc(ai_pending_actions::Column::CreatedAt)
             .all(self.db.as_ref())
@@ -223,20 +383,49 @@ impl PendingActionService {
     /// as an Err, so the caller can surface status to the UI.
     pub async fn confirm(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        self.confirm_with_status(project_id, public_id, auth, confirmed_by, "proposed")
+            .await
+    }
+
+    /// Resolve an action that belongs to the currently active inline waiter.
+    pub async fn confirm_inline(
+        &self,
+        project_id: Option<i32>,
+        public_id: &str,
+        auth: &AuthContext,
+        confirmed_by: Option<i32>,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        self.confirm_with_status(
+            project_id,
+            public_id,
+            auth,
+            confirmed_by,
+            "awaiting_inline_approval",
+        )
+        .await
+    }
+
+    async fn confirm_with_status(
+        &self,
+        project_id: Option<i32>,
+        public_id: &str,
+        auth: &AuthContext,
+        confirmed_by: Option<i32>,
+        expected_status: &str,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // 1. Load + project-scope check.
-        let action = self.get(project_id, public_id).await?;
+        let user_id = auth.user_id();
+        let action = self.get(project_id, user_id, public_id).await?;
 
-        // 2. Defense-in-depth: re-check the write-actions toggle at confirm time
-        //    (the toggle may have been turned off after the action was proposed).
-        self.check_write_actions_enabled(project_id).await?;
-
-        // 3. Status pre-check.
-        if action.status != "proposed" {
+        // 2. Status pre-check. Project-level feature toggles do not participate
+        // in authorization: the native harness approval and the confirming
+        // user's current RBAC/project scope are the authoritative controls.
+        if action.status != expected_status {
             return Err(PendingActionError::InvalidState {
                 public_id: public_id.to_string(),
                 status: action.status.clone(),
@@ -246,7 +435,7 @@ impl PendingActionService {
         // 3b. Plan ordering: a chained step can only run once every earlier step
         //     has executed. Blocks before the atomic claim so a premature confirm
         //     never leaves a stuck "executing" row.
-        self.ensure_plan_step_ready(&action).await?;
+        self.ensure_plan_step_ready(&action, user_id).await?;
 
         // 4. Advisory permission check using the caller's auth.
         //    This MUST run before the atomic claim so a denied user never leaves
@@ -263,7 +452,19 @@ impl PendingActionService {
             // real boundary at execute time).
         }
 
-        // 5. Atomic claim: flip to "executing" only if still "proposed".
+        // Decrypt before claiming the row. A corrupt payload is an operator
+        // error, not an execution attempt, and must not strand the action in
+        // the transient `executing` state.
+        let executable_params =
+            decrypt_value(self.encryption.as_ref(), &action.params).map_err(|reason| {
+                PendingActionError::Encryption {
+                    operation: "decrypt",
+                    reason,
+                }
+            })?;
+
+        // 5. Atomic claim: flip to "executing" only from the lifecycle this
+        // caller owns. Detached endpoints therefore cannot claim inline rows.
         let now = Utc::now();
         let rows_affected = ai_pending_actions::Entity::update_many()
             .col_expr(
@@ -271,7 +472,8 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value("executing"),
             )
             .filter(ai_pending_actions::Column::Id.eq(action.id))
-            .filter(ai_pending_actions::Column::Status.eq("proposed"))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
+            .filter(ai_pending_actions::Column::Status.eq(expected_status))
             .exec(self.db.as_ref())
             .await?
             .rows_affected;
@@ -299,10 +501,12 @@ impl PendingActionService {
         // 7. Execute with the CONFIRMING user's auth, scoped to the action's project.
         let scope = ApiCallScope {
             auth: auth.clone(),
-            project_ids: vec![project_id],
+            project_scope: project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
+                ProjectSelectorScope::Allowed(vec![project_id])
+            }),
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, action.params.clone(), &scope)
+            .execute_write(&action.operation_id, executable_params, &scope)
             .await;
 
         // 8. Persist outcome regardless of success/failure.
@@ -311,7 +515,7 @@ impl PendingActionService {
                 ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("executed".to_string()),
-                    result: Set(Some(resp.body)),
+                    result: Set(Some(redact_value(&resp.body))),
                     confirmed_by: Set(confirmed_by),
                     confirmed_at: Set(Some(now)),
                     executed_at: Set(Some(Utc::now())),
@@ -324,7 +528,7 @@ impl PendingActionService {
                 let failed = ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("failed".to_string()),
-                    error: Set(Some(e.to_string())),
+                    error: Set(Some(redact_text(&e.to_string()))),
                     confirmed_by: Set(confirmed_by),
                     confirmed_at: Set(Some(now)),
                     ..Default::default()
@@ -333,7 +537,7 @@ impl PendingActionService {
                 .await?;
                 // Stop-and-report: a failed step halts the plan — the later steps
                 // must not run against a failed prerequisite.
-                self.skip_remaining_steps(&action).await;
+                self.skip_remaining_steps(&action, user_id).await;
                 failed
             }
         };
@@ -348,16 +552,43 @@ impl PendingActionService {
     /// confirmed/executed action from being flipped to "rejected" via a race.
     pub async fn reject(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         public_id: &str,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         rejected_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        // Load first so we have the id and can return the updated row.
-        let action = self.get(project_id, public_id).await?;
+        self.reject_with_status(project_id, public_id, auth, rejected_by, "proposed")
+            .await
+    }
 
-        // Defense-in-depth: re-check the write-actions toggle (same as confirm).
-        self.check_write_actions_enabled(project_id).await?;
+    pub async fn reject_inline(
+        &self,
+        project_id: Option<i32>,
+        public_id: &str,
+        auth: &AuthContext,
+        rejected_by: Option<i32>,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        self.reject_with_status(
+            project_id,
+            public_id,
+            auth,
+            rejected_by,
+            "awaiting_inline_approval",
+        )
+        .await
+    }
+
+    async fn reject_with_status(
+        &self,
+        project_id: Option<i32>,
+        public_id: &str,
+        auth: &AuthContext,
+        rejected_by: Option<i32>,
+        expected_status: &str,
+    ) -> Result<ai_pending_actions::Model, PendingActionError> {
+        // Load first so we have the id and can return the updated row.
+        let user_id = auth.user_id();
+        let action = self.get(project_id, user_id, public_id).await?;
 
         let now = Utc::now();
 
@@ -377,7 +608,8 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value(now),
             )
             .filter(ai_pending_actions::Column::Id.eq(action.id))
-            .filter(ai_pending_actions::Column::Status.eq("proposed"))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
+            .filter(ai_pending_actions::Column::Status.eq(expected_status))
             .exec(self.db.as_ref())
             .await?
             .rows_affected;
@@ -391,28 +623,41 @@ impl PendingActionService {
         }
 
         // Reload the row to return its current state.
-        let updated = self.get(project_id, public_id).await?;
+        let updated = self.get(project_id, user_id, public_id).await?;
 
         // Stop-and-report: rejecting a step halts the rest of the plan.
-        self.skip_remaining_steps(&updated).await;
+        self.skip_remaining_steps(&updated, user_id).await;
 
         // Audit is emitted by the handler with full RequestMetadata (ip/user_agent).
         Ok(updated)
     }
 
-    /// Check that `ai_write_actions_enabled` is true for `project_id`.
-    ///
-    /// Returns `PendingActionError::Disabled` when the toggle is off or the
-    /// project cannot be loaded. Called at the start of both `confirm` and
-    /// `reject` so the toggle is enforced even after a row was proposed while
-    /// the feature was on.
-    async fn check_write_actions_enabled(&self, project_id: i32) -> Result<(), PendingActionError> {
-        let project = temps_entities::projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?;
-        match project {
-            Some(p) if p.ai_write_actions_enabled => Ok(()),
-            _ => Err(PendingActionError::Disabled { project_id }),
+    /// Make abandoned inline approvals permanently non-executable. This is
+    /// idempotent and intentionally does not require an auth snapshot: it can
+    /// only move rows owned by the active inline lifecycle into `cancelled`.
+    pub async fn cancel_inline(&self, action_public_ids: &[String], reason: &str) {
+        if action_public_ids.is_empty() {
+            return;
+        }
+        let result = ai_pending_actions::Entity::update_many()
+            .col_expr(
+                ai_pending_actions::Column::Status,
+                sea_orm::sea_query::Expr::value("cancelled"),
+            )
+            .col_expr(
+                ai_pending_actions::Column::Error,
+                sea_orm::sea_query::Expr::value(Some(redact_text(reason))),
+            )
+            .filter(ai_pending_actions::Column::PublicId.is_in(action_public_ids.to_vec()))
+            .filter(ai_pending_actions::Column::Status.eq("awaiting_inline_approval"))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(error) = result {
+            tracing::error!(
+                action_count = action_public_ids.len(),
+                %error,
+                "failed to cancel abandoned inline AI actions"
+            );
         }
     }
 
@@ -425,12 +670,14 @@ impl PendingActionService {
     async fn ensure_plan_step_ready(
         &self,
         action: &ai_pending_actions::Model,
+        user_id: i32,
     ) -> Result<(), PendingActionError> {
         let (Some(plan_id), true) = (action.plan_public_id.as_ref(), action.step_index > 0) else {
             return Ok(());
         };
         let earlier = ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::PlanPublicId.eq(plan_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::StepIndex.lt(action.step_index))
             .all(self.db.as_ref())
             .await?;
@@ -445,11 +692,11 @@ impl PendingActionService {
     }
 
     /// Halt a plan after a step failed or was rejected: mark every later step
-    /// (`step_index` greater than `after`, same plan, still `proposed`) as
+    /// (`step_index` greater than `after`, same plan, still pending) as
     /// `skipped` so the UI stops offering them and the chain doesn't proceed.
     /// No-op for standalone actions. Best-effort — errors are swallowed since the
     /// triggering step's outcome is already persisted.
-    async fn skip_remaining_steps(&self, action: &ai_pending_actions::Model) {
+    async fn skip_remaining_steps(&self, action: &ai_pending_actions::Model, user_id: i32) {
         let Some(plan_id) = action.plan_public_id.as_ref() else {
             return;
         };
@@ -459,8 +706,13 @@ impl PendingActionService {
                 sea_orm::sea_query::Expr::value("skipped"),
             )
             .filter(ai_pending_actions::Column::PlanPublicId.eq(plan_id))
+            .filter(ai_pending_actions::Column::CreatedBy.eq(user_id))
             .filter(ai_pending_actions::Column::StepIndex.gt(action.step_index))
-            .filter(ai_pending_actions::Column::Status.eq("proposed"))
+            .filter(
+                Condition::any()
+                    .add(ai_pending_actions::Column::Status.eq("proposed"))
+                    .add(ai_pending_actions::Column::Status.eq("awaiting_inline_approval")),
+            )
             .exec(self.db.as_ref())
             .await;
         if let Err(e) = res {
@@ -477,7 +729,7 @@ impl PendingActionService {
         ai_pending_actions::ActiveModel {
             id: Set(action.id),
             status: Set("failed".to_string()),
-            error: Set(Some(reason.to_string())),
+            error: Set(Some(redact_text(reason))),
             confirmed_at: Set(Some(Utc::now())),
             ..Default::default()
         }
@@ -517,7 +769,7 @@ mod tests {
             public_id: public_id.to_string(),
             conversation_id: 1,
             message_id: None,
-            project_id,
+            project_id: Some(project_id),
             plan_public_id: None,
             step_index: 0,
             operation_id: "redeploy_deployment".to_string(),
@@ -528,7 +780,7 @@ mod tests {
             status: "proposed".to_string(),
             result: None,
             error: None,
-            created_by: Some(1),
+            created_by: 1,
             confirmed_by: None,
             created_at: now,
             confirmed_at: None,
@@ -540,6 +792,14 @@ mod tests {
         let now = Utc::now();
         temps_entities::projects::Model {
             id,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test-project".to_string(),
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),
@@ -551,6 +811,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             slug: "test-project".to_string(),
+            template_slug: None,
             is_deleted: false,
             deleted_at: None,
             last_deployment: None,
@@ -559,13 +820,20 @@ mod tests {
             git_provider_connection_id: None,
             attack_mode: false,
             ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_debug_chat_enabled: Some(true),
             ai_write_actions_enabled: write_enabled,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
             enable_preview_environments: false,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
@@ -587,6 +855,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -603,8 +872,12 @@ mod tests {
         Arc::new(WriteApiToolsHandle::new())
     }
 
+    fn test_encryption() -> Arc<temps_core::EncryptionService> {
+        Arc::new(temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap())
+    }
+
     fn make_svc(db: sea_orm::DatabaseConnection) -> PendingActionService {
-        PendingActionService::new(Arc::new(db), noop_write_handle())
+        PendingActionService::new(Arc::new(db), noop_write_handle(), test_encryption())
     }
 
     // create inserts a proposed row.
@@ -616,11 +889,75 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let prepared = make_prepared();
-        let result = svc.create(1, 7, &prepared, None, Some(1)).await;
+        let result = svc.create(1, Some(7), &prepared, None, 1).await;
         assert!(result.is_ok(), "create should succeed: {:?}", result.err());
         let model = result.unwrap();
         assert_eq!(model.status, "proposed");
-        assert_eq!(model.project_id, 7);
+        assert_eq!(model.project_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn inline_actions_use_a_non_legacy_lifecycle() {
+        let mut row = make_proposed(1, "inline", 7);
+        row.status = "awaiting_inline_approval".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let svc = make_svc(db);
+
+        let created = svc
+            .create_inline(1, Some(7), &make_prepared(), None, 1)
+            .await
+            .expect("inline action is stored");
+        assert_eq!(created.status, "awaiting_inline_approval");
+    }
+
+    #[tokio::test]
+    async fn detached_confirm_cannot_execute_an_inline_action() {
+        let mut action = make_proposed(1, "inline", 7);
+        action.status = "awaiting_inline_approval".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![action]])
+            .append_query_results(vec![vec![make_project(7, true)]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+
+        let error = svc
+            .confirm(Some(7), "inline", &auth, Some(auth.user_id()))
+            .await
+            .expect_err("legacy confirmation must reject inline lifecycle rows");
+        assert!(matches!(
+            error,
+            PendingActionError::InvalidState { ref status, .. }
+                if status == "awaiting_inline_approval"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_never_persists_plaintext_write_secrets() {
+        let row = make_proposed(1, "abc", 7);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![row]])
+                .into_connection(),
+        );
+        let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+        let mut prepared = make_prepared();
+        prepared.params = serde_json::json!({
+            "name": "DATABASE_PASSWORD",
+            "value": "must-not-reach-the-database-in-plaintext"
+        });
+
+        svc.create(1, Some(7), &prepared, None, 1)
+            .await
+            .expect("encrypted action is created");
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(!log.contains("must-not-reach-the-database-in-plaintext"));
+        assert!(log.contains("__temps_encrypted_v1"));
+        assert!(log.contains("***"));
     }
 
     // get: not-found returns NotFound.
@@ -631,7 +968,7 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let err = svc
-            .get(7, "nonexistent")
+            .get(Some(7), 1, "nonexistent")
             .await
             .expect_err("should be not found");
         assert!(
@@ -640,68 +977,140 @@ mod tests {
         );
     }
 
-    // confirm: write-actions toggle is off → Disabled before anything else.
     #[tokio::test]
-    async fn test_confirm_disabled_returns_disabled_error() {
+    async fn global_action_scope_uses_is_null_instead_of_equals_null() {
+        let mut action = make_proposed(1, "global-inline", 7);
+        action.project_id = None;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![action.clone()]])
+                .append_query_results(vec![vec![action]])
+                .into_connection(),
+        );
+        let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+
+        svc.get(None, 1, "global-inline")
+            .await
+            .expect("global action should be found");
+        svc.list_for_conversation(None, 1, 1)
+            .await
+            .expect("global actions should be listed");
+
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert_eq!(
+            log.matches("IS NULL").count(),
+            2,
+            "both global queries must use SQL IS NULL: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_action_surfaces_fail_closed_for_other_or_null_creators() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .append_query_results([Vec::<ai_pending_actions::Model>::new()])
+                .into_connection(),
+        );
+        let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+        let auth = make_auth();
+
+        assert!(svc
+            .list_for_conversation(Some(7), auth.user_id(), 1)
+            .await
+            .expect("owned action list")
+            .is_empty());
+        assert!(matches!(
+            svc.get(Some(7), auth.user_id(), "other-user-or-legacy")
+                .await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            svc.confirm(Some(7), "other-user-or-legacy", &auth, Some(auth.user_id()))
+                .await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            svc.reject(Some(7), "other-user-or-legacy", &auth, Some(auth.user_id()))
+                .await,
+            Err(PendingActionError::NotFound { .. })
+        ));
+
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let statements = db
+            .into_transaction_log()
+            .into_iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 4);
+        assert!(statements.iter().all(|statement| {
+            statement.sql.contains("created_by")
+                && format!("{statement:?}").contains(&auth.user_id().to_string())
+        }));
+    }
+
+    // A legacy false project toggle must not veto a native-approved action.
+    #[tokio::test]
+    async fn test_confirm_ignores_legacy_write_toggle() {
         let action = make_proposed(1, "abc", 7);
-        let project = make_project(7, false); // toggle OFF
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // get() for the action
             .append_query_results(vec![vec![action]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![make_proposed(1, "abc", 7)]])
             .into_connection();
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(7, "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1))
             .await
-            .expect_err("should fail with Disabled");
-        assert!(
-            matches!(err, PendingActionError::Disabled { project_id: 7 }),
-            "unexpected: {err:?}"
-        );
+            .expect_err("empty write handle remains unavailable");
+        assert!(matches!(err, PendingActionError::Unavailable));
     }
 
-    // reject: write-actions toggle is off → Disabled.
+    // Rejecting also remains available independently of the removed toggle.
     #[tokio::test]
-    async fn test_reject_disabled_returns_disabled_error() {
-        let action = make_proposed(1, "abc", 7);
-        let project = make_project(7, false); // toggle OFF
+    async fn test_reject_does_not_query_legacy_write_toggle() {
+        let proposed = make_proposed(1, "abc", 7);
+        let mut rejected = proposed.clone();
+        rejected.status = "rejected".to_string();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // get() for the action
-            .append_query_results(vec![vec![action]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
+            .append_query_results(vec![vec![proposed]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![rejected]])
             .into_connection();
         let svc = make_svc(db);
         let auth = make_auth();
-        let err = svc
-            .reject(7, "abc", &auth, Some(1))
+        let result = svc
+            .reject(Some(7), "abc", &auth, Some(1))
             .await
-            .expect_err("should fail with Disabled");
-        assert!(
-            matches!(err, PendingActionError::Disabled { project_id: 7 }),
-            "unexpected: {err:?}"
-        );
+            .expect("reject should not depend on a project feature flag");
+        assert_eq!(result.status, "rejected");
     }
 
-    // confirm on non-proposed → InvalidState (after the enabled check).
+    // confirm on non-proposed → InvalidState.
     #[tokio::test]
     async fn test_confirm_non_proposed_returns_invalid_state() {
         let mut row = make_proposed(1, "abc", 7);
         row.status = "executed".to_string();
-        let project = make_project(7, true); // toggle ON
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // get() for the action (executed status)
             .append_query_results(vec![vec![row]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
             .into_connection();
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(7, "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1))
             .await
             .expect_err("should fail");
         assert!(
@@ -711,8 +1120,8 @@ mod tests {
     }
 
     // confirm: a plan step whose earlier step hasn't executed → StepBlocked
-    // (before any atomic claim). Query order: get(action) → enabled(project) →
-    // status-proposed ok → ensure_plan_step_ready loads earlier steps.
+    // (before any atomic claim). Query order: get(action) → status-proposed
+    // ok → ensure_plan_step_ready loads earlier steps.
     #[tokio::test]
     async fn test_confirm_plan_step_blocked_when_prior_step_incomplete() {
         // step 2 of a plan (step_index = 1)
@@ -724,16 +1133,14 @@ mod tests {
         step1.plan_public_id = Some("plan-abc".to_string());
         step1.step_index = 0;
 
-        let project = make_project(7, true); // toggle ON
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![step2]]) // get()
-            .append_query_results(vec![vec![project]]) // check enabled
             .append_query_results(vec![vec![step1]]) // ensure_plan_step_ready: earlier steps
             .into_connection();
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(7, "step2", &auth, Some(1))
+            .confirm(Some(7), "step2", &auth, Some(1))
             .await
             .expect_err("step 2 must be blocked until step 1 executes");
         assert!(
@@ -755,7 +1162,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let svc = make_svc(db);
         // No earlier-steps query is issued for a standalone action.
-        assert!(svc.ensure_plan_step_ready(&standalone).await.is_ok());
+        assert!(svc.ensure_plan_step_ready(&standalone, 1).await.is_ok());
     }
 
     // reject: proposed → rejected (atomic path: exec_result 1 row, then get).
@@ -767,12 +1174,9 @@ mod tests {
             m.status = "rejected".to_string();
             m
         };
-        let project = make_project(7, true); // toggle ON
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // get() for the action
             .append_query_results(vec![vec![proposed]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
             // atomic update_many (exec result)
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
@@ -783,7 +1187,7 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let auth = make_auth();
-        let result = svc.reject(7, "abc", &auth, Some(1)).await;
+        let result = svc.reject(Some(7), "abc", &auth, Some(1)).await;
         assert!(result.is_ok(), "reject should succeed: {:?}", result.err());
         let m = result.unwrap();
         assert_eq!(m.status, "rejected");
@@ -794,12 +1198,9 @@ mod tests {
     async fn test_reject_non_proposed_returns_invalid_state() {
         let mut row = make_proposed(1, "abc", 7);
         row.status = "rejected".to_string();
-        let project = make_project(7, true); // toggle ON
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // get() for the action (already rejected)
             .append_query_results(vec![vec![row]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
             // atomic update_many returns 0 rows (nothing to flip)
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
@@ -809,7 +1210,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .reject(7, "abc", &auth, Some(1))
+            .reject(Some(7), "abc", &auth, Some(1))
             .await
             .expect_err("should fail");
         assert!(
@@ -828,7 +1229,7 @@ mod tests {
             .into_connection();
         let svc = make_svc(db);
         let rows = svc
-            .list_for_conversation(7, 1)
+            .list_for_conversation(Some(7), 1, 1)
             .await
             .expect("should succeed");
         assert_eq!(rows.len(), 2);
@@ -862,8 +1263,8 @@ mod tests {
     }
 
     // confirm when write handle is empty → Unavailable (after claiming "executing").
-    // Sequence: get action → check_write_actions_enabled (project query) → status
-    // pre-check passes (proposed) → permission check passes (None) → atomic claim
+    // Sequence: get action → status pre-check passes (proposed) → permission
+    // check passes (None) → atomic claim
     // (1 row affected) → handle.get() returns None → set_failed → Unavailable.
     #[tokio::test]
     async fn test_confirm_unavailable_write_handle() {
@@ -873,12 +1274,9 @@ mod tests {
             m.status = "failed".to_string();
             m
         };
-        let project = make_project(7, true); // toggle ON
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // get() for the action
             .append_query_results(vec![vec![proposed]])
-            // check_write_actions_enabled → project query
-            .append_query_results(vec![vec![project]])
             // atomic claim update_many
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
@@ -891,7 +1289,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(7, "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1))
             .await
             .expect_err("should fail with Unavailable");
         assert!(

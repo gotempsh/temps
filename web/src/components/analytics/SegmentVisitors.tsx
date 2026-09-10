@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getVisitorsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse, VisitorInfo } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
@@ -22,7 +25,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { ArrowLeft, Bot, ChevronLeft, ChevronRight, Globe, User } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import type { DimensionKey } from './DimensionList'
 
 const PAGE_SIZE = 25

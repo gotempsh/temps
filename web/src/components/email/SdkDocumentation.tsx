@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import { listEmailDomains as listDomains2, listEmailProviders as listProviders2 } from '@/api/client'

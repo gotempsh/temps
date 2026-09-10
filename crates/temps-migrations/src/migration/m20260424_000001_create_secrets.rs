@@ -1,7 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `secrets` and `secret_environments` tables.
 //!
 //! Secrets are exposed to containers as files mounted under `/run/secrets/<KEY>`
-//! (mode 0400, tmpfs) instead of as environment variables. Values are always
+//! via a read-only mount instead of as environment variables. Values are always
 //! stored encrypted via EncryptionService (AES-256-GCM) and are never returned
 //! in plaintext from the API after creation.
 //!

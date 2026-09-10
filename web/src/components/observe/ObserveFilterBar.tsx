@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 // Toggle UI primitive doesn't exist in this project — we render kind

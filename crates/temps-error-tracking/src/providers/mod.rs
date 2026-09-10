@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error Provider Trait System
 //!
 //! Defines a common interface for error tracking providers (Sentry, Bugsnag, Rollbar, etc.)
@@ -52,6 +55,10 @@ pub struct AuthContext {
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    /// Ingest rate limit to enforce for this request, if any. `None` for
+    /// providers/paths that don't carry a per-project limit (e.g. resolved
+    /// from Host rather than a specific DSN row).
+    pub rate_limit_per_minute: Option<i32>,
 }
 
 /// Parsed error event from provider

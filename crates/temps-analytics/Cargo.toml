@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-analytics"
 version.workspace = true
@@ -13,10 +16,12 @@ readme = "README.md"
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
+temps-ai = { path = "../temps-ai" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-migrations = { path = "../temps-migrations" }
+schemars = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
@@ -25,6 +30,7 @@ sea-orm-migration = { workspace = true }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
@@ -34,6 +40,7 @@ axum = { workspace = true }
 axum-macros = { workspace = true }
 url = "2"
 urlencoding = "2"
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

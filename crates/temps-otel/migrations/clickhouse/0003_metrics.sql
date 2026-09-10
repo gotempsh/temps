@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- OTel metrics table: system-of-record for metric telemetry when ClickHouse is enabled.
 --
 -- Design decisions (ADR-016, Phase B):

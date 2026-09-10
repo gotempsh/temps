@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import chalk from 'chalk'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -23,13 +26,13 @@ function formatRate(rate: number): string {
   return `${rate.toFixed(1)}%`
 }
 
-function formatDuration(seconds: number): string {
+export function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds.toFixed(1)}s`
   if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`
   return `${(seconds / 3600).toFixed(1)}h`
 }
 
-function renderConversionBar(rate: number, width = 20): string {
+export function renderConversionBar(rate: number, width = 20): string {
   const filled = Math.round((rate / 100) * width)
   const empty = width - filled
   const bar = '█'.repeat(filled) + '░'.repeat(empty)

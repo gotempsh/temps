@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Anonymous product telemetry abstraction.
 //!
 //! Temps optionally reports **anonymous** product-usage events to a central
@@ -40,6 +43,7 @@ pub enum TelemetryEventKind {
     DeployAttempted,
     DeploySucceeded,
     DeployFailed,
+    DeployCancelled,
     RollbackTriggered,
     FirstDeploySucceeded,
 
@@ -89,6 +93,13 @@ pub enum TelemetryEventKind {
 
     // ---- Status page ----
     StatusPagePublished,
+
+    // ---- Instance health ----
+    /// Periodic aggregated summary of internal errors on the instance (ERROR
+    /// logs by target, console-API 5xx by route template, panics by source
+    /// location). Carries only counts keyed by compile-time identifiers of our
+    /// own code — never error messages. See [`crate::error_metrics`].
+    ErrorSummary,
 }
 
 impl TelemetryEventKind {
@@ -104,6 +115,7 @@ impl TelemetryEventKind {
             Self::DeployAttempted => "deploy_attempted",
             Self::DeploySucceeded => "deploy_succeeded",
             Self::DeployFailed => "deploy_failed",
+            Self::DeployCancelled => "deploy_cancelled",
             Self::RollbackTriggered => "rollback_triggered",
             Self::FirstDeploySucceeded => "first_deploy_succeeded",
 
@@ -141,6 +153,8 @@ impl TelemetryEventKind {
             Self::EmailProviderConfigured => "email_provider_configured",
 
             Self::StatusPagePublished => "status_page_published",
+
+            Self::ErrorSummary => "error_summary",
         }
     }
 
@@ -156,6 +170,7 @@ impl TelemetryEventKind {
             Self::DeployAttempted,
             Self::DeploySucceeded,
             Self::DeployFailed,
+            Self::DeployCancelled,
             Self::RollbackTriggered,
             Self::FirstDeploySucceeded,
             Self::ProjectCreated,
@@ -184,6 +199,7 @@ impl TelemetryEventKind {
             Self::VulnerabilityScanTriggered,
             Self::EmailProviderConfigured,
             Self::StatusPagePublished,
+            Self::ErrorSummary,
         ]
     }
 }
@@ -233,6 +249,25 @@ impl TelemetryEvent {
             Some(v) => self.with(key, v),
             None => self,
         }
+    }
+
+    /// Attach bounded template provenance without allowing operator-defined
+    /// slugs to leave the instance. Only reviewed bundled slugs are emitted.
+    pub fn with_template_provenance(self, provenance: Option<&str>) -> Self {
+        let (source, safe_slug) = match provenance {
+            None => ("none", None),
+            Some(value) => {
+                if let Some(slug) = crate::templates::telemetry_safe_template_slug(value) {
+                    ("bundled", Some(slug))
+                } else {
+                    ("custom", None)
+                }
+            }
+        };
+
+        self.with("is_template", provenance.is_some())
+            .with("template_source", source)
+            .with_opt("template_slug", safe_slug.map(str::to_string))
     }
 }
 
@@ -306,8 +341,9 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 36 events (34 initial + instance_heartbeat + project_created_from_template).
-        assert_eq!(TelemetryEventKind::all().len(), 36);
+        // 38 events (34 initial + instance_heartbeat + project_created_from_template
+        // + error_summary + deploy_cancelled).
+        assert_eq!(TelemetryEventKind::all().len(), 38);
     }
 
     #[test]
@@ -323,6 +359,22 @@ mod tests {
         assert_eq!(event.properties.get("duration_ms").unwrap(), 8700);
         assert_eq!(event.properties.get("region").unwrap(), "fsn1");
         assert!(!event.properties.contains_key("absent"));
+    }
+
+    #[test]
+    fn template_provenance_exposes_only_reviewed_public_slugs() {
+        let service_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
+            .with_template_provenance(Some("keycloak"));
+        assert_eq!(service_event.properties["template_source"], "bundled");
+        assert_eq!(service_event.properties["template_slug"], "keycloak");
+
+        let private = "customer-private-template";
+        let private_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
+            .with_template_provenance(Some(private));
+        let serialized = serde_json::to_string(&private_event).unwrap();
+        assert_eq!(private_event.properties["template_source"], "custom");
+        assert!(!private_event.properties.contains_key("template_slug"));
+        assert!(!serialized.contains(private));
     }
 
     #[test]

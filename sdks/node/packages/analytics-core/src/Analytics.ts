@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { DEFAULT_BASE_PATH } from "./constants";
 import type { AnalyticsApi, AnalyticsOptions, JsonValue } from "./types";
 import {
@@ -24,6 +27,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     disabled = false,
     ignoreLocalhost = true,
     domain,
+    ingestKey,
     autoTrackPageviews = true,
     autoTrackPageLeave = true,
     pageLeaveEventName = "page_leave",
@@ -52,10 +56,12 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: data as Record<string, JsonValue>,
       },
       "POST",
-      basePath
+      basePath,
+      ingestKey
     );
   };
 
@@ -68,6 +74,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: {
           referrer: document.referrer,
           userAgent: navigator.userAgent,
@@ -75,7 +82,8 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         },
       },
       "POST",
-      basePath
+      basePath,
+      ingestKey
     );
   };
 
@@ -91,6 +99,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     if (autoTrackEngagement) {
       const tracker = new EngagementTracker({
         basePath,
+        ingestKey,
         domain: resolveDomain(),
         heartbeatInterval,
         inactivityTimeout,
@@ -98,11 +107,11 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       });
       cleanups.push(() => tracker.destroy());
     } else if (autoTrackPageLeave) {
-      cleanups.push(setupLegacyPageLeave(pageLeaveEventName, resolveDomain, basePath));
+      cleanups.push(setupLegacyPageLeave(pageLeaveEventName, resolveDomain, basePath, ingestKey));
     }
 
     if (autoTrackSpeedAnalytics) {
-      const speed = new SpeedTracker({ basePath });
+      const speed = new SpeedTracker({ basePath, ingestKey });
       cleanups.push(() => speed.destroy());
     }
 
@@ -111,7 +120,13 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
 
   const recorder =
     enabled && enableSessionRecording
-      ? new SessionRecorder({ basePath, domain: resolveDomain(), enabled: true, ...sessionRecordingConfig })
+      ? new SessionRecorder({
+          basePath,
+          ingestKey,
+          domain: resolveDomain(),
+          enabled: true,
+          ...sessionRecordingConfig,
+        })
       : null;
   if (recorder) cleanups.push(() => recorder.destroy());
 
@@ -122,6 +137,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     get enabled(): boolean {
       return enabled;
     },
+    ingestKey,
     trackEvent,
     trackPageview,
     identify,
@@ -133,6 +149,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
       }
       runtimeRecorder = new SessionRecorder({
         basePath,
+        ingestKey,
         domain: resolveDomain(),
         enabled: true,
         ...sessionRecordingConfig,
@@ -248,7 +265,8 @@ function setupClickDelegation(
 function setupLegacyPageLeave(
   pageLeaveEventName: string,
   resolveDomain: () => string,
-  basePath: string
+  basePath: string,
+  ingestKey?: string
 ): InternalCleanup {
   let hasTracked = false;
   const startTime = Date.now();
@@ -264,6 +282,7 @@ function setupLegacyPageLeave(
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: {
           time_on_page_ms: timeOnPage,
           timestamp: new Date().toISOString(),
@@ -271,7 +290,8 @@ function setupLegacyPageLeave(
           referrer: document.referrer,
         },
       },
-      basePath
+      basePath,
+      ingestKey
     );
   };
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Unified observability surface for the project-level Observe page.
 //!
 //! Exposes one discriminated `ObservabilityEvent` row that covers request

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Resource-metrics table: system-of-record for scraped DB/container/node metrics
 -- (CPU, memory, connections, ...) when the monitoring store is set to ClickHouse.
 --

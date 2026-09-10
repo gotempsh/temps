@@ -1,5 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router'
 import { ServicesOverview } from './services/ServicesOverview'
 import { KvService } from './services/KvService'
 import { BlobService } from './services/BlobService'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-credential throttle for `last_used_at` bookkeeping writes.
 //!
 //! `ApiKeyService::validate_api_key` and `DeploymentTokenValidationService::validate_token`

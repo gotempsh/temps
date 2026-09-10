@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Drop the `backups.last_heartbeat_at` column.
 //!
 //! The column was added by `m20260504_000001_widen_backup_size_and_heartbeat`

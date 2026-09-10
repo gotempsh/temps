@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Hand-written helpers for external-service health endpoints. Replace with the
  * generated SDK (`bun run openapi-ts`) once the OpenAPI spec is re-exported.

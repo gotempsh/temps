@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Sessions table: ReplacingMergeTree because end_time is updated as the
 -- session progresses. Latest `_version` wins — Postgres is the source of
 -- truth, this is just the analytical replica.

@@ -1,8 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   createServiceMutation,
   getServiceTypeParametersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client/types.gen'
+import {
+  CreatableServiceTypeRoute,
+  CreateServiceResponse,
+} from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -26,13 +32,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
-import { customAlphabet } from 'nanoid'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
+
+import {
+  completeServiceCreation,
+  ServiceCreationSuccessMessage,
+} from '@/lib/service-creation-success'
 
 /**
  * Parameter names that get tucked into the "Advanced" collapsible by
@@ -51,9 +62,6 @@ const ADVANCED_PARAM_NAMES = new Set([
 
 /** Service types that support WAL-G streaming backups */
 const WALG_SERVICE_TYPES = ['postgres', 'redis', 'mongodb']
-
-// Create a custom nanoid with lowercase alphanumeric characters
-const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /**
  * Shows a warning when the user selects a Docker image without WAL-G support
@@ -85,11 +93,11 @@ function BackupWarning({
           Atomic backups only
         </p>
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This image does not include WAL-G. Backups will buffer the entire
-          database in memory before uploading to S3. For large databases
-          this can cause out-of-memory failures and service interruptions.
-          Use the default image or a <code className="font-mono">gotempsh/</code> image
-          for streaming backups with constant memory usage.
+          This image does not include WAL-G. Logical backups must stage a
+          complete database dump on local disk before uploading to S3. For large
+          databases this can exhaust disk space and interrupt backup jobs. Use
+          the default image or a <code className="font-mono">gotempsh/</code>{' '}
+          image for streaming backups with constant disk usage.
         </p>
       </div>
     </div>
@@ -97,9 +105,10 @@ function BackupWarning({
 }
 
 interface CreateServiceFormProps {
-  serviceType: ServiceTypeRoute
+  serviceType: CreatableServiceTypeRoute
   onCancel: () => void
   onSuccess: (data: CreateServiceResponse) => void
+  successMessage?: ServiceCreationSuccessMessage<CreateServiceResponse>
 }
 
 type ParamFieldObj = {
@@ -137,7 +146,9 @@ function ParamField({
                 onValueChange={field.onChange}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder={paramObj.default_value || 'Select value'} />
+                  <SelectValue
+                    placeholder={paramObj.default_value || 'Select value'}
+                  />
                 </SelectTrigger>
                 <SelectContent>
                   {paramObj.enum_values.map((value) => (
@@ -150,7 +161,7 @@ function ParamField({
             ) : (
               <Input
                 {...field}
-                value={field.value as string}
+                value={(field.value as string | undefined) ?? ''}
                 type={
                   paramObj.encrypted
                     ? 'password'
@@ -180,11 +191,8 @@ export function CreateServiceForm({
   serviceType,
   onCancel,
   onSuccess,
+  successMessage,
 }: CreateServiceFormProps) {
-  const defaultName = useMemo(
-    () => `${serviceType}-${generateId()}`,
-    [serviceType]
-  )
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
 
   // Fetch parameters for the selected service type
@@ -311,7 +319,7 @@ export function CreateServiceForm({
     mode: 'onChange', // Validate on change for immediate feedback
     reValidateMode: 'onChange', // Revalidate on every change
     defaultValues: {
-      name: defaultName,
+      name: '',
       service_type: serviceType,
       parameters: {},
     },
@@ -335,7 +343,11 @@ export function CreateServiceForm({
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+    const defaults = serviceCreationDefaults(parametersResponse)
+    if (defaults?.name && !form.getFieldState('name').isDirty) {
+      form.setValue('name', defaults.name, { shouldValidate: true })
+    }
+  }, [parameters, parametersResponse, form])
 
   const createServiceMut = useMutation({
     ...createServiceMutation(),
@@ -343,8 +355,12 @@ export function CreateServiceForm({
       errorTitle: 'Failed to create service',
     },
     onSuccess: (data) => {
-      toast.success('Service created successfully')
-      onSuccess(data)
+      completeServiceCreation({
+        createdService: data,
+        notifySuccess: toast.success,
+        onSuccess,
+        successMessage,
+      })
     },
   })
 
@@ -375,7 +391,7 @@ export function CreateServiceForm({
 
     await createServiceMut.mutateAsync({
       body: {
-        service_type: values.service_type as ServiceTypeRoute,
+        service_type: values.service_type as CreatableServiceTypeRoute,
         name: values.name,
         parameters: processedParameters,
       },
@@ -426,13 +442,13 @@ export function CreateServiceForm({
             }
             const valid = (parameters as unknown[]).filter(
               (p): p is ParamObj =>
-                !!p && typeof p === 'object' && 'name' in (p as object),
+                !!p && typeof p === 'object' && 'name' in (p as object)
             )
             const basic = valid.filter(
-              (p) => !ADVANCED_PARAM_NAMES.has(p.name.toLowerCase()),
+              (p) => !ADVANCED_PARAM_NAMES.has(p.name.toLowerCase())
             )
             const advanced = valid.filter((p) =>
-              ADVANCED_PARAM_NAMES.has(p.name.toLowerCase()),
+              ADVANCED_PARAM_NAMES.has(p.name.toLowerCase())
             )
             return (
               <>

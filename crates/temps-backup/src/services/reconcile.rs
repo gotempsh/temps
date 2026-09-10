@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Reconciliation for orphaned `running` backup rows at server boot.
 //!
 //! When the temps process restarts mid-backup, the in-process task that
@@ -152,6 +155,8 @@ mod tests {
             compression_type: "lz4".into(),
             created_by: 1,
             expires_at: None,
+            service_name_snapshot: Some("redis-test".to_string()),
+            service_type_snapshot: Some("redis".to_string()),
         }
     }
 

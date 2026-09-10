@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,6 +18,14 @@ use crate::services::{HealthCheckService, MonitorService, StatusPageService};
 /// Status Page Plugin for monitoring and incident management
 pub struct StatusPagePlugin;
 
+const MAX_CONCURRENT_POST_DEPLOY_CHECKS: usize = 10;
+
+fn try_reserve_post_deploy_check(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    semaphore.clone().try_acquire_owned().ok()
+}
+
 impl StatusPagePlugin {
     pub fn new() -> Self {
         Self
@@ -24,7 +35,11 @@ impl StatusPagePlugin {
     async fn process_jobs(
         mut receiver: Box<dyn JobReceiver>,
         monitor_service: Arc<MonitorService>,
+        health_check_service: Arc<HealthCheckService>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let post_deploy_checks = Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_POST_DEPLOY_CHECKS,
+        ));
         loop {
             match receiver.recv().await {
                 Ok(job) => {
@@ -69,28 +84,71 @@ impl StatusPagePlugin {
                             }
                         }
                         Job::DeploymentSucceeded(job) => {
-                            // Update monitor check_path from .temps.yaml if provided
-                            if let Some(ref health_path) = job.health_check_path {
-                                tracing::info!(
-                                    "Updating monitor check_path to '{}' for environment {} in project {}",
-                                    health_path,
+                            // Persist the deployment's health path before checking so
+                            // the first post-deploy result reflects the service's real
+                            // health endpoint rather than a stale `/` probe.
+                            tracing::info!(
+                                health_path = ?job.health_check_path,
+                                environment_id = job.environment_id,
+                                project_id = job.project_id,
+                                "Synchronizing managed monitor path with successful deployment"
+                            );
+                            if let Err(e) = monitor_service
+                                .update_managed_check_path_for_environment(
+                                    job.project_id,
                                     job.environment_id,
-                                    job.project_id
+                                    job.health_check_path.as_deref(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to synchronize managed monitor check_path for environment {}: {:?}",
+                                    job.environment_id,
+                                    e
                                 );
-                                if let Err(e) = monitor_service
-                                    .update_check_path_for_environment(
-                                        job.project_id,
-                                        job.environment_id,
-                                        health_path,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(
-                                        "Failed to update monitor check_path for environment {}: {:?}",
-                                        job.environment_id,
-                                        e
-                                    );
-                                }
+                            }
+
+                            // Existing monitors only receive MonitorCreated once, so
+                            // relying on the 60-second scheduler leaves a successful
+                            // deployment showing the previous Down/Unknown state. The
+                            // HTTP probe must not block this shared lifecycle-event
+                            // receiver, and the non-blocking permit prevents deployment
+                            // bursts from creating an unbounded task backlog. If all
+                            // permits are busy, the regular scheduler remains the
+                            // eventual fallback.
+                            if let Some(permit) = try_reserve_post_deploy_check(&post_deploy_checks)
+                            {
+                                let health_check_service = health_check_service.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    match health_check_service
+                                        .check_monitors_for_environment(
+                                            job.project_id,
+                                            job.environment_id,
+                                        )
+                                        .await
+                                    {
+                                        Ok(checked) => tracing::info!(
+                                            checked,
+                                            environment_id = job.environment_id,
+                                            deployment_id = job.deployment_id,
+                                            "Recomputed monitor status after successful deployment"
+                                        ),
+                                        Err(e) => tracing::error!(
+                                            environment_id = job.environment_id,
+                                            deployment_id = job.deployment_id,
+                                            error = ?e,
+                                            "Failed to recompute monitor status after successful deployment"
+                                        ),
+                                    }
+                                });
+                            } else {
+                                tracing::warn!(
+                                    environment_id = job.environment_id,
+                                    deployment_id = job.deployment_id,
+                                    max_concurrent_checks = MAX_CONCURRENT_POST_DEPLOY_CHECKS,
+                                    "Skipped immediate monitor recomputation because all post-deploy check slots are busy"
+                                );
                             }
                         }
                         Job::EnvironmentDeleted(job) => {
@@ -164,25 +222,27 @@ impl TempsPlugin for StatusPagePlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn JobQueue>();
 
-            // Register status page service
-            let status_page_service =
-                Arc::new(StatusPageService::new(db.clone(), config_service.clone()));
-            context.register_service(status_page_service.clone());
-
-            // Create monitor service with job queue support for realtime event emission
-            let monitor_service = Arc::new(MonitorService::with_job_queue(
+            // Register status page service. ONE MonitorService instance (with a
+            // job queue) backs both this and the job-listener loop below via
+            // monitor_service_arc() -- see StatusPageService::with_job_queue's
+            // doc comment for the bug two separate instances caused.
+            let status_page_service = Arc::new(StatusPageService::with_job_queue(
                 db.clone(),
                 config_service.clone(),
                 queue_service.clone(),
             ));
+            context.register_service(status_page_service.clone());
+            let monitor_service = status_page_service.monitor_service_arc();
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
-            let health_check_service = Arc::new(HealthCheckService::new(
-                db.clone(),
-                config_service,
-                queue_service.clone(),
-            ));
+            let health_check_service = Arc::new(
+                HealthCheckService::new(db.clone(), config_service, queue_service.clone())
+                    .map_err(|error| PluginError::PluginRegistrationFailed {
+                        plugin_name: "status-page".to_string(),
+                        error: error.to_string(),
+                    })?,
+            );
             context.register_service(health_check_service.clone());
 
             // Start the health check scheduler with job receiver for realtime monitor creation
@@ -197,9 +257,16 @@ impl TempsPlugin for StatusPagePlugin {
             // Start job listener for project/environment lifecycle events
             let job_receiver = queue_service.subscribe();
             let monitor_service_clone = monitor_service.clone();
+            let health_check_service_clone = health_check_service.clone();
             tokio::spawn(async move {
                 tracing::debug!("Starting status page job listener");
-                if let Err(e) = Self::process_jobs(job_receiver, monitor_service_clone).await {
+                if let Err(e) = Self::process_jobs(
+                    job_receiver,
+                    monitor_service_clone,
+                    health_check_service_clone,
+                )
+                .await
+                {
                     tracing::error!("Status page job processor error: {}", e);
                 }
             });
@@ -216,10 +283,12 @@ impl TempsPlugin for StatusPagePlugin {
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
         struct AppState {
             status_page_service: Arc<StatusPageService>,
             telemetry: Arc<dyn temps_core::TelemetryReporter>,
+            audit_service: Arc<dyn temps_core::AuditLogger>,
             project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
         }
 
@@ -232,6 +301,10 @@ impl TempsPlugin for StatusPagePlugin {
                 &self.telemetry
             }
 
+            fn audit_service(&self) -> &Arc<dyn temps_core::AuditLogger> {
+                &self.audit_service
+            }
+
             fn project_access_checker(&self) -> Option<Arc<dyn temps_core::ProjectAccessChecker>> {
                 self.project_access_checker.clone()
             }
@@ -240,6 +313,7 @@ impl TempsPlugin for StatusPagePlugin {
         let app_state = Arc::new(AppState {
             status_page_service,
             telemetry,
+            audit_service,
             project_access_checker,
         });
 
@@ -266,5 +340,23 @@ mod tests {
     async fn test_status_page_plugin_default() {
         let plugin = StatusPagePlugin;
         assert_eq!(plugin.name(), "status-page");
+    }
+
+    #[test]
+    fn post_deploy_monitor_checks_are_reserved_without_waiting_and_bounded() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let first = try_reserve_post_deploy_check(&semaphore)
+            .expect("the first post-deploy check should reserve a slot");
+        let second = try_reserve_post_deploy_check(&semaphore)
+            .expect("the second post-deploy check should reserve a slot");
+
+        assert!(
+            try_reserve_post_deploy_check(&semaphore).is_none(),
+            "reservation must return immediately instead of queueing another check"
+        );
+
+        drop(first);
+        assert!(try_reserve_post_deploy_check(&semaphore).is_some());
+        drop(second);
     }
 }

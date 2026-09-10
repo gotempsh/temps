@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Telemetry schema for Temps product analytics
 -- All data is anonymous: no emails, IPs, or PII stored
 -- anonymous_id is a stable random UUID generated on the instance at first boot

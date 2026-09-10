@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add `preview_password_encrypted` to `workspace_sessions`.
 //!
 //! DORMANT: the temps-workspace feature was removed; this migration is kept

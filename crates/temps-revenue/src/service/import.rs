@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CSV-based backfill for migrating users.
 //!
 //! A user who migrates to Temps can export their existing subscriptions

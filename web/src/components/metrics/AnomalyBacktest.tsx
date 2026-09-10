@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // "Would this have fired?" backtest for an anomaly alert rule.
 //
 // Replays the rule's band over the last 7 days via the /otel/alerts/preview

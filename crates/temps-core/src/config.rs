@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Configuration management utilities
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +16,7 @@ pub struct DatabaseConfig {
 
 /// Common pagination parameters
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
     /// Page number (1-indexed)
     #[param(example = 1)]

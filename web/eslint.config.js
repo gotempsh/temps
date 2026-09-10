@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import js from '@eslint/js'
 import tseslint from 'typescript-eslint'
 import reactPlugin from 'eslint-plugin-react'
@@ -103,6 +106,21 @@ export default tseslint.config(
 
       // Prettier integration
       'prettier/prettier': 'warn',
+    },
+  },
+
+  // Playwright end-to-end specs. These are Node-side test code, not React.
+  {
+    files: ['e2e/**/*.ts'],
+    rules: {
+      // Playwright's fixture signature is `async ({ page }, use) => { ... }`,
+      // and the linter mistakes that `use(...)` call for the React `use` hook,
+      // reporting "React Hook 'use' is called in function 'consoleErrors'".
+      // There is no React in this directory.
+      'react-hooks/rules-of-hooks': 'off',
+      // Specs legitimately print diagnostics (which endpoint 404'd, which
+      // sidebar link is dead) -- that output is the point when CI goes red.
+      'no-console': 'off',
     },
   },
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! OSS extension point for deploy-time secrets injection.
 //!
 //! This trait avoids a circular dependency between `temps-deployments` (which

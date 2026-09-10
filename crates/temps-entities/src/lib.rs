@@ -1,12 +1,21 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_application_projects;
+pub mod ai_application_workspaces;
+pub mod ai_applications;
 pub mod ai_conversations;
 pub mod ai_gateway_config;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
+pub mod ai_provider_models;
+pub mod ai_thread_artifacts;
 pub mod ai_usage_logs;
 pub mod alarms;
+pub mod analytics_ingest_keys;
 pub mod cross_project_trace_refs;
 // Agent entities (renamed from autopilot)
 pub mod agent_run_logs;
@@ -28,6 +37,15 @@ pub mod backup_schedules;
 pub mod backups;
 pub mod challenge_sessions;
 pub mod cli_login_sessions;
+pub mod cloud_analytics_write_mode;
+pub mod cloud_backup_mirror_cursors;
+pub mod cloud_backup_mirror_states;
+pub mod cloud_telemetry_backfills;
+pub mod cloud_telemetry_bulk_job_projects;
+pub mod cloud_telemetry_bulk_jobs;
+pub mod cloud_telemetry_fidelity;
+pub mod cloud_telemetry_outbox;
+pub mod cloud_telemetry_write_mode;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
@@ -47,8 +65,10 @@ pub mod dns_reconciliation_runs;
 pub mod domain_delivery_bindings;
 pub mod domain_delivery_previews;
 pub mod domains;
+pub mod email_domain_projects;
 pub mod email_domains;
 pub mod email_events;
+pub mod email_idempotency_keys;
 pub mod email_links;
 pub mod email_providers;
 pub mod emails;
@@ -61,6 +81,8 @@ pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
 pub mod external_services;
+pub mod feature_flag_environments;
+pub mod feature_flags;
 pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
@@ -74,6 +96,8 @@ pub mod node_route_state;
 pub mod nodes;
 pub mod notification_preferences;
 pub mod notification_providers;
+pub mod notification_route_providers;
+pub mod notification_routes;
 pub mod notifications;
 pub mod oauth_states;
 pub mod oidc_login_states;
@@ -86,35 +110,51 @@ pub mod preset;
 pub mod project_custom_domains;
 pub mod project_delivery_settings;
 pub mod project_services;
+pub mod project_telemetry_write_intervals;
 pub mod projects;
 pub mod proxy_logs;
+pub mod renewal_attempts;
 pub mod repositories;
 pub mod request_sessions;
 pub mod restore_runs;
 pub mod roles;
 pub mod s3_sources;
 pub mod schedule_runs;
+pub mod secret_compose_services;
 pub mod secret_environments;
 pub mod secrets;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod source_bundles;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
+pub mod traefik_discovered_routes;
+pub mod traefik_route_certificates;
 pub mod types;
 pub mod upstream_config;
 pub mod user_roles;
 pub mod users;
 
+// Teams + project-scoped RBAC entities
+pub mod project_team_access;
+pub mod team_members;
+pub mod team_role;
+pub mod teams;
+
+pub use team_role::{TeamRole, TeamRoleParseError};
+
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
+pub mod session_replay_ingest_batches;
 pub mod session_replay_sessions;
 pub mod settings;
+pub mod telemetry_gap_windows;
 pub mod visitor;
 
 // Error tracking entities
@@ -123,6 +163,7 @@ pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
 pub mod project_dsns;
+pub mod source_files;
 pub mod source_maps;
 pub mod tokenizer;
 
@@ -140,6 +181,9 @@ pub mod metric_dashboards;
 
 // Metric alert rules (first-class metric-centric alerting)
 pub mod metric_alert_rules;
+
+// OTel span attribute facets (pre-allocated slot columns for fast filtering)
+pub mod otel_span_facets;
 
 // Webhook entities
 pub mod webhook_deliveries;
@@ -160,6 +204,8 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_events;
+pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory

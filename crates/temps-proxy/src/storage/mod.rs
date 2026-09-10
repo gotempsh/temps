@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pluggable storage backend for proxy / request logs.
 //!
 //! Proxy logs are one row per HTTP request flowing through the Pingora reverse
@@ -50,6 +53,7 @@ use crate::service::proxy_log_service::{
     AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogServiceError,
     StatsFilters, TimeBucketStats,
 };
+use crate::traffic_aggregation::{TrafficAggregationRequest, TrafficAggregationResponse};
 
 /// Backend-neutral storage interface for proxy / request logs.
 ///
@@ -71,6 +75,15 @@ pub trait ProxyLogStorage: Send + Sync {
         entries: Vec<CreateProxyLogRequest>,
     ) -> Result<(), ProxyLogServiceError>;
 
+    /// Generic, client-shaped traffic aggregation. Implementations must keep
+    /// dimension/filter identifiers on a static allowlist and return an
+    /// identical response for equivalent TimescaleDB and ClickHouse data.
+    async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError>;
+
     /// Paginated, filtered, sorted list of proxy logs.
     ///
     /// Returns `(rows, total)` where `total` powers `total_pages` computation in
@@ -83,6 +96,21 @@ pub trait ProxyLogStorage: Send + Sync {
         page: u64,
         page_size: u64,
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError>;
+
+    /// Newest-first page of proxy logs WITHOUT the pagination total.
+    ///
+    /// The unified Observe feed fetches a merged page on every load/poll and
+    /// never renders a total; `list_with_filters`' COUNT (exact on the
+    /// TimescaleDB hypertable, `FINAL` merge-on-read on ClickHouse) would be
+    /// pure waste there — and unbounded when the caller sends no time range.
+    /// Mirrors `ProxyLogService::list_page`.
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its serial id.
     ///
@@ -97,9 +125,15 @@ pub trait ProxyLogStorage: Send + Sync {
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its (unique) request id, for tracing joins.
+    ///
+    /// `timestamp` is the row's known event time (the list endpoint returns it
+    /// per row). It bounds the lookup the same way as [`Self::get_by_id`]:
+    /// chunk exclusion on the TimescaleDB hypertable, partition pruning on the
+    /// ClickHouse table.
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// `stats/today` — total request count since UTC midnight.
@@ -118,8 +152,9 @@ pub trait ProxyLogStorage: Send + Sync {
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError>;
 
-    /// `stats/projects-health` — per-project request/error/latency rollup with a
-    /// derived health status, including projects with no data as `unknown`.
+    /// `stats/projects-health` — per-project user-traffic request/error/latency
+    /// rollup with a derived health status, including projects with no data as
+    /// `unknown`. Temps' own status-monitor requests are excluded.
     async fn get_projects_health_summary(
         &self,
         project_ids: &[i32],

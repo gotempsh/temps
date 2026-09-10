@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { App, InjectionKey, Plugin } from "vue";
 import { createAnalytics, type AnalyticsApi, type AnalyticsOptions } from "@temps-sdk/analytics-core";
 

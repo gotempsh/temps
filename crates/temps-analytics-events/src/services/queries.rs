@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Query value-types for the analytics read surface.
 //!
 //! Each `*Spec` struct captures the parameter space of one trait method on
@@ -161,6 +164,10 @@ pub struct PropertyBreakdownSpec {
     pub aggregation_level: String,
     pub limit: i32,
     pub filters: Option<PropertyBreakdownFilters>,
+    /// Include crawler/bot traffic. Defaults to false so breakdowns share a
+    /// denominator with the headline counts from `unique-counts`, which always
+    /// exclude crawlers. Callers opt in explicitly when they want bot traffic.
+    pub include_crawlers: bool,
 }
 
 impl PropertyBreakdownSpec {
@@ -181,7 +188,15 @@ impl PropertyBreakdownSpec {
             aggregation_level: aggregation_level.into(),
             limit: clamp_limit(limit, 20),
             filters,
+            include_crawlers: false,
         }
+    }
+
+    /// Opt in to crawler/bot traffic. Off by default — see
+    /// [`PropertyBreakdownSpec::include_crawlers`].
+    pub fn with_crawlers(mut self, include: bool) -> Self {
+        self.include_crawlers = include;
+        self
     }
 }
 
@@ -193,6 +208,8 @@ pub struct PropertyTimelineSpec {
     pub group_by_column: PropertyColumn,
     pub aggregation_level: String,
     pub bucket_size: Option<String>,
+    /// See [`PropertyBreakdownSpec::include_crawlers`].
+    pub include_crawlers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

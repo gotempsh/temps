@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-cluster certificate authority and per-node certificate issuance for
 //! multi-node mTLS (ADR-020 WS-2.1 / WS-1.1).
 //!

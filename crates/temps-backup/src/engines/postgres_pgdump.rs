@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `PostgresPgDumpEngine`: in-process `pg_dump`-based backup of an external
 //! Postgres service, implemented against `engine_v2::BackupEngine`.
 //!

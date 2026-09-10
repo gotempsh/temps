@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useMemo, useState, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -31,7 +34,7 @@ import {
   FileText,
   Calendar as CalendarIcon,
 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { format, subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'

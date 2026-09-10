@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { registerRestoreCommands } from './restore.js'
+import { registerWalHealthCommands } from './wal-health.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -15,14 +19,30 @@ import {
   listServiceProjects,
   updateService,
   upgradeService,
+  repointContinuousArchiveSource,
   importExternalService,
   linkServiceToProject,
   unlinkServiceFromProject,
   getServiceEnvironmentVariables,
   getServiceEnvironmentVariable,
   getProjectBySlug,
+  externalServiceMetricsGetRange,
+  externalServiceMetricsGetLatest,
+  externalServiceMetricsStatus,
+  externalServiceMetricsByDatabase,
+  externalServiceMetricsToggle,
+  externalServiceMetricsGetAlertRules,
+  externalServiceMetricsCreateAlertRule,
+  externalServiceMetricsUpdateAlertRule,
+  externalServiceMetricsDeleteAlertRule,
 } from '../../api/sdk.gen.js'
-import type { ExternalServiceInfo, ServiceTypeRoute } from '../../api/types.gen.js'
+import type {
+  CreatableServiceTypeRoute,
+  ExternalServiceInfo,
+  ServiceTypeRoute,
+  ServiceAlertRuleResponse,
+  MetricDataPoint,
+} from '../../api/types.gen.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
@@ -32,6 +52,7 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue 
 const SERVICE_TYPE_LABELS: Record<ServiceTypeRoute, string> = {
   postgres: 'PostgreSQL',
   mongodb: 'MongoDB',
+  mariadb: 'MariaDB',
   redis: 'Redis',
   s3: 'MinIO (S3)',
   kv: 'KV',
@@ -77,7 +98,7 @@ interface PromptParam {
   param_type: string
 }
 
-function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
+export function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
   if (!schema?.properties) return []
   const required = new Set(schema.required ?? [])
   const readonly = new Set(schema.readonly ?? [])
@@ -97,7 +118,7 @@ function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
  * Parse repeatable --set key=value pairs into a Record.
  * Supports type coercion: numbers → number, true/false → boolean, rest → string.
  */
-function parseSetPairs(pairs: string[]): Record<string, unknown> {
+export function parseSetPairs(pairs: string[]): Record<string, unknown> {
   const result: Record<string, unknown> = {}
   for (const pair of pairs) {
     const eqIdx = pair.indexOf('=')
@@ -160,6 +181,11 @@ interface UpdateOptions {
 interface UpgradeOptions {
   id: string
   version?: string
+}
+
+interface RepointContinuousArchiveSourceOptions {
+  id: string
+  s3Source: string
 }
 
 interface ImportOptions {
@@ -298,6 +324,18 @@ export function registerServicesCommands(program: Command): void {
     .action(upgradeServiceAction)
 
   services
+    .command('repoint-continuous-archive-source')
+    .description(
+      "Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog " +
+        'shipper) to a different S3 source. Data archived before this call stays under the ' +
+        'previous source and will no longer be verifiable or replayable once archiving points ' +
+        'at the new one.',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--s3-source <id>', 'S3 source ID to point continuous archiving at')
+    .action(repointContinuousArchiveSourceAction)
+
+  services
     .command('import')
     .description('Import an existing external service')
     .option('-t, --type <type>', 'Service type (postgres, mongodb, redis, s3)')
@@ -348,9 +386,159 @@ export function registerServicesCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(envVarAction)
 
+  services
+    .command('logs')
+    .description('View persisted logs for an external service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option(
+      '--from <datetime>',
+      'Start of time range. ISO 8601 timestamp or a relative duration like "1h", "24h", "7d" (default: 24h ago)',
+    )
+    .option(
+      '--to <datetime>',
+      'End of time range. ISO 8601 timestamp (default: now)',
+    )
+    .option(
+      '-l, --level <levels>',
+      'Comma-separated log levels to include: ERROR,WARN,INFO,DEBUG,TRACE',
+    )
+    .option(
+      '-n, --tail <lines>',
+      'Maximum number of log lines to fetch (default: 200, max: 1000)',
+      '200',
+    )
+    .option('-t, --text <query>', 'Filter log lines by text (case-insensitive)')
+    .option('--json', 'Output raw JSON instead of formatted lines')
+    .action(serviceLogsAction)
+
+  services
+    .command('slow-queries')
+    .description('Show slowest PostgreSQL queries from pg_stat_statements')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--page <n>', 'Page number (1-based, default: 1)', '1')
+    .option('--page-size <n>', 'Rows per page (1–100, default: 20)', '20')
+    .option(
+      '--sort-by <column>',
+      'Sort column: calls, total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio (default: mean_exec_time_ms)',
+    )
+    .option('--sort-order <order>', 'Sort direction: asc or desc (default: desc)')
+    .option('--json', 'Output raw JSON instead of a formatted table')
+    .action(serviceSlowQueriesAction)
+
+  services
+    .command('enable-pg-stat-statements')
+    .description(
+      'Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .option('-y, --yes', 'Skip the restart confirmation prompt (for automation)')
+    .action(serviceEnablePgStatStatementsAction)
+
+  const metrics = services
+    .command('metrics')
+    .description('Resource and engine metrics for a database/cache/storage service')
+
+  metrics
+    .command('latest')
+    .description('Show the most recent value of every tracked metric')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsLatestAction)
+
+  metrics
+    .command('range')
+    .description('Show a time-series range for a single metric')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('-m, --metric <name>', 'Metric name, e.g. "pg.connections_active"')
+    .option('-r, --range <window>', 'Time window: 1h, 6h, 24h, 7d (default: 24h)')
+    .option('-p, --percentile <n>', 'Histogram percentile (0-100) instead of a plain average')
+    .option('--json', 'Output raw JSON instead of a formatted table')
+    .action(serviceMetricsRangeAction)
+
+  metrics
+    .command('status')
+    .description('Show when metrics were last received for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsStatusAction)
+
+  metrics
+    .command('by-database')
+    .description('Per-database metric breakdown (PostgreSQL services only)')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsByDatabaseAction)
+
+  metrics
+    .command('enable')
+    .description('Enable metric collection for a service (seeds default alert rules)')
+    .requiredOption('--id <id>', 'Service ID')
+    .action(serviceMetricsEnableAction)
+
+  metrics
+    .command('disable')
+    .description('Disable metric collection for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .action(serviceMetricsDisableAction)
+
+  const alertRules = metrics
+    .command('alert-rules')
+    .description('Manage monitoring alert rules for a service')
+
+  alertRules
+    .command('list')
+    .alias('ls')
+    .description('List alert rules for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesListAction)
+
+  alertRules
+    .command('create')
+    .alias('add')
+    .description('Create an alert rule for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('-n, --name <name>', 'Alert rule name')
+    .requiredOption('-m, --metric <name>', 'Metric name, e.g. "pg.connections_active"')
+    .requiredOption('-c, --comparator <op>', 'Comparator: >, <, >=, <=')
+    .requiredOption('-t, --threshold <n>', 'Threshold value that triggers the alert')
+    .option('-s, --severity <level>', 'warning or critical (default: warning)')
+    .option('--for-duration <secs>', 'Seconds the breach must persist before firing (default: 0)')
+    .option('--disabled', 'Create the rule disabled')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesCreateAction)
+
+  alertRules
+    .command('update')
+    .description('Update an existing alert rule')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--rule-id <id>', 'Alert rule ID')
+    .option('-n, --name <name>', 'Alert rule name')
+    .option('-m, --metric <name>', 'Metric name')
+    .option('-c, --comparator <op>', 'Comparator: >, <, >=, <=')
+    .option('-t, --threshold <n>', 'Threshold value')
+    .option('-s, --severity <level>', 'warning or critical')
+    .option('--for-duration <secs>', 'Seconds the breach must persist before firing')
+    .option('--enable', 'Enable the rule')
+    .option('--disable', 'Disable the rule')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesUpdateAction)
+
+  alertRules
+    .command('remove')
+    .alias('rm')
+    .description('Delete an alert rule')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--rule-id <id>', 'Alert rule ID')
+    .option('-y, --yes', 'Skip confirmation prompt')
+    .action(serviceMetricsAlertRulesRemoveAction)
+
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
+
+  // Live WAL / archive_command diagnostics for PostgreSQL services.
+  registerWalHealthCommands(services)
 }
 
 async function listServicesAction(options: { json?: boolean }): Promise<void> {
@@ -410,7 +598,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
     return
   }
 
-  let serviceType: ServiceTypeRoute
+  let serviceType: CreatableServiceTypeRoute
   let name: string
   let parameters: Record<string, unknown> = {}
 
@@ -426,7 +614,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
       warning(`Invalid service type: ${options.type}. Available: ${types.join(', ')}`)
       return
     }
-    serviceType = options.type as ServiceTypeRoute
+    serviceType = options.type as CreatableServiceTypeRoute
     name = options.name!
 
     // Parse --set key=value pairs if provided, otherwise use smart defaults
@@ -448,7 +636,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
         warning(`Invalid service type: ${options.type}. Available: ${types.join(', ')}`)
         return
       }
-      serviceType = options.type as ServiceTypeRoute
+      serviceType = options.type as CreatableServiceTypeRoute
       info(`Service type: ${colors.bold(SERVICE_TYPE_LABELS[serviceType] || serviceType)}`)
     } else {
       serviceType = await promptSelect({
@@ -457,7 +645,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
           name: SERVICE_TYPE_LABELS[t] || t,
           value: t,
         })),
-      }) as ServiceTypeRoute
+      }) as CreatableServiceTypeRoute
     }
 
     if (options.name) {
@@ -583,6 +771,13 @@ async function showService(options: ShowOptions): Promise<void> {
   }
   keyValue('Created', new Date(service.created_at).toLocaleString())
   keyValue('Updated', new Date(service.updated_at).toLocaleString())
+  if (service.continuous_archive_s3_source_id != null) {
+    keyValue('Continuous archive S3 source', String(service.continuous_archive_s3_source_id))
+    if (service.continuous_archive_pinned_at) {
+      keyValue('  pinned at', new Date(service.continuous_archive_pinned_at).toLocaleString())
+    }
+    info('Change with: temps services repoint-continuous-archive-source --id <id> --s3-source <id>')
+  }
 
   if (details.current_parameters && Object.keys(details.current_parameters).length > 0) {
     newline()
@@ -718,7 +913,7 @@ async function listServiceTypes(options: { json?: boolean }): Promise<void> {
 }
 
 /** Build an example `services create` command using --set flags with all schema defaults */
-function buildExampleCommand(type: string, schema?: JsonSchema): string {
+export function buildExampleCommand(type: string, schema?: JsonSchema): string {
   const setParts: string[] = []
   if (schema?.properties) {
     for (const [key, prop] of Object.entries(schema.properties)) {
@@ -901,6 +1096,42 @@ async function upgradeServiceAction(options: UpgradeOptions): Promise<void> {
 
   success('Service upgrade initiated')
   info(`Run: temps services show --id ${options.id} to check the status`)
+}
+
+async function repointContinuousArchiveSourceAction(options: RepointContinuousArchiveSourceOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID')
+    return
+  }
+
+  const newS3SourceId = parseInt(options.s3Source, 10)
+  if (isNaN(newS3SourceId)) {
+    warning('Invalid S3 source ID')
+    return
+  }
+
+  const result = await withSpinner('Repointing continuous archive source...', async () => {
+    const { data, error } = await repointContinuousArchiveSource({
+      client,
+      path: { id },
+      body: { new_s3_source_id: newS3SourceId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  success('Continuous archive source repointed')
+  if (result) {
+    keyValue('Service ID', String(result.service_id))
+    keyValue('S3 source', String(result.continuous_archive_s3_source_id))
+    keyValue('Pinned at', result.continuous_archive_pinned_at)
+  }
 }
 
 async function importServiceAction(options: ImportOptions): Promise<void> {
@@ -1251,4 +1482,855 @@ async function connectAction(name: string, options: { project?: string; json?: b
     }
   }
   newline()
+}
+
+// ── services logs ────────────────────────────────────────────────────────────
+
+interface ServiceLogsOptions {
+  id: string
+  from?: string
+  to?: string
+  level?: string
+  tail?: string
+  text?: string
+  json?: boolean
+}
+
+/** Parse a relative duration string ("15m", "1h", "24h", "7d") into the
+ *  equivalent Date in the past, or return null if it is not a recognised
+ *  relative format (assumed to be an ISO 8601 string instead). */
+export function parseFromFlag(value: string): Date | null {
+  const match = value.match(/^(\d+)(m|h|d)$/)
+  if (!match || !match[1] || !match[2]) return null
+  const n = parseInt(match[1], 10)
+  const unit = match[2]
+  const ms =
+    unit === 'm' ? n * 60_000 :
+    unit === 'h' ? n * 3_600_000 :
+    n * 86_400_000
+  return new Date(Date.now() - ms)
+}
+
+interface SearchLogsLine {
+  timestamp: string
+  level: string
+  message: string
+  service?: string
+  fields?: Record<string, unknown> | null
+}
+
+interface SearchLogsResponse {
+  lines: SearchLogsLine[]
+  next_cursor: string | null
+  total_scanned: number
+}
+
+const LEVEL_COLORS: Record<string, (s: string) => string> = {
+  ERROR: (s: string) => colors.error(s),
+  WARN: (s: string) => colors.warning(s),
+  INFO: (s: string) => s,
+  DEBUG: (s: string) => colors.muted(s),
+  TRACE: (s: string) => colors.muted(s),
+}
+
+export function formatLogTs(ts: string): string {
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ts
+  return d.toISOString().replace('T', ' ').slice(0, 19)
+}
+
+async function serviceLogsAction(options: ServiceLogsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  // Resolve start time: relative shorthand or ISO string (default: last 24h).
+  let startTime: string
+  if (options.from) {
+    const relative = parseFromFlag(options.from)
+    startTime = relative ? relative.toISOString() : options.from
+  } else {
+    startTime = new Date(Date.now() - 24 * 3_600_000).toISOString()
+  }
+
+  // Resolve end time: ISO string (default: omit → server defaults to now).
+  let endTime: string | undefined
+  if (options.to) {
+    endTime = options.to
+  }
+
+  // Resolve level filter.
+  const levels =
+    options.level
+      ? options.level
+          .toUpperCase()
+          .split(',')
+          .map((l) => l.trim())
+          .filter(Boolean)
+      : undefined
+
+  // Clamp tail between 1 and 1000.
+  const tail = Math.min(1000, Math.max(1, parseInt(options.tail ?? '200', 10)))
+
+  const result = await withSpinner('Fetching logs…', async () => {
+    const body: Record<string, unknown> = {
+      project_id: 0,
+      external_service_id: id,
+      start_time: startTime,
+      page_size: tail,
+    }
+    if (endTime) body.end_time = endTime
+    if (levels?.length) body.levels = levels
+    if (options.text) body.text = options.text
+
+    const { data, error } = await client.post<SearchLogsResponse>({
+      url: '/logs/search',
+      body,
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (!result) {
+    warning('No log data returned')
+    return
+  }
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const lines = result.lines
+  if (lines.length === 0) {
+    info(`No logs found for service ${id} in the specified time range.`)
+    return
+  }
+
+  // Print formatted log lines.
+  for (const line of lines) {
+    const ts = colors.muted(formatLogTs(line.timestamp))
+    const lvl = line.level?.toUpperCase() ?? 'INFO'
+    const colorFn = LEVEL_COLORS[lvl] ?? ((s: string) => s)
+    const levelTag = colorFn(lvl.padEnd(5))
+    console.log(`${ts}  ${levelTag}  ${line.message}`)
+  }
+
+  newline()
+  info(
+    `${lines.length} line${lines.length === 1 ? '' : 's'} shown` +
+      (result.next_cursor ? ' (more available — use a narrower time range or --tail)' : ''),
+  )
+}
+
+// ── services slow-queries ─────────────────────────────────────────────────────
+
+interface SlowQueryRow {
+  query: string
+  database: string
+  calls: number
+  total_exec_time_ms: number
+  mean_exec_time_ms: number
+  rows: number
+  cache_hit_ratio: number | null
+}
+
+interface SlowQueriesResponse {
+  queries: SlowQueryRow[]
+  page: number
+  page_size: number
+  total_count: number
+}
+
+interface ServiceSlowQueriesOptions {
+  id: string
+  page?: string
+  pageSize?: string
+  sortBy?: string
+  sortOrder?: string
+  json?: boolean
+}
+
+/** Wrap the raw API error with actionable setup steps when the cause is a
+ *  missing extension, rather than surfacing a bare Postgres error string. */
+export function buildSlowQueriesErrorMessage(msg: string): string {
+  if (msg.includes('pg_stat_statements')) {
+    return (
+      `pg_stat_statements is not loaded on this service.\n` +
+      `Add it to shared_preload_libraries and restart the service, then try again.\n` +
+      `Detail: ${msg}`
+    )
+  }
+  return msg
+}
+
+/** Collapse whitespace and cap a query string so one long statement cannot
+ *  blow out the table layout. */
+export function truncateQuery(query: string, maxLen = 60): string {
+  const collapsed = query.replace(/\s+/g, ' ').trim()
+  return collapsed.length > maxLen ? collapsed.slice(0, maxLen - 1) + '…' : collapsed
+}
+
+async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  const page = Math.max(1, parseInt(options.page ?? '1', 10))
+  const pageSize = Math.min(100, Math.max(1, parseInt(options.pageSize ?? '20', 10)))
+
+  const result = await withSpinner('Fetching slow queries…', async () => {
+    const { data, error } = await client.get<SlowQueriesResponse>({
+      url: `/external-services/${id}/pg-stat-statements/slow-queries`,
+      query: {
+        page,
+        page_size: pageSize,
+        sort_by: options.sortBy,
+        sort_order: options.sortOrder,
+      },
+    })
+    if (error) {
+      // Surface the pg_stat_statements not-loaded error cleanly.
+      throw new Error(buildSlowQueriesErrorMessage(getErrorMessage(error)))
+    }
+    return data
+  })
+
+  if (!result) {
+    warning('No data returned')
+    return
+  }
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const queries = result.queries
+  if (queries.length === 0) {
+    info(`No slow-query data found for service ${id}.`)
+    return
+  }
+
+  const columns: TableColumn<SlowQueryRow>[] = [
+    {
+      header: 'Query',
+      accessor: (row) => truncateQuery(row.query),
+    },
+    {
+      header: 'Database',
+      accessor: (row) => row.database,
+    },
+    {
+      header: 'Calls',
+      accessor: (row) => row.calls.toLocaleString(),
+      align: 'right',
+    },
+    {
+      header: 'Total Time (ms)',
+      accessor: (row) => row.total_exec_time_ms.toFixed(2),
+      align: 'right',
+    },
+    {
+      header: 'Mean Time (ms)',
+      accessor: (row) => row.mean_exec_time_ms.toFixed(2),
+      align: 'right',
+    },
+    {
+      header: 'Rows',
+      accessor: (row) => row.rows.toLocaleString(),
+      align: 'right',
+    },
+    {
+      header: 'Cache Hit Ratio',
+      accessor: (row) => (row.cache_hit_ratio !== null ? row.cache_hit_ratio.toFixed(4) : '—'),
+      align: 'right',
+    },
+  ]
+
+  printTable(queries, columns)
+  newline()
+  const totalPages = pageSize > 0 ? Math.ceil((result.total_count ?? 0) / pageSize) : 1
+  info(
+    `${queries.length} quer${queries.length === 1 ? 'y' : 'ies'} shown` +
+      ` (page ${result.page} / ${totalPages}, ${result.total_count ?? 0} total)`,
+  )
+}
+
+// ── services enable-pg-stat-statements ──────────────────────────────────────
+
+interface ServiceEnablePgStatStatementsOptions {
+  id: string
+  yes?: boolean
+}
+
+/** Wrap the raw API error with the manual-restart instructions when a
+ *  clustered Postgres service rejects the self-service restart. */
+export function buildEnablePgStatStatementsErrorMessage(msg: string): string {
+  if (msg.toLowerCase().includes('cluster')) {
+    return (
+      `Self-service restart is not available for clustered Postgres services.\n` +
+      `A rolling restart across all cluster nodes is required — perform it manually.\n` +
+      `Detail: ${msg}`
+    )
+  }
+  return msg
+}
+
+async function serviceEnablePgStatStatementsAction(
+  options: ServiceEnablePgStatStatementsOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  if (!options.yes) {
+    warning(
+      'This will restart the Postgres container to enable pg_stat_statements. Active connections will be briefly dropped.',
+    )
+    const confirmed = await promptConfirm({
+      message: `Enable pg_stat_statements and restart service ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Enabling pg_stat_statements and restarting container…', async () => {
+    const { error } = await client.post({
+      url: `/external-services/${id}/pg-stat-statements/enable`,
+    })
+    if (error) {
+      throw new Error(buildEnablePgStatStatementsErrorMessage(getErrorMessage(error)))
+    }
+  })
+
+  success(`pg_stat_statements enabled — service ${id} has been restarted.`)
+  info(`Run "temps services slow-queries --id ${id}" to view query stats.`)
+}
+
+// ── services metrics ────────────────────────────────────────────────────────
+
+/** Parse a required numeric ID (service ID or alert rule ID), returning
+ *  `undefined` for anything that isn't a positive integer. */
+export function parsePositiveIntId(raw: string): number | undefined {
+  const id = parseInt(raw, 10)
+  return isNaN(id) || id <= 0 ? undefined : id
+}
+
+function parseServiceId(raw: string): number | undefined {
+  const id = parsePositiveIntId(raw)
+  if (id === undefined) {
+    warning('Invalid service ID — --id must be a positive numeric service ID')
+  }
+  return id
+}
+
+function parseRuleId(raw: string): number | undefined {
+  const id = parsePositiveIntId(raw)
+  if (id === undefined) {
+    warning('Invalid --rule-id — must be a positive numeric alert rule ID')
+  }
+  return id
+}
+
+interface ServiceMetricsLatestOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsLatestAction(options: ServiceMetricsLatestOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const latest = await withSpinner('Fetching latest metrics…', async () => {
+    const { data, error } = await externalServiceMetricsGetLatest({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? {}
+  })
+
+  if (options.json) {
+    json(latest)
+    return
+  }
+
+  const entries = Object.entries(latest)
+  newline()
+  header(`${icons.info} Latest Metrics — Service ${id}`)
+
+  if (entries.length === 0) {
+    info('No metrics recorded yet for this service')
+    info(`Run: temps services metrics enable --id ${id} to start collecting metrics`)
+    newline()
+    return
+  }
+
+  for (const [name, value] of entries.sort(([a], [b]) => a.localeCompare(b))) {
+    keyValue(name, value)
+  }
+  newline()
+}
+
+interface ServiceMetricsRangeOptions {
+  id: string
+  metric: string
+  range?: string
+  percentile?: string
+  json?: boolean
+}
+
+async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const percentile = options.percentile !== undefined ? Number(options.percentile) : undefined
+  if (percentile !== undefined && (isNaN(percentile) || percentile < 0 || percentile > 100)) {
+    warning('Invalid --percentile — must be a number between 0 and 100')
+    return
+  }
+
+  const points = await withSpinner(`Fetching "${options.metric}"…`, async () => {
+    const { data, error } = await externalServiceMetricsGetRange({
+      client,
+      path: { id },
+      query: {
+        metric: options.metric,
+        range: options.range,
+        percentile,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? []
+  })
+
+  if (options.json) {
+    json(points)
+    return
+  }
+
+  newline()
+  header(`${icons.info} ${options.metric} — Service ${id} (${options.range ?? '24h'})`)
+
+  if (points.length === 0) {
+    info('No data points in this time range')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<MetricDataPoint>[] = [
+    { header: 'Time', accessor: (p) => formatLogTs(p.time) },
+    { header: 'Value', accessor: (p) => p.value.toString(), align: 'right' },
+  ]
+
+  printTable(points, columns)
+  newline()
+  info(`${points.length} data point${points.length === 1 ? '' : 's'}`)
+}
+
+interface ServiceMetricsStatusOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsStatusAction(options: ServiceMetricsStatusOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const status = await withSpinner('Fetching metrics status…', async () => {
+    const { data, error } = await externalServiceMetricsStatus({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(status)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Metrics Status — Service ${id}`)
+  if (status?.last_received_at) {
+    keyValue('Last received', new Date(status.last_received_at).toLocaleString())
+  } else {
+    info('No metrics received yet')
+    info(`Run: temps services metrics enable --id ${id} to start collecting metrics`)
+  }
+  newline()
+}
+
+interface ServiceMetricsByDatabaseOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsByDatabaseAction(options: ServiceMetricsByDatabaseOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const result = await withSpinner('Fetching per-database metrics…', async () => {
+    const { data, error } = await externalServiceMetricsByDatabase({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const databases = result?.databases ?? []
+  newline()
+  header(`${icons.info} Databases — Service ${id} (${databases.length})`)
+
+  if (databases.length === 0) {
+    info('No per-database metrics recorded yet')
+    newline()
+    return
+  }
+
+  for (const row of databases) {
+    header(row.database)
+    for (const [metric, value] of Object.entries(row.metrics).sort(([a], [b]) => a.localeCompare(b))) {
+      keyValue(metric, value)
+    }
+    newline()
+  }
+}
+
+interface ServiceMetricsToggleOptions {
+  id: string
+}
+
+async function serviceMetricsEnableAction(options: ServiceMetricsToggleOptions): Promise<void> {
+  await toggleServiceMetrics(options.id, true)
+}
+
+async function serviceMetricsDisableAction(options: ServiceMetricsToggleOptions): Promise<void> {
+  await toggleServiceMetrics(options.id, false)
+}
+
+async function toggleServiceMetrics(rawId: string, enabled: boolean): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(rawId)
+  if (id === undefined) return
+
+  await withSpinner(`${enabled ? 'Enabling' : 'Disabling'} metric collection…`, async () => {
+    const { error } = await externalServiceMetricsToggle({
+      client,
+      path: { id },
+      body: { enabled },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success(`Metric collection ${enabled ? 'enabled' : 'disabled'} for service ${id}`)
+  if (enabled) {
+    info(`Run: temps services metrics latest --id ${id} once data has been collected`)
+  }
+}
+
+interface ServiceMetricsAlertRulesListOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsAlertRulesListAction(
+  options: ServiceMetricsAlertRulesListOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const rules = await withSpinner('Fetching alert rules…', async () => {
+    const { data, error } = await externalServiceMetricsGetAlertRules({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? []
+  })
+
+  if (options.json) {
+    json(rules)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Alert Rules — Service ${id} (${rules.length})`)
+
+  if (rules.length === 0) {
+    info('No alert rules configured')
+    info(`Run: temps services metrics alert-rules create --id ${id} --name ... to add one`)
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ServiceAlertRuleResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Metric', key: 'metric_name' },
+    { header: 'Condition', accessor: (r) => `${r.comparator} ${r.threshold}` },
+    { header: 'For', accessor: (r) => `${r.for_duration_secs}s` },
+    { header: 'Severity', key: 'severity' },
+    { header: 'Enabled', accessor: (r) => (r.enabled ? 'yes' : 'no') },
+  ]
+
+  printTable(rules, columns, { style: 'minimal' })
+  newline()
+}
+
+interface ServiceMetricsAlertRulesCreateOptions {
+  id: string
+  name: string
+  metric: string
+  comparator: string
+  threshold: string
+  severity?: string
+  forDuration?: string
+  disabled?: boolean
+  json?: boolean
+}
+
+const VALID_COMPARATORS = new Set(['>', '<', '>=', '<='])
+const VALID_SEVERITIES = new Set(['warning', 'critical'])
+
+/** Alert-rule comparator allowlist — matches the backend's accepted operators. */
+export function isValidComparator(value: string): boolean {
+  return VALID_COMPARATORS.has(value)
+}
+
+/** Alert-rule severity allowlist — matches the backend's accepted values. */
+export function isValidSeverity(value: string): boolean {
+  return VALID_SEVERITIES.has(value)
+}
+
+async function serviceMetricsAlertRulesCreateAction(
+  options: ServiceMetricsAlertRulesCreateOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  if (!isValidComparator(options.comparator)) {
+    warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
+    return
+  }
+
+  const threshold = Number(options.threshold)
+  if (isNaN(threshold)) {
+    warning('Invalid --threshold — must be a number')
+    return
+  }
+
+  const forDurationSecs = options.forDuration !== undefined ? Number(options.forDuration) : undefined
+  if (forDurationSecs !== undefined && (isNaN(forDurationSecs) || forDurationSecs < 0)) {
+    warning('Invalid --for-duration — must be a non-negative number of seconds')
+    return
+  }
+
+  const severity = options.severity ?? 'warning'
+  if (!isValidSeverity(severity)) {
+    warning('Invalid --severity — must be "warning" or "critical"')
+    return
+  }
+
+  const rule = await withSpinner('Creating alert rule…', async () => {
+    const { data, error } = await externalServiceMetricsCreateAlertRule({
+      client,
+      path: { id },
+      body: {
+        name: options.name,
+        metric_name: options.metric,
+        comparator: options.comparator,
+        threshold,
+        severity,
+        for_duration_secs: forDurationSecs,
+        enabled: !options.disabled,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(rule)
+    return
+  }
+
+  success(`Alert rule "${options.name}" created (ID: ${rule?.id})`)
+}
+
+interface ServiceMetricsAlertRulesUpdateOptions {
+  id: string
+  ruleId: string
+  name?: string
+  metric?: string
+  comparator?: string
+  threshold?: string
+  severity?: string
+  forDuration?: string
+  enable?: boolean
+  disable?: boolean
+  json?: boolean
+}
+
+async function serviceMetricsAlertRulesUpdateAction(
+  options: ServiceMetricsAlertRulesUpdateOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const ruleId = parseRuleId(options.ruleId)
+  if (ruleId === undefined) return
+
+  if (options.comparator !== undefined && !isValidComparator(options.comparator)) {
+    warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
+    return
+  }
+
+  if (options.severity !== undefined && !isValidSeverity(options.severity)) {
+    warning('Invalid --severity — must be "warning" or "critical"')
+    return
+  }
+
+  if (options.enable && options.disable) {
+    warning('Cannot pass both --enable and --disable')
+    return
+  }
+
+  let threshold: number | undefined
+  if (options.threshold !== undefined) {
+    threshold = Number(options.threshold)
+    if (isNaN(threshold)) {
+      warning('Invalid --threshold — must be a number')
+      return
+    }
+  }
+
+  let forDurationSecs: number | undefined
+  if (options.forDuration !== undefined) {
+    forDurationSecs = Number(options.forDuration)
+    if (isNaN(forDurationSecs) || forDurationSecs < 0) {
+      warning('Invalid --for-duration — must be a non-negative number of seconds')
+      return
+    }
+  }
+
+  const rule = await withSpinner('Updating alert rule…', async () => {
+    const { data, error } = await externalServiceMetricsUpdateAlertRule({
+      client,
+      path: { id, rule_id: ruleId },
+      body: {
+        name: options.name,
+        metric_name: options.metric,
+        comparator: options.comparator,
+        threshold,
+        severity: options.severity,
+        for_duration_secs: forDurationSecs,
+        enabled: options.enable ? true : options.disable ? false : undefined,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(rule)
+    return
+  }
+
+  success(`Alert rule ${ruleId} updated`)
+}
+
+interface ServiceMetricsAlertRulesRemoveOptions {
+  id: string
+  ruleId: string
+  yes?: boolean
+}
+
+async function serviceMetricsAlertRulesRemoveAction(
+  options: ServiceMetricsAlertRulesRemoveOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const ruleId = parseRuleId(options.ruleId)
+  if (ruleId === undefined) return
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Delete alert rule ${ruleId} on service ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Deleting alert rule…', async () => {
+    const { error } = await externalServiceMetricsDeleteAlertRule({
+      client,
+      path: { id, rule_id: ruleId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success(`Alert rule ${ruleId} deleted`)
 }

@@ -1,5 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
-use temps_core::templates::TemplateService;
+use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
@@ -7,7 +10,7 @@ use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
-use crate::services::types::ProjectError;
+use crate::services::types::{CreateProjectEnvVar, ProjectError};
 use http::StatusCode;
 use std::sync::Arc;
 use temps_core::problemdetails;
@@ -17,9 +20,15 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
+    pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub config_service: Arc<temps_config::ConfigService>,
+    pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
+    pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///
@@ -142,9 +151,32 @@ pub struct ProjectList {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Documentation-only schema for a project-creation environment variable.
+///
+/// The wire format is deserialized by [`CreateProjectEnvVar`], which also
+/// accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+/// OpenAPI spec (and the generated clients) describe the preferred object form
+/// with its `is_secret` flag.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ProjectEnvVarInput {
+    /// Variable name, e.g. `DATABASE_URL`
+    pub key: String,
+    /// Variable value
+    pub value: String,
+    /// Mark the variable as a secret. Secret values are encrypted at rest,
+    /// masked in list responses, and revealable only through an audited,
+    /// permission-checked endpoint. Defaults to `false`.
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
+    /// Optimistically reserved slug used by template creation to ensure the
+    /// persisted project receives the URL shown during configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
@@ -154,7 +186,8 @@ pub struct CreateProjectRequest {
     ///
     /// Different presets accept different configuration options:
     /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
-    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Nixpacks preset**: Accepts ordered `providers` (for example `["...", "python"]`)
+    ///   and optional inline `nixpacksConfig` TOML
     /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
     ///
     /// Example for Dockerfile preset:
@@ -170,7 +203,13 @@ pub struct CreateProjectRequest {
     pub output_dir: Option<String>,
     pub build_command: Option<String>,
     pub install_command: Option<String>,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    /// Environment variables to seed the default (production) environment with.
+    ///
+    /// Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+    /// — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+    /// `is_secret: false`.
+    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub project_type: Option<String>,
     pub is_web_app: Option<bool>,
@@ -183,15 +222,16 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: Option<bool>,
-    /// Port exposed by the container (fallback when image has no EXPOSE directive)
+    /// Explicit port exposed by the container.
     ///
     /// Priority order for port resolution:
-    /// 1. Image EXPOSE directive (auto-detected from built image)
-    /// 2. Environment-level exposed_port (overrides this value per environment)
-    /// 3. This project-level exposed_port (fallback)
+    /// 1. Environment-level exposed_port (explicit override)
+    /// 2. This project-level exposed_port (explicit override)
+    /// 3. Image EXPOSE directive (auto-detected from built image)
     /// 4. Default: 3000
     ///
-    /// Only set this if your image doesn't use EXPOSE directive.
+    /// Set this when the desired application port differs from the image's
+    /// first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
     pub exposed_port: Option<i32>,
@@ -213,6 +253,20 @@ pub struct CreateProjectRequest {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ChangeProjectSourceRequest {
     pub source_type: SourceType,
+}
+
+/// Opt a project in or out of accepting deployments from a source other than
+/// its configured `source_type`.
+///
+/// Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+/// Git project keeps its repository, branch, webhook auto-deploy and
+/// rollback-rebuild behaviour and merely gains the ability to also be deployed
+/// from an uploaded source archive.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SetAlternateSourcesRequest {
+    /// `true` to also accept uploaded source archives, `false` to restrict the
+    /// project to its configured source again.
+    pub allow_alternate_sources: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -250,6 +304,8 @@ fn default_performance_metrics() -> bool {
 pub struct PaginationParams {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
+    /// Optional case-insensitive project name or slug filter.
+    pub search: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -270,13 +326,43 @@ pub struct ProjectResponse {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Product lifecycle classification. `service` projects are tied to a
+    /// persisted, versioned template release; this is independent from the
+    /// deployment transport in `source_type`.
+    pub project_type: String,
+    /// Bundled template slug that created this project. Clients use this to
+    /// present template-specific runtime configuration instead of generic
+    /// source-build controls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_slug: Option<String>,
+    /// Logo from the immutable service-template release applied to this
+    /// project. Clients should prefer it over a deployed site's favicon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_image_url: Option<String>,
+    /// Exact service-template version currently applied to the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Git provider behind `git_provider_connection_id`: `github`,
+    /// `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+    /// the project has no connection (public repository, Docker image or
+    /// uploaded source).
+    ///
+    /// Clients must use this rather than guessing the host from `git_url`: a
+    /// self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+    /// a connected project may have no clone URL stored at all.
+    #[schema(example = "gitlab")]
+    pub git_provider_type: Option<String>,
+    /// Authoritative repository visibility. A missing connection alone does
+    /// not imply that an incompletely configured repository is public.
+    pub is_public_repo: bool,
     /// Git clone URL for the repository (used for public repos without a provider connection)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
@@ -286,10 +372,17 @@ pub struct ProjectResponse {
     pub attack_mode: bool,
     /// Opt-in to AI summarization of metric alert notifications (NULL/false = off).
     pub ai_alert_summaries_enabled: Option<bool>,
-    /// Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
-    pub ai_debug_chat_enabled: Option<bool>,
-    /// Opt-in to AI propose-then-confirm write capability (false = off).
-    pub ai_write_actions_enabled: bool,
+    /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Opt-in to native error-tracking source context (false = off). When on,
+    /// Temps stores uploaded source files and shows source code in stack traces.
+    pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning of this project's deployed Docker
+    /// images. Off by default — project owners explicitly enable it.
+    pub vulnerability_scanning_enabled: bool,
+    /// Where auto-capture reads source from (relative to the checkout). Null =
+    /// the deployment's Docker build context.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode
@@ -301,6 +394,13 @@ pub struct ProjectResponse {
     pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
+    /// Whether this project also accepts deployments from a source other than
+    /// `source_type` — chiefly, whether a Git-backed project will take an
+    /// uploaded source archive (`drop`). `null` or `false` means only the
+    /// configured `source_type` (plus Docker images and static bundles, which
+    /// every project accepts) may be deployed.
+    #[schema(example = false)]
+    pub allow_alternate_sources: Option<bool>,
     /// GitLab webhook ID installed on the connected repository.
     /// `null` when no GitLab webhook is installed (not connected to GitLab,
     /// or webhook was removed / never created).
@@ -312,6 +412,10 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// Hours to retain built Docker images before nightly cleanup. Null = use the
+    /// system-wide default from settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -332,23 +436,33 @@ impl ProjectResponse {
             directory: project.directory,
             main_branch: project.main_branch,
             preset: project.preset,
+            project_type: project.project_type,
+            template_slug: project.template_slug,
+            service_template_image_url: project.service_template_image_url,
+            service_template_version: project.service_template_version,
             preset_config: project.preset_config,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            git_provider_type: project.git_provider_type,
+            is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
-            ai_debug_chat_enabled: project.ai_debug_chat_enabled,
-            ai_write_actions_enabled: project.ai_write_actions_enabled,
+            ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
+            error_source_context_enabled: project.error_source_context_enabled,
+            vulnerability_scanning_enabled: project.vulnerability_scanning_enabled,
+            error_source_root: project.error_source_root,
             enable_preview_environments: project.enable_preview_environments,
             preview_envs_on_demand: project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: project.preview_envs_wake_timeout_seconds,
             source_type: project.source_type,
+            allow_alternate_sources: project.allow_alternate_sources,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            image_retention_hours: project.image_retention_hours,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -423,11 +537,31 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.wake_timeout_seconds)
                     .unwrap_or(30),
+                request_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.request_timeout_seconds),
+                sse_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.sse_idle_timeout_seconds),
+                websocket_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.websocket_idle_timeout_seconds),
+                max_concurrent_connections: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.max_concurrent_connections),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
                     .map(|c| c.container_exec_enabled)
                     .unwrap_or(false),
+                cross_architecture_builds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.cross_architecture_builds),
             },
         }
     }
@@ -442,6 +576,12 @@ pub struct CustomDomainRequest {
     pub environment_id: i32,
     /// Docker Compose service name this domain routes to (only for docker-compose projects)
     pub service_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ReassignCustomDomainRequest {
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -545,10 +685,127 @@ pub struct UpdateDeploymentConfigRequest {
     pub session_recording_enabled: Option<bool>,
     pub replicas: Option<i32>,
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
+    /// Build one image per architecture the eligible nodes run. Off by
+    /// default; environments inherit this and may override it. Cross-builds
+    /// are emulated on the control plane and substantially slower, so they are
+    /// opted into rather than triggered by cluster topology.
+    pub cross_architecture_builds: Option<bool>,
+    /// Project-level default timeout for regular (non-streaming) HTTP
+    /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
+    /// override this; always clamped to the operator's global hard ceiling
+    /// regardless of what's set here. Absent leaves the current value
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for Server-Sent Events streams, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse_idle_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for WebSocket connections, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<i32>,
+    /// Project-level default cap on concurrent in-flight requests to a
+    /// single environment's upstream (0 = unlimited). Environments may
+    /// override this. Absent leaves the current value unchanged. See
+    /// issue #646.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_connections: Option<i32>,
+}
+
+/// Complete replacement for the editable runtime of a single-container
+/// service-template project. Runtime and resource fields are written to the
+/// same project row in one transaction.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServiceTemplateRuntimeRequest {
+    pub image_ref: String,
+    /// Empty means use the image's own default command.
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub health_check_path: String,
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+    pub exposed_port: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTemplateChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// One reviewable change between the project's applied service release and
+/// the current catalog release. Values contain public template metadata only;
+/// project environment values and secrets never enter this response.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateUpgradeChange {
+    pub field: String,
+    pub kind: ServiceTemplateChangeKind,
+    pub current: Option<String>,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateInstanceResponse {
+    pub project_id: i32,
+    pub applied: ServiceTemplateInstance,
+    /// Latest release for the same service family. Absent when the catalog no
+    /// longer carries the template; the applied snapshot is still usable.
+    pub latest: Option<ServiceTemplateInstance>,
+    /// User-safe explanation when the active catalog could not provide this
+    /// service family. The applied snapshot remains authoritative and editable.
+    pub catalog_error: Option<String>,
+    pub upgrade_available: bool,
+    /// The catalog definition changed without a version bump. Applying it is
+    /// intentionally blocked because mutable releases make upgrades and
+    /// rollbacks non-reproducible.
+    pub catalog_drift: bool,
+    pub changes: Vec<ServiceTemplateUpgradeChange>,
+    /// Required target inputs that are not currently configured and cannot be
+    /// filled from a template default or generator.
+    pub required_configuration: Vec<EnvVarTemplate>,
+    /// Managed service families that must be linked before this release can be
+    /// applied. Existing links are never removed automatically.
+    pub missing_services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct UpgradeServiceTemplateRequest {
+    /// Optimistic target selected from the preview. The server rejects a stale
+    /// target if the catalog changes between preview and apply.
+    pub target_version: String,
+    /// Values for inputs introduced by the target release. Existing project
+    /// values are preserved and cannot be overwritten through this endpoint.
+    #[serde(default)]
+    pub environment_variables: Vec<super::templates::EnvVarInput>,
+}
+
+/// Deserialize a PATCH integer field while preserving the distinction between
+/// an omitted key (`None`) and an explicit JSON null (`Some(None)`).
+fn deserialize_optional_optional_i32<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<i32>::deserialize(deserializer)?))
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
+    /// Human-facing project display name. Unlike `slug` this is not part of any
+    /// URL and is not required to be unique. Changing it also changes the
+    /// `OTEL_SERVICE_NAME` injected into subsequent deployments.
+    pub name: Option<String>,
     pub slug: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub main_branch: Option<String>,
@@ -560,10 +817,18 @@ pub struct UpdateProjectSettingsRequest {
     pub attack_mode: Option<bool>,
     /// Opt in to AI summarization of metric alert notifications (ADR-021).
     pub ai_alert_summaries_enabled: Option<bool>,
-    /// Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
-    pub ai_debug_chat_enabled: Option<bool>,
-    /// Opt in to AI propose-then-confirm write capability.
-    pub ai_write_actions_enabled: Option<bool>,
+    /// Opt in to AI summarization of API traffic analytics.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Opt in to native error-tracking source context (source-file upload +
+    /// source code shown in stack traces).
+    pub error_source_context_enabled: Option<bool>,
+    /// Opt in to Trivy vulnerability scanning of this project's deployed Docker
+    /// images (post-deployment scan + daily rescans). Off by default.
+    pub vulnerability_scanning_enabled: Option<bool>,
+    /// Set the auto-capture source root (relative to the checkout). Send an
+    /// empty string to clear it back to the build-context default. Omit to
+    /// leave unchanged.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: Option<bool>,
     /// When true, newly-created preview environments default to on-demand mode.
@@ -572,6 +837,19 @@ pub struct UpdateProjectSettingsRequest {
     pub preview_envs_idle_timeout_seconds: Option<i32>,
     /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
     pub preview_envs_wake_timeout_seconds: Option<i32>,
+    /// How long (hours) to retain built Docker images before nightly cleanup removes them.
+    /// Set to null to use the system default. Valid range: 1–8760.
+    ///
+    /// Omitting the key leaves the current value unchanged; sending an explicit
+    /// `null` clears the per-project override. `skip_serializing_if` keeps the
+    /// round-trip honest — re-serializing a request that omitted the key must
+    /// not emit `"image_retention_hours": null`, which would mean "reset".
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_retention_hours: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -588,6 +866,34 @@ pub struct UpdateProjectSettingsRequest {
     /// from appearing in cross-project discovery results. Default true (consistent
     /// with the OSS global-observability model). Omit to leave unchanged.
     pub cross_project_trace_sharing: Option<bool>,
+}
+
+impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjectSettingsParams {
+    fn from(request: UpdateProjectSettingsRequest) -> Self {
+        Self {
+            name: request.name,
+            slug: request.slug,
+            git_provider_connection_id: request.git_provider_connection_id,
+            main_branch: request.main_branch,
+            repo_owner: request.repo_owner,
+            repo_name: request.repo_name,
+            preset: request.preset,
+            directory: request.directory,
+            attack_mode: request.attack_mode,
+            enable_preview_environments: request.enable_preview_environments,
+            preview_envs_on_demand: request.preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds: request.preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds: request.preview_envs_wake_timeout_seconds,
+            preset_config: request.preset_config,
+            ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
+            cross_project_trace_sharing: request.cross_project_trace_sharing,
+            error_source_context_enabled: request.error_source_context_enabled,
+            vulnerability_scanning_enabled: request.vulnerability_scanning_enabled,
+            error_source_root: request.error_source_root,
+            ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
+            image_retention_hours: request.image_retention_hours,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -680,45 +986,6 @@ pub struct UpdateGitSettingsRequest {
 pub struct UpdateAutomaticDeployRequest {
     pub automatic_deploy: bool,
 }
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateEnvVar {
-    pub name: String,
-    pub example: String,
-    pub default: Option<String>,
-}
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Template {
-    pub name: String,
-    pub github: Option<TemplateGitHub>,
-    pub description: Option<String>,
-    pub features: Option<Vec<String>>,
-    pub services: Option<Vec<String>>,
-    pub image: Option<String>,
-    pub preset: Option<String>,
-    pub env: Option<Vec<TemplateEnvVar>>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateGitHub {
-    pub owner: String,
-    pub repo: String,
-    pub path: Option<String>,
-    pub r#ref: String,
-}
-
-// Add this new struct with the request schema
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
 // Add query parameters struct
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerLogsQuery {
@@ -842,10 +1109,14 @@ impl From<ProjectError> for Problem {
                     "The requested project could not be found: {}",
                     reason
                 )),
-
-            ProjectError::TemplateNotFound => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Template Not Found")
-                .with_detail("The requested template could not be found"),
+            ProjectError::GitProviderConnectionNotFound { connection_id } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Git Provider Connection Not Found")
+                    .with_detail(format!(
+                        "Git provider connection {} not found or not accessible",
+                        connection_id
+                    ))
+            }
 
             ProjectError::DatabaseError { reason } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -866,7 +1137,7 @@ impl From<ProjectError> for Problem {
 
             err @ (ProjectError::EnvironmentCreationFailed { .. }
             | ProjectError::EnvVarCreationFailed { .. }
-            | ProjectError::StorageLinkFailed { .. }) => {
+            | ProjectError::StorageLinksFailed { .. }) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Project Creation Failed")
                     .with_detail(err.to_string())
@@ -886,6 +1157,18 @@ impl From<ProjectError> for Problem {
                     .with_detail(msg)
             }
 
+            ProjectError::DeploymentCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Runtime Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+
+            ProjectError::RouteReloadFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Proxy Route Reload Failed")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -903,10 +1186,10 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
         use crate::services::custom_domains::CustomDomainError;
 
         match error {
-            CustomDomainError::Database(msg) => {
+            CustomDomainError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
-                    .with_detail(msg.to_string())
+                    .with_detail("A database operation failed while managing custom domains")
             }
             CustomDomainError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Custom Domain Not Found")
@@ -932,6 +1215,49 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Invalid Redirect URL")
                     .with_detail(msg)
             }
+            CustomDomainError::AssignmentChanged {
+                domain_id,
+                source_project_id,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Assignment Changed")
+                .with_detail(format!(
+                    "Custom domain {domain_id} is no longer assigned to source project {source_project_id}; refresh and try again"
+                )),
+            CustomDomainError::AuditIntentFailed {
+                domain_id,
+                source_project_id,
+                target_project_id,
+                ..
+            } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Domain Reassignment Audit Failed")
+                    .with_detail(format!(
+                        "Custom domain {domain_id} could not be reassigned from project {source_project_id} to project {target_project_id} because the required audit record could not be persisted; no ownership change was made"
+                    ))
+            }
+            CustomDomainError::EnrichmentDatabase {
+                operation,
+                domain_id,
+                certificate_id,
+                environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Custom Domain Metadata Unavailable")
+                .with_detail(format!(
+                    "Could not {operation} for custom domain {domain_id} (certificate {certificate_id:?}, environment {environment_id})"
+                )),
+            CustomDomainError::ReassignmentDatabase {
+                operation,
+                domain_id,
+                source_project_id,
+                target_project_id,
+                target_environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Domain Reassignment Failed")
+                .with_detail(format!(
+                    "Database operation '{operation}' failed while reassigning custom domain {domain_id} from project {source_project_id} to project {target_project_id} environment {target_environment_id}"
+                )),
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -1017,4 +1343,46 @@ pub struct ReinstallWebhookResponse {
     pub hook_id: i32,
     /// Human-readable status message.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::custom_domains::CustomDomainError;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {
+        let problem: Problem = CustomDomainError::AssignmentChanged {
+            domain_id: 41,
+            source_project_id: 7,
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Domain Assignment Changed"))
+        );
+        assert_eq!(
+            problem.body.get("detail"),
+            Some(&serde_json::json!(
+                "Custom domain 41 is no longer assigned to source project 7; refresh and try again"
+            ))
+        );
+        assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_retention_patch_distinguishes_omitted_null_and_value() {
+        let omitted: UpdateProjectSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":null}"#).unwrap();
+        let set: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":72}"#).unwrap();
+
+        assert_eq!(omitted.image_retention_hours, None);
+        assert_eq!(cleared.image_retention_hours, Some(None));
+        assert_eq!(set.image_retention_hours, Some(Some(72)));
+    }
 }

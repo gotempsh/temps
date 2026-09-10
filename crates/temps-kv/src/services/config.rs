@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! KV Service configuration types
 
 use schemars::JsonSchema;
@@ -48,16 +51,16 @@ fn example_max_memory() -> &'static str {
 pub struct KvInputConfig {
     /// Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm", "redis:7.2-alpine")
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Host port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// Maximum memory for Redis (e.g., "256mb", "1gb")
     #[serde(default = "default_max_memory")]
-    #[schemars(example = "example_max_memory", default = "default_max_memory")]
+    #[schemars(example = example_max_memory(), default = "default_max_memory")]
     pub max_memory: String,
 
     /// Enable persistence (AOF)

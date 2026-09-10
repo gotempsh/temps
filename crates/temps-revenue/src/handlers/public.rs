@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Public webhook ingestion handler. Mounted OUTSIDE the authenticated
 //! tree — the only thing that proves the request is legitimate is the
 //! signing-secret verification performed by the provider adapter.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add `ai_alert_summaries_enabled` to the `projects` table
 //! (ADR-021 Tier 2).
 //!

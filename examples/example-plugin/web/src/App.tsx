@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useRoute } from "./router";
 import { ReportList } from "./components/ReportList";
 import { ReportDetail } from "./components/ReportDetail";

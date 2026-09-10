@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   EnvironmentResponse,
   ProjectResponse,
@@ -7,21 +10,27 @@ import {
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
+  hasTracesOptions,
+  listFacetsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { TelemetryBacklogBanner } from '@/components/observe/TelemetryBacklogBanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { CodeBlock } from '@/components/ui/code-block'
 import { EmptyState } from '@/components/ui/empty-state'
+import {
+  SetupWizardShell,
+  WizardStepId,
+} from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
+import {
+  computeTracesTimeWindow,
+  tracesListTimeBounds,
+  type TracesTimeRange,
+} from '@/lib/traces-time-window'
 import {
   Select,
   SelectContent,
@@ -46,6 +55,8 @@ import { format } from 'date-fns'
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   ArrowUpDown,
   Bot,
@@ -53,11 +64,13 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  Code2,
   FileCode,
+  Gauge,
+  Loader2,
   RefreshCw,
   Search,
   Settings2,
+  Tag,
   Terminal,
   Workflow,
 } from 'lucide-react'
@@ -68,13 +81,11 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
 }
-
-type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
 function statusBadge(status: SpanStatusCode) {
   switch (status) {
@@ -387,7 +398,16 @@ fn init_tracing() {
   },
 ]
 
-function OtelSetupSection({ project }: { project: ProjectResponse }) {
+function OtelSetupSection({
+  project,
+  onVerified,
+}: {
+  project: ProjectResponse
+  onVerified?: () => void
+}) {
+  const navigate = useNavigate()
+  const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
+  const [celebrate, setCelebrate] = useState(false)
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] = useState<string>('nextjs')
 
@@ -428,146 +448,260 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <YOUR_API_KEY>
 OTEL_SERVICE_NAME=${project.name}`
 
+  const { data: waitingProbe } = useQuery({
+    ...hasTracesOptions({ path: { project_id: project.id } }),
+    enabled: !!project.id && wizardStep === 'waiting',
+    refetchInterval: wizardStep === 'waiting' ? 2000 : false,
+    refetchOnWindowFocus: false,
+  })
+  const hasTraceNow = !!waitingProbe?.has_traces
+
+  useEffect(() => {
+    if (wizardStep === 'waiting' && hasTraceNow && !celebrate) {
+      setCelebrate(true)
+      const timer = setTimeout(() => {
+        onVerified?.()
+      }, 1600)
+      return () => clearTimeout(timer)
+    }
+  }, [wizardStep, hasTraceNow, celebrate, onVerified])
+
+  const steps = [
+    { id: 'framework' as WizardStepId, label: 'Framework' },
+    { id: 'install' as WizardStepId, label: 'Install' },
+    { id: 'waiting' as WizardStepId, label: 'Verify' },
+  ]
+
   return (
-    <Card id="traces-setup">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Code2 className="h-4 w-4" />
-          Setup OpenTelemetry
-        </CardTitle>
-        <CardDescription>
-          Pick your framework — the snippet and endpoint are pre-filled for{' '}
-          <strong>{project.name}</strong>. Apps deployed on Temps get these env
-          vars automatically.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {/* Framework picker */}
-        <div className="space-y-2">
-          <h4 className="text-sm font-medium">Framework / runtime</h4>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-            {frameworkPresets.map((fw) => {
-              const Icon = fw.icon
-              const isSelected = selectedFrameworkId === fw.id
-              return (
-                <button
-                  key={fw.id}
-                  type="button"
-                  onClick={() => setSelectedFrameworkId(fw.id)}
-                  className={cn(
-                    'flex items-center gap-3 rounded-lg border bg-card p-3 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
-                    isSelected &&
-                      'border-primary bg-primary/5 ring-2 ring-primary/20'
-                  )}
-                  aria-pressed={isSelected}
-                >
-                  <div className="rounded-md bg-muted p-1.5 text-foreground shrink-0">
-                    <Icon />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium leading-none truncate">
-                      {fw.name}
-                    </p>
-                    <p className="mt-1 text-[11px] text-muted-foreground truncate">
-                      {fw.description}
-                    </p>
-                  </div>
-                  {isSelected && (
-                    <Check className="size-4 shrink-0 text-primary" />
-                  )}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        {/* Deployed-on-Temps note */}
-        <div className="rounded-md border border-green-200 bg-green-50 dark:border-green-900/50 dark:bg-green-900/10 p-3">
-          <p className="text-xs text-green-800 dark:text-green-200">
-            <strong>Deployed on Temps?</strong> The OTLP endpoint, auth token,
-            service name, and version are injected automatically. Just install
-            the SDK and add the instrumentation file below.
-          </p>
-        </div>
-
-        {/* Step 1: Install */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Terminal className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">1. Install dependencies</h4>
-          </div>
-          <CodeBlock code={preset.install} language={preset.installLang} />
-        </div>
-
-        {/* Step 2: Instrumentation file */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <FileCode className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">
-              2. Create <code>{preset.fileName}</code>
-            </h4>
-          </div>
-          <CodeBlock
-            code={setupCode}
-            language={preset.setupLang}
-            title={preset.fileName}
-          />
-        </div>
-
-        {/* Optional extra step */}
-        {preset.extra && (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <FileCode className="size-4 text-muted-foreground" />
-              <h4 className="text-sm font-medium">3. {preset.extra.title}</h4>
+    <div id="traces-setup">
+      <SetupWizardShell
+        title="Setup OpenTelemetry"
+        description="Pick your framework — the snippet and endpoint are pre-filled for this project. Apps deployed on Temps get these env vars automatically."
+        currentStep={wizardStep}
+        steps={steps}
+        celebrate={celebrate}
+      >
+        {wizardStep === 'framework' && (
+          <div className="space-y-6">
+            <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
+              <p className="font-medium">Deployed on Temps?</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                The OTLP endpoint, auth token, service name, and version are
+                injected automatically. Just install the SDK and add the
+                instrumentation file below.
+              </p>
             </div>
-            <CodeBlock
-              code={preset.extra.code}
-              language={preset.extra.lang}
-              title={preset.extra.fileName}
-            />
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {frameworkPresets.map((fw) => {
+                const Icon = fw.icon
+                const isSelected = selectedFrameworkId === fw.id
+                return (
+                  <button
+                    key={fw.id}
+                    type="button"
+                    onClick={() => setSelectedFrameworkId(fw.id)}
+                    className={cn(
+                      'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
+                      isSelected &&
+                        'border-primary bg-primary/5 ring-2 ring-primary/20'
+                    )}
+                    aria-pressed={isSelected}
+                  >
+                    <div className="rounded-md bg-muted p-2 text-foreground shrink-0">
+                      <Icon />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium leading-none truncate">
+                        {fw.name}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground truncate">
+                        {fw.description}
+                      </p>
+                    </div>
+                    {isSelected && (
+                      <Check className="size-4 shrink-0 text-primary" />
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="flex justify-end">
+              <Button onClick={() => setWizardStep('install')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
           </div>
         )}
 
-        {/* External hosting env vars */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Settings2 className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">
-              {preset.extra ? '4' : '3'}. External hosting — environment
-              variables
-            </h4>
+        {wizardStep === 'install' && (
+          <div className="space-y-6">
+            <div className="flex items-center gap-3 rounded-lg border bg-card p-4">
+              <div className="rounded-md bg-muted p-2">
+                <preset.icon />
+              </div>
+              <div className="min-w-0">
+                <p className="font-medium leading-none">{preset.name}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {preset.description}
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Terminal className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">1. Install dependencies</h4>
+              </div>
+              <CodeBlock code={preset.install} language={preset.installLang} />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <FileCode className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">
+                  2. Create <code>{preset.fileName}</code>
+                </h4>
+              </div>
+              <CodeBlock
+                code={setupCode}
+                language={preset.setupLang}
+                title={preset.fileName}
+              />
+            </div>
+
+            {preset.extra && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <FileCode className="size-4 text-muted-foreground" />
+                  <h4 className="text-sm font-medium">
+                    3. {preset.extra.title}
+                  </h4>
+                </div>
+                <CodeBlock
+                  code={preset.extra.code}
+                  language={preset.extra.lang}
+                  title={preset.extra.fileName}
+                />
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Settings2 className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">
+                  {preset.extra ? '4' : '3'}. External hosting — environment
+                  variables
+                </h4>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Skip this if you deploy on Temps. Required when running the
+                app on Vercel, Fly, AWS, bare metal, etc.
+              </p>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground shrink-0">
+                  Environment:
+                </span>
+                <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
+                  <SelectTrigger className="w-[200px] h-8">
+                    <SelectValue placeholder="Select environment" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {environments?.map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={String(env.id)}>
+                        {env.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <CodeBlock code={envVarsCode} language="bash" title=".env" />
+              <p className="text-xs text-muted-foreground">
+                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key
+                (<code>tk_...</code>) from{' '}
+                <strong>Settings &rarr; API Keys</strong>.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Button variant="ghost" onClick={() => setWizardStep('framework')}>
+                <ArrowLeft className="mr-2 size-4" />
+                Back
+              </Button>
+              <Button onClick={() => setWizardStep('waiting')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
           </div>
-          <p className="text-xs text-muted-foreground">
-            Skip this if you deploy on Temps. Required when running the app on
-            Vercel, Fly, AWS, bare metal, etc.
-          </p>
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-muted-foreground shrink-0">
-              Environment:
-            </span>
-            <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
-              <SelectTrigger className="w-[200px] h-8">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                {environments?.map((env: EnvironmentResponse) => (
-                  <SelectItem key={env.id} value={String(env.id)}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        )}
+
+        {wizardStep === 'waiting' && (
+          <div className="space-y-6">
+            <div className="flex flex-col items-center justify-center gap-4 rounded-xl border bg-card px-6 py-12 text-center">
+              {hasTraceNow ? (
+                <>
+                  <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
+                    <Check
+                      className="size-7 text-emerald-500"
+                      strokeWidth={3}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold">
+                      First trace received
+                    </h3>
+                    <p className="text-sm text-muted-foreground">
+                      Taking you to your traces…
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="relative flex size-14 items-center justify-center">
+                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary/20" />
+                    <span className="absolute inline-flex size-10 animate-ping rounded-full bg-primary/30 [animation-delay:200ms]" />
+                    <span className="relative inline-flex size-4 rounded-full bg-primary" />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold">
+                      Waiting for your first trace…
+                    </h3>
+                    <p className="text-sm text-muted-foreground">
+                      Deploy or run your app and trigger a request. We'll
+                      pick it up as soon as it arrives.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="size-3 animate-spin" />
+                    Polling every 2s
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('install')}
+                disabled={celebrate}
+              >
+                <ArrowLeft className="mr-2 size-4" />
+                Back to instructions
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => navigate(`/projects/${project.slug}/traces`)}
+              >
+                Skip to traces
+              </Button>
+            </div>
           </div>
-          <CodeBlock code={envVarsCode} language="bash" title=".env" />
-          <p className="text-xs text-muted-foreground">
-            Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
-            <code>tk_...</code>) from{' '}
-            <strong>Settings &rarr; API Keys</strong>.
-          </p>
-        </div>
-      </CardContent>
-    </Card>
+        )}
+      </SetupWizardShell>
+    </div>
   )
 }
 
@@ -615,8 +749,8 @@ export default function TracesList({ project }: TracesListProps) {
   usePageTitle(`Traces - ${project.name}`)
 
   // State from URL params
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
+  const [timeRange, setTimeRange] = useState<TracesTimeRange>(
+    () => (searchParams.get('range') as TracesTimeRange) || '24h'
   )
   const [serviceName, setServiceName] = useState(
     () => searchParams.get('service') || ''
@@ -639,6 +773,17 @@ export default function TracesList({ project }: TracesListProps) {
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
+  // Attribute filter: restricted to registered facets only (see ADR-039 /
+  // the FacetToggle in TraceDetail) — an unfaceted attribute would force a
+  // JSON scan over every span in the project's whole retention window, which
+  // is exactly the query this platform can't afford at 500M+ rows.
+  const [attrKey, setAttrKey] = useState(
+    () => searchParams.get('attr_key') || ''
+  )
+  const [attrValue, setAttrValue] = useState(
+    () => searchParams.get('attr_value') || ''
+  )
+  const debouncedAttrValue = useDebounce(attrValue, 300)
   const [page, setPage] = useState(() => {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
@@ -653,30 +798,17 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Bumped by Refresh so relative ranges recompute against "now". Without
+  // this, start/end freeze at mount (or last range change) and newly ingested
+  // traces that land after that frozen end_time stay invisible until a full
+  // page reload — including exact trace-id searches that still AND the window.
+  const [refreshKey, setRefreshKey] = useState(0)
 
-  // Compute time window
-  const { startTime, endTime } = useMemo(() => {
-    const now = new Date()
-    const start = new Date()
-    switch (timeRange) {
-      case '1h':
-        start.setHours(start.getHours() - 1)
-        break
-      case '6h':
-        start.setHours(start.getHours() - 6)
-        break
-      case '24h':
-        start.setDate(start.getDate() - 1)
-        break
-      case '7d':
-        start.setDate(start.getDate() - 7)
-        break
-      case '30d':
-        start.setDate(start.getDate() - 30)
-        break
-    }
-    return { startTime: start.toISOString(), endTime: now.toISOString() }
-  }, [timeRange])
+  // Compute time window (refreshKey forces a fresh "now" on Refresh)
+  const { startTime, endTime } = useMemo(
+    () => computeTracesTimeWindow(timeRange),
+    [timeRange, refreshKey],
+  )
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -685,6 +817,30 @@ export default function TracesList({ project }: TracesListProps) {
     }),
     enabled: !!project.id,
   })
+
+  // Registered facets — platform-global, so no project scoping. Backs the
+  // attribute-key dropdown below; only faceted keys are offered since only
+  // those are fast to filter on.
+  const { data: facetsData } = useQuery({
+    ...listFacetsOptions(),
+    staleTime: 30_000,
+  })
+  const facets = facetsData?.data ?? []
+
+  // If the URL names an attribute key (e.g. from a shared link, or one whose
+  // facet was since removed) that isn't a currently registered facet, drop
+  // it once the facet list has loaded. Otherwise the dropdown — which only
+  // lists registered facets — has no matching option to show, renders blank,
+  // and looks like "the selection disappeared" even though the filter is
+  // still silently applied underneath via the slow JSON-scan fallback.
+  useEffect(() => {
+    if (!facetsData || !attrKey) return
+    if (!facets.some((f) => f.attribute_key === attrKey)) {
+      setAttrKey('')
+      setAttrValue('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [facetsData])
 
   // Fetch deployments for the selected environment (or all)
   const { data: deploymentsData } = useQuery({
@@ -711,12 +867,14 @@ export default function TracesList({ project }: TracesListProps) {
     if (debouncedNamePattern) params.set('name', debouncedNamePattern)
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
+    if (attrKey) params.set('attr_key', attrKey)
+    if (attrKey && debouncedAttrValue) params.set('attr_value', debouncedAttrValue)
     if (page > 1) params.set('page', page.toString())
     if (sortBy === null) params.set('sort', 'none')
     else if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
+  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, attrKey, debouncedAttrValue, page, sortBy, sortOrder, setSearchParams])
 
   // Cycle sort on a column header through three states: clicking a new column
   // selects it descending; clicking the active column goes desc → asc → unsorted
@@ -748,13 +906,18 @@ export default function TracesList({ project }: TracesListProps) {
     ])
   }, [project.name, project.slug, setBreadcrumbs])
 
+  const timeBounds = tracesListTimeBounds(debouncedSearch || undefined, {
+    startTime,
+    endTime,
+  })
+
   // Fetch trace summaries (one row per trace, server-side aggregation)
   const { data, isLoading, isFetching, refetch } = useQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
-        start_time: startTime,
-        end_time: endTime,
+        start_time: timeBounds.start_time,
+        end_time: timeBounds.end_time,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: debouncedSearch || undefined,
@@ -763,8 +926,16 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
+        attributes:
+          attrKey && debouncedAttrValue
+            ? `${attrKey}=${debouncedAttrValue}`
+            : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
+        // Explicit: this list renders "Showing X–Y of Z" and a page count, so
+        // it genuinely needs the total. Stating it makes the `?? 0` below safe
+        // by construction rather than by relying on the server default.
+        include_total: true,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -776,26 +947,37 @@ export default function TracesList({ project }: TracesListProps) {
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
   // "Has this project EVER received a trace?" — a window/filter-independent
-  // probe (project_id only, limit 1). The main query above is scoped to the
-  // selected time range and filters, so its `total` goes to 0 whenever the
-  // window happens to be empty. Gating the setup onboarding on that would show
-  // "set up OpenTelemetry" to a project with millions of historical traces just
+  // probe. The main query above is scoped to the selected time range and
+  // filters, so its `total` goes to 0 whenever the window happens to be
+  // empty. Gating the setup onboarding on that would show "set up
+  // OpenTelemetry" to a project with millions of historical traces just
   // because nothing landed in the last 24h. This probe answers the real
   // question the onboarding screen is for.
-  const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
-    ...queryTraceSummariesOptions({
-      query: { project_id: project.id, limit: 1 },
+  //
+  // Uses the dedicated has-traces existence endpoint rather than
+  // trace-summaries with limit=1: without a time bound, trace-summaries
+  // GROUPs BY trace_id over the project's entire retention window — this was
+  // the single most expensive query on this page (measured at ~10s on an
+  // 860M-span project) before has-traces made it an O(1) index lookup.
+  const {
+    data: hasTracesData,
+    isLoading: isProbeLoading,
+    refetch: refetchProbe,
+  } = useQuery({
+    ...hasTracesOptions({
+      path: { project_id: project.id },
     }),
     enabled: !!project.id,
   })
-  const hasEverReceivedTraces = (anyTraceData?.total ?? 0) > 0
+  const hasEverReceivedTraces = !!hasTracesData?.has_traces
 
   const hasActiveFilters =
     !!search ||
     !!serviceName ||
     status !== 'all' ||
     environmentId !== 'all' ||
-    deploymentId !== 'all'
+    deploymentId !== 'all' ||
+    !!attrKey
 
   // Copy for the in-window empty state, in priority order:
   //  1. filters/window active → suggest adjusting them
@@ -821,7 +1003,7 @@ export default function TracesList({ project }: TracesListProps) {
 
   const handleTimeRangeChange = useCallback(
     (v: string) => {
-      setTimeRange(v as TimeRange)
+      setTimeRange(v as TracesTimeRange)
       setPage(1)
     },
     []
@@ -855,6 +1037,11 @@ export default function TracesList({ project }: TracesListProps) {
     },
     []
   )
+  const handleAttrKeyChange = useCallback((v: string) => {
+    setAttrKey(v === '__none__' ? '' : v)
+    setAttrValue('')
+    setPage(1)
+  }, [])
 
   return (
     <div className="space-y-4">
@@ -870,10 +1057,29 @@ export default function TracesList({ project }: TracesListProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => refetch()}
+            onClick={() => {
+              // Advance the relative window so list queries recompute against
+              // "now". Trace-id searches omit the window, so their query key
+              // does not change — refetch those explicitly. Also re-check the
+              // unwindowed "ever received a trace" probe.
+              setRefreshKey((k) => k + 1)
+              if (debouncedSearch) void refetch()
+              void refetchProbe()
+            }}
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={() =>
+              navigate(`/projects/${project.slug}/traces/operations`)
+            }
+          >
+            <Gauge className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Operations</span>
           </Button>
           <Button
             variant="outline"
@@ -910,13 +1116,30 @@ export default function TracesList({ project }: TracesListProps) {
         </div>
       </div>
 
+      {/* Cloud-primary honesty: an outbox backlog looks exactly like an app
+          that stopped emitting spans, and a gap window looks exactly like a
+          quiet hour. Both are volunteered here rather than left to be
+          discovered. Renders nothing for a project storing spans locally. */}
+      <TelemetryBacklogBanner
+        projectId={project.id}
+        projectSlug={project.slug}
+        startTime={startTime}
+        endTime={endTime}
+      />
+
       {/* Setup section — onboarding for a project that has NEVER received a
           trace, or when the user explicitly toggles it. Deliberately NOT gated
           on the windowed `totalCount`: an empty time range is "no results
           here", not "never set up", and must not resurface the setup wizard for
           a project with existing traces (see hasEverReceivedTraces probe). */}
       {((!isProbeLoading && !hasEverReceivedTraces) || showSetup) && (
-        <OtelSetupSection project={project} />
+        <OtelSetupSection
+          project={project}
+          onVerified={() => {
+            refetchProbe()
+            setShowSetup(false)
+          }}
+        />
       )}
 
       {/* Filters */}
@@ -1030,6 +1253,42 @@ export default function TracesList({ project }: TracesListProps) {
                 className="h-9"
               />
             </div>
+
+            {facets.length > 0 && (
+              <>
+                <Select
+                  value={attrKey || '__none__'}
+                  onValueChange={handleAttrKeyChange}
+                >
+                  <SelectTrigger className="h-9 w-full sm:w-[200px]">
+                    <Tag className="mr-2 h-3.5 w-3.5" />
+                    <SelectValue placeholder="Attribute" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">No attribute filter</SelectItem>
+                    {facets.map((f) => (
+                      <SelectItem key={f.attribute_key} value={f.attribute_key}>
+                        {f.attribute_key}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {attrKey && (
+                  <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
+                    <Input
+                      placeholder={`Value for ${attrKey}…`}
+                      value={attrValue}
+                      onChange={(e) => {
+                        setAttrValue(e.target.value)
+                        setPage(1)
+                      }}
+                      className="h-9"
+                    />
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </CardContent>
       </Card>

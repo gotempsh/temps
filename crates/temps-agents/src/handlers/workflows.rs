@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Ephemeral workflow execution (CLI dry-run).
 //!
 //! Lets a developer upload a `WorkflowYamlConfig` from their machine and run
@@ -105,8 +108,8 @@ impl AuditOperation for WorkflowDryRunAudit {
     fn operation_type(&self) -> String {
         "WORKFLOW_DRY_RUN".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

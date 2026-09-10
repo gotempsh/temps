@@ -1,4 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Sentry Event Types based on the Sentry protocol
+
+export type SentryTimestamp = string | number
 
 export interface SentrySDK {
   name: string
@@ -132,7 +137,7 @@ export interface SentryException {
 }
 
 export interface SentryBreadcrumb {
-  timestamp?: number
+  timestamp?: SentryTimestamp
   category?: string
   level?: string
   message?: string
@@ -152,10 +157,10 @@ export interface SentrySpan {
   status?: string
   span_id: string
   trace_id: string
-  timestamp?: number
+  timestamp?: SentryTimestamp
   description?: string
   parent_span_id?: string
-  start_timestamp?: number
+  start_timestamp?: SentryTimestamp
   op?: string
   tags?: Record<string, any>
 }
@@ -189,14 +194,14 @@ export interface SentryEvent {
     exception?: {
       values: SentryException[]
     }
-    timestamp: number
+    timestamp: SentryTimestamp
     breadcrumbs?: {
       values: SentryBreadcrumb[]
     }
     environment?: string
     server_name?: string
     transaction?: string
-    start_timestamp?: number
+    start_timestamp?: SentryTimestamp
     transaction_info?: SentryTransactionInfo
     // Additional fields
     measurements?: Record<string, { value: number; unit?: string }>

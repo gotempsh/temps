@@ -1,18 +1,22 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { Link, useNavigate, useParams } from 'react-router'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Box,
   ChevronDown,
   ChevronRight,
+  Cpu,
   ExternalLink,
+  GitBranch,
+  HardDrive,
+  KeyRound,
   Loader2,
   Play,
+  Plus,
   RefreshCw,
   RotateCw,
   Square,
@@ -50,15 +54,19 @@ import {
   execMutation,
   extendTimeoutMutation,
   getSandboxOptions,
+  listEventsOptions,
   listJobsOptions,
   pauseSandboxMutation,
+  resizeSandboxMutation,
   restartSandboxMutation,
   resumeSandboxMutation,
   stopSandboxMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { jobStatus } from '@/api/client/sdk.gen'
-import type { ExecResponse } from '@/api/client/types.gen'
+import type { ExecResponse, SandboxEvent } from '@/api/client/types.gen'
 import {
+  isSandboxExpired,
+  isWorkspace,
   jobLogsUrl,
   toSandboxView,
   type JobSummary,
@@ -66,7 +74,7 @@ import {
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
 
 function statusVariant(
-  status: string,
+  status: string
 ): 'default' | 'secondary' | 'success' | 'warning' | 'destructive' | 'outline' {
   switch (status) {
     case 'running':
@@ -77,6 +85,60 @@ function statusVariant(
       return 'destructive'
     default:
       return 'outline'
+  }
+}
+
+// Presentation for each timeline event type: icon, human label, and an
+// optional one-line detail derived from the event's structured payload.
+function eventPresentation(e: SandboxEvent): {
+  icon: typeof Plus
+  label: string
+  detail?: string
+} {
+  const d = (e.detail ?? {}) as Record<string, unknown>
+  switch (e.event_type) {
+    case 'created':
+      return {
+        icon: Plus,
+        label: 'Created',
+        detail: [d.backend, d.image].filter(Boolean).join(' · ') || undefined,
+      }
+    case 'stopped':
+      return { icon: Square, label: 'Stopped' }
+    case 'resumed':
+      return { icon: Play, label: 'Resumed' }
+    case 'restarted':
+      return { icon: RotateCw, label: 'Restarted' }
+    case 'timeout_extended':
+      return {
+        icon: Timer,
+        label: 'Timeout extended',
+        detail:
+          typeof d.extra_secs === 'number'
+            ? `+${Math.round((d.extra_secs as number) / 60)}m`
+            : undefined,
+      }
+    case 'resized':
+      return {
+        icon: HardDrive,
+        label: 'Disk resized',
+        detail:
+          d.from_mb && d.to_mb ? `${d.from_mb} → ${d.to_mb} MiB` : undefined,
+      }
+    case 'preview_password_set':
+      return { icon: KeyRound, label: 'Preview password set' }
+    case 'preview_password_cleared':
+      return { icon: KeyRound, label: 'Preview password cleared' }
+    case 'source_seeded':
+      return {
+        icon: GitBranch,
+        label: 'Source seeded',
+        detail: typeof d.type === 'string' ? (d.type as string) : undefined,
+      }
+    case 'destroyed':
+      return { icon: Trash2, label: 'Destroyed' }
+    default:
+      return { icon: Terminal, label: e.event_type }
   }
 }
 
@@ -94,11 +156,9 @@ const DEFAULT_PORTS: { port: number; label: string }[] = [
 
 // Preset exec commands. Each becomes a one-click chip. Chosen for the
 // most common "what's in here / what's running" questions an operator
-// asks without typing anything.
-// `shell: true` pipes through `sh -c`, letting chips use `||`, pipes, and
-// globs. Without it the command is exec'd argv-style and shell operators
-// become literal arguments. Default is false so direct Runs stay faithful
-// to what the user typed.
+// asks without typing anything. All run through `sh -c` like the free-form
+// box (see `runExec`), so pipes, `||`, and globs work. `shell: false` opts
+// a chip out into argv-style exec if one ever needs the args verbatim.
 const PRESET_CMDS: {
   label: string
   cmd: string
@@ -115,9 +175,8 @@ const PRESET_CMDS: {
     label: 'ports',
     // /proc/net/tcp is always present in Linux containers (no extra pkgs).
     // awk parses the hex LISTEN rows (state 0A) into decimal port numbers.
-    cmd: "awk 'NR>1 && $4==\"0A\"{split($2,a,\":\"); print strtonum(\"0x\"a[2])}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -un",
+    cmd: 'awk \'NR>1 && $4=="0A"{split($2,a,":"); print strtonum("0x"a[2])}\' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -un',
     hint: 'Listening TCP ports',
-    shell: true,
   },
 ]
 
@@ -198,6 +257,8 @@ export default function SandboxDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [resizeOpen, setResizeOpen] = useState(false)
+  const [resizeInput, setResizeInput] = useState('')
   const [cmdInput, setCmdInput] = useState('')
   const [cwdInput, setCwdInput] = useState('')
   const [execResult, setExecResult] = useState<ExecResponse | null>(null)
@@ -237,10 +298,31 @@ export default function SandboxDetail() {
   })
   const jobs: JobSummary[] = jobsResp?.items ?? []
 
+  // Operations timeline (lifecycle events, not shell). Polls while alive so
+  // a stop/resize/extend shows up without a manual refresh.
+  const { data: eventsResp } = useQuery({
+    ...listEventsOptions({ path: { id: sandboxId } }),
+    enabled: sandboxId.length > 0,
+    refetchInterval: jobsEnabled ? 5_000 : false,
+  })
+  const events: SandboxEvent[] = eventsResp?.events ?? []
+
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['sandbox', sandboxId] })
     queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    queryClient.invalidateQueries({ queryKey: ['sandbox-events', sandboxId] })
   }
+
+  const resizeMutation = useMutation({
+    ...resizeSandboxMutation(),
+    meta: { errorTitle: 'Failed to resize disk' },
+    onSuccess: () => {
+      invalidate()
+      setResizeOpen(false)
+      setResizeInput('')
+      toast.success('Disk resized — sandbox restarted')
+    },
+  })
 
   const deleteMutation = useMutation({
     ...stopSandboxMutation(),
@@ -287,14 +369,15 @@ export default function SandboxDetail() {
       invalidate()
       const secs = vars.body?.extra_secs ?? 0
       toast.success(
-        `Timeout extended by ${secs >= 3600 ? `${secs / 3600}h` : `${secs / 60}m`}`,
+        `Timeout extended by ${secs >= 3600 ? `${secs / 3600}h` : `${secs / 60}m`}`
       )
     },
   })
 
-  // `shell: true` wraps the raw string as ["sh","-c", raw] so operators like
-  // `||`, `|`, and globs behave. Without it we argv-split and exec directly,
-  // which is what most user-typed commands want.
+  // A `$`-prompt implies shell semantics, so the free-form box runs through
+  // `sh -c` by default — redirections (`>`), `&&`, pipes, and globs all
+  // behave as typed. Pass `shell: false` to exec a command argv-style
+  // (bypassing the shell) when a caller needs the raw args verbatim.
   const execMutationHook = useMutation({
     ...execMutation(),
     meta: { errorTitle: 'Command failed' },
@@ -310,8 +393,13 @@ export default function SandboxDetail() {
 
   const runExec = (args?: { cmd?: string; shell?: boolean }) => {
     const raw = args?.cmd ?? cmdInput
-    const cmd = args?.shell ? ['sh', '-c', raw] : parseCommand(raw)
+    // Shell by default (see execMutationHook note); opt out with shell:false.
+    const useShell = args?.shell ?? true
+    const cmd = useShell ? ['sh', '-c', raw] : parseCommand(raw)
     if (cmd.length === 0) return
+    // This runs only from user event handlers; measuring elapsed command time
+    // is intentionally non-idempotent and never influences rendered state.
+    // eslint-disable-next-line react-hooks/purity
     const started = performance.now()
     setExecStartedCmd(raw)
     execMutationHook.mutate(
@@ -320,9 +408,10 @@ export default function SandboxDetail() {
         body: { cmd, cwd: cwdInput.trim() || undefined },
       },
       {
-        onSettled: () =>
-          setExecDuration(Math.round(performance.now() - started)),
-      },
+        onSettled: () => {
+          setExecDuration(Math.round(performance.now() - started))
+        },
+      }
     )
   }
 
@@ -343,7 +432,7 @@ export default function SandboxDetail() {
 
   if (isLoading) {
     return (
-      <div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8 space-y-6">
+      <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
         <div className="h-4 w-40 rounded bg-muted animate-pulse" />
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div className="space-y-2">
@@ -372,8 +461,12 @@ export default function SandboxDetail() {
 
   if (isError || !sandbox) {
     return (
-      <div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8 space-y-4">
-        <Button variant="ghost" size="sm" onClick={() => navigate('/sandboxes')}>
+      <div className="w-full p-4 sm:p-6 lg:p-8 space-y-4">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => navigate('/sandboxes')}
+        >
           <ArrowLeft className="mr-1.5 h-4 w-4" />
           Back to sandboxes
         </Button>
@@ -382,7 +475,8 @@ export default function SandboxDetail() {
             <Box className="mx-auto h-8 w-8 text-destructive" />
             <p className="text-sm font-medium">Sandbox not found</p>
             <p className="text-xs text-muted-foreground">
-              {(error as Error)?.message ?? 'This sandbox may have been deleted.'}
+              {(error as Error)?.message ??
+                'This sandbox may have been deleted.'}
             </p>
           </CardContent>
         </Card>
@@ -396,10 +490,13 @@ export default function SandboxDetail() {
   const hasPreview = Boolean(sandbox.preview_url_template) && running
 
   const timeLeft = !destroyed ? formatCountdown(sandbox.expires_at, now) : '—'
-  const expired = !destroyed && new Date(sandbox.expires_at).getTime() <= now
+  const workspace = isWorkspace(sandbox)
+  const expired = isSandboxExpired(sandbox, now)
+  const idleDeadlineReached =
+    workspace && new Date(sandbox.expires_at).getTime() <= now
 
   return (
-    <div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8 space-y-6">
+    <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
       {/* Breadcrumb */}
       <div className="flex items-center gap-1 text-sm text-muted-foreground">
         <Link to="/sandboxes" className="hover:text-foreground">
@@ -415,12 +512,46 @@ export default function SandboxDetail() {
           <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2 flex-wrap">
             <span className="truncate">{sandbox.name}</span>
             <Badge variant={statusVariant(sandbox.status)}>
-              {sandbox.status}
+              {workspace && stopped ? 'sleeping' : sandbox.status}
             </Badge>
+            {workspace && (
+              <Badge
+                variant="outline"
+                title="Persistent workspace: files survive idle compute suspension"
+              >
+                persistent workspace
+              </Badge>
+            )}
+            {sandbox.backend && (
+              <Badge
+                variant="secondary"
+                className="gap-1 font-normal"
+                title={
+                  sandbox.backend === 'firecracker'
+                    ? 'Hardware-virtualized microVM (KVM)'
+                    : 'Namespaced container'
+                }
+              >
+                {sandbox.backend === 'firecracker' ? (
+                  <Cpu className="h-3 w-3" />
+                ) : (
+                  <Box className="h-3 w-3" />
+                )}
+                {sandbox.backend === 'firecracker'
+                  ? 'Firecracker'
+                  : sandbox.backend === 'docker'
+                    ? 'Docker'
+                    : sandbox.backend}
+              </Badge>
+            )}
           </h1>
           <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
             <span className="truncate">{sandbox.id}</span>
-            <CopyButton value={sandbox.id} minimal className="h-5 w-5 shrink-0" />
+            <CopyButton
+              value={sandbox.id}
+              minimal
+              className="h-5 w-5 shrink-0"
+            />
           </div>
         </div>
 
@@ -534,7 +665,9 @@ export default function SandboxDetail() {
             disabled={isFetching}
             title="Refresh"
           >
-            <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+            <RefreshCw
+              className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+            />
           </Button>
           {!destroyed && (
             <Button
@@ -568,22 +701,29 @@ export default function SandboxDetail() {
                         expired ? 'text-destructive' : ''
                       }`}
                     >
-                      {expired ? 'expired' : `${timeLeft} left`}
+                      {workspace && stopped
+                        ? 'sleeping — wakes on next use'
+                        : idleDeadlineReached
+                          ? 'suspending idle compute…'
+                          : expired
+                            ? 'expired'
+                            : `${timeLeft} ${workspace ? 'to suspend' : 'left'}`}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      expires {formatDate(sandbox.expires_at)}
+                      {workspace ? 'idle suspension' : 'expires'}{' '}
+                      {formatDate(sandbox.expires_at)}
                     </div>
                   </div>
                 </div>
                 <div className="h-8 w-px bg-border hidden sm:block" />
                 <div className="leading-tight">
-                  <div className="text-sm tabular-nums">{formatAge(sandbox.created_at, now)}</div>
-                  <div className="text-xs text-muted-foreground">
-                    created
+                  <div className="text-sm tabular-nums">
+                    {formatAge(sandbox.created_at, now)}
                   </div>
+                  <div className="text-xs text-muted-foreground">created</div>
                 </div>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <span className="text-xs text-muted-foreground mr-1">
                   Extend:
                 </span>
@@ -641,9 +781,7 @@ export default function SandboxDetail() {
               Command
             </CardTitle>
             {!running && (
-              <Badge variant="warning">
-                sandbox {sandbox.status}
-              </Badge>
+              <Badge variant="warning">sandbox {sandbox.status}</Badge>
             )}
           </div>
         </CardHeader>
@@ -669,8 +807,8 @@ export default function SandboxDetail() {
           </div>
 
           <div className="flex flex-col gap-2 sm:flex-row">
-            <div className="flex-1 flex items-center gap-2 rounded-md border bg-muted/30 px-2">
-              <span className="font-mono text-xs text-muted-foreground select-none">
+            <div className="min-w-0 flex-1 flex items-center gap-2 rounded-md border bg-muted/30 px-2">
+              <span className="font-mono text-xs text-muted-foreground select-none shrink-0">
                 $
               </span>
               <Input
@@ -688,7 +826,7 @@ export default function SandboxDetail() {
                     runExec()
                   }
                 }}
-                className="border-0 bg-transparent shadow-none focus-visible:ring-0 px-0 font-mono text-sm h-9"
+                className="min-w-0 border-0 bg-transparent shadow-none focus-visible:ring-0 px-0 font-mono h-9 text-base sm:text-sm"
               />
             </div>
             <div className="flex gap-2">
@@ -696,7 +834,7 @@ export default function SandboxDetail() {
                 value={cwdInput}
                 placeholder={sandbox.work_dir}
                 onChange={(e) => setCwdInput(e.target.value)}
-                className="font-mono text-xs w-full sm:w-56 h-9"
+                className="font-mono h-9 w-full sm:w-56 text-base sm:text-xs"
                 title="Working directory (optional)"
               />
               <Button
@@ -706,7 +844,7 @@ export default function SandboxDetail() {
                   cmdInput.trim().length === 0 ||
                   !running
                 }
-                className="gap-1"
+                className="gap-1 shrink-0"
               >
                 {execMutationHook.isPending ? (
                   <>
@@ -745,7 +883,9 @@ export default function SandboxDetail() {
                 <CopyButton
                   value={
                     execResult.stdout +
-                    (execResult.stderr ? `\n---stderr---\n${execResult.stderr}` : '')
+                    (execResult.stderr
+                      ? `\n---stderr---\n${execResult.stderr}`
+                      : '')
                   }
                   minimal
                   className="h-7 w-7 shrink-0"
@@ -797,6 +937,35 @@ export default function SandboxDetail() {
               value={sandbox.image ?? 'platform default'}
               mono
             />
+            {sandbox.backend === 'firecracker' && (
+              <div className="flex items-start justify-between gap-4">
+                <span className="text-muted-foreground shrink-0">Disk</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-right">
+                    {sandbox.disk_size_mb
+                      ? sandbox.disk_size_mb >= 1024
+                        ? `${(sandbox.disk_size_mb / 1024).toFixed(sandbox.disk_size_mb % 1024 ? 1 : 0)} GiB`
+                        : `${sandbox.disk_size_mb} MiB`
+                      : '1 GiB (default)'}
+                  </span>
+                  {!destroyed && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-xs"
+                      disabled={resizeMutation.isPending}
+                      onClick={() => setResizeOpen(true)}
+                    >
+                      {resizeMutation.isPending ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        'Resize'
+                      )}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
             <InfoRow label="Work dir" value={sandbox.work_dir} mono />
           </CardContent>
         </Card>
@@ -820,14 +989,56 @@ export default function SandboxDetail() {
                 {sandbox.preview_url_template}
               </code>
               <p className="text-xs text-muted-foreground mt-2">
-                Substitute <code className="font-mono">{'{port}'}</code> for
-                any port bound inside the sandbox. Use "Open preview" above
-                to launch common dev-server ports directly.
+                Substitute <code className="font-mono">{'{port}'}</code> for any
+                port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
+                above to launch common dev-server ports directly.
               </p>
             </CardContent>
           </Card>
         )}
       </div>
+
+      {/* Operations timeline — lifecycle events only, never shell activity. */}
+      {events.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Timeline</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ol className="space-y-3">
+              {events.map((e, i) => {
+                const { icon: Icon, label, detail } = eventPresentation(e)
+                return (
+                  <li
+                    key={`${e.at}-${e.event_type}-${i}`}
+                    className="flex items-start gap-3"
+                  >
+                    <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border bg-muted/40">
+                      <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-baseline gap-x-2">
+                        <span className="text-sm font-medium">{label}</span>
+                        {detail && (
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {detail}
+                          </span>
+                        )}
+                      </div>
+                      <div
+                        className="text-xs text-muted-foreground"
+                        title={new Date(e.at).toLocaleString()}
+                      >
+                        {formatAge(new Date(e.at).toISOString(), now)}
+                      </div>
+                    </div>
+                  </li>
+                )
+              })}
+            </ol>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Preview access gate — only meaningful when preview URLs are
           configured on this install. Destroyed sandboxes freeze the
@@ -840,6 +1051,56 @@ export default function SandboxDetail() {
         />
       )}
 
+      {/* Resize dialog */}
+      <AlertDialog open={resizeOpen} onOpenChange={setResizeOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Resize root disk</AlertDialogTitle>
+            <AlertDialogDescription>
+              Grow this sandbox&apos;s root disk. The disk can only grow, and
+              the sandbox restarts briefly to apply it — the filesystem and its
+              contents are preserved.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-1.5">
+            <Label
+              htmlFor="resize-mb"
+              className="text-xs text-muted-foreground"
+            >
+              New size (MB) — current {sandbox.disk_size_mb ?? 1024} MB
+            </Label>
+            <Input
+              id="resize-mb"
+              type="number"
+              min={(sandbox.disk_size_mb ?? 1024) + 1}
+              placeholder={`> ${sandbox.disk_size_mb ?? 1024}`}
+              value={resizeInput}
+              onChange={(e) => setResizeInput(e.target.value)}
+              className="font-mono"
+            />
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={
+                resizeMutation.isPending ||
+                !resizeInput ||
+                Number(resizeInput) <= (sandbox.disk_size_mb ?? 1024)
+              }
+              onClick={(e) => {
+                e.preventDefault()
+                resizeMutation.mutate({
+                  path: { id: sandboxId },
+                  body: { disk_size_mb: Number(resizeInput) },
+                })
+              }}
+            >
+              {resizeMutation.isPending ? 'Resizing…' : 'Resize'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Delete dialog */}
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
@@ -847,16 +1108,14 @@ export default function SandboxDetail() {
             <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
             <AlertDialogDescription>
               This tears down the container for{' '}
-              <span className="font-mono">{sandbox.id}</span>. The row is
-              kept for audit but cannot be restarted.
+              <span className="font-mono">{sandbox.id}</span>. The row is kept
+              for audit but cannot be restarted.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              onClick={() =>
-                deleteMutation.mutate({ path: { id: sandboxId } })
-              }
+              onClick={() => deleteMutation.mutate({ path: { id: sandboxId } })}
               disabled={deleteMutation.isPending}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
@@ -874,7 +1133,7 @@ export default function SandboxDetail() {
 // done, exited non-zero = warning (something returned an error code), and
 // failed = destructive (the task itself errored, not the underlying cmd).
 function jobStatusVariant(
-  job: JobSummary,
+  job: JobSummary
 ): 'default' | 'secondary' | 'success' | 'warning' | 'destructive' | 'outline' {
   if (job.status === 'running') return 'secondary'
   if (job.status === 'failed') return 'destructive'
@@ -934,9 +1193,7 @@ function JobRow({
           <code className="font-mono hidden sm:inline">{job.id}</code>
         </div>
       </button>
-      {open && (
-        <JobLogsPanel sandboxId={sandboxId} job={job} />
-      )}
+      {open && <JobLogsPanel sandboxId={sandboxId} job={job} />}
     </li>
   )
 }

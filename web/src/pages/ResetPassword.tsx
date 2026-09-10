@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -9,6 +12,7 @@ import {
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -19,30 +23,23 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { resetPasswordMutation } from '@/api/client/@tanstack/react-query.gen'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft, Loader2 } from 'lucide-react'
+import { AlertCircle, ArrowLeft, Check, Loader2, X } from 'lucide-react'
+import { useRef } from 'react'
 import { useForm } from 'react-hook-form'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { cn } from '@/lib/utils'
+import {
+  PASSWORD_REQUIREMENTS,
+  passwordRequirementResults,
+  passwordSchema,
+} from '@/lib/password-policy'
 
-// Mirrors `validate_password_complexity` in
-// temps-auth/src/auth_service.rs. Kept in sync so the user gets inline
-// feedback instead of a round-trip 400. The server remains the source
-// of truth and re-validates.
 const resetPasswordSchema = z
   .object({
-    newPassword: z
-      .string()
-      .min(8, 'Password must be at least 8 characters long')
-      .max(128, 'Password must not exceed 128 characters')
-      .regex(/[A-Z]/, 'Password must contain at least one uppercase letter')
-      .regex(/[a-z]/, 'Password must contain at least one lowercase letter')
-      .regex(/[0-9]/, 'Password must contain at least one digit')
-      .regex(
-        /[^a-zA-Z0-9]/,
-        'Password must contain at least one special character',
-      ),
+    newPassword: passwordSchema,
     confirmPassword: z.string(),
   })
   .refine((data) => data.newPassword === data.confirmPassword, {
@@ -57,11 +54,14 @@ export const ResetPassword = () => {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const token = searchParams.get('token') ?? ''
+  const isSubmittingRef = useRef(false)
 
   const form = useForm<ResetPasswordFormData>({
     resolver: zodResolver(resetPasswordSchema),
     defaultValues: { newPassword: '', confirmPassword: '' },
   })
+  const newPassword = form.watch('newPassword')
+  const requirementResults = passwordRequirementResults(newPassword)
 
   const resetPassword = useMutation({
     ...resetPasswordMutation(),
@@ -76,9 +76,15 @@ export const ResetPassword = () => {
   })
 
   const handleSubmit = async (data: ResetPasswordFormData) => {
-    await resetPassword.mutateAsync({
-      body: { token, new_password: data.newPassword },
-    })
+    if (isSubmittingRef.current || resetPassword.isPending) return
+    isSubmittingRef.current = true
+    try {
+      await resetPassword.mutateAsync({
+        body: { token, new_password: data.newPassword },
+      })
+    } finally {
+      isSubmittingRef.current = false
+    }
   }
 
   return (
@@ -120,11 +126,58 @@ export const ResetPassword = () => {
                             type="password"
                             placeholder="Enter a new password"
                             autoComplete="new-password"
-                            disabled={resetPassword.isPending}
+                            disabled={
+                              resetPassword.isPending ||
+                              form.formState.isSubmitting
+                            }
                             {...field}
                           />
                         </FormControl>
+                        <FormDescription className="sr-only">
+                          Password must meet all complexity requirements listed
+                          below.
+                        </FormDescription>
                         <FormMessage />
+                        <ul
+                          role="list"
+                          aria-live="polite"
+                          aria-label="Password requirements"
+                          className="grid gap-1.5 pt-2 sm:grid-cols-2"
+                        >
+                          {PASSWORD_REQUIREMENTS.map((requirement, index) => {
+                            const met =
+                              requirementResults[index]?.met ?? false
+                            return (
+                              <li
+                                key={requirement.id}
+                                className={cn(
+                                  'flex items-center gap-1.5 text-xs transition-colors',
+                                  met
+                                    ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                    : 'text-rose-500 font-medium'
+                                )}
+                              >
+                                {met ? (
+                                  <Check
+                                    aria-hidden="true"
+                                    className="h-3.5 w-3.5 shrink-0 stroke-[2.5]"
+                                  />
+                                ) : (
+                                  <X
+                                    aria-hidden="true"
+                                    className="h-3.5 w-3.5 shrink-0 stroke-[2.5]"
+                                  />
+                                )}
+                                <span>{requirement.label}</span>
+                                <span className="sr-only">
+                                  {met
+                                    ? '(Requirement met)'
+                                    : '(Requirement not met)'}
+                                </span>
+                              </li>
+                            )
+                          })}
+                        </ul>
                       </FormItem>
                     )}
                   />
@@ -139,7 +192,10 @@ export const ResetPassword = () => {
                             type="password"
                             placeholder="Re-enter your new password"
                             autoComplete="new-password"
-                            disabled={resetPassword.isPending}
+                            disabled={
+                              resetPassword.isPending ||
+                              form.formState.isSubmitting
+                            }
                             {...field}
                           />
                         </FormControl>
@@ -150,9 +206,12 @@ export const ResetPassword = () => {
                   <Button
                     type="submit"
                     className="w-full"
-                    disabled={resetPassword.isPending}
+                    disabled={
+                      resetPassword.isPending || form.formState.isSubmitting
+                    }
                   >
-                    {resetPassword.isPending ? (
+                    {resetPassword.isPending ||
+                    form.formState.isSubmitting ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                         Resetting...

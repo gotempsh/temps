@@ -1,0 +1,100 @@
+export const metadata = {
+  title: 'Set Up Email Event Tracking (SES)',
+  description: 'Get bounce, complaint, and delivery events from AWS SES into Temps — one-click automatic setup, manual steps, required IAM permissions, and troubleshooting.',
+  alternates: {
+    canonical: '/docs/set-up-email-event-tracking',
+  },
+}
+
+export const sections = [
+  { title: 'What you get', id: 'what-you-get' },
+  { title: 'Prerequisites', id: 'prerequisites' },
+  { title: 'Automatic setup', id: 'automatic-setup' },
+  { title: 'IAM permissions', id: 'iam-permissions' },
+  { title: 'Manual setup', id: 'manual-setup' },
+  { title: 'Verify it works', id: 'verify' },
+  { title: 'Troubleshooting', id: 'troubleshooting' },
+]
+
+# Set Up Email Event Tracking (SES)
+
+Wire AWS SES to your Temps instance so bounces, complaints, and delivery confirmations show up on each email's timeline — and hard bounces automatically stop future sends to that recipient. {{ className: 'lead' }}
+
+## What you get {{ id: 'what-you-get' }}
+
+- `delivered`, `bounced`, and `complained` events on the per-email Activity timeline and in Email Analytics.
+- Automatic per-domain suppression of hard-bounced and complaining recipients.
+- Pipeline health on the provider's detail page: subscription confirmed/pending, and the time of the last event received.
+
+Events flow SES → SNS topic → HTTPS webhook on your instance (`/api/t/webhook/ses`). Temps verifies each message's SNS signature and only accepts topics bound to an active SES provider.
+
+## Prerequisites {{ id: 'prerequisites' }}
+
+- An SES provider configured in Temps (**Email → Providers**).
+- Your instance's external URL must be **publicly reachable over HTTPS** — SNS delivers events from AWS's network. The setup UI warns if the configured external URL is private.
+
+## Automatic setup {{ id: 'automatic-setup' }}
+
+Open the SES provider's detail page (**Email → Providers → click the provider**) and press **Set up automatically** in the *Delivery event tracking* section. Using the provider's stored credentials, Temps:
+
+1. Creates (or reuses) an SNS topic named `temps-email-events-{provider-id}` in the provider's region.
+2. Saves the topic ARN on the provider — this authorizes the topic *before* anything subscribes to it.
+3. Subscribes your instance's webhook URL to the topic. SNS sends a confirmation request, which Temps confirms automatically.
+4. Attaches an SESv2 event destination (bounce, complaint, delivery) to the `temps-tracking` configuration set that every Temps send already uses.
+
+Every step is idempotent — if a step fails (for example a missing IAM permission), fix the cause and press the button again; completed steps are simply reused.
+
+## IAM permissions {{ id: 'iam-permissions' }}
+
+Sending email needs no new permissions. The **setup step only** additionally requires:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:Subscribe",
+        "ses:CreateConfigurationSet",
+        "ses:CreateConfigurationSetEventDestination",
+        "ses:UpdateConfigurationSetEventDestination"
+      ],
+      "Resource": [
+        "arn:aws:sns:*:*:temps-email-events-*",
+        "arn:aws:ses:*:*:configuration-set/temps-tracking"
+      ]
+    }
+  ]
+}
+```
+
+At runtime SNS pushes events to your webhook on its own — your AWS credentials are not involved, so you can even attach this policy temporarily, run setup once, and remove it.
+
+## Manual setup {{ id: 'manual-setup' }}
+
+If you prefer creating resources yourself, **the order matters**:
+
+1. Create an SNS topic in the **same region** as the provider.
+2. Paste the topic ARN into the provider's **SNS Topic ARN** field in Temps and **save**. Temps only auto-confirms subscription requests for topics it already knows about — subscribing first leaves the subscription stuck in "pending" forever, with no error shown anywhere.
+3. In the SES console, add an event destination to the `temps-tracking` configuration set for **bounce, complaint, and delivery** events, publishing to your topic.
+4. Subscribe your webhook URL — shown on the provider's detail page, of the form `https://your-instance.example.com/api/t/webhook/ses` — to the topic with protocol HTTPS. Temps confirms the subscription automatically.
+
+## Verify it works {{ id: 'verify' }}
+
+1. The provider's detail page should show **Subscription confirmed** within seconds of setup.
+2. Send a test to SES's bounce simulator: `bounce@simulator.amazonses.com`. A `bounced` event should appear on the email's timeline shortly after, and the recipient lands on the domain's suppression list.
+3. `success@simulator.amazonses.com` produces a `delivered` event; `complaint@simulator.amazonses.com` a `complained` event.
+
+## Troubleshooting {{ id: 'troubleshooting' }}
+
+**Subscription stuck on "pending".** You subscribed the endpoint before the topic ARN was saved in Temps, so the confirmation request was rejected (the webhook returns 403 for unknown topics). Delete the subscription in the AWS console, make sure the ARN is saved on the provider, then subscribe again — or just press **Set up automatically**, which orders the steps correctly.
+
+**Setup fails with an AccessDenied error.** The provider's credentials lack one of the setup-time permissions above. The error message names the exact failing step and AWS's reason.
+
+**Confirmed subscription, but no events arrive.** Check that the SES event destination exists on the `temps-tracking` configuration set and covers bounce/complaint/delivery — and that your sends actually go through this provider's verified domain. Events are correlated by SES message ID; mail sent outside Temps won't appear.
+
+**Webhook returns 403 in SNS delivery logs.** The topic ARN on the provider doesn't exactly match the topic delivering events, the provider is deactivated, or the region changed since setup. Re-run automatic setup after fixing the provider.
+
+**Instance not publicly reachable.** SNS cannot push to a private address, and the setup UI disables the button in that case. Either expose the instance publicly or keep delivery tracking off — open/click tracking has the same reachability requirement, and click tracking on a private instance breaks recipients' links outright.

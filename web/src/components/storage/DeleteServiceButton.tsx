@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { deleteServiceMutation } from '@/api/client/@tanstack/react-query.gen'
 import {
   AlertDialog,
@@ -11,6 +14,7 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
@@ -76,6 +80,7 @@ export function DeleteServiceButton({
           variant="ghost"
           size="icon"
           className="h-8 w-8 text-muted-foreground hover:text-destructive"
+          aria-label={`Delete ${serviceName}`}
           onClick={(e) => {
             e.stopPropagation()
             setIsOpen(true)
@@ -94,11 +99,7 @@ export function DeleteServiceButton({
         </AlertDialogHeader>
         <div className="space-y-2">
           <Label htmlFor="confirm-service-name">
-            Type{' '}
-            <span className="font-mono font-semibold text-foreground">
-              {serviceName}
-            </span>{' '}
-            to confirm
+            Type <ConfirmNameBadge value={serviceName} /> to confirm
           </Label>
           <Input
             id="confirm-service-name"

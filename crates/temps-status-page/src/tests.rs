@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::services::*;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
@@ -1093,6 +1096,7 @@ mod integration_tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
 
@@ -1119,7 +1123,8 @@ mod integration_tests {
         }
 
         let job_queue: Arc<dyn JobQueue> = Arc::new(MockJobQueue);
-        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue);
+        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
+            .expect("test HTTP client should build");
 
         // Initialize monitors for all environments
         health_check_service.initialize_monitors().await.unwrap();

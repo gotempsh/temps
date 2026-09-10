@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
+pub(crate) mod self_update;
 mod shutdown;
 
 use clap::{Args, ValueEnum};
@@ -13,6 +17,22 @@ use tracing::{debug, info, warn};
 
 pub use console::start_console_api;
 pub use proxy::start_proxy_server;
+
+const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Bound on how long single-binary proxy startup waits for console plugin
+/// initialization (specifically, for a licensed plugin to claim
+/// `project_ip_gate_slot`) before starting to serve traffic anyway. See the
+/// comment at the call site for why this exists and why it is bounded
+/// rather than an unconditional wait.
+const PROJECT_IP_GATE_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
+    current
+        .saturating_mul(2)
+        .min(POST_MIGRATION_INDEX_MAX_RETRY)
+}
 
 /// Which halves of the control plane this `temps serve` process runs.
 ///
@@ -72,6 +92,18 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
+    /// Forbid applying release updates from the console, permanently for the
+    /// lifetime of this process.
+    ///
+    /// The console also has a Settings toggle for the same thing, but that one
+    /// lives in the database and can be switched back on by anyone who can
+    /// write settings. This flag cannot: it is set at launch, so an operator
+    /// who keeps upgrades under configuration management (or policy) can rule
+    /// the API path out entirely. The update banner still appears and still
+    /// shows the manual command — only the "Update now" action is refused.
+    #[arg(long)]
+    pub disable_self_update: bool,
+
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
     #[arg(long, env = "TEMPS_SCREENSHOT_PROVIDER", value_parser = ["local", "remote", "noop", "disabled", "none"])]
@@ -119,6 +151,16 @@ impl ServeCommand {
         self,
         extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ) -> anyhow::Result<()> {
+        let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
+        if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
+            warn!(
+                legacy_variable = temps_core::LEGACY_DEPLOYMENT_MODE_VARIABLE,
+                canonical_variable = temps_core::EXECUTION_ENVIRONMENT_VARIABLE,
+                execution_environment = %runtime_context.execution_environment(),
+                "Using deprecated execution-environment configuration; migrate to TEMPS_EXECUTION_ENV"
+            );
+        }
+
         // Install the rustls crypto provider once at startup, before any
         // dependency (e.g. temps-domains) constructs a rustls client.
         crate::install_crypto_provider();
@@ -134,6 +176,17 @@ impl ServeCommand {
         // picks it up regardless of which path the operator used.
         if let Some(ref admin) = self.console_admin_address {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
+        }
+
+        // Same bridge for the data directory. `ServerConfig::new` resolves it
+        // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
+        // flag — so `--data-dir /srv/temps` was silently ignored and the
+        // server wrote its encryption key, auth secret, logs and plugin data
+        // to the home directory instead. Two instances started with different
+        // `--data-dir` values would quietly share one directory.
+        if let Some(ref dir) = self.data_dir {
+            std::env::set_var("TEMPS_DATA_DIR", dir);
+            debug!("Data directory set to '{}' from CLI flag", dir.display());
         }
 
         // In split (`--role=console`) mode the console must bind a STABLE,
@@ -167,7 +220,22 @@ impl ServeCommand {
         let cookie_crypto = Arc::new(temps_core::CookieCrypto::new(&serve_config.auth_secret)?);
 
         debug!("Initializing database connection...");
-        // Create tokio runtime for database connection since we need async for this
+        // THE long-lived runtime for this process. It runs the startup
+        // `block_on`s just below, and later the index build, the backfill, the
+        // listeners and the console (`rt.spawn` further down). It stays alive
+        // until `serve` returns: under `--role=all` that is when pingora stops
+        // blocking this thread, and under `--role=console` when the console
+        // future it is blocking on finishes.
+        //
+        // It is deliberately built HERE, *before* the pool, rather than as a
+        // second runtime after startup: the pool has to be created on the
+        // runtime that will keep driving it. sqlx spawns a pool-maintenance
+        // task when the pool is constructed, and every socket the pool opens
+        // (`min_connections`, plus the connection migrations run on) registers
+        // with the creating runtime's IO driver. A startup-only runtime would
+        // leave both stranded -- the maintenance task unpolled and the pooled
+        // sockets bound to a driver nothing runs -- and the first query issued
+        // from the main runtime would hang forever.
         let rt = tokio::runtime::Runtime::new()?;
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
 
@@ -231,7 +299,27 @@ impl ServeCommand {
             temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
 
         // Create shared route table instance (used by both console API and proxy)
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(
+            db.clone(),
+            runtime_context.clone(),
+        ));
+
+        // Resolve Traefik label discovery config here — BEFORE the route table
+        // listener's initial load is kicked off below — and tell the route
+        // table which Docker network (if any) this process may serve adopted
+        // containers from. The watcher itself is started much later (it needs
+        // the Docker handle), but the *reader* side has to know from the very
+        // first load: without this, previously adopted `traefik_discovered_routes`
+        // rows would keep routing after an operator turned discovery off or
+        // repointed it at a different network, since nothing would ever delete
+        // rows the (now stopped) reconciler owns.
+        let traefik_discovery_config =
+            temps_deployer::traefik_discovery::TraefikDiscoveryConfig::from_env("temps");
+        route_table.set_traefik_discovery_network(
+            traefik_discovery_config
+                .enabled
+                .then(|| traefik_discovery_config.network.clone()),
+        );
 
         // ADR-012-lite: every successful route_table reload also
         // reconciles internal `<env>.<project>.temps.local` A records,
@@ -285,13 +373,30 @@ impl ServeCommand {
         let route_reload_subscriber =
             temps_routes::RouteReloadSubscriber::new(route_table.clone(), queue.clone());
 
-        let rt = tokio::runtime::Runtime::new()?;
-
-        // Backfill TimescaleDB continuous aggregates on this long-lived runtime,
-        // detached. `establish_connection` no longer runs this (it would block
-        // startup on a slow `CALL`); it's idempotent and the refresh policy
-        // catches up regardless, so it must not gate the proxy bind.
+        // Run non-transactional indexes and the TimescaleDB backfill on this
+        // long-lived runtime, detached. Index creation retries with capped
+        // backoff until the retention query has its supporting index; the
+        // idempotent backfill remains best-effort and never gates proxy bind.
         {
+            let index_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+                loop {
+                    match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Post-migration index build failed; retrying in {:?}: {}",
+                                retry_delay,
+                                e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
+                    }
+                }
+            });
+
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =
@@ -305,6 +410,51 @@ impl ServeCommand {
             });
         }
 
+        // Update notifier: shortly after startup, then at the configured
+        // interval (two hours by default), check GitHub
+        // for a newer release on this install's channel (stable vs beta is
+        // inferred from the running version tag). Hits land in this shared
+        // slot, which the console registers as a service so the settings API
+        // (`GET /settings/update-status`) can drive the web-console upgrade
+        // banner. Detached and best-effort — network failures are
+        // debug-logged and it never gates startup. Spawned before the role
+        // branch so it covers both `--role=all` (this runtime outlives the
+        // blocking proxy) and `--role=console` (the console block_on below
+        // runs on this same runtime).
+        let update_status = Arc::new(temps_core::UpdateStatusSlot::new());
+        let update_check_interval = crate::commands::upgrade::configured_update_check_interval();
+        rt.spawn(crate::commands::upgrade::update_notifier_loop(
+            update_status.clone(),
+            update_check_interval,
+            Arc::new(temps_config::ConfigService::new(
+                serve_config.clone(),
+                db.clone(),
+            )),
+        ));
+
+        // Companion to the notifier above: the notifier says a release exists,
+        // this applies it when an admin asks. Constructed here (not in the
+        // console) so it resolves the journal of a previous update attempt
+        // exactly once per process, before any request can observe it.
+        //
+        // In split topology (ADR-017) only the CONSOLE process restarts. The
+        // sibling `temps proxy` keeps serving :80/:443 on the binary it already
+        // exec'd, so the operator has to restart it separately to converge —
+        // stated up front rather than discovered as version skew later.
+        let self_update_caveat = (self.role == ServeRole::Console).then(|| {
+            "This process runs the console only (ADR-017 split topology). The separate \
+             `temps proxy` service keeps serving traffic on the binary it started with — \
+             restart it too once the console is back to finish the upgrade."
+                .to_string()
+        });
+        let self_updater = Arc::new(self_update::BinarySelfUpdater::new(
+            serve_config.data_dir.clone(),
+            self.disable_self_update,
+            self_update_caveat,
+            update_status.clone(),
+            self.database_url.clone(),
+        ));
+
         // Connect to Docker once and share the handle between:
         //   1. OnDemandManager (wake-on-request scale-to-zero)
         //   2. Preview gateway reconciler (workspace preview routing)
@@ -313,25 +463,19 @@ impl ServeCommand {
         // The proxy server (80/443) MUST come up regardless.
         let docker_handle: Option<Arc<bollard::Docker>> = {
             let docker_rt = tokio::runtime::Runtime::new()?;
-            match docker_rt.block_on(async {
-                let docker = bollard::Docker::connect_with_defaults()
-                    .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
-                docker
-                    .ping()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
-                Ok::<_, anyhow::Error>(docker)
-            }) {
-                Ok(docker) => Some(Arc::new(docker)),
-                Err(e) => {
-                    warn!(
-                        "Docker not available — on-demand scale-to-zero and workspace \
-                         preview gateway will be disabled: {}",
-                        e
-                    );
-                    None
-                }
-            }
+            proxy::optional_docker_feature(
+                docker_rt.block_on(async {
+                    let docker = bollard::Docker::connect_with_defaults()
+                        .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
+                    docker
+                        .ping()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
+                    Ok::<_, anyhow::Error>(docker)
+                }),
+                "on-demand scale-to-zero and workspace preview gateway",
+            )
+            .map(Arc::new)
         };
 
         // The on-demand wake manager is a PROXY-side concern: it watches request
@@ -353,7 +497,8 @@ impl ServeCommand {
                         "temps".to_string(),
                     );
                     let adapter = proxy::ContainerLifecycleAdapter::new(
-                        Arc::new(docker_runtime) as Arc<dyn temps_deployer::ContainerDeployer>
+                        Arc::new(docker_runtime) as Arc<dyn temps_deployer::ContainerDeployer>,
+                        runtime_context.clone(),
                     );
                     Arc::new(temps_proxy::on_demand::OnDemandManager::new(
                         db.clone(),
@@ -441,6 +586,71 @@ impl ServeCommand {
             temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
+        // Traefik-label discovery: adopt containers the operator already runs
+        // (an existing docker-compose / Coolify / Dokploy stack) into the route
+        // table by reading their `traefik.*` labels. Opt-in and OFF by default
+        // — it changes routing for workloads that were never deployed through
+        // Temps, so it must be an explicit operator decision.
+        //
+        // It writes `traefik_discovered_routes` rows rather than touching an
+        // in-memory table, so the existing route_table_changes NOTIFY path
+        // carries every change to the split-mode `temps proxy` process and to
+        // every other control plane node. That is also why this only runs here
+        // and not in `temps proxy`: one writer per Docker daemon, many readers.
+        //
+        // The handle built here is handed to the console so
+        // `GET /traefik-discovery/status` answers with this process's real
+        // state. It is built in EVERY case — including "off" and "Docker
+        // unavailable" — because an unconfigured feature must onboard rather
+        // than disappear (CLAUDE.md, Feature Discoverability): the endpoint
+        // returns `configured: false` plus the reason and the env vars that
+        // would enable it.
+        let traefik_discovery_handle = {
+            use temps_deployer::traefik_discovery::{
+                TraefikDiscoveryHandle, TraefikDiscoveryService, ENABLED_ENV,
+            };
+
+            // Resolved once, up where the route table is created, so the reader
+            // (route table) and the writer (this watcher) can never disagree
+            // about which network is in play. Same network `DockerRuntime` is
+            // constructed with above, so an operator who only flips the enable
+            // flag watches a network the proxy can actually reach.
+            let discovery_config = traefik_discovery_config.clone();
+            Arc::new(if !discovery_config.enabled {
+                TraefikDiscoveryHandle::not_running(
+                    discovery_config,
+                    format!("{ENABLED_ENV} is not set to 'true' on this server"),
+                )
+            } else {
+                match docker_handle.clone() {
+                    Some(docker) => {
+                        let discovery = Arc::new(TraefikDiscoveryService::new(
+                            docker,
+                            db.clone(),
+                            discovery_config,
+                            Some(route_table.clone()
+                                as Arc<dyn temps_core::route_table::RouteTableRefresher>),
+                        ));
+                        discovery.clone().start(rt.handle());
+                        TraefikDiscoveryHandle::running(discovery)
+                    }
+                    None => {
+                        warn!(
+                            "{} is set, but Docker is not reachable from this server — no \
+                             containers can be inspected, so Traefik label discovery is not \
+                             running",
+                            ENABLED_ENV
+                        );
+                        TraefikDiscoveryHandle::not_running(
+                            discovery_config,
+                            "Docker is not reachable from this server, so no containers can be \
+                             inspected for Traefik labels",
+                        )
+                    }
+                }
+            })
+        };
+
         // Build the admin-gate handle up-front so both the console listener
         // and the Pingora proxy see the same source of truth. Env precedence
         // is resolved here; the DB is consulted on first read inside the
@@ -465,6 +675,19 @@ impl ServeCommand {
             );
         }
 
+        // Converge on out-of-process gate edits here too. A single-binary
+        // `temps serve` swaps this handle in-process on save, so the listener
+        // is redundant for the common case — but in an HA deployment with
+        // several consoles against one database, replica B would otherwise keep
+        // enforcing its boot-time allowlist after an operator tightened the
+        // gate on replica A. `AdminGateService` is `Clone` and the handle is an
+        // `Arc<ArcSwap<_>>`, so this clone writes to the same live handle.
+        {
+            let listener_service = Arc::new(admin_gate_service.clone());
+            let database_url = self.database_url.clone();
+            rt.block_on(async { listener_service.start_settings_listener(database_url) });
+        }
+
         // Shared retention-resolver slot: constructed ONCE here (before either
         // the console or the proxy bootstraps begin) so both see the same
         // object. The console's ProxyPlugin looks this up via the service
@@ -487,6 +710,12 @@ impl ServeCommand {
         // contexts this way.
         let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
 
+        // See the field doc on `ConsoleApiParams::project_ip_gate_slot` —
+        // same shared-slot mechanism and construction site as
+        // retention_resolver_slot immediately above, flagged for security
+        // review as an explicit exception rather than a second precedent.
+        let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -505,6 +734,10 @@ impl ServeCommand {
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
             retention_resolver_slot: retention_resolver_slot.clone(),
+            project_ip_gate_slot: project_ip_gate_slot.clone(),
+            update_status,
+            self_updater,
+            traefik_discovery: traefik_discovery_handle,
         };
 
         if self.role == ServeRole::Console {
@@ -558,29 +791,75 @@ impl ServeCommand {
             }
         });
 
-        // Monitor console readiness in a background thread so we can log it,
-        // but do NOT block proxy startup on it.
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create runtime for console monitor: {}", e);
-                    return;
-                }
-            };
-            match rt.block_on(ready_rx) {
-                Ok(()) => {
-                    info!("✅ Console API is ready");
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "❌ Console API failed to become ready — check error logs above"
-                    );
-                }
+        // Wait for the console's plugin two-phase init to finish before the
+        // proxy starts serving traffic — this is deliberately NOT the same
+        // thing as waiting for the console to be fully healthy (routers,
+        // middleware, admin gate, listener bind), which could take much
+        // longer or hang on something unrelated (Docker check, GeoIP
+        // validation, etc.) — exactly the "proxied traffic goes down because
+        // of a console problem" failure mode the comment above exists to
+        // avoid.
+        //
+        // The reason this wait exists at all: `project_ip_gate_slot` (see
+        // the security guardrail comment above) starts as `OpenIpGate`
+        // (allow everything) and is only claimed once plugin two-phase init
+        // completes — `ProxyPlugin::initialize` claims it from whatever
+        // `Arc<dyn ProjectIpGate>` an EE plugin registered, and that runs
+        // inside `initialize_plugins()`, nothing later. `console.rs` fires
+        // `ready_signal` (see its call site, right after "All plugins
+        // initialized successfully") at exactly that point — not at the end
+        // of `start_console_api` like it used to. Before that change
+        // (P1 security finding on PR #725), this wait was tied to the FULL
+        // console being ready, so every IP-restricted project was reachable
+        // by any client for however long the rest of console startup took,
+        // on every single boot. Now the wait resolves as soon as the one
+        // thing it actually depends on is done — deterministically, since
+        // plugin registration+init is in-memory service wiring with no
+        // listener bind, no HTTP router construction, and (bar a
+        // pathological plugin) no long-running I/O. The timeout below is a
+        // backstop against a genuinely hung plugin `initialize()`, not the
+        // expected path.
+        // `tokio::time::timeout(..)` must be constructed *inside* the
+        // runtime context `block_on` establishes, not as a bare argument
+        // evaluated on this plain sync thread before `block_on` starts --
+        // it eagerly builds a `Sleep` that registers with the current
+        // runtime's timer driver via `Handle::current()`, which panics
+        // ("there is no reactor running") if called with no ambient
+        // runtime. Wrapping it in an `async` block defers construction
+        // until `block_on` is already polling it.
+        match rt
+            .block_on(async { tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await })
+        {
+            Ok(Ok(())) => {
+                info!(
+                    "✅ Plugin init complete — any project IP gate a licensed plugin \
+                     installed is in place before the proxy starts serving"
+                );
             }
-        });
+            Ok(Err(_)) => {
+                tracing::error!(
+                    "❌ Console plugin initialization failed — check error logs above. \
+                     Starting the proxy anyway (proxied traffic to deployed applications \
+                     is not held hostage by a console failure), but note: any \
+                     project-scoped IP restriction will NOT be enforced until the console \
+                     problem is resolved and the process is restarted."
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "⏳ Console plugin initialization did not complete within {:?} — this \
+                     should not happen in normal operation (it means a plugin's own \
+                     initialize() is hung, not merely that console startup is slow). \
+                     Starting the proxy anyway rather than blocking indefinitely. Any \
+                     project-scoped IP restriction will not be enforced until plugin \
+                     initialization finishes; this is a bounded, logged exposure window, \
+                     not the unbounded one this wait exists to close.",
+                    PROJECT_IP_GATE_STARTUP_GRACE
+                );
+            }
+        }
 
-        info!("Starting proxy server (console API initializing in background)...");
+        info!("Starting proxy server...");
 
         // Start proxy server (this will block until shutdown)
         start_proxy_server(
@@ -596,6 +875,21 @@ impl ServeCommand {
             on_demand_manager,
             Some(admin_gate_handle),
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
+            project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
         )
+    }
+}
+
+#[cfg(test)]
+mod post_migration_tests {
+    use super::*;
+
+    #[test]
+    fn index_retry_backoff_grows_and_caps() {
+        let mut delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+        for expected in [10, 20, 40, 80, 160, 300, 300] {
+            delay = next_post_migration_index_retry(delay);
+            assert_eq!(delay, std::time::Duration::from_secs(expected));
+        }
     }
 }

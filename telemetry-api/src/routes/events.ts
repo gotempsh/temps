@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Pool } from "pg";
 import { countryForRequest } from "../geo.js";
 
@@ -17,11 +20,13 @@ export const KNOWN_EVENT_TYPES = new Set([
   "deploy_attempted",
   "deploy_succeeded",
   "deploy_failed",
+  "deploy_cancelled",
   "rollback_triggered",
   "first_deploy_succeeded",
 
   // Project & environment
   "project_created",
+  "project_created_from_template",
   "environment_created",
   "scale_to_zero_configured",
   "auto_deploy_enabled",
@@ -62,6 +67,11 @@ export const KNOWN_EVENT_TYPES = new Set([
 
   // Status page
   "status_page_published",
+
+  // Instance health — periodic aggregated error counts (ERROR logs by
+  // target, console-API 5xx by route template, panics by source location).
+  // Counts keyed by compile-time identifiers only; never error messages.
+  "error_summary",
 ]);
 
 interface IngestBody {

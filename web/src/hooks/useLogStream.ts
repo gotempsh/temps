@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
@@ -25,10 +28,25 @@ export interface UseLogStreamOptions {
 // they need older data.
 const DEFAULT_MAX_LOGS = 1000
 
+export function buildLogStreamUrl(
+  wsUrl: string,
+  origin: string,
+  showTimestamps: boolean,
+  tail: number
+): string {
+  const url = new URL(wsUrl, origin)
+  url.searchParams.set('timestamps', showTimestamps.toString())
+  // Bound the backlog at Docker, not only after it reaches the browser. If
+  // `tail` is omitted the API defaults to `all`, which can replay every log
+  // line from every restart before the client-side ring buffer trims it.
+  url.searchParams.set('tail', tail.toString())
+  return url.toString()
+}
+
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
-  connectionStatus: 'connecting' | 'connected' | 'error'
+  connectionStatus: 'connecting' | 'connected' | 'complete' | 'error'
   errorMessage: string
   searchTerm: string
   selectedLevels: LiveLogLevel[]
@@ -106,7 +124,7 @@ export function useLogStream({
 }: UseLogStreamOptions): UseLogStreamReturn {
   const [logs, setLogs] = useState<LiveLogLine[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
-    'connecting' | 'connected' | 'error'
+    'connecting' | 'connected' | 'complete' | 'error'
   >('connecting')
   const [errorMessage, setErrorMessage] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
@@ -134,10 +152,7 @@ export function useLogStream({
     if (selectedLevels.length === 0 && !searchTerm) return logs
     const term = searchTerm.toLowerCase()
     return logs.filter((log) => {
-      if (
-        selectedLevels.length > 0 &&
-        !selectedLevels.includes(log.level)
-      ) {
+      if (selectedLevels.length > 0 && !selectedLevels.includes(log.level)) {
         return false
       }
       if (term && !log.message.toLowerCase().includes(term)) {
@@ -200,15 +215,16 @@ export function useLogStream({
 
     try {
       // Add timestamps query parameter to request server-side timestamps
-      const url = new URL(
+      const url = buildLogStreamUrl(
         wsUrl,
         typeof window !== 'undefined'
           ? window.location.origin
-          : 'http://localhost'
+          : 'http://localhost',
+        showTimestamps,
+        maxLogs
       )
-      url.searchParams.set('timestamps', showTimestamps.toString())
 
-      const ws = new WebSocket(url.toString())
+      const ws = new WebSocket(url)
 
       ws.onopen = () => {
         setConnectionStatus('connected')
@@ -243,8 +259,14 @@ export function useLogStream({
         onError?.(msg)
       }
 
-      ws.onclose = () => {
-        setConnectionStatus('error')
+      ws.onclose = (event) => {
+        setConnectionStatus(event.code === 1000 ? 'complete' : 'error')
+        if (event.code !== 1000) {
+          const msg =
+            event.reason || `Log stream closed unexpectedly (${event.code})`
+          setErrorMessage(msg)
+          onError?.(msg)
+        }
         isConnectingRef.current = false
       }
 

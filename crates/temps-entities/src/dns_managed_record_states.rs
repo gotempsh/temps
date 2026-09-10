@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Durable allowlist of successfully synchronized managed DNS records.
 
 use async_trait::async_trait;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Real-Postgres integration test for the control-plane DNS resolver (ADR-024).
 //!
 //! Seeds one `*.temps.local` A record into a real `service_endpoints` table

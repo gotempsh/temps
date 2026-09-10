@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -48,7 +51,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { listSourceBackupsWithScan, testS3SourceConnection } from '@/lib/s3-sources'
 import { runScheduleNow } from '@/lib/schedule-runs'
-import { cn, formatBytes } from '@/lib/utils'
+import { cn, formatBytes, isPitrCapableFormat } from '@/lib/utils'
 import { iconForServiceType, serviceTypeRouteForEngine } from '@/lib/serviceIcons'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Input } from '@/components/ui/input'
@@ -75,7 +78,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
@@ -801,7 +804,7 @@ export function S3SourceDetail() {
                                   {backup.engine}
                                 </Badge>
                               ) : null}
-                              {backup.format === 'walg' ? (
+                              {isPitrCapableFormat(backup.format) ? (
                                 <Badge variant="secondary" className="text-xs">
                                   PITR
                                 </Badge>

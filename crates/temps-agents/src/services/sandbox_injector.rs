@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared injector: writes skills + MCP server config + secret mounts into
 //! a live sandbox. Used by both the agent executor and the workspace session
 //! executor. The two systems keep separate sandbox registries (one per-run,

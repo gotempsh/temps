@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Shared schedule preset options used by both CreateBackupSchedule and
  * EditBackupSchedule pages. Extracted here so the constant and its type are
@@ -24,7 +27,9 @@ export const scheduleOptions: ScheduleOption[] = [
   },
   {
     label: 'Weekly',
-    value: '0 0 0 * * 0',
+    // Named weekdays avoid the incompatible numeric conventions used by
+    // common Unix cron (0 = Sunday) and the Rust cron parser (1 = Sunday).
+    value: '0 0 0 * * SUN',
     description: 'Runs every Sunday at midnight',
   },
   {

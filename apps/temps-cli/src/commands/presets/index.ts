@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -29,6 +32,16 @@ export function registerPresetsCommands(program: Command): void {
     .action(showPresetAction)
 }
 
+/**
+ * Case-insensitive filter on `project_type` — a preset's type is compared
+ * lowercased on both sides so `--type Server` and `--type server` behave
+ * identically instead of one silently returning an empty list.
+ */
+export function filterPresetsByType(presets: PresetResponse[], type?: string): PresetResponse[] {
+  if (!type) return presets
+  return presets.filter((p) => p.project_type.toLowerCase() === type.toLowerCase())
+}
+
 async function listPresetsAction(options: { json?: boolean; type?: string }): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -41,13 +54,7 @@ async function listPresetsAction(options: { json?: boolean; type?: string }): Pr
     return data
   })
 
-  let presets = presetsData?.presets ?? []
-
-  if (options.type) {
-    presets = presets.filter(
-      (p) => p.project_type.toLowerCase() === options.type!.toLowerCase()
-    )
-  }
+  const presets = filterPresetsByType(presetsData?.presets ?? [], options.type)
 
   if (options.json) {
     json(presets)

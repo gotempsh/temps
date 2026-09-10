@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -15,8 +18,13 @@ import {
   cancelDomainOrder,
   setupDnsChallenge as setupDnsChallengeApi,
   getHttpChallengeDebug,
+  listRenewalAttempts as listRenewalAttemptsApi,
 } from '../../api/sdk.gen.js'
-import type { DomainResponse, AcmeOrderResponse, HttpChallengeDebugResponse } from '../../api/types.gen.js'
+import type {
+  DomainResponse,
+  AcmeOrderResponse,
+  RenewalAttemptResponse,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -25,13 +33,34 @@ import {
   keyValue, formatDate, box
 } from '../../ui/output.js'
 
+// Exact match only — a case-insensitive or partial match here would let
+// `domains ssl`/`domains status` silently target the wrong domain.
+export function findDomainByName(domains: DomainResponse[], domainName: string): number | null {
+  const domain = domains.find((d) => d.domain === domainName)
+  return domain?.id ?? null
+}
+
 // Helper function to find domain ID by domain name
 async function findDomainIdByName(domainName: string): Promise<number | null> {
   const { data, error } = await listDomainsApi({ client })
   if (error || !data?.domains) return null
 
-  const domain = data.domains.find((d: DomainResponse) => d.domain === domainName)
-  return domain?.id ?? null
+  return findDomainByName(data.domains, domainName)
+}
+
+// The ACME TXT record for a wildcard domain (`*.example.com`) is always
+// scoped to the base domain, never the literal `*.` name.
+export function wildcardBaseDomain(domain: string): string {
+  return domain.startsWith('*.') ? domain.slice(2) : domain
+}
+
+export function isProvisionedStatus(status: string): boolean {
+  return status === 'active' || status === 'provisioned'
+}
+
+/** Domain API timestamps are epoch milliseconds, matching JavaScript Date. */
+export function domainTimestamp(timestampMillis: number): Date {
+  return new Date(timestampMillis)
 }
 
 interface AddOptions {
@@ -57,6 +86,13 @@ interface SslOptions {
 
 interface StatusOptions {
   domain: string
+}
+
+interface RenewalAttemptsOptions {
+  domain: string
+  page?: string
+  pageSize?: string
+  json?: boolean
 }
 
 interface OrderShowOptions {
@@ -136,6 +172,15 @@ export function registerDomainsCommands(program: Command): void {
     .description('Check domain status')
     .requiredOption('-d, --domain <domain>', 'Domain name')
     .action(domainStatus)
+
+  domains
+    .command('renewal-attempts')
+    .description('Show the certificate renewal-attempt history for a domain')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
+    .option('--page <page>', 'Page number (1-indexed)', '1')
+    .option('--page-size <pageSize>', 'Items per page (max 100)', '20')
+    .option('--json', 'Output in JSON format')
+    .action(listRenewalAttempts)
 
   // --- Nested orders command group ---
   const orders = domains
@@ -218,7 +263,7 @@ async function listDomains(options: { json?: boolean }): Promise<void> {
     { header: 'Method', accessor: (d) => d.verification_method },
     {
       header: 'Expires',
-      accessor: (d) => d.expiration_time ? formatDate(new Date(d.expiration_time * 1000).toISOString()) : '-',
+      accessor: (d) => d.expiration_time ? formatDate(domainTimestamp(d.expiration_time).toISOString()) : '-',
       color: (v) => colors.muted(v)
     },
   ]
@@ -252,7 +297,7 @@ async function addDomain(options: AddOptions): Promise<void> {
   success(`Domain ${domain} added`)
 
   if (result?.dns_challenge_token && result?.dns_challenge_value) {
-    const baseDomain = domain.startsWith('*.') ? domain.slice(2) : domain
+    const baseDomain = wildcardBaseDomain(domain)
     newline()
     box(
       `Type: TXT\n` +
@@ -293,7 +338,7 @@ async function verifyDomain(options: VerifyOptions): Promise<void> {
   // Handle union type based on 'type' discriminator
   if (result.type === 'complete') {
     const domainData = result
-    if (domainData.status === 'active' || domainData.status === 'provisioned') {
+    if (isProvisionedStatus(domainData.status)) {
       success(`Domain ${domain} verified and SSL certificate provisioned`)
     } else {
       warning(`Domain status: ${domainData.status}`)
@@ -382,9 +427,9 @@ async function manageSsl(options: SslOptions): Promise<void> {
   keyValue('Status', statusBadge(sslInfo?.status ?? 'unknown'))
   keyValue('Wildcard', sslInfo?.is_wildcard ? 'Yes' : 'No')
   keyValue('Method', sslInfo?.verification_method ?? '-')
-  keyValue('Expires', sslInfo?.expiration_time ? formatDate(new Date(sslInfo.expiration_time * 1000).toISOString()) : '-')
+  keyValue('Expires', sslInfo?.expiration_time ? formatDate(domainTimestamp(sslInfo.expiration_time).toISOString()) : '-')
   if (sslInfo?.last_renewed) {
-    keyValue('Last Renewed', formatDate(new Date(sslInfo.last_renewed * 1000).toISOString()))
+    keyValue('Last Renewed', formatDate(domainTimestamp(sslInfo.last_renewed).toISOString()))
   }
   if (sslInfo?.last_error) {
     keyValue('Last Error', colors.error(sslInfo.last_error))
@@ -427,7 +472,7 @@ async function domainStatus(options: StatusOptions): Promise<void> {
     keyValue('DNS Challenge Value', status.dns_challenge_value)
   }
 
-  keyValue('Certificate Expires', status?.expiration_time ? formatDate(new Date(status.expiration_time * 1000).toISOString()) : '-')
+  keyValue('Certificate Expires', status?.expiration_time ? formatDate(domainTimestamp(status.expiration_time).toISOString()) : '-')
 
   if (status?.last_error) {
     newline()
@@ -438,6 +483,62 @@ async function domainStatus(options: StatusOptions): Promise<void> {
   }
 
   newline()
+}
+
+async function listRenewalAttempts(options: RenewalAttemptsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const page = Number.parseInt(options.page ?? '1', 10) || 1
+  const pageSize = Number.parseInt(options.pageSize ?? '20', 10) || 20
+
+  const result = await withSpinner(`Fetching renewal attempts for ${options.domain}...`, async () => {
+    const { data, error } = await listRenewalAttemptsApi({
+      client,
+      path: { domain: options.domain },
+      query: { page, page_size: pageSize },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.lock} Renewal Attempts for ${options.domain} (${result?.total ?? 0} total, page ${result?.page ?? page}/${Math.max(1, Math.ceil((result?.total ?? 0) / (result?.page_size ?? pageSize)))})`)
+
+  const attempts = result?.attempts ?? []
+  if (attempts.length === 0) {
+    info('No renewal attempts recorded for this domain')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<RenewalAttemptResponse>[] = [
+    {
+      header: 'When',
+      accessor: (a) => formatDate(new Date(a.created_at).toISOString()),
+      color: (v) => colors.muted(v),
+    },
+    { header: 'Stage', key: 'stage' },
+    { header: 'Method', key: 'verification_method' },
+    { header: 'Outcome', key: 'outcome', color: (v) => statusBadge(v) },
+    {
+      header: 'Error',
+      accessor: (a) => a.error ?? '-',
+      color: (v) => (v === '-' ? colors.muted(v) : colors.error(v)),
+    },
+  ]
+
+  printTable(attempts, columns)
+  newline()
+  if ((result?.total ?? 0) > page * pageSize) {
+    info(`Run with --page ${page + 1} to see more`)
+    newline()
+  }
 }
 
 // --- ACME Orders ---
@@ -474,12 +575,12 @@ async function listOrders(options: { json?: boolean }): Promise<void> {
     { header: 'Email', key: 'email' },
     {
       header: 'Created',
-      accessor: (o) => formatDate(new Date(o.created_at * 1000).toISOString()),
+      accessor: (o) => formatDate(domainTimestamp(o.created_at).toISOString()),
       color: (v) => colors.muted(v),
     },
     {
       header: 'Expires',
-      accessor: (o) => o.expires_at ? formatDate(new Date(o.expires_at * 1000).toISOString()) : '-',
+      accessor: (o) => o.expires_at ? formatDate(domainTimestamp(o.expires_at).toISOString()) : '-',
       color: (v) => colors.muted(v),
     },
   ]
@@ -529,10 +630,10 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
   if (order.certificate_url) {
     keyValue('Certificate URL', order.certificate_url)
   }
-  keyValue('Created', formatDate(new Date(order.created_at * 1000).toISOString()))
-  keyValue('Updated', formatDate(new Date(order.updated_at * 1000).toISOString()))
+  keyValue('Created', formatDate(domainTimestamp(order.created_at).toISOString()))
+  keyValue('Updated', formatDate(domainTimestamp(order.updated_at).toISOString()))
   if (order.expires_at) {
-    keyValue('Expires', formatDate(new Date(order.expires_at * 1000).toISOString()))
+    keyValue('Expires', formatDate(domainTimestamp(order.expires_at).toISOString()))
   }
 
   if (order.challenge_validation) {
@@ -636,11 +737,11 @@ async function finalizeOrder(options: OrderFinalizeOptions): Promise<void> {
   }
 
   newline()
-  if (result.status === 'active' || result.status === 'provisioned') {
+  if (isProvisionedStatus(result.status)) {
     success(`ACME order finalized for ${result.domain}`)
     keyValue('Status', statusBadge(result.status))
     if (result.expiration_time) {
-      keyValue('Certificate Expires', formatDate(new Date(result.expiration_time * 1000).toISOString()))
+      keyValue('Certificate Expires', formatDate(domainTimestamp(result.expiration_time).toISOString()))
     }
   } else {
     warning(`Order finalization returned status: ${result.status}`)

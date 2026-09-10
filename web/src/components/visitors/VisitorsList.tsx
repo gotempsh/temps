@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getVisitorFacetsOptions,
   getVisitorsOptions,
@@ -49,7 +52,7 @@ import {
   X,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FacetCombobox, type FacetOption } from './FacetCombobox'
 

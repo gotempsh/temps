@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   acknowledgeAlarmMutation,
   getProjectAlarmsSummaryOptions,
@@ -6,11 +9,18 @@ import {
   listProjectAlarmsOptions,
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
+  silenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AlarmResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
   Select,
@@ -33,10 +43,17 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { AlarmClock, Check, CheckCircle2, X } from 'lucide-react'
+import { AlarmClock, BellOff, Check, CheckCircle2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+
+const SILENCE_OPTIONS = [
+  { label: '1 hour', hours: 1 },
+  { label: '4 hours', hours: 4 },
+  { label: '24 hours', hours: 24 },
+  { label: '7 days', hours: 24 * 7 },
+] as const
 
 const PAGE_SIZE = 20
 const ALL = '__all__'
@@ -85,6 +102,12 @@ function statusBadge(status: string) {
   }
 }
 
+function isSilenced(alarm: AlarmResponse): boolean {
+  return (
+    !!alarm.silenced_until && new Date(alarm.silenced_until).getTime() > Date.now()
+  )
+}
+
 function scopeLabel(alarm: AlarmResponse): string {
   const parts: string[] = []
   if (alarm.environment_id != null) parts.push(`env #${alarm.environment_id}`)
@@ -96,7 +119,7 @@ function scopeLabel(alarm: AlarmResponse): string {
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
-export function Alarms() {
+export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
   usePageTitle('Alarms')
@@ -120,7 +143,7 @@ export function Alarms() {
       const raw = searchParams.get('project_id')
       const n = raw ? Number(raw) : NaN
       return Number.isFinite(n) ? n : null
-    },
+    }
   )
   const [status, setStatus] = useState<string>(ALL)
   const [severity, setSeverity] = useState<string>(ALL)
@@ -128,24 +151,32 @@ export function Alarms() {
   const [page, setPage] = useState(1)
 
   const { data: projectsData, isLoading: projectsLoading } = useQuery(
-    getProjectsOptions({ query: { per_page: 100 } }),
+    getProjectsOptions({ query: { per_page: 100 } })
   )
-  const projects = projectsData?.projects ?? []
+  const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
+  const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
+  const hasProject = effectiveProjectId != null
+  const projectPath = { project_id: effectiveProjectId ?? 0 }
 
-  // Default to the first project once the list loads.
-  useEffect(() => {
-    if (selectedProjectId == null && projects.length > 0) {
-      setSelectedProjectId(projects[0].id)
-    }
-  }, [projects, selectedProjectId])
-
-  // Reset to the first page whenever filters or the project change.
-  useEffect(() => {
+  const selectProject = (projectId: number) => {
+    setSelectedProjectId(projectId)
     setPage(1)
-  }, [selectedProjectId, status, severity, alarmType])
+  }
 
-  const hasProject = selectedProjectId != null
-  const projectPath = { project_id: selectedProjectId ?? 0 }
+  const selectStatus = (value: string) => {
+    setStatus(value)
+    setPage(1)
+  }
+
+  const selectSeverity = (value: string) => {
+    setSeverity(value)
+    setPage(1)
+  }
+
+  const selectAlarmType = (value: string) => {
+    setAlarmType(value)
+    setPage(1)
+  }
 
   const { data: summary } = useQuery({
     ...getProjectAlarmsSummaryOptions({ path: projectPath }),
@@ -190,7 +221,8 @@ export function Alarms() {
       toast.success('Alarm acknowledged')
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to acknowledge: ${err.message}`),
+    onError: (err: Error) =>
+      toast.error(`Failed to acknowledge: ${err.message}`),
   })
 
   const resolve = useMutation({
@@ -202,11 +234,23 @@ export function Alarms() {
     onError: (err: Error) => toast.error(`Failed to resolve: ${err.message}`),
   })
 
+  const silence = useMutation({
+    ...silenceAlarmMutation(),
+    onSuccess: (_data, variables) => {
+      const hours = variables.body?.duration_hours ?? 0
+      const label =
+        SILENCE_OPTIONS.find((o) => o.hours === hours)?.label ?? `${hours}h`
+      toast.success(`Alarm silenced for ${label}`)
+      invalidate()
+    },
+    onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
+  })
+
   const items = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
-  const isMutating = acknowledge.isPending || resolve.isPending
+  const isMutating = acknowledge.isPending || resolve.isPending || silence.isPending
 
   // Once the deep-linked alarm's row is on the page, scroll it into view. The
   // row itself keeps a persistent highlight (below) while the param is present.
@@ -245,17 +289,26 @@ export function Alarms() {
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
-          <p className="text-sm text-muted-foreground">
-            Firing history across metrics, containers, uptime, and databases —
-            acknowledge or resolve from one place.
-          </p>
-        </div>
+      <div
+        className={cn(
+          'flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between',
+          embedded && 'justify-end sm:justify-end'
+        )}
+      >
+        {!embedded && (
+          <div className="flex flex-col gap-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
+            <p className="text-sm text-muted-foreground">
+              Firing history across metrics, containers, uptime, and databases —
+              acknowledge or resolve from one place.
+            </p>
+          </div>
+        )}
         <Select
-          value={selectedProjectId != null ? String(selectedProjectId) : undefined}
-          onValueChange={(v) => setSelectedProjectId(Number(v))}
+          value={
+            effectiveProjectId != null ? String(effectiveProjectId) : undefined
+          }
+          onValueChange={(v) => selectProject(Number(v))}
           disabled={projectsLoading || projects.length === 0}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
@@ -279,7 +332,9 @@ export function Alarms() {
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 {c.label}
               </p>
-              <p className={`mt-1 text-2xl font-semibold tabular-nums ${c.tone}`}>
+              <p
+                className={`mt-1 text-2xl font-semibold tabular-nums ${c.tone}`}
+              >
                 {c.value}
               </p>
             </CardContent>
@@ -291,7 +346,7 @@ export function Alarms() {
       <Card>
         <CardContent className="p-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <Select value={status} onValueChange={setStatus}>
+            <Select value={status} onValueChange={selectStatus}>
               <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Status" />
               </SelectTrigger>
@@ -303,7 +358,7 @@ export function Alarms() {
               </SelectContent>
             </Select>
 
-            <Select value={severity} onValueChange={setSeverity}>
+            <Select value={severity} onValueChange={selectSeverity}>
               <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
@@ -317,7 +372,7 @@ export function Alarms() {
 
             <Select
               value={alarmType}
-              onValueChange={setAlarmType}
+              onValueChange={selectAlarmType}
               disabled={typeOptions.length === 0}
             >
               <SelectTrigger className="w-full sm:w-[200px]">
@@ -419,7 +474,7 @@ export function Alarms() {
                     data-alarm-id={alarm.id}
                     className={cn(
                       deepLinkAlarmId === alarm.id &&
-                        'bg-primary/5 ring-1 ring-inset ring-primary/40',
+                        'bg-primary/5 ring-1 ring-inset ring-primary/40'
                     )}
                   >
                     <TableCell>{severityBadge(alarm.severity)}</TableCell>
@@ -437,7 +492,27 @@ export function Alarms() {
                     <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
                       {scopeLabel(alarm)}
                     </TableCell>
-                    <TableCell>{statusBadge(alarm.status)}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-col gap-1">
+                        {statusBadge(alarm.status)}
+                        {isSilenced(alarm) && (
+                          <span
+                            className="flex items-center gap-1 text-[11px] text-muted-foreground"
+                            title={format(
+                              new Date(alarm.silenced_until as string),
+                              'PPpp'
+                            )}
+                          >
+                            <BellOff className="h-3 w-3" />
+                            Silenced{' '}
+                            {formatDistanceToNow(
+                              new Date(alarm.silenced_until as string),
+                              { addSuffix: true }
+                            )}
+                          </span>
+                        )}
+                      </div>
+                    </TableCell>
                     <TableCell
                       className="hidden text-right text-xs text-muted-foreground md:table-cell"
                       title={format(new Date(alarm.fired_at), 'PPpp')}
@@ -456,7 +531,7 @@ export function Alarms() {
                             onClick={() =>
                               acknowledge.mutate({
                                 path: {
-                                  project_id: selectedProjectId ?? 0,
+                                  project_id: effectiveProjectId ?? 0,
                                   alarm_id: alarm.id,
                                 },
                               })
@@ -474,7 +549,7 @@ export function Alarms() {
                             onClick={() =>
                               resolve.mutate({
                                 path: {
-                                  project_id: selectedProjectId ?? 0,
+                                  project_id: effectiveProjectId ?? 0,
                                   alarm_id: alarm.id,
                                 },
                               })
@@ -483,6 +558,38 @@ export function Alarms() {
                             <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
                             Resolve
                           </Button>
+                        )}
+                        {alarm.status !== 'resolved' && (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isMutating}
+                              >
+                                <BellOff className="mr-1 h-3.5 w-3.5" />
+                                Silence
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              {SILENCE_OPTIONS.map((opt) => (
+                                <DropdownMenuItem
+                                  key={opt.hours}
+                                  onClick={() =>
+                                    silence.mutate({
+                                      path: {
+                                        project_id: effectiveProjectId ?? 0,
+                                        alarm_id: alarm.id,
+                                      },
+                                      body: { duration_hours: opt.hours },
+                                    })
+                                  }
+                                >
+                                  {opt.label}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         )}
                       </div>
                     </TableCell>

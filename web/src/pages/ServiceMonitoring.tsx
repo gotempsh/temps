@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * ServiceMonitoring — full-page metrics dashboard for a single external service.
  *
@@ -11,7 +14,12 @@
  */
 
 import { Button } from '@/components/ui/button'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  TOOLTIP_CONTENT_STYLE,
+  TOOLTIP_LABEL_STYLE,
+  formatChartTick,
+  formatChartTooltipLabel,
+} from '@/lib/chart-tooltip'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -59,7 +67,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {
@@ -72,6 +80,11 @@ import {
   CartesianGrid,
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
+import {
+  SERVICE_ALERT_COMPARATOR_OPTIONS,
+  type ServiceAlertComparator,
+} from '@/lib/service-alert-comparator'
+import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -81,10 +94,10 @@ import { formatBytes } from '@/lib/utils'
  *  `metrics/latest` endpoint returns. */
 type MetricLatest = { name: string; value: number }
 
-/** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
- *  plain strings; these constrain the UI selects to the supported values. */
-type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
-type Severity = 'info' | 'warning' | 'critical'
+/** Alert-rule form-state union for `severity`. The API accepts it as a plain
+ *  string; this constrains the UI select to the supported values.
+ *  `comparator` has its own type — see `@/lib/service-alert-comparator`. */
+type Severity = 'warning' | 'critical'
 
 /** Extract a comparable message from whatever the SDK throws on a failed
  *  request. `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
@@ -331,6 +344,18 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
   ],
 }
 
+// Container resource metrics — CPU/memory of the docker container(s) backing
+// the service, sampled every ~30s by the health monitor. Engine-agnostic, so
+// this group is shown for every engine (prepended in MonitoringDashboard).
+const RESOURCES_GROUP: MetricGroup = {
+  title: 'Resources',
+  metrics: [
+    'container.cpu_percent',
+    'container.memory_used_bytes',
+    'container.memory_percent',
+  ],
+}
+
 // Per-database Postgres metric groups, shown in the dedicated "Databases"
 // section with a database selector. Each metric is emitted once per `datname`
 // plus an instance-wide aggregate (selector value "All databases"). Order /
@@ -374,6 +399,7 @@ const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
     [
+      ...RESOURCES_GROUP.metrics,
       ...groups.flatMap((g) => g.metrics),
       ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
     ],
@@ -468,6 +494,11 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
+  // Container resources (all engines) — sampled from docker stats. CPU uses
+  // the docker CLI convention: 100% == one core fully used.
+  'container.cpu_percent': 'CPU',
+  'container.memory_used_bytes': 'Memory',
+  'container.memory_percent': 'Memory %',
   // Postgres connections — "Total" is the headline (client backends only;
   // engine background processes are excluded by the collector).
   'pg.connections': 'Connections',
@@ -642,10 +673,7 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
   })
 
   const chartData = (data ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
+    time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
@@ -682,10 +710,12 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
         />
         <XAxis
           dataKey="time"
+          type="number"
+          domain={['dataMin', 'dataMax']}
           tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
           tickLine={false}
           axisLine={false}
-          interval="preserveStartEnd"
+          tickFormatter={formatChartTick}
         />
         <YAxis
           tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -708,6 +738,7 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           labelStyle={TOOLTIP_LABEL_STYLE}
           itemStyle={{ color: CHART_LINE_COLOR }}
           cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
+          labelFormatter={(label) => formatChartTooltipLabel(Number(label))}
           formatter={(v) => [
             formatMetricValue(metricName, Number(v)),
             labelForMetric(metricName),
@@ -748,7 +779,7 @@ function AddAlertRuleDialog({
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
   const [threshold, setThreshold] = useState('0')
-  const [comparator, setComparator] = useState<Comparator>('gt')
+  const [comparator, setComparator] = useState<ServiceAlertComparator>('>')
   const [severity, setSeverity] = useState<Severity>('warning')
 
   const create = useMutation({
@@ -761,7 +792,9 @@ function AddAlertRuleDialog({
       setThreshold('0')
     },
     onError: (err: Error) =>
-      toast.error('Failed to create alert rule', { description: err.message }),
+      toast.error('Failed to create alert rule', {
+        description: metricsErrorText(err),
+      }),
   })
 
   return (
@@ -775,21 +808,28 @@ function AddAlertRuleDialog({
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-name"
+              className="text-sm font-medium text-foreground"
+            >
               Rule name
             </label>
             <Input
+              id="alert-rule-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. High connection count"
             />
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-metric"
+              className="text-sm font-medium text-foreground"
+            >
               Metric
             </label>
             <Select value={metricName} onValueChange={setMetricName}>
-              <SelectTrigger>
+              <SelectTrigger id="alert-rule-metric" aria-label="Metric">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -803,29 +843,42 @@ function AddAlertRuleDialog({
           </div>
           <div className="flex gap-3">
             <div className="w-32 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">
+              <label
+                htmlFor="alert-rule-comparator"
+                className="text-sm font-medium text-foreground"
+              >
                 Comparator
               </label>
               <Select
                 value={comparator}
-                onValueChange={(v) => setComparator(v as Comparator)}
+                onValueChange={(v) =>
+                  setComparator(v as ServiceAlertComparator)
+                }
               >
-                <SelectTrigger>
+                <SelectTrigger
+                  id="alert-rule-comparator"
+                  aria-label="Comparator"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="gt">&gt; greater than</SelectItem>
-                  <SelectItem value="gte">&ge; greater or equal</SelectItem>
-                  <SelectItem value="lt">&lt; less than</SelectItem>
-                  <SelectItem value="lte">&le; less or equal</SelectItem>
+                  {SERVICE_ALERT_COMPARATOR_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
             <div className="flex-1 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">
+              <label
+                htmlFor="alert-rule-threshold"
+                className="text-sm font-medium text-foreground"
+              >
                 Threshold
               </label>
               <Input
+                id="alert-rule-threshold"
                 type="number"
                 value={threshold}
                 onChange={(e) => setThreshold(e.target.value)}
@@ -833,18 +886,20 @@ function AddAlertRuleDialog({
             </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-severity"
+              className="text-sm font-medium text-foreground"
+            >
               Severity
             </label>
             <Select
               value={severity}
               onValueChange={(v) => setSeverity(v as Severity)}
             >
-              <SelectTrigger>
+              <SelectTrigger id="alert-rule-severity" aria-label="Severity">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="info">Info</SelectItem>
                 <SelectItem value="warning">Warning</SelectItem>
                 <SelectItem value="critical">Critical</SelectItem>
               </SelectContent>
@@ -1191,7 +1246,9 @@ function MonitoringDashboard({
   latestMetrics,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
-  const groups = ENGINE_GROUPS[engine]
+  // Container CPU/memory first — resource saturation is the first thing an
+  // operator checks — then the engine-specific groups.
+  const groups = [RESOURCES_GROUP, ...ENGINE_GROUPS[engine]]
   const heroMetrics = HERO_METRICS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(
@@ -1322,6 +1379,8 @@ function MonitoringDashboard({
         />
       )}
 
+      {/* Slow queries moved to the dedicated Query Performance page */}
+
       {/* Alert rules */}
       <AlertRulesSection serviceId={serviceId} engine={engine} />
     </div>
@@ -1402,6 +1461,11 @@ export function ServiceMonitoring() {
     refetchInterval,
   })
   const lastReceivedAt = statusData?.last_received_at ?? null
+  const freshnessSummary = telemetryFreshnessSummary(
+    engine,
+    latestMetrics?.map((metric) => metric.name) ?? [],
+    lastReceivedAt ? formatRelativeTime(lastReceivedAt) : null
+  )
 
   const handleRefresh = () => {
     refetch()
@@ -1447,10 +1511,9 @@ export function ServiceMonitoring() {
               </h1>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Real-time metrics and performance monitoring
-                {lastReceivedAt && (
+                {freshnessSummary && (
                   <span>
-                    {' '}
-                    · last received {formatRelativeTime(lastReceivedAt)}
+                    {' '}· {freshnessSummary}
                   </span>
                 )}
               </p>

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Agent — lightweight HTTP server wrapping the local Docker runtime.
 //!
 //! Runs on worker nodes. Exposes a small bearer-token–authenticated API that
@@ -5,9 +8,11 @@
 //! and external services.
 
 pub mod auth;
+mod exec_timeout;
 pub mod handlers;
 pub mod internal_proxy;
 pub mod network_sync;
+mod output_buffer;
 pub mod route_store;
 pub mod route_sync_client;
 pub mod server;
@@ -67,6 +72,12 @@ pub struct NodeHealthReport {
     pub disk_total_bytes: u64,
     /// Number of running containers
     pub running_containers: u64,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). The control plane reads this as a fallback when the
+    /// `nodes` row has no architecture yet (agent upgraded but not yet
+    /// heartbeated), so it can validate an image before transferring it.
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Configuration for the agent server.
@@ -105,6 +116,48 @@ pub struct AgentConfig {
     /// verifies the control plane's client certificate.
     #[serde(default)]
     pub cluster_ca_path: Option<std::path::PathBuf>,
+    /// Refuse to start the agent listener without a complete mTLS identity.
+    /// Newly enrolled workers set this to `true`. The serde default remains
+    /// `false` so legacy `agent.json` files can be upgraded deliberately.
+    #[serde(default)]
+    pub require_mtls: bool,
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. `enp6s0`). `None` (the default) auto-detects the
+    /// device carrying the host's IPv4 default route at startup — set
+    /// this only when a host has multiple candidate interfaces and the
+    /// default route doesn't point at the one that should carry overlay
+    /// traffic. `#[serde(default)]` so older `agent.json` files without
+    /// this field still parse.
+    #[serde(default)]
+    pub underlay_dev: Option<String>,
+    /// Optional MTU ceiling for the selected underlay. When absent, the
+    /// agent reads the interface MTU from the kernel. A configured value can
+    /// lower that detected ceiling for tunnels with a smaller path MTU, but
+    /// it can never raise the overlay beyond what the link supports.
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
+    /// This node's private/underlay address as registered with the control
+    /// plane (`nodes.private_address`) — the WireGuard tunnel IP assigned by
+    /// the relay, or the user-supplied address in direct mode. Always an IP
+    /// already bound to a local interface by the time `temps agent` starts,
+    /// since relay mode configures the WireGuard interface and direct mode
+    /// requires the operator's networking to already own it.
+    ///
+    /// Used to bind published Docker container ports to this address
+    /// instead of `0.0.0.0`, so deployed app containers are reachable only
+    /// over the private/overlay network (where the control-plane proxy
+    /// connects from) and never on the node's public interface.
+    /// `#[serde(default)]` so `agent.json` files saved before this field
+    /// existed still parse as `None` rather than failing deserialization —
+    /// but `temps agent`'s config resolution then hard-errors at startup
+    /// when it's missing (see `resolve_config` in `temps-cli`), directing
+    /// the operator to re-run `temps join`. There is no insecure fallback:
+    /// `build_router`'s own defensive fallback for a `None` config
+    /// substitutes loopback (`127.0.0.1`), never `0.0.0.0` — and is
+    /// unreachable in the real `temps agent` binary, since `resolve_config`
+    /// always rejects a `None` config before `build_router` is called.
+    #[serde(default)]
+    pub private_address: Option<String>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -391,11 +444,48 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             cluster_ca_path: None,
+            require_mtls: false,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: Some("10.100.0.2".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
+        assert!(!parsed.require_mtls);
+        assert_eq!(parsed.private_address.as_deref(), Some("10.100.0.2"));
+    }
+
+    #[test]
+    fn test_agent_config_without_private_address_remains_compatible() {
+        let json = r#"{
+            "listen_address": "0.0.0.0:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.private_address, None);
+    }
+
+    #[test]
+    fn test_agent_config_without_underlay_mtu_remains_compatible() {
+        let json = r#"{
+            "listen_address":"0.0.0.0:3100",
+            "token":"test-token",
+            "node_name":"worker-1",
+            "control_plane_url":"https://control:3000",
+            "node_id":1,
+            "labels":{},
+            "dns_data_dir":"/tmp/temps-dns"
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.underlay_mtu, None);
+        assert!(!parsed.require_mtls);
     }
 }

@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 use std::env::consts::{ARCH, OS};
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Seek, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
@@ -27,45 +32,92 @@ pub enum UpgradeTier {
 /// available GitHub releases through this channel before selecting the
 /// newest, so a host on `Stable` never auto-upgrades onto a beta tag.
 /// Pre-release tags carry a `-` (`v1.2.0-beta.4`, `v1.2.0-rc.1`); stable
-/// tags don't (`v1.2.0`).
+/// tags don't (`v1.2.0`). Nightly tags are a distinct kind of prerelease,
+/// identified by a `-nightly.` segment (`v1.2.0-nightly.20260727.abc1234`),
+/// minted automatically by CI — see `is_nightly_tag`.
 ///
 /// Channel selection is **CLI-only** — there is no env-var fallback. The
 /// default is `Stable` and the user must explicitly pass `--channel beta`
-/// to opt into prereleases. This is by design: an env var on a long-lived
-/// shell or CI runner could silently switch a host onto beta without an
-/// audit trail, which we want to prevent. Pinning a specific `--version`
-/// ignores the channel entirely.
+/// or `--channel nightly` to opt into prereleases. This is by design: an
+/// env var on a long-lived shell or CI runner could silently switch a host
+/// onto beta/nightly without an audit trail, which we want to prevent.
+/// Pinning a specific `--version` ignores the channel entirely.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum UpgradeChannel {
     /// Track stable releases only (default). Tag must NOT contain `-`.
     Stable,
-    /// Track beta releases. Includes any prerelease tag (anything with `-`).
+    /// Track beta releases: any prerelease tag EXCEPT nightly builds.
     /// `Beta` selects the newest of stable + beta, so a beta host receives
     /// stable releases too — they're considered an upgrade from the latest
-    /// beta on the same line.
+    /// beta on the same line. Nightly builds are excluded so an operator who
+    /// opts into a deliberate `-beta.N` cut never silently lands on an
+    /// automated nightly instead.
     Beta,
+    /// Track nightly builds only: tags containing `-nightly.`, cut
+    /// automatically once a day from `main` when it has new commits. The
+    /// least stable channel — intended for testing unreleased work, not
+    /// production hosts.
+    Nightly,
+}
+
+/// Is this tag a nightly build (minted by the `Nightly Release` CI workflow)?
+/// Nightly tags look like `v0.1.0-nightly.20260727.abc1234` — the
+/// `-nightly.` marker distinguishes them from a deliberate `-beta.N` cut.
+fn is_nightly_tag(tag: &str) -> bool {
+    tag.contains("-nightly.")
 }
 
 impl UpgradeChannel {
-    fn as_str(self) -> &'static str {
+    /// Parse a channel configured in settings. Unknown values return `None` so
+    /// the caller falls back to inferring from the running version rather than
+    /// silently tracking the wrong channel.
+    pub fn from_setting(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            "nightly" => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
             Self::Beta => "beta",
+            Self::Nightly => "nightly",
         }
     }
 
     /// Does this release belong to this channel?
     /// - Stable: only non-prerelease tags. `v1.2.0` matches; `v1.2.0-beta.4` does not.
-    /// - Beta: any non-draft tag. Both stable AND beta releases qualify, so
-    ///   a beta host always sees the freshest available version regardless of
-    ///   whether it was promoted to stable or not.
+    /// - Beta: any non-draft prerelease-or-stable tag EXCEPT nightly builds.
+    /// - Nightly: only tags with a `-nightly.` marker.
     fn includes(self, release: &GitHubRelease) -> bool {
         if release.draft {
             return false;
         }
+        let nightly = is_nightly_tag(&release.tag_name);
         match self {
             Self::Stable => !release.prerelease,
-            Self::Beta => true,
+            Self::Beta => !nightly,
+            Self::Nightly => nightly,
+        }
+    }
+
+    /// Infer the channel an *installed* binary is on from its version tag.
+    /// A `-nightly.` tag means the host opted into nightly; any other
+    /// prerelease tag (`v1.2.0-beta.4` — anything with a `-` after the core
+    /// version) means the host opted into beta at install/upgrade time; a
+    /// plain tag (`v1.2.0`) means stable. Used by the startup update
+    /// notifier, which has no `--channel` flag to consult.
+    pub fn for_installed_version(tag: &str) -> Self {
+        let core = tag.trim().trim_start_matches('v');
+        if is_nightly_tag(tag) {
+            Self::Nightly
+        } else if core.contains('-') {
+            Self::Beta
+        } else {
+            Self::Stable
         }
     }
 }
@@ -74,7 +126,9 @@ impl UpgradeChannel {
 #[derive(Args)]
 pub struct UpgradeCommand {
     /// Release channel to track. Default: `stable`. Pass `--channel beta`
-    /// to opt into prereleases. Pinning a `--version` ignores the channel.
+    /// to opt into prereleases, or `--channel nightly` to track automated
+    /// nightly builds cut from `main`. Pinning a `--version` ignores the
+    /// channel.
     #[arg(long, value_enum)]
     pub channel: Option<UpgradeChannel>,
 
@@ -121,7 +175,13 @@ pub struct UpgradeCommand {
     /// is also copied to `<data-dir>/data/license.jwt` and, if a systemd
     /// unit exists, the unit's `TEMPS_EE_LICENSE_PATH` env is updated so
     /// the binary finds its license on every restart.
-    #[arg(long)]
+    ///
+    /// Also readable from `TEMPS_EE_LICENSE_PATH` -- the same env var an
+    /// EE binary's own startup gate reads, so one value covers both "the
+    /// license this running binary starts with" and "the license to
+    /// install for this upgrade" when they're the same file, which they
+    /// almost always are.
+    #[arg(long, env = "TEMPS_EE_LICENSE_PATH")]
     pub license_path: Option<PathBuf>,
 
     /// Base URL of the Temps Cloud EE proxy (`--tier ee` only). Defaults to
@@ -146,9 +206,9 @@ pub struct GitHubRelease {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
+    pub(crate) name: String,
+    pub(crate) browser_download_url: String,
+    pub(crate) size: u64,
 }
 
 impl UpgradeCommand {
@@ -239,6 +299,17 @@ impl UpgradeCommand {
             return Ok(());
         }
 
+        // Channel selection is not permission to go backwards. This matters
+        // when a beta installation runs plain `temps upgrade`: the newest
+        // stable release can be older than the installed beta. An explicit
+        // --version remains the deliberate escape hatch for rollback.
+        ensure_implicit_upgrade_is_not_downgrade(
+            self.version.as_deref(),
+            channel,
+            &current_version,
+            latest_version,
+        )?;
+
         // Find the matching asset
         let tarball_name = format!("temps-{}.tar.gz", target);
         let asset = release
@@ -304,9 +375,32 @@ impl UpgradeCommand {
         // Check write permissions before downloading
         check_write_permission(&binary_path)?;
 
+        let parent = binary_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of binary"))?
+            .to_path_buf();
+
+        // The whole upgrade streams through disk. The tarball is ~110 MB and
+        // the binary inside it ~270 MB; buffering either one meant a peak well
+        // past half a gigabyte, which on a 1 GB host with the server running
+        // pushes the box into swap thrashing.
+        //
+        // The tarball is staged to disk rather than piped straight into the
+        // untar because the checksum has to be verified BEFORE any of those
+        // bytes are unpacked. A direct download -> gunzip -> tar -> binary
+        // pipeline would save the 110 MB of scratch disk but would write
+        // unverified content over the live executable.
+        let mut download_file = create_upgrade_temp_file(&parent, ".temps-upgrade-dl.")?;
+        let download_path = download_file.path().to_path_buf();
+
         // Download the tarball
         println!("  Downloading {}...", tarball_name);
-        let tarball_bytes = download_asset(&asset.browser_download_url).await?;
+        let computed = download_asset_to_file(
+            &asset.browser_download_url,
+            download_file.as_file_mut(),
+            &download_path,
+        )
+        .await?;
 
         // Also download the checksum
         let checksum_name = format!("{}.sha256", tarball_name);
@@ -315,19 +409,32 @@ impl UpgradeCommand {
         if let Some(checksum_asset) = checksum_asset {
             debug!("Verifying checksum...");
             let checksum_text = download_asset_text(&checksum_asset.browser_download_url).await?;
-            verify_checksum(&tarball_bytes, &checksum_text)?;
+            verify_computed_checksum(&computed, &checksum_text)?;
             println!("  Checksum verified.");
         } else {
             debug!("No checksum asset found, skipping verification");
         }
 
-        // Extract the binary from the tarball
+        // Extract the binary from the tarball, straight into the staging file
+        // that the atomic rename below consumes.
         println!("  Extracting binary...");
-        let new_binary = extract_binary_from_tarball(&tarball_bytes)?;
+        let mut staged_file = create_upgrade_temp_file(&parent, ".temps-upgrade-bin.")?;
+        let staged_path = staged_file.path().to_path_buf();
+        extract_binary_from_tarball_file(
+            download_file.as_file_mut(),
+            &download_path,
+            staged_file.as_file_mut(),
+            &staged_path,
+        )?;
+
+        // Close the writable staging handle before the file can ever be
+        // executed. This is also required by the in-process updater's
+        // preflight: Unix rejects an executable that is still open for write.
+        let staged_path = seal_staged_binary(staged_file)?;
 
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
-        replace_binary(&binary_path, &new_binary)?;
+        finalize_staged_binary(&binary_path, staged_path)?;
 
         println!();
         println!(
@@ -458,16 +565,43 @@ impl UpgradeCommand {
         println!("  Verifying checksum...");
         let expected = fetch_ee_checksum(&api, &version, &asset, &license_jwt).await?;
 
+        let parent = binary_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of binary"))?
+            .to_path_buf();
+
+        // Same streaming shape as the OSS path, and for the same reason: see
+        // the comment in `run_oss`.
+        let mut download_file = create_upgrade_temp_file(&parent, ".temps-upgrade-dl.")?;
+        let download_path = download_file.path().to_path_buf();
+
         println!("  Downloading {}...", asset);
-        let tarball = download_ee_asset(&api, &version, &asset, &license_jwt).await?;
-        verify_checksum(&tarball, &expected)?;
+        let computed = download_ee_asset_to_file(
+            &api,
+            &version,
+            &asset,
+            &license_jwt,
+            download_file.as_file_mut(),
+            &download_path,
+        )
+        .await?;
+        verify_computed_checksum(&computed, &expected)?;
         println!("  Checksum verified.");
 
         println!("  Extracting binary...");
-        let new_binary = extract_binary_from_tarball(&tarball)?;
+        let mut staged_file = create_upgrade_temp_file(&parent, ".temps-upgrade-bin.")?;
+        let staged_path = staged_file.path().to_path_buf();
+        extract_binary_from_tarball_file(
+            download_file.as_file_mut(),
+            &download_path,
+            staged_file.as_file_mut(),
+            &staged_path,
+        )?;
+
+        let staged_path = seal_staged_binary(staged_file)?;
 
         println!("  Replacing binary at {}...", binary_path.display());
-        replace_binary(&binary_path, &new_binary)?;
+        finalize_staged_binary(&binary_path, staged_path)?;
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -570,8 +704,284 @@ pub fn current_version_tag() -> String {
     version.to_string()
 }
 
+/// How long a single background update check may take before it's abandoned.
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Delay before the first startup check so it never competes with startup
+/// work (DB migrations, plugin init, proxy bind) for I/O or log attention.
+const UPDATE_CHECK_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default re-check interval. Two hours stays comfortably below GitHub's
+/// unauthenticated API limit while surfacing releases promptly.
+const DEFAULT_UPDATE_CHECK_INTERVAL_HOURS: u64 = 2;
+const DEFAULT_UPDATE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(DEFAULT_UPDATE_CHECK_INTERVAL_HOURS * 60 * 60);
+const UPDATE_CHECK_INTERVAL_ENV: &str = "TEMPS_UPDATE_CHECK_INTERVAL_HOURS";
+const MIN_UPDATE_CHECK_INTERVAL_HOURS: u64 = 1;
+const MAX_UPDATE_CHECK_INTERVAL_HOURS: u64 = 168;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum UpdateCheckIntervalError {
+    #[error("value '{value}' is not a whole number of hours")]
+    InvalidNumber { value: String },
+    #[error("{hours} hours is outside the supported range 1..=168")]
+    OutOfRange { hours: u64 },
+    #[error("value is not valid UTF-8")]
+    NotUnicode,
+}
+
+fn parse_update_check_interval_hours(value: &str) -> Result<u64, UpdateCheckIntervalError> {
+    let hours =
+        value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| UpdateCheckIntervalError::InvalidNumber {
+                value: value.to_string(),
+            })?;
+    if !(MIN_UPDATE_CHECK_INTERVAL_HOURS..=MAX_UPDATE_CHECK_INTERVAL_HOURS).contains(&hours) {
+        return Err(UpdateCheckIntervalError::OutOfRange { hours });
+    }
+    Ok(hours)
+}
+
+pub fn configured_update_check_interval() -> std::time::Duration {
+    let configured_hours = match std::env::var(UPDATE_CHECK_INTERVAL_ENV) {
+        Ok(value) => match parse_update_check_interval_hours(&value) {
+            Ok(hours) => hours,
+            Err(error) => {
+                tracing::warn!(
+                    variable = UPDATE_CHECK_INTERVAL_ENV,
+                    value = %value,
+                    error = %error,
+                    default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                    "Invalid update-check interval; using the default"
+                );
+                return DEFAULT_UPDATE_CHECK_INTERVAL;
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            let error = UpdateCheckIntervalError::NotUnicode;
+            tracing::warn!(
+                variable = UPDATE_CHECK_INTERVAL_ENV,
+                error = %error,
+                default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                "Invalid update-check interval; using the default"
+            );
+            return DEFAULT_UPDATE_CHECK_INTERVAL;
+        }
+    };
+    let interval = std::time::Duration::from_secs(configured_hours * 60 * 60);
+    tracing::info!(
+        interval_hours = configured_hours,
+        variable = UPDATE_CHECK_INTERVAL_ENV,
+        "Release update-check cadence configured"
+    );
+    interval
+}
+
+/// A newer release the background notifier found for this install's channel.
+pub struct UpdateNotice {
+    pub current_version: String,
+    pub latest_version: String,
+    pub channel: UpgradeChannel,
+    /// GitHub release page (release notes) for the newer version.
+    pub release_url: String,
+}
+
+/// Prerelease identifier with semver §11 ordering: numeric identifiers
+/// compare numerically and rank below alphanumeric ones (`Num` before
+/// `Alpha` in the enum gives that via derived `Ord`).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreIdent {
+    Num(u64),
+    Alpha(String),
+}
+
+/// Sort key for a `vMAJOR.MINOR.PATCH[-pre]` tag, ordered per semver:
+/// core version first, then "release beats prerelease" (the `bool`), then
+/// prerelease identifiers element-wise (a longer identifier list wins a
+/// shared prefix, which is exactly `Vec`'s derived ordering).
+type VersionSortKey = ((u64, u64, u64), bool, Vec<PreIdent>);
+
+/// Parse a tag into its ordering key. `None` when the tag isn't
+/// version-shaped — callers must treat that as "not comparable", never as
+/// older or newer.
+fn version_sort_key(tag: &str) -> Option<VersionSortKey> {
+    let v = tag.trim().trim_start_matches('v');
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (is_release, idents) = match pre {
+        None => (true, Vec::new()),
+        Some(p) => (
+            false,
+            p.split('.')
+                .map(|ident| {
+                    ident
+                        .parse::<u64>()
+                        .map(PreIdent::Num)
+                        .unwrap_or_else(|_| PreIdent::Alpha(ident.to_string()))
+                })
+                .collect(),
+        ),
+    };
+    Some(((major, minor, patch), is_release, idents))
+}
+
+/// Is `candidate` strictly newer than `current`? Conservative by design:
+/// if either tag doesn't parse as a version, the answer is `false` — the
+/// notifier would rather stay silent than nag a dev build or a fork with
+/// exotic tags. This is deliberately stricter than `temps upgrade`, which
+/// treats any tag difference as upgradeable (including downgrades the
+/// operator explicitly pins with `--version`).
+pub(crate) fn is_newer_version(candidate: &str, current: &str) -> bool {
+    match (version_sort_key(candidate), version_sort_key(current)) {
+        (Some(candidate_key), Some(current_key)) => candidate_key > current_key,
+        _ => false,
+    }
+}
+
+/// Is `candidate` strictly older than `current`? Unparsable development or
+/// fork tags are not classified as downgrades so existing explicit workflows
+/// keep working; official release tags are always semver-shaped.
+fn is_older_version(candidate: &str, current: &str) -> bool {
+    match (version_sort_key(candidate), version_sort_key(current)) {
+        (Some(candidate_key), Some(current_key)) => candidate_key < current_key,
+        _ => false,
+    }
+}
+
+fn ensure_implicit_upgrade_is_not_downgrade(
+    requested_version: Option<&str>,
+    channel: UpgradeChannel,
+    current: &str,
+    candidate: &str,
+) -> anyhow::Result<()> {
+    if requested_version.is_none() && is_older_version(candidate, current) {
+        anyhow::bail!(
+            "Refusing to downgrade temps from {} to {} selected by the '{}' channel. \
+             Choose a channel that contains a newer release (for example `--channel beta`) \
+             or explicitly authorize the rollback with `--version {}`.",
+            current,
+            candidate,
+            channel.as_str(),
+            candidate
+        );
+    }
+    Ok(())
+}
+
+/// One background update check: fetch the newest release on this install's
+/// channel and return a notice if it is strictly newer than the running
+/// binary. Every failure path (network, GitHub quota, unparsable tags)
+/// collapses to `None` with a debug log — the notifier is advisory and must
+/// never surface errors to an operator who didn't ask for a check.
+pub async fn check_for_newer_release(configured_channel: Option<&str>) -> Option<UpdateNotice> {
+    let current_version = current_version_tag();
+    // An explicit channel from settings wins; otherwise fall back to the tag
+    // the running binary carries, which is what the CLI has always done.
+    let channel = configured_channel
+        .and_then(UpgradeChannel::from_setting)
+        .unwrap_or_else(|| UpgradeChannel::for_installed_version(&current_version));
+
+    let release = match tokio::time::timeout(
+        UPDATE_CHECK_TIMEOUT,
+        fetch_latest_release_in_channel(channel),
+    )
+    .await
+    {
+        Ok(Ok(release)) => release,
+        Ok(Err(e)) => {
+            debug!(
+                "Update check on '{}' channel failed: {}",
+                channel.as_str(),
+                e
+            );
+            return None;
+        }
+        Err(_) => {
+            debug!(
+                "Update check on '{}' channel timed out after {:?}",
+                channel.as_str(),
+                UPDATE_CHECK_TIMEOUT
+            );
+            return None;
+        }
+    };
+
+    if is_newer_version(&release.tag_name, &current_version) {
+        Some(UpdateNotice {
+            current_version,
+            latest_version: release.tag_name,
+            channel,
+            release_url: release.html_url,
+        })
+    } else {
+        debug!(
+            "temps {} is up to date on '{}' channel (latest published: {})",
+            current_version,
+            channel.as_str(),
+            release.tag_name
+        );
+        None
+    }
+}
+
+/// Background task for `temps serve`: check for a newer release shortly
+/// after startup, then re-check at the configured interval. Each hit is published into the
+/// shared `UpdateStatusSlot`, which `GET /settings/update-status` serves so
+/// the web console can render an upgrade banner; a single WARN line covers
+/// headless/log-only operators. Never returns; the caller detaches it on a
+/// long-lived runtime.
+pub async fn update_notifier_loop(
+    slot: Arc<temps_core::UpdateStatusSlot>,
+    interval: std::time::Duration,
+    config_service: Arc<temps_config::ConfigService>,
+) {
+    tokio::time::sleep(UPDATE_CHECK_STARTUP_DELAY).await;
+    loop {
+        // Re-read every pass so switching channel in the console takes effect
+        // on the next check instead of requiring a restart.
+        let configured_channel = config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.self_update().channel);
+        if let Some(notice) = check_for_newer_release(configured_channel.as_deref()).await {
+            tracing::warn!(
+                current_version = %notice.current_version,
+                latest_version = %notice.latest_version,
+                channel = notice.channel.as_str(),
+                "A new temps release is available: {} -> {} ({} channel). \
+                 See {} or run `temps upgrade`.",
+                notice.current_version,
+                notice.latest_version,
+                notice.channel.as_str(),
+                temps_core::UPGRADE_DOCS_URL
+            );
+            slot.set(temps_core::AvailableUpdate {
+                current_version: notice.current_version,
+                latest_version: notice.latest_version,
+                channel: notice.channel.as_str().to_string(),
+                release_url: notice.release_url,
+                checked_at: chrono::Utc::now(),
+            });
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Determine the platform target string matching release asset names.
-fn platform_target() -> anyhow::Result<String> {
+pub(crate) fn platform_target() -> anyhow::Result<String> {
     let target = match (OS, ARCH) {
         ("macos", "x86_64") => "darwin-amd64",
         ("macos", "aarch64") => "darwin-arm64",
@@ -591,10 +1001,10 @@ fn platform_target() -> anyhow::Result<String> {
 
 /// Fetch the latest release on a given channel from GitHub.
 ///
-/// Pulls the first page of releases (per_page=20, GitHub's default ordering
-/// is most-recent-first) and returns the first one that belongs to the
-/// requested channel. 20 is enough to find the newest stable even on a
-/// project that ships many betas between stables.
+/// Pulls every release page and returns the greatest semantic version for the
+/// requested channel. GitHub orders by creation time, so nightly releases can
+/// push the latest stable beyond the first page and backfilled releases can
+/// violate semantic-version order.
 ///
 /// Note: this returns the channel's *newest* release, which may be older
 /// than the absolute newest tag — that's the point. A `Stable` host on a
@@ -602,37 +1012,71 @@ fn platform_target() -> anyhow::Result<String> {
 pub async fn fetch_latest_release_in_channel(
     channel: UpgradeChannel,
 ) -> anyhow::Result<GitHubRelease> {
-    let client = reqwest::Client::new();
-    let url = format!("{}?per_page=20", GITHUB_RELEASES_API);
-    let response = client
-        .get(&url)
-        .header("User-Agent", "temps-self-upgrade")
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch releases: {}", e))?;
+    let target = platform_target()?;
+    fetch_latest_release_in_channel_from(channel, GITHUB_RELEASES_API, &target).await
+}
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "GitHub API returned {} when fetching releases: {}",
-            status,
-            body
-        ));
+async fn fetch_latest_release_in_channel_from(
+    channel: UpgradeChannel,
+    releases_api: &str,
+    target: &str,
+) -> anyhow::Result<GitHubRelease> {
+    let client = reqwest::Client::new();
+    let mut releases = Vec::new();
+    let mut page = 1_u32;
+    loop {
+        let url = format!("{}?per_page=100&page={}", releases_api, page);
+        let response = client
+            .get(&url)
+            .header("User-Agent", "temps-self-upgrade")
+            .header("Accept", "application/vnd.github.v3+json")
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch release page {}: {}", page, e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "GitHub API returned {} when fetching release page {}: {}",
+                status,
+                page,
+                body
+            ));
+        }
+
+        let page_releases: Vec<GitHubRelease> = response.json().await.map_err(|e| {
+            anyhow::anyhow!("Failed to parse releases response page {}: {}", page, e)
+        })?;
+        let fetch_next_page = release_page_requires_next(&page_releases);
+        releases.extend(page_releases);
+
+        if !fetch_next_page {
+            break;
+        }
+        page += 1;
     }
 
-    let releases: Vec<GitHubRelease> = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse releases response: {}", e))?;
-
-    pick_release_for_channel(releases, channel).ok_or_else(|| match channel {
+    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
         UpgradeChannel::Stable => anyhow::anyhow!(
-            "No stable releases found. Try `--channel beta` to include prereleases."
+            "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
+            target
         ),
-        UpgradeChannel::Beta => anyhow::anyhow!("No releases found."),
+        UpgradeChannel::Beta => anyhow::anyhow!(
+            "No stable or beta releases with a temps-{}.tar.gz asset found.",
+            target
+        ),
+        UpgradeChannel::Nightly => anyhow::anyhow!(
+            "No nightly releases with a temps-{}.tar.gz asset found. The nightly build only cuts a new tag when \
+             `main` has commits since the last one — check the 'Nightly Release' \
+             workflow run history, or try `--channel beta`.",
+            target
+        ),
     })
+}
+
+fn release_page_requires_next(releases: &[GitHubRelease]) -> bool {
+    releases.len() == 100
 }
 
 /// Pure picker — split out so tests can drive it without an HTTP mock.
@@ -640,22 +1084,122 @@ fn pick_release_for_channel(
     releases: Vec<GitHubRelease>,
     channel: UpgradeChannel,
 ) -> Option<GitHubRelease> {
-    releases.into_iter().find(|r| channel.includes(r))
+    releases
+        .into_iter()
+        .filter(|release| channel.includes(release))
+        .filter_map(|release| {
+            version_sort_key(&release.tag_name).map(|sort_key| (sort_key, release))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, release)| release)
+}
+
+/// Select the newest release that this host can actually install. GitHub can
+/// contain semver-valid test releases without binary assets; selecting one of
+/// those makes `temps upgrade --check` fail even when an older, real release
+/// exists in the same channel.
+fn pick_installable_release_for_channel(
+    releases: Vec<GitHubRelease>,
+    channel: UpgradeChannel,
+    target: &str,
+) -> Option<GitHubRelease> {
+    let tarball_name = format!("temps-{}.tar.gz", target);
+    pick_release_for_channel(
+        releases
+            .into_iter()
+            .filter(|release| {
+                release
+                    .assets
+                    .iter()
+                    .any(|asset| asset.name == tarball_name)
+            })
+            .collect(),
+        channel,
+    )
+}
+
+/// Normalize a caller-supplied version into a release tag, rejecting anything
+/// that is not a plain semver-shaped tag.
+///
+/// **This is a security boundary, not cosmetics.** The tag is interpolated into
+/// a GitHub API path, and the `url` crate resolves `..` segments when parsing —
+/// so an unvalidated tag like `v/../../../../../owner/repo/releases/latest`
+/// walks out of `gotempsh/temps` and resolves to *another repository's* release.
+/// Everything downstream then behaves normally: it downloads that release's
+/// `temps-<target>.tar.gz`, checks it against that release's own `.sha256`
+/// (which of course matches), executes it for the version preflight, and
+/// installs it over the running binary. In other words, a caller who can reach
+/// `temps upgrade --version` or `POST /settings/update` could install an
+/// arbitrary binary. Keep this strict.
+pub(crate) fn normalize_release_tag(version: &str) -> anyhow::Result<String> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Version must not be empty"));
+    }
+
+    let core = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    // Split off the prerelease/build suffix; the numeric core is validated
+    // separately so `1.2.3` and `1.2.3-beta.4` are both accepted but
+    // `1.2.3/../x` is not.
+    let (numeric, suffix) = match core.split_once(['-', '+']) {
+        Some((numeric, suffix)) => (numeric, Some(suffix)),
+        None => (core, None),
+    };
+
+    let mut parts = numeric.split('.');
+    let mut components = 0;
+    for _ in 0..3 {
+        let component = parts.next().ok_or_else(|| {
+            anyhow::anyhow!("Version '{version}' must look like 'v1.2.3' or 'v1.2.3-beta.4'")
+        })?;
+        if component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has a non-numeric component '{component}'"
+            ));
+        }
+        components += 1;
+    }
+    if components != 3 || parts.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "Version '{version}' must have exactly three numeric components"
+        ));
+    }
+
+    if let Some(suffix) = suffix {
+        // Deliberately narrow: alphanumerics, dot and dash only. No slashes, no
+        // percent-encoding, nothing that can add or escape a path segment.
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an unsupported prerelease suffix"
+            ));
+        }
+        if suffix.split('.').any(|segment| segment.is_empty()) {
+            return Err(anyhow::anyhow!(
+                "Version '{version}' has an empty prerelease segment"
+            ));
+        }
+    }
+
+    Ok(format!("v{core}"))
 }
 
 /// Fetch a specific release by tag from GitHub.
-async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
-    // Ensure the version starts with 'v'
-    let tag = if version.starts_with('v') {
-        version.to_string()
-    } else {
-        format!("v{}", version)
-    };
+pub(crate) async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> {
+    let tag = normalize_release_tag(version)?;
 
-    let url = format!(
-        "https://api.github.com/repos/gotempsh/temps/releases/tags/{}",
-        tag
-    );
+    // Built by pushing a validated segment rather than string interpolation, so
+    // even a future validation slip cannot alter the path structure.
+    let mut url = reqwest::Url::parse("https://api.github.com/repos/gotempsh/temps/releases/tags/")
+        .map_err(|e| anyhow::anyhow!("Failed to build the release URL: {e}"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Failed to build the release URL"))?
+        .pop_if_empty()
+        .push(&tag);
+    let url = url.to_string();
 
     let client = reqwest::Client::new();
     let response = client
@@ -687,7 +1231,7 @@ async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> 
 }
 
 /// Download a release asset as bytes.
-async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::new();
     let response = client
         .get(url)
@@ -711,7 +1255,7 @@ async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Download a release asset as text (for checksums).
-async fn download_asset_text(url: &str) -> anyhow::Result<String> {
+pub(crate) async fn download_asset_text(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let response = client
         .get(url)
@@ -733,20 +1277,107 @@ async fn download_asset_text(url: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to read checksum response: {}", e))
 }
 
-/// Verify SHA256 checksum of downloaded data.
-fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
+/// Stream a release asset to an already-open file, hashing it in the same pass.
+///
+/// Returns the lowercase hex SHA256 of everything written, so the caller can
+/// verify the download without reading the file back. The whole point is that
+/// the artifact never exists in memory: the release tarball is ~110 MB and the
+/// binary inside it ~270 MB, which does not fit alongside a running server on
+/// a 1 GB host.
+pub(crate) async fn download_asset_to_file(
+    url: &str,
+    dest: &mut fs::File,
+    dest_path: &Path,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .header("User-Agent", "temps-self-upgrade")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to download asset: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to download asset: HTTP {}",
+            response.status()
+        ));
+    }
+
+    stream_response_to_file(response, dest, dest_path).await
+}
+
+/// Shared body of the streaming downloads (OSS release and EE proxy).
+///
+/// Peak memory here is one HTTP chunk (tens of KB), not the asset size.
+async fn stream_response_to_file(
+    mut response: reqwest::Response,
+    file: &mut fs::File,
+    dest_path: &Path,
+) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
 
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to seek download file {}: {}",
+            dest_path.display(),
+            e
+        )
+    })?;
+    file.set_len(0).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to truncate download file {}: {}",
+            dest_path.display(),
+            e
+        )
+    })?;
     let mut hasher = Sha256::new();
-    hasher.update(data);
-    let computed = hex::encode(hasher.finalize());
+    let mut written: u64 = 0;
 
-    // Checksum file format: "<hash>  <filename>" or "<hash> <filename>"
-    let expected = checksum_text
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read download response: {}", e))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write download to {} (after {} bytes): {}",
+                dest_path.display(),
+                written,
+                e
+            )
+        })?;
+        written += chunk.len() as u64;
+    }
+
+    file.flush().map_err(|e| {
+        anyhow::anyhow!("Failed to flush download to {}: {}", dest_path.display(), e)
+    })?;
+
+    debug!("Downloaded {} bytes to {}", written, dest_path.display());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Parse the expected hash out of a `.sha256` file body.
+///
+/// Format: `"<hash>  <filename>"` or `"<hash> <filename>"`.
+fn parse_expected_checksum(checksum_text: &str) -> anyhow::Result<String> {
+    Ok(checksum_text
         .split_whitespace()
         .next()
         .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format"))?
-        .to_lowercase();
+        .to_lowercase())
+}
+
+/// Compare an already-computed SHA256 against a `.sha256` file body.
+///
+/// Split out from [`verify_checksum`] so the streaming download can verify the
+/// digest it accumulated on the way to disk, instead of re-reading the file (or
+/// keeping it in memory) just to hash it a second time.
+pub(crate) fn verify_computed_checksum(computed: &str, checksum_text: &str) -> anyhow::Result<()> {
+    let expected = parse_expected_checksum(checksum_text)?;
+    let computed = computed.to_lowercase();
 
     if computed != expected {
         return Err(anyhow::anyhow!(
@@ -759,8 +1390,25 @@ fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verify SHA256 checksum of downloaded data.
+pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let computed = hex::encode(hasher.finalize());
+
+    verify_computed_checksum(&computed, checksum_text)
+}
+
 /// Extract the `temps` binary from a gzipped tarball.
-fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+///
+/// No production caller remains — both `temps upgrade` and the in-process
+/// self-updater stream through disk via [`extract_binary_from_tarball_file`].
+/// Kept `#[cfg(test)]` as the byte-identical baseline the streaming path is
+/// checked against.
+#[cfg(test)]
+pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -783,8 +1431,235 @@ fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> 
     ))
 }
 
+/// Extract the `temps` binary from an open gzipped tarball, straight into an
+/// already-open staging file.
+///
+/// The streaming counterpart of [`extract_binary_from_tarball`]: the gunzip and
+/// untar run over the file, and the entry is copied out with `std::io::copy`,
+/// so memory stays at one copy buffer instead of holding the ~270 MB
+/// uncompressed binary (which `read_to_end` would additionally double while
+/// growing its `Vec`).
+pub(crate) fn extract_binary_from_tarball_file(
+    tarball: &mut fs::File,
+    tarball_path: &Path,
+    dest: &mut fs::File,
+    dest_path: &Path,
+) -> anyhow::Result<u64> {
+    use flate2::read::GzDecoder;
+
+    tarball.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to seek downloaded tarball {}: {}",
+            tarball_path.display(),
+            e
+        )
+    })?;
+    let decoder = GzDecoder::new(std::io::BufReader::new(tarball));
+    let mut archive = tar::Archive::new(decoder);
+
+    let entries = archive
+        .entries()
+        .map_err(|e| anyhow::anyhow!("Failed to read tarball {}: {}", tarball_path.display(), e))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read entry in tarball {}: {}",
+                tarball_path.display(),
+                e
+            )
+        })?;
+        let is_binary = entry
+            .path()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read entry path in tarball {}: {}",
+                    tarball_path.display(),
+                    e
+                )
+            })?
+            .file_name()
+            .map(|n| n == "temps")
+            .unwrap_or(false);
+
+        if !is_binary {
+            continue;
+        }
+
+        // An entry can carry the right name and still not be a binary: an
+        // empty file, a symlink or a hard link named `temps` would copy zero
+        // bytes and pass a size check of 0 == 0, landing on the executable the
+        // whole system runs.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() {
+            return Err(anyhow::anyhow!(
+                "Entry 'temps' in tarball {} is not a regular file ({:?})",
+                tarball_path.display(),
+                entry_type
+            ));
+        }
+
+        // `Entry::size`, not `Header::size`: the former is the number of bytes
+        // the entry reader yields, honouring a PAX size override, while the
+        // latter reports the logical size and disagrees for PAX and sparse
+        // entries, which would read as a truncation that never happened.
+        let declared = entry.size();
+
+        dest.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to seek staged binary {}: {}",
+                dest_path.display(),
+                e
+            )
+        })?;
+        dest.set_len(0).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to truncate staged binary {}: {}",
+                dest_path.display(),
+                e
+            )
+        })?;
+        let written = std::io::copy(&mut entry, dest).map_err(|e| {
+            anyhow::anyhow!("Failed to extract binary to {}: {}", dest_path.display(), e)
+        })?;
+
+        // Validate before the rename, not after. The verified checksum covers
+        // the tarball, so a short read here (full disk, truncated gzip stream)
+        // would otherwise put a valid-looking but incomplete file over the live
+        // executable. Comparing against the tar header's declared size is free
+        // and catches exactly that.
+        if written != declared {
+            return Err(anyhow::anyhow!(
+                "Extracted binary is truncated: expected {} bytes, wrote {} to {}",
+                declared,
+                written,
+                dest_path.display()
+            ));
+        }
+        if written == 0 {
+            return Err(anyhow::anyhow!(
+                "Entry 'temps' in tarball {} is empty",
+                tarball_path.display()
+            ));
+        }
+
+        debug!("Extracted {} bytes to {}", written, dest_path.display());
+        return Ok(written);
+    }
+
+    Err(anyhow::anyhow!(
+        "Binary 'temps' not found in the downloaded tarball"
+    ))
+}
+
+/// Securely create an upgrade scratch file beside the target binary.
+///
+/// This preserves constant-memory/same-filesystem staging while `tempfile`
+/// supplies an unpredictable name and atomic create-new semantics.
+pub(crate) fn create_upgrade_temp_file(
+    parent: &Path,
+    prefix: &str,
+) -> anyhow::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempfile_in(parent)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create upgrade temporary file in {}: {}",
+                parent.display(),
+                e
+            )
+        })
+}
+
+/// Finish writing a staged executable, make it durable, and close its writable
+/// handle.
+///
+/// Closing the handle is part of the correctness contract: the in-process
+/// updater executes this path for its preflight, and Unix can reject (or kill)
+/// an executable while any process still has it open for writing.
+pub(crate) fn seal_staged_binary(staged_file: NamedTempFile) -> anyhow::Result<TempPath> {
+    let staged_path = staged_file.path().to_path_buf();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        staged_file.as_file().set_permissions(perms).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to set executable permissions on staged binary {}: {}",
+                staged_path.display(),
+                e
+            )
+        })?;
+    }
+
+    staged_file.as_file().sync_all().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to sync staged binary {} before closing its write handle: {}",
+            staged_path.display(),
+            e
+        )
+    })?;
+
+    Ok(staged_file.into_temp_path())
+}
+
+/// Atomically persist a sealed staged binary over the target.
+pub(crate) fn finalize_staged_binary(
+    binary_path: &Path,
+    staged_path: TempPath,
+) -> anyhow::Result<()> {
+    let staged_path_for_error = staged_path.to_path_buf();
+
+    // The destination normally exists, so overwrite-capable `persist` is the
+    // correct atomic operation; `persist_noclobber` would reject an upgrade.
+    staged_path.persist(binary_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to atomically replace binary {} using staged file {}: {}",
+            binary_path.display(),
+            staged_path_for_error.display(),
+            e.error
+        )
+    })?;
+
+    sync_binary_parent(binary_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_binary_parent(binary_path: &Path) -> anyhow::Result<()> {
+    let parent = binary_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot determine parent directory of replaced binary {}",
+            binary_path.display()
+        )
+    })?;
+    let directory = fs::File::open(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "Binary {} was replaced, but failed to open parent directory {} for sync: {}",
+            binary_path.display(),
+            parent.display(),
+            e
+        )
+    })?;
+    directory.sync_all().map_err(|e| {
+        anyhow::anyhow!(
+            "Binary {} was replaced, but failed to sync parent directory {}: {}",
+            binary_path.display(),
+            parent.display(),
+            e
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn sync_binary_parent(_binary_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// Check we have write permission to the binary path.
-fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
+pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
     // Check the parent directory is writable (for atomic rename)
     let parent = binary_path
         .parent()
@@ -817,38 +1692,37 @@ fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replace the binary using an atomic rename strategy:
-/// 1. Write new binary to a temp file next to the target
+/// Replace the binary using an atomic persist strategy:
+/// 1. Securely create and write a random temp file next to the target
 /// 2. Set executable permissions
-/// 3. Rename temp file over the target (atomic on the same filesystem)
-fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
+/// 3. Sync it, persist it over the target, and sync the parent directory
+///
+/// No production caller remains — both `temps upgrade` and the in-process
+/// self-updater stage into a file via [`create_upgrade_temp_file`] and commit
+/// with [`finalize_staged_binary`] directly. Kept `#[cfg(test)]` to exercise
+/// the write-then-finalize sequence from an in-memory buffer.
+#[cfg(test)]
+pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::Result<()> {
     let parent = binary_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
 
-    let tmp_path = parent.join(".temps-upgrade-tmp");
+    let mut staged_file = create_upgrade_temp_file(parent, ".temps-upgrade-bin.")?;
+    let staged_path = staged_file.path().to_path_buf();
+    staged_file
+        .as_file_mut()
+        .write_all(new_binary)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write staged binary {} for {}: {}",
+                staged_path.display(),
+                binary_path.display(),
+                e
+            )
+        })?;
 
-    // Write the new binary to temp file
-    fs::write(&tmp_path, new_binary)
-        .map_err(|e| anyhow::anyhow!("Failed to write temporary file: {}", e))?;
-
-    // Set executable permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&tmp_path, perms)
-            .map_err(|e| anyhow::anyhow!("Failed to set executable permissions: {}", e))?;
-    }
-
-    // Atomic rename
-    fs::rename(&tmp_path, binary_path).map_err(|e| {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&tmp_path);
-        anyhow::anyhow!("Failed to replace binary: {}", e)
-    })?;
-
-    Ok(())
+    let staged_path = seal_staged_binary(staged_file)?;
+    finalize_staged_binary(binary_path, staged_path)
 }
 
 // ── EE proxy helpers ────────────────────────────────────────────────────────
@@ -1014,13 +1888,19 @@ async fn fetch_ee_checksum(
         .map_err(|e| anyhow::anyhow!("Failed to read EE checksum: {}", e))
 }
 
-/// Download an EE binary tarball through the license-gated proxy.
-async fn download_ee_asset(
+/// Stream an EE binary tarball through the license-gated proxy into `dest`,
+/// returning its lowercase hex SHA256.
+///
+/// Streaming counterpart of the OSS `download_asset_to_file`; the EE tarball is
+/// the same size and would blow the same memory budget.
+async fn download_ee_asset_to_file(
     api: &str,
     version: &str,
     asset: &str,
     license_jwt: &str,
-) -> anyhow::Result<Vec<u8>> {
+    dest: &mut fs::File,
+    dest_path: &Path,
+) -> anyhow::Result<String> {
     let url = format!("{}/api/ee/download/{}/{}", api, version, asset);
     let client = reqwest::Client::new();
     let resp = client
@@ -1037,10 +1917,7 @@ async fn download_ee_asset(
             url
         ));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| anyhow::anyhow!("Failed to read EE download: {}", e))
+    stream_response_to_file(resp, dest, dest_path).await
 }
 
 /// Resolve the data dir: explicit flag/env > `~/.temps`.
@@ -1184,6 +2061,72 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_release_tag_accepts_real_tags() {
+        for (input, expected) in [
+            ("v1.2.3", "v1.2.3"),
+            ("1.2.3", "v1.2.3"),
+            ("v0.1.0-beta.55", "v0.1.0-beta.55"),
+            (
+                "v0.1.0-nightly.20260806.c64e8f98",
+                "v0.1.0-nightly.20260806.c64e8f98",
+            ),
+            ("  v1.0.0  ", "v1.0.0"),
+        ] {
+            assert_eq!(
+                normalize_release_tag(input).expect(input),
+                expected,
+                "should accept {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_path_traversal() {
+        // The exploit this validation exists for: the `url` crate resolves
+        // `..` segments, so an unvalidated tag escapes gotempsh/temps and
+        // reaches an arbitrary repository's release — whose asset would then
+        // be downloaded, checksum-matched against ITS OWN published hash,
+        // executed by the preflight and installed over the running binary.
+        for input in [
+            "v/../../../../../rust-lang/rust/releases/latest",
+            "v1.2.3/../../../../../owner/repo/releases/latest",
+            "../../owner/repo/releases/latest",
+            "v1.2.3/..",
+            "v1.2.3/extra",
+            "v1.2.3%2f..%2fowner",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject traversal: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_release_tag_blocks_malformed_tags() {
+        for input in [
+            "",
+            "   ",
+            "v",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.2.x",
+            "v1.2.3-beta 4",
+            "v1.2.3-",
+            "v1.2.3-beta..4",
+            "v1.2.3?foo=bar",
+            "v1.2.3#frag",
+            "v1.2.3@evil.com",
+            "http://evil.com/v1.2.3",
+        ] {
+            assert!(
+                normalize_release_tag(input).is_err(),
+                "must reject malformed tag: {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_platform_target() {
         // Just verify it doesn't panic on the current platform
         let result = platform_target();
@@ -1261,6 +2204,431 @@ mod tests {
         assert_eq!(result.unwrap(), b"fake-binary-content");
     }
 
+    /// Build a gzipped tarball containing a single `temps` entry.
+    fn tarball_with_binary(content: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, "temps", content).unwrap();
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    fn upgrade_scratch_paths(parent: &Path) -> Vec<PathBuf> {
+        let mut paths = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".temps-upgrade-"))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    async fn spawn_raw_http_server(
+        response_parts: Vec<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            for part in response_parts {
+                socket.write_all(&part).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        (format!("http://{address}/asset"), server)
+    }
+
+    #[test]
+    fn test_verify_computed_checksum_matches_case_insensitively() {
+        let computed = "AABBCC";
+        let checksum_text = "aabbcc  temps-linux-amd64.tar.gz";
+        assert!(verify_computed_checksum(computed, checksum_text).is_ok());
+    }
+
+    #[test]
+    fn test_verify_computed_checksum_reports_both_hashes_on_mismatch() {
+        let err = verify_computed_checksum("aaaa", "bbbb  temps.tar.gz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Checksum mismatch"));
+        assert!(err.contains("aaaa"));
+        assert!(err.contains("bbbb"));
+    }
+
+    #[tokio::test]
+    async fn test_download_asset_to_file_multiple_chunks_writes_all_bytes_and_sha() {
+        use sha2::{Digest, Sha256};
+
+        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let (url, server) = spawn_raw_http_server(vec![
+            [header.as_slice(), b"5\r\nhello\r\n"].concat(),
+            b"1\r\n \r\n".to_vec(),
+            b"5\r\nworld\r\n0\r\n\r\n".to_vec(),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut download = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let download_path = download.path().to_path_buf();
+
+        let computed = download_asset_to_file(&url, download.as_file_mut(), &download_path)
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        let expected_bytes = b"hello world";
+        assert_eq!(std::fs::read(&download_path).unwrap(), expected_bytes);
+        assert_eq!(
+            computed,
+            hex::encode(Sha256::digest(expected_bytes)),
+            "the digest must cover every streamed response chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_asset_to_file_truncated_response_errors_and_temp_cleans_on_drop() {
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n";
+        let (url, server) =
+            spawn_raw_http_server(vec![[header.as_slice(), b"short"].concat()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let download_path;
+
+        {
+            let mut download = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+            download_path = download.path().to_path_buf();
+
+            let error = download_asset_to_file(&url, download.as_file_mut(), &download_path)
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("Failed to read download response"),
+                "error was: {error}"
+            );
+            assert!(download_path.exists());
+        }
+
+        server.await.unwrap();
+        assert!(!download_path.exists());
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_checksum_mismatch_preserves_target_and_cleans_download_temp() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("temps");
+        let original = b"existing-production-binary";
+        std::fs::write(&target, original).unwrap();
+
+        let verification_error = {
+            let mut download = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+            download
+                .as_file_mut()
+                .write_all(b"downloaded-but-untrusted")
+                .unwrap();
+            let computed = hex::encode(Sha256::digest(b"downloaded-but-untrusted"));
+
+            verify_computed_checksum(
+                &computed,
+                "0000000000000000000000000000000000000000000000000000000000000000  temps.tar.gz",
+            )
+        };
+
+        assert!(verification_error.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_streams_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball
+            .as_file_mut()
+            .write_all(&tarball_with_binary(b"fake-binary-content"))
+            .unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        let written = extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap();
+        assert_eq!(written, b"fake-binary-content".len() as u64);
+        assert_eq!(std::fs::read(&dest_path).unwrap(), b"fake-binary-content");
+    }
+
+    /// The streaming path must produce exactly what the in-memory path does,
+    /// byte for byte, for the same tarball.
+    #[test]
+    fn test_extract_binary_from_tarball_file_matches_in_memory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Big enough that `read_to_end` would have grown its Vec more than once.
+        let content: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        let tarball_bytes = tarball_with_binary(&content);
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball.as_file_mut().write_all(&tarball_bytes).unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap();
+
+        let streamed = std::fs::read(&dest_path).unwrap();
+        let in_memory = extract_binary_from_tarball(&tarball_bytes).unwrap();
+        assert_eq!(streamed, in_memory);
+        assert_eq!(streamed, content);
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_rejects_symlink_named_temps() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "temps", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball
+            .as_file_mut()
+            .write_all(&encoder.finish().unwrap())
+            .unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        let err = extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a regular file"), "error was: {err}");
+        drop(dest);
+        assert!(!dest_path.exists());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_rejects_empty_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball
+            .as_file_mut()
+            .write_all(&tarball_with_binary(b""))
+            .unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        let err = extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is empty"), "error was: {err}");
+        drop(dest);
+        assert!(!dest_path.exists());
+    }
+
+    #[test]
+    fn test_replace_binary_removes_staged_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory cannot be replaced by a file rename, so finalize fails
+        // after the staged file is written and synced.
+        let target = dir.path().join("temps");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(replace_binary(&target, b"new-binary").is_err());
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_replace_binary_valid_bytes_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("temps");
+        std::fs::write(&target, b"old-binary").unwrap();
+
+        replace_binary(&target, b"new-binary").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-binary");
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_not_found() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let content = b"not-temps";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "other-file", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball
+            .as_file_mut()
+            .write_all(&encoder.finish().unwrap())
+            .unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        let err = extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+        drop(dest);
+        assert!(!dest_path.exists());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_corrupt_gzip_cleans_staged_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tarball = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let tarball_path = tarball.path().to_path_buf();
+        tarball
+            .as_file_mut()
+            .write_all(b"not-a-complete-gzip-stream")
+            .unwrap();
+        let mut dest = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let dest_path = dest.path().to_path_buf();
+
+        let err = extract_binary_from_tarball_file(
+            tarball.as_file_mut(),
+            &tarball_path,
+            dest.as_file_mut(),
+            &dest_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(&tarball_path.display().to_string()));
+        drop(dest);
+        drop(tarball);
+        assert!(!dest_path.exists());
+        assert!(upgrade_scratch_paths(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_create_upgrade_temp_file_uses_random_distinct_prefixed_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let second = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+
+        assert_ne!(first.path(), second.path());
+        for file in [&first, &second] {
+            let name = file.path().file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with(".temps-upgrade-bin."), "name was: {name}");
+            assert!(file.path().exists());
+        }
+    }
+
+    #[test]
+    fn test_create_upgrade_temp_file_returns_atomically_created_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+        let path = file.path().to_path_buf();
+
+        file.as_file_mut().write_all(b"owned").unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn test_create_upgrade_temp_file_removes_file_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = {
+            let file = create_upgrade_temp_file(dir.path(), ".temps-upgrade-dl.").unwrap();
+            let path = file.path().to_path_buf();
+            assert!(path.exists());
+            path
+        };
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_finalize_staged_binary_renames_and_marks_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("temps");
+        std::fs::write(&target, b"old").unwrap();
+        let mut staged = create_upgrade_temp_file(dir.path(), ".temps-upgrade-bin.").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        staged.as_file_mut().write_all(b"new").unwrap();
+
+        let staged = seal_staged_binary(staged).unwrap();
+        finalize_staged_binary(&target, staged).unwrap();
+
+        assert!(!staged_path.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
     #[test]
     fn test_extract_binary_from_tarball_not_found() {
         use flate2::write::GzEncoder;
@@ -1308,6 +2676,148 @@ mod tests {
         version.to_string()
     }
 
+    // ── Startup update notifier ──────────────────────────────────────────
+    //
+    // The notifier decides (a) which channel an installed binary tracks and
+    // (b) whether a published tag is strictly newer. Both rules are pinned
+    // here because a regression means either nagging stable hosts about
+    // betas or silently never telling anyone about releases.
+
+    #[test]
+    fn test_installed_channel_stable_for_plain_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0"),
+            UpgradeChannel::Stable
+        );
+    }
+
+    #[test]
+    fn test_installed_channel_beta_for_prerelease_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-beta.4"),
+            UpgradeChannel::Beta
+        );
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-rc.1"),
+            UpgradeChannel::Beta
+        );
+    }
+
+    #[test]
+    fn test_installed_channel_nightly_for_nightly_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-nightly.20260727.abc1234"),
+            UpgradeChannel::Nightly
+        );
+    }
+
+    #[test]
+    fn test_is_newer_version_core_ordering() {
+        assert!(is_newer_version("v0.2.0", "v0.1.9"));
+        assert!(is_newer_version("v1.0.0", "v0.9.9"));
+        assert!(is_newer_version("v0.1.10", "v0.1.9"));
+        assert!(!is_newer_version("v0.1.9", "v0.1.9"));
+        // Never flag a downgrade: a host running a newer (e.g. unreleased)
+        // version than the latest published tag must stay silent.
+        assert!(!is_newer_version("v0.1.8", "v0.1.9"));
+    }
+
+    #[test]
+    fn test_is_newer_version_prerelease_ordering() {
+        // Release beats its own prereleases…
+        assert!(is_newer_version("v1.0.0", "v1.0.0-beta.2"));
+        assert!(!is_newer_version("v1.0.0-beta.2", "v1.0.0"));
+        // …prereleases order among themselves numerically…
+        assert!(is_newer_version("v1.0.0-beta.10", "v1.0.0-beta.2"));
+        // …and a prerelease of the NEXT version beats the current release.
+        assert!(is_newer_version("v1.1.0-beta.1", "v1.0.0"));
+    }
+
+    #[test]
+    fn test_is_newer_version_unparsable_tags_stay_silent() {
+        // Fork/dev tags that aren't vX.Y.Z-shaped must never trigger the
+        // banner in either position.
+        assert!(!is_newer_version("nightly", "v1.0.0"));
+        assert!(!is_newer_version("v2.0.0", "local-dev"));
+        assert!(!is_newer_version("v1.2", "v1.1.0"));
+        assert!(!is_newer_version("v1.2.3.4", "v1.1.0"));
+    }
+
+    #[test]
+    fn implicit_channel_selection_detects_downgrades() {
+        assert!(is_older_version("v0.0.8", "v0.1.0-beta.56"));
+        assert!(is_older_version("v1.0.0-beta.2", "v1.0.0"));
+        assert!(!is_older_version("v1.0.0", "v1.0.0-beta.2"));
+        assert!(!is_older_version("v1.0.0", "v1.0.0"));
+        assert!(!is_older_version("stable", "local-dev"));
+    }
+
+    #[test]
+    fn implicit_upgrade_policy_refuses_downgrades_but_allows_explicit_rollbacks() {
+        let error = ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Stable,
+            "v0.1.0-beta.56",
+            "v0.0.8",
+        )
+        .expect_err("implicit stable selection must not downgrade a beta host");
+        assert!(error.to_string().contains("Refusing to downgrade"));
+        assert!(error.to_string().contains("--channel beta"));
+
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            Some("v0.0.8"),
+            UpgradeChannel::Stable,
+            "v0.1.0-beta.56",
+            "v0.0.8",
+        )
+        .is_ok());
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Beta,
+            "v0.1.0-beta.56",
+            "v0.1.0-beta.57",
+        )
+        .is_ok());
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Stable,
+            "v1.0.0",
+            "v1.0.0",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_update_check_interval_defaults_to_two_hours() {
+        assert_eq!(
+            DEFAULT_UPDATE_CHECK_INTERVAL,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_accepts_bounded_whole_hours() {
+        assert_eq!(parse_update_check_interval_hours("1"), Ok(1));
+        assert_eq!(parse_update_check_interval_hours(" 2 "), Ok(2));
+        assert_eq!(parse_update_check_interval_hours("168"), Ok(168));
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_rejects_invalid_values() {
+        assert!(matches!(
+            parse_update_check_interval_hours("0"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 0 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("169"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 169 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("1.5"),
+            Err(UpdateCheckIntervalError::InvalidNumber { .. })
+        ));
+    }
+
     // ── Channel logic ─────────────────────────────────────────────────────
     //
     // The release picker is the contract that determines what `temps
@@ -1322,6 +2832,21 @@ mod tests {
             assets: vec![],
             html_url: String::new(),
         }
+    }
+
+    fn release_with_asset(
+        tag: &str,
+        prerelease: bool,
+        draft: bool,
+        asset_name: &str,
+    ) -> GitHubRelease {
+        let mut release = release(tag, prerelease, draft);
+        release.assets.push(GitHubAsset {
+            name: asset_name.to_string(),
+            browser_download_url: format!("https://example.test/{asset_name}"),
+            size: 1,
+        });
+        release
     }
 
     #[test]
@@ -1353,17 +2878,38 @@ mod tests {
     }
 
     #[test]
-    fn picker_returns_first_matching_in_response_order() {
-        // GitHub returns releases newest-first. Picker takes the first
-        // match, which is the newest release on that channel. We trust
-        // GitHub's ordering here — re-sorting by semver locally would
-        // also have to handle prerelease ordering correctly, and we'd
-        // rather lean on GitHub than reimplement it.
+    fn channel_beta_excludes_nightly_builds() {
+        // Beta must never silently resolve to an automated nightly — an
+        // operator who deliberately opts into beta expects a `-beta.N` cut,
+        // not whatever CI cut overnight. Nightly is a separate, opt-in
+        // channel.
+        let nightly = release("v1.3.0-nightly.20260727.abc1234", true, false);
+        assert!(!UpgradeChannel::Beta.includes(&nightly));
+    }
+
+    #[test]
+    fn channel_nightly_includes_only_nightly_tags() {
+        let stable = release("v1.2.0", false, false);
+        let beta = release("v1.3.0-beta.1", true, false);
+        let nightly = release("v1.3.0-nightly.20260727.abc1234", true, false);
+        let draft_nightly = release("v1.4.0-nightly.20260728.def5678", true, true);
+
+        assert!(!UpgradeChannel::Nightly.includes(&stable));
+        assert!(!UpgradeChannel::Nightly.includes(&beta));
+        assert!(UpgradeChannel::Nightly.includes(&nightly));
+        assert!(!UpgradeChannel::Nightly.includes(&draft_nightly));
+    }
+
+    #[test]
+    fn picker_returns_highest_semver_even_when_response_order_differs() {
+        // Release creation order is not semantic-version order when a release
+        // is backfilled or republished. The picker must not select an older
+        // candidate merely because GitHub returned it first.
         let releases = vec![
-            release("v1.3.0-beta.2", true, false), // newest, beta
-            release("v1.3.0-beta.1", true, false),
-            release("v1.2.0", false, false), // newest stable
             release("v1.1.0", false, false),
+            release("v1.3.0-beta.1", true, false),
+            release("v1.2.0", false, false),
+            release("v1.3.0-beta.2", true, false),
         ];
 
         let picked_stable = pick_release_for_channel(releases.clone(), UpgradeChannel::Stable);
@@ -1394,6 +2940,123 @@ mod tests {
             picked.expect("should fall through to v1.9.0").tag_name,
             "v1.9.0"
         );
+    }
+
+    #[test]
+    fn picker_skips_malformed_release_tags() {
+        let mixed = vec![
+            release("latest", false, false),
+            release("v1.9.0", false, false),
+        ];
+        assert_eq!(
+            pick_release_for_channel(mixed, UpgradeChannel::Stable)
+                .expect("valid semantic release should remain")
+                .tag_name,
+            "v1.9.0"
+        );
+
+        let malformed_only = vec![release("latest", false, false)];
+        assert!(pick_release_for_channel(malformed_only, UpgradeChannel::Stable).is_none());
+    }
+
+    #[test]
+    fn installable_picker_skips_newer_release_without_platform_asset() {
+        let releases = vec![
+            release("v1.3.0-test", true, false),
+            release_with_asset("v1.2.0-beta.4", true, false, "temps-darwin-arm64.tar.gz"),
+            release_with_asset("v1.1.0-beta.3", true, false, "temps-linux-amd64.tar.gz"),
+        ];
+
+        let picked =
+            pick_installable_release_for_channel(releases, UpgradeChannel::Beta, "darwin-arm64");
+
+        assert_eq!(
+            picked.expect("an installable beta should remain").tag_name,
+            "v1.2.0-beta.4"
+        );
+    }
+
+    #[test]
+    fn release_lookup_continues_until_github_returns_a_short_page() {
+        let nightlies: Vec<_> = (0..100)
+            .map(|index| {
+                release(
+                    &format!("v1.0.0-nightly.202609{:02}.abc1234", index),
+                    true,
+                    false,
+                )
+            })
+            .collect();
+
+        assert!(release_page_requires_next(&nightlies));
+
+        let mut page_with_stable = nightlies;
+        page_with_stable[99] = release("v0.0.8", false, false);
+        assert!(release_page_requires_next(&page_with_stable));
+        assert!(!release_page_requires_next(&page_with_stable[..99]));
+    }
+
+    #[tokio::test]
+    async fn release_fetch_reads_second_page_before_selecting_stable_version() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use std::collections::HashMap;
+
+        async fn releases(Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+            let page = query.get("page").map(String::as_str).unwrap_or("1");
+            let releases = if page == "1" {
+                (0..100)
+                    .map(|index| {
+                        serde_json::json!({
+                            "tag_name": format!("v1.0.0-nightly.202609{:02}.abc1234", index),
+                            "prerelease": true,
+                            "draft": false,
+                            "assets": [{
+                                "name": "temps-test-target.tar.gz",
+                                "browser_download_url": "https://example.test/nightly.tar.gz",
+                                "size": 1
+                            }],
+                            "html_url": "https://example.test/nightly"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![serde_json::json!({
+                    "tag_name": "v0.0.8",
+                    "prerelease": false,
+                    "draft": false,
+                    "assets": [{
+                        "name": "temps-test-target.tar.gz",
+                        "browser_download_url": "https://example.test/stable.tar.gz",
+                        "size": 1
+                    }],
+                    "html_url": "https://example.test/stable"
+                })]
+            };
+            Json(serde_json::Value::Array(releases))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/releases", get(releases)))
+                .await
+                .expect("test release server should run");
+        });
+
+        let selected = fetch_latest_release_in_channel_from(
+            UpgradeChannel::Stable,
+            &format!("http://{address}/releases"),
+            "test-target",
+        )
+        .await
+        .expect("stable release should be found on page two");
+
+        server.abort();
+        assert_eq!(selected.tag_name, "v0.0.8");
     }
 
     #[test]

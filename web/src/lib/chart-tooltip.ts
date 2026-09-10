@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type React from 'react'
 
 // Shared Recharts <Tooltip> styles.
@@ -20,4 +23,29 @@ export const TOOLTIP_LABEL_STYLE: React.CSSProperties = {
   color: 'var(--muted-foreground)',
   fontSize: 11,
   marginBottom: 2,
+}
+
+// Multi-day range charts key their X axis on the raw epoch-ms timestamp, not
+// an "HH:mm" string — recharts' category axis picks the tooltip's data point
+// by matching the dataKey value, so points from different days that format
+// to the same "HH:mm" (e.g. 08:00 today and 08:00 a week ago) would collide
+// and the tooltip could snap to the wrong day's value. Ticks stay time-only;
+// the tooltip label adds the date so same-time points stay distinguishable.
+
+/** Format an epoch-ms timestamp for chart axis ticks. */
+export function formatChartTick(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+/** Format an epoch-ms timestamp for a chart tooltip's label row. */
+export function formatChartTooltipLabel(ts: number): string {
+  return new Date(ts).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }

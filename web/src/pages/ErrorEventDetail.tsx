@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import { getErrorEventOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
@@ -19,9 +22,9 @@ import { cn } from '@/lib/utils'
 import { extractSentryEvent } from '@/lib/sentry-utils'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { AlertTriangle, ArrowLeft, Clock } from 'lucide-react'
+import { AlertCircle, AlertTriangle, ArrowLeft, Clock, RotateCcw } from 'lucide-react'
 import { useEffect } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId, eventId } = useParams<{
@@ -33,7 +36,12 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
 
   // Fetch event details
-  const { data: event, isLoading } = useQuery({
+  const {
+    data: event,
+    isLoading,
+    error: eventError,
+    refetch: refetchEvent,
+  } = useQuery({
     ...getErrorEventOptions({
       path: {
         event_id: parseInt(eventId!),
@@ -98,6 +106,39 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
             </div>
           </CardContent>
         </Card>
+      </div>
+    )
+  }
+
+  const isNotFound =
+    (eventError as any)?.status === 404 ||
+    (eventError as any)?.title === 'Not Found'
+
+  if (!event && eventError && !isNotFound) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 min-h-[400px]">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+        <div className="text-center">
+          <h2 className="text-lg font-semibold">Failed to load error event</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {eventError instanceof Error
+              ? eventError.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => void refetchEvent()}>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => navigate(`/projects/${project.slug}/errors/${errorGroupId}`)}
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to Error Group
+          </Button>
+        </div>
       </div>
     )
   }

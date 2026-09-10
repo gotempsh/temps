@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { SandboxError } from './errors.js';
 
 // Thin fetch wrapper. Centralises auth header, base URL resolution, and

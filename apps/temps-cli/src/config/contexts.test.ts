@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import {
   pickActiveContext,
   envContextName,
+  contextExists,
   __resetMissingContextWarning,
   type CliContext,
 } from './contexts.js'
@@ -89,5 +93,21 @@ describe('pickActiveContext', () => {
   test('whitespace-only TEMPS_CONTEXT is ignored, active flag wins', () => {
     process.env[ENV_KEY] = '   '
     expect(pickActiveContext(contexts)?.name).toBe('local')
+  })
+})
+
+describe('contextExists', () => {
+  const contexts = [ctx('local'), ctx('prod'), ctx('stage')]
+
+  test('true for a configured name', () => {
+    expect(contextExists('prod', contexts)).toBe(true)
+  })
+
+  test('false for a typo / unconfigured name', () => {
+    expect(contextExists('production', contexts)).toBe(false)
+  })
+
+  test('false against an empty list', () => {
+    expect(contextExists('local', [])).toBe(false)
   })
 })

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { readFile, stat } from 'node:fs/promises'
 import { basename } from 'node:path'
@@ -97,21 +100,20 @@ async function listIntegrations(projectId: number): Promise<IntegrationResponse[
 }
 
 /**
- * Resolve which integration to target. Priority:
+ * Pick which integration to target out of an already-fetched list. Priority:
  *   1. --integration-id <n>
  *   2. --provider <name> (must match exactly one integration)
  *   3. If the project has exactly one integration, use it.
  */
-async function resolveIntegration(
-  projectId: number,
-  opts: ImportOptions,
-): Promise<IntegrationResponse> {
+export function selectIntegration(
+  integrations: IntegrationResponse[],
+  opts: Pick<ImportOptions, 'integrationId' | 'provider'>,
+): IntegrationResponse {
   if (opts.integrationId) {
     const id = Number(opts.integrationId)
     if (!Number.isFinite(id) || id <= 0) {
       throw new Error(`Invalid --integration-id: "${opts.integrationId}"`)
     }
-    const integrations = await listIntegrations(projectId)
     const found = integrations.find((i) => i.id === id)
     if (!found) {
       throw new Error(`Integration ${id} not found in this project`)
@@ -119,7 +121,6 @@ async function resolveIntegration(
     return found
   }
 
-  const integrations = await listIntegrations(projectId)
   if (integrations.length === 0) {
     throw new Error(
       'No revenue integrations configured for this project. ' +
@@ -150,6 +151,18 @@ async function resolveIntegration(
   }
 
   return integrations[0]!
+}
+
+/**
+ * Resolve which integration to target, fetching the project's integrations
+ * first. See {@link selectIntegration} for the selection priority.
+ */
+async function resolveIntegration(
+  projectId: number,
+  opts: ImportOptions,
+): Promise<IntegrationResponse> {
+  const integrations = await listIntegrations(projectId)
+  return selectIntegration(integrations, opts)
 }
 
 async function uploadCsv(

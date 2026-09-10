@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-infra"
 version.workspace = true
@@ -20,7 +23,7 @@ log = { workspace = true }
 anyhow = { workspace = true }
 
 # Crate-specific dependencies
-get_if_addrs = "0.5"
+if-addrs = "0.15"
 parking_lot = "0.12"
 hickory-resolver = "0.26"
 
@@ -33,3 +36,5 @@ tracing = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
 tower = { workspace = true }
+chrono = { workspace = true }
+temps-entities = { path = "../temps-entities" }

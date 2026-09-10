@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deploy Static Files Job
 //!
 //! Deploys static files (Vite, React, etc.) to the filesystem instead of containers
@@ -180,33 +183,40 @@ impl WorkflowTask for DeployStaticJob {
         )
         .await?;
 
-        // Create temporary directory to extract files
-        let temp_dir = std::env::temp_dir().join(format!("temps-static-{}", uuid::Uuid::new_v4()));
-        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-            return Err(self
-                .log_and_fail(
-                    &context,
-                    format!("❌ Failed to create temp directory: {}", e),
-                )
-                .await);
-        }
+        // Acquire first so reverse drop order removes the extracted directory
+        // before releasing capacity to another extraction.
+        let _extraction_permit = super::acquire_archive_extraction_permit().await?;
+
+        // TempDir owns the extraction tree so every return path (including
+        // sensitive-file rejection and logging errors) removes it. tempfile
+        // also creates the directory with owner-only permissions on Unix.
+        let temp_dir = match tempfile::Builder::new().prefix("temps-static-").tempdir() {
+            Ok(temp_dir) => temp_dir,
+            Err(error) => {
+                return Err(self
+                    .log_and_fail(
+                        &context,
+                        format!("❌ Failed to create secure temp directory: {error}"),
+                    )
+                    .await);
+            }
+        };
 
         self.log(
             &context,
             format!(
                 "📂 Extracting from {} to {}",
                 self.static_output_dir,
-                temp_dir.display()
+                temp_dir.path().display()
             ),
         )
         .await?;
 
-        // Extract static files from the container image
-        if let Err(e) = self
+        let extraction_result = self
             .image_builder
-            .extract_from_image(&image_tag, &self.static_output_dir, &temp_dir)
-            .await
-        {
+            .extract_from_image(&image_tag, &self.static_output_dir, temp_dir.path())
+            .await;
+        if let Err(e) = extraction_result {
             return Err(self
                 .log_and_fail(
                     &context,
@@ -223,7 +233,7 @@ impl WorkflowTask for DeployStaticJob {
 
         // Create deploy request
         let request = StaticDeployRequest {
-            source_dir: temp_dir.clone(),
+            source_dir: temp_dir.path().to_path_buf(),
             project_slug: self.project_slug.clone(),
             environment_slug: self.environment_slug.clone(),
             deployment_slug: self.deployment_slug.clone(),
@@ -241,15 +251,6 @@ impl WorkflowTask for DeployStaticJob {
 
         self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
             .await?;
-
-        // Clean up temporary directory
-        if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
-            self.log(
-                &context,
-                format!("⚠️  Warning: Failed to clean up temp directory: {}", e),
-            )
-            .await?;
-        }
 
         // Set outputs
         context.set_output(&self.job_id, "static_dir_location", &result.storage_path)?;
@@ -327,6 +328,7 @@ mod tests {
     // Mock ImageBuilder for tests
     struct MockImageBuilder {
         extract_dir: PathBuf,
+        extracted_destination: Option<Arc<std::sync::Mutex<Option<PathBuf>>>>,
     }
 
     #[async_trait]
@@ -352,6 +354,14 @@ mod tests {
             _source_path: &str,
             destination_path: &std::path::Path,
         ) -> Result<(), BuilderError> {
+            if let Some(extracted_destination) = &self.extracted_destination {
+                *extracted_destination.lock().map_err(|error| {
+                    BuilderError::Other(format!(
+                        "Failed to record mock extraction destination: {error}"
+                    ))
+                })? = Some(destination_path.to_path_buf());
+            }
+
             // Copy files from extract_dir to destination_path to simulate extraction
             std::fs::create_dir_all(destination_path)
                 .map_err(|e| BuilderError::Other(format!("Failed to create destination: {}", e)))?;
@@ -446,6 +456,7 @@ mod tests {
         let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.clone()));
         let image_builder = Arc::new(MockImageBuilder {
             extract_dir: built_files_dir,
+            extracted_destination: None,
         });
 
         let job = DeployStaticJob::new(
@@ -520,6 +531,7 @@ mod tests {
         let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir));
         let image_builder = Arc::new(MockImageBuilder {
             extract_dir: temp_dir.path().to_path_buf(),
+            extracted_destination: None,
         });
 
         let job = DeployStaticJob::new(
@@ -556,6 +568,51 @@ mod tests {
             error_msg.contains("static_output_dir"),
             "Expected error about static_output_dir, got: {}",
             error_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sensitive_static_deploy_cleans_temporary_extraction() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        let built_files_dir = temp_dir.path().join("built_files");
+        std_fs::create_dir_all(&built_files_dir).unwrap();
+        std_fs::write(built_files_dir.join("index.html"), b"ordinary").unwrap();
+        std_fs::write(built_files_dir.join("app.js.map"), b"private source map").unwrap();
+
+        let extracted_destination = Arc::new(std::sync::Mutex::new(None));
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir));
+        let image_builder = Arc::new(MockImageBuilder {
+            extract_dir: built_files_dir,
+            extracted_destination: Some(extracted_destination.clone()),
+        });
+        let job = DeployStaticJob::new(
+            "deploy_static".to_string(),
+            "build_image".to_string(),
+            "/app/dist".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-sensitive".to_string(),
+            deployer,
+            image_builder,
+        );
+        let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        context
+            .set_output("build_image", "image_tag", "myapp:latest")
+            .unwrap();
+
+        let result = job.execute(context).await;
+
+        assert!(result.is_err(), "source maps must not be published");
+        let extraction_path = extracted_destination
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mock extraction destination was recorded");
+        assert!(
+            !extraction_path.exists(),
+            "failed deployment leaked temporary extraction directory {}",
+            extraction_path.display()
         );
     }
 }

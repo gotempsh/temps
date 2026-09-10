@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps-pty-agent` — in-sandbox PTY multiplexer reached over a Unix socket.
 //!
 //! The agent runs as a long-lived process inside every workspace sandbox

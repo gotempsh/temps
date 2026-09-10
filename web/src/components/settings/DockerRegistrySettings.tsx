@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   Card,
   CardContent,
@@ -25,6 +28,11 @@ export interface DockerRegistrySettings {
 
 interface DockerRegistryFormValues {
   docker_registry: DockerRegistrySettings
+  // Present only so this type matches `DockerRegistryPage`'s form values
+  // exactly -- react-hook-form's `Control`/`UseFormRegister` generics require
+  // an exact match, and the page also has a `RegistryMirrorSettings` section.
+  // Unused by this component.
+  registry_mirror_prefix: string | null
 }
 
 interface DockerRegistrySettingsProps {

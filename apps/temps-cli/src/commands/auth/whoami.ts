@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { credentials, config } from '../../config/store.js'
 import { getActiveContext } from '../../config/contexts.js'
 import { withSpinner } from '../../ui/spinner.js'

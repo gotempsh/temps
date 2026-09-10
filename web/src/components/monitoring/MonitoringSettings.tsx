@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import { getPreferences, updatePreferences } from '@/api/client/sdk.gen'
@@ -25,8 +28,8 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useForm, useWatch } from 'react-hook-form'
+import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   backupAlertsSchema,
@@ -43,7 +46,13 @@ import {
   type WeeklyDigestFormData,
 } from './schemas'
 import { AlertRulesManagement } from './AlertRulesManagement'
-import { ResourceMonitoring } from './ResourceMonitoring'
+import { NodeAlertRules } from './NodeAlertRules'
+import { Alarms } from '@/pages/Alarms'
+import {
+  MONITORING_SECTIONS,
+  monitoringSectionLabel,
+} from './monitoring-sections'
+import { PageHeader } from '@/components/layout/PageContainer'
 
 interface AlertComponentProps<T> {
   onSave: (data: T) => Promise<void>
@@ -641,7 +650,10 @@ function WeeklyDigest({
     form.reset(data)
   }
 
-  const digestEnabled = form.watch('weeklyDigestEnabled')
+  const digestEnabled = useWatch({
+    control: form.control,
+    name: 'weeklyDigestEnabled',
+  })
 
   return (
     <Form {...form}>
@@ -649,8 +661,8 @@ function WeeklyDigest({
         <div className="space-y-4">
           <h3 className="text-lg font-medium">Weekly Digest</h3>
           <p className="text-sm text-muted-foreground">
-            Receive a comprehensive weekly summary of your project's activity,
-            performance, and health metrics
+            Receive a comprehensive weekly summary of your project&apos;s
+            activity, performance, and health metrics
           </p>
 
           <FormField
@@ -715,11 +727,7 @@ function WeeklyDigest({
                     <FormItem>
                       <FormLabel>Send Time (24-hour format)</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="time"
-                          placeholder="09:00"
-                        />
+                        <Input {...field} type="time" placeholder="09:00" />
                       </FormControl>
                       <FormDescription>
                         Time of day to send the digest
@@ -845,7 +853,7 @@ function WeeklyDigest({
 export function MonitoringSettings() {
   const navigate = useNavigate()
   const { section } = useParams()
-  const currentSection = section || 'resources'
+  const currentSection = section || 'alerts'
 
   const { data: preferences, isLoading } = useQuery({
     queryKey: ['preferences'],
@@ -858,13 +866,6 @@ export function MonitoringSettings() {
   const handleSectionChange = (value: string) => {
     navigate(`/monitoring/${value}`)
   }
-
-  const settingsSections = [
-    { id: 'resources', label: 'Health' },
-    { id: 'alerts', label: 'Alerts' },
-    { id: 'alarms', label: 'Alarms' },
-    { id: 'notifications', label: 'Notifications' },
-  ] as const
 
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
     if (!preferences) return
@@ -1023,9 +1024,17 @@ export function MonitoringSettings() {
   }
 
   const renderContent = () => {
-    // Health tab doesn't depend on preferences
-    if (currentSection === 'resources') {
-      return <ResourceMonitoring />
+    if (currentSection === 'rules') {
+      return (
+        <div className="space-y-8">
+          <NodeAlertRules />
+          <AlertRulesManagement />
+        </div>
+      )
+    }
+
+    if (currentSection === 'alarms') {
+      return <Alarms embedded />
     }
 
     if (isLoading) {
@@ -1083,17 +1092,13 @@ export function MonitoringSettings() {
       },
       batchNotifications: preferences.batch_similar_notifications,
       minimumSeverity: preferences.minimum_severity as
-        | 'critical'
-        | 'warning'
-        | 'info',
+        'critical' | 'warning' | 'info',
     }
 
     const digestDefaults = {
       weeklyDigestEnabled: preferences.weekly_digest_enabled ?? false,
       digestSendDay: (preferences.digest_send_day ?? 'monday') as
-        | 'monday'
-        | 'friday'
-        | 'sunday',
+        'monday' | 'friday' | 'sunday',
       digestSendTime: preferences.digest_send_time ?? '09:00',
       digestSections: {
         performance: preferences.digest_sections?.performance ?? true,
@@ -1105,33 +1110,33 @@ export function MonitoringSettings() {
     }
 
     switch (currentSection) {
-      case 'resources':
-        return <ResourceMonitoring /> // handled by early return above, kept for switch exhaustiveness
       case 'alerts':
         return (
-          <div className="space-y-8">
-            <Card className="p-6">
+          <div className="grid items-start gap-4 xl:grid-cols-2">
+            <Card className="p-5 sm:p-6">
               <ProjectAlerts
                 onSave={handleProjectSave}
                 defaultValues={projectDefaults}
               />
             </Card>
-            <Card className="p-6">
+            <Card className="p-5 sm:p-6">
               <DomainAlerts
                 onSave={handleDomainSave}
                 defaultValues={domainDefaults}
               />
             </Card>
-            <Card className="p-6">
+            <Card className="p-5 sm:p-6">
               <BackupAlerts
                 onSave={handleBackupSave}
                 defaultValues={backupDefaults}
               />
             </Card>
-            <Card className="p-6">
-              <RouteAlerts onSave={handleRouteSave} defaultValues={routeDefaults} />
+            <Card className="p-5 sm:p-6">
+              <RouteAlerts
+                onSave={handleRouteSave}
+                defaultValues={routeDefaults}
+              />
             </Card>
-            <AlertRulesManagement />
           </div>
         )
       case 'notifications':
@@ -1158,24 +1163,21 @@ export function MonitoringSettings() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold">Monitoring & Alerts</h2>
-        <p className="text-sm text-muted-foreground">
-          Configure monitoring thresholds and alert notifications
-        </p>
-      </div>
+      <PageHeader
+        title="Monitoring & Alerts"
+        description="Configure monitoring thresholds and alert notifications"
+      />
 
       {/* Mobile Select */}
       <div className="sm:hidden">
         <Select value={currentSection} onValueChange={handleSectionChange}>
           <SelectTrigger className="w-full">
             <SelectValue>
-              {settingsSections.find((section) => section.id === currentSection)
-                ?.label || 'Select section'}
+              {monitoringSectionLabel(currentSection) || 'Select section'}
             </SelectValue>
           </SelectTrigger>
           <SelectContent>
-            {settingsSections.map((section) => (
+            {MONITORING_SECTIONS.map((section) => (
               <SelectItem key={section.id} value={section.id}>
                 {section.label}
               </SelectItem>
@@ -1192,7 +1194,7 @@ export function MonitoringSettings() {
           className="space-y-4"
         >
           <TabsList>
-            {settingsSections.map((section) => (
+            {MONITORING_SECTIONS.map((section) => (
               <TabsTrigger key={section.id} value={section.id}>
                 {section.label}
               </TabsTrigger>

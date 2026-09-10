@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -37,6 +40,9 @@ pub struct Model {
     /// single DB and doesn't want the control plane lumped in.
     #[sea_orm(default_value = true)]
     pub include_control_plane: bool,
+    /// Stable machine-readable marker for schedules created by Temps.
+    /// User-created schedules remain `None` and are never lifecycle-managed.
+    pub generated_kind: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

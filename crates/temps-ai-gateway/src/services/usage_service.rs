@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set, Statement,
@@ -719,10 +722,15 @@ impl UsageService {
     }
 
     /// Get all invocations for a specific conversation.
+    ///
+    /// `caller_user_id`: `None` runs an unscoped (admin) lookup; `Some(id)`
+    /// restricts results to invocations owned by that user, so ordinary
+    /// callers cannot read another user's conversation by guessing its ID.
     pub async fn get_conversation_detail(
         &self,
         conversation_id: &str,
         limit: u64,
+        caller_user_id: Option<i32>,
     ) -> Result<Vec<UsageLogEntry>, AiGatewayError> {
         let rows = UsageLogRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -744,9 +752,14 @@ impl UsageService {
                 trace_id
             FROM ai_usage_logs
             WHERE conversation_id = $1
+              AND ($3::int IS NULL OR user_id = $3)
             ORDER BY timestamp ASC
             LIMIT $2"#,
-            [conversation_id.into(), (limit as i64).into()],
+            [
+                conversation_id.into(),
+                (limit as i64).into(),
+                caller_user_id.into(),
+            ],
         ))
         .all(self.db.as_ref())
         .await?;

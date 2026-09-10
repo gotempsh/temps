@@ -1,5 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { aiHarnessName } from '@/components/ui/ai-harness-brand'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Card, CardContent } from '@/components/ui/card'
 import {
   Dialog,
@@ -21,9 +26,17 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, CheckCircle2, Loader2, Pencil, Play, Sparkles, Terminal } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Loader2,
+  Pencil,
+  Play,
+  Sparkles,
+  Terminal,
+} from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import type { Agent } from './AgentEditPage'
 import { CodeBlock } from '@/components/ui/code-block'
@@ -38,6 +51,7 @@ import {
   updateAgentMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunResponse } from '@/api/client/types.gen'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 
 type AgentRun = AgentRunResponse
@@ -73,7 +87,15 @@ function nextCronRun(cron: string | null | undefined): string | null {
   const parts = cron.split(' ')
   if (parts.length !== 5) return cron
   const [min, hour, , , dow] = parts
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  const days = [
+    'Sunday',
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+  ]
   const dayName = dow !== '*' ? days[parseInt(dow)] || dow : 'Daily'
   const time = `${hour.padStart(2, '0')}:${min.padStart(2, '0')} UTC`
   return `${dayName} at ${time}`
@@ -83,42 +105,80 @@ function nextCronRun(cron: string | null | undefined): string | null {
  * Renders the list of triggers configured for a workflow as visual badges.
  * Shows which events will fire this workflow.
  */
-function TriggerBadges({ agent, nextRun }: { agent: Agent; nextRun: string | null }) {
+function TriggerBadges({
+  agent,
+  nextRun,
+}: {
+  agent: Agent
+  nextRun: string | null
+}) {
   const triggers = agent.trigger_config ?? {}
   const badges: { label: string; color: string; key: string }[] = []
 
   // Error triggers
   if (triggers.error?.new_issue) {
-    badges.push({ key: 'error-new', label: 'New errors', color: 'bg-red-500/10 text-red-400 border border-red-500/20' })
+    badges.push({
+      key: 'error-new',
+      label: 'New errors',
+      color: 'bg-red-500/10 text-red-400 border border-red-500/20',
+    })
   }
   if (triggers.error?.regression) {
-    badges.push({ key: 'error-reg', label: 'Error regressions', color: 'bg-red-500/10 text-red-400 border border-red-500/20' })
+    badges.push({
+      key: 'error-reg',
+      label: 'Error regressions',
+      color: 'bg-red-500/10 text-red-400 border border-red-500/20',
+    })
   }
 
   // Deploy triggers
   if (triggers.deploy?.production) {
-    badges.push({ key: 'deploy-prod', label: 'Production deploys', color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20' })
+    badges.push({
+      key: 'deploy-prod',
+      label: 'Production deploys',
+      color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20',
+    })
   }
   if (triggers.deploy?.preview) {
-    badges.push({ key: 'deploy-prev', label: 'Preview deploys', color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20' })
+    badges.push({
+      key: 'deploy-prev',
+      label: 'Preview deploys',
+      color: 'bg-purple-500/10 text-purple-400 border border-purple-500/20',
+    })
   }
 
   // Monitoring triggers
   if (triggers.monitoring?.downtime) {
-    badges.push({ key: 'mon-down', label: 'Downtime', color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20' })
+    badges.push({
+      key: 'mon-down',
+      label: 'Downtime',
+      color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20',
+    })
   }
   if (triggers.monitoring?.latency_spike) {
-    badges.push({ key: 'mon-lat', label: 'Latency spikes', color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20' })
+    badges.push({
+      key: 'mon-lat',
+      label: 'Latency spikes',
+      color: 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20',
+    })
   }
 
   // Schedule
   if (nextRun) {
-    badges.push({ key: 'schedule', label: `Schedule: ${nextRun}`, color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20' })
+    badges.push({
+      key: 'schedule',
+      label: `Schedule: ${nextRun}`,
+      color: 'bg-blue-500/10 text-blue-400 border border-blue-500/20',
+    })
   }
 
   // Manual
   if (triggers.manual) {
-    badges.push({ key: 'manual', label: 'Manual', color: 'bg-muted text-muted-foreground border border-border' })
+    badges.push({
+      key: 'manual',
+      label: 'Manual',
+      color: 'bg-muted text-muted-foreground border border-border',
+    })
   }
 
   if (badges.length === 0) {
@@ -131,9 +191,14 @@ function TriggerBadges({ agent, nextRun }: { agent: Agent; nextRun: string | nul
 
   return (
     <div className="flex flex-wrap gap-1.5 items-center mt-2">
-      <span className="text-xs text-muted-foreground font-medium">Triggers:</span>
+      <span className="text-xs text-muted-foreground font-medium">
+        Triggers:
+      </span>
       {badges.map((b) => (
-        <span key={b.key} className={`text-xs px-1.5 py-0.5 rounded ${b.color}`}>
+        <span
+          key={b.key}
+          className={`text-xs px-1.5 py-0.5 rounded ${b.color}`}
+        >
           {b.label}
         </span>
       ))}
@@ -190,120 +255,122 @@ function AgentCard({
 
   return (
     <>
-    <Card className="bg-background">
-      <CardContent className="p-4">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-2">
-            <button
-              className="font-medium hover:underline text-left"
-              onClick={() => onNavigate(agent.slug)}
-            >
-              {agent.name}
-            </button>
-            {agent.source === 'yaml' && (
-              <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">YAML</span>
+      <Card className="bg-background">
+        <CardContent className="p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <button
+                className="font-medium hover:underline text-left"
+                onClick={() => onNavigate(agent.slug)}
+              >
+                {agent.name}
+              </button>
+              {agent.source === 'yaml' && (
+                <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">
+                  YAML
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={agent.enabled}
+                onCheckedChange={() =>
+                  toggleEnabled.mutate({
+                    path: { project_id: projectId, slug: agent.slug },
+                    body: { slug: agent.slug, enabled: !agent.enabled },
+                  })
+                }
+                disabled={toggleEnabled.isPending}
+              />
+              <Button variant="ghost" size="sm" onClick={() => onEdit(agent)}>
+                <Pencil className="h-3 w-3" />
+              </Button>
+              {agent.trigger_config?.manual && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowTriggerDialog(true)}
+                  disabled={trigger.isPending || !agent.enabled}
+                >
+                  <Play className="h-3 w-3 mr-1" />
+                  Run
+                </Button>
+              )}
+            </div>
+          </div>
+          {agent.description && (
+            <p className="text-sm text-muted-foreground mb-2">
+              {agent.description}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground items-center">
+            <span className="flex items-center gap-1.5 bg-muted px-1.5 py-0.5 rounded font-medium">
+              <AiHarnessLogo providerId={agent.ai_provider} size={18} />
+              {aiHarnessName(agent.ai_provider)}
+            </span>
+            {agent.ai_model && (
+              <span className="bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-mono">
+                {agent.ai_model}
+              </span>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            <Switch
-              checked={agent.enabled}
-              onCheckedChange={() =>
-                toggleEnabled.mutate({
+          <TriggerBadges agent={agent} nextRun={nextRun} />
+        </CardContent>
+      </Card>
+
+      {/* Trigger dialog with optional context */}
+      <Dialog open={showTriggerDialog} onOpenChange={setShowTriggerDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Run Workflow: {agent.name}</DialogTitle>
+            <DialogDescription>
+              {agent.description || 'Trigger this workflow manually.'}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              Context{' '}
+              <span className="text-muted-foreground font-normal">
+                (optional)
+              </span>
+            </label>
+            <Textarea
+              placeholder="e.g. Research edge caching best practices for Next.js in 2026..."
+              value={userContext}
+              onChange={(e) => setUserContext(e.target.value)}
+              rows={4}
+            />
+            <p className="text-xs text-muted-foreground">
+              Provide additional instructions or a topic for the workflow. This
+              is appended to the workflow’s prompt.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowTriggerDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                trigger.mutate({
                   path: { project_id: projectId, slug: agent.slug },
-                  body: { slug: agent.slug, enabled: !agent.enabled },
+                  body: userContext ? { user_context: userContext } : {},
                 })
               }
-              disabled={toggleEnabled.isPending}
-            />
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onEdit(agent)}
+              disabled={trigger.isPending}
             >
-              <Pencil className="h-3 w-3" />
+              {trigger.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+              ) : (
+                <Play className="h-4 w-4 mr-2" />
+              )}
+              Run Workflow
             </Button>
-            {agent.trigger_config?.manual && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setShowTriggerDialog(true)}
-                disabled={trigger.isPending || !agent.enabled}
-              >
-                <Play className="h-3 w-3 mr-1" />
-                Run
-              </Button>
-            )}
-          </div>
-        </div>
-        {agent.description && (
-          <p className="text-sm text-muted-foreground mb-2">{agent.description}</p>
-        )}
-        <div className="flex flex-wrap gap-2 text-xs text-muted-foreground items-center">
-          <span className="bg-muted px-1.5 py-0.5 rounded font-medium">
-            {agent.ai_provider === 'claude_cli'
-              ? 'Claude Code'
-              : agent.ai_provider === 'codex_cli'
-                ? 'Codex'
-                : agent.ai_provider === 'opencode'
-                  ? 'OpenCode'
-                  : agent.ai_provider}
-          </span>
-          {agent.ai_model && (
-            <span className="bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded font-mono">
-              {agent.ai_model}
-            </span>
-          )}
-        </div>
-        <TriggerBadges agent={agent} nextRun={nextRun} />
-      </CardContent>
-    </Card>
-
-    {/* Trigger dialog with optional context */}
-    <Dialog open={showTriggerDialog} onOpenChange={setShowTriggerDialog}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Run Workflow: {agent.name}</DialogTitle>
-          <DialogDescription>
-            {agent.description || 'Trigger this workflow manually.'}
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-2">
-          <label className="text-sm font-medium">
-            Context <span className="text-muted-foreground font-normal">(optional)</span>
-          </label>
-          <Textarea
-            placeholder="e.g. Research edge caching best practices for Next.js in 2026..."
-            value={userContext}
-            onChange={(e) => setUserContext(e.target.value)}
-            rows={4}
-          />
-          <p className="text-xs text-muted-foreground">
-            Provide additional instructions or a topic for the workflow. This is appended to the workflow's prompt.
-          </p>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setShowTriggerDialog(false)}>
-            Cancel
-          </Button>
-          <Button
-            onClick={() =>
-              trigger.mutate({
-                path: { project_id: projectId, slug: agent.slug },
-                body: userContext ? { user_context: userContext } : {},
-              })
-            }
-            disabled={trigger.isPending}
-          >
-            {trigger.isPending ? (
-              <Loader2 className="h-4 w-4 animate-spin mr-2" />
-            ) : (
-              <Play className="h-4 w-4 mr-2" />
-            )}
-            Run Workflow
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   )
 }
@@ -312,10 +379,7 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
-  const {
-    data: agentsData,
-    isLoading: isLoadingAgents,
-  } = useQuery({
+  const { data: agentsData, isLoading: isLoadingAgents } = useQuery({
     ...listAgentsOptions({ path: { project_id: project.id } }),
   })
   const agents = (agentsData?.items ?? []) as Agent[]
@@ -323,27 +387,18 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
   // Fetch the provider catalog to determine the platform's configured default
   // and whether credentials are saved (which is what actually matters for sandbox mode)
   const { data: providerCatalog } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: async () => {
-      const res = await fetch('/api/settings/ai-providers')
-      if (!res.ok) return null
-      return res.json() as Promise<{
-        default_provider: string
-        providers: Array<{ id: string; name: string; credential_saved: boolean }>
-      }>
-    },
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60_000,
   })
 
   const defaultProvider = providerCatalog?.default_provider ?? 'claude_cli'
-  const defaultProviderEntry = providerCatalog?.providers.find((p) => p.id === defaultProvider)
+  const defaultProviderEntry = providerCatalog?.providers.find(
+    (p) => p.id === defaultProvider
+  )
   const defaultProviderName = defaultProviderEntry?.name ?? 'AI CLI'
   const hasCredential = defaultProviderEntry?.credential_saved ?? false
 
-  const {
-    data: runsData,
-    isLoading: isLoadingRuns,
-  } = useQuery({
+  const { data: runsData, isLoading: isLoadingRuns } = useQuery({
     ...listAllRunsOptions({ path: { project_id: project.id } }),
     refetchInterval: 5000,
     enabled: agents.length > 0,
@@ -365,9 +420,12 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
       <div className="mx-auto max-w-2xl py-12">
         <div className="flex flex-col items-center text-center mb-8">
           <Sparkles className="h-12 w-12 text-muted-foreground mb-4" />
-          <h2 className="text-lg font-semibold mb-2">No workflows configured</h2>
+          <h2 className="text-lg font-semibold mb-2">
+            No workflows configured
+          </h2>
           <p className="text-muted-foreground text-sm max-w-md">
-            Workflows are defined in your repository or run ephemerally from the CLI.
+            Workflows are defined in your repository or run ephemerally from the
+            CLI.
           </p>
         </div>
 
@@ -380,14 +438,16 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                   'flex size-8 shrink-0 items-center justify-center rounded-md text-sm font-medium',
                   hasCredential
                     ? 'bg-emerald-500/10 text-emerald-500'
-                    : 'bg-amber-500/10 text-amber-500',
+                    : 'bg-amber-500/10 text-amber-500'
                 )}
               >
                 {hasCredential ? <CheckCircle2 className="size-4" /> : '1'}
               </div>
               <div className="min-w-0 flex-1 space-y-2">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <h3 className="text-sm font-semibold">Configure an AI provider</h3>
+                  <h3 className="text-sm font-semibold">
+                    Configure an AI provider
+                  </h3>
                   {hasCredential ? (
                     <span className="text-xs text-emerald-500 font-medium">
                       {defaultProviderName} configured
@@ -399,8 +459,8 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Workflows need an AI CLI (Claude Code, Codex, or OpenCode) to run.
-                  Add credentials once in{' '}
+                  Workflows need an AI CLI (Claude Code, Codex, or OpenCode) to
+                  run. Add credentials once in{' '}
                   <Link to="/agent-sandbox" className="underline font-medium">
                     Settings &gt; AI Workflows
                   </Link>
@@ -422,14 +482,16 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                 2
               </div>
               <div className="min-w-0 flex-1 space-y-2">
-                <h3 className="text-sm font-semibold">Commit a workflow to your repo</h3>
+                <h3 className="text-sm font-semibold">
+                  Commit a workflow to your repo
+                </h3>
                 <p className="text-xs text-muted-foreground">
                   Add a YAML file to{' '}
                   <code className="text-[11px] bg-muted px-1 py-0.5 rounded">
                     .temps/workflows/
                   </code>{' '}
-                  in your repository. Temps picks it up on the next deploy and wires
-                  up the triggers automatically.
+                  in your repository. Temps picks it up on the next deploy and
+                  wires up the triggers automatically.
                 </p>
                 <CodeBlock
                   language="yaml"
@@ -464,8 +526,9 @@ prompt: |
                   </h3>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Trigger a one-off run from a local YAML file — nothing is stored
-                  in the project config. Great for experimenting before committing.
+                  Trigger a one-off run from a local YAML file — nothing is
+                  stored in the project config. Great for experimenting before
+                  committing.
                 </p>
                 <CodeBlock
                   language="bash"
@@ -496,7 +559,9 @@ prompt: |
               </p>
               <p className="text-sm opacity-90">
                 Add credentials in{' '}
-                <Link to="/agent-sandbox" className="underline font-medium">Settings &gt; AI Workflows</Link>
+                <Link to="/agent-sandbox" className="underline font-medium">
+                  Settings &gt; AI Workflows
+                </Link>
               </p>
             </div>
           </AlertDescription>
@@ -519,9 +584,7 @@ prompt: |
               agent={agent}
               projectId={project.id}
               queryClient={queryClient}
-              onEdit={(a) =>
-                navigate(`detail/${a.slug}/edit`)
-              }
+              onEdit={(a) => navigate(`detail/${a.slug}/edit`)}
               onNavigate={(slug) => navigate(`detail/${slug}`)}
             />
           ))}
@@ -566,8 +629,13 @@ prompt: |
                     key={run.id}
                     className="cursor-pointer hover:bg-muted/50"
                     onClick={() => {
-                      if (run.trigger_type === 'autofixer' && run.trigger_source_id) {
-                        navigate(`/projects/${project.slug}/errors/${run.trigger_source_id}/autofix`)
+                      if (
+                        run.trigger_type === 'autofixer' &&
+                        run.trigger_source_id
+                      ) {
+                        navigate(
+                          `/projects/${project.slug}/errors/${run.trigger_source_id}/autofix`
+                        )
                       } else {
                         navigate(`${run.id}`)
                       }
@@ -580,7 +648,9 @@ prompt: |
                       <div className="flex items-center gap-2">
                         <span>
                           {run.agent_name ||
-                            (run.trigger_type === 'autofixer' ? 'Autofix' : '-')}
+                            (run.trigger_type === 'autofixer'
+                              ? 'Autofix'
+                              : '-')}
                         </span>
                         {run.source === 'cli_ephemeral' && (
                           <span
@@ -593,7 +663,9 @@ prompt: |
                       </div>
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
-                      {run.trigger_type === 'autofixer' ? 'Autofix' : run.trigger_type}
+                      {run.trigger_type === 'autofixer'
+                        ? 'Autofix'
+                        : run.trigger_type}
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-sm">
                       {run.pr_number ? `#${run.pr_number}` : '-'}

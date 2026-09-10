@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Shared .env file parsing utility.
  * Handles comments, empty lines, quoted values, and escape sequences.

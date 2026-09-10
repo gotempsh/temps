@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -49,6 +52,20 @@ interface CheckOptions {
   json?: boolean
 }
 
+const IP_ACCESS_ACTIONS = ['allow', 'deny', 'block']
+
+/**
+ * Validates a raw --action value and normalizes "deny" to the "block" value
+ * the API expects. Returns undefined for anything not in the allowed set so
+ * callers can reject before a malformed action reaches the API.
+ */
+export function resolveIpAccessAction(rawAction: string): string | undefined {
+  if (!IP_ACCESS_ACTIONS.includes(rawAction)) {
+    return undefined
+  }
+  return rawAction === 'deny' ? 'block' : rawAction
+}
+
 export function registerIpAccessCommands(program: Command): void {
   const ipAccess = program
     .command('ip-access')
@@ -66,7 +83,7 @@ export function registerIpAccessCommands(program: Command): void {
     .command('create')
     .alias('add')
     .description('Create a new IP access control rule')
-    .option('--ip <ip_or_cidr>', 'IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24")')
+    .option('--ip <ip_or_cidr>', 'IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32")')
     .option('--action <action>', 'Action to take: "allow" or "deny"')
     .option('--description <desc>', 'Optional description/reason for the rule')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
@@ -150,8 +167,6 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const validActions = ['allow', 'deny', 'block']
-
   let ipAddress: string
   let action: string
   let reason: string | null = null
@@ -163,15 +178,12 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
     action = options.action!
     reason = options.description || null
 
-    // Normalize "deny" to "block" for the API
-    if (action === 'deny') {
-      action = 'block'
-    }
-
-    if (!validActions.includes(action)) {
+    const resolved = resolveIpAccessAction(action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${action}. Available: allow, deny`)
       return
     }
+    action = resolved
   } else {
     ipAddress = options.ip || await promptText({
       message: 'IP address or CIDR range',
@@ -183,15 +195,12 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
       required: true,
     })
 
-    // Normalize "deny" to "block" for the API
-    if (action === 'deny') {
-      action = 'block'
-    }
-
-    if (!validActions.includes(action)) {
+    const resolved = resolveIpAccessAction(action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${action}. Available: allow, deny`)
       return
     }
+    action = resolved
 
     reason = options.description || await promptText({
       message: 'Description/reason (optional)',
@@ -271,15 +280,12 @@ async function updateIpAccessAction(options: UpdateOptions): Promise<void> {
   }
 
   if (options.action) {
-    let action = options.action
-    if (action === 'deny') {
-      action = 'block'
-    }
-    if (!['allow', 'block', 'deny'].includes(options.action)) {
+    const resolved = resolveIpAccessAction(options.action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${options.action}. Available: allow, deny`)
       return
     }
-    body.action = action
+    body.action = resolved
   }
 
   if (options.description !== undefined) {

@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use maxminddb::geoip2;
-use rand::seq::SliceRandom;
+use maxminddb::Mmap;
+use rand::prelude::IndexedRandom;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -180,8 +187,165 @@ const MOCK_CITIES: &[MockCity] = &[
 ];
 
 pub enum GeoIpService {
-    MaxMind(Box<MaxMindGeoIpService>),
+    MaxMind(Arc<MaxMindGeoIpService>),
     Mock(MockGeoIpService),
+}
+
+/// Readers already loaded in this process, keyed by the resolved City database
+/// path and held weakly so the memo never outlives its last consumer.
+///
+/// `temps serve` builds two independent plugin registries in one process -- one
+/// for the proxy (`temps_proxy::server::setup_proxy_server`) and one for the
+/// console API (`start_console_api`) -- and each registers its own `GeoPlugin`.
+/// Without this memo each registration calls `Reader::open_readfile`, which
+/// reads the whole database into a fresh `Vec<u8>`, so a single-node instance
+/// holds two full copies of GeoLite2-City.mmdb on the heap.
+static LOADED_DATABASES: LazyLock<Mutex<HashMap<PathBuf, Weak<MaxMindGeoIpService>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns the cached value for `key`, or inserts what `load` produces.
+///
+/// The lock is deliberately held across `load`: the proxy and console register
+/// their geo plugins concurrently, so releasing it first would let both observe
+/// a miss and each read the database anyway -- the exact duplication this memo
+/// exists to prevent. `load` is startup-only file I/O, never on a request path.
+/// A poisoned lock only means some earlier caller panicked while loading; the
+/// map itself is still a consistent cache, so recover it rather than propagate.
+fn get_or_load<T, F>(
+    cache: &Mutex<HashMap<PathBuf, Weak<T>>>,
+    key: PathBuf,
+    load: F,
+) -> Result<Arc<T>, GeoIpError>
+where
+    F: FnOnce() -> Result<T, GeoIpError>,
+{
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    let loaded = Arc::new(load()?);
+    cache.insert(key, Arc::downgrade(&loaded));
+    Ok(loaded)
+}
+
+/// Resolves an mmdb filename the same way `validate_geolite2_database`
+/// (temps-cli's serve startup check) does: current working directory first,
+/// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
+/// two resolution orders must stay in sync -- when they diverged (this
+/// function previously only checked CWD), `temps serve` could pass its own
+/// startup validation (which checks + downloads to `TEMPS_DATA_DIR`) and
+/// then fail to actually open the database here, because a process whose
+/// working directory isn't its data directory (e.g. any Docker/systemd
+/// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
+/// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
+    resolve_mmdb_path_from(filename, &cwd, data_dir.as_deref())
+}
+
+fn resolve_mmdb_path_from(
+    filename: &str,
+    cwd: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let cwd_path = cwd.join(filename);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    // When neither file exists yet, prefer the configured data directory:
+    // startup downloads there. Returning the absent CWD candidate would make
+    // the plugin wait loop watch a path that can never receive the download.
+    data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
+}
+
+/// Open an `.mmdb` database as a read-only memory map.
+///
+/// Backing store for a MaxMind reader.
+///
+/// Normally a read-only mapping of a *private* copy of the database (see
+/// [`open_mmdb`]); falls back to the database read into the heap when a
+/// private copy cannot be made, so a read-only data directory still works.
+enum MmdbSource {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for MmdbSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapping) => mapping.as_ref(),
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+/// Copy `path` into an anonymous temporary file and map that.
+///
+/// # Safety
+///
+/// `Mmap::map` is unsafe because a mapped file modified *in place* under the
+/// process yields torn reads or `SIGBUS`. These databases are operator-managed:
+/// the setup flow tells operators to `cp` the file into the data directory, and
+/// `docker-compose.yml` shows them bind-mounted from the host. A `cp` over an
+/// existing destination truncates and rewrites that inode, so mapping the
+/// operator's file directly would let a routine database refresh crash a running
+/// server.
+///
+/// `tempfile_in` creates a file with no name in the filesystem, so nothing
+/// outside this process can reach the inode this maps. The copy costs one pass
+/// over the file at startup and the space is released when the reader drops.
+fn private_mapping(path: &std::path::Path) -> std::io::Result<Mmap> {
+    use std::io::Write;
+
+    let mut source = std::fs::File::open(path)?;
+    // Alongside the database, not `std::env::temp_dir()`, which is a tmpfs on
+    // many hosts -- that would put the copy straight back into RAM and undo the
+    // point of mapping it.
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut copy = tempfile::tempfile_in(directory)?;
+    std::io::copy(&mut source, &mut copy)?;
+    copy.flush()?;
+
+    // SAFETY: `copy` is an anonymous inode with no directory entry, so no other
+    // process can truncate or rewrite it, and this process only reads it.
+    unsafe { Mmap::map(&copy) }
+}
+
+/// Open a MaxMind database, mapping a private copy when possible.
+///
+/// The GeoLite2 City database is ~58 MB and the ASN database ~10 MB.
+/// `Reader::open_readfile` reads both into `Vec<u8>`, i.e. ~70 MB of anonymous
+/// heap (`RssAnon`) that the kernel can only reclaim through swap. A mapping
+/// puts those pages in `RssFile` (clean page cache) instead, which the kernel
+/// evicts and re-faults on demand -- the working set of a lookup is a handful
+/// of pages along one search tree path, so resident usage tracks traffic rather
+/// than file size.
+///
+/// Falls back to reading into the heap if the private copy cannot be made, for
+/// example when the data directory is mounted read-only. That is the previous
+/// behaviour, so the fallback is a footprint regression and never a failure.
+fn open_mmdb(
+    path: &std::path::Path,
+) -> Result<maxminddb::Reader<MmdbSource>, maxminddb::MaxMindDbError> {
+    match private_mapping(path) {
+        Ok(mapping) => maxminddb::Reader::from_source(MmdbSource::Mapped(mapping)),
+        Err(e) => {
+            // Only reachable if the database itself is unreadable (reported by
+            // the caller with the path) or the directory is not writable.
+            if path.exists() {
+                warn!(
+                    "Could not stage a private copy of '{}' ({}); reading it into memory instead",
+                    path.display(),
+                    e
+                );
+            }
+            maxminddb::Reader::from_source(MmdbSource::Owned(std::fs::read(path)?))
+        }
+    }
 }
 
 impl GeoIpService {
@@ -196,40 +360,41 @@ impl GeoIpService {
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
 
-        let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
-        debug!("Loading MaxMind database from: {:?}", db_path);
-        let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
-            GeoIpError::Other(format!(
-                "Failed to open MaxMind database at '{}': {}",
-                db_path.display(),
-                e
-            ))
+        let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
+        let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
+            debug!("Loading MaxMind database from: {:?}", db_path);
+            let reader = open_mmdb(&db_path).map_err(|e| {
+                GeoIpError::Other(format!(
+                    "Failed to open MaxMind database at '{}': {}",
+                    db_path.display(),
+                    e
+                ))
+            })?;
+
+            // ASN database is optional: hosting-provider detection degrades gracefully
+            // (asn_org/is_hosting_provider stay None) rather than failing startup when
+            // the operator hasn't provisioned it, same as the City database's own
+            // optional-file convention in Dockerfile/docker-compose.
+            let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
+            let asn_reader = match open_mmdb(&asn_db_path) {
+                Ok(reader) => {
+                    info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                    Some(reader)
+                }
+                Err(e) => {
+                    warn!(
+                        "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                        asn_db_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+
+            Ok(MaxMindGeoIpService { reader, asn_reader })
         })?;
 
-        // ASN database is optional: hosting-provider detection degrades gracefully
-        // (asn_org/is_hosting_provider stay None) rather than failing startup when
-        // the operator hasn't provisioned it, same as the City database's own
-        // optional-file convention in Dockerfile/docker-compose.
-        let asn_db_path = std::env::current_dir()?.join("GeoLite2-ASN.mmdb");
-        let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
-            Ok(reader) => {
-                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
-                Some(reader)
-            }
-            Err(e) => {
-                warn!(
-                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
-                    asn_db_path.display(),
-                    e
-                );
-                None
-            }
-        };
-
-        Ok(Self::MaxMind(Box::new(MaxMindGeoIpService {
-            reader,
-            asn_reader,
-        })))
+        Ok(Self::MaxMind(service))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -241,8 +406,8 @@ impl GeoIpService {
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<Vec<u8>>,
-    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: maxminddb::Reader<MmdbSource>,
+    asn_reader: Option<maxminddb::Reader<MmdbSource>>,
 }
 
 impl MaxMindGeoIpService {
@@ -365,7 +530,7 @@ impl MockGeoIpService {
     }
 
     fn random_mock_location() -> Result<GeoLocation, GeoIpError> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mock_city = MOCK_CITIES
             .choose(&mut rng)
             .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;
@@ -396,6 +561,129 @@ impl MockGeoIpService {
 mod tests {
     use super::*;
 
+    /// A second load of the same database path must reuse the first reader
+    /// rather than allocate another copy. This is the whole point of the memo:
+    /// `temps serve` registers `GeoPlugin` once for the proxy and once for the
+    /// console API, and GeoLite2-City.mmdb is ~58 MiB per copy.
+    #[test]
+    fn test_get_or_load_reuses_live_entry_for_same_path() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let first = get_or_load(&cache, path.clone(), || Ok("loaded once".to_string()))
+            .expect("first load should succeed");
+        let second = get_or_load(&cache, path.clone(), || {
+            panic!("second load must come from the memo, not re-read the database")
+        })
+        .expect("second load should hit the memo");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(Arc::strong_count(&first), 2);
+    }
+
+    #[test]
+    fn test_get_or_load_keys_on_path() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+
+        let a = get_or_load(
+            &cache,
+            PathBuf::from("/a/City.mmdb"),
+            || Ok("a".to_string()),
+        )
+        .expect("load a");
+        let b = get_or_load(
+            &cache,
+            PathBuf::from("/b/City.mmdb"),
+            || Ok("b".to_string()),
+        )
+        .expect("load b");
+
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(*a, "a");
+        assert_eq!(*b, "b");
+    }
+
+    /// The memo holds `Weak`, so once every consumer drops its handle the
+    /// database is freed and a later caller reloads it instead of resurrecting
+    /// a dangling entry.
+    #[test]
+    fn test_get_or_load_reloads_after_all_handles_dropped() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let first = get_or_load(&cache, path.clone(), || Ok("first".to_string()))
+            .expect("first load should succeed");
+        drop(first);
+
+        let reloaded = get_or_load(&cache, path.clone(), || Ok("second".to_string()))
+            .expect("reload after drop should succeed");
+        assert_eq!(*reloaded, "second");
+    }
+
+    /// A failed load must not poison the memo: the next caller retries.
+    #[test]
+    fn test_get_or_load_does_not_cache_failures() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let failed = get_or_load(&cache, path.clone(), || {
+            Err(GeoIpError::Other("database missing".to_string()))
+        });
+        assert!(failed.is_err());
+
+        let recovered = get_or_load(&cache, path.clone(), || Ok("now present".to_string()))
+            .expect("retry after a failed load should succeed");
+        assert_eq!(*recovered, "now present");
+    }
+
+    /// The case the mapping has to survive: an operator refreshing the database
+    /// with `cp`, which truncates and rewrites the *existing* inode. Mapping the
+    /// operator's file directly would give torn reads or SIGBUS here.
+    #[test]
+    fn private_mapping_survives_the_source_being_rewritten_in_place() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        let original = vec![b'A'; 256 * 1024];
+        std::fs::write(&path, &original).expect("seed database");
+
+        let mapping = private_mapping(&path).expect("stage a private copy");
+        assert_eq!(mapping.len(), original.len());
+
+        // Exactly what `cp src dest` does to an existing dest: same inode,
+        // truncated and rewritten shorter.
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("reopen for truncation");
+        handle.write_all(b"replaced").expect("rewrite in place");
+        handle.sync_all().expect("flush");
+        drop(handle);
+
+        // The mapping is of a private inode, so it is unchanged and safe to read.
+        assert_eq!(mapping.len(), original.len());
+        assert!(mapping.iter().all(|byte| *byte == b'A'));
+    }
+
+    #[test]
+    fn private_mapping_reports_a_missing_source_instead_of_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.mmdb");
+        assert!(private_mapping(&missing).is_err());
+    }
+
+    #[test]
+    fn test_open_mmdb_missing_file_is_a_recoverable_error() {
+        // The ASN database is optional and its absence must stay a plain
+        // `Err` the caller can degrade on, not a panic. `open_mmap` is
+        // `unsafe`, so this also pins that a missing path is rejected before
+        // any mapping is attempted.
+        let missing = std::path::Path::new("/nonexistent/definitely-not-here.mmdb");
+        assert!(open_mmdb(missing).is_err());
+    }
+
     #[test]
     fn test_known_hosting_orgs_detected() {
         assert!(is_hosting_org("EGIHosting"));
@@ -423,5 +711,40 @@ mod tests {
     fn test_case_insensitive_match() {
         assert!(is_hosting_org("SUBNET DIGITAL LLC"));
         assert!(is_hosting_org("subnet digital llc"));
+    }
+
+    #[test]
+    fn mmdb_resolution_watches_data_dir_when_download_is_pending() {
+        let unique = format!(
+            "temps-geo-resolution-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let cwd = std::env::temp_dir().join(&unique).join("cwd");
+        let data_dir = std::env::temp_dir().join(&unique).join("data");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            data_dir.join("GeoLite2-City.mmdb")
+        );
+    }
+
+    #[test]
+    fn mmdb_resolution_keeps_existing_cwd_file_precedence() {
+        let root = std::env::temp_dir().join(format!("temps-geo-existing-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let cwd_file = cwd.join("GeoLite2-City.mmdb");
+        std::fs::write(&cwd_file, b"test").expect("write test mmdb placeholder");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            cwd_file
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove test directories");
     }
 }

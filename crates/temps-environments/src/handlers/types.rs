@@ -1,6 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{AuditLogger, DeploymentCanceller, ProjectEnvVarsProvider};
+use temps_core::{
+    AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
+};
 use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
@@ -14,6 +19,7 @@ pub struct AppState {
     pub secret_service: Arc<SecretService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub deployment_service: Arc<dyn DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     /// Optional on-demand waker for starting/stopping containers during wake/sleep.
     /// Only available when the proxy's OnDemandManager is registered.
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -25,6 +31,8 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central policy evaluator for sensitive mutations.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -34,10 +42,12 @@ pub fn create_environment_app_state(
     secret_service: Arc<SecretService>,
     audit_service: Arc<dyn AuditLogger>,
     deployment_service: Arc<dyn DeploymentCanceller>,
+    deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         environment_service,
@@ -45,10 +55,12 @@ pub fn create_environment_app_state(
         secret_service,
         audit_service,
         deployment_service,
+        deployment_container_cleaner,
         on_demand_waker,
         integration_env_provider,
         telemetry,
         project_access_checker,
+        sensitive_action_authorizer,
     })
 }
 
@@ -57,13 +69,14 @@ pub struct CreateEnvironmentVariableRequest {
     pub key: String,
     pub value: String,
     pub environment_ids: Vec<i32>,
-    /// Include this environment variable in preview environments (default: true)
+    /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
-    /// When true the variable is treated as write-only: never returned in
-    /// plaintext from the API, masked in the UI, and updates that omit the
-    /// value preserve the existing ciphertext. The flag is one-way — secret
-    /// vars cannot be demoted back to regular vars.
+    /// When true the variable is masked in list responses and can only be
+    /// viewed through the permission-checked, audited per-variable reveal
+    /// endpoint. Updates that omit the value preserve the existing ciphertext.
+    /// The flag is one-way — secret vars cannot be demoted to regular vars.
     #[serde(default)]
     pub is_secret: bool,
 }
@@ -88,7 +101,7 @@ pub struct UpdateEnvironmentVariableRequest {
 }
 
 fn default_include_in_preview() -> bool {
-    true
+    false
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -96,15 +109,15 @@ pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
     /// Plaintext value for non-secret vars (or `"***"` mask for list responses).
-    /// `None` for secret vars — secrets are write-only.
+    /// `None` for secret vars; use the audited per-variable reveal endpoint.
     pub value: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<EnvironmentInfo>,
     /// Include this environment variable in preview environments
     pub include_in_preview: bool,
-    /// Whether the variable is a write-only secret. Secrets always have
-    /// `value: None` in responses.
+    /// Whether the variable is a secret. Secrets always have `value: None` in
+    /// list responses.
     pub is_secret: bool,
 }
 
@@ -119,6 +132,12 @@ pub struct EnvironmentInfo {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct GetEnvironmentVariablesQuery {
     pub environment_id: Option<i32>,
+    /// Exact manual env-var row to reveal. Required by the dashboard so
+    /// duplicate keys on disjoint environments cannot cross-reveal.
+    pub var_id: Option<i32>,
+    /// Required by integration-value reveals to bind the plaintext response to
+    /// the exact service displayed by the client.
+    pub service_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -154,6 +173,12 @@ pub struct EnvironmentResponse {
     /// explicitly enable/disable the challenge for this environment. Always
     /// serialized (NOT skipped) so the UI can distinguish `null` from `false`.
     pub attack_mode: Option<bool>,
+    /// Per-environment HTTP→HTTPS redirect override.
+    /// `null` means inherit the proxy default (redirect only when the host has
+    /// an active TLS certificate); `true` always redirects plain HTTP for this
+    /// environment, `false` never does. Always serialized (NOT skipped) so the
+    /// UI can distinguish `null` from `false`.
+    pub force_https: Option<bool>,
     /// Last proxied request timestamp (epoch millis) for on-demand environments.
     /// NULL when on-demand is disabled or no traffic has been received yet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,6 +224,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            force_https: env.force_https,
             last_activity_at,
             estimated_sleep_at,
         }
@@ -253,6 +279,7 @@ pub struct EnvVarIntegrationInfo {
     pub service_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_slug: Option<String>,
+    pub service_updated_at: String,
 }
 
 /// One entry in the computed env-var view that merges manual and integration
@@ -371,10 +398,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Security configuration for this environment (overrides project-level settings)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
-    /// Optional list of node IDs to deploy to (overrides project-level setting)
+    /// Optional list of node IDs to deploy to (overrides project-level setting).
+    /// Send an empty list to clear the environment-level override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_nodes: Option<Vec<i32>>,
     /// Label selector for node-based scheduling (overrides project-level setting).
+    /// Send an empty object to clear the environment-level override.
     /// Same key with array value -> OR, different keys -> AND.
     /// Example: `{"region": ["us", "asia"], "gpu": "true"}`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,6 +413,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// environment on the same node. Defaults to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anti_affinity: Option<bool>,
+    /// Build one image per architecture the eligible nodes run (overrides the
+    /// project-level setting). Off by default: cross-architecture builds are
+    /// emulated on the control plane and substantially slower, so they are
+    /// opted into per environment rather than triggered by cluster topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_architecture_builds: Option<bool>,
     /// When true, git pushes do NOT auto-deploy to this environment.
     /// Deployments must be promoted from another environment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +429,19 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// - `true`/`false` → override the project setting for this environment
     #[serde(default, deserialize_with = "deserialize_optional_optional_bool")]
     pub attack_mode: Option<Option<bool>>,
+    /// Per-environment HTTP→HTTPS redirect override (tri-state):
+    /// - absent → leave the current override unchanged
+    /// - JSON `null` → clear the override (inherit the proxy default, which
+    ///   redirects only when the host has an active TLS certificate)
+    /// - `true` → always redirect plain HTTP to HTTPS for this environment,
+    ///   even when no local certificate exists (TLS terminated upstream)
+    /// - `false` → never redirect this environment, even when a certificate does
+    ///   exist
+    ///
+    /// Requests under `/.well-known/acme-challenge/` are never redirected
+    /// regardless of this setting, so ACME HTTP-01 validation always completes.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_bool")]
+    pub force_https: Option<Option<bool>>,
     /// Enable on-demand mode (scale-to-zero). Containers are stopped after
     /// idle_timeout_seconds of no traffic and started on the next request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,6 +452,31 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Max seconds to wait for containers to start on wake (5-120). Default: 30.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_timeout_seconds: Option<i32>,
+    /// Override the proxy's timeout for regular (non-streaming) HTTP requests
+    /// to this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+    /// operator's global hard ceiling regardless of what's set here.
+    /// Absent leaves the current value unchanged. Send JSON `null` to clear
+    /// the override (inherit the project/global default).
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub request_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's idle timeout for Server-Sent Events streams to
+    /// this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+    /// operator's global hard ceiling. Absent leaves the current value
+    /// unchanged. Send JSON `null` to clear the override.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub sse_idle_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's idle timeout for WebSocket connections to this
+    /// environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's
+    /// global hard ceiling. Absent leaves the current value unchanged. Send
+    /// JSON `null` to clear the override.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub websocket_idle_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's cap on concurrent in-flight requests to this
+    /// environment's upstream (0 = unlimited). Absent leaves the current
+    /// value unchanged. Send JSON `null` to clear the override (inherit
+    /// the project/global default). See issue #646.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub max_concurrent_connections: Option<Option<i32>>,
     /// Set a password to protect this environment. The proxy will show an HTML
     /// password form before allowing access. The password is bcrypt-hashed
     /// server-side and never stored in plaintext.
@@ -439,7 +512,8 @@ pub struct CreateEnvironmentRequest {
 /// Request to create a new project secret.
 ///
 /// Project secrets are mounted into the container as files under
-/// `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+/// `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+/// variables, so they do not appear in `docker inspect`.
 /// Values are always encrypted at rest and never returned in plaintext from
 /// the API after create. Distinct from agent secrets (global `/settings/secrets`).
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -451,9 +525,18 @@ pub struct CreateProjectSecretRequest {
     pub value: String,
     #[serde(default)]
     pub environment_ids: Vec<i32>,
-    /// Include this secret in preview environments.
+    /// Include this secret in preview environments (default: false).
     #[serde(default = "default_include_in_preview")]
+    #[schema(default = false)]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Request to update a project secret. The `value` field is optional — omit it
@@ -468,6 +551,14 @@ pub struct UpdateProjectSecretRequest {
     pub environment_ids: Vec<i32>,
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Project secret metadata. There is deliberately no `value` field — secret
@@ -482,6 +573,9 @@ pub struct ProjectSecretResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<ProjectSecretEnvironmentInfo>,
+    /// Compose services this secret is restricted to. Empty means every
+    /// service in the stack.
+    pub compose_services: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -499,6 +593,35 @@ pub struct GetProjectSecretsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_var_preview_inclusion_requires_explicit_opt_in() {
+        let omitted: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"redacted","environment_ids":[1]}"#,
+        )
+        .unwrap();
+        let enabled: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"redacted","environment_ids":[1],"include_in_preview":true}"#,
+        )
+        .unwrap();
+
+        assert!(!omitted.include_in_preview);
+        assert!(enabled.include_in_preview);
+    }
+
+    #[test]
+    fn project_secret_preview_inclusion_requires_explicit_opt_in() {
+        let omitted: CreateProjectSecretRequest =
+            serde_json::from_str(r#"{"key":"API_TOKEN","value":"redacted","environment_ids":[1]}"#)
+                .unwrap();
+        let enabled: CreateProjectSecretRequest = serde_json::from_str(
+            r#"{"key":"API_TOKEN","value":"redacted","environment_ids":[1],"include_in_preview":true}"#,
+        )
+        .unwrap();
+
+        assert!(!omitted.include_in_preview);
+        assert!(enabled.include_in_preview);
+    }
 
     /// The four resource fields must distinguish three JSON states so the UI's
     /// "No limit" action (which sends `null`) actually clears the stored value
@@ -551,5 +674,47 @@ mod tests {
         let disabled: UpdateEnvironmentSettingsRequest =
             serde_json::from_str(r#"{"attack_mode":false}"#).unwrap();
         assert_eq!(disabled.attack_mode, Some(Some(false)));
+    }
+
+    /// `force_https` is the same tri-state shape as `attack_mode`. The `null`
+    /// case matters most here: clearing the override must restore the proxy's
+    /// certificate-driven default rather than pinning the environment to
+    /// "never redirect", which is what a plain `Option<bool>` would have done.
+    #[test]
+    fn force_https_distinguishes_absent_null_and_value() {
+        // Field absent → None (leave unchanged)
+        let absent: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"branch":"main"}"#).unwrap();
+        assert_eq!(absent.force_https, None);
+
+        // Field present as JSON null → Some(None) (clear → inherit proxy default)
+        let cleared: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":null}"#).unwrap();
+        assert_eq!(cleared.force_https, Some(None));
+
+        // Field present as true → Some(Some(true)) (always redirect)
+        let enabled: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
+        assert_eq!(enabled.force_https, Some(Some(true)));
+
+        // Field present as false → Some(Some(false)) (never redirect)
+        let disabled: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":false}"#).unwrap();
+        assert_eq!(disabled.force_https, Some(Some(false)));
+    }
+
+    /// `force_https` and `attack_mode` are independent overrides — updating one
+    /// must not implicitly clear the other.
+    #[test]
+    fn force_https_and_attack_mode_are_independent() {
+        let only_force: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
+        assert_eq!(only_force.force_https, Some(Some(true)));
+        assert_eq!(only_force.attack_mode, None);
+
+        let only_attack: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"attack_mode":true}"#).unwrap();
+        assert_eq!(only_attack.attack_mode, Some(Some(true)));
+        assert_eq!(only_attack.force_https, None);
     }
 }

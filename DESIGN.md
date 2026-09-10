@@ -71,6 +71,11 @@ Colors are defined in `src/globals.css` as OKLCH CSS variables, exposed to
 Tailwind as `bg-*`, `text-*`, `border-*`. **Never use literal colors** except
 for the sanctioned status hues in §3.2.
 
+The only branding exception is an official third-party logo whose SVG uses
+`currentColor`: its icon wrapper may use the vendor's documented light/dark
+brand color. The exception applies to the mark only, never to text, borders,
+backgrounds, status, or decorative accents.
+
 ### 3.1 Semantic surfaces
 
 | Token                | Use                                                 |
@@ -115,13 +120,20 @@ unless aligning to a specific pixel asset.
 
 ### 4.1 Page wrapper
 
-Every top-level page uses the same wrapper:
+Every top-level page uses the same **full-width** wrapper — content fills the
+available space next to the sidebar rather than being capped and centered.
+Readability of individual blocks is handled per-section (grids, `max-w-*` on
+prose/forms where a narrow measure helps), not by constraining the whole page.
 
 ```tsx
-<div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8">
+<div className="w-full p-4 sm:p-6 lg:p-8">
   {/* content */}
 </div>
 ```
+
+Do **not** wrap a page in `mx-auto max-w-7xl` (or similar) — that leaves large
+empty gutters on wide displays. If a specific block reads better narrow, cap
+that block, e.g. a settings form in `<div className="max-w-2xl">`.
 
 ### 4.2 Vertical rhythm
 
@@ -245,6 +257,21 @@ shadcn `Badge` variants: `default` · `secondary` · `destructive` · `outline`.
 - Error text: `text-xs text-destructive` below the input.
 - Submit buttons reflect loading state (`disabled={mutation.isPending}` +
   spinner icon).
+
+#### Searchable entity pickers
+
+Use a shadcn `Popover` + `Command` combobox when selecting a project, service,
+environment, or other relationship from a non-trivial set. A native `<select>`
+is reserved for short scalar choices.
+
+- The trigger and every result show the entity identity: favicon or product
+  logo, display name, stable slug/type, and a semantic status dot.
+- Search matches the display name and stable identifier.
+- Keep the current selection visible in the trigger and mark it with `Check`.
+- Use the shared rich picker component for an existing entity type before
+  creating another one-off combobox.
+- Fetch option collections with TanStack Query and keep cached results visible
+  during background refreshes.
 
 ### 6.6 Tables
 

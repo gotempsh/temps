@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -511,7 +514,7 @@ function displayScanDetails(scan: ScanResponse): void {
   newline()
 }
 
-function scanStatusColor(status: string): string {
+export function scanStatusColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'completed':
       return statusBadge('success')
@@ -529,7 +532,7 @@ function scanStatusColor(status: string): string {
   }
 }
 
-function severityColor(severity: string): string {
+export function severityColor(severity: string): string {
   switch (severity.toUpperCase()) {
     case 'CRITICAL':
       return colors.error(severity)
@@ -544,7 +547,7 @@ function severityColor(severity: string): string {
   }
 }
 
-function truncate(str: string, maxLength: number): string {
+export function truncate(str: string, maxLength: number): string {
   if (str.length <= maxLength) return str
   return str.slice(0, maxLength - 3) + '...'
 }

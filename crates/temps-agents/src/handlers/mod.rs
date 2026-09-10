@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod ai_providers;
 pub mod autofixer;
 pub mod config;
@@ -96,6 +99,7 @@ use crate::services::secret_service::SecretService;
         definitions::list_mcps,
         definitions::create_mcp,
         definitions::get_mcp,
+        definitions::reveal_mcp_config,
         definitions::update_mcp,
         definitions::delete_mcp,
 
@@ -110,14 +114,17 @@ use crate::services::secret_service::SecretService;
         definitions::list_global_mcps,
         definitions::create_global_mcp,
         definitions::get_global_mcp,
+        definitions::reveal_global_mcp_config,
         definitions::update_global_mcp,
         definitions::delete_global_mcp,
 
         // AI providers
         ai_providers::list_ai_providers,
         ai_providers::save_ai_provider_credential,
+        ai_providers::import_local_ai_provider_credential,
         ai_providers::activate_ai_provider,
         ai_providers::update_ai_provider,
+        ai_providers::refresh_ai_provider_models,
     ),
     components(schemas(
         // Agent config
@@ -154,14 +161,16 @@ use crate::services::secret_service::SecretService;
         autofixer::AutofixerRunResponse,
         autofixer::AutofixerRunWithLogsResponse,
         autofixer::CreatePrResponse,
+        crate::services::autofixer::AutofixRunConfig,
 
         // Preview gateway
         preview_gateway::LogsQuery,
-        preview_gateway::LogsResponse,
+        preview_gateway::PreviewGatewayLogsResponse,
         preview_gateway::UpgradeRequest,
         preview_gateway::PreviewGatewaySettingsResponse,
         preview_gateway::PatchSettingsRequest,
         crate::preview_gateway::GatewayStatus,
+        temps_core::problemdetails::ProblemDetails,
 
         // Skill definitions
         definitions::SkillDefinitionResponse,
@@ -172,6 +181,7 @@ use crate::services::secret_service::SecretService;
         // MCP server definitions
         definitions::McpDefinitionResponse,
         definitions::ListMcpsResponse,
+        definitions::SensitiveMcpConfigValueResponse,
         definitions::CreateMcpRequest,
         definitions::UpdateMcpRequest,
 
@@ -181,9 +191,13 @@ use crate::services::secret_service::SecretService;
         ai_providers::ProviderCatalogResponse,
         ai_providers::SaveCredentialRequest,
         ai_providers::SaveCredentialResponse,
+        ai_providers::LocalCredentialDto,
+        ai_providers::ImportLocalCredentialResponse,
         ai_providers::ActivateProviderResponse,
         ai_providers::UpdateProviderRequest,
         ai_providers::UpdateProviderResponse,
+        ai_providers::RefreshProviderModelsResponse,
+        temps_ai::ModelCatalogSource,
     )),
     tags(
         (name = "Agents", description = "Autonomous AI agents, autofixer (interactive AI debugging), skills/MCP definitions, and preview gateway management.")
@@ -211,6 +225,9 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Late-bound normalized AI registry. Model refresh uses this service so
+    /// it observes the same credential/environment as the next workspace turn.
+    pub ai_service: Option<Arc<dyn temps_ai::AiService>>,
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {

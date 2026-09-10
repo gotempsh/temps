@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Anonymous country geolocation.
 //
 // Derives the 2-letter ISO country code from the request's client IP using a

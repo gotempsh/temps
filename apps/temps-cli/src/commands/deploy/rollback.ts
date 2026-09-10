@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -6,14 +9,53 @@ import {
   getProjectDeployments,
   rollbackToDeployment,
 } from '../../api/sdk.gen.js'
+import type { DeploymentResponse } from '../../api/types.gen.js'
 import { promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { success, warning, newline, colors, info, icons, header, keyValue } from '../../ui/output.js'
+import { warning, newline, colors, info, icons, header, keyValue } from '../../ui/output.js'
 
 interface RollbackOptions {
   project?: string
   environment: string
   to?: string
+}
+
+/**
+ * Only deployments that finished successfully in the target environment are
+ * valid rollback targets — rolling back to a failed or in-progress deployment
+ * would redeploy broken state. Capped to the 10 most recent so the picker
+ * stays scannable.
+ */
+export function filterRollbackCandidates(
+  deployments: DeploymentResponse[],
+  environment: string
+): DeploymentResponse[] {
+  return deployments
+    .filter(
+      (d) =>
+        d.environment?.name === environment &&
+        (d.status === 'success' || d.status === 'completed' || d.status === 'deployed')
+    )
+    .slice(0, 10)
+}
+
+export function formatRollbackChoice(d: DeploymentResponse): {
+  name: string
+  value: string
+  description: string
+} {
+  const isRollback = d.metadata?.isRollback
+  const branch = d.branch ?? (isRollback ? 'rollback' : 'unknown')
+  const commit =
+    d.commit_hash?.substring(0, 7) ?? (isRollback ? `from #${d.metadata?.rolledBackFromId ?? '?'}` : '-')
+  const currentTag = d.is_current ? ' (current)' : ''
+  const date = new Date(d.created_at * 1000).toLocaleString()
+
+  return {
+    name: `#${d.id} - ${branch} (${commit})${currentTag}`,
+    value: String(d.id),
+    description: date,
+  }
 }
 
 export async function rollback(options: RollbackOptions): Promise<void> {
@@ -55,12 +97,7 @@ export async function rollback(options: RollbackOptions): Promise<void> {
       }
 
       // Filter by environment and completed status
-      return data.deployments
-        .filter(d =>
-          d.environment?.name === options.environment &&
-          (d.status === 'success' || d.status === 'completed' || d.status === 'deployed')
-        )
-        .slice(0, 10)
+      return filterRollbackCandidates(data.deployments, options.environment)
     })
 
     if (deployments.length === 0) {
@@ -71,19 +108,7 @@ export async function rollback(options: RollbackOptions): Promise<void> {
     // Show all deployments, mark which is current
     const selectedId = await promptSelect({
       message: 'Select deployment to rollback to',
-      choices: deployments.map((d) => {
-        const isRollback = d.metadata?.isRollback
-        const branch = d.branch ?? (isRollback ? 'rollback' : 'unknown')
-        const commit = d.commit_hash?.substring(0, 7) ?? (isRollback ? `from #${d.metadata?.rolledBackFromId ?? '?'}` : '-')
-        const currentTag = d.is_current ? ' (current)' : ''
-        const date = new Date(d.created_at * 1000).toLocaleString()
-
-        return {
-          name: `#${d.id} - ${branch} (${commit})${currentTag}`,
-          value: String(d.id),
-          description: date,
-        }
-      }),
+      choices: deployments.map(formatRollbackChoice),
     })
 
     targetDeploymentId = parseInt(selectedId, 10)

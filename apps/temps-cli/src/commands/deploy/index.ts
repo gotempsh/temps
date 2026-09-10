@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { deploy } from './deploy.js'
 import { deployStatic } from './deploy-static.js'
@@ -7,9 +10,24 @@ import { list } from './list.js'
 import { logs } from './logs.js'
 import { rollback } from './rollback.js'
 import { status } from './status.js'
+import { drop } from './drop.js'
 import { cancelDeploymentAction, pauseDeploymentAction, resumeDeploymentAction, teardownDeploymentAction } from './actions.js'
+import { failureReportPreviewAction, failureReportSendAction } from './failure-report.js'
+import { runtimeLogs } from '../runtime-logs.js'
 
 export function registerDeployCommands(program: Command): void {
+  program
+    .command('drop <path>')
+    .description('Detect and deploy a local source directory or ZIP without Git')
+    .option('--name <name>', 'Name for the new project (slugified automatically)')
+    .option('--project <project>', 'Deploy into an existing project (slug or ID) instead of creating one')
+    .option('--environment <env>', 'Target environment (requires --project, default: production)')
+    .option('--preset <preset>', 'Select a detected preset')
+    .option('--directory <directory>', 'Select a detected project root')
+    .option('--no-wait', 'Do not wait for deployment to complete')
+    .option('--timeout <seconds>', 'Deployment timeout', '600')
+    .action(drop)
+
   // Main deploy command - git-based deployment
   program
     .command('deploy [project]')
@@ -165,4 +183,40 @@ export function registerDeployCommands(program: Command): void {
     .option('-n, --lines <number>', 'Number of lines to show', '100')
     .option('-d, --deployment <id>', 'Specific deployment ID')
     .action(logs)
+
+  deployments
+    .command('container-logs')
+    .description('Show live container logs, including retained failed deployments')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-e, --environment <env>', 'Environment', 'production')
+    .requiredOption('-d, --deployment <id>', 'Deployment ID')
+    .option('-c, --container <id>', 'Container ID or name (partial match supported)')
+    .option('-n, --tail <lines>', 'Number of lines to tail', '1000')
+    .option('-t, --timestamps', 'Show timestamps')
+    .option('-f, --follow', 'Follow log output')
+    .action(runtimeLogs)
+
+  const failureReport = deployments
+    .command('failure-report')
+    .description('Preview or send a redacted deploy-failure trace')
+
+  failureReport
+    .command('preview')
+    .description('Preview the redacted, editable failure-report text for a failed job')
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-d, --deployment-id <id>', 'Deployment ID')
+    .requiredOption('-j, --job-id <id>', 'Failed job ID (see "deployments logs")')
+    .action(failureReportPreviewAction)
+
+  failureReport
+    .command('send')
+    .description(
+      'Send a failure report to the Temps team. Reads report text from --text-file, ' +
+        'or stdin if piped, or defaults to the redacted preview.',
+    )
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-d, --deployment-id <id>', 'Deployment ID')
+    .requiredOption('-j, --job-id <id>', 'Failed job ID (see "deployments logs")')
+    .option('--text-file <path>', 'Read the (already-reviewed) report text from a file')
+    .action(failureReportSendAction)
 }

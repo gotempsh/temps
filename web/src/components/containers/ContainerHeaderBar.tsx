@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
@@ -13,10 +16,8 @@ import {
   ArrowUp,
   Check,
   ChevronsUpDown,
-  Cpu,
   ExternalLink,
   FileText,
-  HardDrive,
   Loader2,
   Play,
   RotateCw,
@@ -26,7 +27,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useContainerMetricsStream } from './useContainerMetricsStream'
-import { formatCpuUsage } from '@/lib/cpu-format'
+import { ContainerMetricHistory } from './ContainerMetricHistory'
 
 type ContainerStatus = string
 type ContainerTab = 'logs' | 'configuration'
@@ -41,6 +42,7 @@ interface ContainerHeaderBarProps {
   onTabChange: (tab: ContainerTab) => void
   onAction: (action: 'start' | 'stop' | 'restart') => void
   actionInFlight?: 'start' | 'stop' | 'restart' | null
+  actionsEnabled?: boolean
 }
 
 export function ContainerHeaderBar({
@@ -53,6 +55,7 @@ export function ContainerHeaderBar({
   onTabChange,
   onAction,
   actionInFlight,
+  actionsEnabled = true,
 }: ContainerHeaderBarProps) {
   const [statusFilter, setStatusFilter] = useState<
     'all' | 'running' | 'stopped'
@@ -130,32 +133,28 @@ export function ContainerHeaderBar({
               {(metrics?.restart_count ?? 0) > 0 && (
                 <RestartCountChip count={metrics?.restart_count ?? 0} />
               )}
+              <ContainerMetricHistory
+                projectId={parseInt(projectId)}
+                environmentId={parseInt(environmentId)}
+                containerId={selectedContainer?.container_id ?? ''}
+                metric="container.cpu_percent"
+                label="CPU"
+                currentValue={metrics?.cpu_percent}
+                format={(value) => `${value.toFixed(1)}%`}
+                enabled={Boolean(isRunning && selectedContainer)}
+              />
+              <ContainerMetricHistory
+                projectId={parseInt(projectId)}
+                environmentId={parseInt(environmentId)}
+                containerId={selectedContainer?.container_id ?? ''}
+                metric="container.memory_used_bytes"
+                label="Mem"
+                currentValue={metrics?.memory_bytes}
+                format={formatBytes}
+                enabled={Boolean(isRunning && selectedContainer)}
+              />
               {isRunning && metrics && (
                 <>
-                  <div className="inline-flex items-center gap-1.5 tabular-nums">
-                    <Cpu className="size-3.5" aria-hidden="true" />
-                    <span>
-                      CPU{' '}
-                      {formatCpuUsage(
-                        metrics.cpu_percent,
-                        metrics.cpu_limit_cores,
-                      )}
-                    </span>
-                  </div>
-                  <div className="inline-flex items-center gap-1.5 tabular-nums">
-                    <HardDrive className="size-3.5" aria-hidden="true" />
-                    <span>
-                      Mem {formatBytes(metrics.memory_bytes)}
-                      {hasRealMemoryLimit(metrics.memory_limit_bytes) ? (
-                        <>
-                          {' / '}
-                          {formatBytes(metrics.memory_limit_bytes!)}
-                          {metrics.memory_percent != null &&
-                            ` (${metrics.memory_percent.toFixed(0)}%)`}
-                        </>
-                      ) : null}
-                    </span>
-                  </div>
                   <div className="inline-flex items-center gap-1.5 tabular-nums">
                     <ArrowDown className="size-3.5" aria-hidden="true" />
                     <span>{formatBytes(metrics.network_rx_rate)}/s</span>
@@ -169,10 +168,11 @@ export function ContainerHeaderBar({
                   href={selectedContainer.service_url}
                   target="_blank"
                   rel="noopener noreferrer"
+                  title={selectedContainer.service_url}
                   className="inline-flex items-center gap-1.5 text-neutral-900 hover:underline dark:text-white"
                 >
                   <span className="truncate max-w-[18rem]">
-                    {selectedContainer.service_url.replace('https://', '')}
+                    {selectedContainer.service_url}
                   </span>
                   <ExternalLink className="size-3" aria-hidden="true" />
                 </a>
@@ -180,56 +180,58 @@ export function ContainerHeaderBar({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {isRunning ? (
-              <>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={actionInFlight === 'restart'}
-                  onClick={() => onAction('restart')}
-                >
-                  {actionInFlight === 'restart' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <RotateCw className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Restart
-                </Button>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="sm"
-                  disabled={actionInFlight === 'stop'}
-                  onClick={() => onAction('stop')}
-                >
-                  {actionInFlight === 'stop' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <Square className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Stop
-                </Button>
-              </>
-            ) : (
-              selectedContainer && (
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={actionInFlight === 'start'}
-                  onClick={() => onAction('start')}
-                >
-                  {actionInFlight === 'start' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <Play className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Start
-                </Button>
-              )
-            )}
-          </div>
+          {actionsEnabled && (
+            <div className="flex items-center gap-2">
+              {isRunning ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={actionInFlight === 'restart'}
+                    onClick={() => onAction('restart')}
+                  >
+                    {actionInFlight === 'restart' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <RotateCw className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Restart
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    disabled={actionInFlight === 'stop'}
+                    onClick={() => onAction('stop')}
+                  >
+                    {actionInFlight === 'stop' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <Square className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Stop
+                  </Button>
+                </>
+              ) : (
+                selectedContainer && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={actionInFlight === 'start'}
+                    onClick={() => onAction('start')}
+                  >
+                    {actionInFlight === 'start' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <Play className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Start
+                  </Button>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         <nav
@@ -470,15 +472,6 @@ function RestartCountChip({ count }: { count: number }) {
       Restarted {count}×
     </span>
   )
-}
-
-/** Docker reports the host's total memory as the "limit" when no explicit
- * limit was set on the container. Treat anything above 100 GiB as no-limit
- * to avoid showing nonsense numbers like "Mem 126 MB / 128 GB". */
-function hasRealMemoryLimit(bytes: number | null | undefined): boolean {
-  if (bytes == null || bytes <= 0) return false
-  const HUNDRED_GIB = 100 * 1024 * 1024 * 1024
-  return bytes < HUNDRED_GIB
 }
 
 function formatBytes(bytes: number): string {

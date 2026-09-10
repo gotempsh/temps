@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Presets - Stateless project detection and Dockerfile generation
 //!
 //! This crate provides utilities for:
@@ -12,10 +15,22 @@ mod mod_rs {
 }
 
 // Re-export main types for easy access
+pub use mod_rs::docker_compose::{
+    list_compose_services, list_compose_services_with_override, render_effective_compose_preview,
+    ComposeParseError, ComposeServicePreview, EffectiveComposePreview,
+};
+pub use mod_rs::dockerfile_expose::detect_primary_exposed_port;
+pub use mod_rs::env_example::{
+    detect_env_example_files, detect_env_example_files_in_directory, parse_env_example,
+    EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
+};
+pub use mod_rs::registry_prefix::apply_registry_prefix;
 pub use {
-    all_presets, detect_all_presets_from_files, detect_node_framework, detect_preset_from_files,
-    get_preset_by_slug, DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider,
-    NodeFramework, PackageManager, Preset, PresetConfig, ProjectType,
+    all_presets, detect_all_presets_from_files, detect_node_framework,
+    detect_node_framework_from_package_json, detect_preset_from_files, get_preset_by_slug,
+    get_preset_for_storage, resolve_preset_slug, runtime_slug, validate_preset_config,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
+    PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType, StoredPreset,
 };
 
 #[cfg(test)]
@@ -99,6 +114,36 @@ mod tests {
 
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "rsbuild");
+    }
+
+    #[test]
+    fn test_detect_static_site_preset() {
+        // A plain HTML/CSS/JS repo with no build system should fall back to
+        // the static-file preset instead of failing to auto-detect.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "nixpacks-static");
+    }
+
+    #[test]
+    fn test_static_site_is_not_detected_when_a_framework_matches() {
+        // index.html alone must never outrank a real framework/build-system
+        // match — it is the last-resort fallback, not an additional option.
+        let files = vec![
+            "vite.config.ts".to_string(),
+            "package.json".to_string(),
+            "index.html".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "vite");
     }
 
     #[test]
@@ -212,6 +257,39 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_presets_from_file_tree_bare_dockerfile_in_docker_dir_roots_at_repo_root() {
+        // Mirrors a real repository (JupyterLab) that ships a
+        // `docker/Dockerfile` whose COPY instructions reach back to files at
+        // the repository root. Unlike `apps/api/Dockerfile` above (which has
+        // its own go.mod and stays its own root), `docker/` has no manifest
+        // of its own, so it must be surfaced as a root-level build option
+        // rather than becoming its own project root/build context.
+        let files = vec![
+            "pyproject.toml".to_string(),
+            "docker/Dockerfile".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 2);
+        assert!(presets.iter().all(|p| p.path == "./"), "{presets:?}");
+
+        let dockerfile = presets
+            .iter()
+            .find(|p| p.slug == "dockerfile")
+            .expect("dockerfile preset should still be detected");
+        assert_eq!(
+            dockerfile.dockerfile_path.as_deref(),
+            Some("docker/Dockerfile")
+        );
+
+        let python = presets
+            .iter()
+            .find(|p| p.slug == "python")
+            .expect("root pyproject.toml should still be detected");
+        assert_eq!(python.dockerfile_path, None);
+    }
+
+    #[test]
     fn test_detect_presets_from_file_tree_skips_node_modules() {
         let files = vec![
             "next.config.js".to_string(),
@@ -299,6 +377,25 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_presets_from_file_tree_static_site() {
+        // Same shape as a plain HTML/CSS/JS repo connected via a git URL:
+        // no framework manifest, just files to serve. The repository-connect
+        // UI (`calculate_repository_preset_live`) calls this function, so an
+        // empty result here is what previously made static repos look
+        // unsupported when connecting via git.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].path, "./");
+        assert_eq!(presets[0].slug, "nixpacks-static");
+    }
+
+    #[test]
     fn test_detect_presets_from_file_tree_no_preset_for_random_files() {
         let files = vec![
             "README.md".to_string(),
@@ -371,7 +468,145 @@ mod tests {
         assert!(get_preset_by_slug("nextjs").is_some());
         assert!(get_preset_by_slug("vite").is_some());
         assert!(get_preset_by_slug("dockerfile").is_some());
+        assert!(get_preset_by_slug("nixpacks").is_some());
+        assert!(get_preset_by_slug("nixpacks-node").is_some());
+        assert!(get_preset_by_slug("nixpacks-python").is_some());
+        assert!(get_preset_by_slug("nixpacks-static").is_some());
         assert!(get_preset_by_slug("nonexistent").is_none());
+        assert!(get_preset_by_slug("nixpacks-not-a-real-provider").is_none());
+    }
+
+    #[test]
+    fn test_every_public_catalog_preset_roundtrips_through_storage() {
+        for catalog_preset in all_presets() {
+            let slug = catalog_preset.slug();
+            let stored = catalog_preset
+                .resolve_storage(None)
+                .unwrap_or_else(|error| panic!("{slug} is not persistable: {error}"));
+            assert!(
+                get_preset_for_storage(stored.preset, stored.config.as_ref())
+                    .unwrap_or_else(|error| panic!("{slug} cannot be restored: {error}"))
+                    .is_some(),
+                "{slug} cannot be restored for deployment"
+            );
+            assert_eq!(
+                runtime_slug(stored.preset, stored.config.as_ref()),
+                slug,
+                "catalog/storage round-trip for {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_custom_catalog_variant_roundtrips_through_dockerfile_storage() {
+        use temps_entities::preset::{
+            DockerfileVariant, Preset as EntityPreset, PresetConfig as EntityPresetConfig,
+        };
+
+        let stored = resolve_preset_slug("custom", None).unwrap();
+        assert_eq!(stored.preset, EntityPreset::Dockerfile);
+        assert!(matches!(
+            stored.config.as_ref(),
+            Some(EntityPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::Custom
+        ));
+
+        let restored = get_preset_for_storage(stored.preset, stored.config.as_ref())
+            .unwrap()
+            .expect("custom preset should restore");
+        assert_eq!(restored.slug(), "custom");
+
+        let switched = resolve_preset_slug("dockerfile", stored.config).unwrap();
+        assert!(matches!(
+            switched.config.as_ref(),
+            Some(EntityPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::File
+        ));
+        let restored = get_preset_for_storage(switched.preset, switched.config.as_ref())
+            .unwrap()
+            .expect("standard Dockerfile preset should restore after switching from custom");
+        assert_eq!(restored.slug(), "dockerfile");
+
+        let legacy_dockerfile = get_preset_for_storage(EntityPreset::Dockerfile, None)
+            .unwrap()
+            .expect("legacy Dockerfile preset should restore");
+        assert_eq!(legacy_dockerfile.slug(), "dockerfile");
+    }
+
+    #[test]
+    fn test_nixpacks_multi_provider_config_uses_canonical_runtime_slug() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, Preset as EntityPreset,
+            PresetConfig as EntityPresetConfig,
+        };
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        });
+        let stored = resolve_preset_slug("nixpacks", Some(config)).unwrap();
+
+        assert_eq!(stored.preset, EntityPreset::Nixpacks);
+        assert_eq!(
+            runtime_slug(stored.preset, stored.config.as_ref()),
+            "nixpacks"
+        );
+    }
+
+    #[test]
+    fn test_nixpacks_provider_without_catalog_variant_uses_canonical_runtime_slug() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, Preset as EntityPreset,
+            PresetConfig as EntityPresetConfig,
+        };
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::FSharp],
+        });
+
+        assert_eq!(
+            runtime_slug(EntityPreset::Nixpacks, Some(&config)),
+            "nixpacks"
+        );
+    }
+
+    #[test]
+    fn test_nixpacks_variant_overrides_existing_provider_and_preserves_config() {
+        use temps_entities::preset::{
+            NixpacksConfig, NixpacksProvider, PresetConfig as EntityPresetConfig,
+        };
+
+        let existing = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: Some("[start]\ncmd = \"python main.py\"".to_string()),
+            providers: vec![NixpacksProvider::Node],
+        });
+        let stored = resolve_preset_slug("nixpacks-python", Some(existing)).unwrap();
+
+        match stored.config {
+            Some(EntityPresetConfig::Nixpacks(config)) => {
+                assert_eq!(config.providers, vec![NixpacksProvider::Python]);
+                assert_eq!(
+                    config.nixpacks_config.as_deref(),
+                    Some("[start]\ncmd = \"python main.py\"")
+                );
+            }
+            other => panic!("expected Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nixpacks_invalid_inline_toml_is_rejected_before_storage() {
+        use temps_entities::preset::{NixpacksConfig, PresetConfig as EntityPresetConfig};
+
+        let config = EntityPresetConfig::Nixpacks(NixpacksConfig {
+            nixpacks_config: Some("invalid = [".to_string()),
+            providers: Vec::new(),
+        });
+        let error = resolve_preset_slug("nixpacks", Some(config)).unwrap_err();
+
+        assert!(matches!(error, PresetResolutionError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("failed to parse Nixpacks TOML"));
     }
 
     #[test]
@@ -389,6 +624,9 @@ mod tests {
         assert!(slugs.contains(&"go".to_string()));
         assert!(slugs.contains(&"python".to_string()));
         assert!(slugs.contains(&"rust".to_string()));
+        assert!(slugs.contains(&"nixpacks".to_string()));
+        assert!(slugs.contains(&"nixpacks-node".to_string()));
+        assert!(slugs.contains(&"nixpacks-python".to_string()));
     }
 
     #[test]

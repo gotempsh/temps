@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { sendAnalytics, sendAnalyticsReliable } from "./utils";
 import { DEFAULT_BASE_PATH } from "./constants";
 import type { JsonValue } from "./types";
 
 export interface EngagementTrackerOptions {
   basePath?: string;
+  /** Analytics ingest key (`pa_…`). See `AnalyticsClientOptions.ingestKey`. */
+  ingestKey?: string;
   domain?: string;
   heartbeatInterval?: number;
   inactivityTimeout?: number;
@@ -37,6 +42,7 @@ export class EngagementTracker {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private hasTrackedLeave: boolean = false;
   private readonly basePath: string;
+  private readonly ingestKey?: string;
   private readonly domain: string;
   private readonly onHeartbeat?: (data: EngagementData) => void;
   private readonly onPageLeave?: (data: EngagementData) => void;
@@ -44,6 +50,7 @@ export class EngagementTracker {
 
   constructor(options: EngagementTrackerOptions = {}) {
     this.basePath = options.basePath || DEFAULT_BASE_PATH;
+    this.ingestKey = options.ingestKey;
     this.domain = options.domain || window.location.hostname;
     this.heartbeatInterval = options.heartbeatInterval || 30000;
     this.inactivityTimeout = options.inactivityTimeout || 30000;
@@ -185,6 +192,7 @@ export class EngagementTracker {
         request_path: window.location.pathname,
         request_query: window.location.search,
         domain: this.domain,
+        language: navigator.language,
         event_data: {
           engagement_time: Math.round(this.engagementTime),
           total_time: Math.round(Date.now() - this.startTime),
@@ -195,7 +203,8 @@ export class EngagementTracker {
         } as Record<string, JsonValue>,
       },
       "POST",
-      this.basePath
+      this.basePath,
+      this.ingestKey
     );
 
     if (this.isActive && this.isVisible) {
@@ -221,6 +230,7 @@ export class EngagementTracker {
         request_path: window.location.pathname,
         request_query: window.location.search,
         domain: this.domain,
+        language: navigator.language,
         event_data: {
           engagement_time_seconds: data.engagement_time_seconds,
           total_time_seconds: data.total_time_seconds,
@@ -230,7 +240,8 @@ export class EngagementTracker {
           referrer: document.referrer,
         } as Record<string, JsonValue>,
       },
-      this.basePath
+      this.basePath,
+      this.ingestKey
     );
   };
 

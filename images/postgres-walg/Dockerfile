@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # PostgreSQL + WAL-G image for Temps backup/restore
 # Based on postgres:XX-bookworm (Debian), adds WAL-G binary for S3-native backups.
 # WAL-G binaries are dynamically linked against glibc, so we use Debian instead of Alpine.

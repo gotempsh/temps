@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Anonymous product telemetry reporter for Temps.
 //!
 //! Temps optionally reports **anonymous** product-usage events (e.g. "an

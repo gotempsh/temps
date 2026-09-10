@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Setup pre-commit hooks for the project
 # Supports both pre-commit (Python) and prek (Rust)
 

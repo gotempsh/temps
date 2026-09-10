@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useRoute, submissionsPath, suggestionsPath, settingsPath } from "./router";
 import { Submissions } from "./components/Submissions";
 import { Suggestions } from "./components/Suggestions";

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -37,6 +40,9 @@ pub enum AgentError {
         stderr: String,
     },
 
+    #[error("AI CLI '{provider}' reported an error: {message}")]
+    AiCliReportedError { provider: String, message: String },
+
     #[error("AI CLI '{provider}' timed out after {timeout_secs} seconds")]
     AiCliTimeout { provider: String, timeout_secs: u64 },
 
@@ -72,6 +78,15 @@ pub enum AgentError {
         reason: String,
     },
 
+    #[error(
+        "Sandbox snapshot for {sandbox_id} exceeded the {max_size_bytes} byte limit while {stage}"
+    )]
+    SnapshotSizeLimitExceeded {
+        sandbox_id: String,
+        stage: String,
+        max_size_bytes: u64,
+    },
+
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]
     SandboxProviderUnavailable { provider: String, reason: String },
 
@@ -83,6 +98,9 @@ pub enum AgentError {
 
     #[error("MCP definition '{slug}' not found in project {project_id}")]
     McpDefinitionNotFound { project_id: i32, slug: String },
+
+    #[error("MCP config field '{field}' was not found for server '{slug}'")]
+    McpConfigFieldNotFound { slug: String, field: String },
 
     #[error("A skill with slug '{slug}' already exists{}", scope_label(*project_id))]
     SkillDefinitionAlreadyExists {

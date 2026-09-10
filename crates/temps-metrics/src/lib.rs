@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod collector;
 pub mod error;
+pub mod node_sampler;
 pub mod scraper;
 pub mod store;
 
@@ -11,11 +15,12 @@ pub use collector::redis::RedisCollector;
 pub use collector::s3::S3Collector;
 pub use collector::{Collector, CollectorConfig};
 pub use error::MetricsError;
+pub use node_sampler::NodeMetricsSampler;
 pub use scraper::MetricsScraper;
 pub use store::clickhouse::{ChMetricRow, ClickHouseMetricsConfig, ClickhouseMetricsStore};
 pub use store::clickhouse_migrations;
 pub use store::timescale::{validate_metric_name, TimescaleMetricsStore};
 pub use store::{
-    LabelledMetric, LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore,
-    RangeQuery, SourceKind,
+    clamp_step, duration_to_step, is_monotonic_counter, range_to_step, LabelledMetric,
+    LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind,
 };

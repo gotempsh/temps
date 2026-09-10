@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! TCP-level connection filtering using Pingora 0.7.0's ConnectionFilter trait.
 //!
 //! This filter operates at the TCP layer, rejecting blocked IPs before any TLS

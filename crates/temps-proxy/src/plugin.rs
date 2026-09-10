@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +30,12 @@ pub struct ProxyPlugin {
     /// gets a chance to provide a resolver — same two-phase handoff
     /// `DeploymentsPlugin` uses for `DeploymentGate`.
     retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+    /// Same two-phase handoff as `retention_resolver_slot`, for
+    /// `ProjectIpGate`. See the field doc on
+    /// `ConsoleApiParams::project_ip_gate_slot` for the security-review
+    /// flag on this object — it is authorization-relevant, unlike
+    /// `retention_resolver_slot`.
+    project_ip_gate_slot: tokio::sync::OnceCell<Arc<temps_core::ProjectIpGateSlot>>,
 }
 
 impl TempsPlugin for ProxyPlugin {
@@ -71,6 +80,9 @@ impl TempsPlugin for ProxyPlugin {
             let retention_slot = context.require_service::<temps_core::RetentionResolverSlot>();
             let _ = self.retention_resolver_slot.set(retention_slot.clone());
 
+            let ip_gate_slot = context.require_service::<temps_core::ProjectIpGateSlot>();
+            let _ = self.project_ip_gate_slot.set(ip_gate_slot.clone());
+
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
 
@@ -105,6 +117,9 @@ impl TempsPlugin for ProxyPlugin {
                 ip_service,
                 proxy_log_storage,
             ));
+            let api_traffic_data_source: Arc<
+                dyn temps_analytics::api_traffic::ApiTrafficDataSource,
+            > = proxy_log_service.clone();
 
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
@@ -115,6 +130,7 @@ impl TempsPlugin for ProxyPlugin {
             // Register the services for other plugins to use
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
+            context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(challenge_service);
 
@@ -147,6 +163,23 @@ impl TempsPlugin for ProxyPlugin {
                     }
                 }
             }
+
+            // Same handoff for ProjectIpGate. Absent a registered plugin,
+            // the slot stays on OpenIpGate — every project remains
+            // unrestricted, matching a build with no such plugin present.
+            if let Some(slot) = self.project_ip_gate_slot.get() {
+                if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
+                    if slot.set(gate) {
+                        tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "proxy: ProjectIpGate slot was already claimed; \
+                             this plugin's gate was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
             Ok(())
         })
     }
@@ -155,6 +188,7 @@ impl TempsPlugin for ProxyPlugin {
         // Get the required services from the service registry
         let lb_service = context.require_service::<LbService>();
         let proxy_log_service = context.require_service::<ProxyLogService>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
         let challenge_service = context.require_service::<ChallengeService>();
         let db = context.require_service::<DbConnection>();
@@ -168,10 +202,15 @@ impl TempsPlugin for ProxyPlugin {
             challenge_service: challenge_service.clone(),
         });
 
+        let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
+            service: proxy_log_service,
+            project_access_checker,
+        });
+
         // Configure routes with the app state
         let router = crate::handler::handler::configure_routes()
             .with_state(app_state)
-            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_log_service))
+            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
                     .with_state(ip_access_control_service),
@@ -200,6 +239,7 @@ impl ProxyPlugin {
     pub fn new() -> Self {
         Self {
             retention_resolver_slot: tokio::sync::OnceCell::new(),
+            project_ip_gate_slot: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -238,6 +278,8 @@ mod tests {
         // boot (commands/serve/mod.rs), before any plugin's register_services
         // runs — see the `retention_resolver_slot` field doc.
         context.register_service(Arc::new(temps_core::RetentionResolverSlot::new_default()));
+        // Likewise for the IP gate slot — see `project_ip_gate_slot`.
+        context.register_service(Arc::new(temps_core::ProjectIpGateSlot::new_default()));
 
         // No ConfigService is registered here: the plugin reads it via
         // `get_service` and, when absent, selects the default TimescaleDB

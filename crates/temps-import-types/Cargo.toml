@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-import-types"
 version.workspace = true
@@ -12,7 +15,7 @@ homepage.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Async
 async-trait = "0.1"
@@ -24,7 +27,7 @@ sea-orm = { workspace = true }
 utoipa = { version = "5.4", features = ["chrono"] }
 
 # Optional for validation
-validator = { version = "0.20", optional = true, features = ["derive"] }
+validator = { version = "0.21", optional = true, features = ["derive"] }
 
 [features]
 default = []

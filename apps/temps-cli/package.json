@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/cli",
-  "version": "0.1.28",
+  "version": "0.1.36",
   "description": "CLI for Temps deployment platform",
   "type": "module",
   "bin": {
@@ -15,10 +15,13 @@
     "prepublishOnly": "bun run clean && bun run build",
     "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js",
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
-    "generate:api": "bun openapi-ts",
+    "spec:update": "bun run scripts/update-openapi.ts",
+    "spec:check": "bun run scripts/check-openapi.ts",
+    "generate:api": "bun openapi-ts && python3 ../../scripts/source_attribution.py annotate apps/temps-cli/src/api",
     "generate:docs": "bun run scripts/generate-docs.ts",
     "generate:docs:mdx": "bun run scripts/generate-docs.ts --format mdx",
     "generate:docs:json": "bun run scripts/generate-docs.ts --format json",
+    "generate:skill-docs": "bun run src/index.ts docs --format markdown --output ../../skills/temps-cli/references/COMMANDS.md && python3 ../../skills/temps/scripts/generate_command_references.py",
     "typecheck": "tsc --noEmit",
     "link": "bun link"
   },
@@ -35,13 +38,16 @@
     "@hey-api/client-fetch": "^0.13.1",
     "@inquirer/prompts": "^8.0.1",
     "@inquirer/search": "^4.0.2",
+    "@types/ws": "^8.18.1",
     "chalk": "^5.6.2",
     "cli-table3": "^0.6.5",
     "commander": "^14.0.2",
     "conf": "^15.0.2",
     "ink": "^6.6.0",
     "ink-spinner": "^5.0.0",
+    "jsonc-parser": "^3.3.1",
     "ora": "^9.0.0",
-    "react": "^19.2.3"
+    "react": "^19.2.3",
+    "ws": "^8.21.2"
   }
 }

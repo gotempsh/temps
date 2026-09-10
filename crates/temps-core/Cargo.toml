@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-core"
 version.workspace = true
@@ -16,6 +19,8 @@ readme = "README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+include_dir = { workspace = true }
+semver = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -27,7 +32,7 @@ axum = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 tower-http = { workspace = true }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = { workspace = true }
 hkdf = { workspace = true }
 rand = { workspace = true }

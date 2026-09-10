@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -47,6 +50,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -71,6 +75,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
+  AlertCircle,
   ArrowLeft,
   CalendarDays,
   ChevronLeft,
@@ -84,11 +89,12 @@ import {
   Pencil,
   Play,
   Plus,
+  RotateCcw,
   Trash2,
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 // ── Local helpers ─────────────────────────────────────────────────────────────
@@ -234,7 +240,12 @@ export function ScheduleDetail() {
 
   // ── Data fetching ──────────────────────────────────────────────────────────
 
-  const { data: schedule, isLoading: isLoadingSchedule } = useQuery({
+  const {
+    data: schedule,
+    isLoading: isLoadingSchedule,
+    error: scheduleError,
+    refetch: refetchSchedule,
+  } = useQuery({
     ...getBackupScheduleOptions({ path: { id: scheduleId! } }),
     enabled: !!scheduleId,
   })
@@ -546,6 +557,34 @@ export function ScheduleDetail() {
     )
   }
 
+  if (scheduleError && !schedule) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+        <div>
+          <h2 className="text-lg font-semibold">Failed to load schedule</h2>
+          <p className="mt-1 text-base text-muted-foreground sm:text-sm">
+            {scheduleError instanceof Error
+              ? scheduleError.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => void refetchSchedule()}>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+          <Button variant="ghost" asChild>
+            <Link to="/backups">
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to Backups
+            </Link>
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
   if (!schedule) {
     return (
       <div className="flex flex-col items-center justify-center px-4 py-12 text-center">
@@ -757,10 +796,16 @@ export function ScheduleDetail() {
                 <Skeleton className="h-10 w-full" />
               </div>
             ) : !attachedServices || attachedServices.length === 0 ? (
-              <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                No services attached yet. Click <strong>Attach service</strong>{' '}
-                to add Postgres, Redis, MongoDB, or RustFS targets.
-              </div>
+              <EmptyState
+                icon={Database}
+                title="No services attached yet"
+                description={
+                  <>
+                    Click <strong>Attach service</strong> to add Postgres,
+                    Redis, MongoDB, or RustFS targets.
+                  </>
+                }
+              />
             ) : (
               <ul className="divide-y rounded-md border">
                 {attachedServices.map((svc) => {

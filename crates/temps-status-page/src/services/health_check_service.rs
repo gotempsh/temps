@@ -1,5 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
+    TransactionTrait,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_config::ConfigService;
@@ -12,6 +18,28 @@ use tracing::{debug, error, info, warn};
 
 use super::types::{validate_check_path, StatusPageError};
 
+/// Grace period before the scheduler runs its first health check cycle.
+///
+/// In split mode (`temps proxy` + `temps serve --role=console`) these are
+/// independent OS processes with no startup handshake between them, and even
+/// in single-process mode the proxy's listener setup (route/project-change
+/// listeners, admin gate, DB connections) can still be in flight when the
+/// console's plugins finish registering. A check that fires the instant this
+/// scheduler starts races the proxy socket bind: `check_monitor` gets a
+/// connection-refused, which is treated as a definitive "container is down"
+/// and reported as `major_outage` with no retry (see the `is_connect()`
+/// branch below). This delay absorbs that boot window so the first cycle
+/// observes the platform in its normal running state; every cycle after the
+/// first runs on the regular interval.
+const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
+#[derive(Clone)]
+struct MonitorProbeSnapshot {
+    monitor_id: i32,
+    deployment_id: i32,
+    monitor_updated_at: temps_core::UtcDateTime,
+}
+
 /// Service for performing health checks on monitored environments
 pub struct HealthCheckService {
     db: Arc<DatabaseConnection>,
@@ -21,24 +49,36 @@ pub struct HealthCheckService {
 }
 
 impl HealthCheckService {
+    /// Match deployment-readiness semantics: a redirect is a valid public
+    /// application response (login/setup redirects are common), while 4xx/5xx
+    /// indicate that the configured application URL is not usable.
+    fn is_operational_http_status(status: reqwest::StatusCode) -> bool {
+        status.is_success() || status.is_redirection()
+    }
+
     /// Create a new HealthCheckService with mandatory ConfigService and JobQueue
     pub fn new(
         db: Arc<DatabaseConnection>,
         config_service: Arc<ConfigService>,
         job_queue: Arc<dyn JobQueue>,
-    ) -> Self {
+    ) -> Result<Self, StatusPageError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("Temps-Status-Monitor/1.0")
+            // The application controls redirect targets. Following them would
+            // turn periodic monitoring into a blind SSRF primitive against
+            // loopback/private/link-local services, and would also prevent us
+            // from classifying the original 3xx as a healthy app response.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|source| StatusPageError::HttpClientBuild { source })?;
 
-        Self {
+        Ok(Self {
             db,
             http_client,
             config_service,
             job_queue,
-        }
+        })
     }
 
     /// Run health checks for all active monitors
@@ -74,7 +114,16 @@ impl HealthCheckService {
             let http_client = self.http_client.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    error!(
+                        ?error,
+                        "Health-check concurrency limiter closed unexpectedly"
+                    );
+                    break;
+                }
+            };
 
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
@@ -99,6 +148,40 @@ impl HealthCheckService {
         Ok(())
     }
 
+    /// Recompute all active monitors for one deployed environment.
+    ///
+    /// Deployment success calls this after updating the monitor's health path,
+    /// avoiding up to a minute of stale Down/Unknown state while preserving the
+    /// periodic scheduler's scale-to-zero exclusion for on-demand environments.
+    pub async fn check_monitors_for_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<usize, StatusPageError> {
+        let monitors_with_envs = status_monitors::Entity::find()
+            .filter(status_monitors::Column::ProjectId.eq(project_id))
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .find_also_related(environments::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        let monitors = Self::filter_on_demand_monitors(monitors_with_envs);
+        let monitor_count = monitors.len();
+
+        for monitor in monitors {
+            Self::check_monitor(
+                self.db.clone(),
+                self.http_client.clone(),
+                self.config_service.clone(),
+                monitor,
+                self.job_queue.clone(),
+            )
+            .await?;
+        }
+
+        Ok(monitor_count)
+    }
+
     /// Check a single monitor
     async fn check_monitor(
         db: Arc<DatabaseConnection>,
@@ -120,10 +203,33 @@ impl HealthCheckService {
             .one(db.as_ref())
             .await?
             .ok_or_else(|| StatusPageError::NotFound)?;
-        if environment.current_deployment_id.is_none() {
+        let Some(current_deployment_id) = environment.current_deployment_id else {
             warn!("Environment {} has no current deployment", env_id);
             return Ok(());
+        };
+
+        // Skip monitors whose deployment was intentionally paused by the
+        // user. This is a live read (not a value cached earlier in the
+        // caller) so it also covers the immediate check fired right after a
+        // monitor is created, and it can't be stale relative to
+        // `pause_deployment`, which persists `state = "paused"` before it
+        // stops any containers. This is only the cheap early exit — it
+        // avoids the HTTP round trip in the common case, but a pause can
+        // still land *during* the request below (which may take several
+        // seconds across retries), so `record_check` re-checks live again
+        // right before persisting any outcome.
+        if Self::is_deployment_paused(&db, current_deployment_id).await {
+            debug!(
+                "Skipping monitor {} for paused deployment {}",
+                monitor.id, current_deployment_id
+            );
+            return Ok(());
         }
+        let probe = MonitorProbeSnapshot {
+            monitor_id: monitor.id,
+            deployment_id: current_deployment_id,
+            monitor_updated_at: monitor.updated_at,
+        };
 
         // IMPORTANT: Always use the public URL for health checks
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
@@ -143,7 +249,6 @@ impl HealthCheckService {
                         if let Err(e) = validate_check_path(path) {
                             warn!(
                                 monitor_id = monitor.id,
-                                check_path = %path,
                                 error = %e,
                                 "Stored check_path failed validation; falling back to default URL"
                             );
@@ -168,7 +273,7 @@ impl HealthCheckService {
                 // Record check as failed due to configuration error
                 Self::record_check(
                     &db,
-                    monitor.id,
+                    probe.clone(),
                     "degraded".to_string(),
                     None,
                     Some(format!("Failed to determine public URL: {:?}", e)),
@@ -213,13 +318,9 @@ impl HealthCheckService {
                 Ok(Ok(response)) => {
                     let status_code = response.status();
 
-                    let status = if status_code.is_success()
-                        || status_code.as_u16() == 404
-                        || status_code.as_u16() == 405
-                    {
-                        // 2xx, 404, and 405 are all considered healthy — many apps
-                        // return 404 on / (API backends) or 405 (no GET handler)
-                        // but the server is running fine.
+                    let status = if Self::is_operational_http_status(status_code) {
+                        // Redirects are healthy (many apps redirect `/` to login or
+                        // setup); client/server errors are not usable.
                         "operational"
                     } else if status_code.is_server_error() {
                         // For server errors, retry
@@ -245,7 +346,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
+                        probe.clone(),
                         status.to_string(),
                         Some(total_response_time_ms),
                         if status != "operational" {
@@ -292,7 +393,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
+                        probe.clone(),
                         "major_outage".to_string(),
                         Some(total_response_time_ms),
                         Some(format!(
@@ -321,7 +422,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
+                        probe.clone(),
                         "major_outage".to_string(),
                         Some(10000), // Max timeout
                         Some(format!(
@@ -339,7 +440,7 @@ impl HealthCheckService {
         error!("Unexpected: exhausted retries for monitor {}", monitor.id);
         Self::record_check(
             &db,
-            monitor.id,
+            probe,
             "major_outage".to_string(),
             Some(total_response_time_ms),
             Some(last_error.unwrap_or_else(|| "Unknown error after retries".to_string())),
@@ -348,17 +449,39 @@ impl HealthCheckService {
         .await
     }
 
-    /// Record a check result in the database with retry logic and emit job for outage detection
+    /// Check if a deployment is currently paused. Always a live read (never
+    /// cached or captured earlier), since it feeds an alarm-suppression
+    /// decision that must reflect `pause_deployment`'s state at the moment
+    /// the caller is about to act, not at some earlier point in the check.
+    async fn is_deployment_paused(db: &Arc<DatabaseConnection>, deployment_id: i32) -> bool {
+        deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
+    }
+
+    /// Record a check result in the database with retry logic and emit job for outage detection.
+    ///
+    /// Re-checks `deployment_id` for a pause live, right before persisting
+    /// anything: `check_monitor`'s own paused guard only runs once, before
+    /// the HTTP request, but that request (with retries) can take several
+    /// seconds — long enough for a pause to land in between. Without this,
+    /// an in-flight check that started against a running deployment could
+    /// still record a "major_outage" for one that finished pausing seconds
+    /// later.
     async fn record_check(
         db: &Arc<DatabaseConnection>,
-        monitor_id: i32,
+        probe: MonitorProbeSnapshot,
         status: String,
         response_time_ms: Option<i32>,
         error_message: Option<String>,
         job_queue: &Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
         let check = status_checks::ActiveModel {
-            monitor_id: Set(monitor_id),
+            monitor_id: Set(probe.monitor_id),
             status: Set(status.clone()),
             response_time_ms: Set(response_time_ms),
             checked_at: Set(Utc::now()),
@@ -377,20 +500,36 @@ impl HealthCheckService {
                 let delay = INITIAL_DB_DELAY_MS * (2_u64.pow(attempt - 1));
                 debug!(
                     "Retrying database insert for monitor {} (attempt {}/{}), waiting {}ms",
-                    monitor_id, attempt, MAX_DB_RETRIES, delay
+                    probe.monitor_id, attempt, MAX_DB_RETRIES, delay
                 );
                 sleep(Duration::from_millis(delay)).await;
             }
 
-            match check.clone().insert(db.as_ref()).await {
-                Ok(_) => {
+            match Self::persist_check_if_current(
+                db,
+                probe.monitor_id,
+                probe.deployment_id,
+                probe.monitor_updated_at,
+                check.clone(),
+            )
+            .await
+            {
+                Ok(false) => {
+                    debug!(
+                        monitor_id = probe.monitor_id,
+                        deployment_id = probe.deployment_id,
+                        "Discarded health result because its deployment is no longer current or was paused"
+                    );
+                    return Ok(());
+                }
+                Ok(true) => {
                     if attempt > 0 {
                         debug!("Database insert succeeded after {} attempts", attempt + 1);
                     }
 
                     // CRITICAL: Emit job for outage detection immediately after recording check
                     let job = Job::StatusCheckCompleted(StatusCheckCompletedJob {
-                        monitor_id,
+                        monitor_id: probe.monitor_id,
                         status: status.clone(),
                         error_message: error_message.clone(),
                     });
@@ -398,7 +537,7 @@ impl HealthCheckService {
                     if let Err(e) = job_queue.send(job).await {
                         error!(
                             "Failed to emit StatusCheckCompleted job for monitor {}: {:?}",
-                            monitor_id, e
+                            probe.monitor_id, e
                         );
                         // Don't fail the health check if job emission fails
                     }
@@ -419,7 +558,7 @@ impl HealthCheckService {
                     if should_retry && attempt < MAX_DB_RETRIES {
                         warn!(
                             "Database insert failed for monitor {} (attempt {}), will retry: {:?}",
-                            monitor_id,
+                            probe.monitor_id,
                             attempt + 1,
                             e
                         );
@@ -430,7 +569,7 @@ impl HealthCheckService {
                     // Non-retryable error or final attempt
                     error!(
                         "Failed to record check for monitor {} after {} attempts: {:?}",
-                        monitor_id,
+                        probe.monitor_id,
                         attempt + 1,
                         e
                     );
@@ -443,6 +582,65 @@ impl HealthCheckService {
         Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
             sea_orm::DbErr::Custom("Failed after all retry attempts".to_string())
         })))
+    }
+
+    /// Commit a result only while the checked deployment is still the
+    /// environment's current, unpaused deployment. The environment row lock
+    /// gives deployment promotion and this insert one database ordering, and
+    /// the monitor lock serializes concurrent probes for the same endpoint.
+    async fn persist_check_if_current(
+        db: &Arc<DatabaseConnection>,
+        monitor_id: i32,
+        deployment_id: i32,
+        expected_monitor_updated_at: temps_core::UtcDateTime,
+        check: status_checks::ActiveModel,
+    ) -> Result<bool, sea_orm::DbErr> {
+        let monitor_snapshot = status_monitors::Entity::find_by_id(monitor_id)
+            .one(db.as_ref())
+            .await?;
+        let Some(environment_id) = monitor_snapshot.and_then(|monitor| monitor.environment_id)
+        else {
+            return Ok(false);
+        };
+
+        let transaction = db.begin().await?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        let Some(environment) = environment else {
+            return Ok(false);
+        };
+        if environment.current_deployment_id != Some(deployment_id) {
+            return Ok(false);
+        }
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        if deployment
+            .as_ref()
+            .is_none_or(|model| model.state == "paused")
+        {
+            return Ok(false);
+        }
+
+        let monitor = status_monitors::Entity::find_by_id(monitor_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        if monitor.as_ref().and_then(|model| model.environment_id) != Some(environment_id)
+            || monitor.as_ref().is_none_or(|model| {
+                !model.is_active || model.updated_at != expected_monitor_updated_at
+            })
+        {
+            return Ok(false);
+        }
+
+        check.insert(&transaction).await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Initialize monitors for all existing environments
@@ -497,6 +695,13 @@ impl HealthCheckService {
     /// waiting for the next scheduled cycle.
     pub async fn start_scheduler(self: Arc<Self>, mut job_receiver: Box<dyn JobReceiver>) {
         debug!("Starting health check scheduler with realtime monitor creation handling");
+
+        // See STARTUP_GRACE_PERIOD: wait out the proxy's boot window before
+        // touching any monitor. This also delays `initialize_monitors` below,
+        // which prevents the MonitorCreated events it emits for newly-seen
+        // environments from triggering an immediate check during the same
+        // race window.
+        sleep(STARTUP_GRACE_PERIOD).await;
 
         // Initialize monitors for all environments first
         if let Err(e) = self.initialize_monitors().await {
@@ -662,7 +867,7 @@ impl HealthCheckService {
         match check_result {
             Ok(Ok(response)) => {
                 let code = response.status();
-                let status = if code.is_success() || code.as_u16() == 404 || code.as_u16() == 405 {
+                let status = if Self::is_operational_http_status(code) {
                     "operational"
                 } else if code.is_server_error() {
                     "major_outage"
@@ -691,8 +896,10 @@ mod tests {
             name: format!("monitor-{}", id),
             monitor_type: "web".to_string(),
             check_path: None,
+            check_path_revision: 0,
             check_interval_seconds: 60,
             is_active: true,
+            is_managed: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -728,6 +935,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }
@@ -808,5 +1016,432 @@ mod tests {
         assert_eq!(result[0].id, 2);
         assert_eq!(result[1].id, 3);
         assert_eq!(result[2].id, 5);
+    }
+
+    #[test]
+    fn test_operational_http_status_matches_deployment_readiness() {
+        for status in [200, 204, 301, 302, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(
+                HealthCheckService::is_operational_http_status(status),
+                "HTTP {status} should be operational"
+            );
+        }
+
+        for status in [400, 401, 403, 404, 405, 429, 500, 502, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(
+                !HealthCheckService::is_operational_http_status(status),
+                "HTTP {status} should not be operational"
+            );
+        }
+    }
+
+    // ── check_monitor: paused-deployment skip ──────────────────────────
+    //
+    // Regression coverage for the gap Greptile flagged on PR #835: the
+    // paused check used to live only in `run_all_checks`'s pre-filter, so
+    // the immediate check fired by the `MonitorCreated` job (which calls
+    // `check_monitor` directly, bypassing that pre-filter) still reported a
+    // freshly-paused deployment as down. The check now lives inside
+    // `check_monitor` itself — the single place every caller goes through —
+    // and reads deployment state live rather than from a value the caller
+    // captured earlier, so it can't be stale relative to
+    // `pause_deployment`, which persists `state = "paused"` before it stops
+    // any containers.
+
+    struct NeverJobQueue;
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for NeverJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            struct NeverReceiver;
+            #[async_trait::async_trait]
+            impl temps_core::JobReceiver for NeverReceiver {
+                async fn recv(&mut self) -> Result<temps_core::Job, temps_core::QueueError> {
+                    std::future::pending().await
+                }
+            }
+            Box::new(NeverReceiver)
+        }
+    }
+
+    fn test_config_service(
+        db: &Arc<DatabaseConnection>,
+        database_url: &str,
+    ) -> Arc<temps_config::ConfigService> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            database_url.to_string(),
+            None,
+            None,
+        )
+        .expect("failed to build test ServerConfig");
+        Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_environment_recheck_selects_monitor_and_skips_paused_deployment() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Paused Skip Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("paused-skip-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("paused-skip-test-production".to_string()),
+            host: Set("paused-skip-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("paused-skip-test-1".to_string()),
+            state: Set("paused".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        let environment = active_environment.update(db.as_ref()).await.unwrap();
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let config_service = test_config_service(&db, &test_db.database_url);
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
+            .expect("test HTTP client should build");
+
+        // If the paused check were skipped or stale, this would try to hit
+        // `paused-skip-test-production.test.local`, which doesn't resolve —
+        // the call would still return `Ok(())` (check_monitor treats a
+        // failed request as a recorded outage, not an error) but it would
+        // insert a `status_checks` row. Assert none was written instead of
+        // asserting on the return value, so the test fails loudly if the
+        // guard regresses instead of passing for the wrong reason.
+        let checked = health_check_service
+            .check_monitors_for_environment(project.id, environment.id)
+            .await
+            .expect("post-deploy environment recheck should succeed");
+        assert_eq!(checked, 1, "the environment's active monitor is selected");
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "check_monitor must not perform an HTTP check against a paused deployment"
+        );
+    }
+
+    /// Regression test for the mid-check race Greptile flagged: `check_monitor`'s
+    /// own paused guard only runs once, before the HTTP request — but that
+    /// request (with up to 3 retries) can take several seconds, long enough
+    /// for a pause to land in between. `record_check` must re-check live,
+    /// right before persisting any outcome, regardless of what the caller
+    /// observed earlier. Exercise `record_check` directly (rather than the
+    /// full `check_monitor`, whose early guard would trivially skip a
+    /// deployment that's already paused at entry) so this only passes if the
+    /// *late* guard inside `record_check` itself is the one doing the work.
+    #[tokio::test]
+    async fn test_record_check_skips_paused_deployment_mid_check() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Mid-Check Pause Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("mid-check-pause-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("mid-check-pause-test-production".to_string()),
+            host: Set("mid-check-pause-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Deployment starts NOT paused — modeling "check_monitor's early
+        // guard saw a running deployment and proceeded to the HTTP request".
+        // It's paused (below) only after that point, simulating the pause
+        // landing while the check is in flight.
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("mid-check-pause-test-1".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Pause lands mid-check, after the (simulated) early guard already
+        // passed.
+        let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+        active_deployment.state = Set("paused".to_string());
+        active_deployment.update(db.as_ref()).await.unwrap();
+
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+
+        let result = HealthCheckService::record_check(
+            &db,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: deployment.id,
+                monitor_updated_at: monitor.updated_at,
+            },
+            "major_outage".to_string(),
+            Some(5000),
+            Some("Connection failed".to_string()),
+            &job_queue,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "record_check must not persist a check result for a deployment paused mid-check, \
+             even when the caller's own paused guard already passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_check_discards_result_from_replaced_deployment() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deployment Replacement Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("deployment-replacement-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("deployment-replacement-test-production".to_string()),
+            host: Set("deployment-replacement-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let old_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("replacement-old".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let current_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("replacement-current".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let environment_id = environment.id;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment_id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+
+        HealthCheckService::record_check(
+            &db,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: old_deployment.id,
+                monitor_updated_at: monitor.updated_at,
+            },
+            "major_outage".to_string(),
+            Some(5000),
+            Some("stale failure".to_string()),
+            &job_queue,
+        )
+        .await
+        .unwrap();
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "a result started for an older deployment must not become current status"
+        );
+
+        let probed_monitor_updated_at = monitor.updated_at;
+        let mut changed_monitor: status_monitors::ActiveModel = monitor.clone().into();
+        changed_monitor.check_path = Set(Some("/ready".to_string()));
+        changed_monitor.update(db.as_ref()).await.unwrap();
+        HealthCheckService::record_check(
+            &db,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: current_deployment.id,
+                monitor_updated_at: probed_monitor_updated_at,
+            },
+            "major_outage".to_string(),
+            Some(5000),
+            Some("result from the old path".to_string()),
+            &job_queue,
+        )
+        .await
+        .unwrap();
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "a result from a monitor path changed mid-probe must be discarded"
+        );
     }
 }

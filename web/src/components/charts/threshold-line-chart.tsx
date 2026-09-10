@@ -1,4 +1,7 @@
-import { ReactNode } from 'react'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { ReactNode, useCallback, useMemo, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
@@ -16,7 +19,17 @@ import {
   ChartTooltipContent,
 } from '@/components/ui/chart'
 import { cn } from '@/lib/utils'
+import {
+  formatChartDateRange,
+  orderedChartDateRange,
+} from '@/lib/chart-range-selection'
+import type { ChartDateRange } from '@/lib/chart-range-selection'
 import type { MetricTone } from './metric-sparkline'
+import {
+  SERIES_STROKE,
+  THRESHOLD_STROKE,
+  seriesLineColor,
+} from './chart-colors'
 
 export type ThresholdLineSeries = {
   /** Data key on each point — what to plot. */
@@ -89,6 +102,8 @@ interface ThresholdLineChartProps {
   height?: number
   /** Format the Y-axis ticks (e.g. "2.5s"). */
   yTickFormatter?: (value: number) => string
+  /** Format categorical X-axis ticks without changing their unique values. */
+  xTickFormatter?: (value: string | number) => string
   /** Format the tooltip value. */
   tooltipValueFormatter?: (value: number) => string
   /** Extra content rendered inside the tooltip under the value. */
@@ -98,34 +113,74 @@ interface ThresholdLineChartProps {
    * to draw a line. Defaults to a generic fallback.
    */
   emptyMessage?: ReactNode
+  /** Raw timestamp key used when the user drags across the chart. */
+  selectionKey?: string
+  /** Called with the ordered timestamp range after a multi-point drag. */
+  onRangeSelect?: (from: Date, to: Date) => void
+  /** Confirmed-but-not-yet-applied range to keep highlighted on the chart. */
+  selectedRange?: ChartDateRange | null
   className?: string
 }
 
-const SERIES_STROKE: Record<NonNullable<ThresholdLineSeries['tone']>, string> = {
-  good: 'var(--chart-2)',
-  warn: 'var(--chart-3)',
-  poor: 'var(--chart-4)',
-  neutral: 'var(--chart-1)',
-  primary: 'var(--chart-1)',
+function SelectedRangeLabel({
+  viewBox,
+  range,
+}: {
+  viewBox?: { x?: number; y?: number; width?: number }
+  range: ChartDateRange
+}) {
+  const x = viewBox?.x ?? 0
+  const y = viewBox?.y ?? 0
+  const width = viewBox?.width ?? 0
+  const text = formatChartDateRange(range)
+  const labelWidth = Math.min(Math.max(text.length * 6.4 + 20, 190), 330)
+  const center = x + width / 2
+
+  return (
+    <g className="pointer-events-none">
+      <rect
+        x={center - labelWidth / 2}
+        y={y + 8}
+        width={labelWidth}
+        height={24}
+        rx={6}
+        fill="var(--popover)"
+        stroke="var(--primary)"
+        strokeOpacity={0.45}
+      />
+      <text
+        x={center}
+        y={y + 24}
+        textAnchor="middle"
+        fill="var(--popover-foreground)"
+        fontFamily="var(--font-mono)"
+        fontSize={10}
+        fontWeight={500}
+      >
+        {text}
+      </text>
+    </g>
+  )
 }
 
-// Breakdown lines don't carry good/warn/poor semantics — cycle the same five
-// theme chart vars every other chart in the app rotates through (see
-// AiAgentsTimelineChart's SERIES_COLORS) so a breakdown looks native in both
-// light and dark mode instead of inventing new hex colors.
-const BREAKDOWN_STROKES = [
-  'var(--chart-1)',
-  'var(--chart-2)',
-  'var(--chart-3)',
-  'var(--chart-4)',
-  'var(--chart-5)',
-]
+function MarkerLabel({
+  viewBox,
+  text,
+  title,
+}: {
+  viewBox?: { x?: number; y?: number }
+  text: string
+  title?: string
+}) {
+  const x = viewBox?.x ?? 0
+  const y = viewBox?.y ?? 0
 
-const THRESHOLD_STROKE: Record<MetricTone, string> = {
-  good: 'var(--chart-2)',
-  warn: 'var(--chart-3)',
-  poor: 'var(--chart-4)',
-  neutral: 'var(--muted-foreground)',
+  return (
+    <text x={x + 4} y={y + 10} fill="var(--chart-5)" fontSize={9}>
+      {title && <title>{title}</title>}
+      {text}
+    </text>
+  )
 }
 
 /**
@@ -147,22 +202,149 @@ export function ThresholdLineChart({
   bandSeries,
   height = 300,
   yTickFormatter,
+  xTickFormatter,
   tooltipValueFormatter,
   tooltipFooter,
   emptyMessage,
+  selectionKey,
+  onRangeSelect,
+  selectedRange,
   className,
 }: ThresholdLineChartProps) {
   const isMulti = Array.isArray(series)
   const seriesList = isMulti ? series : [series]
+  const [selectionStartX, setSelectionStartX] = useState<
+    string | number | null
+  >(null)
+  const [selectionEndX, setSelectionEndX] = useState<string | number | null>(
+    null
+  )
+  const selectionStartValue = useRef<unknown>(null)
+  const selectionEndValue = useRef<unknown>(null)
+  const isSelecting = useRef(false)
+
+  const clearSelection = useCallback(() => {
+    isSelecting.current = false
+    selectionStartValue.current = null
+    selectionEndValue.current = null
+    setSelectionStartX(null)
+    setSelectionEndX(null)
+  }, [])
+
+  const selectionPointFromEvent = useCallback(
+    (event: any) => {
+      const payload = event?.activePayload?.[0]?.payload
+      if (payload) return payload
+
+      const activeIndex = Number(event?.activeIndex)
+      if (
+        Number.isInteger(activeIndex) &&
+        activeIndex >= 0 &&
+        activeIndex < data.length
+      ) {
+        return data[activeIndex]
+      }
+
+      if (event?.activeLabel != null) {
+        return data.find((point) => point?.[xKey] === event.activeLabel)
+      }
+
+      return undefined
+    },
+    [data, xKey]
+  )
+
+  const handleMouseDown = useCallback(
+    (event: any) => {
+      if (!selectionKey || !onRangeSelect) return
+      const payload = selectionPointFromEvent(event)
+      const xValue = payload?.[xKey]
+      const selectionValue = payload?.[selectionKey]
+      if (
+        (typeof xValue !== 'string' && typeof xValue !== 'number') ||
+        selectionValue == null
+      ) {
+        return
+      }
+
+      isSelecting.current = true
+      selectionStartValue.current = selectionValue
+      selectionEndValue.current = null
+      setSelectionStartX(xValue)
+      setSelectionEndX(null)
+    },
+    [onRangeSelect, selectionKey, selectionPointFromEvent, xKey]
+  )
+
+  const handleMouseMove = useCallback(
+    (event: any) => {
+      if (!isSelecting.current || !selectionKey) return
+      const payload = selectionPointFromEvent(event)
+      const xValue = payload?.[xKey]
+      const selectionValue = payload?.[selectionKey]
+      if (
+        (typeof xValue !== 'string' && typeof xValue !== 'number') ||
+        selectionValue == null
+      ) {
+        return
+      }
+
+      selectionEndValue.current = selectionValue
+      setSelectionEndX(xValue)
+    },
+    [selectionKey, selectionPointFromEvent, xKey]
+  )
+
+  const handleMouseUp = useCallback(() => {
+    if (!isSelecting.current || !onRangeSelect) {
+      clearSelection()
+      return
+    }
+
+    const range = orderedChartDateRange(
+      selectionStartValue.current,
+      selectionEndValue.current
+    )
+    clearSelection()
+    if (range) onRangeSelect(range.from, range.to)
+  }, [clearSelection, onRangeSelect])
+
+  const selectedRangeX = useMemo(() => {
+    if (!selectedRange || !selectionKey) return null
+
+    const points = data.flatMap((point) => {
+      const rawTimestamp = point?.[selectionKey]
+      const timestamp = new Date(rawTimestamp).getTime()
+      const x = point?.[xKey]
+      return Number.isNaN(timestamp) ||
+        (typeof x !== 'string' && typeof x !== 'number')
+        ? []
+        : [{ timestamp, x }]
+    })
+    if (points.length === 0) return null
+
+    const closestX = (target: number) =>
+      points.reduce((closest, point) =>
+        Math.abs(point.timestamp - target) <
+        Math.abs(closest.timestamp - target)
+          ? point
+          : closest
+      ).x
+
+    return {
+      from: closestX(selectedRange.from.getTime()),
+      to: closestX(selectedRange.to.getTime()),
+    }
+  }, [data, selectedRange, selectionKey, xKey])
 
   const config: ChartConfig = {}
   seriesList.forEach((s, i) => {
     config[s.dataKey] = {
       label: s.label,
-      color: s.tone
-        ? SERIES_STROKE[s.tone]
-        : isMulti
-          ? BREAKDOWN_STROKES[i % BREAKDOWN_STROKES.length]
+      color: isMulti
+        ? seriesLineColor(s.tone, i)
+        : s.tone
+          ? SERIES_STROKE[s.tone]
           : SERIES_STROKE.primary,
     }
   })
@@ -171,7 +353,7 @@ export function ThresholdLineChart({
     data.reduce((n, p) => {
       const v = p?.[s.dataKey]
       return v === null || v === undefined ? n : n + 1
-    }, 0),
+    }, 0)
   )
   const maxValidCount = Math.max(0, ...validCounts)
 
@@ -180,7 +362,7 @@ export function ThresholdLineChart({
       <div
         className={cn(
           'flex w-full items-center justify-center rounded-md border border-dashed text-sm text-muted-foreground',
-          className,
+          className
         )}
         style={{ height }}
       >
@@ -206,13 +388,13 @@ export function ThresholdLineChart({
   const numericValues = data.flatMap((p) =>
     seriesList
       .map((s) => p?.[s.dataKey])
-      .filter((v): v is number => typeof v === 'number'),
+      .filter((v): v is number => typeof v === 'number')
   )
   const dataMax = numericValues.length ? Math.max(...numericValues) : 0
   const dataMin = numericValues.length ? Math.min(...numericValues) : 0
   const thresholdMax = thresholds.reduce(
     (m, t) => Math.max(m, t.value),
-    dataMax,
+    dataMax
   )
   // Keep shaded band edges inside the visible Y range too.
   const bandMax = bands.reduce((m, b) => Math.max(m, b.upper), thresholdMax)
@@ -231,18 +413,26 @@ export function ThresholdLineChart({
       }
     }
   }
-  const yMax = envMax * 1.1
   const yMin = Math.min(0, envMin)
+  const yMax = envMax === yMin ? yMin + 1 : envMax * 1.1
 
   return (
     <ChartContainer
       config={config}
-      className={cn('aspect-auto w-full', className)}
+      className={cn(
+        'aspect-auto w-full',
+        selectionKey && onRangeSelect && 'cursor-crosshair select-none',
+        className
+      )}
       style={{ height }}
     >
       <ComposedChart
         data={data}
         margin={{ top: 12, right: 24, left: 8, bottom: 0 }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={clearSelection}
       >
         <CartesianGrid
           strokeDasharray="3 3"
@@ -292,6 +482,7 @@ export function ThresholdLineChart({
           axisLine={false}
           tickMargin={8}
           minTickGap={32}
+          tickFormatter={xTickFormatter}
           className="text-xs"
         />
         <YAxis
@@ -313,9 +504,7 @@ export function ThresholdLineChart({
                 // Only the breakdown case needs a per-line label — a single
                 // series already conveys "what" via the tile title.
                 const seriesLabel = isMulti
-                  ? (config[String(item?.dataKey)]?.label as
-                      | string
-                      | undefined)
+                  ? (config[String(item?.dataKey)]?.label as string | undefined)
                   : undefined
                 return (
                   <div className="flex flex-col gap-0.5">
@@ -360,6 +549,28 @@ export function ThresholdLineChart({
             }
           />
         ))}
+        {selectionStartX != null && selectionEndX != null && (
+          <ReferenceArea
+            x1={selectionStartX}
+            x2={selectionEndX}
+            fill="var(--primary)"
+            fillOpacity={0.1}
+            stroke="var(--primary)"
+            strokeOpacity={0.35}
+          />
+        )}
+        {selectionStartX == null && selectedRangeX && selectedRange && (
+          <ReferenceArea
+            x1={selectedRangeX.from}
+            x2={selectedRangeX.to}
+            fill="var(--primary)"
+            fillOpacity={0.14}
+            stroke="var(--primary)"
+            strokeOpacity={0.55}
+            strokeWidth={1}
+            label={<SelectedRangeLabel range={selectedRange} />}
+          />
+        )}
         {thresholds.map((t, idx) => (
           <ReferenceLine
             key={`${t.tone}-${idx}`}
@@ -387,14 +598,9 @@ export function ThresholdLineChart({
             strokeDasharray="3 3"
             strokeOpacity={0.85}
             label={
-              m.label
-                ? {
-                    value: m.label,
-                    position: 'insideTopRight',
-                    fill: 'var(--chart-5)',
-                    fontSize: 9,
-                  }
-                : undefined
+              m.label ? (
+                <MarkerLabel text={m.label} title={m.title} />
+              ) : undefined
             }
           />
         ))}
@@ -408,7 +614,9 @@ export function ThresholdLineChart({
             // A breakdown can have many overlapping lines — per-point dots
             // just add clutter there; the single-series dot-when-sparse
             // behavior is unchanged.
-            dot={!isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false}
+            dot={
+              !isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false
+            }
             activeDot={{ r: 4, strokeWidth: 0 }}
             connectNulls
             isAnimationActive={false}
@@ -428,7 +636,6 @@ export function ThresholdLineChart({
             tooltipType="none"
             isAnimationActive={false}
             activeDot={false}
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             dot={(props: any) => {
               const breaching =
                 props?.payload?.[bandSeries.breachKey as string] != null

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for the email service
 
 mod audit;
@@ -41,7 +44,11 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         providers::update_email_provider,
         providers::delete_email_provider,
         providers::test_provider,
+        providers::list_discoverable_domains,
+        providers::get_email_tracking_status,
+        providers::setup_email_tracking,
         // Domains
+        domains::import_email_domain,
         domains::create_email_domain,
         domains::list_email_domains,
         domains::get_domain,
@@ -50,6 +57,9 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         domains::verify_domain,
         domains::delete_email_domain,
         domains::setup_dns,
+        domains::list_email_domain_projects,
+        domains::authorize_email_domain_project,
+        domains::revoke_email_domain_project,
         // Emails
         emails::send_email,
         emails::list_emails,
@@ -78,7 +88,12 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             types::SmtpCredentialsRequest,
             types::SmtpEncryptionRoute,
             types::TestEmailResponse,
+            types::EmailTrackingStatusResponse,
+            types::EmailTrackingSetupResponse,
+            types::ListProviderDomainsResponse,
+            types::ProviderDomainIdentityResponse,
             // Domain types
+            types::ImportEmailDomainRequest,
             types::CreateEmailDomainRequest,
             types::EmailDomainResponse,
             types::DnsRecordResponse,
@@ -86,6 +101,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             types::SetupDnsRequest,
             types::SetupDnsResponse,
             types::DnsRecordSetupResult,
+            types::AuthorizedEmailDomainProjectResponse,
             // Email types
             types::SendEmailRequestBody,
             types::SendEmailResponseBody,
@@ -101,7 +117,6 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             // Validation types
             validation::ValidateEmailRequest,
             validation::ValidateEmailResponse,
-            validation::ProxyRequest,
             validation::ReachabilityStatus,
             validation::SyntaxResult,
             validation::MxResult,

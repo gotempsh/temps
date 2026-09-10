@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Stateless cookie codec for visitor and session tracking.
 //!
 //! No database round-trips on the hot path:

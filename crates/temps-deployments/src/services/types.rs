@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
 use temps_entities::{deployment_config::DeploymentConfigSnapshot, prelude::DeploymentMetadata};
@@ -35,6 +38,19 @@ pub struct DeploymentListResponse {
     pub total: i64,
     pub page: i64,
     pub per_page: i64,
+}
+
+/// Minimal deployment presentation data used by batch project-card queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LatestDeploymentMedia {
+    pub project_id: i32,
+    /// State of the newest deployment attempt, which may differ from the
+    /// older deployment that is still serving traffic and supplying media.
+    pub latest_attempt_status: String,
+    /// Public deployment URL when this is a currently served deployment.
+    /// Historical screenshot fallbacks deliberately omit the URL.
+    pub url: Option<String>,
+    pub screenshot_location: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

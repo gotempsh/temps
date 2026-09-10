@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getEnvironmentOptions,
   listContainersOptions,
@@ -8,10 +11,16 @@ import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
 import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
+import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { useCallback, useState } from 'react'
+import {
+  resolveEnvironmentView,
+  updateEnvironmentSearchParams,
+  type EnvironmentView,
+} from '@/lib/environment-navigation'
 
 interface EnvironmentDashboardProps {
   project: ProjectResponse
@@ -31,12 +40,12 @@ export function EnvironmentDashboard({
   onDelete,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeView = (searchParams.get('view') || 'containers') as string
+  const activeView = resolveEnvironmentView(searchParams.get('view'))
 
   const handleViewChange = useCallback(
-    (view: string) => {
-      searchParams.set('view', view)
-      setSearchParams(searchParams)
+    (view: EnvironmentView) => {
+      const nextParams = updateEnvironmentSearchParams(searchParams, { view })
+      setSearchParams(nextParams)
     },
     [searchParams, setSearchParams]
   )
@@ -106,7 +115,7 @@ export function EnvironmentDashboard({
     )
   }
 
-  const isStatic = project?.preset === 'custom'
+  const isStatic = project?.source_type === 'static_files'
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-neutral-950">
@@ -137,6 +146,11 @@ export function EnvironmentDashboard({
                 This project does not have running containers to manage.
               </p>
             </div>
+          ) : activeView === 'metrics' ? (
+            <EnvironmentMetricsCharts
+              projectId={project.id}
+              environmentId={environmentId}
+            />
           ) : (
             <ContainerPanel
               project={project}

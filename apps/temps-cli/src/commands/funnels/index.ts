@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -113,7 +116,7 @@ export function registerFunnelsCommands(program: Command): void {
     .action(previewFunnelMetricsAction)
 }
 
-function parseStepsJson(stepsStr: string): CreateFunnelStep[] | null {
+export function parseStepsJson(stepsStr: string): CreateFunnelStep[] | null {
   try {
     const parsed = JSON.parse(stepsStr)
     if (!Array.isArray(parsed)) {

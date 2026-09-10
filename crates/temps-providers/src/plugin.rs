@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use sea_orm::EntityTrait;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
@@ -57,6 +61,11 @@ impl TempsPlugin for ProvidersPlugin {
             ));
             context.register_service(external_service_manager.clone());
 
+            let sandbox_runtime_credentials: Arc<
+                dyn temps_core::SandboxRuntimeCredentialsProvider,
+            > = external_service_manager.clone();
+            context.register_service(sandbox_runtime_credentials);
+
             // Register the cross-crate ProjectEnvVarsProvider so the environments
             // plugin can assemble the resolved (manual + integration) env-var view
             // without depending on this crate.
@@ -74,6 +83,61 @@ impl TempsPlugin for ProvidersPlugin {
                 manager_for_startup
                     .spawn_reconcilers_for_existing_clusters()
                     .await;
+            });
+
+            // Multi-node networking can be enabled or repaired while the
+            // control plane keeps running (`temps network setup-multi-node`).
+            // Re-publish standalone service records periodically so existing
+            // control-plane PostgreSQL/Redis/etc. containers are attached to
+            // the newly-created overlay without a process restart.
+            let manager_for_dns = external_service_manager.clone();
+            let db_for_dns = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    let overlay_ready = match temps_entities::network_config::Entity::find_by_id(1)
+                        .one(db_for_dns.as_ref())
+                        .await
+                    {
+                        Ok(Some(config)) => config.control_plane_overlay_ready,
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Could not inspect control-plane overlay readiness"
+                            );
+                            false
+                        }
+                    };
+                    if !overlay_ready {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    match manager_for_dns.list_services().await {
+                        Ok(services) => {
+                            for service in services {
+                                if let Err(error) = manager_for_dns
+                                    .register_standalone_service_dns(service.id)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        service_id = service.id,
+                                        service_name = %service.name,
+                                        error = %error,
+                                        "Could not reconcile standalone managed-service DNS"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "Could not list managed services for DNS reconciliation"
+                        ),
+                    }
+                    // Service create/start paths publish immediately. This is
+                    // only a bounded recovery sweep for runtime enablement or
+                    // external Docker drift, not a hot polling path.
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                }
             });
 
             tracing::debug!("Providers plugin services registered successfully");
@@ -112,6 +176,8 @@ impl TempsPlugin for ProvidersPlugin {
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let application_network_reconciler =
+            context.get_service::<dyn temps_core::ApplicationDataNetworkReconciler>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
@@ -125,16 +191,24 @@ impl TempsPlugin for ProvidersPlugin {
             config_service,
             telemetry,
             project_access_checker,
+            application_network_reconciler,
         });
 
         // Configure routes with the app state
-        let providers_routes = handlers::configure_routes().with_state(app_state);
+        let providers_routes = handlers::configure_routes().with_state(app_state.clone());
+        let pg_stat_routes =
+            crate::handlers::pg_stat_statements_handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes::new(providers_routes))
+        let router = providers_routes.merge(pg_stat_routes);
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<handlers::ExternalServiceApiDoc as OpenApiTrait>::openapi())
+        use temps_core::openapi::merge_openapi_schemas;
+        let base = <handlers::ExternalServiceApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::pg_stat_statements_handlers::PgStatStatementsApiDoc;
+        let pg_stat = <PgStatStatementsApiDoc as OpenApiTrait>::openapi();
+        Some(merge_openapi_schemas(base, vec![pg_stat]))
     }
 }
 

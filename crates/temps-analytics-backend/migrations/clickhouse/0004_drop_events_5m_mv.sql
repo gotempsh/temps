@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Drop the events_5m_mv SummingMergeTree materialized view.
 --
 -- The MV was a per-INSERT trigger that summed event counts into 5-minute

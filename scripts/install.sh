@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Temps installer script - inspired by Bun's installation approach
 set -euo pipefail
 
@@ -113,11 +116,14 @@ command -v curl >/dev/null ||
 
 # Channel selection. Mirrors `temps upgrade --channel`:
 #   stable (default) — track non-prerelease tags only
-#   beta             — track the newest tag, prerelease or not
+#   beta             — track the newest tag, prerelease or not, EXCLUDING
+#                       nightly builds (a `-nightly.` tag never satisfies beta)
+#   nightly          — track only automated nightly builds (`-nightly.` tags),
+#                       cut once a day from `main` when it has new commits
 #
 # CLI-only by design: there is no env-var fallback. A user must pass
-# `--channel beta` explicitly to opt into prereleases. `bash install.sh`
-# always lands on stable — same contract as `temps upgrade`.
+# `--channel beta` or `--channel nightly` explicitly to opt into prereleases.
+# `bash install.sh` always lands on stable — same contract as `temps upgrade`.
 channel="stable"
 positional=()
 while [[ $# -gt 0 ]]; do
@@ -140,9 +146,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$channel" in
-    stable|beta) ;;
+    stable|beta|nightly) ;;
     *)
-        error "Unknown channel '$channel'. Supported: stable, beta"
+        error "Unknown channel '$channel'. Supported: stable, beta, nightly"
         ;;
 esac
 
@@ -180,8 +186,20 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     #   release. This is GitHub's contract — it's exactly what we want.
     #   404 means there are zero stable releases yet; fall through to a
     #   helpful error.
-    # - beta: /releases/latest skips betas, so we walk the first page of
-    #   /releases (newest-first) and take the very first `tag_name`.
+    # - beta: /releases/latest skips betas, so we walk /releases
+    #   (newest-first) and take the first `tag_name` that is NOT a nightly
+    #   build (mirrors `temps upgrade`'s `UpgradeChannel::Beta`, which
+    #   excludes `-nightly.` tags so a deliberate beta opt-in never silently
+    #   resolves to an automated nightly).
+    # - nightly: same listing, but take the first `tag_name` that IS a
+    #   nightly build (contains `-nightly.`), minted by the "Nightly
+    #   Release" workflow.
+    #
+    # Pagination: nightlies are cut once a day from `main`, so a gap of more
+    # than one page's worth of days between beta releases (or, in principle,
+    # between nightly releases) means the desired tag isn't on page 1. Walk
+    # up to 5 pages of 100 releases (500 releases of headroom) and stop as
+    # soon as a match is found or the API runs out of releases.
     #
     # Why "first tag_name" (no draft check):
     #   We don't ship draft releases publicly — anything visible on the
@@ -198,12 +216,24 @@ if [[ ${#positional[@]} -eq 0 ]]; then
                     head -n 1 |
                     sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
     else
-        # GitHub orders releases newest-first, so the first `tag_name`
-        # in the page is the newest release of any kind.
-        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
-                    grep '"tag_name":' |
-                    head -n 1 |
-                    sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+        temps_tag=""
+        page=1
+        while [[ -z "$temps_tag" && $page -le 5 ]]; do
+            page_tags=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page" |
+                        grep -oE '"tag_name": *"[^"]*"' |
+                        sed -E 's/.*"([^"]+)"$/\1/')
+            [[ -z "$page_tags" ]] && break
+
+            if [[ "$channel" = "nightly" ]]; then
+                # First tag_name that IS a nightly build.
+                temps_tag=$(echo "$page_tags" | grep -- '-nightly\.' | head -n 1)
+            else
+                # beta: first tag_name that is NOT a nightly build.
+                temps_tag=$(echo "$page_tags" | grep -v -- '-nightly\.' | head -n 1)
+            fi
+
+            page=$((page + 1))
+        done
     fi
     set -e
 
@@ -250,7 +280,7 @@ verify_checksum "$tarball" "$temps_uri.sha256"
 
 info "Extracting temps..."
 
-tar -xzf "$tarball" -C "$bin_dir" ||
+tar -xzf "$tarball" -C "$bin_dir" temps ||
     error "Failed to extract temps"
 
 rm "$tarball" ||

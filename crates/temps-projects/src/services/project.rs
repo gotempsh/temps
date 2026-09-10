@@ -1,24 +1,135 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    prelude::Uuid, sea_query::LockType, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    RelationTrait, Set, Statement, TransactionTrait,
 };
-use temps_core::{Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob};
-use temps_entities::projects;
+use temps_core::{
+    ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
+};
+use temps_entities::{
+    env_var_environments, env_vars, environments, external_services, git_provider_connections,
+    git_providers, project_services, projects, types::ProjectType,
+};
 use temps_git::services::public_repo::PublicRepoProviderFactory;
 
 use serde::Serialize;
 
 use super::types::{
-    CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    CreateProjectEnvVar, CreateProjectRequest, Project, ProjectError, ProjectRename,
+    ProjectSettingsUpdate, ProjectStatistics, UpdateDeploymentSettingsRequest,
+    UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
-use crate::handlers::UpdateDeploymentConfigRequest;
-use temps_presets::get_preset_by_slug;
+use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 // Placeholder functions - these should be implemented properly or imported from other services
+
+/// A project row plus the provider type of the Git connection it is linked to.
+///
+/// The provider type lives two hops away (`projects` →
+/// `git_provider_connections` → `git_providers`), so the read queries LEFT JOIN
+/// it in as one extra column rather than paying a second round trip. `LEFT` and
+/// `Option` because most projects have no connection at all — a Docker-image or
+/// uploaded-source project must still come back from the same query.
+#[derive(Debug)]
+struct ProjectWithGitProviderType {
+    project: projects::Model,
+    git_provider_type: Option<String>,
+}
+
+impl sea_orm::FromQueryResult for ProjectWithGitProviderType {
+    fn from_query_result(result: &sea_orm::QueryResult, pre: &str) -> Result<Self, sea_orm::DbErr> {
+        Ok(Self {
+            project: projects::Model::from_query_result(result, pre)?,
+            git_provider_type: result.try_get(pre, GIT_PROVIDER_TYPE_ALIAS)?,
+        })
+    }
+}
+
+/// Alias for the joined-in `git_providers.provider_type` column. Named rather
+/// than bare so it can never collide with a `projects` column.
+const GIT_PROVIDER_TYPE_ALIAS: &str = "git_provider_type";
+
+/// Whether changing `repo_owner`/`repo_name` would leave `git_url` pointing at
+/// a different repository.
+///
+/// Returns `Some((old, new))` — both as `owner/name` — only when the stored URL
+/// demonstrably identifies the *current* repo and the requested change moves
+/// away from it. A URL that doesn't carry a recognisable `owner/name` tail
+/// (self-hosted layouts, ssh remotes with unusual paths) returns `None`: we
+/// can't prove a desync, so we don't block the operator.
+fn would_desync_git_url(
+    git_url: &Option<String>,
+    current: (&str, &str),
+    requested: (Option<&str>, Option<&str>),
+) -> Option<(String, String)> {
+    let (new_owner, new_name) = (
+        requested.0.unwrap_or(current.0),
+        requested.1.unwrap_or(current.1),
+    );
+    let old_pair = format!("{}/{}", current.0, current.1);
+    let new_pair = format!("{}/{}", new_owner, new_name);
+    if old_pair == new_pair {
+        return None;
+    }
+
+    let url = git_url.as_deref()?;
+    // Compare on the `owner/name` tail, ignoring a `.git` suffix and any
+    // trailing slash, so https/ssh and with/without `.git` all match.
+    let tail = url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit(['/', ':'])
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.len() < 2 {
+        return None;
+    }
+    let url_pair = format!("{}/{}", tail[1], tail[0]);
+
+    (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
+
+/// Normalize and validate a project display name.
+///
+/// The name is not just a label: it becomes `OTEL_SERVICE_NAME` on the next
+/// deployment, and the Compose env-file renderer rejects control characters —
+/// so a name accepted here but refused there turns one bad save into every
+/// later deploy failing with an error naming a variable the operator never set.
+/// Format characters (bidi overrides, zero-width spaces) are rejected too:
+/// names are not unique and are rendered next to each other in the dashboard,
+/// alerts, and audit records, where an override can make one project display as
+/// another.
+///
+/// Shared by every path that writes `projects.name` so the three cannot drift.
+fn validate_project_name(raw: &str) -> Result<String, ProjectError> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() || trimmed.chars().count() > 100 {
+        return Err(ProjectError::InvalidInput(
+            "Project name must contain 1-100 characters".to_string(),
+        ));
+    }
+    if trimmed.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}')
+    }) {
+        return Err(ProjectError::InvalidInput(
+            "Project name cannot contain control or text-direction characters".to_string(),
+        ));
+    }
+    Ok(trimmed)
+}
 
 fn slugify(name: &str) -> String {
     name.to_lowercase()
@@ -27,6 +138,27 @@ fn slugify(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+fn escape_like_literal(value: &str) -> String {
+    value.chars().fold(String::new(), |mut escaped, character| {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+        escaped
+    })
+}
+
+fn compose_public_ports(
+    config: Option<&temps_entities::preset::PresetConfig>,
+) -> Vec<temps_entities::preset::ComposePublicPort> {
+    match config {
+        Some(temps_entities::preset::PresetConfig::DockerCompose(compose)) => {
+            compose.public_ports.clone()
+        }
+        _ => Vec::new(),
+    }
 }
 
 // API Response types
@@ -71,6 +203,394 @@ pub const DEFAULT_MEMORY_LIMIT: i32 = 512; // 512 MB (small hosted website profi
 // Add these constants at the top of the file proper key management
 pub const NONCE_LENGTH: usize = 12;
 
+/// Resolve an API/UI catalog slug to its canonical persisted preset and config.
+fn resolve_preset_slug(
+    slug: &str,
+    config: Option<temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    temps_presets::resolve_preset_slug(slug, config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset: {}", error)))
+}
+
+/// Derive the durable project lifecycle from the resolved runtime preset.
+///
+/// Several framework presets (Vite, Create React App, Docusaurus and Rsbuild)
+/// deploy static output even though their stored preset is not the literal
+/// `static` variant. Nixpacks can also switch between server and static based
+/// on its provider configuration, so callers must classify the complete
+/// resolved preset rather than matching only its enum discriminator.
+fn project_type_for_resolved_preset(
+    resolved: &temps_presets::StoredPreset,
+) -> Result<ProjectType, ProjectError> {
+    let runtime_preset =
+        temps_presets::get_preset_for_storage(resolved.preset, resolved.config.as_ref())
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!(
+                    "Could not resolve project lifecycle for preset '{}': {error}",
+                    resolved.preset.as_str()
+                ))
+            })?
+            .ok_or_else(|| {
+                ProjectError::InvalidInput(format!(
+                    "Preset '{}' does not provide a deployable runtime",
+                    resolved.preset.as_str()
+                ))
+            })?;
+
+    Ok(match runtime_preset.project_type() {
+        temps_presets::ProjectType::Static => ProjectType::Static,
+        temps_presets::ProjectType::Server => ProjectType::Server,
+    })
+}
+
+/// Apply a canonical preset selection to a project update.
+fn apply_resolved_preset(
+    active: &mut projects::ActiveModel,
+    resolved: temps_presets::StoredPreset,
+) -> Result<(), ProjectError> {
+    if active.project_type.as_ref() != &ProjectType::Service {
+        active.project_type = Set(project_type_for_resolved_preset(&resolved)?);
+    }
+    active.preset = Set(resolved.preset);
+    active.preset_config = Set(resolved.config);
+    Ok(())
+}
+
+/// Preserve discriminator-like fields when a partial config patch omits them.
+///
+/// An explicit empty Nixpacks provider list still resets to auto, and an
+/// explicit Dockerfile variant is still honored. Catalog preset selection is
+/// normalized separately by the selected preset's resolver.
+fn merge_preset_config(
+    existing: Option<&temps_entities::preset::PresetConfig>,
+    parsed: temps_entities::preset::PresetConfig,
+    config_value: &serde_json::Value,
+    preserve_omitted_providers: bool,
+) -> temps_entities::preset::PresetConfig {
+    use temps_entities::preset::PresetConfig;
+
+    let omits_providers = config_value
+        .as_object()
+        .map(|map| !map.contains_key("providers"))
+        .unwrap_or(true);
+    let omits_dockerfile_variant = config_value
+        .as_object()
+        .map(|map| !map.contains_key("variant"))
+        .unwrap_or(true);
+
+    match (existing, parsed) {
+        (Some(PresetConfig::Nixpacks(existing_cfg)), PresetConfig::Nixpacks(mut parsed_cfg)) => {
+            if preserve_omitted_providers
+                && omits_providers
+                && parsed_cfg.providers.is_empty()
+                && !existing_cfg.providers.is_empty()
+            {
+                parsed_cfg.providers = existing_cfg.providers.clone();
+            }
+            PresetConfig::Nixpacks(parsed_cfg)
+        }
+        (
+            Some(PresetConfig::Dockerfile(existing_cfg)),
+            PresetConfig::Dockerfile(mut parsed_cfg),
+        ) => {
+            if omits_dockerfile_variant {
+                parsed_cfg.variant = existing_cfg.variant;
+            }
+            if config_value
+                .as_object()
+                .map(|map| !map.contains_key("imageRuntime"))
+                .unwrap_or(true)
+            {
+                parsed_cfg.image_runtime = existing_cfg.image_runtime.clone();
+            }
+            PresetConfig::Dockerfile(parsed_cfg)
+        }
+        (
+            Some(PresetConfig::DockerCompose(existing_cfg)),
+            PresetConfig::DockerCompose(mut parsed_cfg),
+        ) => {
+            // A partial PATCH (e.g. the settings-page exclusion toggle sends
+            // only `excludedServices`) parses into a config where every
+            // omitted field is its zero value, not "leave unchanged" — so
+            // without this, a one-field patch would silently wipe
+            // composePath/composeOverride/publicPorts/composeServices.
+            let obj = config_value.as_object();
+            let omits = |key: &str| obj.map(|map| !map.contains_key(key)).unwrap_or(true);
+            if omits("composePath") {
+                parsed_cfg.compose_path = existing_cfg.compose_path.clone();
+            }
+            if omits("composeOverride") {
+                parsed_cfg.compose_override = existing_cfg.compose_override.clone();
+            }
+            if omits("publicPorts") {
+                parsed_cfg.public_ports = existing_cfg.public_ports.clone();
+            }
+            if omits("excludedServices") {
+                parsed_cfg.excluded_services = existing_cfg.excluded_services.clone();
+            }
+            if omits("composeServices") {
+                parsed_cfg.compose_services = existing_cfg.compose_services.clone();
+            }
+            if omits("relaxedCapabilityServices") {
+                parsed_cfg.relaxed_capability_services =
+                    existing_cfg.relaxed_capability_services.clone();
+            }
+            if omits("unsandboxedServices") {
+                parsed_cfg.unsandboxed_services = existing_cfg.unsandboxed_services.clone();
+            }
+            PresetConfig::DockerCompose(parsed_cfg)
+        }
+        (_, other) => other,
+    }
+}
+
+fn validate_preset_config(
+    preset: temps_entities::preset::Preset,
+    config: temps_entities::preset::PresetConfig,
+    config_value: Option<&serde_json::Value>,
+) -> Result<temps_entities::preset::PresetConfig, ProjectError> {
+    temps_presets::validate_preset_config(preset, &config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {}", error)))?;
+    // Only re-validate when this call's patch explicitly touched
+    // relaxedCapabilityServices. A value merged forward unchanged from the
+    // existing config (e.g. because a later, unrelated patch replaced
+    // composeServices and the previously-relaxed service name is no longer
+    // in the new snapshot) must not retroactively fail every subsequent
+    // save — that would permanently wedge the project's settings until the
+    // user manually clears a field they never touched.
+    let touches_relaxed_capability_services = config_value
+        .and_then(|v| v.as_object())
+        .is_some_and(|map| map.contains_key("relaxedCapabilityServices"));
+    let touches_unsandboxed_services = config_value
+        .and_then(|v| v.as_object())
+        .is_some_and(|map| map.contains_key("unsandboxedServices"));
+    if touches_relaxed_capability_services || touches_unsandboxed_services {
+        if let temps_entities::preset::PresetConfig::DockerCompose(ref cfg) = config {
+            validate_relaxed_capability_services(cfg)?;
+            validate_unsandboxed_services(cfg)?;
+        }
+    }
+    let touches_public_ports = config_value
+        .and_then(|value| value.as_object())
+        .is_some_and(|map| map.contains_key("publicPorts"));
+    if touches_public_ports {
+        if let temps_entities::preset::PresetConfig::DockerCompose(ref cfg) = config {
+            validate_compose_public_ports(cfg)?;
+        }
+    }
+    Ok(config)
+}
+
+fn validate_compose_public_ports(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    let mut services = std::collections::HashSet::new();
+    for route in &cfg.public_ports {
+        if route.service.trim().is_empty() {
+            return Err(ProjectError::InvalidInput(
+                "Compose public route service cannot be empty".to_string(),
+            ));
+        }
+        if route.port == 0 || route.published == Some(0) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose public route for service '{}' must use ports between 1 and 65535",
+                route.service
+            )));
+        }
+        if let Some(path) = route.health_check_path.as_deref() {
+            if path.len() > 2048
+                || !path.starts_with('/')
+                || path.contains('@')
+                || path.contains("://")
+                || path.chars().any(char::is_control)
+            {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Compose public route health path '{}' for service '{}' must be a safe relative HTTP path starting with '/'",
+                    path, route.service
+                )));
+            }
+        }
+        if !services.insert(route.service.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose service '{}' can have only one public URL",
+                route.service
+            )));
+        }
+        if cfg
+            .excluded_services
+            .iter()
+            .any(|excluded| excluded == &route.service)
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose service '{}' cannot be both disabled and public",
+                route.service
+            )));
+        }
+        if !cfg.compose_services.is_empty()
+            && !cfg
+                .compose_services
+                .iter()
+                .any(|service| service.name == route.service)
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose public route references unknown service '{}'",
+                route.service
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `relaxed_capability_services` grants a compose service back the Linux
+/// capabilities (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) many official
+/// images' entrypoints need to fix ownership on a data directory and drop
+/// from root to a service user at startup — this is not unique to database
+/// images (confirmed live: Gitea's own official image hits the identical
+/// `chown: ... Operation not permitted` / `su-exec: setgroups: Operation not
+/// permitted` failure), so the settings UI offers this toggle for every
+/// compose service, not just ones flagged `looks_like_database`. The
+/// server-side check mirrors that: any name is accepted as long as it
+/// matches a real service in the persisted snapshot, which rejects typos or
+/// phantom names without narrowing eligibility to a specific image family.
+/// If the snapshot is empty (e.g. before the first deploy has captured one),
+/// allow the list through rather than block a legitimate first-time setup,
+/// since there is nothing yet to validate against.
+fn validate_relaxed_capability_services(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    if cfg.relaxed_capability_services.is_empty() || cfg.compose_services.is_empty() {
+        return Ok(());
+    }
+    for service_name in &cfg.relaxed_capability_services {
+        let matches_known_service = cfg.compose_services.iter().any(|s| &s.name == service_name);
+        if !matches_known_service {
+            return Err(ProjectError::InvalidInput(format!(
+                "Cannot grant elevated capabilities to service '{}': it is not a recognized \
+                 service in this compose file.",
+                service_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unsandboxed_services(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    if cfg.unsandboxed_services.is_empty() {
+        return Ok(());
+    }
+    if cfg.compose_services.is_empty() {
+        return Err(ProjectError::InvalidInput(
+            "Cannot disable the Temps sandbox before Compose services have been recognized. Sync the Compose services from the repository first."
+                .to_string(),
+        ));
+    }
+    for service_name in &cfg.unsandboxed_services {
+        if !cfg.compose_services.iter().any(|s| &s.name == service_name) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Cannot disable the Temps sandbox for service '{}': it is not a recognized service in this compose file.",
+                service_name
+            )));
+        }
+        if cfg.relaxed_capability_services.contains(service_name) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Service '{}' cannot use both elevated permissions and a disabled sandbox. Remove one of these settings.",
+                service_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(".".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':');
+    if has_windows_drive_prefix
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project directory '{directory}' must be a relative path inside the source root"
+        )));
+    }
+    Ok(normalized.trim_start_matches("./").to_string())
+}
+
+/// Resolve an explicit catalog selection for create/update.
+///
+/// Existing config is retained when it belongs to the same canonical preset.
+/// Selecting base `nixpacks` is authoritative: omitted providers reset to
+/// auto-detection while other Nixpacks settings remain intact.
+fn resolve_preset_selection(
+    slug: &str,
+    config_value: Option<&serde_json::Value>,
+    existing: Option<&temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    use temps_entities::preset::PresetConfig;
+
+    let base_selection = resolve_preset_slug(slug, None)?;
+    let compatible_existing =
+        existing.filter(|config| config.preset_type() == base_selection.preset);
+
+    let config = match config_value {
+        Some(value) => {
+            let parsed =
+                PresetConfig::parse_for_preset(&base_selection.preset, value).map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+            Some(merge_preset_config(
+                compatible_existing,
+                parsed,
+                value,
+                slug != "nixpacks",
+            ))
+        }
+        None => {
+            let mut config = compatible_existing.cloned();
+            if slug == "nixpacks" {
+                if let Some(PresetConfig::Nixpacks(nixpacks)) = config.as_mut() {
+                    nixpacks.providers.clear();
+                }
+            }
+            config
+        }
+    };
+
+    let resolved = if config.is_some() {
+        resolve_preset_slug(slug, config)?
+    } else {
+        base_selection
+    };
+    let config = match resolved.config {
+        Some(config) => Some(validate_preset_config(
+            resolved.preset,
+            config,
+            config_value,
+        )?),
+        None => None,
+    };
+    Ok(temps_presets::StoredPreset {
+        preset: resolved.preset,
+        config,
+    })
+}
+
 #[derive(Clone)]
 pub struct ProjectService {
     pub db: Arc<temps_database::DbConnection>,
@@ -81,6 +601,164 @@ pub struct ProjectService {
     env_var_service: Arc<EnvVarService>,
     environment_service: Arc<temps_environments::EnvironmentService>,
     encryption_service: Arc<temps_core::EncryptionService>,
+}
+
+fn initial_deployment_config(
+    request: &CreateProjectRequest,
+) -> temps_entities::deployment_config::DeploymentConfig {
+    temps_entities::deployment_config::DeploymentConfig {
+        cpu_request: request.cpu_request.or(Some(DEFAULT_CPU_REQUEST)),
+        cpu_limit: request.cpu_limit,
+        memory_request: request.memory_request.or(Some(DEFAULT_MEMORY_REQUEST)),
+        memory_limit: request.memory_limit.or(Some(DEFAULT_MEMORY_LIMIT)),
+        exposed_port: request.exposed_port,
+        automatic_deploy: Some(request.automatic_deploy),
+        ..Default::default()
+    }
+}
+
+fn apply_new_template_default_when_unmodified<T: Clone + PartialEq>(
+    current: T,
+    applied_default: T,
+    target_default: T,
+) -> T {
+    if current == applied_default {
+        target_default
+    } else {
+        current
+    }
+}
+
+fn template_resource_value(
+    template: &temps_core::templates::ProjectTemplate,
+    select: impl FnOnce(&temps_core::templates::TemplateResources) -> Option<i32>,
+) -> Option<i32> {
+    template.resources.as_ref().and_then(select)
+}
+
+fn missing_required_service_types(required: &[String], linked: &HashSet<String>) -> Vec<String> {
+    required
+        .iter()
+        .filter(|service| {
+            !linked.iter().any(|linked_service| {
+                temps_core::templates::managed_service_types_compatible(service, linked_service)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Keep template upgrades reversible with the current deployment model.
+/// Deployments intentionally read the project's current managed-service
+/// aliases, so an upgrade may add aliases but cannot remove or remap aliases
+/// used by an older release. That keeps a rollback's database credentials
+/// compatible without guessing from the live catalog.
+fn validate_service_binding_compatibility(
+    applied: &temps_core::templates::ProjectTemplate,
+    target: &temps_core::templates::ProjectTemplate,
+) -> Result<(), ProjectError> {
+    for required_service in &applied.services {
+        if !target.services.iter().any(|target_service| {
+            temps_core::templates::managed_service_types_compatible(
+                required_service,
+                target_service,
+            )
+        }) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template upgrade cannot remove required managed service '{required_service}'; older deployments require it for safe rollback"
+            )));
+        }
+    }
+    for (service_type, applied_bindings) in &applied.managed_service_bindings {
+        let target_bindings = target
+            .managed_service_bindings
+            .iter()
+            .find(|(target_service_type, _)| {
+                temps_core::templates::managed_service_types_compatible(
+                    service_type,
+                    target_service_type,
+                )
+            })
+            .map(|(_, bindings)| bindings);
+        for (application_variable, service_variable) in applied_bindings {
+            let preserved = target_bindings
+                .and_then(|bindings| bindings.get(application_variable))
+                .is_some_and(|target_variable| target_variable == service_variable);
+            if !preserved {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Template upgrade cannot remove or remap managed-service binding \
+                     {service_type}.{application_variable} -> {service_variable}; older \
+                     deployments require it for safe rollback"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn production_configured_variable_keys(
+    variables: &[env_vars::Model],
+    links: &[env_var_environments::Model],
+    production_environment_id: i32,
+) -> HashSet<String> {
+    let linked_ids = links
+        .iter()
+        .map(|link| link.env_var_id)
+        .collect::<HashSet<_>>();
+    let production_linked_ids = links
+        .iter()
+        .filter(|link| link.environment_id == production_environment_id)
+        .map(|link| link.env_var_id)
+        .collect::<HashSet<_>>();
+
+    variables
+        .iter()
+        .filter(|variable| {
+            variable.environment_id == Some(production_environment_id)
+                || production_linked_ids.contains(&variable.id)
+                // Legacy/global variables have neither the old direct
+                // environment id nor a join-table relation and apply to every
+                // environment. Keep their values during upgrades.
+                || (variable.environment_id.is_none() && !linked_ids.contains(&variable.id))
+        })
+        .map(|variable| variable.key.clone())
+        .collect()
+}
+
+fn applied_service_template_from_model(
+    project: &projects::Model,
+) -> Result<temps_core::templates::ServiceTemplateInstance, ProjectError> {
+    if project.project_type != ProjectType::Service {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project {} is not a service project",
+            project.id
+        )));
+    }
+
+    if let Some(snapshot) = &project.service_template {
+        let instance = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+            snapshot.clone(),
+        )
+        .map_err(|error| {
+            ProjectError::Other(format!(
+                "Stored service template for project {} is invalid: {error}",
+                project.id
+            ))
+        })?;
+        instance.validate().map_err(|error| {
+            ProjectError::Other(format!(
+                "Stored service template for project {} is invalid: {error}",
+                project.id
+            ))
+        })?;
+        return Ok(instance);
+    }
+
+    Err(ProjectError::Other(format!(
+        "Service project {} has no applied template release",
+        project.id
+    )))
 }
 
 impl ProjectService {
@@ -111,6 +789,73 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
+        self.create_project_with_identity(request, None).await
+    }
+
+    /// Create a template-backed service project from an immutable resolved
+    /// release. Generic project creation cannot supply this identity, so a
+    /// caller cannot turn an arbitrary image project into a trusted service.
+    pub async fn create_service_project(
+        &self,
+        request: CreateProjectRequest,
+        service_template: temps_core::templates::ServiceTemplateInstance,
+    ) -> Result<Project, ProjectError> {
+        if service_template.template.kind != temps_core::templates::TemplateKind::Service {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template '{}' is not a service template",
+                service_template.slug
+            )));
+        }
+        service_template.validate().map_err(|error| {
+            ProjectError::InvalidInput(format!(
+                "Invalid service template {}@{}: {error}",
+                service_template.slug, service_template.version,
+            ))
+        })?;
+        if request.template_slug.as_deref() != Some(service_template.slug.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Service project provenance must match template '{}'",
+                service_template.slug
+            )));
+        }
+        self.create_project_with_identity(request, Some(service_template))
+            .await
+    }
+
+    async fn create_project_with_identity(
+        &self,
+        request: CreateProjectRequest,
+        service_template: Option<temps_core::templates::ServiceTemplateInstance>,
+    ) -> Result<Project, ProjectError> {
+        if request.template_slug.as_deref().is_some_and(|slug| {
+            slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+        }) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template slug cannot exceed {} characters",
+                temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+            )));
+        }
+
+        // Reject unusable env vars before the project row exists. Catching this
+        // here keeps it a 400 on the request that caused it, instead of a 500
+        // from the post-insert finalize step that then rolls the project back.
+        if let Some(env_vars) = request.environment_variables.as_ref() {
+            for env_var in env_vars {
+                if env_var.key.trim().is_empty() {
+                    return Err(ProjectError::InvalidInput(
+                        "Environment variable names cannot be empty".to_string(),
+                    ));
+                }
+                if env_var.is_secret && env_var.value.is_empty() {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "Environment variable '{}' is marked as a secret but has no value. \
+                         Provide a value or clear the secret flag.",
+                        env_var.key
+                    )));
+                }
+            }
+        }
+
         // Verify storage service IDs exist if provided
         if !request.storage_service_ids.is_empty() {
             use temps_entities::external_services;
@@ -130,59 +875,66 @@ impl ProjectService {
             }
         }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
+        let normalized_directory = normalize_project_directory(&request.directory)?;
+
+        let validated_name = validate_project_name(&request.name)?;
+        let project_slug = if let Some(expected_slug) = request.expected_slug.as_deref() {
+            self.validate_expected_project_slug(&validated_name, expected_slug)
+                .await?;
+            expected_slug.to_string()
         } else {
-            request.directory.clone()
+            self.generate_unique_project_slug(&validated_name).await?
         };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            None,
+        )?;
+        let preset = resolved.preset;
+        let preset_config = resolved.config.clone();
+        let project_type = if service_template.is_some() {
+            ProjectType::Service
         } else {
-            normalized_directory
+            project_type_for_resolved_preset(&resolved)?
         };
-
-        let project_slug = self.generate_unique_project_slug(&request.name).await?;
-        // Get preset info and determine project type
-        let preset_info = get_preset_by_slug(request.preset.as_str()).ok_or_else(|| {
-            ProjectError::InvalidInput(format!("Invalid preset: {}", request.preset))
-        })?;
-
-        let _project_type_enum = preset_info.project_type();
-
-        // Parse preset string to enum
-        let preset = request
-            .preset
-            .parse::<temps_entities::preset::Preset>()
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-
-        // Parse preset_config from JSON if provided
-        let preset_config: Option<temps_entities::preset::PresetConfig> = request
-            .preset_config
-            .map(|json_value| {
-                serde_json::from_value(json_value).map_err(|e| {
-                    ProjectError::InvalidInput(format!("Invalid preset_config: {}", e))
-                })
-            })
-            .transpose()?;
+        let service_template_json = service_template
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!(
+                    "Could not serialize the resolved service template: {error}"
+                ))
+            })?;
 
         // Create deployment config with resource and deployment settings.
         // New hosted websites get the conservative "small" profile by default:
         // a scheduling request plus a hard memory limit so a runaway app cannot
         // OOM a small single-node host. Operators can still choose standard,
         // dedicated, or explicit uncapped limits later via deployment settings.
-        let deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
-            cpu_request: Some(DEFAULT_CPU_REQUEST),
-            cpu_limit: None,
-            memory_request: Some(DEFAULT_MEMORY_REQUEST),
-            memory_limit: Some(DEFAULT_MEMORY_LIMIT),
-            exposed_port: request.exposed_port,
-            automatic_deploy: Some(request.automatic_deploy),
-            ..Default::default()
-        });
+        let deployment_config = Some(initial_deployment_config(&request));
+        if let Some(config) = deployment_config.as_ref() {
+            config.validate().map_err(|reason| {
+                ProjectError::InvalidInput(format!(
+                    "Invalid initial deployment configuration for project '{}': {reason}",
+                    request.name
+                ))
+            })?;
+        }
+        if request.cpu_request.is_some()
+            || request.cpu_limit.is_some()
+            || request.memory_request.is_some()
+            || request.memory_limit.is_some()
+        {
+            let app_settings = self.config_service.get_settings().await.map_err(|error| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings before applying template resources: {error}"
+                ))
+            })?;
+            if let Some(config) = deployment_config.as_ref() {
+                Self::enforce_tenant_ceilings(config, &app_settings)?;
+            }
+        }
 
         // SSRF guard: validate git_url before persisting (Fix #12).
         if let Some(ref git_url) = request.git_url {
@@ -193,7 +945,7 @@ impl ProjectService {
         }
 
         let project = projects::ActiveModel {
-            name: Set(request.name),
+            name: Set(validated_name),
             repo_name: Set(request.repo_name.unwrap_or_default()),
             repo_owner: Set(request.repo_owner.unwrap_or_default()),
             directory: Set(normalized_directory),
@@ -210,6 +962,9 @@ impl ProjectService {
             deleted_at: Set(None),
             last_deployment: Set(None),
             source_type: Set(request.source_type),
+            project_type: Set(project_type),
+            template_slug: Set(request.template_slug),
+            service_template: Set(service_template_json),
             ..Default::default()
         };
 
@@ -227,7 +982,10 @@ impl ProjectService {
                 })
             }
         };
-        info!("Created project: {:?}", project_found_db);
+        info!(
+            "Created project id={} slug={} preset={}",
+            project_found_db.id, project_found_db.slug, project_found_db.preset
+        );
 
         // From here on, the project row exists. If any downstream step
         // fails, hard-delete it (CASCADE cleans up environments, env vars,
@@ -242,6 +1000,8 @@ impl ProjectService {
                 &project_found_db,
                 request.environment_variables,
                 request.storage_service_ids,
+                request.storage_service_claim_ids,
+                request.storage_service_claim_user_id,
             )
             .await
         {
@@ -503,7 +1263,7 @@ impl ProjectService {
             project_found_db
         };
 
-        Ok(Self::map_db_project_to_project(project_found_db))
+        Ok(self.map_written_project(project_found_db).await)
     }
 
     /// Post-insert steps for `create_project`. Returns the default environment
@@ -512,19 +1272,30 @@ impl ProjectService {
     async fn finalize_project_creation(
         &self,
         project: &projects::Model,
-        environment_variables: Option<Vec<(String, String)>>,
+        environment_variables: Option<Vec<CreateProjectEnvVar>>,
         storage_service_ids: Vec<i32>,
+        storage_service_claim_ids: Vec<i32>,
+        storage_service_claim_user_id: Option<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
+        let project_config = project.deployment_config.as_ref();
         let default_environment = self
             .environment_service
             .create_environment(
                 project.id,
                 "production".to_string(),
-                Some(DEFAULT_CPU_REQUEST),
-                // CPU remains uncapped by default; memory gets the small hosted-web cap.
-                None,
-                Some(DEFAULT_MEMORY_REQUEST),
-                Some(DEFAULT_MEMORY_LIMIT),
+                project_config
+                    .and_then(|config| config.cpu_request)
+                    .or(Some(DEFAULT_CPU_REQUEST)),
+                // The production environment starts with the project's
+                // effective profile so its normal precedence does not shadow
+                // curated template requirements with platform defaults.
+                project_config.and_then(|config| config.cpu_limit),
+                project_config
+                    .and_then(|config| config.memory_request)
+                    .or(Some(DEFAULT_MEMORY_REQUEST)),
+                project_config
+                    .and_then(|config| config.memory_limit)
+                    .or(Some(DEFAULT_MEMORY_LIMIT)),
                 project.main_branch.clone(),
             )
             .await
@@ -539,13 +1310,19 @@ impl ProjectService {
         );
 
         if let Some(env_vars) = environment_variables {
-            for (key, value) in env_vars {
+            for env_var in env_vars {
+                let CreateProjectEnvVar {
+                    key,
+                    value,
+                    is_secret,
+                } = env_var;
                 self.env_var_service
                     .create_environment_variable(
                         project.id,
                         vec![default_environment.id],
                         key.clone(),
                         value,
+                        is_secret,
                     )
                     .await
                     .map_err(|e| ProjectError::EnvVarCreationFailed {
@@ -562,23 +1339,29 @@ impl ProjectService {
                 storage_service_ids.len(),
                 project.id
             );
-            for storage_service_id in storage_service_ids {
-                self.external_service_manager
-                    .link_service_to_project(storage_service_id, project.id)
-                    .await
-                    .map_err(|e| ProjectError::StorageLinkFailed {
-                        project_id: project.id,
-                        service_id: storage_service_id,
-                        reason: e.to_string(),
-                    })?;
-            }
+            let claims = storage_service_claim_user_id
+                .map(|user_id| {
+                    storage_service_claim_ids
+                        .into_iter()
+                        .map(|service_id| (service_id, user_id))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            self.external_service_manager
+                .link_services_to_project_with_claims(&storage_service_ids, project.id, &claims)
+                .await
+                .map_err(|e| ProjectError::StorageLinksFailed {
+                    project_id: project.id,
+                    service_ids: storage_service_ids,
+                    reason: e.to_string(),
+                })?;
         }
 
         Ok(default_environment)
     }
 
     pub async fn get_projects(&self) -> Result<Vec<Project>, ProjectError> {
-        let results = projects::Entity::find()
+        let results = Self::with_git_provider_type(projects::Entity::find())
             // Most-recently-deployed first; never-deployed projects (NULL
             // last_deployment) sort last, not first — a NULL under DESC would
             // otherwise be treated as "deployed infinitely recently".
@@ -588,41 +1371,78 @@ impl ProjectService {
                 sea_orm::sea_query::NullOrdering::Last,
             )
             .order_by_desc(projects::Column::CreatedAt)
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         Ok(results
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect())
     }
 
     pub async fn get_project(&self, project_id: i32) -> Result<Project, ProjectError> {
-        let project_found_db = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| ProjectError::Other(e.to_string()))?;
+        let project_found_db =
+            Self::with_git_provider_type(projects::Entity::find_by_id(project_id))
+                .into_model::<ProjectWithGitProviderType>()
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         project_found_db
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .ok_or(ProjectError::NotFound(format!(
                 "project {} not found",
                 project_id
             )))
     }
 
+    /// Load the immutable release currently applied to a service project.
+    pub async fn get_applied_service_template(
+        &self,
+        project_id: i32,
+    ) -> Result<temps_core::templates::ServiceTemplateInstance, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {project_id} not found"))
+            })?;
+        applied_service_template_from_model(&project)
+    }
+
+    /// Return the managed-service families currently linked to a project.
+    pub async fn get_linked_service_types(
+        &self,
+        project_id: i32,
+    ) -> Result<HashSet<String>, ProjectError> {
+        let linked = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id))
+            .find_also_related(external_services::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        Ok(linked
+            .into_iter()
+            .filter_map(|(_, service)| service)
+            .map(|service| service.service_type.to_ascii_lowercase())
+            .collect())
+    }
+
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Project, ProjectError> {
-        let project_found_db = projects::Entity::find()
+        let project_found_db = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::Slug.eq(slug))
+            .into_model::<ProjectWithGitProviderType>()
             .one(self.db.as_ref())
             .await?
             .ok_or(ProjectError::NotFound(format!(
                 "project {} not found",
                 slug
             )))?;
+        let project_found = Self::map_db_project_row_to_project(project_found_db);
 
-        Ok(Self::map_db_project_to_project(project_found_db))
+        Ok(project_found)
     }
 
     pub async fn get_projects_by_repo_owner_and_name(
@@ -630,16 +1450,17 @@ impl ProjectService {
         repo_owner: &str,
         repo_name: &str,
     ) -> Result<Vec<Project>, ProjectError> {
-        let projects_found_db = projects::Entity::find()
+        let projects_found_db = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::RepoOwner.eq(repo_owner))
             .filter(projects::Column::RepoName.eq(repo_name))
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
 
         let projects_found: Vec<Project> = projects_found_db
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect();
         Ok(projects_found)
     }
@@ -649,15 +1470,16 @@ impl ProjectService {
         owner: &str,
         repo: &str,
     ) -> Result<Project, ProjectError> {
-        let project_found = projects::Entity::find()
+        let project_found = Self::with_git_provider_type(projects::Entity::find())
             .filter(projects::Column::RepoOwner.eq(owner))
             .filter(projects::Column::RepoName.eq(repo))
+            .into_model::<ProjectWithGitProviderType>()
             .one(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(format!("Database error: {}", e)))?;
 
         match project_found {
-            Some(project) => Ok(Self::map_db_project_to_project(project)),
+            Some(project) => Ok(Self::map_db_project_row_to_project(project)),
             None => Err(ProjectError::NotFound(format!(
                 "Project not found for repository {}/{}",
                 owner, repo
@@ -678,43 +1500,38 @@ impl ProjectService {
                 "project {} not found",
                 project_id
             )))?;
+        if project.project_type == ProjectType::Service {
+            return Err(ProjectError::InvalidInput(
+                "Service projects must be configured through the service runtime and template update controls"
+                    .to_string(),
+            ));
+        }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
-
-        // Parse preset string to enum
-        let preset = request
-            .preset
-            .parse::<temps_entities::preset::Preset>()
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            project.preset_config.as_ref(),
+        )?;
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
-        active_project.name = Set(request.name);
+        active_project.name = Set(validate_project_name(&request.name)?);
         active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
         active_project.repo_owner =
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
-        active_project.preset = Set(preset); // No longer Optional
+        apply_resolved_preset(&mut active_project, resolved)?;
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
-        let project_found = Self::map_db_project_to_project(project_found);
 
-        // Emit ProjectUpdated job
+        // Emit ProjectUpdated before reading anything else. Everything after
+        // the commit is a fresh await point, and a cancelled request (client
+        // disconnect, timeout) drops the task there — so the notification goes
+        // out first, and only the response can be lost.
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
             project_id: project_found.id,
             project_name: project_found.name.clone(),
@@ -732,7 +1549,7 @@ impl ProjectService {
             );
         }
 
-        Ok(project_found)
+        Ok(self.map_written_project(project_found).await)
     }
 
     /// Change a project's source type to a Git-less type (docker_image /
@@ -752,6 +1569,11 @@ impl ProjectService {
                 "project {} not found",
                 project_id
             )))?;
+        if project.project_type == ProjectType::Service {
+            return Err(ProjectError::InvalidInput(
+                "A service project's source type is fixed by its applied template".to_string(),
+            ));
+        }
 
         // Switching to Git is a direct flip only when a repository is already
         // configured (repo owner + name). A project can carry git info without
@@ -775,9 +1597,10 @@ impl ProjectService {
         active_project.source_type = Set(source_type);
         active_project.updated_at = Set(chrono::Utc::now());
         let updated = active_project.update(self.db.as_ref()).await?;
-        let updated = Self::map_db_project_to_project(updated);
 
-        // Deploy routing / behavior keys off source_type — notify consumers.
+        // Deploy routing / behavior keys off source_type — notify consumers
+        // before anything else awaits, so a cancelled request can only cost
+        // the response, never the notification.
         if let Err(e) = self
             .queue_service
             .send(Job::ProjectUpdated(ProjectUpdatedJob {
@@ -791,7 +1614,53 @@ impl ProjectService {
                 updated.id, e
             );
         }
-        Ok(updated)
+        Ok(self.map_written_project(updated).await)
+    }
+
+    /// Toggle whether the project accepts deployments from a source other than
+    /// its configured `source_type`.
+    ///
+    /// This deliberately does NOT touch `source_type`: the project keeps its
+    /// primary source (and, for a Git project, its repository, webhook-driven
+    /// auto-deploy and rollback rebuild-from-source), and simply gains the
+    /// ability to also take an uploaded source archive via `drop`.
+    pub async fn set_allow_alternate_sources(
+        &self,
+        project_id: i32,
+        allow: bool,
+    ) -> Result<Project, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.allow_alternate_sources = Set(Some(allow));
+        active_project.updated_at = Set(chrono::Utc::now());
+        let updated = active_project.update(self.db.as_ref()).await?;
+        Ok(self.map_written_project(updated).await)
+    }
+
+    /// Persist deletion intent before cancelling workflows or touching Docker.
+    /// Deployment workers reject projects with this fence, closing the window
+    /// where a new container could appear after the cleanup snapshot.
+    pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        if project.is_deleted {
+            return Ok(());
+        }
+
+        let mut active: projects::ActiveModel = project.into();
+        active.is_deleted = Set(true);
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.updated_at = Set(chrono::Utc::now());
+        active.update(self.db.as_ref()).await?;
+        info!(project_id, "Marked project for deletion");
+        Ok(())
     }
 
     pub async fn delete_project(
@@ -856,28 +1725,35 @@ impl ProjectService {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_project_settings(
         &self,
         project_id: i32,
-        new_slug: Option<String>,
-        git_provider_connection_id: Option<i32>,
-        main_branch: Option<String>,
-        repo_owner: Option<String>,
-        repo_name: Option<String>,
-        preset: Option<String>,
-        directory: Option<String>,
-        attack_mode: Option<bool>,
-        enable_preview_environments: Option<bool>,
-        preview_envs_on_demand: Option<bool>,
-        preview_envs_idle_timeout_seconds: Option<i32>,
-        preview_envs_wake_timeout_seconds: Option<i32>,
-        preset_config: Option<serde_json::Value>,
-        ai_alert_summaries_enabled: Option<bool>,
-        ai_debug_chat_enabled: Option<bool>,
-        ai_write_actions_enabled: Option<bool>,
-        cross_project_trace_sharing: Option<bool>,
-    ) -> Result<Project, ProjectError> {
+        params: UpdateProjectSettingsParams,
+    ) -> Result<ProjectSettingsUpdate, ProjectError> {
+        let UpdateProjectSettingsParams {
+            name: new_name,
+            slug: new_slug,
+            git_provider_connection_id,
+            main_branch,
+            repo_owner,
+            repo_name,
+            preset,
+            directory,
+            attack_mode,
+            enable_preview_environments,
+            preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds,
+            preset_config,
+            ai_alert_summaries_enabled,
+            cross_project_trace_sharing,
+            error_source_context_enabled,
+            vulnerability_scanning_enabled,
+            error_source_root,
+            ai_api_traffic_summary_enabled,
+            image_retention_hours,
+        } = params;
+
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
         // never out of range.
@@ -897,6 +1773,22 @@ impl ProjectService {
                 )));
             }
         }
+        if let Some(Some(hours)) = image_retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "image_retention_hours {} is not in valid range (1-8760)",
+                    hours
+                )));
+            }
+        }
+        // Normalize the display name up-front with the other validations so an
+        // unusable name is rejected before anything is written, then persist it
+        // only at the end (see below) — a rename must not survive a request that
+        // goes on to fail on a conflicting slug or a git desync.
+        let new_name = match new_name {
+            Some(raw) => Some(validate_project_name(&raw)?),
+            None => None,
+        };
 
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -906,14 +1798,42 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        if project.project_type == ProjectType::Service
+            && (git_provider_connection_id.is_some()
+                || main_branch.is_some()
+                || repo_owner.is_some()
+                || repo_name.is_some()
+                || preset.is_some()
+                || directory.is_some()
+                || preset_config.is_some())
+        {
+            return Err(ProjectError::InvalidInput(
+                "Service source and runtime fields must be changed through the service controls"
+                    .to_string(),
+            ));
+        }
+        let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
+            let slug_value = slugify(&slug_value);
+            if slug_value.is_empty() || slug_value.len() > 63 {
+                return Err(ProjectError::InvalidInput(
+                    "Project slug must contain 1-63 lowercase DNS-safe characters".to_string(),
+                ));
+            }
+            let txn = self.db.begin().await?;
+            txn.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtext('project-slug:' || $1))",
+                [slug_value.clone().into()],
+            ))
+            .await?;
             // Check if the slug is already taken by another project
             let existing = projects::Entity::find()
                 .filter(projects::Column::Slug.eq(&slug_value))
                 .filter(projects::Column::Id.ne(project_id))
-                .one(self.db.as_ref())
+                .one(&txn)
                 .await?;
 
             if existing.is_some() {
@@ -924,28 +1844,94 @@ impl ProjectService {
             }
 
             let old_slug = project.slug.clone();
-            project.slug = slug_value.clone();
-
-            // Update the project in the database
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.slug = Set(slug_value.clone());
-            project = active_project.update(self.db.as_ref()).await?;
-
-            // Update the environment_domain in the environment if the slug has changed
-            if old_slug != project.slug {
+            if old_slug != slug_value {
                 let envs = temps_entities::environments::Entity::find()
                     .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
-                    .all(self.db.as_ref())
+                    .all(&txn)
                     .await?;
+                let project_environment_ids = envs.iter().map(|env| env.id).collect::<Vec<_>>();
+                let mut target_subdomains = HashSet::new();
+
+                // Acquire claims in deterministic order to avoid deadlocks when
+                // concurrent project renames touch multiple hostnames.
+                let mut active_claims = envs
+                    .iter()
+                    .filter(|env| env.deleted_at.is_none())
+                    .map(|env| {
+                        (
+                            format!("{}-{}", slug_value, env.slug).to_ascii_lowercase(),
+                            env.id,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                active_claims.sort_unstable();
+                for (new_subdomain, _) in &active_claims {
+                    if !target_subdomains.insert(new_subdomain.clone()) {
+                        return Err(ProjectError::InvalidInput(format!(
+                            "Project slug '{}' would create duplicate environment subdomain '{}'",
+                            slug_value, new_subdomain
+                        )));
+                    }
+                    if temps_entities::environments::claim_subdomain(
+                        &txn,
+                        new_subdomain,
+                        &project_environment_ids,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        return Err(ProjectError::InvalidInput(format!(
+                            "Project slug '{}' would use an environment subdomain that is already in use",
+                            slug_value
+                        )));
+                    }
+                }
+
+                project.slug = slug_value.clone();
+                let mut active_project: projects::ActiveModel = project.clone().into();
+                active_project.slug = Set(slug_value.clone());
+                active_project.update(&txn).await?;
 
                 for env in envs {
-                    let new_subdomain = format!("{}-{}", slug_value.clone(), env.slug);
+                    let previous_subdomain = env.subdomain.clone();
+                    let new_subdomain = format!("{}-{}", slug_value, env.slug).to_ascii_lowercase();
 
-                    // Update environment
+                    // Keep the environment and its auto-managed domain row in
+                    // the same transaction as the project rename.
                     let mut active_env: temps_entities::environments::ActiveModel = env.into();
                     active_env.subdomain = Set(new_subdomain.clone());
-                    active_env.update(self.db.as_ref()).await?;
+                    let updated_env = active_env.update(&txn).await?;
+
+                    let existing_domain = temps_entities::environment_domains::Entity::find()
+                        .filter(
+                            temps_entities::environment_domains::Column::EnvironmentId
+                                .eq(updated_env.id),
+                        )
+                        .filter(
+                            temps_entities::environment_domains::Column::Domain
+                                .eq(&previous_subdomain),
+                        )
+                        .one(&txn)
+                        .await?;
+                    if let Some(domain) = existing_domain {
+                        let mut active_domain: temps_entities::environment_domains::ActiveModel =
+                            domain.into();
+                        active_domain.domain = Set(new_subdomain);
+                        active_domain.update(&txn).await?;
+                    } else {
+                        let active_domain = temps_entities::environment_domains::ActiveModel {
+                            environment_id: Set(updated_env.id),
+                            domain: Set(new_subdomain),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        };
+                        active_domain.insert(&txn).await?;
+                    }
                 }
+
+                txn.commit().await?;
+            } else {
+                txn.rollback().await?;
             }
         }
 
@@ -966,10 +1952,7 @@ impl ProjectService {
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -1006,12 +1989,13 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update AI feature toggles if provided (ADR-021 / ADR-023). Both are
+        // Update AI feature toggles if provided (ADR-021 / ADR-023). These are
         // tri-state opt-ins (Some(true) = on), stored as nullable columns.
-        // ai_write_actions_enabled is a non-null bool column (default false).
         if ai_alert_summaries_enabled.is_some()
-            || ai_debug_chat_enabled.is_some()
-            || ai_write_actions_enabled.is_some()
+            || error_source_context_enabled.is_some()
+            || vulnerability_scanning_enabled.is_some()
+            || error_source_root.is_some()
+            || ai_api_traffic_summary_enabled.is_some()
         {
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1024,11 +2008,22 @@ impl ProjectService {
             if let Some(v) = ai_alert_summaries_enabled {
                 active_project.ai_alert_summaries_enabled = Set(Some(v));
             }
-            if let Some(v) = ai_debug_chat_enabled {
-                active_project.ai_debug_chat_enabled = Set(Some(v));
+            if let Some(v) = ai_api_traffic_summary_enabled {
+                active_project.ai_api_traffic_summary_enabled = Set(Some(v));
             }
-            if let Some(v) = ai_write_actions_enabled {
-                active_project.ai_write_actions_enabled = Set(v);
+            // Opt-in for native error-tracking source context (non-null bool).
+            if let Some(v) = error_source_context_enabled {
+                active_project.error_source_context_enabled = Set(v);
+            }
+            // Opt-in for Trivy vulnerability scanning (non-null bool, default false).
+            if let Some(v) = vulnerability_scanning_enabled {
+                active_project.vulnerability_scanning_enabled = Set(v);
+            }
+            // Auto-capture source root (nullable). Empty string clears it back
+            // to the build-context default.
+            if let Some(v) = error_source_root {
+                active_project.error_source_root =
+                    Set(if v.trim().is_empty() { None } else { Some(v) });
             }
             active_project.update(self.db.as_ref()).await?;
         }
@@ -1047,13 +2042,14 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preview environment settings if any are provided
-        let needs_preview_update = enable_preview_environments.is_some()
+        // Update preview environment settings and image retention if any are provided
+        let needs_project_row_update = enable_preview_environments.is_some()
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
-            || preview_envs_wake_timeout_seconds.is_some();
+            || preview_envs_wake_timeout_seconds.is_some()
+            || image_retention_hours.is_some();
 
-        if needs_preview_update {
+        if needs_project_row_update {
             // Reload project to ensure we have the latest state
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1077,38 +2073,20 @@ impl ProjectService {
             if let Some(wake) = preview_envs_wake_timeout_seconds {
                 active_project.preview_envs_wake_timeout_seconds = Set(wake);
             }
+            if let Some(hours) = image_retention_hours {
+                active_project.image_retention_hours = Set(hours);
+            }
 
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preset_config if provided
-        if let Some(ref config_value) = preset_config {
-            // Reload project to ensure we have the latest state
-            let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
-
-            // Parse the preset config based on the project's current preset
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &project.preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.preset_config = Set(Some(parsed_config));
-            active_project.update(self.db.as_ref()).await?;
-        }
-
-        // Update git-related fields if any are provided
+        // Update git-related fields and preset configuration atomically so a
+        // config submitted with a new preset is parsed against that new preset.
         let needs_git_update = main_branch.is_some()
             || repo_owner.is_some()
             || repo_name.is_some()
             || preset.is_some()
+            || preset_config.is_some()
             || directory.is_some();
 
         if needs_git_update {
@@ -1121,6 +2099,34 @@ impl ProjectService {
                     project_id
                 )))?;
 
+            // `repo_owner`/`repo_name` and `git_url` are read by different
+            // code paths — branch resolution uses the former, the clone uses
+            // the latter — and this endpoint only writes the former. Changing
+            // the repo identity here therefore used to leave a stale clone
+            // URL behind, and the next deploy resolved a commit from one repo
+            // and cloned another:
+            //
+            //   Starting repository download for owner/new-repo
+            //   Checking out ref: <commit that only exists in new-repo>
+            //   Cloning public repository from: .../old-repo.git
+            //
+            // The project could not be recovered through the API. Reject the
+            // change when it would actually desync — the git URL is owned by
+            // `POST /projects/{id}/git`, which validates it.
+            let desync = would_desync_git_url(
+                &project.git_url,
+                (&project.repo_owner, &project.repo_name),
+                (repo_owner.as_deref(), repo_name.as_deref()),
+            );
+            if let Some((old, new)) = desync {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Changing the repository to '{new}' would leave the clone URL pointing at \
+                     '{old}'. Update both together with POST /projects/{project_id}/git, which \
+                     sets git_url alongside the owner and name."
+                )));
+            }
+
+            let existing_preset_config = project.preset_config.clone();
             let mut active_project: projects::ActiveModel = project.into();
 
             if let Some(branch) = main_branch {
@@ -1133,60 +2139,166 @@ impl ProjectService {
                 active_project.repo_name = Set(name);
             }
             if let Some(preset_value) = preset {
-                // Parse preset string to enum
-                let preset_enum = preset_value
-                    .parse::<temps_entities::preset::Preset>()
-                    .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-                active_project.preset = Set(preset_enum);
+                let resolved = resolve_preset_selection(
+                    preset_value.as_str(),
+                    preset_config.as_ref(),
+                    existing_preset_config.as_ref(),
+                )?;
+                apply_resolved_preset(&mut active_project, resolved)?;
+            } else if let Some(config_value) = preset_config.as_ref() {
+                let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                    active_project.preset.as_ref(),
+                    config_value,
+                )
+                .map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+                let merged = merge_preset_config(
+                    existing_preset_config.as_ref(),
+                    parsed,
+                    config_value,
+                    true,
+                );
+                let merged = validate_preset_config(
+                    *active_project.preset.as_ref(),
+                    merged,
+                    Some(config_value),
+                )?;
+                let resolved = temps_presets::StoredPreset {
+                    preset: *active_project.preset.as_ref(),
+                    config: Some(merged.clone()),
+                };
+                if active_project.project_type.as_ref() != &ProjectType::Service {
+                    active_project.project_type = Set(project_type_for_resolved_preset(&resolved)?);
+                }
+                active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
-                active_project.directory = Set(dir);
+                active_project.directory = Set(normalize_project_directory(&dir)?);
+            }
+            // Carry the write and the route-reload signal on one transaction.
+            // If the signal cannot be published, returning an error while the
+            // rename and the preset/directory changes stayed persisted would
+            // leave the caller unable to tell what actually happened — and on a
+            // port removal, leave a withdrawn route reachable. Dropping the
+            // transaction on the error path rolls all of it back together.
+            let txn = self.db.begin().await?;
+
+            // Fold the rename into this same write so a name change submitted
+            // alongside git settings commits atomically with them. The write
+            // itself rides `active_project` below rather than a separate update.
+            let mut rename = None;
+            if let Some(ref name_value) = new_name {
+                rename = self.locked_rename(&txn, project_id, name_value).await?;
+                active_project.name = Set(name_value.clone());
             }
 
-            let updated_project = active_project.update(self.db.as_ref()).await?;
-            let project_found = Self::map_db_project_to_project(updated_project);
-
-            // Emit ProjectUpdated job
+            let updated_project = active_project.update(&txn).await?;
+            let ports_changed = initial_public_ports
+                != compose_public_ports(updated_project.preset_config.as_ref());
+            if ports_changed {
+                // Only this transaction rolls back. Earlier steps of this same
+                // request (slug, attack mode, AI toggles, preview envs) were
+                // committed independently and survive, so do not tell the
+                // operator the whole request was discarded.
+                self.publish_route_reload(
+                    &txn,
+                    project_id,
+                    "The git settings, preset, directory and name portion of this update was \
+                     rolled back; other settings sent in the same request (slug, attack mode, \
+                     AI toggles, preview environments) commit independently and may already be \
+                     saved.",
+                )
+                .await?;
+            }
+            txn.commit().await?;
+            if ports_changed {
+                self.enqueue_route_reload(project_id).await;
+            }
+            // Notify before the provider lookup: past the commit, every await
+            // is a point the task can be cancelled at, and losing the response
+            // is recoverable where losing the notification is not.
             let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-                project_id: project_found.id,
-                project_name: project_found.name.clone(),
+                project_id: updated_project.id,
+                project_name: updated_project.name.clone(),
             });
 
             if let Err(e) = self.queue_service.send(project_updated_job).await {
                 warn!(
                     "Failed to emit ProjectUpdated job for project {}: {}",
-                    project_found.id, e
+                    updated_project.id, e
                 );
             }
 
-            return Ok(project_found);
+            return Ok(ProjectSettingsUpdate {
+                project: self.map_written_project(updated_project).await,
+                rename,
+            });
         }
 
-        // Always reload the final project state before returning
-        let final_project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ProjectError::NotFound(format!(
-                "Project {} not found",
-                project_id
-            )))?;
+        // Persist the rename last, once every other fallible step has
+        // succeeded, so a failed request never leaves a renamed project behind.
+        //
+        // Note the guarantee is one-directional and this endpoint is *not*
+        // all-or-nothing: everything above committed independently, so a failure
+        // in this block still leaves those earlier steps persisted. Ordering the
+        // rename last only ensures it is never the survivor of someone else's
+        // failure. Making the whole endpoint atomic belongs with the parked
+        // optimistic-concurrency work, not here.
+        // The locked read, the write, and the read-back of the final state all
+        // ride one transaction: committing before the read-back would let a
+        // failure there report an error over an already-persisted rename, and
+        // reading back outside the lock would let a concurrent rename supply
+        // the "after" half of a transition whose "before" half came from here.
+        let mut rename = None;
+        let final_project = if let Some(name_value) = new_name {
+            let txn = self.db.begin().await?;
+            rename = self.locked_rename(&txn, project_id, &name_value).await?;
+            if rename.is_some() {
+                let mut active_project = projects::ActiveModel {
+                    id: Set(project_id),
+                    ..Default::default()
+                };
+                active_project.name = Set(name_value);
+                active_project.update(&txn).await?;
+            }
 
-        let project_found = Self::map_db_project_to_project(final_project);
+            let final_project = projects::Entity::find_by_id(project_id)
+                .one(&txn)
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            txn.commit().await?;
+            final_project
+        } else {
+            // No mutation to lose here, so a plain read is enough.
+            projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?
+        };
 
-        // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
-            project_id: project_found.id,
-            project_name: project_found.name.clone(),
+            project_id: final_project.id,
+            project_name: final_project.name.clone(),
         });
 
         if let Err(e) = self.queue_service.send(project_updated_job).await {
             warn!(
                 "Failed to emit ProjectUpdated job for project {}: {}",
-                project_found.id, e
+                final_project.id, e
             );
         }
 
-        Ok(project_found)
+        Ok(ProjectSettingsUpdate {
+            project: self.map_written_project(final_project).await,
+            rename,
+        })
     }
 
     pub async fn update_automatic_deploy(
@@ -1202,7 +2314,6 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
-
         // Update automatic_deploy setting in deployment_config
         let mut active_project: projects::ActiveModel = project.clone().into();
 
@@ -1213,7 +2324,7 @@ impl ProjectService {
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1238,6 +2349,12 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        if project.project_type == ProjectType::Service {
+            return Err(ProjectError::InvalidInput(
+                "A service project cannot be converted to a Git source; update its applied template or runtime instead"
+                    .to_string(),
+            ));
+        }
 
         // Snapshot fields we need to reason about the old/new repo transition.
         let old_connection_id = project.git_provider_connection_id;
@@ -1250,17 +2367,21 @@ impl ProjectService {
         // acceptable for v1 (no stored ID to call DELETE with).
         // Generic: no remote API at all — just regenerate the token.
 
-        // Verify git provider connection if provided
+        // Verify git provider connection if provided.
+        //
+        // Connections are scoped to the installation (workspace-wide), not to
+        // the user who created them: a GitHub App installation is shared by
+        // design, and PAT connections are intended to be usable by anyone
+        // with write access to the project, not just their creator. Access
+        // control for this endpoint is enforced by `permission_guard!` and
+        // `project_scope_guard!` in the handler, not by connection ownership.
         if let Some(connection_id) = git_provider_connection_id {
             if connection_id > 0 {
                 use temps_entities::git_provider_connections;
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -1288,26 +2409,48 @@ impl ProjectService {
             }
         }
 
-        // Capture the current preset before converting to ActiveModel
+        // Capture the current preset/config before converting to ActiveModel
         let project_preset = project.preset;
+        let existing_preset_config = project.preset_config.clone();
+        let previous_public_ports = compose_public_ports(existing_preset_config.as_ref());
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
         active_project.main_branch = Set(main_branch.clone());
         active_project.repo_owner = Set(repo_owner.clone());
         active_project.repo_name = Set(repo_name.clone());
-        active_project.directory = Set(directory);
+        active_project.directory = Set(normalize_project_directory(&directory)?);
         // Configuring a Git repository makes this a Git-source project — this is
         // how a docker_image / static_files project is converted to Git (the
         // reverse conversion goes through `set_source_type`).
         active_project.source_type = Set(temps_entities::source_type::SourceType::Git);
 
         if let Some(preset_value) = preset {
-            // Parse preset string to enum
-            let preset_enum = preset_value
-                .parse::<temps_entities::preset::Preset>()
-                .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-            active_project.preset = Set(preset_enum);
+            let resolved = resolve_preset_selection(
+                preset_value.as_str(),
+                preset_config.as_ref(),
+                existing_preset_config.as_ref(),
+            )?;
+            apply_resolved_preset(&mut active_project, resolved)?;
+        } else if let Some(config_value) = preset_config.as_ref() {
+            let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                &project_preset,
+                config_value,
+            )
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+            })?;
+            let merged =
+                merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
+            let merged = validate_preset_config(project_preset, merged, Some(config_value))?;
+            let resolved = temps_presets::StoredPreset {
+                preset: project_preset,
+                config: Some(merged.clone()),
+            };
+            if active_project.project_type.as_ref() != &ProjectType::Service {
+                active_project.project_type = Set(project_type_for_resolved_preset(&resolved)?);
+            }
+            active_project.preset_config = Set(Some(merged));
         }
 
         // Determine the effective new connection id and whether we need to handle
@@ -1342,24 +2485,6 @@ impl ProjectService {
 
         if let Some(is_public) = is_public_repo {
             active_project.is_public_repo = Set(is_public);
-        }
-
-        // Update preset_config if provided (e.g., Dockerfile path for Docker preset)
-        if let Some(ref config_value) = preset_config {
-            // Determine the target preset: use the newly set preset if provided, otherwise use current
-            let target_preset = if active_project.preset.is_set() {
-                *active_project.preset.as_ref()
-            } else {
-                project_preset
-            };
-
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &target_preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-
-            active_project.preset_config = Set(Some(parsed_config));
         }
 
         // ── GitLab webhook lifecycle ──────────────────────────────────────────
@@ -1567,9 +2692,159 @@ impl ProjectService {
             active_project.generic_webhook_token = Set(None);
         }
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        // Same rollback-together reasoning as `update_project_settings`: publish
+        // the reload on the transaction that carries the write, so a failure to
+        // signal leaves nothing persisted.
+        let txn = self.db.begin().await?;
+        let updated_project = active_project.update(&txn).await?;
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        let ports_changed =
+            previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref());
+        if ports_changed {
+            // Every *database* write in this method rides `txn`. The provider-side
+            // webhook install/removal above does not, and nothing here undoes
+            // it — so do not claim a total rollback.
+            self.publish_route_reload(
+                &txn,
+                project_id,
+                "No database changes were saved, but any git-provider webhook this request \
+                 installed or removed has already been applied at the provider.",
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        if ports_changed {
+            self.enqueue_route_reload(project_id).await;
+        }
+
+        Ok(self.map_written_project(updated_project).await)
+    }
+
+    /// Take the row lock and report the rename `new_name` would perform against
+    /// the currently-stored name, or `None` when it matches and no write is
+    /// needed.
+    ///
+    /// Both ends of the transition come from the locked read, so the pair always
+    /// describes one real change. Callers must perform the write on the same
+    /// `conn`: reading here and writing outside this transaction would let a
+    /// concurrent rename land in between and make the reported transition
+    /// fiction.
+    /// Takes a transaction rather than a generic connection on purpose: passing
+    /// an autocommit handle would compile and silently discard the `FOR UPDATE`
+    /// guarantee this whole design rests on, so the type makes that unrepresentable.
+    async fn locked_rename(
+        &self,
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        new_name: &str,
+    ) -> Result<Option<ProjectRename>, ProjectError> {
+        let locked = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )))?;
+
+        Ok(if locked.name == new_name {
+            None
+        } else {
+            Some(ProjectRename {
+                from: locked.name,
+                to: new_name.to_string(),
+            })
+        })
+    }
+
+    /// Public Compose ports are read directly from `projects.preset_config`
+    /// when the proxy builds its route table. Updating the JSON alone leaves
+    /// the in-memory table stale, because the project DB trigger deliberately
+    /// ignores generic preset-config changes.
+    ///
+    /// Publishes on the caller's connection rather than reaching for `self.db`,
+    /// so a caller writing inside a transaction issues the NOTIFY on that same
+    /// transaction. PostgreSQL queues notifications and delivers them at commit,
+    /// so a rolled-back update signals nothing and no listener can observe a
+    /// reload for a write that never landed.
+    ///
+    /// The in-process queue job is deliberately *not* sent here, and there is
+    /// deliberately no eager fallback to it when the NOTIFY fails. Its
+    /// subscriber reloads the route table over its own database connection, so
+    /// enqueuing before the transaction commits races that commit: the
+    /// subscriber can read the pre-update ports and latch them in with nothing
+    /// left to trigger a re-read. On a change that *removes* a public port
+    /// that fails open — the withdrawn route stays reachable indefinitely — so
+    /// the safe response to an unavailable NOTIFY is to roll the write back and
+    /// let the caller retry, not to persist it behind a signal that may never
+    /// land. The caller sends the job after committing; see
+    /// [`Self::enqueue_route_reload`].
+    async fn publish_route_reload<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        project_id: i32,
+        rolled_back_scope: &str,
+    ) -> Result<(), ProjectError> {
+        let payload = serde_json::json!({
+            "action": "UPDATE",
+            "project_id": project_id,
+            "field": "preset_config.public_ports",
+        })
+        .to_string();
+        conn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_notify('project_route_change', $1)",
+            [payload.into()],
+        ))
+        .await
+        .map_err(|database_error| {
+            // The driver text can name the connection target or a constraint, so
+            // it stays in the operator's logs rather than the HTTP response.
+            error!(
+                project_id,
+                error = %database_error,
+                "Failed to publish project route-reload NOTIFY"
+            );
+            ProjectError::RouteReloadFailed {
+                project_id,
+                rolled_back_scope: rolled_back_scope.to_string(),
+            }
+        })?;
+
+        Ok(())
+    }
+
+    /// Send the in-process route-reload job. Call only *after* the transaction
+    /// carrying the port change has committed, so the subscriber cannot read
+    /// pre-commit state.
+    ///
+    /// Best-effort. NOTIFY is not durable — it reaches only sessions holding a
+    /// `LISTEN` at commit time — so a queue failure here is not automatically
+    /// harmless. What makes it recoverable is the listener itself, which
+    /// reloads the full route table on two independent triggers: after a
+    /// reconnect (catching signals missed while it was down) and after an idle
+    /// window elapses with no notification (catching a connection that died
+    /// without ever reporting an error). The second is what bounds the damage
+    /// here — without it, losing both the NOTIFY and this queue send would
+    /// leave a withdrawn public port reachable indefinitely. Do not weaken
+    /// either trigger while trusting this comment; see
+    /// `temps_routes::project_change_listener::IDLE_RECONCILE_INTERVAL`.
+    async fn enqueue_route_reload(&self, project_id: i32) {
+        if let Err(e) = self
+            .queue_service
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            }))
+            .await
+        {
+            warn!(
+                project_id,
+                error = %e,
+                "Route reload job could not be enqueued after committing a public-port change; \
+                 this process will rely on the delivered NOTIFY"
+            );
+        }
     }
 
     /// Resolve whether the given connection points to a GitLab provider.
@@ -1671,7 +2946,8 @@ impl ProjectService {
         let webhook_url = format!("{}/api/webhook/git/gitlab/events", external_url);
 
         // Generate a random 32-byte signing token.
-        let signing_token = generate_signing_token();
+        let signing_token = generate_signing_token()
+            .map_err(|error| format!("Failed to generate GitLab webhook token: {error}"))?;
 
         let hook_id = client
             .install_webhook(owner, repo, &webhook_url, &signing_token)
@@ -1862,7 +3138,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh secret-in-path delivery token.
-        let delivery_token = generate_bitbucket_webhook_token();
+        let delivery_token = generate_bitbucket_webhook_token()
+            .map_err(|error| format!("Failed to generate Bitbucket webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/bitbucket/events/{}",
@@ -2056,7 +3333,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh HMAC secret (used as the Gitea webhook secret).
-        let signing_token = generate_gitea_signing_token();
+        let signing_token = generate_gitea_signing_token()
+            .map_err(|error| format!("Failed to generate Gitea webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/gitea/events",
@@ -2153,28 +3431,17 @@ impl ProjectService {
             return Ok(None);
         }
 
-        let token = generate_generic_webhook_token();
+        let token = generate_generic_webhook_token()
+            .map_err(|error| format!("Failed to generate Generic webhook token: {error}"))?;
 
         let encrypted_token = self
             .encryption_service
             .encrypt_string(&token)
             .map_err(|e| format!("Failed to encrypt Generic webhook token: {e}"))?;
 
-        let external_url = self
-            .config_service
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.external_url)
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-
         info!(
-            "Generated Generic webhook token for project {} (conn {}). \
-             Configure your git host to POST to: {}/api/webhook/git/generic/events/{}",
-            project_id,
-            connection_id,
-            external_url.trim_end_matches('/'),
-            token // plaintext token is only logged here; stored value is encrypted
+            "Generated and encrypted Generic webhook token for project {} (conn {})",
+            project_id, connection_id
         );
 
         Ok(Some(encrypted_token))
@@ -2185,14 +3452,93 @@ impl ProjectService {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding(page, per_page, &[])
+            .await
+    }
+
+    /// [`Self::get_projects_paginated`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// `hidden` comes from
+    /// [`ProjectAccessChecker::hidden_project_ids`](temps_core::ProjectAccessChecker::hidden_project_ids)
+    /// and is empty on an instance with no access grants configured, which
+    /// makes this identical to the unfiltered query in that case. The
+    /// exclusion is applied to the **count** as well as the page, so
+    /// pagination doesn't advertise rows the caller can never see.
+    pub async fn get_projects_paginated_excluding(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding_search(page, per_page, hidden, None)
+            .await
+    }
+
+    pub async fn get_projects_paginated_excluding_search(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+        search: Option<&str>,
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
+        use sea_orm::sea_query::extension::postgres::PgExpr;
+        use sea_orm::sea_query::LikeExpr;
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
-        // Calculate offset
-        let offset = ((page - 1) * per_page) as u64;
+        if page < 1 {
+            return Err(ProjectError::InvalidInput(
+                "page must be greater than or equal to 1".to_string(),
+            ));
+        }
+        if !(1..=100).contains(&per_page) {
+            return Err(ProjectError::InvalidInput(
+                "per_page must be between 1 and 100".to_string(),
+            ));
+        }
+
+        let offset = page
+            .checked_sub(1)
+            .and_then(|zero_based_page| zero_based_page.checked_mul(per_page))
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or_else(|| {
+                ProjectError::InvalidInput("page produces an invalid pagination offset".to_string())
+            })?;
+
+        let filtered = || {
+            let mut query = projects::Entity::find();
+            if !hidden.is_empty() {
+                query = query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()));
+            }
+            if let Some(search) = search {
+                let pattern = format!("%{}%", escape_like_literal(search));
+                // Table-qualified: the page query joins `git_providers`, which
+                // has a `name` column of its own, and an unqualified `name`
+                // here is rejected by Postgres as ambiguous.
+                query = query.filter(
+                    Condition::any()
+                        .add(
+                            sea_orm::sea_query::Expr::col((
+                                projects::Entity,
+                                projects::Column::Name,
+                            ))
+                            .ilike(LikeExpr::new(pattern.clone())),
+                        )
+                        .add(
+                            sea_orm::sea_query::Expr::col((
+                                projects::Entity,
+                                projects::Column::Slug,
+                            ))
+                            .ilike(LikeExpr::new(pattern.clone())),
+                        ),
+                );
+            }
+            query
+        };
 
         // Get total count
-        let total = projects::Entity::find()
+        let total = filtered()
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2201,7 +3547,9 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = projects::Entity::find()
+        // The count query above stays join-free: it counts projects, and the
+        // provider join exists only to carry an extra column.
+        let projects = Self::with_git_provider_type(filtered())
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,
@@ -2210,14 +3558,16 @@ impl ProjectService {
             .order_by_desc(projects::Column::CreatedAt)
             .offset(offset)
             .limit(per_page as u64)
+            .into_model::<ProjectWithGitProviderType>()
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?;
 
         let projects_found: Vec<Project> = projects
             .into_iter()
-            .map(Self::map_db_project_to_project)
+            .map(Self::map_db_project_row_to_project)
             .collect();
+
         Ok((projects_found, total))
     }
 
@@ -2231,10 +3581,30 @@ impl ProjectService {
     }
 
     pub async fn get_project_statistics(&self) -> Result<ProjectStatistics, ProjectError> {
+        self.get_project_statistics_excluding(&[]).await
+    }
+
+    /// [`Self::get_project_statistics`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// The count has to honour the same exclusion as the list, or the
+    /// dashboard tells a scoped user how many projects exist on the
+    /// instance while showing them only their own — a smaller leak than
+    /// the names, but the same leak.
+    pub async fn get_project_statistics_excluding(
+        &self,
+        hidden: &[i32],
+    ) -> Result<ProjectStatistics, ProjectError> {
         use sea_orm::PaginatorTrait;
 
-        // Get total count of projects
-        let total_count = projects::Entity::find()
+        let query = projects::Entity::find();
+        let query = if hidden.is_empty() {
+            query
+        } else {
+            query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+        };
+
+        let total_count = query
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2243,10 +3613,37 @@ impl ProjectService {
         Ok(ProjectStatistics { total_count })
     }
 
+    /// Reject `deployment_config` if it violates `app_settings`'s tenant
+    /// resource ceilings; a no-op when no ceiling is configured.
+    ///
+    /// Pulled out of the two call sites below so the error-mapping (join the
+    /// violations into one `InvalidInput`) has a single place to test without
+    /// standing up a full `ProjectService` — the ceiling logic itself is
+    /// covered independently on [`temps_entities::deployment_config::DeploymentConfig::check_against_tenant_ceilings`].
+    fn enforce_tenant_ceilings(
+        deployment_config: &temps_entities::deployment_config::DeploymentConfig,
+        app_settings: &temps_core::AppSettings,
+    ) -> Result<(), ProjectError> {
+        deployment_config
+            .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+            .map_err(|violations| ProjectError::InvalidInput(violations.join("; ")))
+    }
+
+    /// See [`Self::update_project_deployment_config`] for what
+    /// `ceiling_enforcement` means.
+    ///
+    /// No handler in this crate calls this method today — `ProjectsWrite`
+    /// callers reach deployment-config updates through
+    /// [`Self::update_project_deployment_config`] instead. It is kept public
+    /// and ceiling-enforced because [`ProjectService`] is registered with the
+    /// plugin DI system (see `crates/temps-projects/src/plugin.rs`), so an
+    /// out-of-tree plugin may call it directly; if you're removing the last
+    /// in-tree reference to this method, check for that before deleting it.
     pub async fn update_deployment_settings(
         &self,
         project_id_or_slug: &str,
         settings: UpdateDeploymentSettingsRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
@@ -2278,6 +3675,16 @@ impl ProjectService {
         deployment_config.cpu_limit = settings.cpu_limit;
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
+
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
+
         active_project.deployment_config = Set(Some(deployment_config));
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -2300,14 +3707,21 @@ impl ProjectService {
             );
         }
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
     }
 
-    /// Update deployment configuration for a project
+    /// Update a project's deployment config.
+    ///
+    /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
+    /// whoever can raise the instance-wide ceilings is by definition allowed to
+    /// exceed them, so the check would be theatre for them. Everyone else is
+    /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
+    /// until an operator configures it.
     pub async fn update_project_deployment_config(
         &self,
         project_id: i32,
         config: UpdateDeploymentConfigRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -2351,11 +3765,41 @@ impl ProjectService {
         if let Some(security) = config.security {
             deployment_config.security = Some(security);
         }
+        // Absent leaves it unset (disabled, and inheritable); an explicit value
+        // — including `false` — pins it for every environment that doesn't
+        // override it.
+        if let Some(cross_architecture_builds) = config.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
+        if let Some(request_timeout_seconds) = config.request_timeout_seconds {
+            deployment_config.request_timeout_seconds = Some(request_timeout_seconds);
+        }
+        if let Some(sse_idle_timeout_seconds) = config.sse_idle_timeout_seconds {
+            deployment_config.sse_idle_timeout_seconds = Some(sse_idle_timeout_seconds);
+        }
+        if let Some(websocket_idle_timeout_seconds) = config.websocket_idle_timeout_seconds {
+            deployment_config.websocket_idle_timeout_seconds = Some(websocket_idle_timeout_seconds);
+        }
+        if let Some(max_concurrent_connections) = config.max_concurrent_connections {
+            deployment_config.max_concurrent_connections = Some(max_concurrent_connections);
+        }
 
         // Validate the deployment config
         deployment_config
             .validate()
             .map_err(|e| ProjectError::InvalidInput(format!("Invalid deployment config: {}", e)))?;
+
+        // Checked on the merged config, not on the request, so clearing an
+        // override back to "inherit" is judged by what the project will
+        // actually run with.
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.clone().into();
@@ -2381,19 +3825,556 @@ impl ProjectService {
             );
         }
 
-        Ok(Self::map_db_project_to_project(updated_project))
+        Ok(self.map_written_project(updated_project).await)
+    }
+
+    /// Replace the editable runtime snapshot for a single-container image
+    /// template and its project-level resources atomically.
+    ///
+    /// Both JSON columns live on `projects`, so one row update is enough. A
+    /// rejected image, command, health path, resource profile, or tenant
+    /// ceiling leaves every previous value intact.
+    pub async fn update_service_template_runtime(
+        &self,
+        project_id: i32,
+        runtime: UpdateServiceTemplateRuntimeRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
+    ) -> Result<Project, ProjectError> {
+        let txn = self.db.begin().await?;
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {} not found", project_id))
+            })?;
+
+        if project.source_type != temps_entities::source_type::SourceType::DockerImage
+            || project.project_type != ProjectType::Service
+        {
+            return Err(ProjectError::InvalidInput(
+                "Service runtime settings are available only for template-backed service projects"
+                    .to_string(),
+            ));
+        }
+        if project.preset != temps_entities::preset::Preset::Dockerfile {
+            return Err(ProjectError::InvalidInput(
+                "Single-container service templates must use the Dockerfile runtime preset"
+                    .to_string(),
+            ));
+        }
+        // A service identity is never inferred from its slug or current
+        // runtime. New service projects always carry their complete release.
+        applied_service_template_from_model(&project)?;
+
+        let mut preset_config = project.preset_config.clone().unwrap_or_else(|| {
+            temps_entities::preset::PresetConfig::default_for_preset(
+                temps_entities::preset::Preset::Dockerfile,
+            )
+        });
+        let temps_entities::preset::PresetConfig::Dockerfile(config) = &mut preset_config else {
+            return Err(ProjectError::InvalidInput(
+                "Project preset configuration does not match the Dockerfile runtime".to_string(),
+            ));
+        };
+        config.image_runtime = Some(temps_entities::preset::ImageRuntimeConfig {
+            image_ref: runtime.image_ref,
+            command: (!runtime.command.is_empty()).then_some(runtime.command),
+            health_check_path: Some(runtime.health_check_path),
+        });
+        temps_presets::validate_preset_config(project.preset, &preset_config).map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid service runtime: {error}"))
+        })?;
+
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = runtime.cpu_request;
+        deployment_config.cpu_limit = runtime.cpu_limit;
+        deployment_config.memory_request = runtime.memory_request;
+        deployment_config.memory_limit = runtime.memory_limit;
+        deployment_config.exposed_port = runtime.exposed_port;
+        deployment_config.validate().map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid deployment config: {error}"))
+        })?;
+
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|error| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {error}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.preset_config = Set(Some(preset_config));
+        active_project.deployment_config = Set(Some(deployment_config));
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
+
+        let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+            project_id: updated_project.id,
+            project_name: updated_project.name.clone(),
+        });
+        if let Err(error) = self.queue_service.send(project_updated_job).await {
+            warn!(
+                "Failed to emit ProjectUpdated job for project {}: {}",
+                updated_project.id, error
+            );
+        }
+
+        Ok(self.map_written_project(updated_project).await)
+    }
+
+    /// Apply a newer release of the same service template while preserving
+    /// instance overrides. A field receives the new template default only when
+    /// its current value still equals the previously applied default.
+    pub async fn upgrade_service_template(
+        &self,
+        project_id: i32,
+        target: temps_core::templates::ServiceTemplateInstance,
+        new_environment_variables: Vec<CreateProjectEnvVar>,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
+    ) -> Result<Project, ProjectError> {
+        let txn = self.db.begin().await?;
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {} not found", project_id))
+            })?;
+
+        if project.project_type != ProjectType::Service {
+            return Err(ProjectError::InvalidInput(
+                "Only service projects can apply service-template upgrades".to_string(),
+            ));
+        }
+        if target.template.kind != temps_core::templates::TemplateKind::Service {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template '{}' is not a service release",
+                target.slug
+            )));
+        }
+        target.validate().map_err(|error| {
+            ProjectError::InvalidInput(format!(
+                "Invalid target service template {}@{}: {error}",
+                target.slug, target.version,
+            ))
+        })?;
+
+        let applied = applied_service_template_from_model(&project)?;
+
+        if applied.slug != target.slug {
+            return Err(ProjectError::InvalidInput(format!(
+                "A '{}' service cannot be changed into '{}'; select a newer release of the same template",
+                applied.slug, target.slug
+            )));
+        }
+        let is_newer = target.is_newer_than(&applied).map_err(|error| {
+            ProjectError::InvalidInput(format!(
+                "Cannot compare service template releases {}@{} and {}@{}: {error}",
+                applied.slug, applied.version, target.slug, target.version
+            ))
+        })?;
+        if !is_newer {
+            return Err(ProjectError::InvalidInput(format!(
+                "Service project {project_id} uses {}@{}; target release {}@{} must be newer",
+                applied.slug, applied.version, target.slug, target.version
+            )));
+        }
+        validate_service_binding_compatibility(&applied.template, &target.template)?;
+        if project.source_type != temps_entities::source_type::SourceType::DockerImage
+            || project.preset != temps_entities::preset::Preset::Dockerfile
+        {
+            return Err(ProjectError::InvalidInput(
+                "This release can only upgrade a single-container image service".to_string(),
+            ));
+        }
+
+        let linked_services = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id))
+            .find_also_related(external_services::Entity)
+            .all(&txn)
+            .await?;
+        let linked_service_types = linked_services
+            .iter()
+            .filter_map(|(_, service)| service.as_ref())
+            .map(|service| service.service_type.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let missing_services =
+            missing_required_service_types(&target.template.services, &linked_service_types);
+        if !missing_services.is_empty() {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template {}@{} requires linked managed service(s): {}",
+                target.slug,
+                target.version,
+                missing_services.join(", ")
+            )));
+        }
+        for required in &target.template.services {
+            let count = linked_services
+                .iter()
+                .filter_map(|(_, service)| service.as_ref())
+                .filter(|service| {
+                    temps_core::templates::managed_service_types_compatible(
+                        required,
+                        &service.service_type,
+                    )
+                })
+                .count();
+            if count > 1 {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Template {}@{} requires exactly one linked {} service, but project {project_id} has {count}",
+                    target.slug, target.version, required
+                )));
+            }
+        }
+
+        let mut preset_config = project.preset_config.clone().ok_or_else(|| {
+            ProjectError::Other(format!(
+                "Service project {project_id} has no persisted runtime configuration"
+            ))
+        })?;
+        let temps_entities::preset::PresetConfig::Dockerfile(config) = &mut preset_config else {
+            return Err(ProjectError::Other(format!(
+                "Service project {project_id} has a non-Dockerfile runtime configuration"
+            )));
+        };
+        let current_runtime = config.image_runtime.clone().ok_or_else(|| {
+            ProjectError::Other(format!(
+                "Service project {project_id} has no persisted image runtime"
+            ))
+        })?;
+        let target_image = target.template.image.clone().ok_or_else(|| {
+            ProjectError::InvalidInput(format!(
+                "Target service template {}@{} has no image",
+                target.slug, target.version
+            ))
+        })?;
+
+        config.image_runtime = Some(temps_entities::preset::ImageRuntimeConfig {
+            image_ref: apply_new_template_default_when_unmodified(
+                current_runtime.image_ref,
+                applied.template.image.clone().unwrap_or_default(),
+                target_image,
+            ),
+            command: apply_new_template_default_when_unmodified(
+                current_runtime.command,
+                applied.template.command.clone(),
+                target.template.command.clone(),
+            ),
+            health_check_path: apply_new_template_default_when_unmodified(
+                current_runtime.health_check_path,
+                applied
+                    .template
+                    .health_check_path
+                    .clone()
+                    .or_else(|| Some("/".to_string())),
+                target
+                    .template
+                    .health_check_path
+                    .clone()
+                    .or_else(|| Some("/".to_string())),
+            ),
+        });
+        temps_presets::validate_preset_config(project.preset, &preset_config).map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid target service runtime: {error}"))
+        })?;
+
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+        let applied_resources = &applied.template;
+        let target_resources = &target.template;
+        deployment_config.cpu_request = apply_new_template_default_when_unmodified(
+            deployment_config.cpu_request,
+            template_resource_value(applied_resources, |resources| resources.cpu_request),
+            template_resource_value(target_resources, |resources| resources.cpu_request),
+        );
+        deployment_config.cpu_limit = apply_new_template_default_when_unmodified(
+            deployment_config.cpu_limit,
+            template_resource_value(applied_resources, |resources| resources.cpu_limit),
+            template_resource_value(target_resources, |resources| resources.cpu_limit),
+        );
+        deployment_config.memory_request = apply_new_template_default_when_unmodified(
+            deployment_config.memory_request,
+            template_resource_value(applied_resources, |resources| resources.memory_request),
+            template_resource_value(target_resources, |resources| resources.memory_request),
+        );
+        deployment_config.memory_limit = apply_new_template_default_when_unmodified(
+            deployment_config.memory_limit,
+            template_resource_value(applied_resources, |resources| resources.memory_limit),
+            template_resource_value(target_resources, |resources| resources.memory_limit),
+        );
+        deployment_config.exposed_port = apply_new_template_default_when_unmodified(
+            deployment_config.exposed_port,
+            applied.template.exposed_port,
+            target.template.exposed_port,
+        );
+        deployment_config.validate().map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid target deployment config: {error}"))
+        })?;
+
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|error| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings before upgrading project {project_id}: {error}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
+
+        let production_environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::IsPreview.eq(false))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::Other(format!(
+                    "Service project {project_id} has no active production environment"
+                ))
+            })?;
+        let existing_variables = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .all(&txn)
+            .await?;
+        let existing_variable_ids = existing_variables
+            .iter()
+            .map(|variable| variable.id)
+            .collect::<Vec<_>>();
+        let variable_links = if existing_variable_ids.is_empty() {
+            Vec::new()
+        } else {
+            env_var_environments::Entity::find()
+                .filter(env_var_environments::Column::EnvVarId.is_in(existing_variable_ids))
+                .all(&txn)
+                .await?
+        };
+        let linked_ids = variable_links
+            .iter()
+            .map(|link| link.env_var_id)
+            .collect::<HashSet<_>>();
+        let production_linked_ids = variable_links
+            .iter()
+            .filter(|link| link.environment_id == production_environment.id)
+            .map(|link| link.env_var_id)
+            .collect::<HashSet<_>>();
+        let applies_to_production = |variable: &env_vars::Model| {
+            variable.environment_id == Some(production_environment.id)
+                || production_linked_ids.contains(&variable.id)
+                || (variable.environment_id.is_none() && !linked_ids.contains(&variable.id))
+        };
+        let mut production_variables = BTreeMap::<String, Vec<env_vars::Model>>::new();
+        for variable in existing_variables
+            .iter()
+            .filter(|variable| applies_to_production(variable))
+        {
+            production_variables
+                .entry(variable.key.clone())
+                .or_default()
+                .push(variable.clone());
+        }
+        let is_production_specific = |variable: &env_vars::Model| {
+            variable.environment_id == Some(production_environment.id)
+                || production_linked_ids.contains(&variable.id)
+        };
+        let effective_index = |variables: &[env_vars::Model]| {
+            variables
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, variable)| (is_production_specific(variable), variable.id))
+                .map(|(index, _)| index)
+        };
+        let mut configured_keys = HashSet::new();
+        for (key, variables) in &production_variables {
+            let Some(variable) = effective_index(variables).map(|index| &variables[index]) else {
+                continue;
+            };
+            let cleartext = if variable.is_encrypted {
+                self.encryption_service
+                    .decrypt_string(&variable.value)
+                    .map_err(|error| {
+                        ProjectError::Other(format!(
+                            "Failed to decrypt production environment variable '{}' while upgrading project {project_id}: {error}",
+                            variable.key
+                        ))
+                    })?
+            } else {
+                variable.value.clone()
+            };
+            if !cleartext.is_empty() {
+                configured_keys.insert(key.clone());
+            }
+        }
+
+        let definitions = target
+            .template
+            .env_vars
+            .iter()
+            .map(|definition| (definition.name.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let mut pending_keys = HashSet::new();
+        let mut pending_non_empty_keys = HashSet::new();
+        for variable in &new_environment_variables {
+            if !pending_keys.insert(variable.key.clone()) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Environment variable '{}' is supplied more than once for template upgrade",
+                    variable.key
+                )));
+            }
+            if !definitions.contains_key(variable.key.as_str()) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Environment variable '{}' is not declared by template {}@{}",
+                    variable.key, target.slug, target.version
+                )));
+            }
+            if !variable.value.is_empty() {
+                pending_non_empty_keys.insert(variable.key.clone());
+            }
+        }
+        for definition in target
+            .template
+            .env_vars
+            .iter()
+            .filter(|definition| definition.required)
+        {
+            if !configured_keys.contains(&definition.name)
+                && !pending_non_empty_keys.contains(&definition.name)
+            {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Required environment variable '{}' has no production value for template {}@{}",
+                    definition.name, target.slug, target.version
+                )));
+            }
+        }
+
+        // A newer release may classify an existing configuration key as a
+        // credential. Sensitivity is project/key-wide, so promote matching
+        // rows in every scope before the snapshot changes; never leave a
+        // preview/staging duplicate readable or demote an existing secret.
+        for definition in target
+            .template
+            .env_vars
+            .iter()
+            .filter(|definition| definition.is_secret())
+        {
+            for existing in existing_variables
+                .iter()
+                .filter(|variable| variable.key == definition.name && !variable.is_secret)
+            {
+                let mut active: env_vars::ActiveModel = existing.clone().into();
+                active.is_secret = Set(true);
+                active.update(&txn).await?;
+            }
+        }
+
+        for variable in new_environment_variables {
+            // A concurrent settings edit may have created the input after the
+            // upgrade preview. Preserve that user value instead of replacing
+            // it with a stale submitted/default value.
+            if configured_keys.contains(&variable.key) {
+                continue;
+            }
+            let definition = definitions.get(variable.key.as_str()).ok_or_else(|| {
+                ProjectError::InvalidInput(format!(
+                    "Environment variable '{}' is not declared by template {}@{}",
+                    variable.key, target.slug, target.version
+                ))
+            })?;
+            if variable.value.is_empty() && definition.required {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Required environment variable '{}' cannot be empty",
+                    variable.key
+                )));
+            }
+            let encrypted_value = self
+                .encryption_service
+                .encrypt_string(&variable.value)
+                .map_err(|error| {
+                    ProjectError::Other(format!(
+                        "Failed to encrypt environment variable '{}' while upgrading project {project_id}: {error}",
+                        variable.key
+                    ))
+                })?;
+            if let Some(existing_variables) = production_variables.get_mut(&variable.key) {
+                let existing_index = effective_index(existing_variables).ok_or_else(|| {
+                    ProjectError::Other(format!(
+                        "No effective production row found for environment variable '{}' while upgrading project {project_id}",
+                        variable.key
+                    ))
+                })?;
+                let existing = &mut existing_variables[existing_index];
+                let mut active: env_vars::ActiveModel = existing.clone().into();
+                active.value = Set(encrypted_value);
+                active.is_encrypted = Set(true);
+                active.is_secret =
+                    Set(existing.is_secret || variable.is_secret || definition.is_secret());
+                *existing = active.update(&txn).await?;
+                configured_keys.insert(variable.key);
+                continue;
+            }
+            let inserted = env_vars::ActiveModel {
+                project_id: Set(project_id),
+                environment_id: Set(None),
+                key: Set(variable.key.clone()),
+                value: Set(encrypted_value),
+                include_in_preview: Set(false),
+                is_encrypted: Set(true),
+                is_secret: Set(variable.is_secret || definition.is_secret()),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await?;
+            env_var_environments::ActiveModel {
+                env_var_id: Set(inserted.id),
+                environment_id: Set(production_environment.id),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await?;
+            configured_keys.insert(variable.key);
+        }
+
+        let target_json = serde_json::to_value(&target).map_err(|error| {
+            ProjectError::Other(format!(
+                "Failed to persist target service template {}@{} for project {project_id}: {error}",
+                target.slug, target.version
+            ))
+        })?;
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.project_type = Set(ProjectType::Service);
+        active_project.template_slug = Set(Some(target.slug));
+        active_project.service_template = Set(Some(target_json));
+        active_project.preset_config = Set(Some(preset_config));
+        active_project.deployment_config = Set(Some(deployment_config));
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
+
+        if let Err(error) = self
+            .queue_service
+            .send(Job::ProjectUpdated(ProjectUpdatedJob {
+                project_id: updated_project.id,
+                project_name: updated_project.name.clone(),
+            }))
+            .await
+        {
+            warn!(
+                project_id = updated_project.id,
+                %error,
+                "Failed to emit ProjectUpdated after service-template upgrade"
+            );
+        }
+
+        Ok(self.map_written_project(updated_project).await)
     }
 
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
     /// Slug is truncated to 40 chars max to keep DNS labels within the 63-char limit
     /// when combined with environment slug and service name prefix.
     pub async fn generate_unique_project_slug(&self, name: &str) -> Result<String, ProjectError> {
-        let mut base_slug = slugify(name);
-        // Truncate to 40 chars max (leaves room for "-production" env slug + "service-" prefix
-        // within the 63-char DNS label limit)
-        if base_slug.len() > 40 {
-            base_slug = base_slug[..40].trim_end_matches('-').to_string();
-        }
+        let base_slug = base_project_slug(name);
 
         // First, try the base slug
         let existing = projects::Entity::find()
@@ -2439,12 +4420,131 @@ impl ProjectService {
         }
     }
 
-    pub fn map_db_project_to_project(db_project: projects::Model) -> Project {
+    pub async fn plan_project_slug(&self, name: &str) -> Result<String, ProjectError> {
+        let validated_name = validate_project_name(name)?;
+        self.generate_unique_project_slug(&validated_name).await
+    }
+
+    async fn validate_expected_project_slug(
+        &self,
+        name: &str,
+        expected_slug: &str,
+    ) -> Result<(), ProjectError> {
+        let base_slug = base_project_slug(name);
+        let suffix = expected_slug
+            .strip_prefix(&format!("{base_slug}-"))
+            .filter(|suffix| matches!(suffix.len(), 6 | 8))
+            .filter(|suffix| suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        if expected_slug != base_slug && suffix.is_none() {
+            return Err(ProjectError::InvalidInput(format!(
+                "Expected slug '{expected_slug}' does not match project name '{name}'"
+            )));
+        }
+        let exists = projects::Entity::find()
+            .filter(projects::Column::Slug.eq(expected_slug))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| ProjectError::DatabaseError {
+                reason: format!(
+                    "failed to validate expected project slug '{expected_slug}': {error}"
+                ),
+            })?
+            .is_some();
+        if exists {
+            return Err(ProjectError::SlugConflict {
+                slug: expected_slug.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// LEFT JOIN each project to the provider behind its Git connection and
+    /// select that provider's type as one extra column.
+    ///
+    /// Neither hop can fan a project out into several rows (both are
+    /// many-to-one), so this changes the row count of no query it is applied
+    /// to, and it never needs a second round trip to fill the field in.
+    fn with_git_provider_type(
+        select: sea_orm::Select<projects::Entity>,
+    ) -> sea_orm::Select<projects::Entity> {
+        select
+            .join(
+                sea_orm::JoinType::LeftJoin,
+                projects::Relation::GitProviderConnection.def(),
+            )
+            .join(
+                sea_orm::JoinType::LeftJoin,
+                git_provider_connections::Relation::Provider.def(),
+            )
+            .column_as(git_providers::Column::ProviderType, GIT_PROVIDER_TYPE_ALIAS)
+    }
+
+    fn map_db_project_row_to_project(row: ProjectWithGitProviderType) -> Project {
+        let mut project = Self::map_db_project_to_project(row.project);
+        project.git_provider_type = row.git_provider_type;
+        project
+    }
+
+    /// Build the client-facing `Project` for a row a mutation just wrote.
+    ///
+    /// Writes return an updated `projects::Model` rather than going back
+    /// through the joined read query, so the provider type is fetched here —
+    /// one primary-key lookup, and none at all for a project with no
+    /// connection. Answering a successful update with `git_provider_type:
+    /// null` would tell a client that a connected project has no provider, and
+    /// any client that trusts its own mutation response would downgrade a
+    /// GitLab project back to a guess until its next read.
+    ///
+    /// Deliberately infallible. This runs *after* the write has committed, and
+    /// it reads a display label — failing here would report a change the
+    /// database has already accepted as a failed request, and would skip the
+    /// `ProjectUpdated` job that several callers emit straight after this call,
+    /// leaving routes and notifications unaware of a change that did happen. A
+    /// lookup that fails is logged and leaves the field empty; the next read
+    /// fills it in.
+    async fn map_written_project(&self, db_project: projects::Model) -> Project {
+        let git_provider_type = match db_project.git_provider_connection_id {
+            None => None,
+            Some(connection_id) => {
+                match git_provider_connections::Entity::find_by_id(connection_id)
+                    .select_only()
+                    .column(git_providers::Column::ProviderType)
+                    .inner_join(git_providers::Entity)
+                    .into_tuple::<String>()
+                    .one(self.db.as_ref())
+                    .await
+                {
+                    Ok(provider_type) => provider_type,
+                    Err(e) => {
+                        warn!(
+                            "Failed to read the git provider type for connection {} of project {} \
+                             after a successful write; responding without it: {}",
+                            connection_id, db_project.id, e
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        let mut project = Self::map_db_project_to_project(db_project);
+        project.git_provider_type = git_provider_type;
+        project
+    }
+
+    /// Maps the project row alone, leaving `git_provider_type` empty.
+    ///
+    /// Private on purpose: every client-facing path must go through
+    /// `map_db_project_row_to_project` (joined read) or `map_written_project`
+    /// (mutation), so a new endpoint cannot quietly answer with "no provider"
+    /// for a connected project.
+    fn map_db_project_to_project(db_project: projects::Model) -> Project {
         // Extract deployment config fields
         let deployment_config = db_project.deployment_config.clone();
 
-        // Convert preset enum to string for backwards compatibility
-        let preset_str = format!("{:?}", db_project.preset).to_lowercase();
+        // Convert preset to the runtime/UI slug (reconstructs nixpacks-{provider})
+        let preset_str =
+            temps_presets::runtime_slug(db_project.preset, db_project.preset_config.as_ref());
 
         // Handle repo_name and repo_owner - return None for empty strings (Git-less projects)
         let repo_name = if db_project.repo_name.is_empty() {
@@ -2464,6 +4564,18 @@ impl ProjectService {
             .as_ref()
             .and_then(|config| serde_json::to_value(config).ok());
 
+        let service_template = db_project.service_template.as_ref().and_then(|snapshot| {
+            serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+                snapshot.clone(),
+            )
+            .ok()
+            .filter(|instance| instance.validate().is_ok())
+        });
+        let service_template_image_url = service_template
+            .as_ref()
+            .and_then(|instance| instance.template.image_url.clone());
+        let service_template_version = service_template.map(|instance| instance.version);
+
         Project {
             id: db_project.id,
             slug: db_project.slug,
@@ -2473,6 +4585,9 @@ impl ProjectService {
             directory: db_project.directory,
             main_branch: db_project.main_branch,
             preset: Some(preset_str),
+            template_slug: db_project.template_slug,
+            service_template_image_url,
+            service_template_version,
             preset_config: preset_config_json,
             created_at: db_project.created_at,
             updated_at: db_project.updated_at,
@@ -2489,29 +4604,34 @@ impl ProjectService {
                 .map(|c| c.performance_metrics_enabled)
                 .unwrap_or(false),
             last_deployment: db_project.last_deployment,
-            project_type: if db_project.preset == temps_entities::preset::Preset::Static {
-                "static".to_string()
-            } else {
-                "server".to_string()
-            },
+            project_type: db_project.project_type.to_string(),
             use_default_wildcard: true, // Deprecated field, always true
             custom_domain: None,        // Deprecated field, use project_domains table
             is_public_repo: db_project.is_public_repo,
             git_url: db_project.git_url,
             git_provider_connection_id: db_project.git_provider_connection_id,
+            // Lives on the connection's provider row, not on the project row,
+            // so it is filled in by the caller: `map_db_project_row_to_project`
+            // from the joined read query, or `map_written_project` after a
+            // mutation. Both are the only ways a `Project` reaches a client.
+            git_provider_type: None,
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
             ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
-            ai_debug_chat_enabled: db_project.ai_debug_chat_enabled,
-            ai_write_actions_enabled: db_project.ai_write_actions_enabled,
+            ai_api_traffic_summary_enabled: db_project.ai_api_traffic_summary_enabled,
+            error_source_context_enabled: db_project.error_source_context_enabled,
+            vulnerability_scanning_enabled: db_project.vulnerability_scanning_enabled,
+            error_source_root: db_project.error_source_root,
             enable_preview_environments: db_project.enable_preview_environments,
             preview_envs_on_demand: db_project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
+            allow_alternate_sources: db_project.allow_alternate_sources,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
+            image_retention_hours: db_project.image_retention_hours,
         }
     }
 
@@ -2532,9 +4652,10 @@ impl ProjectService {
         environment_ids: Vec<i32>,
         key: String,
         value: String,
+        is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, ProjectError> {
         self.env_var_service
-            .create_environment_variable(project_id, environment_ids, key, value)
+            .create_environment_variable(project_id, environment_ids, key, value, is_secret)
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))
     }
@@ -2738,18 +4859,26 @@ impl ProjectService {
                 "github"
             };
 
-            // Use authenticated token if available (avoids 60 req/hr rate limit)
-            let token = if provider_name == "github" {
-                self.git_provider_manager.get_any_github_token().await
-            } else {
-                None
-            };
+            // Public projects must never borrow a credential from an arbitrary
+            // provider connection. A repository that needs authentication must
+            // use the caller-owned connected-repository workflow instead.
+            let provider = PublicRepoProviderFactory::create(provider_name).map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to create public repo provider for {}: {}",
+                    provider_name, e
+                ))
+            })?;
 
-            let provider = PublicRepoProviderFactory::create_with_token(provider_name, token)
+            // A shared credential may be able to see private repositories.
+            // `is_public_repo` must never turn that credential into a private
+            // repository oracle, so verify visibility before reading branches.
+            provider
+                .get_repository(&project.repo_owner, &project.repo_name)
+                .await
                 .map_err(|e| {
                     ProjectError::Other(format!(
-                        "Failed to create public repo provider for {}: {}",
-                        provider_name, e
+                        "Failed to verify that repository {}/{} is public: {}",
+                        project.repo_owner, project.repo_name, e
                     ))
                 })?;
 
@@ -2835,10 +4964,605 @@ impl ProjectService {
     }
 }
 
+fn base_project_slug(name: &str) -> String {
+    let mut slug = slugify(name);
+    // Leave room for the production environment and service namespace within
+    // a single DNS label. This must stay identical for planning and creation.
+    if slug.chars().count() > 40 {
+        slug = slug.chars().take(40).collect::<String>();
+        slug.truncate(slug.trim_end_matches('-').len());
+    }
+    slug
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    #[test]
+    fn resolved_framework_and_nixpacks_presets_get_their_runtime_project_type() {
+        let vite = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Vite,
+            config: Some(temps_entities::preset::PresetConfig::Vite(
+                temps_entities::preset::ViteConfig::default(),
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&vite).expect("Vite is deployable"),
+            ProjectType::Static
+        );
+
+        let nixpacks_static = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Nixpacks,
+            config: Some(temps_entities::preset::PresetConfig::Nixpacks(
+                temps_entities::preset::NixpacksConfig {
+                    providers: vec![temps_entities::preset::NixpacksProvider::Static],
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&nixpacks_static)
+                .expect("static Nixpacks is deployable"),
+            ProjectType::Static
+        );
+
+        let nixpacks_auto = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Nixpacks,
+            config: Some(temps_entities::preset::PresetConfig::Nixpacks(
+                temps_entities::preset::NixpacksConfig::default(),
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&nixpacks_auto)
+                .expect("automatic Nixpacks is deployable"),
+            ProjectType::Server
+        );
+    }
+
+    #[test]
+    fn service_upgrade_replaces_only_an_unmodified_template_default() {
+        assert_eq!(
+            apply_new_template_default_when_unmodified(
+                "image:v1".to_string(),
+                "image:v1".to_string(),
+                "image:v2".to_string(),
+            ),
+            "image:v2"
+        );
+        assert_eq!(
+            apply_new_template_default_when_unmodified(
+                "registry.example/custom@sha256:123".to_string(),
+                "image:v1".to_string(),
+                "image:v2".to_string(),
+            ),
+            "registry.example/custom@sha256:123"
+        );
+    }
+
+    #[test]
+    fn production_template_upgrade_preserves_global_and_production_variables() {
+        let now = chrono::Utc::now();
+        let variable = |id: i32, key: &str, environment_id: Option<i32>| env_vars::Model {
+            id,
+            project_id: 7,
+            environment_id,
+            key: key.to_string(),
+            value: "encrypted".to_string(),
+            created_at: now,
+            updated_at: now,
+            include_in_preview: false,
+            is_encrypted: true,
+            is_secret: false,
+        };
+        let variables = vec![
+            variable(1, "GLOBAL", None),
+            variable(2, "PRODUCTION_JOIN", None),
+            variable(3, "PREVIEW_JOIN", None),
+            variable(4, "PRODUCTION_LEGACY", Some(20)),
+        ];
+        let links = vec![
+            env_var_environments::Model {
+                id: 1,
+                env_var_id: 2,
+                environment_id: 20,
+                created_at: now,
+            },
+            env_var_environments::Model {
+                id: 2,
+                env_var_id: 3,
+                environment_id: 21,
+                created_at: now,
+            },
+        ];
+
+        let keys = production_configured_variable_keys(&variables, &links, 20);
+
+        assert_eq!(
+            keys,
+            ["GLOBAL", "PRODUCTION_JOIN", "PRODUCTION_LEGACY"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    // ── tenant resource ceilings ─────────────────────────────────────────
+
+    /// The default ceilings are unenforced, so a project config that uses
+    /// every `0 = unlimited` sentinel must pass unchanged — this is what
+    /// "an upgrade changes nothing" means at the service layer.
+    #[test]
+    fn enforce_tenant_ceilings_is_a_noop_with_default_settings() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings::default();
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+
+    /// A configured ceiling rejects a violating config with an
+    /// `InvalidInput` whose message names every violation, not just the
+    /// first — the caller joins them with "; " for a single round trip.
+    #[test]
+    fn enforce_tenant_ceilings_rejects_violations_with_a_joined_message() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        let error = ProjectService::enforce_tenant_ceilings(&config, &app_settings)
+            .expect_err("values above the ceiling must be rejected");
+        match error {
+            ProjectError::InvalidInput(msg) => {
+                assert!(msg.contains("4096"), "got: {msg}");
+                assert!(msg.contains("200"), "got: {msg}");
+                assert!(msg.contains(';'), "expected violations joined, got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    /// A config within every configured ceiling is accepted.
+    #[test]
+    fn enforce_tenant_ceilings_accepts_values_within_the_ceiling() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(2048),
+            max_concurrent_connections: Some(100),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+
+    // ── git_url / repo identity consistency ─────────────────────────────
+
+    /// The failure this guards: the repo identity was changed through
+    /// `/settings`, the clone URL was left behind, and the next deploy
+    /// resolved a commit from the new repo while cloning the old one.
+    #[test]
+    fn test_repo_change_that_strands_git_url_is_detected() {
+        let url = Some("https://github.com/acme/old-repo.git".to_string());
+        let desync = would_desync_git_url(&url, ("acme", "old-repo"), (None, Some("new-repo")));
+
+        let (old, new) = desync.expect("changing the name strands the URL");
+        assert_eq!(old, "acme/old-repo");
+        assert_eq!(new, "acme/new-repo");
+    }
+
+    /// Changing the owner counts too.
+    #[test]
+    fn test_owner_change_is_detected() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (Some("other"), None)).is_some());
+    }
+
+    /// No repo change means nothing to desync, whatever the URL looks like.
+    #[test]
+    fn test_no_repo_change_is_allowed() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (None, None)).is_none());
+        assert!(
+            would_desync_git_url(&url, ("acme", "app"), (Some("acme"), Some("app"))).is_none(),
+            "restating the same values is not a change"
+        );
+    }
+
+    /// A URL that doesn't identify the current repo can't be proven stale, so
+    /// the operator isn't blocked — self-hosted layouts and unusual remotes
+    /// must keep working.
+    #[test]
+    fn test_unrelated_or_unparsable_url_does_not_block() {
+        // Points somewhere that isn't the current repo: not our call to make.
+        let other = Some("https://git.internal/mirrors/vendored.git".to_string());
+        assert!(would_desync_git_url(&other, ("acme", "app"), (None, Some("app2"))).is_none());
+
+        // No URL at all.
+        assert!(would_desync_git_url(&None, ("acme", "app"), (None, Some("app2"))).is_none());
+    }
+
+    /// ssh remotes and missing `.git` must match the same way https does,
+    /// or the guard would fire on projects it shouldn't.
+    #[test]
+    fn test_matching_is_scheme_and_suffix_insensitive() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://github.com/ACME/App.git",
+        ] {
+            assert!(
+                would_desync_git_url(
+                    &Some(url.to_string()),
+                    ("acme", "app"),
+                    (None, Some("app2"))
+                )
+                .is_some(),
+                "should recognise {url} as the current repo"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_matching_database_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["db".to_string()],
+            compose_services: vec![
+                ComposeServiceSnapshot {
+                    name: "db".to_string(),
+                    image: Some("postgres:18".to_string()),
+                    looks_like_database: true,
+                    ..Default::default()
+                },
+                ComposeServiceSnapshot {
+                    name: "web".to_string(),
+                    image: Some("nginx".to_string()),
+                    looks_like_database: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_non_database_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        // The fix isn't database-specific — e.g. Gitea's own official image
+        // hits the identical `chown: ... Operation not permitted` failure at
+        // startup, confirmed live. The toggle (and this validation) is
+        // available for any real service in the compose file, not just ones
+        // flagged looks_like_database.
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["web".to_string()],
+            compose_services: vec![
+                ComposeServiceSnapshot {
+                    name: "db".to_string(),
+                    image: Some("postgres:18".to_string()),
+                    looks_like_database: true,
+                    ..Default::default()
+                },
+                ComposeServiceSnapshot {
+                    name: "web".to_string(),
+                    image: Some("gitea/gitea:latest".to_string()),
+                    looks_like_database: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_rejects_unknown_service_name() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["nonexistent".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "db".to_string(),
+                image: Some("postgres:18".to_string()),
+                looks_like_database: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_when_snapshot_empty() {
+        use temps_entities::preset::DockerComposeConfig;
+
+        // No compose_services snapshot yet (e.g. before the first deploy) —
+        // nothing to validate against, so don't block a legitimate first-time
+        // setup.
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["db".to_string()],
+            compose_services: vec![],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_allows_known_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["webserver".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                image: Some("ghcr.io/paperless-ngx/paperless-ngx:latest".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_unsandboxed_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_rejects_unknown_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["unknown".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error.to_string().contains("not a recognized service"));
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_rejects_elevated_overlap() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["webserver".to_string()],
+            unsandboxed_services: vec!["webserver".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot use both elevated permissions and a disabled sandbox"));
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_requires_recognized_snapshot() {
+        use temps_entities::preset::DockerComposeConfig;
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["webserver".to_string()],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("before Compose services have been recognized"));
+    }
+
+    #[test]
+    fn test_partial_compose_patch_preserves_unsandboxed_services() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+
+        let existing = PresetConfig::DockerCompose(DockerComposeConfig {
+            compose_path: Some("compose.yml".to_string()),
+            unsandboxed_services: vec!["webserver".to_string()],
+            ..Default::default()
+        });
+        let parsed = PresetConfig::DockerCompose(DockerComposeConfig {
+            excluded_services: vec!["db".to_string()],
+            ..Default::default()
+        });
+
+        let merged = merge_preset_config(
+            Some(&existing),
+            parsed,
+            &serde_json::json!({ "excludedServices": ["db"] }),
+            true,
+        );
+
+        match merged {
+            PresetConfig::DockerCompose(cfg) => {
+                assert_eq!(cfg.compose_path.as_deref(), Some("compose.yml"));
+                assert_eq!(cfg.excluded_services, ["db"]);
+                assert_eq!(cfg.unsandboxed_services, ["webserver"]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_dockerfile_patch_preserves_service_image_runtime() {
+        use temps_entities::preset::{DockerfileConfig, ImageRuntimeConfig, PresetConfig};
+
+        let runtime = ImageRuntimeConfig {
+            image_ref: "registry.example.test/app:1".to_string(),
+            command: Some(vec!["serve".to_string()]),
+            health_check_path: Some("/ready".to_string()),
+        };
+        let existing = PresetConfig::Dockerfile(DockerfileConfig {
+            image_runtime: Some(runtime.clone()),
+            ..Default::default()
+        });
+        let parsed = PresetConfig::Dockerfile(DockerfileConfig {
+            target: Some("runner".to_string()),
+            ..Default::default()
+        });
+
+        let merged = merge_preset_config(
+            Some(&existing),
+            parsed,
+            &serde_json::json!({ "target": "runner" }),
+            true,
+        );
+
+        match merged {
+            PresetConfig::Dockerfile(config) => {
+                assert_eq!(config.target.as_deref(), Some("runner"));
+                assert_eq!(config.image_runtime, Some(runtime));
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preset_selection_rejects_unknown_unsandboxed_service() {
+        let config = serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [{ "name": "webserver", "image": "paperless:latest" }],
+            "unsandboxedServices": ["unknown"]
+        });
+
+        let error = resolve_preset_selection("docker-compose", Some(&config), None).unwrap_err();
+
+        assert!(error.to_string().contains("not a recognized service"));
+    }
+
+    #[test]
+    fn test_preset_selection_rejects_overlapping_security_modes() {
+        let config = serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [{ "name": "webserver", "image": "paperless:latest" }],
+            "relaxedCapabilityServices": ["webserver"],
+            "unsandboxedServices": ["webserver"]
+        });
+
+        let error = resolve_preset_selection("docker-compose", Some(&config), None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot use both elevated permissions and a disabled sandbox"));
+    }
+
+    #[test]
+    fn validate_compose_public_ports_rejects_duplicate_unknown_and_disabled_services() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+
+        let route = |service: &str| ComposePublicPort {
+            service: service.to_string(),
+            port: 80,
+            published: Some(15_455),
+            health_check_path: None,
+        };
+        let base = DockerComposeConfig {
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "web".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let duplicate = DockerComposeConfig {
+            public_ports: vec![route("web"), route("web")],
+            ..base.clone()
+        };
+        assert!(validate_compose_public_ports(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("only one public URL"));
+
+        let unknown = DockerComposeConfig {
+            public_ports: vec![route("missing")],
+            ..base.clone()
+        };
+        assert!(validate_compose_public_ports(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown service"));
+
+        let disabled = DockerComposeConfig {
+            public_ports: vec![route("web")],
+            excluded_services: vec!["web".to_string()],
+            ..base
+        };
+        assert!(validate_compose_public_ports(&disabled)
+            .unwrap_err()
+            .to_string()
+            .contains("disabled and public"));
+    }
+
+    #[test]
+    fn validate_compose_public_ports_accepts_target_and_published_mapping() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+        let cfg = DockerComposeConfig {
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 80,
+                published: Some(15_455),
+                health_check_path: None,
+            }],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "web".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_compose_public_ports(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_compose_public_ports_rejects_absolute_health_urls() {
+        use temps_entities::preset::{ComposePublicPort, DockerComposeConfig};
+        let cfg = DockerComposeConfig {
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 80,
+                health_check_path: Some("https://attacker.example/ready".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_compose_public_ports(&cfg).expect_err("absolute URL must fail");
+        assert!(error.to_string().contains("safe relative HTTP path"));
+    }
+
     use std::sync::Arc;
     use std::sync::Mutex;
     use temps_core::async_trait::async_trait;
@@ -2938,6 +5662,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_project_deletion_persists_idempotent_deployment_fence() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deleting Project".to_string()),
+            slug: Set("deleting-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        service.begin_project_deletion(project.id).await.unwrap();
+        service.begin_project_deletion(project.id).await.unwrap();
+
+        let fenced = temps_entities::projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project remains until container cleanup completes");
+        assert!(fenced.is_deleted);
+        assert!(fenced.deleted_at.is_some());
+    }
+
+    /// Opting a Git project into alternate sources must leave everything that
+    /// makes it a Git project intact. If `source_type` flipped here, the
+    /// project would lose rollback rebuild-from-source (which keys off
+    /// `source_type == Git` in temps-deployments) while still looking fine.
+    #[tokio::test]
+    async fn allowing_alternate_sources_preserves_git_configuration() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Flexible Project".to_string()),
+            slug: Set("flexible-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(project.allow_alternate_sources, None, "defaults to off");
+
+        let opted_in = service
+            .set_allow_alternate_sources(project.id, true)
+            .await
+            .unwrap();
+
+        assert_eq!(opted_in.allow_alternate_sources, Some(true));
+        assert_eq!(
+            opted_in.source_type,
+            temps_entities::source_type::SourceType::Git,
+            "the project must remain git-sourced"
+        );
+        assert_eq!(opted_in.repo_owner.as_deref(), Some("owner"));
+        assert_eq!(opted_in.repo_name.as_deref(), Some("repo"));
+        assert_eq!(opted_in.main_branch, "main");
+
+        // And it must be reversible, without disturbing git config either.
+        let opted_out = service
+            .set_allow_alternate_sources(project.id, false)
+            .await
+            .unwrap();
+        assert_eq!(opted_out.allow_alternate_sources, Some(false));
+        assert_eq!(
+            opted_out.source_type,
+            temps_entities::source_type::SourceType::Git
+        );
+        assert_eq!(opted_out.repo_owner.as_deref(), Some("owner"));
+    }
+
+    /// The console draws a provider logo for each project. Before this, it had
+    /// nothing authoritative to draw it from and guessed from the clone URL —
+    /// which reports GitHub for every project whose URL is missing, and for
+    /// self-hosted instances whose hostname doesn't happen to spell out the
+    /// vendor. A GitLab-connected project must report GitLab.
+    #[tokio::test]
+    async fn connected_projects_report_the_provider_they_are_linked_to() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        // Self-hosted GitLab on a hostname that says nothing about the vendor,
+        // and a project connected to it that stores no clone URL at all.
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("Internal Git".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(Some("https://code.example.internal".to_string())),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connection = temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("platform-team".to_string()),
+            account_type: Set("Organization".to_string()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connected = temps_entities::projects::ActiveModel {
+            name: Set("Connected Project".to_string()),
+            slug: Set("connected-project".to_string()),
+            repo_name: Set("api".to_string()),
+            repo_owner: Set("platform-team".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_url: Set(None),
+            git_provider_connection_id: Set(Some(connection.id)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let standalone = temps_entities::projects::ActiveModel {
+            name: Set("Image Project".to_string()),
+            slug: Set("image-project".to_string()),
+            repo_name: Set("image".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_provider_connection_id: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let fetched = service.get_project(connected.id).await.unwrap();
+        assert_eq!(fetched.git_provider_type.as_deref(), Some("gitlab"));
+
+        let by_slug = service
+            .get_project_by_slug("connected-project")
+            .await
+            .unwrap();
+        assert_eq!(by_slug.git_provider_type.as_deref(), Some("gitlab"));
+
+        // A project with no connection has no provider to report — it must stay
+        // empty rather than fall back to a guess.
+        let unconnected = service.get_project(standalone.id).await.unwrap();
+        assert_eq!(unconnected.git_provider_type, None);
+
+        // The dashboard list carries the provider in the same query.
+        let (listed, total) = service
+            .get_projects_paginated_excluding_search(1, 100, &[], None)
+            .await
+            .unwrap();
+        let matching = |id: i32| listed.iter().filter(move |project| project.id == id);
+        let listed_connected = matching(connected.id)
+            .next()
+            .expect("connected project is listed");
+        let listed_standalone = matching(standalone.id)
+            .next()
+            .expect("standalone project is listed");
+        assert_eq!(
+            listed_connected.git_provider_type.as_deref(),
+            Some("gitlab")
+        );
+        assert_eq!(listed_standalone.git_provider_type, None);
+
+        // The provider join must not fan a project out into several rows, and
+        // must not drift from the count query, which stays join-free.
+        assert_eq!(matching(connected.id).count(), 1, "no duplicate rows");
+        assert_eq!(
+            total,
+            listed.len() as i64,
+            "count query and page agree once the provider join is in the page query"
+        );
+
+        // A write answers with the provider too. A client that trusts its own
+        // mutation response would otherwise downgrade a connected project to
+        // "no provider" until its next read.
+        let after_write = service
+            .set_allow_alternate_sources(connected.id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_write.git_provider_type.as_deref(),
+            Some("gitlab"),
+            "an update response must not drop the connected provider"
+        );
+
+        let after_write_unconnected = service
+            .set_allow_alternate_sources(standalone.id, true)
+            .await
+            .unwrap();
+        assert_eq!(after_write_unconnected.git_provider_type, None);
+    }
+
+    #[tokio::test]
     async fn test_update_project_emits_event() {
         // Setup test database
         let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -2967,6 +5914,7 @@ mod tests {
         // Update the project
         let update_request = CreateProjectRequest {
             name: "Updated Test Project".to_string(),
+            expected_slug: None,
             repo_name: None,
             repo_owner: None,
             directory: "/".to_string(),
@@ -2978,9 +5926,16 @@ mod tests {
             git_provider_connection_id: None,
             automatic_deploy: false,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         let result = project_service
@@ -3000,6 +5955,362 @@ mod tests {
             }
             _ => panic!("Expected ProjectUpdated job"),
         }
+    }
+
+    /// Renaming must change only the display name — the slug is the routing
+    /// identifier, and a rename that silently moved a project's URL would break
+    /// every domain already pointing at it.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_without_touching_slug() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Old Name".to_string()),
+            slug: Set("rename-keeps-slug".to_string()),
+            repo_name: Set("rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  New Display Name  ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename should succeed");
+
+        // The service reports the transition it actually performed — both ends
+        // captured under one lock — so the audit never has to infer it from a
+        // racy read-before-write, nor splice two requests' renames together.
+        let rename = updated.rename.as_ref().expect("a rename was performed");
+        assert_eq!(rename.from, "Old Name");
+        assert_eq!(rename.to, "New Display Name");
+
+        let updated = updated.project;
+
+        // Trimmed, persisted, and the slug is exactly as it was.
+        assert_eq!(updated.name, "New Display Name");
+        assert_eq!(updated.slug, "rename-keeps-slug");
+
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "New Display Name");
+        assert_eq!(reloaded.slug, "rename-keeps-slug");
+    }
+
+    /// The rename can also travel inside the git-settings transaction, which is
+    /// a separate implementation from the tail path above: it mutates a
+    /// pre-lock ActiveModel and takes the row lock afterwards. Cover it, and
+    /// assert the accompanying git change commits alongside the rename.
+    #[tokio::test]
+    async fn test_update_project_settings_renames_alongside_git_settings() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Before Git Rename".to_string()),
+            slug: Set("rename-with-git".to_string()),
+            repo_name: Set("git-rename-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rename-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // `main_branch` makes `needs_git_update` true, routing the rename
+        // through the git-settings transaction rather than the tail path.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  After Git Rename  ".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename alongside git settings should succeed");
+
+        let rename = updated
+            .rename
+            .as_ref()
+            .expect("the git path must report the rename it performed");
+        assert_eq!(rename.from, "Before Git Rename");
+        assert_eq!(rename.to, "After Git Rename");
+        assert_eq!(updated.project.name, "After Git Rename");
+
+        // Both halves of the transaction committed together.
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(stored.name, "After Git Rename");
+        assert_eq!(stored.main_branch, "develop");
+        assert_eq!(stored.slug, "rename-with-git");
+    }
+
+    /// Validation of the accompanying git settings happens before the rename is
+    /// staged, so a request that renames *and* sends an unusable preset leaves
+    /// the name untouched. (Failures after the rename is staged are covered by
+    /// the slug-conflict test, which exercises the rollback itself.)
+    #[tokio::test]
+    async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep This Name".to_string()),
+            slug: Set("rename-git-rollback".to_string()),
+            repo_name: Set("git-rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("git-rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    preset: Some("definitely-not-a-real-preset".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(_))),
+            "an unknown preset should fail validation, not something unrelated"
+        );
+
+        let stored = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            stored.name, "Keep This Name",
+            "a request rejected during validation must not have renamed anything"
+        );
+    }
+
+    /// Re-submitting the name a project already has performs no write, so the
+    /// service must report no rename — otherwise the audit records a transition
+    /// that never happened.
+    #[tokio::test]
+    async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Unchanged Name".to_string()),
+            slug: Set("rename-noop".to_string()),
+            repo_name: Set("noop-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("noop-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        // Whitespace that trims back to the stored name is still a no-op.
+        let updated = project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    name: Some("  Unchanged Name  ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("no-op rename should succeed");
+
+        assert!(
+            updated.rename.is_none(),
+            "a no-op rename must not report a transition"
+        );
+        assert_eq!(updated.project.name, "Unchanged Name");
+    }
+
+    /// A request that renames *and* fails on something else must not leave the
+    /// rename behind: the endpoint reporting an error while the project silently
+    /// kept a new name is exactly the kind of half-applied write a self-hosted
+    /// operator has no way to diagnose.
+    #[tokio::test]
+    async fn test_update_project_settings_rename_does_not_persist_when_slug_conflicts() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // The project we will try to rename...
+        let target = temps_entities::projects::ActiveModel {
+            name: Set("Original Name".to_string()),
+            slug: Set("rename-rollback-target".to_string()),
+            repo_name: Set("rollback-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rollback-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let target = target.insert(db.as_ref()).await.unwrap();
+
+        // ...and a second project already holding the slug we will collide with.
+        let occupier = temps_entities::projects::ActiveModel {
+            name: Set("Occupier".to_string()),
+            slug: Set("rename-rollback-taken".to_string()),
+            repo_name: Set("occupier-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("occupier-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        occupier.insert(db.as_ref()).await.unwrap();
+
+        let result = project_service
+            .update_project_settings(
+                target.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Renamed Before Failure".to_string()),
+                    slug: Some("rename-rollback-taken".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProjectError::SlugAlreadyExists(_))),
+            "conflicting slug should be rejected"
+        );
+
+        let reloaded = projects::Entity::find_by_id(target.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(
+            reloaded.name, "Original Name",
+            "rename must not survive a failed request"
+        );
+        assert_eq!(reloaded.slug, "rename-rollback-target");
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_blank_and_overlong_names() {
+        // create_test_services needs a Docker daemon; skip rather than fail
+        // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Keep Me".to_string()),
+            slug: Set("rename-validation".to_string()),
+            repo_name: Set("rename-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("rename-validation".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        };
+        let inserted_project = project.insert(db.as_ref()).await.unwrap();
+
+        for candidate in ["   ".to_string(), "x".repeat(101)] {
+            let result = project_service
+                .update_project_settings(
+                    inserted_project.id,
+                    UpdateProjectSettingsParams {
+                        name: Some(candidate.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ProjectError::InvalidInput(_))),
+                "name {:?} should be rejected as invalid input",
+                candidate
+            );
+        }
+
+        // A rejected rename must not have partially applied.
+        let reloaded = projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project should still exist");
+        assert_eq!(reloaded.name, "Keep Me");
     }
 
     #[tokio::test]
@@ -3033,23 +6344,12 @@ mod tests {
         let result = project_service
             .update_project_settings(
                 inserted_project.id,
-                Some("new-slug".to_string()),
-                None,
-                Some("develop".to_string()),
-                None,
-                None,
-                Some(Preset::Nixpacks.to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // cross_project_trace_sharing
+                UpdateProjectSettingsParams {
+                    slug: Some("new-slug".to_string()),
+                    main_branch: Some("develop".to_string()),
+                    preset: Some(Preset::Nixpacks.to_string()),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -3099,6 +6399,7 @@ mod tests {
         // Update the project name
         let update_request = CreateProjectRequest {
             name: "Event Data Test Updated".to_string(),
+            expected_slug: None,
             repo_name: None,
             repo_owner: None,
             directory: "/".to_string(),
@@ -3108,11 +6409,18 @@ mod tests {
             environment_variables: None,
             automatic_deploy: false,
             storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: None,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         project_service
@@ -3139,6 +6447,71 @@ mod tests {
     /// `ExternalServiceManager`. When Docker isn't available locally
     /// (CI without docker-in-docker, dev machines without daemon) skip
     /// rather than failing — matches the `cargo test` discipline in CLAUDE.md.
+    /// Pins an assumption the git-settings path depends on: it builds its
+    /// `ActiveModel` from a project snapshot loaded *before* the transaction's
+    /// row lock, so if `update()` wrote back every column of that snapshot, an
+    /// unrelated concurrent change would be silently lost.
+    ///
+    /// It does not: `Model -> ActiveModel` marks columns `Unchanged`, and
+    /// `update()` emits a SET clause containing only the columns explicitly
+    /// `Set`. This test exists because that is a Sea-ORM behaviour rather than
+    /// something visible in our code — if it ever changed, the git-settings path
+    /// would start clobbering concurrent writes with no other signal.
+    #[tokio::test]
+    async fn test_partial_update_does_not_clobber_concurrent_columns() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+
+        let inserted = temps_entities::projects::ActiveModel {
+            name: Set("Probe Original".to_string()),
+            slug: Set("probe-stale-snapshot".to_string()),
+            repo_name: Set("probe-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("probe-dir".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // A stale snapshot, taken before the "concurrent" write below.
+        let stale = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Concurrent, unrelated update: someone else changes attack_mode.
+        let mut other: projects::ActiveModel = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        other.attack_mode = Set(true);
+        other.update(db.as_ref()).await.unwrap();
+
+        // Now write the stale snapshot back, setting only `directory`.
+        let mut from_stale: projects::ActiveModel = stale.into();
+        from_stale.directory = Set("probe-dir-changed".to_string());
+        from_stale.update(db.as_ref()).await.unwrap();
+
+        let final_row = projects::Entity::find_by_id(inserted.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(final_row.directory, "probe-dir-changed");
+        assert!(
+            final_row.attack_mode,
+            "LOST UPDATE: the stale snapshot clobbered the concurrent attack_mode change"
+        );
+    }
+
     async fn docker_available() -> bool {
         match bollard::Docker::connect_with_local_defaults() {
             Ok(d) => d.ping().await.is_ok(),
@@ -3146,9 +6519,406 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let old_runtime = temps_entities::preset::ImageRuntimeConfig {
+            image_ref: "quay.io/keycloak/keycloak:26.7.2".to_string(),
+            command: Some(vec!["start".to_string()]),
+            health_check_path: Some("/realms/master".to_string()),
+        };
+        let applied = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("keycloak")
+                .expect("bundled Keycloak release"),
+        );
+        let project = projects::ActiveModel {
+            name: Set("Template runtime".to_string()),
+            slug: Set("template-runtime".to_string()),
+            repo_name: Set(String::new()),
+            repo_owner: Set(String::new()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Dockerfile),
+            preset_config: Set(Some(temps_entities::preset::PresetConfig::Dockerfile(
+                temps_entities::preset::DockerfileConfig {
+                    image_runtime: Some(old_runtime.clone()),
+                    ..Default::default()
+                },
+            ))),
+            deployment_config: Set(Some(temps_entities::deployment_config::DeploymentConfig {
+                cpu_request: Some(500_000),
+                memory_request: Some(512),
+                exposed_port: Some(8080),
+                ..Default::default()
+            })),
+            source_type: Set(temps_entities::source_type::SourceType::DockerImage),
+            project_type: Set(ProjectType::Service),
+            template_slug: Set(Some(applied.slug.clone())),
+            service_template: Set(Some(
+                serde_json::to_value(applied).expect("serialize applied service release"),
+            )),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_service_template_runtime(
+                project.id,
+                UpdateServiceTemplateRuntimeRequest {
+                    image_ref: "quay.io/keycloak/keycloak:27.0.0".to_string(),
+                    command: Vec::new(),
+                    health_check_path: "/ready".to_string(),
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    exposed_port: None,
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+
+        let updated = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) =
+            updated.preset_config.as_ref()
+        else {
+            panic!("expected Dockerfile config");
+        };
+        let runtime = config.image_runtime.as_ref().unwrap();
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.command, None);
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
+        let deployment_config = updated.deployment_config.as_ref().unwrap();
+        assert_eq!(deployment_config.cpu_request, None);
+        assert_eq!(deployment_config.memory_request, None);
+        assert_eq!(deployment_config.exposed_port, None);
+
+        let invalid = project_service
+            .update_service_template_runtime(
+                project.id,
+                UpdateServiceTemplateRuntimeRequest {
+                    image_ref: "quay.io/keycloak/keycloak:99.0.0".to_string(),
+                    command: vec!["start".to_string()],
+                    health_check_path: "https://attacker.example".to_string(),
+                    cpu_request: Some(750_000),
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    exposed_port: Some(9090),
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await;
+        assert!(matches!(invalid, Err(ProjectError::InvalidInput(_))));
+
+        let unchanged = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) =
+            unchanged.preset_config.as_ref()
+        else {
+            panic!("expected Dockerfile config");
+        };
+        assert_eq!(
+            config.image_runtime.as_ref().unwrap().image_ref,
+            "quay.io/keycloak/keycloak:27.0.0"
+        );
+        assert_eq!(unchanged.deployment_config.unwrap().exposed_port, None);
+    }
+
+    #[tokio::test]
+    async fn service_template_upgrade_persists_release_and_preserves_runtime_overrides() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut applied = temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("browserless")
+                .expect("bundled Browserless release"),
+        );
+        applied
+            .template
+            .env_vars
+            .push(temps_core::templates::EnvVarTemplate {
+                name: "OPTIONAL_SETTING".to_string(),
+                example: None,
+                default: None,
+                description: Some("Becomes required and sensitive in the next release".to_string()),
+                required: false,
+                secret: false,
+                default_generator: None,
+            });
+        let mut request = create_request("Browserless upgrade");
+        request.preset = Preset::Dockerfile.to_string();
+        request.source_type = temps_entities::source_type::SourceType::DockerImage;
+        request.template_slug = Some(applied.slug.clone());
+        request.preset_config = Some(
+            serde_json::to_value(temps_entities::preset::PresetConfig::Dockerfile(
+                temps_entities::preset::DockerfileConfig {
+                    image_runtime: Some(temps_entities::preset::ImageRuntimeConfig {
+                        // User customization: an upgrade must not replace this.
+                        image_ref: "registry.example/browserless-custom:7".to_string(),
+                        command: applied.template.command.clone(),
+                        health_check_path: applied.template.health_check_path.clone(),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .expect("Dockerfile config serialization"),
+        );
+        request.exposed_port = applied.template.exposed_port;
+        request.cpu_request = applied
+            .template
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.cpu_request);
+        request.cpu_limit = applied
+            .template
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.cpu_limit);
+        request.memory_request = applied
+            .template
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.memory_request);
+        request.memory_limit = applied
+            .template
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.memory_limit);
+        request.environment_variables = Some(vec![
+            CreateProjectEnvVar {
+                key: "TOKEN".to_string(),
+                value: "existing-secret".to_string(),
+                is_secret: true,
+            },
+            CreateProjectEnvVar {
+                key: "EXTERNAL".to_string(),
+                value: "https://browser.example.test".to_string(),
+                is_secret: false,
+            },
+            CreateProjectEnvVar {
+                key: "CONCURRENT".to_string(),
+                value: "2".to_string(),
+                is_secret: false,
+            },
+            CreateProjectEnvVar {
+                key: "OPTIONAL_SETTING".to_string(),
+                value: String::new(),
+                is_secret: false,
+            },
+        ]);
+
+        let created = project_service
+            .create_service_project(request, applied.clone())
+            .await
+            .expect("service project creation");
+        assert_eq!(
+            created.service_template_image_url,
+            applied.template.image_url.clone()
+        );
+        assert_eq!(
+            created.service_template_version.as_deref(),
+            Some(applied.version.as_str())
+        );
+        let stored = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.project_type, ProjectType::Service);
+        assert_eq!(
+            applied_service_template_from_model(&stored)
+                .unwrap()
+                .version,
+            applied.version
+        );
+
+        // A legacy/global fallback can coexist with a production-scoped row.
+        // The production row remains authoritative even when empty, and every
+        // applicable duplicate must be promoted if the template later marks
+        // the key sensitive.
+        let encrypted_global = project_service
+            .encryption_service
+            .encrypt_string("global-readable")
+            .expect("encrypt global fallback");
+        env_vars::ActiveModel {
+            project_id: Set(created.id),
+            environment_id: Set(None),
+            key: Set("OPTIONAL_SETTING".to_string()),
+            value: Set(encrypted_global),
+            include_in_preview: Set(false),
+            is_encrypted: Set(true),
+            is_secret: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert global duplicate");
+        let production_environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(created.id))
+            .filter(environments::Column::IsPreview.eq(false))
+            .one(db.as_ref())
+            .await
+            .expect("query production environment")
+            .expect("production environment");
+        let mut preview_environment: environments::ActiveModel = production_environment.into();
+        preview_environment.id = sea_orm::NotSet;
+        preview_environment.name = Set("Preview".to_string());
+        preview_environment.slug = Set("preview-secret-promotion".to_string());
+        preview_environment.subdomain = Set("preview-secret-promotion".to_string());
+        preview_environment.host = Set("preview-secret-promotion.localho.st".to_string());
+        preview_environment.branch = Set(Some("preview-secret-promotion".to_string()));
+        preview_environment.is_preview = Set(true);
+        preview_environment.current_deployment_id = Set(None);
+        preview_environment.last_deployment = Set(None);
+        let preview_environment = preview_environment
+            .insert(db.as_ref())
+            .await
+            .expect("insert preview environment");
+        let encrypted_preview = project_service
+            .encryption_service
+            .encrypt_string("preview-readable")
+            .expect("encrypt preview value");
+        env_vars::ActiveModel {
+            project_id: Set(created.id),
+            environment_id: Set(Some(preview_environment.id)),
+            key: Set("OPTIONAL_SETTING".to_string()),
+            value: Set(encrypted_preview),
+            include_in_preview: Set(true),
+            is_encrypted: Set(true),
+            is_secret: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert preview duplicate");
+
+        let mut target = applied.clone();
+        target.version = "1.1.0".to_string();
+        target.template.version = target.version.clone();
+        target.template.image = Some(
+            "ghcr.io/browserless/chromium@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+        );
+        target.template.exposed_port = Some(3100);
+        target.template.health_check_path = Some("/ready".to_string());
+        target.template.resources.as_mut().unwrap().memory_limit = Some(2_560);
+        let promoted_definition = target
+            .template
+            .env_vars
+            .iter_mut()
+            .find(|definition| definition.name == "OPTIONAL_SETTING")
+            .expect("optional setting definition");
+        promoted_definition.required = true;
+        promoted_definition.secret = true;
+
+        let missing_value = project_service
+            .upgrade_service_template(
+                created.id,
+                target.clone(),
+                Vec::new(),
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await;
+        assert!(matches!(missing_value, Err(ProjectError::InvalidInput(_))));
+
+        project_service
+            .upgrade_service_template(
+                created.id,
+                target.clone(),
+                vec![CreateProjectEnvVar {
+                    key: "OPTIONAL_SETTING".to_string(),
+                    value: "configured-after-upgrade".to_string(),
+                    is_secret: false,
+                }],
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .expect("same-family template upgrade");
+
+        let upgraded = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = applied_service_template_from_model(&upgraded).unwrap();
+        assert_eq!(snapshot.version, "1.1.0");
+        assert_eq!(snapshot, target);
+        let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) =
+            upgraded.preset_config.as_ref()
+        else {
+            panic!("expected Dockerfile config");
+        };
+        let runtime = config.image_runtime.as_ref().unwrap();
+        assert_eq!(
+            runtime.image_ref, "registry.example/browserless-custom:7",
+            "a user-pinned image must survive a catalog default change"
+        );
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
+        let deployment = upgraded.deployment_config.unwrap();
+        assert_eq!(deployment.exposed_port, Some(3100));
+        assert_eq!(deployment.memory_limit, Some(2_560));
+        let promoted = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(created.id))
+            .filter(env_vars::Column::Key.eq("OPTIONAL_SETTING"))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            promoted.len() == 3 && promoted.iter().all(|variable| variable.is_secret),
+            "upgrade must protect every project-scoped duplicate"
+        );
+        let values = promoted
+            .iter()
+            .map(|variable| {
+                project_service
+                    .encryption_service
+                    .decrypt_string(&variable.value)
+                    .expect("decrypt promoted value")
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            values,
+            [
+                "configured-after-upgrade",
+                "global-readable",
+                "preview-readable",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+    }
+
     fn create_request(name: &str) -> CreateProjectRequest {
         CreateProjectRequest {
             name: name.to_string(),
+            expected_slug: None,
             repo_name: Some("repo".to_string()),
             repo_owner: Some("owner".to_string()),
             directory: "/".to_string(),
@@ -3160,9 +6930,166 @@ mod tests {
             git_provider_connection_id: None,
             automatic_deploy: false,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
+        }
+    }
+
+    #[test]
+    fn curated_template_resources_override_project_defaults() {
+        let mut request = create_request("Keycloak");
+        request.exposed_port = Some(8080);
+        request.cpu_request = Some(500_000);
+        request.cpu_limit = Some(1_000_000);
+        request.memory_request = Some(512);
+        request.memory_limit = Some(1_536);
+
+        let config = initial_deployment_config(&request);
+
+        assert_eq!(config.exposed_port, Some(8080));
+        assert_eq!(config.cpu_request, Some(500_000));
+        assert_eq!(config.cpu_limit, Some(1_000_000));
+        assert_eq!(config.memory_request, Some(512));
+        assert_eq!(config.memory_limit, Some(1_536));
+    }
+
+    #[test]
+    fn service_upgrade_may_add_but_not_remap_managed_service_bindings() {
+        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("bundled Keycloak release");
+        let mut target = applied.clone();
+        target
+            .managed_service_bindings
+            .entry("postgres".to_string())
+            .or_default()
+            .insert("NEW_ALIAS".to_string(), "POSTGRES_HOST".to_string());
+        validate_service_binding_compatibility(&applied, &target)
+            .expect("adding a managed-service alias is rollback-safe");
+
+        let existing_alias = applied
+            .managed_service_bindings
+            .get_mut("postgres")
+            .and_then(|bindings| bindings.keys().next().cloned())
+            .expect("Keycloak declares a PostgreSQL binding");
+        target
+            .managed_service_bindings
+            .get_mut("postgres")
+            .expect("target PostgreSQL bindings")
+            .insert(existing_alias, "REMAPPED_SOURCE".to_string());
+        assert!(matches!(
+            validate_service_binding_compatibility(&applied, &target),
+            Err(ProjectError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn service_upgrade_cannot_remove_required_service_without_custom_bindings() {
+        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("bundled Keycloak release");
+        applied.managed_service_bindings.clear();
+        let mut target = applied.clone();
+        target.services.clear();
+
+        assert!(matches!(
+            validate_service_binding_compatibility(&applied, &target),
+            Err(ProjectError::InvalidInput(_))
+        ));
+    }
+
+    async fn insert_search_test_project(
+        db: &temps_database::DbConnection,
+        name: &str,
+        slug: &str,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set(name.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set(slug.to_string()),
+            repo_owner: Set("search-tests".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert search test project")
+    }
+
+    #[tokio::test]
+    async fn project_search_is_case_insensitive_bounded_and_honors_hidden_projects() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let alpha = insert_search_test_project(db.as_ref(), "Acme Alpha", "alpha").await;
+        let beta = insert_search_test_project(db.as_ref(), "ACME Beta", "beta").await;
+        let slug_match = insert_search_test_project(db.as_ref(), "Gamma", "Special-SLUG").await;
+        let hidden = insert_search_test_project(db.as_ref(), "Acme Secret", "acme-secret").await;
+        insert_search_test_project(db.as_ref(), "Unrelated", "unrelated").await;
+        let literal_wildcard =
+            insert_search_test_project(db.as_ref(), "Percent%Project", "percent-project").await;
+
+        let (first_page, total) = service
+            .get_projects_paginated_excluding_search(1, 1, &[hidden.id], Some("aCmE"))
+            .await
+            .expect("mixed-case name search");
+        let (second_page, second_total) = service
+            .get_projects_paginated_excluding_search(2, 1, &[hidden.id], Some("ACME"))
+            .await
+            .expect("second filtered page");
+
+        assert_eq!(
+            total, 2,
+            "filtered total must omit hidden and unrelated rows"
+        );
+        assert_eq!(second_total, 2);
+        let visible_ids = [first_page[0].id, second_page[0].id];
+        assert!(visible_ids.contains(&alpha.id));
+        assert!(visible_ids.contains(&beta.id));
+        assert!(!visible_ids.contains(&hidden.id));
+
+        let (slug_results, slug_total) = service
+            .get_projects_paginated_excluding_search(1, 25, &[], Some("special-slug"))
+            .await
+            .expect("mixed-case slug search");
+        assert_eq!(slug_total, 1);
+        assert_eq!(slug_results[0].id, slug_match.id);
+
+        let (literal_results, literal_total) = service
+            .get_projects_paginated_excluding_search(1, 25, &[], Some("%"))
+            .await
+            .expect("LIKE wildcard characters are treated literally");
+        assert_eq!(literal_total, 1);
+        assert_eq!(literal_results[0].id, literal_wildcard.id);
+
+        for result in [
+            service
+                .get_projects_paginated_excluding_search(0, 25, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(1, 0, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(1, 101, &[], None)
+                .await,
+            service
+                .get_projects_paginated_excluding_search(i64::MAX, 100, &[], None)
+                .await,
+        ] {
+            assert!(matches!(result, Err(ProjectError::InvalidInput(_))));
         }
     }
 
@@ -3217,6 +7144,1075 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_project_applies_resource_profile_to_default_environment() {
+        use temps_entities::environments;
+
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Keycloak Resources");
+        request.cpu_request = Some(500_000);
+        request.memory_request = Some(512);
+        request.memory_limit = Some(1_536);
+
+        let project = project_service
+            .create_project(request)
+            .await
+            .expect("project with curated resources should be created");
+
+        let production = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("production environment should exist");
+        let config = production
+            .deployment_config
+            .expect("production should inherit the project's resource profile");
+
+        assert_eq!(config.cpu_request, Some(500_000));
+        assert_eq!(config.memory_request, Some(512));
+        assert_eq!(config.memory_limit, Some(1_536));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_persists_curated_template_provenance() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Observability Starter");
+        request.template_slug = Some("observability-starter".to_string());
+
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("template project creation should succeed");
+        let persisted = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .expect("template project query should succeed")
+            .expect("template project should exist");
+
+        assert_eq!(
+            persisted.template_slug.as_deref(),
+            Some("observability-starter")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+        let mut request = create_request("Custom Template");
+        request.template_slug =
+            Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+
+        let error = match project_service.create_project(request).await {
+            Ok(_) => panic!("oversized template slug must be rejected before insertion"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::InvalidInput(message) if message.contains("255")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_nixpacks_node_stores_provider_and_returns_runtime_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut request = create_request("Nixpacks Node App");
+        request.preset = "nixpacks-node".to_string();
+
+        let result = project_service
+            .create_project(request)
+            .await
+            .expect("create with nixpacks-node should succeed");
+
+        // API/UI surface reconstructs the provider-specific slug
+        assert_eq!(result.preset.as_deref(), Some("nixpacks-node"));
+
+        let row = projects::Entity::find_by_id(result.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+
+        // Persistable column stays the single Nixpacks enum variant
+        assert_eq!(row.preset, Preset::Nixpacks);
+
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+            }
+            other => panic!("expected Nixpacks preset_config with providers=[node], got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_unknown_nixpacks_provider_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut request = create_request("Bad Nixpacks");
+        request.preset = "nixpacks-not-a-real-provider".to_string();
+
+        match project_service.create_project(request).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("nixpacks-not-a-real-provider"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("unknown nixpacks provider slug must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_project_leaving_nixpacks_clears_stale_preset_config() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Leave Nixpacks");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let mut update = create_request("Leave Nixpacks");
+        update.preset = "nextjs".to_string();
+        let updated = project_service
+            .update_project(created.id, update)
+            .await
+            .expect("switch to nextjs");
+
+        assert_eq!(updated.preset.as_deref(), Some("nextjs"));
+        assert!(
+            updated.preset_config.is_none(),
+            "stale Nixpacks preset_config must be cleared, got {:?}",
+            updated.preset_config
+        );
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        assert_eq!(row.preset, Preset::NextJs);
+        assert!(row.preset_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_partial_preset_config_patch_preserves_nixpacks_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Preserve Provider");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("partial preset_config patch")
+            .project;
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+                assert_eq!(cfg.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected Nixpacks config with providers=[node], got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_preset_config_patch_preserves_docker_compose_fields() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Preserve Compose Fields");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
+                {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // A settings patch must not wipe Compose fields already captured at
+        // project creation.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
+                        "excludedServices": ["postgres"]
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("partial excludedServices patch")
+            .project;
+
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.compose_path, Some("compose.yml".to_string()));
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+                assert_eq!(cfg.compose_services.len(), 2);
+                assert_eq!(cfg.compose_services[0].name, "postgres");
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // A patch touching only relaxedCapabilityServices must not wipe the
+        // other DockerCompose fields either — same bug class, new field.
+        // "postgres" is still present and looksLikeDatabase in the snapshot
+        // at this point, so the server-side database-service check passes.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["postgres"] }),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("partial relaxedCapabilityServices patch")
+            .project;
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+                // Still preserved from the earlier patch.
+                assert_eq!(cfg.compose_services.len(), 2);
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // A patch explicitly replacing composeServices to drop "postgres"
+        // entirely must still succeed even though it leaves
+        // relaxedCapabilityServices pointing at a service that no longer
+        // exists in the new snapshot — this patch doesn't touch that field,
+        // so the server-side database-service check must not re-run against
+        // the now-stale reference and wedge the update.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
+                    "composeServices": [
+                        {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
+                    ]
+                })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices")
+            .project;
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.compose_services.len(), 1);
+                assert_eq!(cfg.compose_services[0].name, "hub");
+                // excludedServices was omitted from this patch too, so it must
+                // still survive from the previous update.
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+                // relaxedCapabilityServices survives too, even though it now
+                // references a service absent from the new snapshot.
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // And a subsequent unrelated patch must not wipe (or re-reject)
+        // relaxedCapabilityServices either.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "excludedServices": [] })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unrelated excludedServices patch")
+            .project;
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relaxed_capability_services_allows_non_database_service_via_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Allow Non-DB Relax");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
+                {"name": "gitea", "image": "gitea/gitea:latest", "looksLikeDatabase": false}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // "gitea" is a real service in the snapshot and not flagged
+        // looksLikeDatabase, but the fix isn't database-specific (confirmed
+        // live: Gitea's own official image hits the identical ownership-fix
+        // failure at startup) — the toggle must accept any real service.
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["gitea"] }),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("relaxedCapabilityServices patch for a real non-database service")
+            .project;
+        assert_eq!(result.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.relaxed_capability_services, vec!["gitea".to_string()]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relaxed_capability_services_rejects_phantom_service_via_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Reject Phantom Relax");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // A name that doesn't correspond to any service in the compose file
+        // at all — typo or a fabricated API request — must still be
+        // rejected.
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(
+                        serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] }),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(ProjectError::InvalidInput(_))));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert!(cfg.relaxed_capability_services.is_empty());
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_empty_providers_resets_nixpacks_to_auto() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Clear Provider");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": [] })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit empty providers")
+            .project;
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert!(cfg.providers.is_empty());
+            }
+            other => panic!("expected Nixpacks config without providers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_project_base_nixpacks_resets_provider_and_preserves_toml() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let mut create = create_request("Reset Through Full Update");
+        create.preset = "nixpacks-node".to_string();
+        create.preset_config = Some(serde_json::json!({ "nixpacksConfig": toml }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node project");
+
+        let mut update = create_request("Reset Through Full Update");
+        update.preset = "nixpacks".to_string();
+        let updated = project_service
+            .update_project(created.id, update)
+            .await
+            .expect("select base nixpacks");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected base Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_config_rejects_unknown_provider() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Reject Invalid Provider"))
+            .await
+            .expect("create nixpacks project");
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "providers": ["not-real"] })),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("not-real"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid provider must be rejected"),
+        }
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(project_service.db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+            }
+            other => panic!("expected unchanged Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_create() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let mut request = create_request("Invalid Nixpacks TOML");
+        request.preset_config = Some(serde_json::json!({
+            "nixpacksConfig": "secret_token = [\"do-not-echo\""
+        }));
+        let result = project_service.create_project(request).await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+                assert!(
+                    !message.contains("do-not-echo"),
+                    "validation errors must not echo inline config contents"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_git_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Git Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_git_settings(
+                created.id,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_config_only_settings_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Settings Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset_config: Some(serde_json::json!({
+                        "dockerfilePath": "Dockerfile.updated"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update custom Dockerfile config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_config_only_git_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Git Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_git_settings(
+                created.id,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({
+                    "dockerfilePath": "Dockerfile.updated"
+                })),
+                None,
+                None,
+            )
+            .await
+            .expect("update custom Dockerfile Git config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_supports_multiple_ordered_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Multiple Providers");
+        request.preset_config = Some(serde_json::json!({
+            "providers": ["...", "python"]
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create multi-provider Nixpacks project");
+
+        assert_eq!(created.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_settings_persist_multiple_ordered_nixpacks_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Git Settings Providers"))
+            .await
+            .expect("create project");
+        let updated = project_service
+            .update_git_settings(
+                created.id,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                Some("nixpacks".to_string()),
+                ".".to_string(),
+                Some(serde_json::json!({ "providers": ["...", "python"] })),
+                None,
+                None,
+            )
+            .await
+            .expect("update git settings");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preset_and_config_update_use_effective_new_preset() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Atomic Preset Update");
+        request.preset = "nextjs".to_string();
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create nextjs project");
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                UpdateProjectSettingsParams {
+                    preset: Some("nixpacks-node".to_string()),
+                    preset_config: Some(serde_json::json!({ "nixpacksConfig": toml })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update preset and config together")
+            .project;
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected updated Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_project_with_duplicate_name_gets_suffixed_slug() {
         if !docker_available().await {
             println!("Docker not available, skipping");
@@ -3231,8 +8227,14 @@ mod tests {
             .create_project(create_request("Duplicate Name"))
             .await
             .expect("first create should succeed");
+        let planned_slug = project_service
+            .plan_project_slug("Duplicate Name")
+            .await
+            .expect("slug planning should succeed");
+        let mut second_request = create_request("Duplicate Name");
+        second_request.expected_slug = Some(planned_slug.clone());
         let second = project_service
-            .create_project(create_request("Duplicate Name"))
+            .create_project(second_request)
             .await
             .expect("second create with same name should succeed with suffixed slug");
 
@@ -3243,6 +8245,22 @@ mod tests {
             second.slug
         );
         assert_ne!(first.id, second.id);
+        assert_eq!(second.slug, planned_slug);
+    }
+
+    #[test]
+    fn planned_slug_base_matches_creation_truncation() {
+        let slug = base_project_slug(
+            "This project name is deliberately much longer than the DNS allocation permits",
+        );
+        assert!(slug.len() <= 40);
+        assert!(slug.starts_with("this-project-name-is-deliberately"));
+    }
+
+    #[test]
+    fn planned_slug_truncation_is_safe_for_unicode_names() {
+        let slug = base_project_slug(&"é".repeat(50));
+        assert_eq!(slug.chars().count(), 40);
     }
 
     #[tokio::test]
@@ -3361,5 +8379,364 @@ mod tests {
 
         let err = sea_orm::DbErr::Custom("connection refused".to_string());
         assert!(!super::super::types::is_unique_violation(&err));
+    }
+
+    // ── Regression test: git provider connections are installation-scoped ───
+    //
+    // Connections belong to the installation (workspace-wide), not to the
+    // user who created them — a GitHub App installation is inherently
+    // shared, and PAT connections are meant to be usable by any project
+    // maintainer, not gated to their creator. update_git_settings must not
+    // reject a connection just because a different user created it; access
+    // to the project itself is what `permission_guard!`/`project_scope_guard!`
+    // already enforce in the handler.
+
+    #[tokio::test]
+    async fn test_update_git_settings_allows_connection_created_by_different_user() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        use temps_entities::{git_provider_connections, git_providers, users};
+        let creator = users::ActiveModel {
+            email: Set("git-connection-creator@example.com".to_string()),
+            name: Set("Connection Creator".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Create a git provider (required FK for connections).
+        let provider = git_providers::ActiveModel {
+            name: Set("Scoping Test Provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("oauth".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Connection created by `creator` — a different caller must still be
+        // able to attach it to a project they have write access to.
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(creator.id)),
+            account_name: Set("creator-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Scoping Test Project".to_string()),
+            slug: Set("scoping-test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let result = project_service
+            .update_git_settings(
+                project.id,
+                Some(connection.id),
+                "main".to_string(),
+                "test-owner".to_string(),
+                "test-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // The connection lookup itself must succeed regardless of who
+        // created it — GitProviderConnectionNotFound must not fire here.
+        // (The call may still fail later, e.g. verifying the branch against
+        // a real git host, which this test doesn't stub.)
+        assert!(
+            !matches!(
+                result,
+                Err(ProjectError::GitProviderConnectionNotFound { .. })
+            ),
+            "connection created by a different user was rejected; connections must be installation-scoped, not user-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_normalizes_blank_directory() {
+        // Regression: saving project settings with an empty "Base directory"
+        // used to persist "" verbatim, after which every deployment failed with
+        // "directory must be a non-empty relative path (got '')".
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Blank Dir Project".to_string()),
+            slug: Set("blank-dir-project".to_string()),
+            repo_name: Set("blank-dir-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("apps/web".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    main_branch: Some("main".to_string()),
+                    directory: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update_project_settings should succeed");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.directory, ".",
+            "a blank directory must be stored as the repo-root marker, not \"\""
+        );
+    }
+
+    /// `ImageRetentionSettings::effective_default_hours` clamps an
+    /// out-of-range *global* default instead of failing (see
+    /// `test_out_of_range_operator_setting_is_clamped` in
+    /// `docker_cleanup_service`). The *per-project* override validated here
+    /// is a different, intentional behavior: it rejects rather than clamps,
+    /// because it comes straight from an operator-typed API/CLI/form value
+    /// rather than a settings row an admin edited once.
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_out_of_range_image_retention_hours() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Retention Validation Project".to_string()),
+            slug: Set("retention-validation-project".to_string()),
+            repo_name: Set("retention-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let update_with_hours = |hours: i32| {
+            project_service.update_project_settings(
+                inserted_project.id,
+                UpdateProjectSettingsParams {
+                    image_retention_hours: Some(Some(hours)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let below_range = update_with_hours(0).await;
+        assert!(
+            matches!(below_range, Err(ProjectError::InvalidInput(_))),
+            "0 hours must be rejected, not clamped"
+        );
+
+        let above_range = update_with_hours(8761).await;
+        assert!(
+            matches!(above_range, Err(ProjectError::InvalidInput(_))),
+            "8761 hours must be rejected, not clamped"
+        );
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.image_retention_hours, None,
+            "a rejected update must never reach the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_git_settings_normalizes_blank_directory() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Blank Git Dir Project".to_string()),
+            slug: Set("blank-git-dir-project".to_string()),
+            repo_name: Set("blank-git-dir-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("apps/web".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                None,
+                "main".to_string(),
+                "test-owner".to_string(),
+                "blank-git-dir-repo".to_string(),
+                None,
+                "/".to_string(), // absolute root, equally invalid downstream
+                None,
+                Some("https://github.com/test-owner/blank-git-dir-repo".to_string()),
+                Some(true),
+            )
+            .await
+            .expect("update_git_settings should succeed");
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.directory, ".");
+    }
+
+    #[tokio::test]
+    async fn changing_compose_public_ports_requests_a_route_reload() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Compose route reload".to_string()),
+            slug: Set("compose-route-reload".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            preset_config: Set(Some(temps_entities::preset::PresetConfig::DockerCompose(
+                temps_entities::preset::DockerComposeConfig {
+                    public_ports: vec![temps_entities::preset::ComposePublicPort {
+                        service: "web".to_string(),
+                        port: 80,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({
+                    "publicPorts": [{ "service": "web", "port": 8080 }]
+                })),
+                None,
+                None,
+            )
+            .await
+            .expect("compose port save should succeed");
+
+        let jobs = mock_queue.get_jobs().await;
+        assert!(jobs.iter().any(|job| matches!(
+            job,
+            Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            })
+        )));
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [`InternalApiCaller`] — executes API calls via Axum router replay.
 //!
 //! ## How it works
@@ -25,7 +28,8 @@
 use crate::{
     error::ApiToolError,
     index::{
-        ApiOperation, OperationSchema, OperationSummary, ParamLocation, ParamSpec, ReadOnlyApiIndex,
+        ApiOperation, ObjectShape, OperationSchema, OperationSummary, ParamLocation, ParamSpec,
+        ReadOnlyApiIndex,
     },
 };
 use axum::body::Body;
@@ -41,7 +45,7 @@ use tracing::{debug, warn};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// The authentication + project-scoping context for a single tool invocation.
+/// The authentication + optional project context for a single tool invocation.
 /// This is supplied by the substrate adapter (OSS `ChatTool`, EE rig `Tool`),
 /// never derived from anything the model says.
 #[derive(Debug, Clone)]
@@ -49,10 +53,30 @@ pub struct ApiCallScope {
     /// Resolved auth context for the caller.  This is inserted into the Axum
     /// request extensions so the router's `permission_guard!` can evaluate it.
     pub auth: AuthContext,
-    /// Accessible project IDs for this caller in this turn.  Used for the
-    /// client-side project-scope guard in [`build_request_parts`].
-    /// Empty means "no project constraint" (admin-level calls).
-    pub project_ids: Vec<i32>,
+    /// How project selectors are constrained for this call. Global operations
+    /// are unaffected and always inherit authorization from `auth`.
+    pub project_scope: ProjectSelectorScope,
+}
+
+/// Independent policy for project selectors embedded in API operations.
+///
+/// `Allowed([])` deliberately denies every project-specific operation. Global
+/// workspace chats use `Unrestricted`: the synthetic request still carries the
+/// current user's `AuthContext`, and each routed handler remains the authority
+/// for both RBAC and project membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectSelectorScope {
+    Unrestricted,
+    Allowed(Vec<i32>),
+}
+
+impl ProjectSelectorScope {
+    fn allowed_ids(&self) -> Option<&[i32]> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Allowed(project_ids) => Some(project_ids),
+        }
+    }
 }
 
 /// The result of the pure param-routing step.
@@ -162,10 +186,12 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///   regardless of their (often-unreliable) `required` flag; the real router is
 ///   the source of truth and returns a real 4xx if needed.
 /// - **Enum check**: `ApiToolError::BadEnum` if a value is not in `param.enum_values`.
-/// - **Project scoping**: if a param is named `project_id` (exact match) and
-///   `allowed_project_ids` is non-empty, the value is validated ∈
-///   `allowed_project_ids`.  If the param is absent and `allowed_project_ids.len() == 1`,
-///   it is auto-filled with the single accessible project.
+/// - **Project context**: when `allowed_project_ids` is non-empty and the
+///   operation exposes a recognized project selector, that selector is
+///   validated against the allowed set and auto-filled when exactly one project
+///   is allowed. Operations without a project selector remain available: their
+///   authorization is evaluated by the real router using the authenticated
+///   user's current role and permissions.
 /// - **Limit injection**: if a param named `limit` exists in the operation:
 ///   - absent → `default_limit` is injected.
 ///   - present → clamped to `[1, max_limit]`.
@@ -174,8 +200,8 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///
 /// - `op`: the operation whose params define the routing rules.
 /// - `params`: a flat JSON object `{"param_name": value, …}`.
-/// - `allowed_project_ids`: the caller's accessible project IDs (from
-///   [`ApiCallScope::project_ids`]).  Empty slice = no constraint applied.
+/// - `allowed_project_ids`: legacy convenience scope. An empty slice is
+///   unrestricted; a non-empty slice constrains project selectors.
 /// - `default_limit`: default page size to inject when `limit` is absent.
 /// - `max_limit`: upper bound that `limit` is clamped to.
 pub fn build_request_parts(
@@ -185,7 +211,111 @@ pub fn build_request_parts(
     default_limit: i64,
     max_limit: i64,
 ) -> Result<BuiltRequest, ApiToolError> {
+    let project_scope = if allowed_project_ids.is_empty() {
+        ProjectSelectorScope::Unrestricted
+    } else {
+        ProjectSelectorScope::Allowed(allowed_project_ids.to_vec())
+    };
+    build_request_parts_scoped(op, params, &project_scope, default_limit, max_limit)
+}
+
+/// Policy-aware request builder used by chat tool calls. Unlike the public
+/// convenience wrapper, this preserves `Allowed([])` as an explicit deny-all
+/// project-selector boundary for an application with no selected project.
+fn build_request_parts_scoped(
+    op: &ApiOperation,
+    params: &Value,
+    project_scope: &ProjectSelectorScope,
+    default_limit: i64,
+    max_limit: i64,
+) -> Result<BuiltRequest, ApiToolError> {
+    let allowed_project_ids = project_scope.allowed_ids();
     let params_obj = params.as_object();
+
+    // Pre-pass: reject parameters this operation does not have.
+    //
+    // Silently ignoring them is the dangerous option. A near-miss on a filter
+    // name (`--metric` for `--metric_name`) used to produce a 200 carrying the
+    // *unfiltered* result — an average across every metric in the project,
+    // which looks like a real number and is not. A wrong answer that cannot be
+    // distinguished from a right one is worse than no answer, so this fails
+    // loudly and says nothing was queried.
+    if let Some(obj) = params_obj {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !op.params.iter().any(|p| p.name == *key))
+            .collect();
+        if !unknown.is_empty() {
+            let valid: Vec<&str> = op.params.iter().map(|p| p.name.as_str()).collect();
+            let described: Vec<String> = unknown
+                .iter()
+                .map(|key| match nearest_param(key, &valid) {
+                    Some(hint) => format!("'{key}' (did you mean '{hint}'?)"),
+                    None => format!("'{key}'"),
+                })
+                .collect();
+            return Err(ApiToolError::UnknownParams {
+                unknown: described.join(", "),
+                valid: valid.join(", "),
+                operation_id: op.operation_id.clone(),
+            });
+        }
+    }
+
+    // Pre-pass: report EVERY missing required parameter at once.
+    //
+    // The per-param loop below fails on the first one it meets, which reads fine
+    // to a human running a CLI but is expensive for a model: each failure costs a
+    // whole round, and the model only learns the next field's name by failing
+    // again. An operation with many required fields therefore burns its way
+    // through the tool loop's round cap discovering the signature one name at a
+    // time, and never reaches a valid call. Collecting them means one round.
+    //
+    // The rules mirror the loop exactly — auto-filled project selectors and the
+    // injected `limit` are not "missing", and absent query params are left to the
+    // router (OpenAPI required-ness is frequently wrong for those).
+    let missing: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|param| {
+            if params_obj
+                .and_then(|o| o.get(&param.name))
+                .is_some_and(|v| !v.is_null())
+            {
+                return false;
+            }
+            if is_project_scope_param(op, param)
+                && allowed_project_ids.is_some_and(|project_ids| project_ids.len() == 1)
+            {
+                return false; // auto-filled
+            }
+            if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
+                return false; // injected with a default
+            }
+            match param.location {
+                ParamLocation::Path => true,
+                ParamLocation::Body => param.required,
+                ParamLocation::Query => false,
+            }
+        })
+        .map(|param| param.name.as_str())
+        .collect();
+    match missing.as_slice() {
+        [] => {}
+        [name] => {
+            return Err(ApiToolError::MissingParam {
+                name: (*name).to_string(),
+                operation_id: op.operation_id.clone(),
+            });
+        }
+        _ => {
+            return Err(ApiToolError::MissingParams {
+                names: missing.join(", "),
+                operation_id: op.operation_id.clone(),
+            });
+        }
+    }
 
     let mut path = op.path.clone();
     let mut query_parts: Vec<String> = Vec::new();
@@ -197,7 +327,8 @@ pub fn build_request_parts(
         // `/projects/{id}/…` shape where the project's own path param is named
         // `id` (see `is_project_scope_param`) — so the model never has to supply
         // (or be asked for) a project id the chat is already scoped to.
-        let value = if is_project_scope_param(op, param) && !allowed_project_ids.is_empty() {
+        let value = if is_project_scope_param(op, param) && allowed_project_ids.is_some() {
+            let allowed_project_ids = allowed_project_ids.unwrap_or_default();
             let raw = params_obj.and_then(|o| o.get(&param.name));
             match raw {
                 Some(v) => {
@@ -225,16 +356,33 @@ pub fn build_request_parts(
                     v.clone()
                 }
                 None => {
+                    // An optional body-level project selector is an association,
+                    // not an operation scope. For example, create_service may
+                    // create a standalone database and optionally link it to a
+                    // project. With no single selected project, preserve the
+                    // API's omission semantics instead of inventing a mandatory
+                    // project requirement. Optional query selectors remain
+                    // constrained because omitting one can broaden a read across
+                    // projects outside an application context.
+                    if matches!(param.location, ParamLocation::Body) && !param.required {
+                        continue;
+                    }
                     if allowed_project_ids.len() == 1 {
                         // Auto-fill the single accessible project.
                         Value::Number(allowed_project_ids[0].into())
-                    } else if param.required {
-                        return Err(ApiToolError::MissingParam {
-                            name: param.name.clone(),
-                            operation_id: op.operation_id.clone(),
-                        });
                     } else {
-                        continue; // optional, absent, skip
+                        return Err(ApiToolError::ProjectSelectionRequired {
+                            operation_id: op.operation_id.clone(),
+                            allowed: if allowed_project_ids.is_empty() {
+                                "none".to_string()
+                            } else {
+                                allowed_project_ids
+                                    .iter()
+                                    .map(i32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            },
+                        });
                     }
                 }
             }
@@ -282,6 +430,19 @@ pub fn build_request_parts(
                 }
             }
         };
+
+        // Nested-object shape check. Only meaningful for body fields whose
+        // schema resolved to a known object shape; everything else is skipped.
+        if let Some(shape) = &param.object_shape {
+            if let Some(problem) = check_object_shape(&value, shape) {
+                return Err(ApiToolError::BadObjectShape {
+                    name: param.name.clone(),
+                    problem,
+                    expected: shape.describe(),
+                    operation_id: op.operation_id.clone(),
+                });
+            }
+        }
 
         // Enum membership check.
         if !param.enum_values.is_empty() {
@@ -407,6 +568,35 @@ impl InternalApiCaller {
         }
     }
 
+    /// Like [`Self::new_allowlisted`], but additionally indexes a separate,
+    /// explicitly-vetted set of **read-only `POST`** operations (`safe_posts`).
+    ///
+    /// See [`ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts`] for the
+    /// security rationale and the rule for what may be listed: an operation
+    /// belongs in `safe_posts` only if it has no side effects. Anything that
+    /// mutates must go through the propose-then-confirm write tool instead.
+    pub fn new_allowlisted_with_safe_posts(
+        router: axum::Router,
+        openapi: &utoipa::openapi::OpenApi,
+        allowlist: Vec<String>,
+        safe_posts: Vec<String>,
+    ) -> Self {
+        let allowlist_refs: Vec<&str> = allowlist.iter().map(|s| s.as_str()).collect();
+        let safe_post_refs: Vec<&str> = safe_posts.iter().map(|s| s.as_str()).collect();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            openapi,
+            &allowlist_refs,
+            &safe_post_refs,
+        );
+        Self {
+            router,
+            index,
+            default_limit: 20,
+            max_limit: 100,
+            max_response_bytes: 128 * 1024, // 128 KiB
+        }
+    }
+
     /// Construct a caller whose index contains ONLY the allowlisted write
     /// (`POST`/`PUT`/`PATCH`/`DELETE`) operation IDs.
     ///
@@ -467,6 +657,36 @@ impl InternalApiCaller {
     /// for injection into the chat system prompt.
     pub fn catalog(&self) -> String {
         self.index.catalog()
+    }
+
+    /// Deterministic catalogue of read operations visible to `auth`.
+    ///
+    /// Unlike the model-facing root help, this includes every operation so a
+    /// resumable provider session can be invalidated when an operation is
+    /// added, removed, or changes its method/path/description contract.
+    pub fn cli_read_catalog(&self, auth: &AuthContext) -> String {
+        let mut ops: Vec<&ApiOperation> = self
+            .index
+            .operations()
+            .iter()
+            .filter(|op| self.permitted(op, auth))
+            .collect();
+        ops.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+
+        let mut out = String::with_capacity(ops.len() * 96);
+        for op in ops {
+            out.push_str(&op.operation_id);
+            out.push('\t');
+            out.push_str(&op.method);
+            out.push('\t');
+            out.push_str(&op.path);
+            out.push('\t');
+            if let Some(description) = op.summary.as_deref().or(op.description.as_deref()) {
+                out.push_str(description.trim());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// The `operation_id`s actually resolved into this caller's index — i.e. the
@@ -605,10 +825,10 @@ impl InternalApiCaller {
             crate::cli::CliAction::Execute(op, params) => {
                 // Validate by running build_request_parts but discarding the
                 // built request — we only care whether it succeeds or errors.
-                match build_request_parts(
+                match build_request_parts_scoped(
                     op,
                     &params,
-                    &scope.project_ids,
+                    &scope.project_scope,
                     self.default_limit,
                     self.max_limit,
                 ) {
@@ -706,10 +926,10 @@ impl InternalApiCaller {
         );
 
         // Step 2: validate params and build path + query + optional body.
-        let built = build_request_parts(
+        let built = build_request_parts_scoped(
             op,
             &params,
-            &scope.project_ids,
+            &scope.project_scope,
             self.default_limit,
             self.max_limit,
         )?;
@@ -749,6 +969,14 @@ impl InternalApiCaller {
 
         // Inject the caller's AuthContext so permission_guard! can read it.
         req.extensions_mut().insert(scope.auth.clone());
+
+        // Mark the request as agent-originated. Authorization still comes from
+        // the AuthContext above; this only lets handlers apply gates that turn
+        // on *because* a model is the consumer — currently the per-service
+        // `ai_data_access` opt-in for reading table rows, which would otherwise
+        // send row contents to a third-party AI provider.
+        req.extensions_mut()
+            .insert(temps_core::ai_tool_call::AiToolCall);
 
         // Step 4: replay through the router.
         let response =
@@ -825,6 +1053,181 @@ impl InternalApiCaller {
             Some(perm) => auth.has_permission(&perm),
             None => true,
         }
+    }
+}
+
+/// Best guess at which valid parameter an unknown name was meant to be.
+///
+/// The near-misses that actually happen are prefixes and small typos
+/// (an abbreviated `metric`, or a pair of transposed characters), so a
+/// containment check plus a bounded edit distance covers them. Returns `None`
+/// rather than a bad guess when nothing is close — a wrong suggestion sends the
+/// caller further astray than none at all.
+fn nearest_param<'a>(unknown: &str, valid: &[&'a str]) -> Option<&'a str> {
+    let needle = unknown.to_ascii_lowercase();
+
+    // A name that is a prefix/substring of exactly one valid parameter is almost
+    // certainly it (the `--metric` / `--metric_name` case).
+    let contained: Vec<&&str> = valid
+        .iter()
+        .filter(|v| {
+            let v = v.to_ascii_lowercase();
+            v.contains(&needle) || needle.contains(&v)
+        })
+        .collect();
+    if let [only] = contained.as_slice() {
+        return Some(**only);
+    }
+
+    // Otherwise the closest by edit distance, accepting at most a third of the
+    // name being wrong so unrelated parameters are never suggested.
+    let budget = (needle.chars().count() / 3).max(1);
+    valid
+        .iter()
+        .map(|v| (edit_distance(&needle, &v.to_ascii_lowercase()), *v))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, v)| v)
+}
+
+/// Levenshtein distance, two-row variant (names here are short).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur = vec![0; b_chars.len() + 1];
+
+    for (i, ac) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, bc) in b_chars.iter().enumerate() {
+            let cost = usize::from(ac != *bc);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b_chars.len()]
+}
+
+/// Check an object-valued parameter against its schema shape.
+///
+/// Returns `Some(problem)` describing what is wrong, or `None` when the value
+/// is acceptable. This is a *shape* check, not full JSON Schema validation: it
+/// verifies the discriminator and the required keys, which is what separates a
+/// call that can possibly succeed from one that cannot. Type-checking
+/// fields whose schema metadata is available here as well, so a confirmation
+/// card never presents a request the router is guaranteed to reject.
+fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
+    let Some(obj) = value.as_object() else {
+        return Some(format!("expected a JSON object, got {}", json_kind(value)));
+    };
+
+    let fields = match &shape.discriminator {
+        Some(discriminator) => {
+            // Tagged union: the discriminator decides which fields apply, so it
+            // has to be present and recognised before anything else.
+            let Some(tag) = obj.get(discriminator) else {
+                return Some(format!("missing the '{discriminator}' discriminator"));
+            };
+            let Some(tag) = tag.as_str() else {
+                return Some(format!("'{discriminator}' must be a string"));
+            };
+            let Some(fields) = shape.fields_for(Some(tag)) else {
+                let mut known: Vec<&str> = shape.variants.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                return Some(format!(
+                    "'{discriminator}' is '{tag}', which is not one of: {}",
+                    known.join(", ")
+                ));
+            };
+            fields
+        }
+        None => shape.fields_for(None)?,
+    };
+
+    let missing: Vec<&str> = fields
+        .iter()
+        .filter(|f| f.required && obj.get(&f.name).is_none_or(serde_json::Value::is_null))
+        .map(|f| f.name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!("missing key(s): {}", missing.join(", ")));
+    }
+
+    // Type and enum checks on what WAS supplied. Presence alone is not enough:
+    // a quoted number (`"0.5"` for an f64) and a plausible-but-wrong enum
+    // spelling (`">"` where the schema wants `gt`) are both present, both
+    // fatal, and both indistinguishable from correct until the API rejects
+    // them.
+    for field in fields {
+        let Some(supplied) = obj.get(&field.name) else {
+            continue; // optional and absent
+        };
+        if supplied.is_null() {
+            continue;
+        }
+        if !field.enum_values.is_empty() {
+            let ok = supplied
+                .as_str()
+                .is_some_and(|v| field.enum_values.iter().any(|allowed| allowed == v));
+            if !ok {
+                return Some(format!(
+                    "'{}' is {}, which is not one of: {}",
+                    field.name,
+                    render_value(supplied),
+                    field.enum_values.join(", ")
+                ));
+            }
+            continue;
+        }
+        if !json_matches_type(supplied, &field.ty) {
+            return Some(format!(
+                "'{}' is {}, expected {}",
+                field.name,
+                render_value(supplied),
+                field.ty
+            ));
+        }
+    }
+    None
+}
+
+/// Does a JSON value satisfy a short JSON Schema type name?
+///
+/// Deliberately permissive in one direction only: an integer is accepted where
+/// a number is wanted (`300` for an f64 is fine), but a *string* is never
+/// accepted for a number even when it would parse. Quoting a number is the
+/// exact mistake this catches, and silently accepting it would just move the
+/// failure back to the API.
+fn json_matches_type(value: &Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        // "any" or an unrecognised type — nothing to assert.
+        _ => true,
+    }
+}
+
+/// Render a supplied value compactly for an error message, so the caller can
+/// see that it sent `"0.5"` rather than `0.5`.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("the string \"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// Name a JSON value's kind, for error messages.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -932,6 +1335,9 @@ pub(crate) fn required_write_permission(op: &ApiOperation) -> Option<Permission>
             "DELETE" => Permission::DomainsDelete,
             _ => Permission::DomainsWrite,
         }
+    } else if tag.contains("alert") {
+        // Metric alert create/update/delete routes share the OTel write gate.
+        Permission::OtelWrite
     } else {
         // Unknown / unsupported domain — show it (router still guards).
         return None;
@@ -1011,7 +1417,7 @@ pub(crate) fn value_as_i32(v: &Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{ApiOperation, ParamLocation, ParamSpec};
+    use crate::index::{ApiOperation, ObjectField, ParamLocation, ParamSpec};
 
     // -----------------------------------------------------------------------
     // Test-only helpers
@@ -1088,6 +1494,7 @@ mod tests {
             ty: "integer".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1099,6 +1506,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1110,6 +1518,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1121,6 +1530,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1189,6 +1599,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1331,6 +1742,426 @@ mod tests {
             matches!(err, ApiToolError::MissingParam { ref name, .. } if name == "name"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn required_null_body_param_returns_missing_param_error() {
+        let op = make_write_op(
+            "create_thing",
+            "POST",
+            "/things",
+            "Things",
+            vec![body_param("name", true)],
+        );
+
+        let err = build_request_parts(&op, &serde_json::json!({ "name": null }), &[], 20, 100)
+            .expect_err("a required body field cannot be null");
+        assert!(matches!(
+            err,
+            ApiToolError::MissingParam { ref name, .. } if name == "name"
+        ));
+    }
+
+    /// Several missing required fields must be reported in ONE error.
+    ///
+    /// Discovered against a live model: `create_alert` has eight required body
+    /// fields, and one-at-a-time reporting made the model spend a full tool
+    /// round per field, exhausting the round cap before it could ever stage a
+    /// valid proposal.
+    #[test]
+    fn all_missing_required_body_params_are_reported_together() {
+        let op = make_write_op(
+            "create_alert",
+            "POST",
+            "/otel/alerts",
+            "Alerts",
+            vec![
+                body_param("name", true),
+                body_param("metric_name", true),
+                body_param("aggregation", true),
+                body_param("severity", true),
+                body_param("note", false),
+            ],
+        );
+
+        let params = serde_json::json!({ "name": "p95 latency" });
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("must fail while required fields are absent");
+
+        let ApiToolError::MissingParams { names, .. } = &err else {
+            panic!("expected MissingParams, got {err:?}");
+        };
+        // Compare whole names — "metric_name" contains "name" as a substring.
+        let listed: Vec<&str> = names.split(", ").collect();
+        assert_eq!(
+            listed,
+            vec!["metric_name", "aggregation", "severity"],
+            "expected exactly the absent required fields, got: {names}"
+        );
+    }
+
+    /// Build the real-world shape: `detection_config` is an internally-tagged
+    /// union, the exact field a live model kept getting wrong.
+    fn detector_shape() -> ObjectShape {
+        fn field(name: &str, ty: &str, enum_values: &[&str]) -> ObjectField {
+            ObjectField {
+                name: name.to_string(),
+                required: true,
+                ty: ty.to_string(),
+                enum_values: enum_values.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            "static".to_string(),
+            vec![
+                field("kind", "string", &[]),
+                field("comparator", "string", &["gt", "gte", "lt", "lte"]),
+                field("threshold", "number", &[]),
+            ],
+        );
+        variants.insert(
+            "anomaly".to_string(),
+            vec![
+                field("kind", "string", &[]),
+                field("deviations", "number", &[]),
+            ],
+        );
+        ObjectShape {
+            discriminator: Some("kind".to_string()),
+            variants,
+            fields: Vec::new(),
+        }
+    }
+
+    fn op_with_detector() -> ApiOperation {
+        let mut param = body_param("detection_config", true);
+        param.object_shape = Some(detector_shape());
+        make_write_op(
+            "create_alert",
+            "POST",
+            "/otel/alerts",
+            "Alerts",
+            vec![param],
+        )
+    }
+
+    /// The exact failure seen against a live model: it proposed
+    /// `{"type": "threshold"}`, which has no `kind`. Before this check the call
+    /// validated fine, was staged for approval, and only failed with a 422
+    /// AFTER a human clicked Confirm.
+    #[test]
+    fn object_body_param_missing_discriminator_is_rejected_at_validation() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "type": "threshold", "threshold": 500 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a payload the API cannot accept must not validate");
+
+        let ApiToolError::BadObjectShape {
+            problem, expected, ..
+        } = &err
+        else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(
+            problem.contains("kind"),
+            "problem should name it: {problem}"
+        );
+        // The accepted shape must travel with the error — the model does not
+        // reliably run `--help`, so this is the one place it is guaranteed to
+        // see the discriminator's name and values.
+        assert!(expected.contains("static"), "expected: {expected}");
+        assert!(expected.contains("comparator"), "expected: {expected}");
+    }
+
+    #[test]
+    fn object_body_param_with_unknown_variant_lists_the_known_ones() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "threshold", "threshold": 500 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("unknown variant");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(
+            problem.contains("anomaly") && problem.contains("static"),
+            "{problem}"
+        );
+    }
+
+    /// The variant's own required keys are enforced too — a `static` detector
+    /// without a threshold is just as unusable as one without a `kind`.
+    #[test]
+    fn object_body_param_missing_variant_keys_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({ "detection_config": { "kind": "static" } });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("incomplete variant");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("comparator"), "{problem}");
+        assert!(problem.contains("threshold"), "{problem}");
+    }
+
+    #[test]
+    fn object_body_param_required_null_key_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": {
+                "kind": "static",
+                "comparator": "gt",
+                "threshold": null
+            }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a required nested field cannot be null");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("threshold"), "{problem}");
+    }
+
+    #[test]
+    fn well_formed_object_body_param_passes_through_untouched() {
+        let op = op_with_detector();
+        let detector = serde_json::json!({
+            "kind": "static", "comparator": "gt", "threshold": 500
+        });
+        let params = serde_json::json!({ "detection_config": detector.clone() });
+
+        let built = build_request_parts(&op, &params, &[], 20, 100).expect("valid payload");
+        assert_eq!(
+            built.body.expect("body")["detection_config"],
+            detector,
+            "a valid object must reach the API byte-for-byte"
+        );
+    }
+
+    /// A plain (non-union) object is checked against its own required keys.
+    #[test]
+    fn plain_object_body_param_requires_its_keys() {
+        let mut param = body_param("window", true);
+        param.object_shape = Some(ObjectShape {
+            discriminator: None,
+            variants: std::collections::BTreeMap::new(),
+            fields: ["from", "to"]
+                .iter()
+                .map(|n| ObjectField {
+                    name: n.to_string(),
+                    required: true,
+                    ty: "string".to_string(),
+                    enum_values: Vec::new(),
+                })
+                .collect(),
+        });
+        let op = make_write_op("create_thing", "POST", "/things", "Things", vec![param]);
+
+        let params = serde_json::json!({ "window": { "from": "now-1h" } });
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("missing 'to'");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("to"), "{problem}");
+    }
+
+    /// A scalar where an object belongs must be named as such, not silently
+    /// forwarded for the API to reject.
+    #[test]
+    fn scalar_where_object_expected_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({ "detection_config": "static" });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("scalar");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("string"), "{problem}");
+    }
+
+    /// The bug this exists to prevent, in full.
+    ///
+    /// A live model called `query_metrics --metric http.server.duration`. The
+    /// real flag is `--metric_name`, so the value was dropped, the query ran
+    /// UNFILTERED, and the endpoint returned 200 with the average across every
+    /// metric in the project (~62 million — a mean of latency-in-ms, error
+    /// rates and memory-in-bytes mixed together). The model then reasoned
+    /// confidently about thresholds from that number. Nothing downstream could
+    /// have caught it: the response was well-formed and the status was 200.
+    #[test]
+    fn near_miss_filter_name_is_rejected_instead_of_silently_unfiltering() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![
+                query_param("project_id", false),
+                query_param("metric_name", false),
+                query_param("start_time", false),
+            ],
+        );
+
+        let params = serde_json::json!({ "metric": "http.server.duration" });
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("an unfiltered query must never be passed off as a filtered one");
+
+        let ApiToolError::UnknownParams { unknown, valid, .. } = &err else {
+            panic!("expected UnknownParams, got {err:?}");
+        };
+        assert!(
+            unknown.contains("metric_name"),
+            "should suggest it: {unknown}"
+        );
+        assert!(
+            valid.contains("start_time"),
+            "should list the real flags: {valid}"
+        );
+        // Saying nothing ran is what stops the model treating the failure as an
+        // empty result set and concluding the metric has no data.
+        assert!(err.to_string().contains("Nothing was queried"), "{err}");
+    }
+
+    /// Optional filters must still be omittable — the whole point of the
+    /// unfiltered query is that it is legitimate when you meant it.
+    #[test]
+    fn omitting_optional_params_is_still_fine() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![
+                query_param("metric_name", false),
+                query_param("start_time", false),
+            ],
+        );
+        let params = serde_json::json!({ "metric_name": "http.server.duration" });
+        build_request_parts(&op, &params, &[], 20, 100).expect("partial filters are valid");
+    }
+
+    #[test]
+    fn unknown_param_with_no_close_match_is_reported_without_a_guess() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![query_param("metric_name", false)],
+        );
+        let params = serde_json::json!({ "wibble": 1 });
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("unknown");
+        let ApiToolError::UnknownParams { unknown, .. } = &err else {
+            panic!("expected UnknownParams, got {err:?}");
+        };
+        assert!(
+            !unknown.contains("did you mean"),
+            "a bad guess is worse than none: {unknown}"
+        );
+    }
+
+    #[test]
+    fn nearest_param_matches_prefixes_and_typos_but_not_unrelated_names() {
+        let valid = ["metric_name", "environment_id", "start_time"];
+        assert_eq!(nearest_param("metric", &valid), Some("metric_name"));
+        // The transposition is built at runtime on purpose: a misspelled
+        // literal in this file gets "corrected" by the repo's spell-check hook,
+        // which would quietly reduce this to an exact-match assertion proving
+        // nothing.
+        let mut chars: Vec<char> = "metric_name".chars().collect();
+        chars.swap(8, 9);
+        let transposed: String = chars.into_iter().collect();
+        assert_eq!(nearest_param(&transposed, &valid), Some("metric_name"));
+        assert_eq!(nearest_param("zzzzzzzzzz", &valid), None);
+    }
+
+    /// A quoted number is present, required, and fatal.
+    ///
+    /// Seen live: `{"kind":"static","threshold":"0.5","comparator":">"}` passed
+    /// the presence check, was staged, the user clicked Confirm, and the API
+    /// answered `invalid type: string "0.5", expected f64`. Checking that a key
+    /// exists catches only half the mistakes.
+    #[test]
+    fn quoted_number_in_object_body_param_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": "gt", "threshold": "0.5" }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a string where the API wants f64 must not be staged");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("threshold"), "{problem}");
+        // Showing the quotes is the whole point — `0.5` and `"0.5"` are
+        // indistinguishable in a message that just echoes the value.
+        assert!(problem.contains("the string \"0.5\""), "{problem}");
+        assert!(problem.contains("number"), "{problem}");
+    }
+
+    /// The other half of the same payload: `>` is a natural way to write a
+    /// comparator and not what the schema accepts (`gt|gte|lt|lte`). The
+    /// schema's own description even warns "NOT the SQL operators" — but that
+    /// text never reaches the model, so the enum has to be enforced.
+    #[test]
+    fn wrong_enum_spelling_in_object_body_param_lists_the_allowed_values() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": ">", "threshold": 0.5 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("bad comparator");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("comparator"), "{problem}");
+        for allowed in ["gt", "gte", "lt", "lte"] {
+            assert!(
+                problem.contains(allowed),
+                "should list {allowed}: {problem}"
+            );
+        }
+    }
+
+    /// An integer is a valid f64 — `300` must not be rejected for a number
+    /// field, or every whole-numbered threshold breaks.
+    #[test]
+    fn integer_is_accepted_where_a_number_is_expected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": "gt", "threshold": 300 }
+        });
+        build_request_parts(&op, &params, &[], 20, 100).expect("integers are valid numbers");
+    }
+
+    /// Optional fields that are absent must not trip the type check.
+    #[test]
+    fn absent_optional_object_fields_are_not_type_checked() {
+        let mut param = body_param("window", true);
+        param.object_shape = Some(ObjectShape {
+            discriminator: None,
+            variants: std::collections::BTreeMap::new(),
+            fields: vec![
+                ObjectField {
+                    name: "from".to_string(),
+                    required: true,
+                    ty: "string".to_string(),
+                    enum_values: Vec::new(),
+                },
+                ObjectField {
+                    name: "step".to_string(),
+                    required: false,
+                    ty: "integer".to_string(),
+                    enum_values: Vec::new(),
+                },
+            ],
+        });
+        let op = make_write_op("create_thing", "POST", "/things", "Things", vec![param]);
+
+        let params = serde_json::json!({ "window": { "from": "now-1h" } });
+        build_request_parts(&op, &params, &[], 20, 100).expect("absent optional field is fine");
     }
 
     #[test]
@@ -1538,17 +2369,112 @@ mod tests {
     }
 
     #[test]
-    fn non_project_id_path_param_stays_required() {
-        // An `id` that is NOT the leading `/projects/{id}` segment (here a
-        // resource id) is a genuine required path param the model must supply —
-        // it must not be silently filled with the project id.
+    fn resource_id_path_param_is_not_rewritten_by_project_context() {
+        // An `id` that is NOT the leading `/projects/{id}` segment is a resource
+        // selector, not a project selector. Leave it alone and let the real
+        // endpoint authorize that resource for the current user.
         let op = make_op("get_thing", "/things/{id}", vec![path_param("id")]);
 
-        let err = build_request_parts(&op, &serde_json::json!({}), &[42], 20, 100)
-            .expect_err("non-project id must stay required");
-        assert!(
-            matches!(err, ApiToolError::MissingParam { ref name, .. } if name == "id"),
-            "unexpected error: {err:?}"
+        let result = build_request_parts(&op, &serde_json::json!({ "id": 99 }), &[42], 20, 100)
+            .expect("resource authorization belongs to the real endpoint");
+        assert_eq!(result.path, "/things/99");
+    }
+
+    #[test]
+    fn global_operation_inherits_user_authorization_despite_project_context() {
+        let mut limit = query_param("limit", false);
+        limit.ty = "integer".to_string();
+        let op = make_op("list_audit_logs", "/audit/logs", vec![limit]);
+
+        let result = build_request_parts(&op, &serde_json::json!({ "limit": 20 }), &[42], 20, 100)
+            .expect("the router must decide from the authenticated user's role");
+        assert_eq!(result.path, "/audit/logs");
+        assert_eq!(result.query, "limit=20");
+    }
+
+    #[test]
+    fn global_operation_remains_available_with_deny_all_project_scope() {
+        let op = make_op("list_services", "/external-services", vec![]);
+
+        let result = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({}),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect("global authorization belongs to the authenticated router");
+
+        assert_eq!(result.path, "/external-services");
+    }
+
+    #[test]
+    fn empty_application_scope_rejects_inline_project_selector() {
+        let op = make_op(
+            "get_project",
+            "/projects/{project_id}",
+            vec![path_param("project_id")],
+        );
+
+        let error = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({ "project_id": 42 }),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect_err("an inline selector cannot escape the application context");
+
+        assert!(matches!(
+            error,
+            ApiToolError::ProjectNotAllowed { project_id: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn empty_application_scope_requires_selection_for_optional_project_filter() {
+        let op = make_op(
+            "list_project_resources",
+            "/resources",
+            vec![query_param("project_id", false)],
+        );
+
+        let error = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({}),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect_err("an omitted optional selector must not broaden application scope");
+
+        assert!(matches!(
+            error,
+            ApiToolError::ProjectSelectionRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_application_scope_allows_omitting_optional_project_link() {
+        let op = make_op(
+            "create_service",
+            "/external-services",
+            vec![body_param("name", true), body_param("project_id", false)],
+        );
+
+        let request = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({ "name": "redis-hvcm" }),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect("an optional project link must remain optional");
+
+        assert_eq!(request.path, "/external-services");
+        assert_eq!(
+            request.body,
+            Some(serde_json::json!({ "name": "redis-hvcm" }))
         );
     }
 
@@ -1696,6 +2622,18 @@ mod tests {
     }
 
     #[test]
+    fn required_write_permission_alerts_uses_otel_write() {
+        for method in ["POST", "PATCH", "DELETE"] {
+            let op = op_tagged_with_method("Alerts", method);
+            assert_eq!(
+                required_write_permission(&op),
+                Some(Permission::OtelWrite),
+                "method {method}"
+            );
+        }
+    }
+
+    #[test]
     fn required_write_permission_unknown_tag_returns_none() {
         let op = op_tagged_with_method("Wibble", "POST");
         assert_eq!(required_write_permission(&op), None);
@@ -1733,10 +2671,34 @@ mod tests {
             ))
             .build();
 
+        // POST /external-services — `project_id` is an optional association,
+        // not a prerequisite for creating the service.
+        let create_service = OperationBuilder::new()
+            .operation_id(Some("create_service"))
+            .summary(Some("Create an external service"))
+            .tag("External Services")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        build_inline_body_schema(&[
+                            ("name", "string", true, &[]),
+                            ("project_id", "integer", false, &[]),
+                        ]),
+                    )
+                    .build(),
+            ))
+            .build();
+
         let paths = PathsBuilder::new()
             .path("/deployments", {
                 let mut item = PathItem::default();
                 item.post = Some(create_deploy);
+                item
+            })
+            .path("/external-services", {
+                let mut item = PathItem::default();
+                item.post = Some(create_service);
                 item
             })
             .build();
@@ -1750,7 +2712,10 @@ mod tests {
         InternalApiCaller::new_write_allowlisted(
             router,
             &openapi,
-            vec!["create_deployment".to_string()],
+            vec![
+                "create_deployment".to_string(),
+                "create_service".to_string(),
+            ],
         )
     }
 
@@ -1772,6 +2737,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -1784,7 +2750,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let outcome = caller.prepare_write_cli("--help", &scope);
@@ -1812,6 +2778,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -1824,7 +2791,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         // Supply the required `branch` param.
@@ -1848,6 +2815,56 @@ mod tests {
     }
 
     #[test]
+    fn prepare_create_service_without_a_project_returns_unlinked_proposal() {
+        use chrono::Utc;
+        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_entities::users;
+
+        let now = Utc::now();
+        let user = users::Model {
+            id: 1,
+            name: "Test".into(),
+            email: "t@t.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(user, Role::Admin),
+            project_scope: ProjectSelectorScope::Allowed(Vec::new()),
+        };
+
+        let outcome =
+            make_write_caller().prepare_write_cli("create_service --name redis-hvcm", &scope);
+
+        match outcome {
+            WritePrepareOutcome::Prepared(proposal) => {
+                assert_eq!(proposal.operation_id, "create_service");
+                assert_eq!(proposal.params, serde_json::json!({ "name": "redis-hvcm" }));
+                assert!(proposal.params.get("project_id").is_none());
+            }
+            WritePrepareOutcome::Help(help) => {
+                panic!("expected an unlinked proposal, got help: {help}")
+            }
+            WritePrepareOutcome::Invalid(error) => {
+                panic!("expected an unlinked proposal, got error: {error}")
+            }
+        }
+    }
+
+    #[test]
     fn prepare_write_cli_missing_required_body_param_returns_invalid() {
         let caller = make_write_caller();
         use chrono::Utc;
@@ -1865,6 +2882,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -1877,7 +2895,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         // Do NOT supply `branch` — should get Invalid.

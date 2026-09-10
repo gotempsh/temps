@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 const fs = require('fs');
 
 // Read the SDK file and extract all function names
@@ -144,7 +147,10 @@ for (const [category, funcs] of Object.entries(categories)) {
 }
 
 // Generate the complete TypeScript file
-const clientClass = `import { createClient, createConfig } from './client/client';
+const clientClass = `// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { createClient, createConfig } from './client/client';
 import type { Client } from './client/client';
 import * as sdk from './client/sdk.gen';
 

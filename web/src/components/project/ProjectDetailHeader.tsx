@@ -1,52 +1,108 @@
-import { ProjectResponse } from '@/api/client'
-import { getLastDeploymentOptions } from '@/api/client/@tanstack/react-query.gen'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
-import { buttonVariants } from '@/components/ui/button'
-import { ReloadableImage } from '@/components/utils/ReloadableImage'
-import { cn } from '@/lib/utils'
-import { useDashboardHealth } from '@/hooks/useDashboardHealth'
-import { useQuery } from '@tanstack/react-query'
-import { ExternalLink, Users } from 'lucide-react'
-import GithubIcon from '@/icons/Github'
-import { Link, useNavigate } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-const healthDotColors: Record<string, string> = {
-  operational: 'bg-emerald-500',
+import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { ReloadableImage } from '@/components/utils/ReloadableImage'
+import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
+import {
+  projectHealthIndicator,
+  type ProjectHealthTone,
+} from '@/components/dashboard/project-card-health'
+import {
+  gitProviderKind,
+  repositoryWebUrl,
+  type GitProviderKind,
+} from '@/lib/project-header-actions'
+import { ExternalLink, GitFork, Rocket, Users } from 'lucide-react'
+import BitbucketIcon from '@/icons/Bitbucket'
+import GiteaIcon from '@/icons/Gitea'
+import GithubIcon from '@/icons/Github'
+import GitlabIcon from '@/icons/Gitlab'
+import { Link, useNavigate } from 'react-router'
+
+/**
+ * Tones for the header health badge. Mirrors the projects-list card so the same
+ * project reads the same in both places.
+ */
+const healthToneStyles: Record<ProjectHealthTone, string> = {
+  healthy: 'bg-emerald-500',
   degraded: 'bg-amber-500',
   down: 'bg-red-500',
-}
-
-const healthLabels: Record<string, string> = {
-  operational: 'Operational',
-  degraded: 'Degraded',
-  down: 'Down',
+  idle: 'bg-zinc-300',
+  unavailable: 'bg-zinc-400',
+  pending: 'bg-zinc-300 animate-pulse',
 }
 
 interface ProjectDetailHeaderProps {
   project: ProjectResponse
   activeVisitorsCount?: { active_visitors: number }
   repositoryCloneUrl?: string | null
+  repositoryProviderType?: string | null
+  lastDeployment?: DeploymentResponse
   lastDeploymentUrl?: string | null
   isLoadingLastDeployment?: boolean
+  onDeploy: () => void
+}
+
+function RepositoryProviderIcon({
+  provider,
+  className,
+}: {
+  provider: GitProviderKind | null
+  className?: string
+}) {
+  if (provider === 'github') return <GithubIcon className={className} />
+  if (provider === 'gitlab') return <GitlabIcon className={className} />
+  if (provider === 'bitbucket') return <BitbucketIcon className={className} />
+  if (provider === 'gitea') return <GiteaIcon className={className} />
+  return <GitFork className={className} />
 }
 
 export function ProjectDetailHeader({
   project,
   activeVisitorsCount,
   repositoryCloneUrl,
+  repositoryProviderType,
+  lastDeployment,
   lastDeploymentUrl,
   isLoadingLastDeployment = false,
+  onDeploy,
 }: ProjectDetailHeaderProps) {
   const navigate = useNavigate()
   const healthQuery = useDashboardHealth([project.id])
-  const health = healthQuery.data?.projects?.[String(project.id)]
-  const { data: lastDeployment } = useQuery({
-    ...getLastDeploymentOptions({ path: { id: project.id } }),
-    enabled: !!project.id,
-    refetchOnWindowFocus: true,
+  const monitorQuery = useProjectsMonitorHealth([project.id])
+  // This badge links to Monitors, so it had better report what the monitors
+  // say. Traffic health alone reports "unknown" for a project nobody visited
+  // in the last hour — including one whose monitor is green — because the
+  // proxy query excludes Temps' own checks (is_system_request = FALSE).
+  const healthIndicator = projectHealthIndicator({
+    health: healthQuery.data?.projects?.[String(project.id)],
+    monitor: monitorQuery.data?.projects?.[String(project.id)],
+    loading: healthQuery.isLoading,
+    error: healthQuery.isError,
+    windowHours: 1,
   })
   const screenshotLocation = lastDeployment?.screenshot_location
+  // getLastDeploymentOptions returns the most recent deployment by created_at,
+  // not necessarily the one actually live -- get_last_deployment (services.rs)
+  // computes is_current separately by checking each environment's
+  // current_deployment_id. A completed-but-superseded deployment (e.g. after
+  // a rollback to an older one) must not read as "Deployed" just because its
+  // own build succeeded once.
+  const hasCompletedDeployment =
+    !!lastDeployment?.is_current &&
+    (lastDeployment?.status === 'completed' ||
+      lastDeployment?.status === 'deployed')
+  const repositoryUrl = repositoryCloneUrl
+    ? repositoryWebUrl(repositoryCloneUrl)
+    : null
+  const repositoryProvider = repositoryCloneUrl
+    ? gitProviderKind(repositoryProviderType, repositoryCloneUrl)
+    : null
 
   const handleVisitorsClick = () => {
     if ((activeVisitorsCount?.active_visitors ?? 0) > 0) {
@@ -71,24 +127,33 @@ export function ProjectDetailHeader({
               />
             </div>
           ) : (
-            <Avatar className="size-8">
-              <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-              <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
-            </Avatar>
+            <ProjectAvatar name={project.name} className="size-8" />
           )}
           <div className="flex items-center gap-2 min-w-0">
-            <h1 className="text-base sm:text-lg font-semibold truncate">{project.slug}</h1>
-            <Badge variant={project.last_deployment ? 'default' : 'outline'} className="hidden sm:inline-flex shrink-0">
-              {project.last_deployment ? 'Deployed' : 'Not deployed'}
+            <h1 className="text-base sm:text-lg font-semibold truncate">
+              {project.slug}
+            </h1>
+            <Badge
+              variant={hasCompletedDeployment ? 'default' : 'outline'}
+              className="hidden sm:inline-flex shrink-0"
+            >
+              {hasCompletedDeployment ? 'Deployed' : 'Not deployed'}
             </Badge>
-            {health && health.status !== 'no_monitors' && (
-              <Link to={`/projects/${project.slug}/monitors`}>
-                <Badge variant="outline" className="hidden sm:inline-flex shrink-0 gap-1.5">
-                  <span className={`inline-block h-2 w-2 rounded-full ${healthDotColors[health.status] || 'bg-zinc-400'}`} />
-                  {healthLabels[health.status] || health.status}
-                </Badge>
-              </Link>
-            )}
+            <Link
+              to={`/projects/${project.slug}/monitors`}
+              title={healthIndicator.detail}
+            >
+              <Badge
+                variant="outline"
+                className="hidden sm:inline-flex shrink-0 gap-1.5"
+              >
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
+                />
+                {healthIndicator.label}
+                <span className="sr-only">. {healthIndicator.detail}</span>
+              </Badge>
+            </Link>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -118,63 +183,39 @@ export function ProjectDetailHeader({
               </span>
             </button>
           )}
-          {/* Mobile: Icon-only buttons */}
-          <div className="md:hidden flex items-center gap-1">
-            {repositoryCloneUrl && (
-              <Link
-                to={repositoryCloneUrl.replace('.git', '')}
+          {repositoryUrl && (
+            <Button variant="outline" size="icon" className="size-9" asChild>
+              <a
+                href={repositoryUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-2 hover:bg-accent rounded-md transition-colors"
-                title="View repository"
+                aria-label="Open repository in a new window"
+                title="Open repository"
               >
-                <GithubIcon className="h-4 w-4" />
-              </Link>
-            )}
-            {lastDeploymentUrl && !isLoadingLastDeployment && (
-              <Link
-                to={lastDeploymentUrl}
+                <RepositoryProviderIcon
+                  provider={repositoryProvider}
+                  className="size-4"
+                />
+              </a>
+            </Button>
+          )}
+          {lastDeploymentUrl && !isLoadingLastDeployment && (
+            <Button variant="outline" size="icon" className="size-9" asChild>
+              <a
+                href={lastDeploymentUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-2 hover:bg-accent rounded-md transition-colors"
+                aria-label="Visit deployed site in a new window"
                 title="Visit deployed site"
               >
-                <ExternalLink className="h-4 w-4" />
-              </Link>
-            )}
-          </div>
-          {/* Desktop: Full buttons */}
-          <div className="hidden md:flex items-center gap-2">
-            {repositoryCloneUrl && (
-              <Link
-                to={repositoryCloneUrl.replace('.git', '')}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={cn(
-                  buttonVariants({
-                    variant: 'outline',
-                    size: 'sm',
-                  })
-                )}
-              >
-                Repository
-              </Link>
-            )}
-            {lastDeploymentUrl && !isLoadingLastDeployment && (
-              <Link
-                to={lastDeploymentUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={cn(
-                  buttonVariants({
-                    size: 'sm',
-                  })
-                )}
-              >
-                Visit
-              </Link>
-            )}
-          </div>
+                <ExternalLink className="size-4" />
+              </a>
+            </Button>
+          )}
+          <Button size="sm" onClick={onDeploy}>
+            <Rocket className="size-4" />
+            <span className="hidden sm:inline">Deploy</span>
+          </Button>
         </div>
       </div>
     </header>

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -9,7 +12,7 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "custom"
+    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "openrouter", "custom"
     pub provider: String,
     /// Human-readable display name, e.g. "OpenAI Production"
     pub display_name: String,
@@ -28,7 +31,16 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(has_many = "super::ai_provider_models::Entity")]
+    Models,
+}
+
+impl Related<super::ai_provider_models::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Models.def()
+    }
+}
 
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {

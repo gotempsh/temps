@@ -1,10 +1,13 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Request and response types for Blob HTTP handlers
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_providers::externalsvc::RustfsService;
 use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
@@ -17,6 +20,10 @@ pub struct BlobAppState {
     pub rustfs_service: Arc<RustfsService>,
     pub external_service_manager: Arc<ExternalServiceManager>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Team-based project access checker (registered by a plugin; `None` in
+    /// plain OSS, where the guard is a no-op). Confines blob data-plane access
+    /// to projects the caller may reach when the checker is present.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
 }
 
 /// Options for uploading a blob
@@ -175,10 +182,10 @@ pub struct BlobStatusResponse {
     #[schema(example = true)]
     pub healthy: bool,
     /// Current version (if running)
-    #[schema(example = "0.5.0")]
+    #[schema(example = "1.0.0-rc.5")]
     pub version: Option<String>,
     /// Docker image being used
-    #[schema(example = "ghcr.io/rustfs/rustfs:0.5.0")]
+    #[schema(example = "rustfs/rustfs:1.0.0-rc.5")]
     pub docker_image: Option<String>,
 }
 
@@ -186,7 +193,7 @@ pub struct BlobStatusResponse {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct EnableBlobRequest {
     /// Docker image to use (optional, defaults to RustFS)
-    #[schema(example = "ghcr.io/rustfs/rustfs:0.5.0")]
+    #[schema(example = "rustfs/rustfs:1.0.0-rc.5")]
     pub docker_image: Option<String>,
     /// Root user for S3 access
     pub root_user: Option<String>,
@@ -221,8 +228,8 @@ pub struct DisableBlobResponse {
 /// Request to update Blob service configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateBlobRequest {
-    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.98")
-    #[schema(example = "rustfs/rustfs:1.0.0-alpha.98")]
+    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-rc.5")
+    #[schema(example = "rustfs/rustfs:1.0.0-rc.5")]
     pub docker_image: Option<String>,
 }
 

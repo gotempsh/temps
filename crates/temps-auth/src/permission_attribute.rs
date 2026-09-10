@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// A more elegant solution for permission-based handlers
 ///
 /// Since we can't create true procedural macros without a separate crate,
@@ -144,6 +147,7 @@ define_permissions! {
     // System
     SystemAdmin => Permission::SystemAdmin,
     SystemRead => Permission::SystemRead,
+    SecretsRead => Permission::SecretsRead,
 
     // API Keys
     ApiKeysRead => Permission::ApiKeysRead,

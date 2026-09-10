@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::handlers::backup_handler::{
     CreateBackupScheduleRequest, CreateS3SourceRequest, UpdateBackupScheduleRequest,
 };
@@ -12,7 +15,7 @@ use sea_orm::{
 };
 use serde_json::json;
 use serde_yaml;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -24,8 +27,9 @@ use urlencoding;
 use uuid::Uuid;
 
 use cron::Schedule;
-use temps_core::notifications::{BackupFailureData, NotificationService};
+use temps_core::notifications::BackupFailureData;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
 use tokio_stream::StreamExt;
 
@@ -35,6 +39,18 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let valid_key = key
+        .chars()
+        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    valid_key.then(|| format!("export {key}={}", shell_escape(value)))
+}
+
 /// Classify a backup location into one of the known storage formats.
 /// Returns `None` for non-postgres / unknown locations so the UI can show
 /// a neutral badge without guessing.
@@ -42,7 +58,9 @@ fn shell_escape(s: &str) -> String {
 /// The `engine` hint is used to disambiguate formats that share location
 /// shapes. Object-store backups (s3/rustfs/blob/minio) are always a
 /// bucket-to-bucket mirror — their path has no extension — so we tag them
-/// `"mirror"` when the engine identifies them as such.
+/// `"mirror"` when the engine identifies them as such. MariaDB's logical
+/// dump shares the `.sql.gz` suffix with Postgres's legacy pg_dump, so it
+/// needs the hint too; its physical base (`base.mbstream.gz`) does not.
 fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String> {
     if location.is_empty() {
         return None;
@@ -58,6 +76,20 @@ fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String
     // Extension-based classification runs first — it's unambiguous when
     // the file suffix is present, regardless of whether the location is
     // an s3:// URL or a bare key.
+    //
+    // MariaDB's physical base carries a suffix no other engine produces, so
+    // it needs no engine hint.
+    if location.ends_with(".mbstream.gz") {
+        return Some("mariadb_physical".to_string());
+    }
+    // `.sql.gz` is the ONE genuinely ambiguous suffix: Postgres's legacy
+    // pg_dump and MariaDB's logical `dump.sql.gz` share it. Filenames can't
+    // separate them, so the engine hint decides — checked BEFORE the generic
+    // Postgres branch, which would otherwise label every MariaDB dump
+    // `pg_dump` and send the restore planner down the pg_restore path.
+    if location.ends_with(".sql.gz") && engine.is_some_and(|e| e.eq_ignore_ascii_case("mariadb")) {
+        return Some("mariadb_dump".to_string());
+    }
     if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") {
         return Some("pg_dump".to_string());
     }
@@ -78,6 +110,49 @@ fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String
         return Some("walg".to_string());
     }
     None
+}
+
+fn reject_source_backing_targets(
+    backing_service_ids: &HashSet<i32>,
+    target_service_ids: impl IntoIterator<Item = i32>,
+) -> Result<(), BackupError> {
+    if let Some(service_id) = target_service_ids
+        .into_iter()
+        .find(|service_id| backing_service_ids.contains(service_id))
+    {
+        return Err(BackupError::Validation(format!(
+            "Service {} supplies this schedule's backup destination and cannot back up into itself",
+            service_id
+        )));
+    }
+    Ok(())
+}
+
+fn exclude_source_backing_services(
+    services: Vec<temps_entities::external_services::Model>,
+    backing_service_ids: &HashSet<i32>,
+) -> Vec<temps_entities::external_services::Model> {
+    services
+        .into_iter()
+        .filter(|service| !backing_service_ids.contains(&service.id))
+        .collect()
+}
+
+fn schedule_run_aggregate_state(
+    total_jobs: i64,
+    failed_jobs: i64,
+    running_jobs: i64,
+    pending_jobs: i64,
+) -> &'static str {
+    if total_jobs == 0 {
+        "skipped"
+    } else if pending_jobs + running_jobs > 0 {
+        "running"
+    } else if failed_jobs > 0 {
+        "failed"
+    } else {
+        "completed"
+    }
 }
 
 /// Walk the S3 source's `external_services/` prefix to find backups that
@@ -267,7 +342,13 @@ async fn list_walg_sentinels(
     Ok(out)
 }
 
-/// Find pg_dump / rdb / bson dump objects under a service prefix.
+/// Find pg_dump / rdb / bson / mariadb dump-or-base objects under a service
+/// prefix.
+///
+/// MariaDB is the one engine here with no `/walg/` prefix, so
+/// `scan_s3_for_orphan_backups`'s sentinel pass cannot see it at all: if a
+/// MariaDB suffix is missing from this allowlist, its backups are invisible
+/// to the disaster-recovery scan entirely.
 async fn list_dump_objects(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -297,7 +378,10 @@ async fn list_dump_objects(
                 || key.ends_with(".pgdump.gz")
                 || key.ends_with(".rdb.gz")
                 || key.ends_with(".bson.gz")
-                || key.ends_with(".archive"))
+                || key.ends_with(".archive")
+                // MariaDB physical base (`base.mbstream.gz`). Its logical
+                // dump is already covered by `.sql.gz` above.
+                || key.ends_with(".mbstream.gz"))
             {
                 continue;
             }
@@ -589,6 +673,115 @@ pub enum BackupError {
 
     #[error("Cleanup preview is stale: {detail}. Run a new dry-run preview before deleting")]
     CleanupPreviewStale { detail: String },
+
+    #[error("Access denied to {resource}: {detail}")]
+    Forbidden { resource: String, detail: String },
+
+    #[error("Failed to verify access to {resource}: {detail}")]
+    Authorization { resource: String, detail: String },
+}
+
+/// Project ownership resolved for one external service.
+///
+/// Resolution is intentionally service-layer owned so handlers never query
+/// the `project_services` join table directly. An empty `project_ids` list is
+/// ownerless and must fail closed whenever project-aware authorization is
+/// enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceProjectScope {
+    pub service_id: i32,
+    pub project_ids: Vec<i32>,
+}
+
+/// Why a schedule cannot be confined to a set of tenant projects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalScheduleReason {
+    TargetsAllServices,
+    IncludesControlPlane,
+    HasNoAttachedServices,
+    HasOwnerlessService { service_id: i32 },
+}
+
+impl std::fmt::Display for GlobalScheduleReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetsAllServices => formatter.write_str("it targets all external services"),
+            Self::IncludesControlPlane => formatter.write_str("it includes the control plane"),
+            Self::HasNoAttachedServices => formatter.write_str("it has no attached services"),
+            Self::HasOwnerlessService { service_id } => write!(
+                formatter,
+                "external service {service_id} is not linked to a project"
+            ),
+        }
+    }
+}
+
+/// Authoritative tenant scope for a backup schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupScheduleAccessScope {
+    Global {
+        schedule_id: i32,
+        reason: GlobalScheduleReason,
+    },
+    Projects {
+        schedule_id: i32,
+        project_ids: Vec<i32>,
+    },
+}
+
+impl BackupScheduleAccessScope {
+    pub fn schedule_id(&self) -> i32 {
+        match self {
+            Self::Global { schedule_id, .. } | Self::Projects { schedule_id, .. } => *schedule_id,
+        }
+    }
+}
+
+/// Authoritative tenant ownership for one backup row. Producer services are
+/// immutable ownership-at-creation evidence. A row without a producer is
+/// global: the current schedule configuration is mutable and therefore must
+/// never be used to retroactively narrow historical backup ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupAccessScope {
+    Services {
+        backup_id: i32,
+        service_ids: Vec<i32>,
+    },
+    Global {
+        backup_id: i32,
+    },
+}
+
+impl BackupAccessScope {
+    pub fn backup_id(&self) -> i32 {
+        match self {
+            Self::Services { backup_id, .. } | Self::Global { backup_id } => *backup_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupWithAccessScope {
+    pub backup: Backup,
+    pub access_scope: BackupAccessScope,
+}
+
+/// Bounded authorization summary for a backup collection. The number of
+/// service ids is bounded by configured services rather than backup history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupCollectionAccessScope {
+    pub contains_global: bool,
+    pub service_ids: Vec<i32>,
+}
+
+#[derive(FromQueryResult)]
+struct BackupCollectionGlobalRow {
+    contains_global: bool,
+}
+
+#[derive(FromQueryResult)]
+struct BackupCollectionServiceRow {
+    service_id: i32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -992,11 +1185,54 @@ pub struct ChildBackupEntry {
     pub compression_type: String,
 }
 
+/// One unresolved backup alert, including optional schedule metadata used by
+/// the API to build a safe response without issuing SQL from the handler.
+#[derive(Debug, FromQueryResult)]
+pub struct BackupAlertEntry {
+    pub id: i64,
+    pub kind: String,
+    pub severity: String,
+    pub schedule_id: Option<i32>,
+    pub schedule_name: Option<String>,
+    pub schedule_s3_source_id: Option<i32>,
+    pub message: String,
+    pub opened_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of attempting to publish a native whole-instance recovery set for a
+/// terminal backup event.
+///
+/// Only fully successful scheduled runs that include a control-plane backup
+/// are published. This prevents `temps backup restore` from presenting a
+/// partial fan-out run as a recoverable instance snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoverySetPublication {
+    NotScheduled,
+    Pending {
+        schedule_run_id: i64,
+    },
+    Incomplete {
+        schedule_run_id: i64,
+        failed_backup_ids: Vec<i32>,
+    },
+    NoControlPlane {
+        schedule_run_id: i64,
+    },
+    AlreadyPublished {
+        schedule_run_id: i64,
+        backup_id: String,
+    },
+    Published {
+        schedule_run_id: i64,
+        backup_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct BackupService {
     db: Arc<DatabaseConnection>,
     external_service_manager: Arc<ExternalServiceManager>,
-    notification_dispatcher: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     config_service: Arc<temps_config::ConfigService>,
     encryption_service: Arc<temps_core::EncryptionService>,
     /// Shared workspace `JobQueue` (typically backed by the in-memory
@@ -1010,14 +1246,14 @@ impl BackupService {
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,
-        notification_dispatcher: Arc<dyn NotificationService>,
+        alarm_service: Arc<AlarmService>,
         serve_config: Arc<temps_config::ConfigService>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self {
             db,
             external_service_manager,
-            notification_dispatcher,
+            alarm_service,
             config_service: serve_config,
             encryption_service,
             queue: std::sync::OnceLock::new(),
@@ -1037,7 +1273,11 @@ impl BackupService {
     ///
     /// The reconcile rebuilds the bucket's lifecycle rules from current
     /// schedule state, so even concurrent schedule changes converge to a
-    /// consistent rule set eventually.
+    /// consistent rule set eventually. A failure here isn't a dead end: it's
+    /// recorded on the source via `lifecycle_reconcile_failed_at` (see
+    /// `S3LifecycleService::reconcile_bucket`), which keeps the source in
+    /// the hourly sweep's scope — even with no enabled schedule left — until
+    /// a later attempt actually succeeds.
     fn fire_lifecycle_reconcile(&self, s3_source_id: i32) {
         let db = self.db.clone();
         let enc = self.encryption_service.clone();
@@ -1065,31 +1305,443 @@ impl BackupService {
             .expect("BackupService.queue not set — plugin init did not call set_queue")
     }
 
+    async fn sha256_s3_object(
+        s3_client: &S3Client,
+        bucket: &str,
+        location: &str,
+    ) -> Result<String, BackupError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+
+        let key = if let Some(uri) = location.strip_prefix("s3://") {
+            let (location_bucket, key) = uri.split_once('/').ok_or_else(|| {
+                BackupError::Validation(format!("Invalid S3 backup location '{}'", location))
+            })?;
+            if location_bucket != bucket {
+                return Err(BackupError::Validation(format!(
+                    "Backup location bucket '{}' does not match source bucket '{}'",
+                    location_bucket, bucket
+                )));
+            }
+            key
+        } else {
+            location.trim_start_matches('/')
+        };
+        if key.is_empty() {
+            return Err(BackupError::Validation(
+                "Control-plane backup location has no object key".to_string(),
+            ));
+        }
+
+        let response = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::S3(crate::engines::v2_common::describe_sdk_error(
+                    "download control-plane backup for integrity hashing",
+                    &error,
+                ))
+            })?;
+        let mut reader = response.body.into_async_read();
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to hash control-plane backup {}: {}",
+                        location, error
+                    ),
+                })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Publish the aggregate recovery manifest consumed by `temps backup
+    /// restore` once every backup in a fan-out schedule run has completed.
+    ///
+    /// The executor publishes one terminal event per child. Those events are
+    /// intentionally treated as hints: the database is re-read here and is
+    /// the source of truth. The operation is idempotent and refuses to publish
+    /// when any child failed or is still live.
+    pub async fn publish_recovery_set_if_complete(
+        &self,
+        terminal_backup_id: i32,
+    ) -> Result<RecoverySetPublication, BackupError> {
+        let terminal_backup = temps_entities::backups::Entity::find_by_id(terminal_backup_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("terminal backup row {}", terminal_backup_id),
+            })?;
+
+        let Some(schedule_run_id) = terminal_backup.schedule_run_id else {
+            return Ok(RecoverySetPublication::NotScheduled);
+        };
+
+        let run_backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::ScheduleRunId.eq(schedule_run_id))
+            .order_by_asc(temps_entities::backups::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+
+        if run_backups
+            .iter()
+            .any(|backup| matches!(backup.state.as_str(), "pending" | "running"))
+        {
+            return Ok(RecoverySetPublication::Pending { schedule_run_id });
+        }
+
+        let failed_backup_ids = run_backups
+            .iter()
+            .filter(|backup| backup.state != "completed")
+            .map(|backup| backup.id)
+            .collect::<Vec<_>>();
+        if !failed_backup_ids.is_empty() {
+            return Ok(RecoverySetPublication::Incomplete {
+                schedule_run_id,
+                failed_backup_ids,
+            });
+        }
+
+        let mut parsed_metadata = Vec::with_capacity(run_backups.len());
+        for backup in &run_backups {
+            let metadata =
+                serde_json::from_str::<serde_json::Value>(&backup.metadata).map_err(|error| {
+                    BackupError::Validation(format!(
+                        "Backup {} in schedule run {} has invalid metadata: {}",
+                        backup.id, schedule_run_id, error
+                    ))
+                })?;
+            parsed_metadata.push((backup, metadata));
+        }
+
+        let Some((control_plane, control_plane_metadata)) =
+            parsed_metadata.iter().find(|(_, metadata)| {
+                metadata.get("engine").and_then(serde_json::Value::as_str) == Some("control_plane")
+            })
+        else {
+            return Ok(RecoverySetPublication::NoControlPlane { schedule_run_id });
+        };
+
+        if control_plane_metadata
+            .get("recovery_set_published")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(RecoverySetPublication::AlreadyPublished {
+                schedule_run_id,
+                backup_id: control_plane.backup_id.clone(),
+            });
+        }
+
+        let mut service_ids = BTreeSet::new();
+        for (backup, metadata) in &parsed_metadata {
+            if backup.id == control_plane.id {
+                continue;
+            }
+            let service_id = metadata
+                .get("external_service_id")
+                .or_else(|| metadata.get("service_id"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "External-service backup {} in schedule run {} has no service identity",
+                        backup.id, schedule_run_id
+                    ))
+                })?;
+            service_ids.insert(service_id);
+        }
+        let expected_service_ids = control_plane_metadata
+            .get("expected_service_ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Control-plane backup {} in schedule run {} has no expected service snapshot",
+                    control_plane.id, schedule_run_id
+                ))
+            })?
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .and_then(|id| i32::try_from(id).ok())
+                    .ok_or_else(|| {
+                        BackupError::Validation(format!(
+                            "Control-plane backup {} has an invalid expected service id",
+                            control_plane.id
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if expected_service_ids != service_ids {
+            return Err(BackupError::Validation(format!(
+                "Schedule run {} backup coverage mismatch: expected services {:?}, completed services {:?}",
+                schedule_run_id, expected_service_ids, service_ids
+            )));
+        }
+
+        let services = if service_ids.is_empty() {
+            Vec::new()
+        } else {
+            temps_entities::external_services::Entity::find()
+                .filter(
+                    temps_entities::external_services::Column::Id
+                        .is_in(service_ids.iter().copied()),
+                )
+                .all(self.db.as_ref())
+                .await?
+        };
+        let services_by_id = services
+            .into_iter()
+            .map(|service| (service.id, service))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut external_service_backups = Vec::with_capacity(service_ids.len());
+        for (backup, metadata) in &parsed_metadata {
+            if backup.id == control_plane.id {
+                continue;
+            }
+            let service_id = metadata
+                .get("external_service_id")
+                .or_else(|| metadata.get("service_id"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "External-service backup {} in schedule run {} has no service identity",
+                        backup.id, schedule_run_id
+                    ))
+                })?;
+            let service = services_by_id
+                .get(&service_id)
+                .ok_or_else(|| BackupError::NotFound {
+                    resource: "ExternalService".to_string(),
+                    detail: format!(
+                        "service {} referenced by backup {} in schedule run {}",
+                        service_id, backup.id, schedule_run_id
+                    ),
+                })?;
+            external_service_backups.push(json!({
+                "backup_id": backup.id,
+                "service_id": service_id,
+                "s3_location": backup.s3_location,
+                "state": backup.state,
+                "size_bytes": backup.size_bytes,
+                "type": backup.backup_type,
+                "metadata": {
+                    "service_type": service.service_type,
+                    "service_name": service.name,
+                }
+            }));
+        }
+
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(control_plane.s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "S3Source".to_string(),
+                detail: format!(
+                    "source {} referenced by recovery set {}",
+                    control_plane.s3_source_id, control_plane.backup_id
+                ),
+            })?;
+        let s3_client = self.create_s3_client(&s3_source).await?;
+        let control_plane_sha256 = Self::sha256_s3_object(
+            &s3_client,
+            &s3_source.bucket_name,
+            &control_plane.s3_location,
+        )
+        .await?;
+
+        // Server configuration contains the instance encryption key and other
+        // credentials. Legacy manifests wrote it in plaintext. New recovery
+        // sets encrypt it with a key derived from the S3 secret already needed
+        // to download the backup, so bucket contents alone do not expose it.
+        let server_config = serde_yaml::to_string(&self.config_service.get_server_config())
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to serialize server config for recovery set {}: {}",
+                    control_plane.backup_id, error
+                ))
+            })?;
+        let s3_secret = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to decrypt S3 secret for recovery set {}: {}",
+                    control_plane.backup_id, error
+                ))
+            })?;
+        let manifest_encryption = temps_core::EncryptionService::new_from_password(&s3_secret);
+        let encrypted_server_config =
+            manifest_encryption
+                .encrypt_string(&server_config)
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to encrypt server config for recovery set {}: {}",
+                        control_plane.backup_id, error
+                    ),
+                })?;
+
+        let mut metadata = json!({
+            "recovery_set_version": 2,
+            "complete": true,
+            "schedule_run_id": schedule_run_id,
+            "backup_id": control_plane.backup_id,
+            "name": control_plane.name,
+            "type": control_plane.backup_type,
+            "created_at": control_plane.started_at.to_rfc3339(),
+            "created_by": control_plane.created_by,
+            "size_bytes": control_plane.size_bytes.unwrap_or(0),
+            "compression_type": control_plane.compression_type,
+            "source": {
+                "id": s3_source.id,
+                "name": s3_source.name,
+                "bucket": s3_source.bucket_name,
+                "path": s3_source.bucket_path,
+            },
+            "schedule_id": control_plane.schedule_id,
+            "state": control_plane.state,
+            "tags": serde_json::from_str::<Vec<String>>(&control_plane.tags).unwrap_or_default(),
+            "checksum": control_plane.checksum,
+            "artifact_sha256": control_plane_sha256,
+            "server_config_encrypted": encrypted_server_config,
+            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "external_service_backups": external_service_backups,
+            "metadata": control_plane_metadata,
+        });
+        let authenticated_payload = serde_json::to_string(&metadata)?;
+        let manifest_authentication = manifest_encryption
+            .encrypt_string(&authenticated_payload)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to authenticate recovery manifest {}: {}",
+                    control_plane.backup_id, error
+                ),
+            })?;
+        metadata["manifest_authentication"] = json!(manifest_authentication);
+        let metadata_key =
+            crate::engines::v2_common::derive_metadata_key(&control_plane.s3_location);
+        s3_client
+            .put_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&metadata_key)
+            .body(serde_json::to_vec(&metadata)?.into())
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::S3(crate::engines::v2_common::describe_sdk_error(
+                    "put recovery metadata",
+                    &error,
+                ))
+            })?;
+        self.update_backup_index(&s3_client, &s3_source, control_plane)
+            .await?;
+
+        let mut updated_metadata =
+            control_plane_metadata.as_object().cloned().ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Control-plane backup {} metadata is not a JSON object",
+                    control_plane.id
+                ))
+            })?;
+        updated_metadata.insert(
+            "recovery_set_published".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        updated_metadata.insert(
+            "recovery_set_version".to_string(),
+            serde_json::Value::Number(2.into()),
+        );
+        let mut active = (*control_plane).clone().into_active_model();
+        active.metadata = Set(serde_json::Value::Object(updated_metadata).to_string());
+        active.update(self.db.as_ref()).await?;
+
+        Ok(RecoverySetPublication::Published {
+            schedule_run_id,
+            backup_id: control_plane.backup_id.clone(),
+        })
+    }
+
+    /// Heal terminal events lost to process restarts or broadcast lag. The
+    /// marker on the control-plane row keeps this bounded to unpublished
+    /// successful runs; each invocation processes at most 100 candidates.
+    pub async fn reconcile_completed_recovery_sets(&self) -> Result<(), BackupError> {
+        #[derive(FromQueryResult)]
+        struct Candidate {
+            id: i32,
+        }
+
+        let candidates = Candidate::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+SELECT cp.id
+  FROM backups cp
+ WHERE cp.schedule_run_id IS NOT NULL
+   AND cp.state = 'completed'
+   AND cp.metadata::jsonb ->> 'engine' = 'control_plane'
+   AND COALESCE((cp.metadata::jsonb ->> 'recovery_set_published')::boolean, false) = false
+   AND NOT EXISTS (
+       SELECT 1
+         FROM backups sibling
+        WHERE sibling.schedule_run_id = cp.schedule_run_id
+          AND sibling.state <> 'completed'
+   )
+ ORDER BY cp.id DESC
+ LIMIT 100
+            "#
+            .to_string(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        for candidate in candidates {
+            match self.publish_recovery_set_if_complete(candidate.id).await {
+                Ok(RecoverySetPublication::Published {
+                    schedule_run_id,
+                    backup_id,
+                }) => info!(
+                    schedule_run_id,
+                    backup_id, "Published recovered native recovery-set manifest"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    backup_id = candidate.id,
+                    error = %error,
+                    "Failed to reconcile native recovery-set manifest"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// Send a backup failure notification
     pub async fn send_backup_failure_notification(
         &self,
         backup_failure_data: BackupFailureData,
     ) -> Result<(), BackupError> {
-        use std::collections::HashMap;
-        use temps_core::notifications::{NotificationData, NotificationPriority, NotificationType};
-
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "schedule_id".to_string(),
-            backup_failure_data.schedule_id.to_string(),
-        );
-        metadata.insert(
-            "schedule_name".to_string(),
-            backup_failure_data.schedule_name.clone(),
-        );
-        metadata.insert(
-            "backup_type".to_string(),
-            backup_failure_data.backup_type.clone(),
-        );
-        metadata.insert("timestamp".to_string(), Utc::now().to_rfc3339());
-
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::BackupFailed,
+            severity: AlarmSeverity::Critical,
             title: format!("Backup Failed: {}", backup_failure_data.schedule_name),
             message: format!(
                 "Backup failed for {} ({}): {}",
@@ -1097,16 +1749,16 @@ impl BackupService {
                 backup_failure_data.backup_type,
                 backup_failure_data.error
             ),
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::High,
-            severity: Some("error".to_string()),
-            timestamp: Utc::now(),
-            metadata,
-            bypass_throttling: false,
+            metadata: Some(json!({
+                "schedule_id": backup_failure_data.schedule_id,
+                "schedule_name": backup_failure_data.schedule_name,
+                "backup_type": backup_failure_data.backup_type,
+                "timestamp": Utc::now().to_rfc3339(),
+            })),
         };
 
-        self.notification_dispatcher
-            .send_notification(notification)
+        self.alarm_service
+            .fire_alarm(request)
             .await
             .map_err(|e| BackupError::NotificationError(e.to_string()))?;
 
@@ -1134,71 +1786,52 @@ impl BackupService {
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
-        // Create S3 client (needed for metadata upload and legacy fallback)
+        // Create S3 client for the portable OSS fallback.
         let s3_client = self.create_s3_client(&s3_source).await?;
 
-        // Try WAL-G backup first (requires the internal DB container to have WAL-G installed).
-        // Falls back to pg_dump sidecar if the DB is not running in a Docker container we can exec into.
-        let (s3_location, size_bytes, compression_type) =
-            match self.backup_postgres_walg(&s3_source, &backup_id).await {
-                Ok((location, size)) => {
-                    info!("WAL-G backup completed: {}", location);
-                    (location, size, "lz4".to_string())
+        // WAL-G is preferred because it supports PITR and streams directly to
+        // object storage. OSS remains usable with arbitrary PostgreSQL images,
+        // so a local-only pg_dump artifact is still a supported fallback. The
+        // Cloud mirror deliberately rejects that fallback and explains that a
+        // WAL-G-capable image is required for managed backups.
+        let (s3_location, size_bytes, compression_type) = match self
+            .backup_postgres_walg(&s3_source, &backup_id)
+            .await
+        {
+            Ok((location, size)) => {
+                info!("WAL-G backup completed: {}", location);
+                (location, size, "lz4".to_string())
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "WAL-G unavailable; creating a local OSS pg_dump backup that will not be mirrored to Cloud"
+                );
+                let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
+                self.backup_postgres_database(&mut temp_file).await?;
+                let size_bytes = temp_file
+                    .as_file()
+                    .metadata()
+                    .map_err(BackupError::Io)?
+                    .len() as i64;
+                if size_bytes == 0 {
+                    return Err(BackupError::Validation(
+                        "Backup failed: pg_dump produced an empty artifact".to_string(),
+                    ));
                 }
-                Err(e) => {
-                    // WAL-G not available (e.g., DB on localhost, no Docker container found).
-                    // Fall back to pg_dump sidecar approach.
-                    warn!(
-                        "WAL-G backup not available ({}), falling back to pg_dump sidecar",
-                        e
-                    );
-
-                    let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
-
-                    self.backup_postgres_database(&mut temp_file)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Database backup failed for S3 source {}: {}",
-                                s3_source_id, e
-                            );
-                            e
-                        })?;
-
-                    let size_bytes = temp_file
-                        .as_file()
-                        .metadata()
-                        .map_err(BackupError::Io)?
-                        .len() as i64;
-
-                    if size_bytes == 0 {
-                        return Err(BackupError::Validation(
-                            "Backup failed: backup file has zero size".to_string(),
-                        ));
-                    }
-
-                    let s3_location = build_s3_key(
-                        &s3_source.bucket_path,
-                        &format!(
-                            "backups/{}/{}/backup.sql.gz",
-                            Utc::now().format("%Y/%m/%d"),
-                            backup_id
-                        ),
-                    );
-
-                    self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Failed to upload backup to S3 source {} at {}: {}",
-                                s3_source_id, s3_location, e
-                            );
-                            e
-                        })?;
-
-                    (s3_location, size_bytes, "gzip".to_string())
-                }
-            };
+                let s3_location = build_s3_key(
+                    &s3_source.bucket_path,
+                    &format!(
+                        "backups/{}/{}/backup.sql.gz",
+                        Utc::now().format("%Y/%m/%d"),
+                        backup_id
+                    ),
+                );
+                self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
+                    .await?;
+                (s3_location, size_bytes, "gzip".to_string())
+            }
+        };
 
         // Create backup record
         let new_backup = temps_entities::backups::ActiveModel {
@@ -1284,10 +1917,17 @@ impl BackupService {
                 "Backup completed with failures. Failed services: {}",
                 failed_services.join(", ")
             );
+            return Err(BackupError::Internal {
+                message: format!(
+                    "Whole-instance backup {} is incomplete because these services failed: {}",
+                    backup.backup_id,
+                    failed_services.join(", ")
+                ),
+            });
         }
 
         // After successful backup upload, create and upload metadata file
-        let metadata = self.generate_backup_metadata(&backup, &s3_source, &external_backups);
+        let metadata = self.generate_backup_metadata(&backup, &s3_source, &external_backups)?;
         let metadata_key = build_s3_key(
             &s3_source.bucket_path,
             &format!(
@@ -1546,6 +2186,15 @@ impl BackupService {
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         // Build environment variables for WAL-G
         let mut env_vars: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -1554,12 +2203,17 @@ impl BackupService {
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env_vars.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         // localhost/127.0.0.1 endpoints are translated to Docker-resolvable addresses.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -1725,16 +2379,21 @@ impl BackupService {
             .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
             .collect();
 
-        // Write the env file via docker exec
+        // Write the env file via docker exec. `walg_env_path` is derived from
+        // the container's PGDATA and must be escaped like any other value
+        // reaching `sh -c` -- an unescaped path lets shell metacharacters in
+        // it inject arbitrary commands into the exec.
+        let escaped_walg_env_path = shell_escape(&walg_env_path);
         let write_cmd = format!(
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            walg_env_path,
-            walg_env_path,
+            escaped_walg_env_path,
+            escaped_walg_env_path,
         );
 
         let exec = docker
@@ -2208,10 +2867,19 @@ impl BackupService {
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
 
+        // `None` for a long-lived credential — the third argument stays exactly
+        // what it was for every operator-configured source. `Some` only for a
+        // temporary one, which SigV4 rejects without its session token.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
+
         let creds = aws_sdk_s3::config::Credentials::new(
             decrypted_access_key,
             decrypted_secret_key,
-            None,
+            decrypted_session_token,
             None,
             "backup-service",
         );
@@ -2221,7 +2889,15 @@ impl BackupService {
             .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
             .force_path_style(s3_source.force_path_style.unwrap_or(true)) // Default to true for Minio
             .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client());
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            // aws-sdk-s3 defaults to computing a flexible checksum and sending it via
+            // aws-chunked trailers on every PutObject/UploadPart. Most third-party
+            // S3-compatible providers (Cloudflare R2, OVH, MinIO, Backblaze) don't
+            // implement that trailer format and reject or corrupt the upload, so only
+            // compute checksums when a caller explicitly asks for one.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            );
 
         // Only set endpoint URL if endpoint is specified (for Minio/custom S3)
         if let Some(endpoint) = &s3_source.endpoint {
@@ -2256,7 +2932,11 @@ impl BackupService {
             .region(aws_sdk_s3::config::Region::new(request.region.clone()))
             .force_path_style(request.force_path_style.unwrap_or(true))
             .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client());
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            // See create_s3_client() above for why this is forced to WhenRequired.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            );
 
         // Only set endpoint URL if endpoint is specified (for MinIO)
         if let Some(endpoint) = &request.endpoint {
@@ -3327,6 +4007,15 @@ impl BackupService {
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         let walg_s3_prefix = &backup.s3_location;
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -3335,11 +4024,16 @@ impl BackupService {
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -3366,6 +4060,12 @@ impl BackupService {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "/var/lib/postgresql".to_string());
         let restore_temp = format!("{}/restore_temp", volume_root);
+        // Both paths reach `sh -c` below in several commands; escape once and
+        // reuse rather than risk an unescaped interpolation creeping back in
+        // at one of the call sites. `pgdata` is configured per-service, so an
+        // unescaped path here is a shell-injection vector into the container.
+        let escaped_pgdata = shell_escape(&pgdata);
+        let escaped_restore_temp = shell_escape(&restore_temp);
 
         info!(
             "Step 1: Fetching WAL-G backup to {} in container {}",
@@ -3373,7 +4073,7 @@ impl BackupService {
         );
         let fetch_cmd_str = format!(
             "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} LATEST > /tmp/walg_restore.log 2>&1",
-            restore_temp = restore_temp,
+            restore_temp = escaped_restore_temp,
         );
 
         let exec = docker
@@ -3450,8 +4150,8 @@ impl BackupService {
                 "rm -rf {restore_temp}/pg_wal && ",
                 "cp -a {pgdata}/pg_wal {restore_temp}/pg_wal"
             ),
-            restore_temp = restore_temp,
-            pgdata = pgdata,
+            restore_temp = escaped_restore_temp,
+            pgdata = escaped_pgdata,
         );
 
         let exec = docker
@@ -3534,8 +4234,8 @@ impl BackupService {
         info!("Step 4: Swapping PGDATA via helper container");
         let swap_script = format!(
             "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp}",
-            pgdata = pgdata,
-            restore_temp = restore_temp,
+            pgdata = escaped_pgdata,
+            restore_temp = escaped_restore_temp,
         );
 
         // Get the image from the container's config to use the same image for the helper
@@ -3891,7 +4591,13 @@ impl BackupService {
                     &backup.backup_id,
                 )?);
             }
-            if prefixes.is_empty() {
+            if prefixes.is_empty() && backup.state != "failed" {
+                // A `failed` backup never finished uploading, so there is
+                // nothing on remote storage to attribute — safe to fall
+                // through and delete only the bookkeeping rows below.
+                // Any other state reaching here with no artifact indicates
+                // a lost reference to real remote data, which must not be
+                // silently discarded.
                 return Err(BackupError::Validation(format!(
                     "Backup {} has no attributable remote artifact",
                     backup.backup_id
@@ -4166,12 +4872,24 @@ impl BackupService {
                     source.id, error
                 ))
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            source,
+        )
+        .map_err(|error| {
+            BackupError::Configuration(format!(
+                "Failed to decrypt session token for S3 source {}: {}",
+                source.id, error
+            ))
+        })?;
         let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
             BackupError::ExternalService(format!("Failed to connect to Docker: {}", error))
         })?;
         let endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: source.region.clone(),
             endpoint: source.endpoint.clone(),
             bucket_name: source.bucket_name.clone(),
@@ -4190,6 +4908,10 @@ impl BackupService {
             format!("AWS_SECRET_ACCESS_KEY={}", secret_key),
             format!("AWS_REGION={}", source.region),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         if let Some(endpoint) = endpoint {
             env.push(format!(
                 "AWS_ENDPOINT={}",
@@ -4712,25 +5434,28 @@ impl BackupService {
             ));
         }
 
+        if let Some(service_id) = request.backing_service_id {
+            let backing_service = temps_entities::external_services::Entity::find_by_id(service_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "Backing service {} does not exist",
+                        service_id
+                    ))
+                })?;
+            if !matches!(backing_service.service_type.as_str(), "rustfs" | "s3") {
+                return Err(BackupError::Validation(format!(
+                    "Service {} has type '{}' and cannot back an S3 destination",
+                    service_id, backing_service.service_type
+                )));
+            }
+        }
+
         // Test S3 connection and auto-create bucket before persisting
         let s3_client = self.create_s3_client_from_request(&request).await?;
         self.test_and_create_s3_bucket(&s3_client, &request.bucket_name)
             .await?;
-
-        // Encrypt sensitive credentials before storing
-        let encrypted_access_key = self
-            .encryption_service
-            .encrypt_string(&request.access_key_id)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt access key: {}", e),
-            })?;
-
-        let encrypted_secret_key = self
-            .encryption_service
-            .encrypt_string(&request.secret_key)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt secret key: {}", e),
-            })?;
 
         // First source is automatically default; subsequent sources require an explicit
         // set-default call. An explicit `is_default: true` in the request is honored and
@@ -4755,22 +5480,37 @@ impl BackupService {
                 .await?;
         }
 
-        let new_source = temps_entities::s3_sources::ActiveModel {
-            id: sea_orm::NotSet,
-            name: sea_orm::Set(request.name.clone()),
-            bucket_name: sea_orm::Set(request.bucket_name),
-            bucket_path: sea_orm::Set(request.bucket_path),
-            access_key_id: sea_orm::Set(encrypted_access_key),
-            secret_key: sea_orm::Set(encrypted_secret_key),
-            region: sea_orm::Set(request.region),
-            created_at: sea_orm::Set(Utc::now()),
-            updated_at: sea_orm::Set(Utc::now()),
-            endpoint: sea_orm::Set(request.endpoint),
-            force_path_style: sea_orm::Set(request.force_path_style),
-            is_default: sea_orm::Set(should_be_default),
-        };
-
-        let source = new_source.insert(&txn).await?;
+        // Encrypt sensitive credentials and insert — shared with
+        // `temps-cloud`'s Cloud-managed backup credential provisioning so the
+        // encryption call site and the persisted row shape never drift.
+        let source = temps_entities::s3_sources::insert_encrypted(
+            &txn,
+            &self.encryption_service,
+            temps_entities::s3_sources::S3SourceCredentials {
+                name: request.name.clone(),
+                bucket_name: request.bucket_name,
+                bucket_path: request.bucket_path,
+                access_key_id: request.access_key_id,
+                secret_key: request.secret_key,
+                // An operator typing credentials into the S3 Sources form is
+                // always configuring a long-lived credential. Temporary,
+                // prefix-scoped credentials only ever arrive from Temps Cloud
+                // via `CloudService::provision_managed_backup_source`, so this
+                // path stores NULL for both and behaves exactly as before.
+                session_token: None,
+                credentials_expire_at: None,
+                region: request.region,
+                endpoint: request.endpoint,
+                force_path_style: request.force_path_style,
+            },
+            should_be_default,
+            false,
+            request.backing_service_id,
+        )
+        .await
+        .map_err(|error| BackupError::Internal {
+            message: format!("Failed to create S3 source '{}': {}", request.name, error),
+        })?;
         txn.commit().await?;
 
         debug!(
@@ -4923,10 +5663,126 @@ impl BackupService {
         Ok(source)
     }
 
+    /// Resolve every managed service that can be identified as the provider
+    /// of an S3 destination. New sources carry an explicit FK; legacy sources
+    /// are matched conservatively by their encrypted access/secret pair so an
+    /// upgrade cannot reintroduce recursive self-backups.
+    async fn source_backing_service_ids(
+        &self,
+        source_id: i32,
+    ) -> Result<HashSet<i32>, BackupError> {
+        let source = self.get_s3_source(source_id).await?;
+        if let Some(service_id) = source.backing_service_id {
+            return Ok(HashSet::from([service_id]));
+        }
+
+        let candidates = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::ServiceType.is_in(["rustfs", "s3"]))
+            .all(self.db.as_ref())
+            .await?;
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let access_key = self
+            .encryption_service
+            .decrypt_string(&source.access_key_id)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to resolve backing service for S3 source {}: access key could not be decrypted: {}",
+                    source_id, error
+                ),
+            })?;
+        let secret_key = self
+            .encryption_service
+            .decrypt_string(&source.secret_key)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to resolve backing service for S3 source {}: secret key could not be decrypted: {}",
+                    source_id, error
+                ),
+            })?;
+
+        let mut service_ids = HashSet::new();
+        for candidate in candidates {
+            let config = self
+                .external_service_manager
+                .get_service_config(candidate.id)
+                .await
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to inspect managed storage service {} for S3 source {}: {}",
+                        candidate.id, source_id, error
+                    ),
+                })?;
+            let candidate_access = config
+                .parameters
+                .get("access_key")
+                .and_then(serde_json::Value::as_str);
+            let candidate_secret = config
+                .parameters
+                .get("secret_key")
+                .and_then(serde_json::Value::as_str);
+            if candidate_access == Some(access_key.as_str())
+                && candidate_secret == Some(secret_key.as_str())
+            {
+                service_ids.insert(candidate.id);
+            }
+        }
+
+        Ok(service_ids)
+    }
+
+    /// Normalize and validate an explicit schedule target list before it is
+    /// written. Returning the de-duplicated IDs keeps create, update, and the
+    /// standalone attach endpoint on the same validation contract.
+    async fn validated_schedule_service_ids(
+        &self,
+        s3_source_id: i32,
+        service_ids: &[i32],
+    ) -> Result<Vec<i32>, BackupError> {
+        let mut unique_ids = service_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        if unique_ids.is_empty() {
+            return Ok(unique_ids);
+        }
+
+        let backing_service_ids = self.source_backing_service_ids(s3_source_id).await?;
+        reject_source_backing_targets(&backing_service_ids, unique_ids.iter().copied())?;
+
+        let found_count = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::Id.is_in(unique_ids.clone()))
+            .count(self.db.as_ref())
+            .await?;
+        if found_count as usize != unique_ids.len() {
+            return Err(BackupError::Validation(format!(
+                "One or more service ids do not exist (requested {}, found {})",
+                unique_ids.len(),
+                found_count
+            )));
+        }
+
+        Ok(unique_ids)
+    }
+
     /// Delete an S3 source
     pub async fn delete_s3_source(&self, id: i32) -> Result<bool, BackupError> {
         // First check if source exists and is not in use
         let source = self.get_s3_source(id).await?;
+
+        // Refuse to delete a Cloud-managed source. It was not created by an
+        // operator and cannot be recreated by one; only Temps Cloud's own
+        // disconnect cleanup (which does not go through this method) may
+        // remove it.
+        if source.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be deleted manually. \
+                 Disconnect Temps Cloud to remove it.",
+                source.name
+            )));
+        }
 
         // Refuse to delete the default source while other sources exist. The caller
         // should set a different source as default first.
@@ -4952,6 +5808,22 @@ impl BackupService {
             return Err(BackupError::Validation(format!(
                 "Cannot delete S3 source '{}': still referenced by {} backup schedule(s)",
                 source.name, schedule_count
+            )));
+        }
+
+        // Completed and failed backup records are retained as recovery evidence.
+        // Deleting their source would cascade into `backups`, which is deliberately
+        // prevented once a restore run references a backup. Check the direct
+        // dependency up front so callers receive a stable validation error instead
+        // of leaking a database foreign-key violation as HTTP 500.
+        let backup_count = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::S3SourceId.eq(id))
+            .count(self.db.as_ref())
+            .await?;
+        if backup_count > 0 {
+            return Err(BackupError::Validation(format!(
+                "Cannot delete S3 source '{}': still referenced by {} backup record(s)",
+                source.name, backup_count
             )));
         }
 
@@ -4984,6 +5856,21 @@ impl BackupService {
 
         validate_retention_period(request.retention_period)?;
 
+        let target_all = request.target_all_services.unwrap_or(true);
+        let include_control_plane = request.include_control_plane.unwrap_or(true);
+        if target_all && !request.service_ids.is_empty() {
+            return Err(BackupError::Validation(
+                "service_ids cannot be set when target_all_services=true".to_string(),
+            ));
+        }
+        if !target_all && !include_control_plane && request.service_ids.is_empty() {
+            return Err(BackupError::Validation(
+                "A schedule must include the control plane, at least one specific database, \
+                 or all databases."
+                    .to_string(),
+            ));
+        }
+
         // Resolve S3 source: explicit id OR fall back to the default source.
         let s3_source_id = self.resolve_s3_source_id(request.s3_source_id).await?;
 
@@ -5004,7 +5891,14 @@ impl BackupService {
             .map_err(|e| BackupError::Schedule(e.to_string()))?;
         let next_run = cron_schedule.upcoming(Utc).next();
 
-        // Insert with SeaORM
+        let service_ids = self
+            .validated_schedule_service_ids(s3_source_id, &request.service_ids)
+            .await?;
+
+        // Insert the schedule and its explicit memberships in one transaction.
+        // A scheduler tick can therefore never observe an enabled specific-
+        // target schedule before its databases have been attached.
+        let txn = self.db.begin().await?;
         let now = chrono::Utc::now();
         let tags_json = serde_json::to_string(&request.tags)?;
         let new_schedule = temps_entities::backup_schedules::ActiveModel {
@@ -5024,30 +5918,25 @@ impl BackupService {
             // Default is true ("back up every database, including future
             // ones") so a freshly-created schedule does the obvious thing
             // without the operator having to pick services up front.
-            target_all_services: Set(request.target_all_services.unwrap_or(true)),
-            include_control_plane: Set(request.include_control_plane.unwrap_or(true)),
+            target_all_services: Set(target_all),
+            include_control_plane: Set(include_control_plane),
             ..Default::default()
         };
 
-        // Validate the resulting schedule has at least one thing to back
-        // up. We do this *after* defaulting so callers who omit the flags
-        // get the safe "back up everything" behaviour instead of a 400.
-        let target_all = request.target_all_services.unwrap_or(true);
-        let include_cp = request.include_control_plane.unwrap_or(true);
-        if !target_all && !include_cp {
-            // Without target_all_services the operator must also attach at
-            // least one service. They can't do that until the schedule
-            // exists, so the only way to get here legitimately is via an
-            // update — block it on create.
-            return Err(BackupError::Validation(
-                "A schedule must include the control plane, target all databases, \
-                 or both. Set include_control_plane=true or target_all_services=true \
-                 (or omit the flags to use the defaults)."
-                    .to_string(),
-            ));
+        let schedule_model = new_schedule.insert(&txn).await?;
+        if !service_ids.is_empty() {
+            let memberships = service_ids.into_iter().map(|service_id| {
+                temps_entities::backup_schedule_services::ActiveModel {
+                    schedule_id: Set(schedule_model.id),
+                    service_id: Set(service_id),
+                    created_at: Set(now),
+                }
+            });
+            temps_entities::backup_schedule_services::Entity::insert_many(memberships)
+                .exec(&txn)
+                .await?;
         }
-
-        let schedule_model = new_schedule.insert(self.db.as_ref()).await?;
+        txn.commit().await?;
         info!("Created new backup schedule: {}", schedule_model.name);
         self.fire_lifecycle_reconcile(schedule_model.s3_source_id);
         Ok(schedule_model)
@@ -5086,6 +5975,207 @@ impl BackupService {
         Ok(schedule)
     }
 
+    /// Resolve project ownership for many external services in one database
+    /// query. The result contains one entry for every requested service id,
+    /// including ids with no project link (their `project_ids` is empty).
+    pub async fn project_scopes_for_services(
+        &self,
+        service_ids: &[i32],
+    ) -> Result<Vec<ServiceProjectScope>, BackupError> {
+        if service_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_ids = service_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        let links = temps_entities::project_services::Entity::find()
+            .filter(temps_entities::project_services::Column::ServiceId.is_in(unique_ids.clone()))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        let mut projects_by_service: BTreeMap<i32, BTreeSet<i32>> = unique_ids
+            .into_iter()
+            .map(|service_id| (service_id, BTreeSet::new()))
+            .collect();
+        for link in links {
+            if let Some(project_ids) = projects_by_service.get_mut(&link.service_id) {
+                project_ids.insert(link.project_id);
+            }
+        }
+
+        Ok(projects_by_service
+            .into_iter()
+            .map(|(service_id, project_ids)| ServiceProjectScope {
+                service_id,
+                project_ids: project_ids.into_iter().collect(),
+            })
+            .collect())
+    }
+
+    /// Resolve the authoritative access scope for many backup schedules with
+    /// a fixed number of batched queries. This avoids the former per-service
+    /// project lookup in schedule list and membership handlers.
+    pub async fn access_scopes_for_schedules(
+        &self,
+        schedule_ids: &[i32],
+    ) -> Result<Vec<BackupScheduleAccessScope>, BackupError> {
+        if schedule_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_schedule_ids = schedule_ids.to_vec();
+        unique_schedule_ids.sort_unstable();
+        unique_schedule_ids.dedup();
+
+        let schedules = temps_entities::backup_schedules::Entity::find()
+            .filter(temps_entities::backup_schedules::Column::Id.is_in(unique_schedule_ids.clone()))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        let memberships = temps_entities::backup_schedule_services::Entity::find()
+            .filter(
+                temps_entities::backup_schedule_services::Column::ScheduleId
+                    .is_in(unique_schedule_ids),
+            )
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        let mut services_by_schedule: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+        let mut service_ids = Vec::with_capacity(memberships.len());
+        for membership in memberships {
+            services_by_schedule
+                .entry(membership.schedule_id)
+                .or_default()
+                .push(membership.service_id);
+            service_ids.push(membership.service_id);
+        }
+
+        let project_scopes = self.project_scopes_for_services(&service_ids).await?;
+        let projects_by_service: BTreeMap<i32, Vec<i32>> = project_scopes
+            .into_iter()
+            .map(|scope| (scope.service_id, scope.project_ids))
+            .collect();
+
+        let mut scopes = Vec::with_capacity(schedules.len());
+        for schedule in schedules {
+            if schedule.target_all_services {
+                scopes.push(BackupScheduleAccessScope::Global {
+                    schedule_id: schedule.id,
+                    reason: GlobalScheduleReason::TargetsAllServices,
+                });
+                continue;
+            }
+            if schedule.include_control_plane {
+                scopes.push(BackupScheduleAccessScope::Global {
+                    schedule_id: schedule.id,
+                    reason: GlobalScheduleReason::IncludesControlPlane,
+                });
+                continue;
+            }
+
+            let Some(attached_service_ids) = services_by_schedule.get(&schedule.id) else {
+                scopes.push(BackupScheduleAccessScope::Global {
+                    schedule_id: schedule.id,
+                    reason: GlobalScheduleReason::HasNoAttachedServices,
+                });
+                continue;
+            };
+
+            let mut project_ids = BTreeSet::new();
+            let mut ownerless_service_id = None;
+            for service_id in attached_service_ids {
+                let service_project_ids = projects_by_service
+                    .get(service_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if service_project_ids.is_empty() {
+                    ownerless_service_id = Some(*service_id);
+                    break;
+                }
+                project_ids.extend(service_project_ids.iter().copied());
+            }
+
+            if let Some(service_id) = ownerless_service_id {
+                scopes.push(BackupScheduleAccessScope::Global {
+                    schedule_id: schedule.id,
+                    reason: GlobalScheduleReason::HasOwnerlessService { service_id },
+                });
+            } else if project_ids.is_empty() {
+                scopes.push(BackupScheduleAccessScope::Global {
+                    schedule_id: schedule.id,
+                    reason: GlobalScheduleReason::HasNoAttachedServices,
+                });
+            } else {
+                scopes.push(BackupScheduleAccessScope::Projects {
+                    schedule_id: schedule.id,
+                    project_ids: project_ids.into_iter().collect(),
+                });
+            }
+        }
+
+        scopes.sort_by_key(BackupScheduleAccessScope::schedule_id);
+        Ok(scopes)
+    }
+
+    /// Resolve a single schedule scope, preserving a contextual not-found
+    /// error when the caller supplies an unknown schedule id.
+    pub async fn access_scope_for_schedule(
+        &self,
+        schedule_id: i32,
+    ) -> Result<BackupScheduleAccessScope, BackupError> {
+        self.access_scopes_for_schedules(&[schedule_id])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "BackupSchedule".to_string(),
+                detail: format!("Backup schedule {schedule_id} not found"),
+            })
+    }
+
+    /// Resolve the owning schedule for a real or synthetic schedule-run id.
+    /// Synthetic legacy run ids are the negated `backups.id` values emitted
+    /// by `list_schedule_runs`.
+    pub async fn schedule_id_for_run(&self, run_id: i64) -> Result<i32, BackupError> {
+        if run_id >= 0 {
+            let run = temps_entities::schedule_runs::Entity::find_by_id(run_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(BackupError::Database)?
+                .ok_or_else(|| BackupError::NotFound {
+                    resource: "ScheduleRun".to_string(),
+                    detail: format!("Schedule run {run_id} not found"),
+                })?;
+            return Ok(run.schedule_id);
+        }
+
+        let backup_id_i64 = run_id.checked_neg().ok_or_else(|| {
+            BackupError::Validation(format!("Schedule run id {run_id} cannot be resolved"))
+        })?;
+        let backup_id = i32::try_from(backup_id_i64).map_err(|_| {
+            BackupError::Validation(format!(
+                "Schedule run id {run_id} is outside the valid range"
+            ))
+        })?;
+        let backup = temps_entities::backups::Entity::find_by_id(backup_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "ScheduleRun".to_string(),
+                detail: format!("Synthetic schedule run {run_id} not found"),
+            })?;
+        backup.schedule_id.ok_or_else(|| BackupError::NotFound {
+            resource: "ScheduleRun".to_string(),
+            detail: format!("Backup {backup_id} is not linked to a schedule"),
+        })
+    }
+
     /// Delete a backup schedule
     pub async fn delete_backup_schedule(&self, id: i32) -> Result<bool, BackupError> {
         use sea_orm::EntityTrait;
@@ -5112,33 +6202,19 @@ impl BackupService {
         schedule_id: i32,
         service_ids: &[i32],
     ) -> Result<u64, BackupError> {
-        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+        use sea_orm::ConnectionTrait;
 
-        // Validate schedule exists (raises NotFound otherwise).
-        self.get_backup_schedule(schedule_id).await?;
+        // Validate schedule exists (raises NotFound otherwise) and resolve the
+        // destination identity before accepting explicit targets.
+        let schedule = self.get_backup_schedule(schedule_id).await?;
 
         if service_ids.is_empty() {
             return Ok(0);
         }
 
-        // De-duplicate the input so we don't ask the DB to insert dup rows
-        // (ON CONFLICT handles it, but logging stays clean).
-        let mut unique_ids: Vec<i32> = service_ids.to_vec();
-        unique_ids.sort_unstable();
-        unique_ids.dedup();
-
-        // Validate every requested service id exists.
-        let found_count = temps_entities::external_services::Entity::find()
-            .filter(temps_entities::external_services::Column::Id.is_in(unique_ids.clone()))
-            .count(self.db.as_ref())
+        let unique_ids = self
+            .validated_schedule_service_ids(schedule.s3_source_id, service_ids)
             .await?;
-        if (found_count as usize) != unique_ids.len() {
-            return Err(BackupError::Validation(format!(
-                "One or more service ids do not exist (requested {}, found {})",
-                unique_ids.len(),
-                found_count
-            )));
-        }
 
         // Build a single multi-row INSERT with ON CONFLICT DO NOTHING for
         // idempotency. Sea-ORM `insert_many` does not expose ON CONFLICT in
@@ -5281,44 +6357,18 @@ impl BackupService {
             ),
             tags: vec![],
             max_runtime_secs: None,
-            // Target exactly this service (attached below), not every DB.
-            //
-            // `create_backup_schedule` refuses to create a schedule that has
-            // nothing to back up (target_all=false AND include_control_plane=
-            // false) because no services can be attached until the schedule
-            // row exists. So we create it with the control plane temporarily
-            // included, attach the service, then flip include_control_plane
-            // off via `update_backup_schedule` — which permits the otherwise-
-            // empty combination precisely because a service is now attached.
+            // Target exactly this service, not every DB or the control plane.
+            // Schedule creation commits this membership atomically.
             target_all_services: Some(false),
-            include_control_plane: Some(true),
+            include_control_plane: Some(false),
+            service_ids: vec![service.id],
         };
 
         let schedule = self.create_backup_schedule(request).await?;
-
-        // Attach exactly this service so the schedule's fan-out targets it.
-        self.attach_services_to_schedule(schedule.id, &[service.id])
-            .await?;
-
-        // Now that the service is attached, narrow the schedule down to exactly
-        // that service: drop the control-plane backup so the schedule only
-        // produces base backups for this MariaDB service.
-        let schedule = self
-            .update_backup_schedule(
-                schedule.id,
-                UpdateBackupScheduleRequest {
-                    name: None,
-                    description: None,
-                    schedule_expression: None,
-                    retention_period: None,
-                    max_runtime_secs: None,
-                    enabled: None,
-                    tags: None,
-                    target_all_services: None,
-                    include_control_plane: Some(false),
-                },
-            )
-            .await?;
+        let mut generated_schedule: temps_entities::backup_schedules::ActiveModel =
+            schedule.clone().into();
+        generated_schedule.generated_kind = Set(Some("mariadb_base_backup".to_string()));
+        generated_schedule.update(self.db.as_ref()).await?;
 
         // Flip the one-shot latch so we never provision this service again.
         let mut active: temps_entities::external_services::ActiveModel = service.clone().into();
@@ -5409,28 +6459,199 @@ impl BackupService {
         Ok(schedules)
     }
 
-    /// List backups for a schedule
+    /// Resolve the immutable authorization summary for all historical backups
+    /// of a schedule without materializing every backup id. The two bounded
+    /// queries return one existence bit plus distinct producer service ids.
+    pub async fn backup_history_access_scope_for_schedule(
+        &self,
+        schedule_id: i32,
+    ) -> Result<BackupCollectionAccessScope, BackupError> {
+        self.get_backup_schedule(schedule_id).await?;
+
+        let global_row =
+            BackupCollectionGlobalRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"SELECT EXISTS (
+                    SELECT 1
+                    FROM backups b
+                    WHERE b.schedule_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM external_service_backups esb
+                          WHERE esb.backup_id = b.id
+                      )
+                ) AS contains_global"#,
+                vec![Value::from(schedule_id)],
+            ))
+            .one(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?
+            .ok_or_else(|| BackupError::Internal {
+                message: format!(
+                    "Schedule {schedule_id} backup history scope query returned no result"
+                ),
+            })?;
+
+        let service_rows =
+            BackupCollectionServiceRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"SELECT DISTINCT esb.service_id
+                    FROM backups b
+                    JOIN external_service_backups esb ON esb.backup_id = b.id
+                    WHERE b.schedule_id = $1
+                    ORDER BY esb.service_id"#,
+                vec![Value::from(schedule_id)],
+            ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        Ok(BackupCollectionAccessScope {
+            contains_global: global_row.contains_global,
+            service_ids: service_rows.into_iter().map(|row| row.service_id).collect(),
+        })
+    }
+
+    /// List raw backup rows after the bounded history summary has been
+    /// authorized by the handler.
     pub async fn list_backups_for_schedule(
         &self,
         schedule_id: i32,
     ) -> Result<Vec<Backup>, BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
-        // Verify schedule exists
         self.get_backup_schedule(schedule_id).await?;
 
         let backups = temps_entities::backups::Entity::find()
             .filter(temps_entities::backups::Column::ScheduleId.eq(schedule_id))
             .order_by_desc(temps_entities::backups::Column::StartedAt)
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(BackupError::Database)?;
 
-        debug!(
-            "Listed {} backups for schedule {}",
-            backups.len(),
-            schedule_id
-        );
         Ok(backups)
+    }
+
+    /// Resolve immutable access scopes for every backup job in one scheduler
+    /// run. This is used to authorize run drill-down before returning any
+    /// aggregate or per-job metadata.
+    pub async fn backups_with_access_scopes_for_schedule_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<BackupWithAccessScope>, BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::ScheduleRunId.eq(run_id))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        self.derive_backup_access_scopes(backups).await
+    }
+
+    /// Resolve immutable scopes for the exact live children that a run cancel
+    /// can mutate. Terminal children are intentionally excluded because the
+    /// cancellation helper does not update them.
+    pub async fn live_backups_with_access_scopes_for_schedule_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<BackupWithAccessScope>, BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::ScheduleRunId.eq(run_id))
+            .filter(
+                temps_entities::backups::Column::State
+                    .is_in(["pending".to_string(), "running".to_string()]),
+            )
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        self.derive_backup_access_scopes(backups).await
+    }
+
+    /// Resolve immutable scopes for the exact UUID set supplied by a
+    /// preview-bound destructive operation. Missing rows are left for the
+    /// operation's stale-preview validation to reject.
+    pub async fn backups_with_access_scopes_by_uuids(
+        &self,
+        backup_uuids: &[String],
+    ) -> Result<Vec<BackupWithAccessScope>, BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        if backup_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique_backup_uuids = backup_uuids.to_vec();
+        unique_backup_uuids.sort();
+        unique_backup_uuids.dedup();
+        let backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::BackupId.is_in(unique_backup_uuids))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        self.derive_backup_access_scopes(backups).await
+    }
+
+    /// Resolve a bounded immutable scope summary for all backups currently
+    /// selected by one schedule's retention policy. The authorization query
+    /// scales with distinct producer services, not expired backup count.
+    pub async fn retention_candidate_access_scope(
+        &self,
+        schedule_id: i32,
+    ) -> Result<BackupCollectionAccessScope, BackupError> {
+        let schedule = self.get_backup_schedule(schedule_id).await?;
+        if schedule.retention_period <= 0 {
+            return Ok(BackupCollectionAccessScope {
+                contains_global: false,
+                service_ids: Vec::new(),
+            });
+        }
+        let cutoff = retention_cutoff(schedule.retention_period)?;
+
+        let global_row =
+            BackupCollectionGlobalRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"SELECT EXISTS (
+                    SELECT 1
+                    FROM backups b
+                    WHERE b.schedule_id = $1
+                      AND b.started_at < $2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM external_service_backups esb
+                          WHERE esb.backup_id = b.id
+                      )
+                ) AS contains_global"#,
+                vec![Value::from(schedule_id), Value::from(cutoff)],
+            ))
+            .one(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?
+            .ok_or_else(|| BackupError::Internal {
+                message: format!("Schedule {schedule_id} retention scope query returned no result"),
+            })?;
+
+        let service_rows =
+            BackupCollectionServiceRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"SELECT DISTINCT esb.service_id
+                    FROM backups b
+                    JOIN external_service_backups esb ON esb.backup_id = b.id
+                    WHERE b.schedule_id = $1
+                      AND b.started_at < $2
+                    ORDER BY esb.service_id"#,
+                vec![Value::from(schedule_id), Value::from(cutoff)],
+            ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+
+        Ok(BackupCollectionAccessScope {
+            contains_global: global_row.contains_global,
+            service_ids: service_rows.into_iter().map(|row| row.service_id).collect(),
+        })
     }
 
     /// Paginated run history for a backup schedule (deliverable 1).
@@ -5575,13 +6796,13 @@ OFFSET $3
         let runs = raw_rows
             .into_iter()
             .map(|r| {
-                let aggregate_state = if r.pending_jobs + r.running_jobs > 0 {
-                    "running".to_string()
-                } else if r.failed_jobs > 0 {
-                    "failed".to_string()
-                } else {
-                    "completed".to_string()
-                };
+                let aggregate_state = schedule_run_aggregate_state(
+                    r.total_jobs,
+                    r.failed_jobs,
+                    r.running_jobs,
+                    r.pending_jobs,
+                )
+                .to_string();
 
                 ScheduleRunSummary {
                     run_id: r.run_id,
@@ -5655,7 +6876,7 @@ SELECT
     b.id                                            AS backup_id,
     b.backup_id                                     AS backup_uuid,
     COALESCE(b.metadata::jsonb ->> 'engine', 'control_plane') AS engine,
-    COALESCE(es.name, 'control plane')              AS service_name,
+    COALESCE(es.name, esb.service_name_snapshot, 'control plane') AS service_name,
     esb.service_id                                  AS service_id,
     b.state                                         AS state,
     b.started_at                                    AS started_at,
@@ -6031,6 +7252,9 @@ SELECT sr.id FROM schedule_runs sr
         //   - false → only services attached via `backup_schedule_services`
         //             (the operator picked specific DBs).
         use sea_orm::{ColumnTrait, QueryFilter};
+        let backing_service_ids = self
+            .source_backing_service_ids(schedule.s3_source_id)
+            .await?;
         let external_services = if schedule.target_all_services {
             temps_entities::external_services::Entity::find()
                 .all(self.db.as_ref())
@@ -6046,6 +7270,8 @@ SELECT sr.id FROM schedule_runs sr
                 .await
                 .map_err(BackupError::Database)?
         };
+        let external_services =
+            exclude_source_backing_services(external_services, &backing_service_ids);
 
         if external_services.is_empty() {
             // Two reasons we could end up here: no DBs exist yet, or the
@@ -6077,6 +7303,17 @@ SELECT sr.id FROM schedule_runs sr
                     );
                 }
             }
+        }
+        let expected_service_ids = resolved_services
+            .iter()
+            .map(|(service, _)| service.id)
+            .collect::<Vec<_>>();
+
+        if !schedule.include_control_plane && resolved_services.is_empty() {
+            return Err(BackupError::Validation(format!(
+                "Schedule {} has no eligible backup targets; no run was recorded",
+                schedule.id
+            )));
         }
 
         // ── Step 3: open the write transaction ────────────────────────────────
@@ -6153,6 +7390,7 @@ RETURNING id
                     "scheduled": triggered_by == TriggerSource::Cron,
                     "schedule_id": schedule.id,
                     "run_id": run_id,
+                    "expected_service_ids": expected_service_ids,
                     "timestamp": now.to_rfc3339(),
                 })
                 .to_string()),
@@ -6230,14 +7468,15 @@ RETURNING id
                     });
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         schedule_id = schedule.id,
                         service_id = svc.id,
                         service_name = %svc.name,
                         engine = engine_key,
                         error = %e,
-                        "enqueue_scheduled_run: failed to insert external service rows, skipping",
+                        "enqueue_scheduled_run: failed to insert external service rows; rolling back the fan-out",
                     );
+                    return Err(e);
                 }
             }
         }
@@ -6304,7 +7543,6 @@ RETURNING id
 
         let backup_uuid = Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-
         let new_backup = temps_entities::backups::ActiveModel {
             id: sea_orm::NotSet,
             name: Set(format!("Backup {}", backup_uuid)),
@@ -6399,6 +7637,16 @@ RETURNING id
 
         let backup_uuid = Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
+        let source_service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "ExternalService".to_string(),
+                detail: format!(
+                    "service {} disappeared while creating its backup",
+                    service_id
+                ),
+            })?;
 
         let mut backups_metadata = serde_json::Map::new();
         backups_metadata.insert(
@@ -6495,6 +7743,8 @@ RETURNING id
             compression_type: Set(compression_type.to_string()),
             created_by: Set(created_by),
             expires_at: Set(None),
+            service_name_snapshot: Set(Some(source_service.name)),
+            service_type_snapshot: Set(Some(source_service.service_type)),
         }
         .insert(txn)
         .await?;
@@ -6599,6 +7849,16 @@ RETURNING id
                 detail: "S3 source not found".to_string(),
             })?;
 
+        // Refuse to edit a Cloud-managed source. Its credentials are rotated
+        // by Temps Cloud's own provisioning path, not by an operator editing
+        // this row by hand.
+        if current.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be edited manually.",
+                current.name
+            )));
+        }
+
         let mut active = current.into_active_model();
 
         if let Some(name) = request.name {
@@ -6655,13 +7915,31 @@ RETURNING id
             temps_entities::external_service_backups::Model,
             temps_entities::external_services::Model,
         )],
-    ) -> serde_json::Value {
-        // Serialize the server config
-        let config_yaml = serde_yaml::to_string(&self.config_service.get_server_config())
-            .unwrap_or_else(|e| {
-                error!("Failed to serialize server config: {}", e);
-                String::new()
-            });
+    ) -> Result<serde_json::Value, BackupError> {
+        let config_yaml =
+            serde_yaml::to_string(&self.config_service.get_server_config()).map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to serialize server config for backup {}: {}",
+                    backup.backup_id, error
+                ))
+            })?;
+        let s3_secret = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to decrypt S3 secret for backup {}: {}",
+                    backup.backup_id, error
+                ))
+            })?;
+        let encrypted_server_config = temps_core::EncryptionService::new_from_password(&s3_secret)
+            .encrypt_string(&config_yaml)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to encrypt server config for backup {}: {}",
+                    backup.backup_id, error
+                ),
+            })?;
 
         // Map external backups to the required format
         let external_backups = external_backups
@@ -6682,7 +7960,7 @@ RETURNING id
             })
             .collect::<Vec<_>>();
 
-        json!({
+        Ok(json!({
             "backup_id": backup.backup_id,
             "name": backup.name,
             "type": backup.backup_type,
@@ -6700,10 +7978,11 @@ RETURNING id
             "state": backup.state,
             "tags": serde_json::from_str::<Vec<String>>(&backup.tags).unwrap_or_default(),
             "checksum": backup.checksum,
-            "server_config": config_yaml,
+            "server_config_encrypted": encrypted_server_config,
+            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
             "external_service_backups": external_backups,
             "metadata": serde_json::from_str::<serde_json::Value>(&backup.metadata).unwrap_or_default()
-        })
+        }))
     }
 
     /// Update the source's backup index
@@ -7232,10 +8511,10 @@ SELECT
     esb.s3_location   AS s3_location,
     esb.error_message AS error_message,
     esb.compression_type AS compression_type,
-    es.name           AS service_name,
-    es.service_type   AS service_type
+    COALESCE(es.name, esb.service_name_snapshot, 'deleted service') AS service_name,
+    COALESCE(es.service_type, esb.service_type_snapshot, 'unknown') AS service_type
 FROM external_service_backups esb
-JOIN external_services es ON es.id = esb.service_id
+LEFT JOIN external_services es ON es.id = esb.service_id
 WHERE esb.backup_id = $1
 ORDER BY esb.id ASC
         "#;
@@ -7258,6 +8537,42 @@ ORDER BY esb.id ASC
         Ok(rows)
     }
 
+    /// Return every unresolved backup alert, newest first. The schedule JOIN
+    /// is owned by the service layer so handlers do not access the database
+    /// directly. Raw database failures are logged here and converted to a
+    /// stable client-safe error.
+    pub async fn list_open_backup_alerts(&self) -> Result<Vec<BackupAlertEntry>, BackupError> {
+        let sql = r#"
+SELECT
+    a.id,
+    a.kind,
+    a.severity,
+    a.schedule_id,
+    s.name             AS schedule_name,
+    s.s3_source_id     AS schedule_s3_source_id,
+    a.message,
+    a.opened_at
+FROM backup_alerts a
+LEFT JOIN backup_schedules s ON s.id = a.schedule_id
+WHERE a.resolved_at IS NULL
+ORDER BY a.opened_at DESC
+"#;
+
+        BackupAlertEntry::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|db_error| {
+            error!(error = %db_error, "failed to query open backup alerts");
+            BackupError::Internal {
+                message: "Failed to list open backup alerts".to_string(),
+            }
+        })
+    }
+
     /// Get a backup by ID
     pub async fn get_backup(&self, backup_id: &str) -> Result<Option<Backup>, BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -7268,6 +8583,118 @@ ORDER BY esb.id ASC
             .await?;
 
         Ok(model)
+    }
+
+    /// Resolve backup rows and their authoritative access scopes in a fixed
+    /// number of batched queries. Producer-service ownership is the only
+    /// project-confined ownership evidence; rows without a producer are
+    /// global even when they reference a currently project-scoped schedule.
+    pub async fn backups_with_access_scopes(
+        &self,
+        backup_ids: &[i32],
+    ) -> Result<Vec<BackupWithAccessScope>, BackupError> {
+        if backup_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique_backup_ids = backup_ids.to_vec();
+        unique_backup_ids.sort_unstable();
+        unique_backup_ids.dedup();
+        let backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::Id.is_in(unique_backup_ids))
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+        self.derive_backup_access_scopes(backups).await
+    }
+
+    pub async fn backup_with_access_scope_by_id(
+        &self,
+        backup_id: i32,
+    ) -> Result<BackupWithAccessScope, BackupError> {
+        self.backups_with_access_scopes(&[backup_id])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("Backup row {backup_id} not found"),
+            })
+    }
+
+    pub async fn backup_with_access_scope_by_uuid(
+        &self,
+        backup_uuid: &str,
+    ) -> Result<BackupWithAccessScope, BackupError> {
+        let backup = self
+            .get_backup(backup_uuid)
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("Backup {backup_uuid} not found"),
+            })?;
+        self.derive_backup_access_scopes(vec![backup])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackupError::Internal {
+                message: format!(
+                    "Backup {backup_uuid} disappeared while resolving its authorization scope"
+                ),
+            })
+    }
+
+    async fn derive_backup_access_scopes(
+        &self,
+        backups: Vec<Backup>,
+    ) -> Result<Vec<BackupWithAccessScope>, BackupError> {
+        if backups.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let backup_ids: Vec<i32> = backups.iter().map(|backup| backup.id).collect();
+        let producer_rows = temps_entities::external_service_backups::Entity::find()
+            .filter(
+                temps_entities::external_service_backups::Column::BackupId
+                    .is_in(backup_ids.iter().copied()),
+            )
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)?;
+        let mut producers_by_backup: BTreeMap<i32, BTreeSet<i32>> = backup_ids
+            .iter()
+            .copied()
+            .map(|backup_id| (backup_id, BTreeSet::new()))
+            .collect();
+        for producer in producer_rows {
+            if let Some(service_ids) = producers_by_backup.get_mut(&producer.backup_id) {
+                service_ids.insert(producer.service_id);
+            }
+        }
+
+        Ok(backups
+            .into_iter()
+            .map(|backup| {
+                let producer_service_ids: Vec<i32> = producers_by_backup
+                    .remove(&backup.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let access_scope = if !producer_service_ids.is_empty() {
+                    BackupAccessScope::Services {
+                        backup_id: backup.id,
+                        service_ids: producer_service_ids,
+                    }
+                } else {
+                    BackupAccessScope::Global {
+                        backup_id: backup.id,
+                    }
+                };
+                BackupWithAccessScope {
+                    backup,
+                    access_scope,
+                }
+            })
+            .collect())
     }
 
     /// Best-effort progress size for a running backup.
@@ -7370,6 +8797,22 @@ ORDER BY esb.id ASC
             })
     }
 
+    /// Resolve the live backup artifact and Cloud mirror compatibility for an
+    /// external service. Database lookup and Docker probing stay in the
+    /// service layer so HTTP handlers only perform authorization and mapping.
+    pub async fn get_external_service_backup_capability(
+        &self,
+        service_id: i32,
+    ) -> Result<super::ExternalServiceBackupCapability, super::BackupCapabilityError> {
+        let service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| super::BackupCapabilityError::LoadService { service_id, source })?
+            .ok_or(super::BackupCapabilityError::ServiceNotFound { service_id })?;
+
+        Ok(super::capability::probe_external_service_backup_capability(&service).await)
+    }
+
     pub async fn backup_external_service(
         &self,
         service: &temps_entities::external_services::Model,
@@ -7408,9 +8851,18 @@ ORDER BY esb.id ASC
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to decrypt secret key for backup: {}", e),
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            &s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt session token for backup: {}", e),
+        })?;
         let s3_credentials = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key,
             secret_key: decrypted_secret_key,
+            session_token: decrypted_session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -7563,16 +9015,35 @@ ORDER BY esb.id ASC
 
         // Mark the parent `backups` row as completed. Without this the row
         // stays in state='running' forever, which breaks listing/filtering
-        // and makes the restore UI skip the backup.
-        let mut backup_update: temps_entities::backups::ActiveModel = backup.clone().into();
-        backup_update.state = sea_orm::Set("completed".to_string());
-        backup_update.s3_location = sea_orm::Set(backup_outcome.location.clone());
-        backup_update.finished_at = sea_orm::Set(Some(Utc::now()));
-        backup_update.size_bytes = sea_orm::Set(final_size_bytes);
-        if let Err(e) = backup_update.update(self.db.as_ref()).await {
+        // and makes the restore UI skip the backup. Retry transient DB
+        // failures a few times before giving up — the backup data itself
+        // already succeeded, so we don't fail the caller on a lasting
+        // failure either, but we also don't want a single blip to strand
+        // the row in 'running' until the next server restart reconciles it.
+        let retry = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(2));
+        let update_result = retry
+            .retry(|| {
+                let mut backup_update: temps_entities::backups::ActiveModel = backup.clone().into();
+                backup_update.state = sea_orm::Set("completed".to_string());
+                backup_update.s3_location = sea_orm::Set(backup_outcome.location.clone());
+                backup_update.finished_at = sea_orm::Set(Some(Utc::now()));
+                backup_update.size_bytes = sea_orm::Set(final_size_bytes);
+                let db = self.db.as_ref();
+                async move { backup_update.update(db).await }
+            })
+            .await;
+        if let Err(e) = update_result {
             // Don't fail the caller — the backup itself succeeded. Log and
-            // continue; the row will be reconciled next time.
-            error!("Failed to mark backup {} as completed: {}", backup.id, e);
+            // continue; the boot-time reconciler will mark the still-'running'
+            // row as failed, and the completed child `external_service_backups`
+            // row (already correctly updated above) keeps the real S3 location
+            // attributable for later cleanup/restore.
+            error!(
+                "Failed to mark backup {} as completed after retries: {}",
+                backup.id, e
+            );
         }
 
         // Get the external service backup record
@@ -7831,6 +9302,8 @@ ORDER BY esb.id ASC
 
         // 1. Load the existing schedule (returns NotFound if absent).
         let existing = self.get_backup_schedule(id).await?;
+        let requested_target_all = request.target_all_services;
+        let requested_service_ids = request.service_ids.clone();
 
         // 2. Validate fields before touching the ActiveModel.
         if let Some(ref name) = request.name {
@@ -7920,45 +9393,79 @@ ORDER BY esb.id ASC
         let final_include_cp = request
             .include_control_plane
             .unwrap_or(existing.include_control_plane);
-        if !final_target_all && !final_include_cp {
-            use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
-            let attached_count = temps_entities::backup_schedule_services::Entity::find()
+        if final_target_all
+            && requested_service_ids
+                .as_ref()
+                .is_some_and(|service_ids| !service_ids.is_empty())
+        {
+            return Err(BackupError::Validation(
+                "service_ids cannot be set when target_all_services=true".to_string(),
+            ));
+        }
+
+        let validated_service_ids = match requested_service_ids.as_deref() {
+            Some(service_ids) => Some(
+                self.validated_schedule_service_ids(existing.s3_source_id, service_ids)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let txn = self.db.begin().await?;
+        let final_service_count = if final_target_all {
+            0
+        } else if let Some(service_ids) = validated_service_ids.as_ref() {
+            service_ids.len() as u64
+        } else {
+            temps_entities::backup_schedule_services::Entity::find()
                 .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(id))
-                .count(self.db.as_ref())
-                .await
-                .map_err(BackupError::Database)?;
-            if attached_count == 0 {
-                return Err(BackupError::Validation(
-                    "Schedule would have nothing to back up: \
-                     include_control_plane=false, target_all_services=false, \
-                     and no services attached. Attach at least one service \
-                     or re-enable one of the broader flags."
-                        .to_string(),
-                ));
-            }
+                .count(&txn)
+                .await?
+        };
+        if !final_target_all && !final_include_cp && final_service_count == 0 {
+            return Err(BackupError::Validation(
+                "Schedule would have nothing to back up: select at least one specific database, \
+                 enable the control plane, or target all databases."
+                    .to_string(),
+            ));
         }
 
         active.updated_at = Set(Utc::now());
 
-        let updated = active.update(self.db.as_ref()).await?;
+        let updated = active.update(&txn).await?;
 
-        // When the caller flipped target_all_services to true, clear any
-        // stale explicit-membership rows. The user's choice ("clear it")
-        // means "all means all" — no hidden saved list to surface later if
-        // they flip back to specific.
-        if matches!(request.target_all_services, Some(true)) {
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        // Apply the target-mode and explicit selection in the same transaction
+        // as the schedule fields. This prevents both no-target scheduler races
+        // and partial UI saves when switching from all to specific databases.
+        if matches!(requested_target_all, Some(true)) || validated_service_ids.is_some() {
             let deleted = temps_entities::backup_schedule_services::Entity::delete_many()
                 .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(id))
-                .exec(self.db.as_ref())
-                .await
-                .map_err(BackupError::Database)?;
+                .exec(&txn)
+                .await?;
             info!(
                 schedule_id = id,
                 rows_deleted = deleted.rows_affected,
-                "Cleared explicit service memberships after flipping target_all_services=true",
+                "Cleared explicit service memberships before applying schedule targets",
             );
         }
+        if !final_target_all {
+            if let Some(service_ids) = validated_service_ids {
+                if !service_ids.is_empty() {
+                    let now = Utc::now();
+                    let memberships = service_ids.into_iter().map(|service_id| {
+                        temps_entities::backup_schedule_services::ActiveModel {
+                            schedule_id: Set(id),
+                            service_id: Set(service_id),
+                            created_at: Set(now),
+                        }
+                    });
+                    temps_entities::backup_schedule_services::Entity::insert_many(memberships)
+                        .exec(&txn)
+                        .await?;
+                }
+            }
+        }
+        txn.commit().await?;
 
         info!(
             schedule_id = id,
@@ -7990,11 +9497,17 @@ ORDER BY esb.id ASC
                 detail: "Backup schedule not found".to_string(),
             })?;
 
+        let s3_source_id = schedule_model.s3_source_id;
         let mut schedule_update: temps_entities::backup_schedules::ActiveModel =
             schedule_model.into_active_model();
         schedule_update.enabled = sea_orm::Set(false);
         schedule_update.updated_at = sea_orm::Set(Utc::now());
         schedule_update.update(self.db.as_ref()).await?;
+
+        // Disabling may have been this source's last enabled schedule —
+        // reconcile now so a stale S3-side lifecycle rule doesn't keep
+        // expiring objects after the schedule stops running.
+        self.fire_lifecycle_reconcile(s3_source_id);
 
         self.get_backup_schedule(id).await
     }
@@ -8059,6 +9572,12 @@ ORDER BY esb.id ASC
         schedule_update.next_run = sea_orm::Set(next_run);
 
         let updated_schedule = schedule_update.update(self.db.as_ref()).await?;
+
+        // Re-enabling puts this source back in scope for lifecycle
+        // reconciliation — push the rule immediately rather than waiting
+        // for the hourly sweep to notice.
+        self.fire_lifecycle_reconcile(updated_schedule.s3_source_id);
+
         Ok(updated_schedule)
     }
 }
@@ -8108,7 +9627,9 @@ mod tests {
     use super::*;
     use bollard::Docker;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-    use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
+    use temps_core::notifications::{
+        EmailMessage, NotificationData, NotificationError, NotificationService,
+    };
     use temps_core::EncryptionService;
     use temps_entities::{backup_schedules, s3_sources};
 
@@ -8132,7 +9653,492 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: true,
             include_control_plane: true,
+            generated_kind: None,
         }
+    }
+
+    fn make_scope_test_service(db: Arc<DatabaseConnection>) -> BackupService {
+        BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db),
+            create_mock_alarm_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        )
+    }
+
+    fn make_schedule_membership(
+        schedule_id: i32,
+        service_id: i32,
+    ) -> temps_entities::backup_schedule_services::Model {
+        temps_entities::backup_schedule_services::Model {
+            schedule_id,
+            service_id,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_project_service_link(
+        id: i32,
+        project_id: i32,
+        service_id: i32,
+    ) -> temps_entities::project_services::Model {
+        temps_entities::project_services::Model {
+            id,
+            project_id,
+            service_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_external_service_backup(
+        id: i32,
+        backup_id: i32,
+        service_id: i32,
+    ) -> temps_entities::external_service_backups::Model {
+        temps_entities::external_service_backups::Model {
+            id,
+            service_id,
+            backup_id,
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: Some(1024),
+            s3_location: format!("s3://bucket/{backup_id}/{service_id}"),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            service_name_snapshot: Some(format!("service-{service_id}")),
+            service_type_snapshot: Some("postgres".to_string()),
+        }
+    }
+
+    fn make_collection_global_row(
+        contains_global: bool,
+    ) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        let mut row = std::collections::BTreeMap::new();
+        row.insert(
+            "contains_global".to_string(),
+            sea_orm::Value::Bool(Some(contains_global)),
+        );
+        row
+    }
+
+    fn make_collection_service_row(
+        service_id: i32,
+    ) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        let mut row = std::collections::BTreeMap::new();
+        row.insert(
+            "service_id".to_string(),
+            sea_orm::Value::Int(Some(service_id)),
+        );
+        row
+    }
+
+    #[tokio::test]
+    async fn test_access_scopes_for_schedules_global_reasons_are_classified() {
+        // Arrange: exercise every condition that makes a schedule global.
+        let mut targets_all = make_test_schedule(10, 1);
+        targets_all.include_control_plane = false;
+
+        let mut includes_control_plane = make_test_schedule(20, 1);
+        includes_control_plane.target_all_services = false;
+
+        let mut no_attachments = make_test_schedule(30, 1);
+        no_attachments.target_all_services = false;
+        no_attachments.include_control_plane = false;
+
+        let mut ownerless = make_test_schedule(40, 1);
+        ownerless.target_all_services = false;
+        ownerless.include_control_plane = false;
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    ownerless,
+                    no_attachments,
+                    includes_control_plane,
+                    targets_all,
+                ]])
+                .append_query_results(vec![vec![make_schedule_membership(40, 400)]])
+                .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scopes = service
+            .access_scopes_for_schedules(&[40, 30, 20, 10])
+            .await
+            .expect("schedule scopes should resolve");
+
+        // Assert: output is sorted and every global reason remains distinct.
+        assert_eq!(
+            scopes,
+            vec![
+                BackupScheduleAccessScope::Global {
+                    schedule_id: 10,
+                    reason: GlobalScheduleReason::TargetsAllServices,
+                },
+                BackupScheduleAccessScope::Global {
+                    schedule_id: 20,
+                    reason: GlobalScheduleReason::IncludesControlPlane,
+                },
+                BackupScheduleAccessScope::Global {
+                    schedule_id: 30,
+                    reason: GlobalScheduleReason::HasNoAttachedServices,
+                },
+                BackupScheduleAccessScope::Global {
+                    schedule_id: 40,
+                    reason: GlobalScheduleReason::HasOwnerlessService { service_id: 400 },
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_scopes_for_schedules_batch_dedupes_and_sorts_project_scope() {
+        // Arrange: duplicate schedule ids, memberships and project links model
+        // a batch list query without introducing an authorization N+1.
+        let mut schedule = make_test_schedule(50, 1);
+        schedule.target_all_services = false;
+        schedule.include_control_plane = false;
+        let memberships = vec![
+            make_schedule_membership(50, 500),
+            make_schedule_membership(50, 501),
+        ];
+        let links = vec![
+            make_project_service_link(1, 9, 500),
+            make_project_service_link(2, 3, 500),
+            make_project_service_link(3, 3, 500),
+            make_project_service_link(4, 7, 501),
+            make_project_service_link(5, 3, 501),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![schedule]])
+                .append_query_results(vec![memberships])
+                .append_query_results(vec![links])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+
+        // Act.
+        let scopes = service
+            .access_scopes_for_schedules(&[50, 50])
+            .await
+            .expect("batched schedule scope should resolve");
+
+        // Assert.
+        assert_eq!(
+            scopes,
+            vec![BackupScheduleAccessScope::Projects {
+                schedule_id: 50,
+                project_ids: vec![3, 7, 9],
+            }]
+        );
+
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one database reference")
+            .into_transaction_log();
+        assert_eq!(
+            statements.len(),
+            3,
+            "scope batching must use one schedules, one memberships and one project-links query"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_scopes_for_services_ownerless_and_duplicates_are_preserved_safely() {
+        // Arrange: service 600 is ownerless; service 601 has duplicate links.
+        let links = vec![
+            make_project_service_link(1, 8, 601),
+            make_project_service_link(2, 3, 601),
+            make_project_service_link(3, 8, 601),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![links])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scopes = service
+            .project_scopes_for_services(&[601, 600, 601])
+            .await
+            .expect("service scopes should resolve");
+
+        // Assert.
+        assert_eq!(
+            scopes,
+            vec![
+                ServiceProjectScope {
+                    service_id: 600,
+                    project_ids: vec![],
+                },
+                ServiceProjectScope {
+                    service_id: 601,
+                    project_ids: vec![3, 8],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_scopes_for_services_database_error_is_typed() {
+        // Arrange.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "scope lookup failed".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let error = service
+            .project_scopes_for_services(&[700])
+            .await
+            .expect_err("database failure must remain typed");
+
+        // Assert.
+        assert!(matches!(error, BackupError::Database(_)));
+        assert!(error.to_string().contains("scope lookup failed"));
+    }
+
+    #[tokio::test]
+    async fn test_backups_with_access_scopes_producer_precedes_global_fallback() {
+        // Arrange.
+        let mut producer_backup = make_test_backup_model(801);
+        producer_backup.schedule_id = Some(10);
+        let mut scheduled_backup = make_test_backup_model(802);
+        scheduled_backup.schedule_id = Some(20);
+        let global_backup = make_test_backup_model(803);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![global_backup, scheduled_backup, producer_backup]])
+                .append_query_results(vec![vec![
+                    make_external_service_backup(1, 801, 101),
+                    make_external_service_backup(2, 801, 101),
+                ]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scoped = service
+            .backups_with_access_scopes(&[803, 801, 802, 801])
+            .await
+            .expect("backup scopes should resolve");
+        let scopes: BTreeMap<i32, BackupAccessScope> = scoped
+            .into_iter()
+            .map(|entry| (entry.backup.id, entry.access_scope))
+            .collect();
+
+        // Assert: immutable producer ownership wins. A schedule id alone is
+        // not ownership evidence because schedule configuration can change
+        // after the backup is created, so both ownerless rows are global.
+        assert_eq!(
+            scopes.get(&801),
+            Some(&BackupAccessScope::Services {
+                backup_id: 801,
+                service_ids: vec![101],
+            })
+        );
+        assert_eq!(
+            scopes.get(&802),
+            Some(&BackupAccessScope::Global { backup_id: 802 })
+        );
+        assert_eq!(
+            scopes.get(&803),
+            Some(&BackupAccessScope::Global { backup_id: 803 })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schedule_history_ownerless_backup_stays_global_after_schedule_scope_change() {
+        // Arrange: the schedule currently targets one attached project
+        // service, but the historical backup has no immutable producer row,
+        // matching a control-plane backup created before the schedule changed.
+        let mut current_schedule = make_test_schedule(20, 1);
+        current_schedule.target_all_services = false;
+        current_schedule.include_control_plane = false;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![current_schedule]])
+                .append_query_results(vec![vec![make_collection_global_row(true)]])
+                .append_query_results(vec![vec![make_collection_service_row(202)]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+
+        // Act.
+        let scope = service
+            .backup_history_access_scope_for_schedule(20)
+            .await
+            .expect("historical backup scopes should resolve");
+
+        // Assert: the global bit forces administrator-only access, while the
+        // producer set remains bounded by distinct configured services.
+        assert_eq!(
+            scope,
+            BackupCollectionAccessScope {
+                contains_global: true,
+                service_ids: vec![202],
+            }
+        );
+
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one database reference")
+            .into_transaction_log();
+        let sql = format!("{statements:?}");
+        assert!(
+            sql.contains("EXISTS"),
+            "global ownership must use EXISTS: {sql}"
+        );
+        assert!(
+            sql.contains("DISTINCT"),
+            "producer ownership must select distinct services: {sql}"
+        );
+        assert!(
+            !sql.contains("backup_id IN"),
+            "history authorization must not build an unbounded backup-id IN list: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_run_cancel_scope_keeps_ownerless_control_plane_backup_global() {
+        // Arrange: this live control-plane child belongs to a schedule run,
+        // but has no producer row. A later schedule change to project-only
+        // must not make the child cancellable by that project.
+        let mut live_control_plane_backup = make_test_backup_model(804);
+        live_control_plane_backup.schedule_id = Some(20);
+        live_control_plane_backup.schedule_run_id = Some(55);
+        live_control_plane_backup.state = "running".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![live_control_plane_backup]])
+                .append_query_results(vec![
+                    Vec::<temps_entities::external_service_backups::Model>::new(),
+                ])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scoped = service
+            .live_backups_with_access_scopes_for_schedule_run(55)
+            .await
+            .expect("live cancellation scopes should resolve");
+
+        // Assert.
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            scoped[0].access_scope,
+            BackupAccessScope::Global { backup_id: 804 }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_preview_scope_keeps_historical_control_plane_backup_global() {
+        // Arrange: the schedule is project-scoped today, while the expired
+        // historical control-plane backup has no immutable producer.
+        let mut current_schedule = make_test_schedule(20, 1);
+        current_schedule.target_all_services = false;
+        current_schedule.include_control_plane = false;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![current_schedule]])
+                .append_query_results(vec![vec![make_collection_global_row(true)]])
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scope = service
+            .retention_candidate_access_scope(20)
+            .await
+            .expect("retention candidate scopes should resolve");
+
+        // Assert: the dry-run handler will pass this global scope through the
+        // collection guard before returning any candidate metadata.
+        assert_eq!(
+            scope,
+            BackupCollectionAccessScope {
+                contains_global: true,
+                service_ids: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preview_bound_deletion_scope_keeps_expected_ownerless_backup_global() {
+        // Arrange: destructive cleanup re-resolves the exact preview UUIDs.
+        // A schedule id alone must not turn an ownerless historical row into
+        // project-owned data.
+        let mut expected_control_plane_backup = make_test_backup_model(806);
+        expected_control_plane_backup.schedule_id = Some(20);
+        let expected_uuid = expected_control_plane_backup.backup_id.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![expected_control_plane_backup]])
+                .append_query_results(vec![
+                    Vec::<temps_entities::external_service_backups::Model>::new(),
+                ])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let scoped = service
+            .backups_with_access_scopes_by_uuids(&[expected_uuid])
+            .await
+            .expect("preview-bound deletion scopes should resolve");
+
+        // Assert: the destructive handler will require global admin before
+        // handing this exact candidate set to enforce_retention.
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            scoped[0].access_scope,
+            BackupAccessScope::Global { backup_id: 806 }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backups_with_access_scopes_producer_query_error_is_typed() {
+        // Arrange.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_test_backup_model(900)]])
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "producer lookup failed".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let error = service
+            .backups_with_access_scopes(&[900])
+            .await
+            .expect_err("producer query error must be typed");
+
+        // Assert.
+        assert!(matches!(error, BackupError::Database(_)));
+        assert!(error.to_string().contains("producer lookup failed"));
     }
 
     #[test]
@@ -8142,6 +10148,15 @@ mod tests {
             classify_backup_format(loc, Some("postgres")),
             Some("pg_dump".to_string())
         );
+    }
+
+    #[test]
+    fn sourced_internal_walg_values_are_shell_quoted() {
+        assert_eq!(
+            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
+            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
+        );
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
     }
 
     #[test]
@@ -8195,12 +10210,18 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            backing_service_id: None,
         };
         let id = "4dc29e1a-1234-4abc-8def-123456789abc";
         assert_eq!(
@@ -8250,6 +10271,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
+        let source = s3_sources::Model {
+            id: 17,
+            backing_service_id: None,
+            name: "recovery-evidence".to_string(),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let count_row = |count: i64| {
+            let mut row = std::collections::BTreeMap::new();
+            row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(count)));
+            row
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .append_query_results(vec![vec![count_row(0)]])
+                .append_query_results(vec![vec![count_row(2)]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(17)
+            .await
+            .expect_err("retained backups must block source deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(message)
+                if message.contains("recovery-evidence")
+                    && message.contains("2 backup record(s)")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            3,
+            "validation must stop after source lookup and the two reference counts, before DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 21,
+            backing_service_id: None,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(21)
+            .await
+            .expect_err("a Cloud-managed source must refuse user-initiated deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the delete before any reference-count query"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 22,
+            backing_service_id: None,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .update_s3_source(
+                22,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("attacker-key".to_string()),
+                    secret_key: Some("attacker-secret".to_string()),
+                    region: None,
+                    endpoint: None,
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("a Cloud-managed source must refuse manual credential edits");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the update before any write"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_backup_refuses_restore_history_before_object_deletion() {
         let mut count_row = std::collections::BTreeMap::new();
         count_row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(1)));
@@ -8294,6 +10481,105 @@ mod tests {
                 restore_count: 1
             } if backup_id == "backup-uuid"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
+    async fn delete_backup_model_removes_failed_backup_with_no_remote_artifact() {
+        // Regression test: a backup whose upload never completed (state
+        // "failed") has no s3_location on the parent row or any child
+        // external_service_backups row. Retention cleanup must still be
+        // able to delete this bookkeeping row instead of hard-failing with
+        // "no attributable remote artifact" forever.
+        let failed_backup = temps_entities::backups::Model {
+            id: 55,
+            name: "failed-backup".to_string(),
+            backup_id: "failed-backup-uuid".to_string(),
+            schedule_id: Some(9),
+            backup_type: "full".to_string(),
+            state: "failed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: None,
+            file_count: None,
+            s3_source_id: 1,
+            s3_location: "".to_string(),
+            error_message: Some("upload failed".to_string()),
+            metadata: "{}".to_string(),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".to_string(),
+            schedule_run_id: None,
+        };
+
+        let mut count_row = std::collections::BTreeMap::new();
+        count_row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(0)));
+
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let encrypted_access_key = encryption_service.encrypt_string("test-key").unwrap();
+        let encrypted_secret_key = encryption_service.encrypt_string("test-secret").unwrap();
+        let s3_source = s3_sources::Model {
+            id: 1,
+            name: "test-source".to_string(),
+            bucket_name: "test-bucket".to_string(),
+            bucket_path: "/backups".to_string(),
+            access_key_id: encrypted_access_key,
+            secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            backing_service_id: None,
+        };
+
+        let deleting_backup = temps_entities::backups::Model {
+            state: "deleting".to_string(),
+            ..failed_backup.clone()
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // Phase one: lock + fetch the backup row.
+                .append_query_results(vec![vec![failed_backup.clone()]])
+                // restore_runs count
+                .append_query_results(vec![vec![count_row]])
+                // s3_sources lookup
+                .append_query_results(vec![vec![s3_source.clone()]])
+                // external_service_backups children (none — the upload never got that far)
+                .append_query_results(vec![
+                    Vec::<temps_entities::external_service_backups::Model>::new(),
+                ])
+                // state -> "deleting" (UPDATE ... RETURNING)
+                .append_query_results(vec![vec![deleting_backup.clone()]])
+                // Phase two: re-lock the tombstone before deleting.
+                .append_query_results(vec![vec![deleting_backup]])
+                // Final DB row deletion.
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db).expect("mock service should construct");
+
+        let (_, deleted_objects) = service
+            .delete_backup_model(failed_backup)
+            .await
+            .expect("a failed backup with no remote artifact must still be deletable");
+        assert_eq!(
+            deleted_objects, 0,
+            "nothing was ever uploaded, so nothing should be deleted remotely"
+        );
     }
 
     #[test]
@@ -8342,6 +10628,67 @@ mod tests {
     }
 
     #[test]
+    fn explicit_target_rejects_destination_backing_service() {
+        let backing = HashSet::from([41]);
+        let error = reject_source_backing_targets(&backing, [7, 41])
+            .expect_err("the destination service must never be an explicit target");
+        assert!(matches!(error, BackupError::Validation(_)));
+        assert!(reject_source_backing_targets(&backing, [7, 42]).is_ok());
+    }
+
+    #[test]
+    fn target_all_expansion_excludes_destination_backing_service() {
+        fn service(id: i32) -> temps_entities::external_services::Model {
+            let now = Utc::now();
+            temps_entities::external_services::Model {
+                id,
+                name: format!("service-{id}"),
+                service_type: "rustfs".to_string(),
+                version: None,
+                status: "running".to_string(),
+                created_at: now,
+                updated_at: now,
+                slug: None,
+                config: None,
+                node_id: None,
+                topology: "standalone".to_string(),
+                error_message: None,
+                health_status: None,
+                last_health_check_at: None,
+                last_health_error: None,
+                consecutive_health_failures: 0,
+                health_metadata: None,
+                metrics_enabled: false,
+                default_backup_provisioned: false,
+                container_name: None,
+                ai_data_access: false,
+                created_by_user_id: None,
+                continuous_archive_s3_source_id: None,
+                continuous_archive_pinned_at: None,
+            }
+        }
+
+        let expanded = exclude_source_backing_services(
+            vec![service(7), service(41), service(42)],
+            &HashSet::from([41]),
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|service| service.id)
+                .collect::<Vec<_>>(),
+            vec![7, 42]
+        );
+    }
+
+    #[test]
+    fn zero_target_schedule_run_is_skipped_not_completed() {
+        assert_eq!(schedule_run_aggregate_state(0, 0, 0, 0), "skipped");
+        assert_eq!(schedule_run_aggregate_state(1, 0, 0, 0), "completed");
+        assert_eq!(schedule_run_aggregate_state(1, 1, 0, 0), "failed");
+    }
+
+    #[test]
     fn classify_does_not_default_s3_uris_to_walg() {
         // Regression: any `s3://...` location used to be classified as
         // walg, mislabeling every pg_dump / rdb / mongodump backup that
@@ -8358,6 +10705,50 @@ mod tests {
         // confidently mislabel.
         let unknown = "s3://bucket/external_services/postgres/svc/some/random/key";
         assert_eq!(classify_backup_format(unknown, Some("postgres")), None);
+    }
+
+    #[test]
+    fn classify_mariadb_physical_base_is_filename_driven() {
+        // `base.mbstream.gz` is produced by no other engine, so it classifies
+        // without an engine hint at all.
+        let loc = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/base.mbstream.gz";
+        assert_eq!(
+            classify_backup_format(loc, Some("mariadb")),
+            Some("mariadb_physical".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(loc, None),
+            Some("mariadb_physical".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_mariadb_dump_is_engine_driven_not_filename_driven() {
+        // Regression: MariaDB's logical dump is literally named
+        // `dump.sql.gz`, which the generic `.sql.gz` branch labels `pg_dump`.
+        // Only the engine hint can tell the two apart.
+        let mariadb = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(mariadb, Some("mariadb")),
+            Some("mariadb_dump".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(mariadb, Some("MariaDB")),
+            Some("mariadb_dump".to_string()),
+            "engine hint must be matched case-insensitively"
+        );
+
+        // Postgres behavior is unchanged: same suffix, different engine.
+        let postgres = "s3://bucket/external_services/postgres/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(postgres, Some("postgres")),
+            Some("pg_dump".to_string())
+        );
+        // ...including when no hint is available at all.
+        assert_eq!(
+            classify_backup_format(postgres, None),
+            Some("pg_dump".to_string())
+        );
     }
 
     // Simple mock notification service for testing
@@ -8386,7 +10777,7 @@ mod tests {
             "127.0.0.1:3000".to_string(),
             "postgres://localhost:5432/test".to_string(),
             None,
-            None,
+            Some("127.0.0.1:3001".to_string()),
         )
         .unwrap();
 
@@ -8399,8 +10790,26 @@ mod tests {
         ))
     }
 
-    fn create_mock_notification_service() -> Arc<dyn NotificationService> {
-        Arc::new(TestNotificationService)
+    struct NoopJobQueue;
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for NoopJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("NoopJobQueue does not support subscribing in tests")
+        }
+    }
+
+    fn create_mock_alarm_service() -> Arc<AlarmService> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        Arc::new(AlarmService::new(
+            db,
+            Arc::new(TestNotificationService),
+            Arc::new(NoopJobQueue),
+        ))
     }
 
     fn create_mock_external_service_manager(
@@ -8428,7 +10837,7 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -8440,7 +10849,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8452,12 +10861,18 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            backing_service_id: None,
         };
 
         let result = backup_service.create_s3_client(&s3_source).await;
@@ -8469,14 +10884,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8495,7 +10910,7 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -8503,7 +10918,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8528,14 +10943,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8554,14 +10969,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8581,12 +10996,18 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "test-key".to_string(),
             secret_key: "test-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            backing_service_id: None,
         };
 
         let db = Arc::new(
@@ -8600,14 +11021,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8622,6 +11043,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let result = backup_service.create_s3_source(request).await;
@@ -8636,14 +11058,14 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8658,6 +11080,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let result = backup_service.create_s3_source(request).await;
@@ -8679,14 +11102,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8705,14 +11128,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8734,14 +11157,14 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8756,8 +11179,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_to_minio_integration() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping test");
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
             return;
         }
 
@@ -8820,7 +11250,7 @@ mod tests {
 
         // Setup backup service
         let external_service_manager = create_mock_external_service_manager(test_db.db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
 
         // Create proper config service with test database
         let server_config = temps_config::ServerConfig::new(
@@ -8841,7 +11271,7 @@ mod tests {
         let backup_service = BackupService::new(
             test_db.db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -8872,6 +11302,7 @@ mod tests {
             endpoint: Some(minio_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let s3_source = backup_service
@@ -8892,6 +11323,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: vec![],
         };
 
         let schedule = backup_service
@@ -9072,10 +11504,243 @@ mod tests {
         println!("  - Objects in bucket before deletion: {}", object_count);
     }
 
+    /// Regression: `disable_backup_schedule` and `enable_backup_schedule`
+    /// must trigger the same S3 lifecycle reconcile that
+    /// `create_backup_schedule`/`update_backup_schedule`/
+    /// `delete_backup_schedule` already do. Without it, disabling a
+    /// source's last enabled schedule leaves a stale
+    /// `PutBucketLifecycleConfiguration` rule on the bucket that keeps
+    /// expiring objects indefinitely — and, after the hourly sweep was
+    /// scoped down to only actively-scheduled sources, there is no other
+    /// path that would ever clear it.
+    #[tokio::test]
+    async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
+            return;
+        }
+
+        use temps_database::test_utils::TestDatabase;
+        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+        let minio_container = GenericImage::new("minio/minio", "latest")
+            .with_env_var("MINIO_ROOT_USER", "minioadmin")
+            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+            .start()
+            .await
+            .expect("Failed to start MinIO container");
+        let minio_port = minio_container
+            .get_host_port_ipv4(9000)
+            .await
+            .expect("Failed to get MinIO port");
+        let minio_endpoint = format!("http://localhost:{}", minio_port);
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(&minio_endpoint)
+            .force_path_style(true)
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        let bucket_name = "test-lifecycle-toggle";
+        s3_client
+            .create_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        let external_service_manager = create_mock_external_service_manager(test_db.db.clone());
+        let alarm_service = create_mock_alarm_service();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            test_db.db.clone(),
+        ));
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let backup_service = BackupService::new(
+            test_db.db.clone(),
+            external_service_manager,
+            alarm_service,
+            config_service,
+            encryption_service,
+        );
+
+        let s3_source = backup_service
+            .create_s3_source(CreateS3SourceRequest {
+                name: "test-minio-toggle".to_string(),
+                bucket_name: bucket_name.to_string(),
+                bucket_path: "/backups".to_string(),
+                access_key_id: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(minio_endpoint.clone()),
+                force_path_style: Some(true),
+                is_default: None,
+                backing_service_id: None,
+            })
+            .await
+            .expect("Failed to create S3 source");
+
+        let schedule = backup_service
+            .create_backup_schedule(CreateBackupScheduleRequest {
+                name: "toggle-schedule".to_string(),
+                backup_type: "full".to_string(),
+                retention_period: 7,
+                s3_source_id: Some(s3_source.id),
+                schedule_expression: "0 0 2 * * *".to_string(),
+                enabled: true,
+                description: None,
+                tags: vec![],
+                max_runtime_secs: None,
+                target_all_services: None,
+                include_control_plane: None,
+                service_ids: vec![],
+            })
+            .await
+            .expect("Failed to create backup schedule");
+
+        // Poll until the schedule creation's own reconcile has pushed the
+        // retention-7d rule (proves the create-path reconcile ran, so the
+        // baseline before disabling is "rule present").
+        let rules_after_create = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count(&s3_client, bucket_name),
+        )
+        .await
+        .expect("lifecycle rule must appear after schedule creation");
+        assert_eq!(
+            rules_after_create, 1,
+            "expected exactly one rule (temps-retention-7d) after create"
+        );
+
+        backup_service
+            .disable_backup_schedule(schedule.id)
+            .await
+            .expect("Failed to disable backup schedule");
+
+        // The disable must clear the now-orphaned rule, not leave it
+        // dangling on the bucket.
+        let rules_after_disable = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count_becomes(&s3_client, bucket_name, 0),
+        )
+        .await
+        .expect("lifecycle rule must be cleared after disabling the schedule");
+        assert_eq!(
+            rules_after_disable, 0,
+            "disabling the sole schedule must clear the S3 lifecycle rule"
+        );
+
+        backup_service
+            .enable_backup_schedule(schedule.id)
+            .await
+            .expect("Failed to enable backup schedule");
+
+        // Re-enabling must push the rule back.
+        let rules_after_enable = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count_becomes(&s3_client, bucket_name, 1),
+        )
+        .await
+        .expect("lifecycle rule must reappear after re-enabling the schedule");
+        assert_eq!(
+            rules_after_enable, 1,
+            "re-enabling the schedule must restore the S3 lifecycle rule"
+        );
+    }
+
+    /// Number of lifecycle rules currently on the bucket, treating "no
+    /// lifecycle configuration at all" (`NoSuchLifecycleConfiguration`) as
+    /// zero rather than an error — that's the expected state before the
+    /// first reconcile, and after a reconcile clears the last rule.
+    async fn current_lifecycle_rule_count(client: &aws_sdk_s3::Client, bucket: &str) -> usize {
+        match client
+            .get_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.rules().len(),
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("NoSuchLifecycleConfiguration") {
+                    0
+                } else {
+                    panic!("unexpected error reading bucket lifecycle config: {msg}");
+                }
+            }
+        }
+    }
+
+    /// Polls until the bucket has at least one lifecycle rule, returning
+    /// the count once non-zero.
+    async fn poll_lifecycle_rule_count(client: &aws_sdk_s3::Client, bucket: &str) -> usize {
+        loop {
+            let count = current_lifecycle_rule_count(client, bucket).await;
+            if count > 0 {
+                return count;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Polls until the bucket's lifecycle rule count equals `expected`.
+    async fn poll_lifecycle_rule_count_becomes(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        expected: usize,
+    ) -> usize {
+        loop {
+            let count = current_lifecycle_rule_count(client, bucket).await;
+            if count == expected {
+                return count;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_restore_postgres_from_url() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping test");
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
             return;
         }
 
@@ -9143,7 +11808,7 @@ mod tests {
 
         // Setup backup service for source database
         let external_service_manager = create_mock_external_service_manager(source_db.db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let source_config = temps_config::ServerConfig::new(
@@ -9162,7 +11827,7 @@ mod tests {
         let source_backup_service = BackupService::new(
             source_db.db.clone(),
             external_service_manager.clone(),
-            notification_service.clone(),
+            alarm_service.clone(),
             source_config_service,
             encryption_service,
         );
@@ -9239,6 +11904,7 @@ mod tests {
             endpoint: Some(minio_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let s3_source = source_backup_service
@@ -9290,7 +11956,7 @@ mod tests {
         let target_backup_service = BackupService::new(
             target_db.db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             target_config_service,
             encryption_service,
         );
@@ -9306,6 +11972,7 @@ mod tests {
             endpoint: Some(minio_endpoint.clone()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let target_s3_source = target_backup_service
@@ -9481,7 +12148,7 @@ mod tests {
     async fn test_create_s3_client_from_request_valid() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9489,7 +12156,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9504,6 +12171,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         let result = backup_service.create_s3_client_from_request(&request).await;
@@ -9518,7 +12186,7 @@ mod tests {
     async fn test_create_s3_source_with_bucket_creation() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9526,7 +12194,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9541,6 +12209,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: None,
+            backing_service_id: None,
         };
 
         // This test requires a real MinIO instance running
@@ -9565,7 +12234,7 @@ mod tests {
     async fn test_create_s3_source_request_validation() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9573,7 +12242,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9588,6 +12257,7 @@ mod tests {
             endpoint: None,
             force_path_style: None,
             is_default: None,
+            backing_service_id: None,
         };
 
         let result = backup_service.create_s3_source(invalid_request).await;
@@ -9633,10 +12303,16 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            backing_service_id: None,
         };
 
         // A runner-created external service backup in `pending` state with empty
@@ -9681,7 +12357,7 @@ mod tests {
         );
 
         let external_service_manager = create_mock_external_service_manager(db.clone());
-        let notification_service = create_mock_notification_service();
+        let alarm_service = create_mock_alarm_service();
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -9689,7 +12365,7 @@ mod tests {
         let backup_service = BackupService::new(
             db,
             external_service_manager,
-            notification_service,
+            alarm_service,
             config_service,
             encryption_service,
         );
@@ -9738,7 +12414,7 @@ mod tests {
         BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         )
@@ -9835,7 +12511,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -9850,6 +12526,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -9888,7 +12565,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -9904,6 +12581,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -9940,7 +12618,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -9955,6 +12633,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -9984,7 +12663,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -9999,6 +12678,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(999, request).await;
@@ -10081,7 +12761,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10122,7 +12802,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10156,7 +12836,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10183,7 +12863,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10226,6 +12906,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_set_waits_for_every_fan_out_child() {
+        let mut control_plane = make_test_backup_model(100);
+        control_plane.schedule_id = Some(5);
+        control_plane.schedule_run_id = Some(50);
+        control_plane.metadata = serde_json::json!({"engine": "control_plane"}).to_string();
+
+        let mut service_backup = make_test_backup_model(101);
+        service_backup.schedule_id = Some(5);
+        service_backup.schedule_run_id = Some(50);
+        service_backup.state = "running".to_string();
+        service_backup.metadata =
+            serde_json::json!({"engine": "postgres_pgdump", "service_id": 7}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane, service_backup]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(100)
+            .await
+            .expect("live siblings should produce a typed pending outcome");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::Pending {
+                schedule_run_id: 50
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_refuses_partial_fan_out_run() {
+        let mut control_plane = make_test_backup_model(110);
+        control_plane.schedule_id = Some(6);
+        control_plane.schedule_run_id = Some(60);
+        control_plane.metadata = serde_json::json!({"engine": "control_plane"}).to_string();
+
+        let mut failed_service = make_test_backup_model(111);
+        failed_service.schedule_id = Some(6);
+        failed_service.schedule_run_id = Some(60);
+        failed_service.state = "failed".to_string();
+        failed_service.error_message = Some("container missing".to_string());
+        failed_service.metadata =
+            serde_json::json!({"engine": "postgres_pgdump", "service_id": 8}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![failed_service.clone()]])
+                .append_query_results(vec![vec![control_plane, failed_service]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(111)
+            .await
+            .expect("failed siblings should produce a typed incomplete outcome");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::Incomplete {
+                schedule_run_id: 60,
+                failed_backup_ids: vec![111],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_requires_a_control_plane_backup() {
+        let mut service_backup = make_test_backup_model(120);
+        service_backup.schedule_id = Some(7);
+        service_backup.schedule_run_id = Some(70);
+        service_backup.metadata =
+            serde_json::json!({"engine": "redis", "service_id": 9}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![service_backup.clone()]])
+                .append_query_results(vec![vec![service_backup]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(120)
+            .await
+            .expect("service-only schedules are valid but not whole-instance recovery sets");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::NoControlPlane {
+                schedule_run_id: 70
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_requires_exact_expected_service_coverage() {
+        let mut control_plane = make_test_backup_model(125);
+        control_plane.schedule_id = Some(7);
+        control_plane.schedule_run_id = Some(75);
+        control_plane.metadata = serde_json::json!({
+            "engine": "control_plane",
+            "expected_service_ids": [9]
+        })
+        .to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let error = service
+            .publish_recovery_set_if_complete(125)
+            .await
+            .expect_err("missing expected service backups must prevent publication");
+
+        assert!(
+            matches!(error, BackupError::Validation(message) if message.contains("coverage mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_publication_is_idempotent() {
+        let mut control_plane = make_test_backup_model(130);
+        control_plane.schedule_id = Some(8);
+        control_plane.schedule_run_id = Some(80);
+        control_plane.metadata = serde_json::json!({
+            "engine": "control_plane",
+            "recovery_set_published": true,
+            "recovery_set_version": 2
+        })
+        .to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(130)
+            .await
+            .expect("already-published recovery sets should be a no-op");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::AlreadyPublished {
+                schedule_run_id: 80,
+                backup_id: "uuid-130".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn preview_retention_is_schedule_scoped_and_non_destructive() {
         let schedule = make_test_schedule(7, 1);
         let mut expired_backup = make_test_backup_model(41);
@@ -10244,7 +13088,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10283,7 +13127,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10311,7 +13155,7 @@ mod tests {
         let service = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10390,7 +13234,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10427,7 +13271,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10454,7 +13298,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10501,7 +13345,7 @@ mod tests {
         Ok(BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         ))
@@ -10556,6 +13400,96 @@ mod tests {
     // Sea-ORM's `.count()` requires a query-result shape that `MockDatabase`
     // does not accept generically. The integration test exercises the same
     // code path against a real Postgres.
+
+    /// Regression for the schedule-creation UI: a weekly schedule targeting
+    /// specific databases must be creatable without a control-plane backup.
+    /// The schedule row and membership are committed together.
+    #[tokio::test]
+    async fn integration_create_weekly_specific_schedule_without_control_plane() {
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
+        use chrono::{Datelike, Weekday};
+        use sea_orm::ActiveValue::Set;
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) => {
+                println!("TestDatabase unavailable, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let s3_source = temps_entities::s3_sources::ActiveModel {
+            name: Set("schedule-target-source".to_string()),
+            bucket_name: Set("schedule-target-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert S3 source");
+
+        let database = temps_entities::external_services::ActiveModel {
+            name: Set("selected-database".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert selected database");
+
+        let service = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db.clone()),
+            create_mock_alarm_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let schedule = service
+            .create_backup_schedule(CreateBackupScheduleRequest {
+                name: "Weekly selected database".to_string(),
+                backup_type: "full".to_string(),
+                retention_period: 7,
+                s3_source_id: Some(s3_source.id),
+                schedule_expression: "0 0 0 * * SUN".to_string(),
+                enabled: true,
+                description: None,
+                tags: vec![],
+                max_runtime_secs: None,
+                target_all_services: Some(false),
+                include_control_plane: Some(false),
+                service_ids: vec![database.id],
+            })
+            .await
+            .expect("weekly specific schedule should be created");
+
+        assert!(!schedule.target_all_services);
+        assert!(!schedule.include_control_plane);
+        assert_eq!(
+            schedule.next_run.map(|run| run.weekday()),
+            Some(Weekday::Sun)
+        );
+
+        let memberships = temps_entities::backup_schedule_services::Entity::find()
+            .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(schedule.id))
+            .all(db.as_ref())
+            .await
+            .expect("list schedule memberships");
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].service_id, database.id);
+    }
 
     #[tokio::test]
     async fn detach_service_returns_false_when_no_row() {
@@ -10669,12 +13603,18 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
+            backing_service_id: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -10700,6 +13640,7 @@ mod tests {
             max_runtime_secs: Set(None),
             target_all_services: Set(false),
             include_control_plane: Set(true),
+            generated_kind: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -10724,7 +13665,11 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -10743,7 +13688,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10849,12 +13794,18 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
+            backing_service_id: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -10878,6 +13829,7 @@ mod tests {
             // Start as specific so we can attach rows.
             target_all_services: Set(false),
             include_control_plane: Set(true),
+            generated_kind: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -10901,7 +13853,11 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -10912,7 +13868,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -10942,6 +13898,7 @@ mod tests {
                 tags: None,
                 target_all_services: Some(true),
                 include_control_plane: None,
+                service_ids: None,
             },
         )
         .await
@@ -10971,6 +13928,7 @@ mod tests {
                 tags: None,
                 target_all_services: Some(false),
                 include_control_plane: None,
+                service_ids: None,
             },
         )
         .await
@@ -10984,6 +13942,38 @@ mod tests {
             after_specific.is_empty(),
             "flipping back to specific must not magically restore membership"
         );
+
+        // The edit form can switch from all databases to one explicit
+        // database while disabling the control-plane target in one PATCH.
+        // This used to fail because the service validated the intermediate
+        // target state before the UI could attach the selected database.
+        let selected = svc
+            .update_backup_schedule(
+                schedule.id,
+                crate::handlers::backup_handler::UpdateBackupScheduleRequest {
+                    name: None,
+                    description: None,
+                    schedule_expression: None,
+                    retention_period: None,
+                    max_runtime_secs: None,
+                    enabled: None,
+                    tags: None,
+                    target_all_services: Some(false),
+                    include_control_plane: Some(false),
+                    service_ids: Some(vec![svc_a.id]),
+                },
+            )
+            .await
+            .expect("atomic specific-target update succeeds");
+        assert!(!selected.target_all_services);
+        assert!(!selected.include_control_plane);
+
+        let selected_services = svc
+            .list_services_for_schedule(schedule.id)
+            .await
+            .expect("list after atomic specific-target update");
+        assert_eq!(selected_services.len(), 1);
+        assert_eq!(selected_services[0].id, svc_a.id);
     }
 
     /// Unit test (no DB needed): create_backup_schedule rejects a request
@@ -11008,19 +13998,25 @@ mod tests {
                     bucket_path: "/".to_string(),
                     access_key_id: "".to_string(),
                     secret_key: "".to_string(),
+                    session_token: None,
+                    credentials_expire_at: None,
                     region: "us-east-1".to_string(),
                     endpoint: None,
                     force_path_style: Some(true),
                     is_default: true,
+                    managed_by_cloud: false,
+                    lifecycle_reconcile_failed_at: None,
+                    lifecycle_reconcile_generation: 0,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
+                    backing_service_id: None,
                 }]])
                 .into_connection(),
         );
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11037,6 +14033,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: Some(false),
             include_control_plane: Some(false),
+            service_ids: vec![],
         };
 
         let err = svc
@@ -11098,7 +14095,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11141,12 +14138,18 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
+            backing_service_id: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -11181,7 +14184,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11283,12 +14286,18 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
+            backing_service_id: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -11312,6 +14321,7 @@ mod tests {
             max_runtime_secs: Set(None),
             target_all_services: Set(false),
             include_control_plane: Set(false),
+            generated_kind: Set(None),
         }
         .insert(db.as_ref())
         .await
@@ -11335,7 +14345,11 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -11346,7 +14360,7 @@ mod tests {
         let svc = BackupService::new(
             db.clone(),
             create_mock_external_service_manager(db.clone()),
-            create_mock_notification_service(),
+            create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         );
@@ -11381,6 +14395,7 @@ mod tests {
                     tags: None,
                     target_all_services: None,
                     include_control_plane: Some(false),
+                    service_ids: None,
                 },
             )
             .await

@@ -1,5 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Card,
@@ -23,6 +26,7 @@ import {
   Clock,
   AlertCircle,
   Activity,
+  RotateCcw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { format } from 'date-fns'
@@ -41,7 +45,12 @@ export default function ApiKeyEdit() {
     expires_at: '',
   })
 
-  const { data: apiKey, isLoading } = useQuery({
+  const {
+    data: apiKey,
+    isLoading,
+    error: apiKeyError,
+    refetch: refetchApiKey,
+  } = useQuery({
     queryKey: ['apiKey', id],
     queryFn: async () => {
       if (!id) throw new Error('No API key ID provided')
@@ -50,6 +59,14 @@ export default function ApiKeyEdit() {
     },
     enabled: !!id,
   })
+
+  useEffect(() => {
+    if (apiKey && apiKeyError) {
+      toast.error('Failed to refresh API key', {
+        action: { label: 'Retry', onClick: () => void refetchApiKey() },
+      })
+    }
+  }, [apiKey, apiKeyError, refetchApiKey])
 
   useEffect(() => {
     if (apiKey) {
@@ -108,6 +125,38 @@ export default function ApiKeyEdit() {
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-20 w-full" />
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  const isNotFound =
+    (apiKeyError as any)?.status === 404 ||
+    (apiKeyError as any)?.title === 'API Key Not Found'
+
+  if (!apiKey && apiKeyError && !isNotFound) {
+    return (
+      <div className="container max-w-4xl mx-auto py-6">
+        <Card>
+          <CardContent className="py-12 text-center">
+            <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
+            <h3 className="text-lg font-medium">Failed to load API key</h3>
+            <p className="text-muted-foreground mt-2">
+              {apiKeyError instanceof Error
+                ? apiKeyError.message
+                : 'An unexpected error occurred. Please try again.'}
+            </p>
+            <div className="flex justify-center gap-2 mt-4">
+              <Button variant="outline" onClick={() => void refetchApiKey()}>
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Retry
+              </Button>
+              <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                Back to API Keys
+              </Button>
+            </div>
           </CardContent>
         </Card>
       </div>

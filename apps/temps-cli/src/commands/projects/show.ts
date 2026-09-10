@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -9,6 +12,25 @@ import { getProject, getProjectBySlug } from '../../api/sdk.gen.js'
 interface ShowOptions {
   project?: string
   json?: boolean
+}
+
+/**
+ * Which Git host the project is connected to, as reported by its provider
+ * connection. Never inferred from the clone URL — a self-hosted instance can
+ * live on any domain, and a connected project may store no clone URL at all.
+ */
+function gitProviderLabel(providerType?: string | null): string {
+  const labels: Record<string, string> = {
+    github: 'GitHub',
+    github_app: 'GitHub (App)',
+    gitlab: 'GitLab',
+    gitea: 'Gitea',
+    bitbucket: 'Bitbucket',
+    generic: 'Self-hosted Git',
+  }
+
+  if (!providerType) return 'Not connected'
+  return labels[providerType.toLowerCase()] ?? providerType
 }
 
 export async function show(options: ShowOptions): Promise<void> {
@@ -62,8 +84,10 @@ export async function show(options: ShowOptions): Promise<void> {
     Directory: project.directory,
     'Main Branch': project.main_branch,
     Repository: project.repo_name ? `${project.repo_owner}/${project.repo_name}` : 'Not connected',
+    'Git Provider': gitProviderLabel(project.git_provider_type),
     'Attack Mode': project.attack_mode ? 'Enabled' : 'Disabled',
     'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
+    'Vulnerability Scanning': project.vulnerability_scanning_enabled ? 'Enabled' : 'Disabled',
     Created: formatDate(new Date(project.created_at * 1000).toISOString()),
     Updated: formatDate(new Date(project.updated_at * 1000).toISOString()),
   })

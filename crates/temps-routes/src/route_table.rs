@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Route table with O(1) lookup and automatic PostgreSQL LISTEN/NOTIFY synchronization
 //!
 //! This module provides a cached routing table that maps hostnames to backend addresses
@@ -26,8 +29,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_core::public_hostname_resolver::match_strategy;
-use temps_core::{AppSettings, DeploymentMode, PublicHostnameStrategy};
+use temps_core::{
+    AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
+    ServiceEndpointScheme,
+};
 use temps_entities::custom_routes::RouteType;
+use temps_entities::preset::ComposePublicPort;
 use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
 
@@ -60,18 +67,139 @@ async fn resolve_node_private_address(
 fn build_backend_entry(
     container: &temps_entities::deployment_containers::Model,
     node_private_address: Option<&str>,
+    runtime_context: &RuntimeContext,
 ) -> BackendEntry {
     let address = build_container_backend_addr(
         &container.container_name,
         container.container_port,
         container.host_port,
         node_private_address,
+        runtime_context,
     );
     BackendEntry {
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
     }
+}
+
+/// Build the route backend for an explicitly published Compose mapping.
+///
+/// `ComposePublicPort::port` selects the stable container target. The public
+/// configuration's `published` value is only a repository/UI hint: it is
+/// user-controlled and must never select an arbitrary host or remote-node
+/// socket. Routing uses the live Docker-discovered host mapping exclusively.
+fn build_public_compose_backend_addr(
+    container_name: &str,
+    recorded_container_port: i32,
+    recorded_host_port: Option<i32>,
+    node_private_address: Option<&str>,
+    public_port: &ComposePublicPort,
+    runtime_context: &RuntimeContext,
+) -> Option<String> {
+    if recorded_container_port != i32::from(public_port.port) {
+        return None;
+    }
+    if (node_private_address.is_some()
+        || runtime_context.execution_environment() == ExecutionEnvironment::Host)
+        && recorded_host_port.is_none()
+    {
+        return None;
+    }
+    Some(build_container_backend_addr(
+        container_name,
+        i32::from(public_port.port),
+        recorded_host_port,
+        node_private_address,
+        runtime_context,
+    ))
+}
+
+/// Build the route backend for a Traefik-label discovered container.
+///
+/// Returns `None` when this deployment mode cannot actually reach the
+/// container, in which case the caller must skip the route rather than build an
+/// address that points somewhere else.
+///
+/// Discovered containers are always local to this node (remote workers run
+/// their own discovery against their own daemon), so there is never a node
+/// private address to fall back to. What is left is exactly the distinction
+/// [`build_public_compose_backend_addr`] already encodes:
+///
+/// * **Docker mode** — Temps runs on the Docker network and reaches the
+///   container as `container_name:target_port` over the internal DNS. The
+///   container port is genuinely reachable, published or not.
+/// * **Baremetal mode** — Temps runs on the host and
+///   [`build_container_backend_addr`] would resolve to
+///   `127.0.0.1:<host_port>`. With no published host port it falls back to
+///   `host_port.unwrap_or(container_port)`, i.e. `127.0.0.1:<container port>`,
+///   which is a *different, unrelated service on the host* — very possibly a
+///   database or the Docker API. Refuse to build an address at all.
+fn build_discovered_backend_addr(
+    container_name: &str,
+    container_port: i32,
+    host_port: Option<i32>,
+    runtime_context: &RuntimeContext,
+) -> Option<String> {
+    if runtime_context.execution_environment() == ExecutionEnvironment::Host && host_port.is_none()
+    {
+        return None;
+    }
+    Some(build_container_backend_addr(
+        container_name,
+        container_port,
+        host_port,
+        None,
+        runtime_context,
+    ))
+}
+
+fn build_public_compose_backend_entry(
+    container: &temps_entities::deployment_containers::Model,
+    node_private_address: Option<&str>,
+    public_port: &ComposePublicPort,
+    runtime_context: &RuntimeContext,
+) -> Option<BackendEntry> {
+    let address = build_public_compose_backend_addr(
+        &container.container_name,
+        container.container_port,
+        container.host_port,
+        node_private_address,
+        public_port,
+        runtime_context,
+    )?;
+    Some(BackendEntry {
+        address,
+        container_id: Some(container.container_id.clone()),
+        container_name: Some(container.container_name.clone()),
+    })
+}
+
+/// Select only the explicitly public Compose service for a generic project URL.
+/// Non-Compose deployments continue to route across all replicas. A Compose
+/// stack without a public-port selection stays private instead of accidentally
+/// round-robining requests across databases, queues, and application services.
+fn select_public_route_containers<'a>(
+    containers: &'a [temps_entities::deployment_containers::Model],
+    public_port: Option<&ComposePublicPort>,
+) -> Option<Vec<&'a temps_entities::deployment_containers::Model>> {
+    if !containers
+        .iter()
+        .any(|container| container.service_name.is_some())
+    {
+        return Some(containers.iter().collect());
+    }
+
+    let public_port = public_port?;
+    let selected: Vec<_> = containers
+        .iter()
+        .filter(|container| {
+            container.service_name.as_deref() == Some(public_port.service.as_str())
+                && container.container_port == i32::from(public_port.port)
+        })
+        .collect();
+
+    (!selected.is_empty()).then_some(selected)
 }
 
 /// Build a backend address for a container based on deployment mode and node location
@@ -87,21 +215,40 @@ fn build_container_backend_addr(
     container_port: i32,
     host_port: Option<i32>,
     node_private_address: Option<&str>,
+    runtime_context: &RuntimeContext,
 ) -> String {
     if let Some(private_addr) = node_private_address {
-        // Remote node: use the node's private/WireGuard IP with host_port
+        // Remote node: use the node's private/WireGuard IP with host_port.
+        // `SocketAddr`'s own Display brackets IPv6 automatically
+        // ("[fc00::1]:5432") -- a bare `format!("{ip}:{port}")` produces an
+        // unparsable authority for any IPv6 private address, since nothing
+        // marks where the address ends and the port begins.
         let port = host_port.unwrap_or(container_port);
-        format!("{}:{}", private_addr, port)
+        match private_addr.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, port as u16).to_string(),
+            // nodes.private_address is validated as a bare IP at
+            // registration; this only defends a pre-existing row from
+            // before that validation existed.
+            Err(_) => format!("{}:{}", private_addr, port),
+        }
     } else {
-        // Local node: use existing logic
-        let (host, port) = DeploymentMode::get_effective_host_port(
+        let endpoint = runtime_context.resolve_service_endpoint(
             container_name,
+            ServiceEndpointScheme::Http,
             container_port as u16,
             host_port.unwrap_or(container_port) as u16,
         );
-        format!("{}:{}", host, port)
+        endpoint.authority()
     }
 }
+
+/// Serializes tests that mutate the process-global `DEPLOYMENT_MODE` env var.
+///
+/// Lives at module scope (not inside `mod tests`) because `route_table_test.rs`
+/// needs the same lock: its database-backed tests assert addresses that depend
+/// on the deployment mode, and would race a unit test flipping it.
+#[cfg(test)]
+pub(crate) static DEPLOYMENT_MODE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Information about a sleeping on-demand environment, returned from route loading.
 #[derive(Clone, Debug)]
@@ -336,6 +483,9 @@ pub struct CachedPeerTable {
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
 
+    /// Immutable execution environment and endpoint resolver selected at startup.
+    runtime_context: Arc<RuntimeContext>,
+
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
 
@@ -363,10 +513,32 @@ pub struct CachedPeerTable {
     /// generation bump rather than spinning. Awoken on every
     /// `load_routes()` success.
     generation_changed: Arc<tokio::sync::Notify>,
+
+    /// Docker network this process adopts Traefik-labelled containers from, or
+    /// `None` when label discovery is not enabled here.
+    ///
+    /// Section 6 of [`Self::load_routes`] loads **nothing** while this is
+    /// `None`, and only rows for this exact network otherwise. That is what
+    /// makes turning discovery off (or repointing it at another network)
+    /// actually take effect: `traefik_discovered_routes` rows outlive the
+    /// configuration that created them, and a disabled reconciler will never
+    /// come back to delete them.
+    ///
+    /// Deliberately injected by the process bootstrap (`temps serve` /
+    /// `temps proxy`) rather than read from the environment here — this crate
+    /// does not parse configuration.
+    traefik_discovery_network: RwLock<Option<String>>,
 }
 
 impl CachedPeerTable {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        Self::new_with_runtime_context(db, Arc::new(RuntimeContext::host()))
+    }
+
+    pub fn new_with_runtime_context(
+        db: Arc<DatabaseConnection>,
+        runtime_context: Arc<RuntimeContext>,
+    ) -> Self {
         Self {
             http_routes: Arc::new(RwLock::new(HashMap::new())),
             tls_routes: Arc::new(RwLock::new(HashMap::new())),
@@ -374,12 +546,44 @@ impl CachedPeerTable {
             tls_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
             routes: Arc::new(RwLock::new(HashMap::new())),
             db,
+            runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
+            // Off until the bootstrap says otherwise: label discovery is
+            // opt-in, so the safe default is "adopt nothing".
+            traefik_discovery_network: RwLock::new(None),
         }
+    }
+
+    /// Point Section 6 of `load_routes()` at the Docker network this process
+    /// adopts Traefik-labelled containers from.
+    ///
+    /// `Some(network)` when label discovery is enabled here, `None` (the
+    /// default) to load no discovered routes at all. Call it before the initial
+    /// route load; the next `load_routes()` picks it up.
+    ///
+    /// The split-mode `temps proxy` process must set this too even though it
+    /// never runs the reconciler: it is a *reader* of `traefik_discovered_routes`
+    /// and would otherwise serve none of them.
+    pub fn set_traefik_discovery_network(&self, network: Option<String>) {
+        let network = network
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
+        match &network {
+            Some(n) => info!(
+                "Traefik label discovery is enabled for this process: routes discovered on Docker \
+                 network '{}' will be served",
+                n
+            ),
+            None => debug!(
+                "Traefik label discovery is not enabled for this process: no discovered routes \
+                 will be served"
+            ),
+        }
+        *self.traefik_discovery_network.write() = network;
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -527,7 +731,7 @@ impl CachedPeerTable {
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
     pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, sea_orm::DbErr> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
         use temps_entities::{
             custom_routes, deployments, environment_domains, environments, project_custom_domains,
             settings,
@@ -634,12 +838,40 @@ impl CachedPeerTable {
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
                         use temps_entities::deployment_containers;
-                        let containers = deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default();
+                        let containers = if deployment.state == "paused" {
+                            // `pause_deployment` flips this row to "paused" BEFORE
+                            // touching any container, and per-container `status`
+                            // writes happen afterward with best-effort retry — if
+                            // one of those writes fails even after retrying, the
+                            // container row can be left stuck at "running" even
+                            // though Docker actually stopped it. Trusting
+                            // `deployment.state` here (rather than only the
+                            // per-container status) closes that gap: a paused
+                            // deployment is never routable, independent of
+                            // whether every container's own status row caught up.
+                            Vec::new()
+                        } else {
+                            deployment_containers::Entity::find()
+                                .filter(
+                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
+                                )
+                                .filter(deployment_containers::Column::DeletedAt.is_null())
+                                // A container row survives (deleted_at stays NULL) for the
+                                // deployment's whole lifecycle, but `status` still moves
+                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                                // deployment pause, or a manual per-container stop) without
+                                // ever being soft-deleted. Only route live traffic to
+                                // containers that are actually up, or where a container has
+                                // never had a status recorded yet.
+                                .filter(
+                                    Condition::any()
+                                        .add(deployment_containers::Column::Status.is_null())
+                                        .add(deployment_containers::Column::Status.eq("running")),
+                                )
+                                .all(self.db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                        };
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&environment.project_id) {
@@ -661,16 +893,46 @@ impl CachedPeerTable {
                                 path: static_dir.clone(),
                             }
                         } else if !containers.is_empty() {
-                            // Container deployment - proxy to containers
-                            let mut backend_entries = Vec::with_capacity(containers.len());
-                            for c in &containers {
+                            let public_port = project
+                                .and_then(|project| project.preset_config.as_ref())
+                                .and_then(|config| match config {
+                                    temps_entities::preset::PresetConfig::DockerCompose(config) => {
+                                        config.public_ports.first()
+                                    }
+                                    _ => None,
+                                });
+                            let Some(route_containers) =
+                                select_public_route_containers(&containers, public_port)
+                            else {
+                                continue;
+                            };
+                            let mut backend_entries = Vec::with_capacity(route_containers.len());
+                            for c in route_containers {
                                 let node_addr = resolve_node_private_address(
                                     c.node_id,
                                     &mut nodes_cache,
                                     self.db.as_ref(),
                                 )
                                 .await;
-                                backend_entries.push(build_backend_entry(c, node_addr.as_deref()));
+                                let entry = match public_port {
+                                    Some(port) => build_public_compose_backend_entry(
+                                        c,
+                                        node_addr.as_deref(),
+                                        port,
+                                        self.runtime_context.as_ref(),
+                                    ),
+                                    None => Some(build_backend_entry(
+                                        c,
+                                        node_addr.as_deref(),
+                                        self.runtime_context.as_ref(),
+                                    )),
+                                };
+                                if let Some(entry) = entry {
+                                    backend_entries.push(entry);
+                                }
+                            }
+                            if backend_entries.is_empty() {
+                                continue;
                             }
                             BackendType::Upstream {
                                 backends: backend_entries,
@@ -858,12 +1120,34 @@ impl CachedPeerTable {
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
                         use temps_entities::deployment_containers;
-                        let containers = deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default();
+                        let containers = if deployment.state == "paused" {
+                            // See the matching comment in the primary-domain branch
+                            // above: trust `deployment.state` over per-container
+                            // `status`, which can lag behind on a retry-exhausted
+                            // write.
+                            Vec::new()
+                        } else {
+                            deployment_containers::Entity::find()
+                                .filter(
+                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
+                                )
+                                .filter(deployment_containers::Column::DeletedAt.is_null())
+                                // A container row survives (deleted_at stays NULL) for the
+                                // deployment's whole lifecycle, but `status` still moves
+                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                                // deployment pause, or a manual per-container stop) without
+                                // ever being soft-deleted. Only route live traffic to
+                                // containers that are actually up, or where a container has
+                                // never had a status recorded yet.
+                                .filter(
+                                    Condition::any()
+                                        .add(deployment_containers::Column::Status.is_null())
+                                        .add(deployment_containers::Column::Status.eq("running")),
+                                )
+                                .all(self.db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                        };
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&custom_domain.project_id) {
@@ -905,7 +1189,11 @@ impl CachedPeerTable {
                                     self.db.as_ref(),
                                 )
                                 .await;
-                                backend_entries.push(build_backend_entry(c, node_addr.as_deref()));
+                                backend_entries.push(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                ));
                             }
                             BackendType::Upstream {
                                 backends: backend_entries,
@@ -1033,12 +1321,33 @@ impl CachedPeerTable {
                 if let Some(deployment) = deployments_cache.get(&deployment_id) {
                     // Load all active containers for this deployment
                     use temps_entities::deployment_containers;
-                    let containers = deployment_containers::Entity::find()
-                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                        .filter(deployment_containers::Column::DeletedAt.is_null())
-                        .all(self.db.as_ref())
-                        .await
-                        .unwrap_or_default();
+                    // "paused" is deliberately checked here rather than folded into
+                    // the "accept any state" comment above it: that comment is about
+                    // NOT filtering on state (e.g. "completed") to avoid a race with
+                    // `mark_deployment_complete`'s write ordering. Excluding "paused"
+                    // is unrelated to that race — it's a deliberate, terminal,
+                    // user-initiated state, not a transient one a deploy passes
+                    // through — and (per the matching comment two branches up) it's
+                    // more trustworthy than per-container `status`, which can lag
+                    // behind on a retry-exhausted write.
+                    let containers = if deployment.state == "paused" {
+                        Vec::new()
+                    } else {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // See the matching comment above: `status` (not just
+                            // `deleted_at`) governs routability, so a paused/stopped
+                            // deployment's containers don't keep serving live traffic.
+                            .filter(
+                                Condition::any()
+                                    .add(deployment_containers::Column::Status.is_null())
+                                    .add(deployment_containers::Column::Status.eq("running")),
+                            )
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default()
+                    };
 
                     // Fetch project if not cached
                     if !projects_cache.contains_key(&env.project_id) {
@@ -1060,13 +1369,15 @@ impl CachedPeerTable {
                             path: static_dir.clone(),
                         }
                     } else if !containers.is_empty() {
-                        // For compose deployments, the main route uses:
-                        // 1. The first public port's service (if public_ports configured)
-                        // 2. The first service (fallback for non-compose or no public_ports)
+                        // For Compose deployments, the main route uses only
+                        // the first explicitly configured public port. A stack
+                        // with no public ports (or a stale service reference)
+                        // remains private instead of exposing whichever
+                        // container happened to be discovered first.
                         let is_compose = containers.iter().any(|c| c.service_name.is_some());
-                        let (route_containers, override_port): (
+                        let (route_containers, public_port): (
                             Vec<&deployment_containers::Model>,
-                            Option<u16>,
+                            Option<ComposePublicPort>,
                         ) = if is_compose {
                             // Check for public_ports config
                             let first_public = project
@@ -1089,46 +1400,11 @@ impl CachedPeerTable {
                                         .filter(|c| c.service_name.as_deref() == Some(&pp.service))
                                         .collect();
                                     if cs.is_empty() {
-                                        // Fallback to first service
-                                        let first_svc = containers
-                                            .iter()
-                                            .filter_map(|c| c.service_name.as_ref())
-                                            .next()
-                                            .cloned();
-                                        (
-                                            match first_svc {
-                                                Some(ref svc) => containers
-                                                    .iter()
-                                                    .filter(|c| {
-                                                        c.service_name.as_ref() == Some(svc)
-                                                    })
-                                                    .collect(),
-                                                None => containers.iter().collect(),
-                                            },
-                                            None,
-                                        )
-                                    } else {
-                                        (cs, Some(pp.port))
+                                        continue;
                                     }
+                                    (cs, Some(pp))
                                 }
-                                None => {
-                                    // No public ports configured — use first service
-                                    let first_svc = containers
-                                        .iter()
-                                        .filter_map(|c| c.service_name.as_ref())
-                                        .next()
-                                        .cloned();
-                                    (
-                                        match first_svc {
-                                            Some(ref svc) => containers
-                                                .iter()
-                                                .filter(|c| c.service_name.as_ref() == Some(svc))
-                                                .collect(),
-                                            None => containers.iter().collect(),
-                                        },
-                                        None,
-                                    )
-                                }
+                                None => continue,
                             }
                         } else {
                             (containers.iter().collect(), None)
@@ -1142,15 +1418,25 @@ impl CachedPeerTable {
                                 self.db.as_ref(),
                             )
                             .await;
-                            let mut entry = build_backend_entry(c, node_addr.as_deref());
-                            // Override port if a public port is configured
-                            if let Some(port) = override_port {
-                                if let Some(colon_pos) = entry.address.rfind(':') {
-                                    entry.address =
-                                        format!("{}{}", &entry.address[..=colon_pos], port);
-                                }
+                            let entry = match public_port.as_ref() {
+                                Some(port) => build_public_compose_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    port,
+                                    self.runtime_context.as_ref(),
+                                ),
+                                None => Some(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                )),
+                            };
+                            if let Some(entry) = entry {
+                                backend_entries.push(entry);
                             }
-                            backend_entries.push(entry);
+                        }
+                        if backend_entries.is_empty() {
+                            continue;
                         }
                         BackendType::Upstream {
                             backends: backend_entries,
@@ -1280,17 +1566,12 @@ impl CachedPeerTable {
                     let has_compose_services = containers.iter().any(|c| c.service_name.is_some());
                     if has_compose_services {
                         // Read public_ports from project's preset_config
-                        let public_ports: Vec<(String, u16)> = project
+                        let public_ports: Vec<ComposePublicPort> = project
                             .and_then(|p| p.preset_config.as_ref())
                             .and_then(|pc| {
                                 if let temps_entities::preset::PresetConfig::DockerCompose(cfg) = pc
                                 {
-                                    Some(
-                                        cfg.public_ports
-                                            .iter()
-                                            .map(|pp| (pp.service.clone(), pp.port))
-                                            .collect(),
-                                    )
+                                    Some(cfg.public_ports.clone())
                                 } else {
                                     None
                                 }
@@ -1307,28 +1588,40 @@ impl CachedPeerTable {
                                 }
                             }
 
-                            for (pub_service, pub_port) in &public_ports {
-                                let svc_containers = match services.get(pub_service) {
+                            for public_port in &public_ports {
+                                let svc_containers = match services.get(&public_port.service) {
                                     Some(c) => c,
                                     None => continue,
                                 };
 
                                 let mut svc_backends = Vec::with_capacity(svc_containers.len());
                                 for c in svc_containers {
-                                    // Override container_port with the public port for routing
                                     let node_addr = resolve_node_private_address(
                                         c.node_id,
                                         &mut nodes_cache,
                                         self.db.as_ref(),
                                     )
                                     .await;
-                                    let mut entry = build_backend_entry(c, node_addr.as_deref());
-                                    // Replace port in address with the public port
-                                    if let Some(colon_pos) = entry.address.rfind(':') {
-                                        entry.address =
-                                            format!("{}{}", &entry.address[..=colon_pos], pub_port);
-                                    }
+                                    let Some(entry) = build_public_compose_backend_entry(
+                                        c,
+                                        node_addr.as_deref(),
+                                        public_port,
+                                        self.runtime_context.as_ref(),
+                                    ) else {
+                                        warn!(
+                                            service = %public_port.service,
+                                            configured_target = public_port.port,
+                                            recorded_target = c.container_port,
+                                            recorded_host_port = ?c.host_port,
+                                            "Skipping public Compose route without a matching live Docker port mapping"
+                                        );
+                                        continue;
+                                    };
                                     svc_backends.push(entry);
+                                }
+
+                                if svc_backends.is_empty() {
+                                    continue;
                                 }
 
                                 let svc_backend = BackendType::Upstream {
@@ -1354,7 +1647,7 @@ impl CachedPeerTable {
                                 let svc_domain = svc_strategy.service_hostname(
                                     &preview_domain,
                                     main_url,
-                                    pub_service,
+                                    &public_port.service,
                                 );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
@@ -1362,8 +1655,14 @@ impl CachedPeerTable {
                                     let addresses: Vec<&str> =
                                         svc_backends.iter().map(|b| b.address.as_str()).collect();
                                     debug!(
-                                        "Loaded compose public port route: {} -> {:?} (service={}, port={}, project={}, env={})",
-                                        svc_domain, addresses, pub_service, pub_port, env.project_id, env.id
+                                        "Loaded compose public port route: {} -> {:?} (service={}, target_port={}, published_port={:?}, project={}, env={})",
+                                        svc_domain,
+                                        addresses,
+                                        public_port.service,
+                                        public_port.port,
+                                        public_port.published,
+                                        env.project_id,
+                                        env.id
                                     );
                                     e.insert(svc_route_info);
                                 }
@@ -1432,12 +1731,27 @@ impl CachedPeerTable {
                 ) {
                     // Load all active containers for this deployment
                     use temps_entities::deployment_containers;
-                    let containers = deployment_containers::Entity::find()
-                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                        .filter(deployment_containers::Column::DeletedAt.is_null())
-                        .all(self.db.as_ref())
-                        .await
-                        .unwrap_or_default();
+                    let containers = if deployment.state == "paused" {
+                        // See the matching comment further up: trust
+                        // `deployment.state` over per-container `status`, which
+                        // can lag behind on a retry-exhausted write.
+                        Vec::new()
+                    } else {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // See the matching comment above: `status` (not just
+                            // `deleted_at`) governs routability, so a paused/stopped
+                            // deployment's containers don't keep serving live traffic.
+                            .filter(
+                                Condition::any()
+                                    .add(deployment_containers::Column::Status.is_null())
+                                    .add(deployment_containers::Column::Status.eq("running")),
+                            )
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default()
+                    };
 
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
@@ -1446,16 +1760,48 @@ impl CachedPeerTable {
                             path: static_dir.clone(),
                         }
                     } else if !containers.is_empty() {
-                        // Container deployment - proxy to containers
-                        let mut backend_entries = Vec::with_capacity(containers.len());
-                        for c in &containers {
+                        let public_port =
+                            project
+                                .preset_config
+                                .as_ref()
+                                .and_then(|config| match config {
+                                    temps_entities::preset::PresetConfig::DockerCompose(config) => {
+                                        config.public_ports.first()
+                                    }
+                                    _ => None,
+                                });
+                        let Some(route_containers) =
+                            select_public_route_containers(&containers, public_port)
+                        else {
+                            continue;
+                        };
+                        let mut backend_entries = Vec::with_capacity(route_containers.len());
+                        for c in route_containers {
                             let node_addr = resolve_node_private_address(
                                 c.node_id,
                                 &mut nodes_cache,
                                 self.db.as_ref(),
                             )
                             .await;
-                            backend_entries.push(build_backend_entry(c, node_addr.as_deref()));
+                            let entry = match public_port {
+                                Some(port) => build_public_compose_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    port,
+                                    self.runtime_context.as_ref(),
+                                ),
+                                None => Some(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                )),
+                            };
+                            if let Some(entry) = entry {
+                                backend_entries.push(entry);
+                            }
+                        }
+                        if backend_entries.is_empty() {
+                            continue;
                         }
                         BackendType::Upstream {
                             backends: backend_entries,
@@ -1513,6 +1859,166 @@ impl CachedPeerTable {
         debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
             projects_cache.len(), environments_cache.len(), deployments_cache.len());
 
+        // 6. Load Traefik-label discovered routes (containers Temps did NOT
+        // deploy — an operator's existing docker-compose/Coolify/Dokploy
+        // stack). Written by `temps_deployer::traefik_discovery`; opt-in via
+        // TEMPS_TRAEFIK_DISCOVERY_ENABLED, so this section is empty on a
+        // default install.
+        //
+        // Loaded LAST on purpose. The discovery reconciler already refuses to
+        // write a host owned by a deployment, custom route, custom domain, or
+        // environment subdomain, but that check races a concurrent write and
+        // cannot see rows another control plane node added a millisecond ago.
+        // This merge is the authoritative precedence rule: a discovered route
+        // is only ever placed on a hostname that no DB-driven route claimed in
+        // this same rebuild. An adversarial (or merely careless) workload can
+        // therefore never take a real deployment's domain by relabelling
+        // itself — the worst it can do is fail to be routed and get logged.
+        //
+        // Scoped to the network this node is *currently* configured to adopt
+        // from, and skipped entirely when discovery is off here. Without that
+        // scope, turning discovery off (or repointing it at another network)
+        // would leave every previously-adopted row still routing forever: the
+        // rows outlive the configuration that created them, and only the
+        // reconciler — which no longer runs — would ever delete them.
+        let discovery_network = self.traefik_discovery_network.read().clone();
+        let discovered_routes = match discovery_network.as_deref() {
+            Some(network) => {
+                temps_entities::traefik_discovered_routes::Entity::find()
+                    .filter(temps_entities::traefik_discovered_routes::Column::Enabled.eq(true))
+                    .filter(
+                        temps_entities::traefik_discovered_routes::Column::Network
+                            .eq(network.to_string()),
+                    )
+                    .all(self.db.as_ref())
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        if !discovered_routes.is_empty() {
+            debug!(
+                "Section 6: Loading {} Traefik-discovered routes (network={})",
+                discovered_routes.len(),
+                discovery_network.as_deref().unwrap_or("<disabled>")
+            );
+        }
+
+        for discovered in discovered_routes {
+            let host = discovered.host.trim().to_ascii_lowercase();
+            if host.is_empty() {
+                continue;
+            }
+
+            // Precedence: any DB-driven route for this host wins, whether it
+            // is an exact HTTP/TLS route, a wildcard pattern that covers the
+            // host, or a legacy environment/custom-domain entry.
+            let claimed_by = if routes.contains_key(&host) {
+                Some("environment or custom domain route")
+            } else if http_routes_map.contains_key(&host) {
+                Some("HTTP custom route")
+            } else if tls_routes_map.contains_key(&host) {
+                Some("TLS custom route")
+            } else if http_wildcards_matcher.match_domain(&host).is_some() {
+                Some("HTTP wildcard custom route")
+            } else if tls_wildcards_matcher.match_domain(&host).is_some() {
+                Some("TLS wildcard custom route")
+            } else {
+                None
+            };
+            if let Some(owner) = claimed_by {
+                warn!(
+                    "Ignoring Traefik-discovered route for '{}' (container '{}'): the host \
+                     already resolves to a {}. The existing route is kept.",
+                    host, discovered.target_container_name, owner
+                );
+                continue;
+            }
+
+            // Same address construction as Temps-deployed containers, so
+            // baremetal installs (where the proxy cannot resolve Docker's
+            // internal DNS) use the published host port. The discovered
+            // container is always local to this node — remote workers run their
+            // own discovery against their own daemon.
+            //
+            // `None` means this deployment mode genuinely cannot reach the
+            // container. Say so loudly instead of routing the host somewhere
+            // else: a baremetal install has no way to reach an unpublished
+            // container port, and guessing `127.0.0.1:<container port>` lands
+            // on whatever unrelated service owns that port on the host.
+            let Some(address) = build_discovered_backend_addr(
+                &discovered.target_container_name,
+                discovered.target_port,
+                discovered.target_host_port,
+                self.runtime_context.as_ref(),
+            ) else {
+                warn!(
+                    "Skipping Traefik-discovered route for '{}' (container '{}', port {}): this \
+                     install runs outside Docker (baremetal mode) and the container publishes no \
+                     host port, so there is no address that reaches it. Publish the port on the \
+                     container (e.g. `ports: - \"8080:{}\"`) or run Temps in Docker mode.",
+                    host,
+                    discovered.target_container_name,
+                    discovered.target_port,
+                    discovered.target_port
+                );
+                continue;
+            };
+
+            routes.insert(
+                host.clone(),
+                RouteInfo {
+                    backend: BackendType::Upstream {
+                        backends: vec![BackendEntry {
+                            address: address.clone(),
+                            container_id: Some(discovered.target_container_id.clone()),
+                            container_name: Some(discovered.target_container_name.clone()),
+                        }],
+                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                    },
+                    redirect_to: None,
+                    status_code: None,
+                    // Not a Temps deployment: no project/environment/deployment
+                    // context exists for these containers by definition.
+                    project: None,
+                    environment: None,
+                    deployment: None,
+                    // TODO(security): pre-merge review finding — a discovered
+                    // container's own `traefik...tls` label used to be mirrored
+                    // here, which let any container on the watched network
+                    // drive ACME issuance for a hostname *it* chose, burning
+                    // Let's Encrypt rate limits and minting certs the operator
+                    // never asked for. Hard-coded off until issuance for
+                    // discovered hosts is gated on an explicit operator
+                    // allowlist. `discovered.tls` is still persisted and shown
+                    // in the admin API, so nothing is lost but auto-issuance.
+                    cert_eligible: false,
+                },
+            );
+            debug!(
+                "Loaded Traefik-discovered route: {} -> {} (container={}, network={}, tls={})",
+                host, address, discovered.target_container_name, discovered.network, discovered.tls
+            );
+        }
+
+        // The console hostname is owned by the control plane, never by a
+        // project. A route pointing it at a deployment locks the operator out
+        // of the console entirely (issue #478) — the create/update API now
+        // refuses such domains, but installs that already stored one would
+        // otherwise stay bricked until the row is deleted over the public IP.
+        // Dropping it here makes the next reload self-heal.
+        if let Some(console_host) = app_settings.console_hostname() {
+            let removed = routes.remove(&console_host).is_some()
+                | http_routes_map.remove(&console_host).is_some()
+                | tls_routes_map.remove(&console_host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for reserved console hostname '{}' — the Temps console keeps it (issue #478)",
+                    console_host
+                );
+            }
+        }
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();
@@ -1537,7 +2043,7 @@ impl CachedPeerTable {
         }
 
         info!(
-            "Route table loaded with {} total entries ({} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards)",
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards",
             route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count
         );
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -1830,10 +2336,6 @@ impl Drop for RouteTableListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Mutex to serialize tests that mutate the DEPLOYMENT_MODE env var.
-    /// Env vars are process-global, so parallel tests would race.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Create a no-op queue for tests that don't need queue functionality
     fn test_queue() -> Arc<dyn temps_core::JobQueue> {
@@ -2165,49 +2667,325 @@ mod tests {
 
     #[test]
     fn test_build_container_backend_addr_local_docker() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // In Docker mode, local containers use container_name:container_port
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            None,
+            &RuntimeContext::docker(),
+        );
         assert_eq!(addr, "my-app:3000");
     }
 
     #[test]
     fn test_build_container_backend_addr_local_baremetal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // In baremetal mode (default), local containers use 127.0.0.1:host_port
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr =
+            build_container_backend_addr("my-app", 3000, Some(8080), None, &RuntimeContext::host());
         assert_eq!(addr, "127.0.0.1:8080");
+    }
+
+    // ── Traefik-discovered backend addresses ─────────────────────────────
+
+    #[test]
+    fn discovered_backend_addr_uses_the_published_host_port_on_baremetal() {
+        let addr =
+            build_discovered_backend_addr("whoami", 8000, Some(18000), &RuntimeContext::host());
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:18000"));
+    }
+
+    /// The SSRF case: without a published host port, `127.0.0.1:<container
+    /// port>` is a *different service on the Temps host* — Postgres on 5432,
+    /// the Docker API on 2375, the console. Refuse to build an address at all.
+    #[test]
+    fn discovered_backend_addr_refuses_an_unpublished_port_on_baremetal() {
+        let addr = build_discovered_backend_addr("whoami", 5432, None, &RuntimeContext::host());
+        assert_eq!(
+            addr, None,
+            "a container port must never be reinterpreted as a loopback port on the host"
+        );
+    }
+
+    /// In Docker mode the container really is reachable at
+    /// `container_name:container_port` over the network's internal DNS, so an
+    /// unpublished port is fine — the restriction is mode-specific, exactly as
+    /// `build_public_compose_backend_addr` already encodes it.
+    #[test]
+    fn discovered_backend_addr_allows_an_unpublished_port_in_docker_mode() {
+        let addr = build_discovered_backend_addr("whoami", 8000, None, &RuntimeContext::docker());
+        assert_eq!(addr.as_deref(), Some("whoami:8000"));
+    }
+
+    fn route_test_container(
+        id: i32,
+        service_name: Option<&str>,
+        container_port: i32,
+    ) -> temps_entities::deployment_containers::Model {
+        let now = chrono::Utc::now();
+        temps_entities::deployment_containers::Model {
+            id,
+            deployment_id: 1,
+            container_id: format!("container-{id}"),
+            container_name: format!("container-{id}"),
+            container_port,
+            host_port: Some(10_000 + id),
+            image_name: None,
+            status: Some("running".to_string()),
+            service_name: service_name.map(str::to_string),
+            created_at: now,
+            deployed_at: now,
+            ready_at: Some(now),
+            deleted_at: None,
+            node_id: None,
+            exit_code: None,
+            exit_reason: None,
+            oom_killed: None,
+            error_message: None,
+            finished_at: None,
+            started_at: Some(now),
+            cpu_limit_cores: None,
+        }
+    }
+
+    #[test]
+    fn compose_route_selects_only_the_configured_public_service_and_port() {
+        let containers = vec![
+            route_test_container(1, Some("database"), 5432),
+            route_test_container(2, Some("web"), 8080),
+            route_test_container(3, Some("web"), 9090),
+        ];
+        let public_port = ComposePublicPort {
+            service: "web".to_string(),
+            port: 8080,
+            published: Some(18080),
+            health_check_path: None,
+        };
+
+        let selected = select_public_route_containers(&containers, Some(&public_port)).unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].service_name.as_deref(), Some("web"));
+        assert_eq!(selected[0].container_port, 8080);
+    }
+
+    #[test]
+    fn compose_route_without_public_port_stays_private() {
+        let containers = vec![
+            route_test_container(1, Some("database"), 5432),
+            route_test_container(2, Some("web"), 8080),
+        ];
+
+        assert!(select_public_route_containers(&containers, None).is_none());
+    }
+
+    #[test]
+    fn public_compose_mapping_uses_docker_recorded_port_on_baremetal() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: Some(65535),
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
+
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:15455"));
+    }
+
+    #[test]
+    fn public_compose_mapping_uses_container_port_in_docker() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: Some(15455),
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::docker(),
+        );
+
+        assert_eq!(addr.as_deref(), Some("web:80"));
+    }
+
+    #[test]
+    fn test_public_compose_mapping_docker_without_host_port_uses_container_port() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: None,
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            None,
+            None,
+            &mapping,
+            &RuntimeContext::docker(),
+        );
+
+        assert_eq!(addr.as_deref(), Some("web:80"));
+    }
+
+    #[test]
+    fn public_compose_mapping_uses_published_port_for_remote_node() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: Some(65535),
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            Some("10.100.0.5"),
+            &mapping,
+            &RuntimeContext::host(),
+        );
+
+        assert_eq!(addr.as_deref(), Some("10.100.0.5:15455"));
+    }
+
+    #[test]
+    fn legacy_public_compose_mapping_uses_recorded_host_port() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: None,
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
+
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:15455"));
+    }
+
+    #[test]
+    fn public_compose_mapping_rejects_unmatched_target_port() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 8211,
+            published: Some(8211),
+            health_check_path: None,
+        };
+
+        assert_eq!(
+            build_public_compose_backend_addr(
+                "web",
+                80,
+                Some(15455),
+                None,
+                &mapping,
+                &RuntimeContext::host(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn public_compose_mapping_requires_discovered_host_port_off_docker_network() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: Some(8211),
+            health_check_path: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            None,
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
+
+        assert_eq!(addr, None);
     }
 
     #[test]
     fn test_build_container_backend_addr_remote_with_host_port() {
         // Remote containers always use private_address:host_port
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
         assert_eq!(addr, "10.100.0.5:8080");
     }
 
     #[test]
     fn test_build_container_backend_addr_remote_without_host_port() {
         // When host_port is None, remote falls back to container_port
-        let addr = build_container_backend_addr("my-app", 3000, None, Some("10.100.0.5"));
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            None,
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
         assert_eq!(addr, "10.100.0.5:3000");
     }
 
     #[test]
+    fn test_build_container_backend_addr_remote_brackets_ipv6() {
+        // Regression guard: a bare "{ip}:{port}" is unparsable for an IPv6
+        // node's private address -- nothing marks where the address ends
+        // and the port begins. The proxy must dial "[fc00::1]:8080", not
+        // "fc00::1:8080" (which parses as a different, wrong IPv6 address).
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("fc00::1"),
+            &RuntimeContext::host(),
+        );
+        assert_eq!(addr, "[fc00::1]:8080");
+    }
+
+    #[test]
     fn test_build_container_backend_addr_remote_ignores_deployment_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Remote address should be the same regardless of deployment mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-        let addr_docker =
-            build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr_baremetal =
-            build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr_docker = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::docker(),
+        );
+        let addr_baremetal = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
 
         assert_eq!(addr_docker, addr_baremetal);
         assert_eq!(addr_docker, "10.100.0.5:8080");

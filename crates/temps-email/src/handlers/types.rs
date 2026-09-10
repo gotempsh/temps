@@ -1,13 +1,17 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Handler types for the email service
 
 use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationService,
+    DomainService, EmailService, ListProviderDomainsResult, ProviderService, TrackingService,
+    TrackingSetupService, ValidationService,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_dns::services::DnsProviderService;
 use utoipa::{IntoParams, ToSchema};
 
@@ -19,9 +23,18 @@ pub struct AppState {
     pub validation_service: Arc<ValidationService>,
     pub tracking_service: Arc<TrackingService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Optional team/project visibility policy supplied by an extension plugin.
+    /// Plain OSS installations intentionally leave this unset.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// AWS-side auto-setup for SES event tracking (SNS topic + webhook
+    /// subscription + SESv2 event destination).
+    pub tracking_setup_service: Arc<TrackingSetupService>,
+    /// For computing the public tracking webhook URL from the configured
+    /// external URL at request time (it can change without a restart).
+    pub config_service: Arc<temps_config::ConfigService>,
 }
 
 // ========================================
@@ -143,6 +156,9 @@ pub struct CreateEmailProviderRequest {
     /// Cloud region. For SMTP this is informational only — the host/port carry the real routing.
     #[schema(example = "us-east-1")]
     pub region: String,
+    /// Exact SNS topic allowed to deliver SES events for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sns_topic_arn: Option<String>,
     /// AWS SES credentials (required if provider_type is ses)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ses_credentials: Option<SesCredentialsRequest>,
@@ -170,6 +186,14 @@ pub struct UpdateEmailProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "us-east-1")]
     pub region: Option<String>,
+    /// Rotate or clear the exact SNS topic allowed for this SES provider.
+    /// Omit to preserve it, send `null` to clear it, or send a string to set it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sns_topic_arn: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +204,14 @@ pub struct UpdateEmailProviderRequest {
     pub smtp_credentials: Option<SmtpCredentialsRequest>,
 }
 
+fn deserialize_present_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EmailProviderResponse {
     pub id: i32,
@@ -188,6 +220,7 @@ pub struct EmailProviderResponse {
     pub provider_type: EmailProviderTypeRoute,
     #[schema(example = "us-east-1")]
     pub region: String,
+    pub sns_topic_arn: Option<String>,
     pub is_active: bool,
     /// Masked credentials for display
     pub credentials: serde_json::Value,
@@ -195,6 +228,91 @@ pub struct EmailProviderResponse {
     pub created_at: String,
     #[schema(example = "2025-12-03T10:30:00Z")]
     pub updated_at: String,
+}
+
+/// A single domain identity already registered on the provider's side,
+/// offered for import.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderDomainIdentityResponse {
+    #[schema(example = "example.com")]
+    pub domain: String,
+    #[schema(example = "12345678-1234-1234-1234-123456789012")]
+    pub provider_identity_id: String,
+    /// The provider's current verification status for this domain
+    /// ("verified", "pending", "failed", "not_started", "temporary_failure")
+    #[schema(example = "verified")]
+    pub status: String,
+}
+
+impl From<crate::providers::ProviderDomainIdentity> for ProviderDomainIdentityResponse {
+    fn from(identity: crate::providers::ProviderDomainIdentity) -> Self {
+        Self {
+            domain: identity.domain,
+            provider_identity_id: identity.provider_identity_id,
+            status: identity.status.to_string(),
+        }
+    }
+}
+
+/// Domains discoverable on a provider's side for the "import existing
+/// domain" picker.
+///
+/// `supported: false` means this provider type has no domain-listing API at
+/// all (SMTP) — the UI must fall back to manual domain entry rather than
+/// treat it as an error to retry. `error` is set when `supported` is `true`
+/// but the live fetch still failed (network, revoked credentials); the same
+/// manual-entry fallback applies, but it's worth surfacing as a warning.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListProviderDomainsResponse {
+    pub supported: bool,
+    pub domains: Vec<ProviderDomainIdentityResponse>,
+    pub error: Option<String>,
+}
+
+impl From<ListProviderDomainsResult> for ListProviderDomainsResponse {
+    fn from(result: ListProviderDomainsResult) -> Self {
+        Self {
+            supported: result.supported,
+            domains: result.domains.into_iter().map(Into::into).collect(),
+            error: result.error,
+        }
+    }
+}
+
+/// Live status of the SES event-tracking pipeline for one provider.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingStatusResponse {
+    /// Public webhook endpoint SNS must deliver events to.
+    #[schema(example = "https://temps.example.com/api/t/webhook/ses")]
+    pub webhook_url: String,
+    /// Only SES providers support SNS event tracking.
+    pub supports_event_tracking: bool,
+    pub sns_topic_arn: Option<String>,
+    /// When the SNS subscription for the current topic was confirmed.
+    /// `null` with a topic set usually means the subscription is still
+    /// pending — most often because the endpoint was subscribed before the
+    /// topic ARN was saved here.
+    #[schema(example = "2026-07-18T10:30:00Z")]
+    pub subscription_confirmed_at: Option<String>,
+    /// Most recent delivered/bounced/complained event recorded for an email
+    /// sent through this provider. `null` means no provider feedback has
+    /// arrived yet.
+    #[schema(example = "2026-07-18T10:31:00Z")]
+    pub last_event_at: Option<String>,
+}
+
+/// Result of the one-click AWS-side event-tracking setup.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingSetupResponse {
+    #[schema(example = "arn:aws:sns:us-east-1:123456789012:temps-email-events-1")]
+    pub topic_arn: String,
+    pub webhook_url: String,
+    /// The webhook subscription was requested; SNS confirms it
+    /// asynchronously through the webhook itself.
+    pub subscription_requested: bool,
+    /// The SESv2 event destination (bounce/complaint/delivery) is attached
+    /// to the `temps-tracking` configuration set.
+    pub event_destination_attached: bool,
 }
 
 /// Request body for testing an email provider
@@ -233,6 +351,29 @@ pub struct CreateEmailDomainRequest {
     /// Domain name (e.g., "updates.example.com")
     #[schema(example = "updates.example.com")]
     pub domain: String,
+}
+
+/// Request body for importing an already-provisioned email domain.
+///
+/// Use this when the domain identity was created directly in the email
+/// provider's own console or API — Temps will look it up rather than
+/// attempting to re-create it, avoiding duplicate or conflicting identities.
+///
+/// `provider_identity_id` is required for Scaleway (where the provider keys
+/// lookups off an internal UUID rather than the domain name) and optional for
+/// SES (which uses the domain name for all lookups). If a required field is
+/// missing, the provider will surface a clear error.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportEmailDomainRequest {
+    /// Provider ID to import the domain into
+    pub provider_id: i32,
+    /// Domain name (e.g., "updates.example.com")
+    #[schema(example = "updates.example.com")]
+    pub domain: String,
+    /// Provider-internal identity identifier. Required for Scaleway (the domain
+    /// UUID shown in the Scaleway console); ignored/optional for SES.
+    #[schema(example = "12345678-1234-1234-1234-123456789012")]
+    pub provider_identity_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -297,6 +438,43 @@ pub struct EmailDomainWithDnsResponse {
     pub dns_records: Vec<DnsRecordResponse>,
 }
 
+/// A project authorized to send email through a sender domain.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthorizedEmailDomainProjectResponse {
+    pub id: i32,
+    pub name: String,
+    pub slug: String,
+}
+
+impl From<temps_entities::projects::Model> for AuthorizedEmailDomainProjectResponse {
+    fn from(project: temps_entities::projects::Model) -> Self {
+        Self {
+            id: project.id,
+            name: project.name,
+            slug: project.slug,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct ListDomainsQuery {
+    /// Only return domains belonging to this provider
+    pub provider_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct DeleteDomainQuery {
+    /// Also remove the domain identity on the provider's side (Scaleway/SES),
+    /// not just the local Temps record. Defaults to `false`: the same domain
+    /// may be shared with other tools against that provider account, so
+    /// deleting it from Temps must not silently un-register it elsewhere
+    /// unless explicitly requested. If the provider-side deletion fails
+    /// (network error, revoked credentials), the local record is still
+    /// deleted -- an unreachable provider never blocks removing it from Temps.
+    #[serde(default)]
+    pub delete_from_provider: bool,
+}
+
 /// Request to setup DNS records using a configured DNS provider
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetupDnsRequest {
@@ -338,7 +516,7 @@ pub struct SetupDnsResponse {
 // Email Types
 // ========================================
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct SendEmailRequestBody {
     /// Sender email address (domain will be auto-extracted for lookup)
     #[schema(example = "hello@updates.example.com")]
@@ -438,6 +616,10 @@ pub struct EmailStatsResponse {
     pub queued: u64,
     /// Emails captured without sending (Mailhog mode - no provider configured)
     pub captured: u64,
+    /// Emails currently owned by an active provider delivery attempt
+    pub sending: u64,
+    /// Emails whose provider accepted/rejected outcome could not be determined
+    pub delivery_unknown: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -458,4 +640,27 @@ pub struct ListEmailsQuery {
     pub page: Option<u64>,
     #[schema(example = 20)]
     pub page_size: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdateEmailProviderRequest;
+
+    #[test]
+    fn update_provider_sns_topic_is_tri_state() {
+        let omitted: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({})).expect("omitted topic request");
+        assert_eq!(omitted.sns_topic_arn, None);
+
+        let cleared: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": null }))
+                .expect("cleared topic request");
+        assert_eq!(cleared.sns_topic_arn, Some(None));
+
+        let topic = "arn:aws:sns:us-east-1:123456789012:temps-events";
+        let rotated: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": topic }))
+                .expect("rotated topic request");
+        assert_eq!(rotated.sns_topic_arn, Some(Some(topic.to_string())));
+    }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Upstream recursive forwarder.
 //!
 //! We are the first (and often only) nameserver visible inside app

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -20,6 +23,7 @@ pub struct Model {
     #[serde(skip_serializing)]
     pub password_reset_token: Option<String>,
     pub password_reset_expires: Option<DBDateTime>,
+    pub must_change_password: bool,
     // Common fields
     pub deleted_at: Option<DBDateTime>,
     #[serde(skip_serializing)]

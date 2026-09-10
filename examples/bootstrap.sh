@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 
 # Bootstrap script to generate example applications for testing Temps presets
 # This script creates minimal working examples for each supported framework

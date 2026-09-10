@@ -1,4 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
+use crate::NotificationRoutingService;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -9,20 +13,190 @@ use lettre::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use temps_cloud::CloudService;
+use temps_cloud_protocol::{ManagedNotificationRequest, ManagedNotificationSeverity};
 use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
 };
+use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
-    notification_preferences, notification_providers, notifications, roles, user_roles, users,
+    notification_preferences, notification_providers, notification_routes, notifications, roles,
+    user_roles, users,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;
+
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderRevealError {
+    #[error("Notification provider {provider_id} was not found")]
+    ProviderNotFound { provider_id: i32 },
+    #[error(
+        "Field '{field}' is not a sensitive field for notification provider {provider_id} ({provider_type})"
+    )]
+    FieldNotRevealable {
+        provider_id: i32,
+        provider_type: String,
+        field: String,
+    },
+    #[error("Sensitive field '{field}' was not found in notification provider {provider_id}")]
+    FieldNotFound { provider_id: i32, field: String },
+    #[error("Failed to load notification provider {provider_id}: {source}")]
+    Database {
+        provider_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to decrypt notification provider {provider_id} configuration: {reason}")]
+    Decryption { provider_id: i32, reason: String },
+    #[error(
+        "Failed to serialize field '{field}' for notification provider {provider_id}: {reason}"
+    )]
+    Serialization {
+        provider_id: i32,
+        field: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderConfigMergeError {
+    #[error("Masked notification provider value at '{path}' has no existing value to preserve")]
+    UnmatchedMaskedValue { path: String },
+    #[error(
+        "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
+    )]
+    AmbiguousMaskedArray { path: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderCreateError {
+    #[error(
+        "Failed to serialize configuration for notification provider '{provider_name}': {source}"
+    )]
+    Serialization {
+        provider_name: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "Failed to encrypt configuration for notification provider '{provider_name}': {reason}"
+    )]
+    Encryption {
+        provider_name: String,
+        reason: String,
+    },
+    #[error(
+        "Failed to {operation} notification provider '{provider_name}' ({provider_id:?}): {source}"
+    )]
+    Database {
+        provider_id: Option<i32>,
+        provider_name: String,
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to create the catch-all route for notification provider '{provider_name}' ({provider_id}): {source}")]
+    CatchAllRoute {
+        provider_id: i32,
+        provider_name: String,
+        #[source]
+        source: crate::routing::NotificationRouteError,
+    },
+}
+
+const MASKED_CONFIG_VALUE: &str = "***";
+
+fn normalize_config_key(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_was_lowercase_or_digit = false;
+    for character in name.chars() {
+        if matches!(character, '-' | ' ' | '.') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            previous_was_lowercase_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lowercase_or_digit {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+        previous_was_lowercase_or_digit =
+            character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    normalized
+}
+
+fn is_sensitive_config_key(name: &str) -> bool {
+    let normalized = normalize_config_key(name);
+    normalized == "url"
+        || normalized.ends_with("_url")
+        || normalized == "authorization"
+        || normalized.ends_with("_authorization")
+        || [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "api_key",
+            "apikey",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "key",
+            "auth",
+        ]
+        .iter()
+        .any(|marker| {
+            normalized == *marker
+                || normalized.starts_with(&format!("{marker}_"))
+                || normalized.ends_with(&format!("_{marker}"))
+        })
+}
+
+fn is_provider_config_field_revealable(_provider_type: &str, field: &str) -> bool {
+    if field
+        .strip_prefix("headers.")
+        .is_some_and(|name| !name.is_empty())
+    {
+        return true;
+    }
+
+    field.split('.').all(|segment| !segment.is_empty())
+        && field
+            .rsplit('.')
+            .next()
+            .is_some_and(is_sensitive_config_key)
+}
+
+fn provider_config_field<'a>(
+    config: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    match field
+        .strip_prefix("headers.")
+        .filter(|name| !name.is_empty())
+    {
+        Some(header_name) => config
+            .get("headers")
+            .and_then(|headers| headers.get(header_name)),
+        None => {
+            let mut value = config;
+            for segment in field.split('.') {
+                value = value.get(segment)?;
+            }
+            Some(value)
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
@@ -77,7 +251,8 @@ pub struct EmailProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackProvider {
     pub webhook_url: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +292,46 @@ pub struct WebhookProvider {
     /// Request timeout in seconds. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+async fn validate_webhook_url(url: &str) -> Result<()> {
+    let parsed = validate_external_url(url)
+        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    }
+    Ok(())
+}
+
+async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+    let parsed = validate_external_url(url)
+        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        let addrs = resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+        builder = builder.resolve_to_addrs(domain, &addrs);
+    }
+
+    Ok(builder.build()?)
 }
 
 /// Cloudflare Email Sending provider.
@@ -332,7 +547,10 @@ impl NotificationProvider for CloudflareProvider {
         match client.get(url).bearer_auth(&self.api_token).send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Cloudflare provider health check failed: {}", e);
+                error!(
+                    "Cloudflare provider health check failed: {}",
+                    e.without_url()
+                );
                 Ok(false)
             }
         }
@@ -356,6 +574,16 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Drop the request URL from a reqwest error before it is logged or
+/// propagated. `reqwest::Error`'s `Display` embeds the full request URL
+/// (`" for url (...)"`) whenever one is attached — for webhook-style
+/// destinations (Slack incoming webhooks, Discord-style webhook URLs) that
+/// URL IS the credential, so leaving it in triggers CWE-532 (secrets in
+/// logs) the moment a delivery or health check fails.
+fn webhook_request_error(prefix: &str, error: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{prefix}: {}", error.without_url())
+}
+
 /// Escape Slack mrkdwn special characters so user-controlled text cannot inject
 /// hyperlinks (`<url|text>`), `<!channel>` mention floods, `&entity;` refs, or
 /// forge bold/italic/code/strikethrough formatting.
@@ -374,6 +602,256 @@ pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
     async fn send(&self, notification: &Notification) -> Result<()>;
     async fn health_check(&self) -> Result<bool>;
+}
+
+const CLOUD_TITLE_MAX_CHARS: usize = 200;
+const CLOUD_MESSAGE_MAX_CHARS: usize = 4_000;
+const CLOUD_METADATA_VALUE_MAX_CHARS: usize = 256;
+const CLOUD_METADATA_MAX_ENTRIES: usize = 3;
+const CLOUD_METADATA_ALLOWLIST: &[&str] = &["environment", "event_kind", "resource_type"];
+
+#[derive(Debug, thiserror::Error)]
+enum CloudNotificationError {
+    #[error("Could not create a private identifier for the managed notification")]
+    Pseudonymization,
+    #[error("The managed notification provider could not accept the notification")]
+    Delivery,
+}
+
+#[async_trait]
+trait ManagedNotificationSender: Send + Sync {
+    fn notifications_enabled(&self) -> bool;
+    fn notifications_available(&self) -> bool;
+    fn pseudonymize_notification_id(
+        &self,
+        notification_id: &str,
+    ) -> std::result::Result<String, CloudNotificationError>;
+    async fn send_managed_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> std::result::Result<(), CloudNotificationError>;
+}
+
+#[async_trait]
+impl ManagedNotificationSender for CloudService {
+    fn notifications_enabled(&self) -> bool {
+        self.link().notifications_enabled()
+    }
+
+    fn notifications_available(&self) -> bool {
+        self.link().notifications_available()
+    }
+
+    fn pseudonymize_notification_id(
+        &self,
+        notification_id: &str,
+    ) -> std::result::Result<String, CloudNotificationError> {
+        self.link()
+            .pseudonymize_notification_id(notification_id)
+            .map_err(|_| CloudNotificationError::Pseudonymization)
+    }
+
+    async fn send_managed_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> std::result::Result<(), CloudNotificationError> {
+        self.send_notification(request)
+            .await
+            .map(|_| ())
+            .map_err(|_| CloudNotificationError::Delivery)
+    }
+}
+
+/// The only managed provider exposed by OSS. Cloud owns all concrete sinks.
+pub struct TempsCloudProvider {
+    cloud: Arc<dyn ManagedNotificationSender>,
+}
+
+fn bound_cloud_text(value: &str, max_chars: usize) -> String {
+    let redacted = redact_sensitive_text(value.trim());
+    if redacted.chars().count() <= max_chars {
+        return redacted;
+    }
+
+    let mut bounded: String = redacted.chars().take(max_chars.saturating_sub(1)).collect();
+    bounded.push('…');
+    bounded
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let value = redact_url_credentials(value);
+    let value = redact_secret_prefixes(&value);
+    redact_key_value_secrets(&value)
+}
+
+fn redact_url_credentials(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(scheme_index) = remaining.find("://") {
+        let credential_start = scheme_index + 3;
+        let tail = &remaining[credential_start..];
+        let boundary = tail
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '/' | '?' | '#')
+            })
+            .unwrap_or(tail.len());
+        let Some(at_index) = tail[..boundary].find('@') else {
+            output.push_str(&remaining[..credential_start]);
+            remaining = tail;
+            continue;
+        };
+        output.push_str(&remaining[..credential_start]);
+        output.push_str("[redacted]@");
+        remaining = &tail[at_index + 1..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_secret_prefixes(value: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "bearer ", "sk-ant-", "sk-", "ghp_", "gho_", "glpat-", "xoxb-", "xoxp-",
+    ];
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let earliest = PREFIXES
+            .iter()
+            .filter_map(|prefix| {
+                lowercase[cursor..]
+                    .find(prefix)
+                    .map(|index| (cursor + index, prefix.len()))
+            })
+            .min_by_key(|(start, _)| *start);
+        let Some((start, prefix_len)) = earliest else {
+            output.push_str(&value[cursor..]);
+            break;
+        };
+        output.push_str(&value[cursor..start]);
+        output.push_str("[redacted]");
+        let token_start = start + prefix_len;
+        let end = value[token_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
+            })
+            .map_or(value.len(), |offset| token_start + offset);
+        cursor = end.max(token_start);
+    }
+    output
+}
+
+fn redact_key_value_secrets(value: &str) -> String {
+    const KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    ];
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let candidate = KEYS
+            .iter()
+            .filter_map(|key| {
+                lowercase[cursor..]
+                    .find(key)
+                    .map(|offset| (cursor + offset, *key))
+            })
+            .filter_map(|(start, key)| {
+                let before_is_boundary = start == 0
+                    || value[..start].chars().next_back().is_some_and(|character| {
+                        !character.is_ascii_alphanumeric() && character != '_'
+                    });
+                let mut separator = start + key.len();
+                while value[separator..]
+                    .starts_with(|character: char| character.is_ascii_whitespace())
+                {
+                    separator += value[separator..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                }
+                let has_separator = value[separator..].starts_with(['=', ':']);
+                (before_is_boundary && has_separator).then_some((start, separator + 1))
+            })
+            .min_by_key(|(start, _)| *start);
+        let Some((start, mut value_start)) = candidate else {
+            output.push_str(&value[cursor..]);
+            break;
+        };
+        while value[value_start..].starts_with(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '"' | '\'')
+        }) {
+            value_start += value[value_start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        }
+        let value_end = value[value_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
+            })
+            .map_or(value.len(), |offset| value_start + offset);
+        output.push_str(&value[cursor..value_start]);
+        output.push_str("[redacted]");
+        cursor = value_end.max(start + 1);
+    }
+    output
+}
+
+fn cloud_metadata(notification: &Notification) -> BTreeMap<String, String> {
+    notification
+        .metadata
+        .iter()
+        .filter(|(key, _)| CLOUD_METADATA_ALLOWLIST.contains(&key.as_str()))
+        .take(CLOUD_METADATA_MAX_ENTRIES)
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                bound_cloud_text(value, CLOUD_METADATA_VALUE_MAX_CHARS),
+            )
+        })
+        .collect()
+}
+
+#[async_trait]
+impl NotificationProvider for TempsCloudProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let severity = match notification.effective_severity() {
+            NotificationSeverity::Debug => ManagedNotificationSeverity::Debug,
+            NotificationSeverity::Info => ManagedNotificationSeverity::Info,
+            NotificationSeverity::Warning => ManagedNotificationSeverity::Warning,
+            NotificationSeverity::Error => ManagedNotificationSeverity::Error,
+            NotificationSeverity::Critical => ManagedNotificationSeverity::Critical,
+            NotificationSeverity::Emergency => ManagedNotificationSeverity::Emergency,
+        };
+        let source_notification_id = self.cloud.pseudonymize_notification_id(&notification.id)?;
+        self.cloud
+            .send_managed_notification(&ManagedNotificationRequest {
+                source_notification_id,
+                title: bound_cloud_text(&notification.title, CLOUD_TITLE_MAX_CHARS),
+                message: bound_cloud_text(&notification.message, CLOUD_MESSAGE_MAX_CHARS),
+                severity,
+                metadata: cloud_metadata(notification),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(self.cloud.notifications_available())
+    }
 }
 
 impl EmailProvider {
@@ -1053,7 +1531,6 @@ impl NotificationProvider for SlackProvider {
         let safe_title = slack_escape(&notification.title);
         let safe_message = slack_escape(&notification.message);
         let payload = serde_json::json!({
-            "channel": self.channel,
             "attachments": [{
                 "color": color,
                 "title": safe_title,
@@ -1062,8 +1539,14 @@ impl NotificationProvider for SlackProvider {
                 "footer": format!("Priority: {:?} | Type: {:?}", notification.priority, notification.notification_type)
             }]
         });
-
-        client.post(&self.webhook_url).json(&payload).send().await?;
+        client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| webhook_request_error("Slack webhook request failed", e))?
+            .error_for_status()
+            .map_err(|e| webhook_request_error("Slack webhook rejected the request", e))?;
 
         Ok(())
     }
@@ -1071,10 +1554,7 @@ impl NotificationProvider for SlackProvider {
     async fn health_check(&self) -> Result<bool> {
         let client = reqwest::Client::new();
 
-        let test_payload = serde_json::json!({
-            "channel": self.channel,
-            "text": "Health check"
-        });
+        let test_payload = serde_json::json!({ "text": "Health check" });
 
         match client
             .post(&self.webhook_url)
@@ -1084,7 +1564,7 @@ impl NotificationProvider for SlackProvider {
         {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Slack provider health check failed: {}", e);
+                error!("Slack provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1096,8 +1576,7 @@ impl NotificationProvider for WebhookProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         // Validate webhook URL with full SSRF protection (blocks private IPs,
         // loopback, cloud metadata, link-local, etc.)
-        temps_core::url_validation::validate_external_url(&self.url)
-            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", self.url, e))?;
+        validate_webhook_url(&self.url).await?;
 
         // Validate HTTP method
         let method = self.method.to_uppercase();
@@ -1112,9 +1591,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Build the payload with all notification data. `_`-prefixed keys are
         // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
@@ -1151,7 +1628,10 @@ impl NotificationProvider for WebhookProvider {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| webhook_request_error("Webhook request failed", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1168,9 +1648,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Send a test payload
         let test_payload = serde_json::json!({
@@ -1198,7 +1676,7 @@ impl NotificationProvider for WebhookProvider {
         match request.send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Webhook provider health check failed: {}", e);
+                error!("Webhook provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1208,6 +1686,8 @@ impl NotificationProvider for WebhookProvider {
 pub struct NotificationService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    cloud: Option<Arc<dyn ManagedNotificationSender>>,
+    routing_service: NotificationRoutingService,
 }
 
 impl NotificationService {
@@ -1216,8 +1696,23 @@ impl NotificationService {
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self {
+            routing_service: NotificationRoutingService::new(db.clone()),
             db,
             encryption_service,
+            cloud: None,
+        }
+    }
+
+    pub fn new_with_cloud(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        cloud: Arc<CloudService>,
+    ) -> Self {
+        Self {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service,
+            cloud: Some(cloud),
         }
     }
 
@@ -1228,21 +1723,33 @@ impl NotificationService {
         )
     }
 
-    async fn get_enabled_providers(&self) -> Result<Vec<Box<dyn NotificationProvider>>> {
-        let db_providers = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .all(self.db.as_ref())
+    async fn get_enabled_providers(
+        &self,
+        notification: &Notification,
+    ) -> Result<Vec<Box<dyn NotificationProvider>>> {
+        let db_providers = self
+            .routing_service
+            .resolve_provider_models(notification.effective_severity())
             .await?;
         let mut providers = vec![];
-        for provider_record in db_providers {
-            match self.load_provider(&provider_record).await {
+        for db_provider in db_providers {
+            match self.load_provider(&db_provider).await {
                 Ok(provider) => {
                     providers.push(provider);
                 }
                 Err(e) => {
-                    error!("Failed to load provider {}: {}", provider_record.name, e);
+                    error!("Failed to load provider {}: {}", db_provider.name, e);
                 }
             }
+        }
+        if let Some(cloud) = self
+            .cloud
+            .as_ref()
+            .filter(|cloud| cloud.notifications_enabled())
+        {
+            providers.push(Box::new(TempsCloudProvider {
+                cloud: cloud.clone(),
+            }));
         }
         Ok(providers)
     }
@@ -1415,9 +1922,9 @@ impl NotificationService {
             );
         }
 
-        // Send through all configured providers
+        // Resolve routes and deliver once to each matching provider.
         let providers = self
-            .get_enabled_providers()
+            .get_enabled_providers(&notification)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
         for provider in &providers {
@@ -1430,21 +1937,22 @@ impl NotificationService {
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
-        let count = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .paginate(self.db.as_ref(), 1)
-            .num_items()
+        if self
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.notifications_enabled())
+        {
+            return Ok(true);
+        }
+        self.routing_service
+            .has_routable_provider()
             .await
-            .map_err(|e| {
-                error!("Failed to check notification providers: {}", e);
-                anyhow::anyhow!("Failed to check notification providers: {}", e)
-            })?;
-
-        Ok(count > 0)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
         let providers = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .all(self.db.as_ref())
             .await?;
         Ok(providers)
@@ -1456,14 +1964,21 @@ impl NotificationService {
         page_size: u64,
     ) -> Result<Vec<notification_providers::Model>> {
         let providers = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .paginate(self.db.as_ref(), page_size)
             .fetch_page(page - 1)
             .await?;
         Ok(providers)
     }
 
-    /// Decrypt the provider config for safe return to API
+    /// Decrypt and mask the provider config for API responses.
     pub fn decrypt_provider_config(&self, encrypted_config: &str) -> Result<serde_json::Value> {
+        let mut config_value = self.decrypt_provider_config_raw(encrypted_config)?;
+        Self::mask_provider_config(&mut config_value);
+        Ok(config_value)
+    }
+
+    fn decrypt_provider_config_raw(&self, encrypted_config: &str) -> Result<serde_json::Value> {
         let decrypted_config = self
             .encryption_service
             .decrypt_string(encrypted_config)
@@ -1473,6 +1988,157 @@ impl NotificationService {
             .map_err(|e| anyhow::anyhow!("Failed to parse decrypted config: {}", e))?;
 
         Ok(config_value)
+    }
+
+    fn mask_provider_config(config: &mut serde_json::Value) {
+        let Some(object) = config.as_object_mut() else {
+            *config = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+            return;
+        };
+
+        for (name, value) in object {
+            if name == "headers" {
+                if let Some(headers) = value.as_object_mut() {
+                    for header_value in headers.values_mut() {
+                        if !header_value.is_null() {
+                            *header_value =
+                                serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                        }
+                    }
+                } else if !value.is_null() {
+                    *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                }
+                continue;
+            }
+
+            if is_sensitive_config_key(name) && !value.is_null() {
+                *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                continue;
+            }
+
+            match value {
+                serde_json::Value::Object(_) => Self::mask_provider_config(value),
+                serde_json::Value::Array(_) => Self::mask_nested_provider_config(value),
+                _ => {}
+            }
+        }
+    }
+
+    fn mask_nested_provider_config(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(_) => Self::mask_provider_config(value),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::mask_nested_provider_config(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains_masked_value(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(value) => value == MASKED_CONFIG_VALUE,
+            serde_json::Value::Object(object) => object.values().any(Self::contains_masked_value),
+            serde_json::Value::Array(items) => items.iter().any(Self::contains_masked_value),
+            _ => false,
+        }
+    }
+
+    fn merge_masked_values(
+        existing: &serde_json::Value,
+        replacement: &mut serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
+        match (existing, replacement) {
+            (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
+                for (key, new_value) in replacement {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if let Some(old_value) = existing.get(key) {
+                        Self::merge_masked_values(old_value, new_value, &child_path)?;
+                    } else if Self::contains_masked_value(new_value) {
+                        return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                            path: child_path,
+                        });
+                    }
+                }
+            }
+            (_, serde_json::Value::Array(replacement)) => {
+                if replacement.iter().any(Self::contains_masked_value) {
+                    return Err(NotificationProviderConfigMergeError::AmbiguousMaskedArray {
+                        path: path.to_string(),
+                    });
+                }
+            }
+            (existing, replacement)
+                if replacement
+                    .as_str()
+                    .is_some_and(|value| value == MASKED_CONFIG_VALUE) =>
+            {
+                *replacement = existing.clone();
+            }
+            (_, replacement) => {
+                if Self::contains_masked_value(replacement) {
+                    return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                        path: path.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reveal a single sensitive configuration field after the HTTP layer has
+    /// applied authorization. The caller must audit every successful result.
+    pub async fn reveal_provider_config_value(
+        &self,
+        provider_id: i32,
+        field: &str,
+    ) -> std::result::Result<(String, String), NotificationProviderRevealError> {
+        let provider = notification_providers::Entity::find_by_id(provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| NotificationProviderRevealError::Database {
+                provider_id,
+                source,
+            })?
+            .ok_or(NotificationProviderRevealError::ProviderNotFound { provider_id })?;
+
+        if !is_provider_config_field_revealable(&provider.provider_type, field) {
+            return Err(NotificationProviderRevealError::FieldNotRevealable {
+                provider_id,
+                provider_type: provider.provider_type,
+                field: field.to_string(),
+            });
+        }
+
+        let config = self
+            .decrypt_provider_config_raw(&provider.config)
+            .map_err(|error| NotificationProviderRevealError::Decryption {
+                provider_id,
+                reason: error.to_string(),
+            })?;
+        let value = provider_config_field(&config, field).ok_or_else(|| {
+            NotificationProviderRevealError::FieldNotFound {
+                provider_id,
+                field: field.to_string(),
+            }
+        })?;
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => serde_json::to_string(other).map_err(|error| {
+                NotificationProviderRevealError::Serialization {
+                    provider_id,
+                    field: field.to_string(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        Ok((provider.provider_type, value))
     }
 
     async fn load_provider(
@@ -1526,26 +2192,75 @@ impl NotificationService {
         p_name: String,
         p_provider_type: String,
         p_config: T,
-    ) -> Result<notification_providers::Model> {
-        let config_json = serde_json::to_string(&p_config)?;
+        p_enabled: bool,
+    ) -> std::result::Result<notification_providers::Model, NotificationProviderCreateError> {
+        let config_json = serde_json::to_string(&p_config).map_err(|source| {
+            NotificationProviderCreateError::Serialization {
+                provider_name: p_name.clone(),
+                source,
+            }
+        })?;
 
         // Encrypt the config before storing
         let encrypted_config = self
             .encryption_service
             .encrypt_string(&config_json)
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt config: {}", e))?;
+            .map_err(|error| NotificationProviderCreateError::Encryption {
+                provider_name: p_name.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let transaction =
+            self.db
+                .begin()
+                .await
+                .map_err(|source| NotificationProviderCreateError::Database {
+                    provider_id: None,
+                    provider_name: p_name.clone(),
+                    operation: "begin creating",
+                    source,
+                })?;
 
         let new_provider = notification_providers::ActiveModel {
-            name: Set(p_name),
+            name: Set(p_name.clone()),
             provider_type: Set(p_provider_type),
             config: Set(encrypted_config),
-            enabled: Set(true),
+            enabled: Set(p_enabled),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
         };
 
-        let provider = new_provider.insert(self.db.as_ref()).await?;
+        let provider = new_provider.insert(&transaction).await.map_err(|source| {
+            NotificationProviderCreateError::Database {
+                provider_id: None,
+                provider_name: p_name.clone(),
+                operation: "insert",
+                source,
+            }
+        })?;
+
+        NotificationRoutingService::create_catch_all_route_for_provider(
+            &transaction,
+            provider.id,
+            &provider.name,
+        )
+        .await
+        .map_err(|source| NotificationProviderCreateError::CatchAllRoute {
+            provider_id: provider.id,
+            provider_name: provider.name.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| NotificationProviderCreateError::Database {
+                provider_id: Some(provider.id),
+                provider_name: provider.name.clone(),
+                operation: "commit with catch-all route for",
+                source,
+            })?;
 
         Ok(provider)
     }
@@ -1561,13 +2276,21 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            let existing_config = provider.config.clone();
+            let renamed_to = update
+                .name
+                .as_ref()
+                .filter(|new_name| *new_name != &provider.name)
+                .cloned();
             let mut active_model: notification_providers::ActiveModel = provider.into();
 
             // Update fields if provided
             if let Some(new_name) = update.name {
                 active_model.name = Set(new_name);
             }
-            if let Some(new_config) = update.config {
+            if let Some(mut new_config) = update.config {
+                let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
+                Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
                 let encrypted_config = self
@@ -1581,8 +2304,36 @@ impl NotificationService {
             }
             active_model.updated_at = Set(Utc::now());
 
+            let transaction = self.db.begin().await?;
+
             // Update the provider in the database
-            let updated_provider = active_model.update(self.db.as_ref()).await?;
+            let updated_provider = active_model.update(&transaction).await?;
+
+            // Keep the auto-generated catch-all route's display name (baked
+            // in at creation time from the provider's name) in sync with a
+            // rename, so the Routes list doesn't keep showing a stale name
+            // for the provider it belongs to.
+            if let Some(new_name) = renamed_to {
+                notification_routes::Entity::update_many()
+                    .col_expr(
+                        notification_routes::Column::Name,
+                        sea_orm::sea_query::Expr::value(
+                            NotificationRoutingService::catch_all_route_name(
+                                provider_id,
+                                &new_name,
+                            ),
+                        ),
+                    )
+                    .col_expr(
+                        notification_routes::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(notification_routes::Column::CatchAllProviderId.eq(provider_id))
+                    .exec(&transaction)
+                    .await?;
+            }
+
+            transaction.commit().await?;
 
             Ok(Some(updated_provider))
         } else {
@@ -1596,6 +2347,10 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            // The provider's auto-generated catch-all route (if any) is
+            // removed automatically via the `catch_all_provider_id` FK's
+            // ON DELETE CASCADE — no orphaned "All notifications - <name>
+            // (provider <id>)" route is left behind.
             provider.delete(self.db.as_ref()).await?;
             Ok(true)
         } else {
@@ -1610,8 +2365,15 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let notification_provider = self.load_provider(&provider).await?;
-            // Let the error propagate instead of swallowing it
-            notification_provider.health_check().await
+            let notification = Notification::new(
+                "Temps test notification",
+                "This is a test alert from your Temps notification settings. No action is required.",
+            );
+            // A provider test must exercise delivery, not only configuration.
+            // Otherwise the UI can report success while credentials, routing,
+            // or the remote destination are unable to accept a message.
+            notification_provider.send(&notification).await?;
+            Ok(true)
         } else {
             Err(anyhow::anyhow!(
                 "Notification provider with ID {} not found",
@@ -2010,6 +2772,24 @@ impl NotificationPreferencesService {
 mod tests {
     use super::*;
     use sea_orm::MockDatabase;
+    use std::sync::Mutex;
+    use temps_database::test_utils::TestDatabase;
+
+    macro_rules! test_database_or_skip {
+        () => {
+            match TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                        eprintln!("Skipping Docker-dependent notification test: {message}");
+                        return;
+                    }
+                    panic!("Failed to set up notification test database: {message}");
+                }
+            }
+        };
+    }
 
     fn create_test_notification() -> Notification {
         Notification {
@@ -2028,6 +2808,237 @@ mod tests {
             .collect(),
             bypass_throttling: false,
         }
+    }
+
+    struct MockManagedNotificationSender {
+        enabled: bool,
+        available: bool,
+        fail_delivery: bool,
+        pseudonym_inputs: Mutex<Vec<String>>,
+        requests: Mutex<Vec<ManagedNotificationRequest>>,
+    }
+
+    impl MockManagedNotificationSender {
+        fn new(enabled: bool, available: bool) -> Self {
+            Self {
+                enabled,
+                available,
+                fail_delivery: false,
+                pseudonym_inputs: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail_delivery: true,
+                ..Self::new(true, true)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ManagedNotificationSender for MockManagedNotificationSender {
+        fn notifications_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn notifications_available(&self) -> bool {
+            self.available
+        }
+
+        fn pseudonymize_notification_id(
+            &self,
+            notification_id: &str,
+        ) -> std::result::Result<String, CloudNotificationError> {
+            if !self.available {
+                return Err(CloudNotificationError::Pseudonymization);
+            }
+            self.pseudonym_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(notification_id.to_string());
+            Ok("8f1d1f5408e49b72e91fe5f10f6c11075b0fd7806ab9c2f49625a4ec638c2ea9".to_string())
+        }
+
+        async fn send_managed_notification(
+            &self,
+            request: &ManagedNotificationRequest,
+        ) -> std::result::Result<(), CloudNotificationError> {
+            if self.fail_delivery {
+                return Err(CloudNotificationError::Delivery);
+            }
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            Ok(())
+        }
+    }
+
+    fn service_with_managed_sender(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        cloud: Arc<dyn ManagedNotificationSender>,
+    ) -> NotificationService {
+        NotificationService {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service,
+            cloud: Some(cloud),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_requires_explicit_opt_in_and_never_duplicates_legacy_rows() {
+        for (enabled, available, expected_count) in
+            [(false, false, 0), (true, false, 1), (true, true, 1)]
+        {
+            let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+                "managed-notification-provider-test",
+            ));
+            let db = Arc::new(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<notification_routes::Model>::new()])
+                    .into_connection(),
+            );
+            let cloud = Arc::new(MockManagedNotificationSender::new(enabled, available));
+            let service = service_with_managed_sender(db.clone(), encryption, cloud);
+
+            let providers = service
+                .get_enabled_providers(&create_test_notification())
+                .await
+                .unwrap();
+            assert_eq!(providers.len(), expected_count);
+
+            drop(providers);
+            drop(service);
+            let log = Arc::try_unwrap(db)
+                .expect("notification service released the mock database")
+                .into_transaction_log();
+            assert_eq!(log.len(), 1, "provider discovery must be read-only");
+            let sql = &log[0].statements()[0].sql;
+            assert!(sql.starts_with("SELECT"));
+            assert!(sql.contains("notification_routes"));
+            assert!(!sql.contains("INSERT"));
+            assert!(!sql.contains("UPDATE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn opted_in_but_unavailable_cloud_provider_is_attempted_and_fails_visibly() {
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "unavailable-cloud-provider-test",
+        ));
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<notification_routes::Model>::new()])
+                .into_connection(),
+        );
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, false));
+        let service = service_with_managed_sender(db, encryption, cloud);
+
+        let providers = service
+            .get_enabled_providers(&create_test_notification())
+            .await
+            .unwrap();
+        assert_eq!(providers.len(), 1, "opted-in Cloud must not disappear");
+        let error = providers[0]
+            .send(&create_test_notification())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Could not create a private identifier for the managed notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_redacts_bounds_and_allowlists_payload() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.id = "local-notification-id".to_string();
+        notification.title = format!("password=hunter2 {}", "T".repeat(CLOUD_TITLE_MAX_CHARS));
+        notification.message = format!(
+            "Bearer upstream-token database=https://user:pass@example.test/db {}",
+            "M".repeat(CLOUD_MESSAGE_MAX_CHARS)
+        );
+        notification.metadata = [
+            (
+                "environment".to_string(),
+                "token=metadata-secret".to_string(),
+            ),
+            ("event_kind".to_string(), "deployment_failed".to_string()),
+            ("resource_type".to_string(), "service".repeat(100)),
+            ("project_id".to_string(), "private-project".to_string()),
+            ("api_key".to_string(), "must-not-leave".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        provider.send(&notification).await.unwrap();
+
+        let pseudonym_inputs = cloud
+            .pseudonym_inputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(pseudonym_inputs.as_slice(), ["local-notification-id"]);
+        drop(pseudonym_inputs);
+        let requests = cloud
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_ne!(request.source_notification_id, notification.id);
+        assert_eq!(request.source_notification_id.len(), 64);
+        assert!(request.title.chars().count() <= CLOUD_TITLE_MAX_CHARS);
+        assert!(request.message.chars().count() <= CLOUD_MESSAGE_MAX_CHARS);
+        assert!(request.title.contains("[redacted]"));
+        assert!(request.message.contains("[redacted]"));
+        let serialized = serde_json::to_string(request).unwrap();
+        for secret in [
+            "hunter2",
+            "upstream-token",
+            "user:pass",
+            "metadata-secret",
+            "private-project",
+            "must-not-leave",
+            "local-notification-id",
+        ] {
+            assert!(!serialized.contains(secret), "payload leaked {secret}");
+        }
+        assert_eq!(request.metadata.len(), CLOUD_METADATA_MAX_ENTRIES);
+        assert!(request.metadata.contains_key("environment"));
+        assert!(request.metadata.contains_key("event_kind"));
+        assert!(request.metadata.contains_key("resource_type"));
+        assert!(request
+            .metadata
+            .values()
+            .all(|value| value.chars().count() <= CLOUD_METADATA_VALUE_MAX_CHARS));
+    }
+
+    #[tokio::test]
+    async fn cloud_send_failure_exposes_no_upstream_or_internal_detail() {
+        let cloud = Arc::new(MockManagedNotificationSender::failing());
+        let provider = TempsCloudProvider { cloud };
+
+        let error = provider
+            .send(&create_test_notification())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "The managed notification provider could not accept the notification"
+        );
+        assert!(!error.contains("http"));
+        assert!(!error.contains("token"));
     }
 
     #[test]
@@ -2565,12 +3576,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_get_defaults() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2595,12 +3602,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2645,12 +3648,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update_existing() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2690,12 +3689,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_delete() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2771,12 +3766,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_multiple_updates() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2908,7 +3899,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_ssrf_allows_public_https() {
-        let mut webhook = create_webhook("https://hooks.example.com/webhook");
+        // Use a public literal so this validation test stays deterministic in
+        // offline CI while domain-based targets exercise DNS validation.
+        let mut webhook = create_webhook("https://93.184.216.34/webhook");
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let result = webhook.initialize(db).await;
         assert!(result.is_ok(), "Must allow public HTTPS URLs");
@@ -3310,6 +4303,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slack_send_uses_webhook_default_when_channel_is_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        provider
+            .send(&Notification::new("Default route", "Use webhook channel"))
+            .await
+            .expect("Slack delivery should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request capture should succeed");
+        assert_eq!(requests.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("Slack payload should be JSON");
+        assert!(
+            payload.get("channel").is_none(),
+            "an absent channel must let Slack use the webhook default"
+        );
+    }
+
+    #[tokio::test]
     async fn test_slack_send_excludes_action_url_metadata_and_html() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3324,7 +4351,7 @@ mod tests {
 
         let provider = SlackProvider {
             webhook_url: server.uri(),
-            channel: "#alerts".to_string(),
+            channel: Some("#alerts".to_string()),
         };
 
         // Mirrors what the error-tracking plugin attaches for the email's CTA
@@ -3347,6 +4374,11 @@ mod tests {
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
 
         assert!(
+            !body.contains("\"channel\"") && !body.contains("#alerts"),
+            "incoming webhooks must use their Slack-configured channel: {body}"
+        );
+
+        assert!(
             !body.contains("_action_url") && !body.contains("temps.example"),
             "reserved _action_url metadata must never be sent to Slack: {body}"
         );
@@ -3366,5 +4398,618 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_returns_an_error_for_rejected_webhooks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(410).set_body_string("invalid_token"))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: Some("#incidents".to_string()),
+        };
+        let error = provider
+            .send(&Notification::new("Critical", "Webhook rejected"))
+            .await
+            .expect_err("Slack HTTP failures must not be reported as successful deliveries");
+
+        assert!(error.to_string().contains("410 Gone"));
+    }
+
+    #[test]
+    fn provider_config_masking_covers_each_credential_shape() {
+        let mut config = serde_json::json!({
+            "password": "smtp-secret",
+            "smtp_password": "smtp-secret-alias",
+            "webhook_url": "https://hooks.example/secret",
+            "api_token": "cloudflare-secret",
+            "oauth": {
+                "client_secret": "oauth-secret",
+                "access_token": "oauth-token",
+                "clientSecret": "camel-secret",
+                "accessToken": "camel-token",
+                "issuer": "https://issuer.example.test"
+            },
+            "webhookUrl": "https://hooks.example/camel-secret",
+            "targets": [
+                [
+                    {"signing_key": "nested-array-secret", "name": "primary"}
+                ]
+            ],
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "secret"
+            },
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::mask_provider_config(&mut config);
+
+        assert_eq!(config["password"], "***");
+        assert_eq!(config["smtp_password"], "***");
+        assert_eq!(config["webhook_url"], "***");
+        assert_eq!(config["api_token"], "***");
+        assert_eq!(config["oauth"]["client_secret"], "***");
+        assert_eq!(config["oauth"]["access_token"], "***");
+        assert_eq!(config["oauth"]["clientSecret"], "***");
+        assert_eq!(config["oauth"]["accessToken"], "***");
+        assert_eq!(config["oauth"]["issuer"], "https://issuer.example.test");
+        assert_eq!(config["webhookUrl"], "***");
+        assert_eq!(config["targets"][0][0]["signing_key"], "***");
+        assert_eq!(config["targets"][0][0]["name"], "primary");
+        assert_eq!(config["headers"]["Authorization"], "***");
+        assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_preserves_masked_credentials() {
+        let existing = serde_json::json!({
+            "password": "smtp-secret",
+            "webhook_url": "https://hooks.slack.com/services/secret",
+            "url": "https://example.com/webhook/secret",
+            "headers": {"Authorization": "Bearer secret"},
+            "oauth": {"client_secret": {"primary": "nested-secret"}}
+        });
+        let mut replacement = serde_json::json!({
+            "password": "***",
+            "webhook_url": "***",
+            "url": "***",
+            "headers": {"Authorization": "***"},
+            "oauth": {"client_secret": "***"},
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect("matching masked paths should preserve existing credentials");
+
+        assert_eq!(replacement["password"], "smtp-secret");
+        assert_eq!(
+            replacement["webhook_url"],
+            "https://hooks.slack.com/services/secret"
+        );
+        assert_eq!(replacement["url"], "https://example.com/webhook/secret");
+        assert_eq!(replacement["headers"]["Authorization"], "Bearer secret");
+        assert_eq!(
+            replacement["oauth"]["client_secret"],
+            serde_json::json!({"primary": "nested-secret"})
+        );
+        assert_eq!(replacement["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_rejects_renamed_masked_credential() {
+        let existing = serde_json::json!({
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let mut replacement = serde_json::json!({
+            "headers": {"X-Authorization": "***"}
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("a sentinel cannot be moved to a new path");
+
+        assert!(error.to_string().contains("headers.X-Authorization"));
+    }
+
+    #[test]
+    fn provider_config_update_rejects_masked_values_inside_arrays() {
+        let existing = serde_json::json!({
+            "targets": [
+                {"name": "primary", "access_token": "first-secret"},
+                {"name": "secondary", "access_token": "second-secret"}
+            ]
+        });
+        let mut replacement = serde_json::json!({
+            "targets": [
+                {"name": "secondary", "access_token": "***"},
+                {"name": "primary", "access_token": "***"}
+            ]
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("array sentinels are structurally ambiguous after edits");
+
+        assert!(error.to_string().contains("inside array 'targets'"));
+    }
+
+    #[test]
+    fn webhook_headers_are_revealed_one_at_a_time() {
+        let config = serde_json::json!({
+            "url": "https://example.com/webhook",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "second secret"
+            }
+        });
+
+        assert!(!is_provider_config_field_revealable("webhook", "headers"));
+        assert!(is_provider_config_field_revealable(
+            "webhook",
+            "headers.Authorization"
+        ));
+        assert!(is_provider_config_field_revealable(
+            "custom",
+            "oauth.client_secret"
+        ));
+        assert!(!is_provider_config_field_revealable(
+            "custom",
+            "oauth.issuer"
+        ));
+        assert_eq!(
+            provider_config_field(&config, "headers.Authorization"),
+            Some(&serde_json::json!("Bearer secret"))
+        );
+        assert_eq!(
+            provider_config_field(&config, "headers.X-Webhook-Secret"),
+            Some(&serde_json::json!("second secret"))
+        );
+    }
+
+    #[test]
+    fn malformed_provider_configs_are_fail_safe_masked() {
+        for malformed in [
+            serde_json::json!("Bearer plaintext"),
+            serde_json::json!({"headers": "Bearer plaintext"}),
+            serde_json::json!({"headers": ["Authorization", "Bearer plaintext"]}),
+        ] {
+            let mut masked = malformed;
+            NotificationService::mask_provider_config(&mut masked);
+            assert!(!masked.to_string().contains("plaintext"));
+        }
+    }
+
+    fn notification_provider_model(
+        encryption_service: &temps_core::EncryptionService,
+        config: serde_json::Value,
+    ) -> notification_providers::Model {
+        notification_providers::Model {
+            id: 17,
+            name: "Custom OAuth".to_string(),
+            provider_type: "custom".to_string(),
+            config: encryption_service
+                .encrypt_string(&config.to_string())
+                .unwrap(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_supports_nested_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({
+                "oauth": {
+                    "client_secret": "oauth-secret",
+                    "issuer": "https://issuer.example.test"
+                }
+            }),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let (_, value) = service
+            .reveal_provider_config_value(17, "oauth.client_secret")
+            .await
+            .unwrap();
+
+        assert_eq!(value, "oauth-secret");
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_rejects_non_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({"oauth": {"issuer": "https://issuer.example.test"}}),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let error = service
+            .reveal_provider_config_value(17, "oauth.issuer")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::FieldNotRevealable {
+                provider_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_reports_not_found_and_database_errors() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let not_found_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<notification_providers::Model>::new()])
+            .into_connection();
+        let not_found_service =
+            NotificationService::new(Arc::new(not_found_db), encryption_service.clone());
+        let error = not_found_service
+            .reveal_provider_config_value(404, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::ProviderNotFound { provider_id: 404 }
+        ));
+
+        let database_error = sea_orm::DbErr::Custom("database unavailable".to_string());
+        let error_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([database_error])
+            .into_connection();
+        let error_service = NotificationService::new(Arc::new(error_db), encryption_service);
+        let error = error_service
+            .reveal_provider_config_value(17, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::Database {
+                provider_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_provider_atomically_creates_a_catch_all_route() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-route-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+
+        let provider = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect("provider and its catch-all route should be created");
+        let disabled_provider = service
+            .add_provider(
+                "Disabled Slack".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/DISABLED",
+                    "channel": "#disabled"
+                }),
+                false,
+            )
+            .await
+            .expect("disabled provider should still receive a catch-all route");
+
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let routes = routing
+            .list(1, 20)
+            .await
+            .expect("catch-all route should be readable");
+        assert_eq!(routes.total, 2);
+        for created_provider in [&provider, &disabled_provider] {
+            let route = routes
+                .items
+                .iter()
+                .find(|route| route.provider_ids == vec![created_provider.id])
+                .expect("each provider should have its own catch-all route");
+            assert_eq!(
+                route.name,
+                NotificationRoutingService::catch_all_route_name(
+                    created_provider.id,
+                    &created_provider.name
+                )
+            );
+            assert_eq!(route.min_severity, "debug");
+            assert_eq!(route.max_severity, "emergency");
+            assert!(
+                route.enabled,
+                "catch-all routes must be ready for later enabling"
+            );
+        }
+
+        for severity in [NotificationSeverity::Debug, NotificationSeverity::Emergency] {
+            let resolved = routing
+                .resolve_provider_models(severity)
+                .await
+                .expect("catch-all route should resolve at both severity bounds");
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].id, provider.id);
+        }
+
+        service
+            .update_provider(
+                disabled_provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: None,
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .expect("disabled provider should be enableable")
+            .expect("disabled provider should still exist");
+        let resolved = routing
+            .resolve_provider_models(NotificationSeverity::Debug)
+            .await
+            .expect("the existing catch-all route should activate with its provider");
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|resolved_provider| resolved_provider.id)
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([provider.id, disabled_provider.id])
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification route test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn provider_rename_and_delete_keep_the_catch_all_route_in_sync() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-lifecycle-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+
+        let provider = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect("provider and its catch-all route should be created");
+
+        // Renaming the provider must rename its catch-all route to match,
+        // not leave the route showing the provider's old name.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: Some("Slack team alerts (renamed)".to_string()),
+                    config: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("provider rename should succeed")
+            .expect("renamed provider should still exist");
+        let routes_after_rename = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after rename");
+        assert_eq!(routes_after_rename.total, 1);
+        assert_eq!(
+            routes_after_rename.items[0].name,
+            NotificationRoutingService::catch_all_route_name(
+                provider.id,
+                "Slack team alerts (renamed)"
+            ),
+            "the catch-all route's name must track the provider rename"
+        );
+
+        // An unrelated update (no name change) must not touch the route.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: None,
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .expect("disabling the provider should succeed")
+            .expect("provider should still exist");
+        let routes_after_unrelated_update = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after an unrelated update");
+        assert_eq!(
+            routes_after_unrelated_update.items[0].name, routes_after_rename.items[0].name,
+            "a config/enabled-only update must not rename the catch-all route"
+        );
+
+        // Deleting the provider must remove its catch-all route too — no
+        // orphaned, permanently-empty route left behind.
+        let deleted = service
+            .delete_provider(provider.id)
+            .await
+            .expect("provider delete should succeed");
+        assert!(deleted);
+        let routes_after_delete = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after delete");
+        assert_eq!(
+            routes_after_delete.total, 0,
+            "the catch-all route must be cascade-deleted with its provider"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification provider lifecycle test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn add_provider_rolls_back_when_catch_all_route_creation_fails() {
+        let test_db = test_database_or_skip!();
+        let now = Utc::now();
+        temps_entities::notification_routes::ActiveModel {
+            name: Set(NotificationRoutingService::catch_all_route_name(
+                1,
+                "Slack team alerts",
+            )),
+            enabled: Set(true),
+            min_severity: Set("debug".to_string()),
+            max_severity: Set("emergency".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("conflicting route should be seeded");
+
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-route-rollback-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let error = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect_err("route name conflict should fail provider creation");
+        assert!(matches!(
+            error,
+            NotificationProviderCreateError::CatchAllRoute { provider_id: 1, .. }
+        ));
+
+        assert_eq!(
+            notification_providers::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("provider count should be readable"),
+            0,
+            "provider insert must roll back when its route cannot be created"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification rollback test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn add_provider_rolls_back_provider_and_route_when_assignment_fails() {
+        let mut test_db = test_database_or_skip!();
+        test_db
+            .execute_sql(
+                r#"
+CREATE FUNCTION reject_notification_route_assignment()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'forced assignment failure';
+END;
+$$
+"#,
+            )
+            .await
+            .expect("assignment rejection function should create");
+        test_db
+            .execute_sql(
+                r#"
+CREATE TRIGGER reject_notification_route_assignment
+BEFORE INSERT ON notification_route_providers
+FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
+"#,
+            )
+            .await
+            .expect("assignment rejection trigger should create");
+
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-assignment-rollback-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let error = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect_err("assignment failure should abort provider creation");
+        assert!(matches!(
+            error,
+            NotificationProviderCreateError::CatchAllRoute { provider_id: 1, .. }
+        ));
+        assert_eq!(
+            notification_providers::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("provider count should be readable"),
+            0
+        );
+        assert_eq!(
+            temps_entities::notification_routes::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("route count should be readable"),
+            0,
+            "route insert must roll back with its provider when assignment fails"
+        );
+
+        test_db.cleanup().await;
     }
 }

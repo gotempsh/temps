@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ProjectEnvVarsProvider implementation for ExternalServiceManager.
 //!
 //! Wraps the existing per-project service enumeration and attaches service
@@ -71,6 +74,7 @@ impl ProjectEnvVarsProvider for ExternalServicesEnvProvider {
                         service_name: s.name,
                         service_type: s.service_type,
                         service_slug: s.slug,
+                        service_updated_at: s.updated_at.to_rfc3339(),
                     },
                     variables: Vec::new(),
                 })
@@ -97,6 +101,7 @@ impl ProjectEnvVarsProvider for ExternalServicesEnvProvider {
                     service_name: svc.name,
                     service_type: svc.service_type,
                     service_slug: svc.slug,
+                    service_updated_at: svc.updated_at.to_rfc3339(),
                 },
                 variables,
             });

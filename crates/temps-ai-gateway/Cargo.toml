@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-ai-gateway"
 version.workspace = true
@@ -10,11 +13,17 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-ai = { path = "../temps-ai" }
+temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
+temps-agents = { path = "../temps-agents" }
 temps-entities = { path = "../temps-entities" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1.17"
 axum = { workspace = true }
@@ -30,6 +39,9 @@ futures-util = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
@@ -40,3 +52,5 @@ tower = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
+wiremock = "0.6"
+tempfile.workspace = true

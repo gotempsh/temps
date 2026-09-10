@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect } from 'react'
 import { ProxyLogsDataTable } from '@/components/proxy-logs/ProxyLogsDataTable'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -13,7 +16,7 @@ export default function ProxyLogs() {
   usePageTitle('Proxy Logs')
 
   return (
-    <div className="container max-w-7xl mx-auto py-8">
+    <div className="w-full py-8">
       <div className="space-y-6">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Proxy Logs</h2>

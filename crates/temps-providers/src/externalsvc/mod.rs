@@ -1,8 +1,30 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use utoipa::ToSchema;
+
+/// Return the Docker summary whose name exactly matches `expected_name`.
+///
+/// Docker's `name` list filter is substring-based: filtering for `redis-cache`
+/// also returns `redis-cache-replica`. Lifecycle code must therefore verify the
+/// returned names before deciding that the requested managed service exists.
+pub(crate) fn exact_named_container<'a>(
+    containers: &'a [bollard::models::ContainerSummary],
+    expected_name: &str,
+) -> Option<&'a bollard::models::ContainerSummary> {
+    containers.iter().find(|container| {
+        container.names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| name.trim_start_matches('/') == expected_name)
+        })
+    })
+}
 
 pub mod cluster_role;
 pub mod exec_util;
@@ -10,6 +32,7 @@ pub mod managed_s3;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
 pub mod mongodb;
+pub mod naming;
 pub mod port_util;
 pub mod postgres;
 pub mod postgres_cluster;
@@ -17,6 +40,7 @@ pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod redis;
+pub mod restore_image;
 pub mod rustfs;
 pub mod s3;
 pub mod s3_util;
@@ -25,26 +49,669 @@ pub mod s3_util;
 #[cfg(test)]
 pub mod test_utils;
 
+#[cfg(test)]
+mod runtime_provisioning_tests {
+    use super::{
+        exact_named_container, is_container_not_found, missing_required_probe_credential,
+        sanitize_probe_result, set_runtime_container_name, validate_managed_probe_target,
+        validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
+        ServiceHealthProbeError, ServiceType,
+    };
+
+    #[test]
+    fn docker_substring_name_match_is_not_treated_as_the_requested_container() {
+        let sibling = bollard::models::ContainerSummary {
+            id: Some("sibling-id".to_string()),
+            names: Some(vec!["/redis-cache-replica".to_string()]),
+            ..Default::default()
+        };
+        let exact = bollard::models::ContainerSummary {
+            id: Some("exact-id".to_string()),
+            names: Some(vec!["/redis-cache".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(exact_named_container(std::slice::from_ref(&sibling), "redis-cache").is_none());
+        assert_eq!(
+            exact_named_container(&[sibling, exact], "redis-cache")
+                .and_then(|container| container.id.as_deref()),
+            Some("exact-id")
+        );
+    }
+
+    #[test]
+    fn only_docker_404_means_container_absent() {
+        let not_found = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".to_string(),
+        };
+        let daemon_failure = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon unavailable".to_string(),
+        };
+
+        assert!(is_container_not_found(&not_found));
+        assert!(!is_container_not_found(&daemon_failure));
+        assert!(!is_container_not_found(
+            &bollard::errors::Error::RequestTimeoutError
+        ));
+    }
+
+    #[test]
+    fn health_probe_rejects_non_loopback_managed_target() {
+        let config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "169.254.169.254", "port": "5432"}),
+        };
+
+        assert!(matches!(
+            validate_managed_probe_target(&config),
+            Err(ServiceHealthProbeError::UnsafeTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_provisioning_rejects_non_loopback_managed_target() {
+        let config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "169.254.169.254", "port": "5432"}),
+        };
+
+        assert!(matches!(
+            validate_runtime_target(&config),
+            Err(RuntimeProvisioningError::UnsafeTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn adopted_container_name_is_injected_before_provider_initialization() {
+        let mut config = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "5432"}),
+        };
+
+        set_runtime_container_name(&mut config, "postgres-orders-db")
+            .expect("object parameters should accept the canonical container name");
+
+        assert_eq!(
+            config.parameters["container_name"],
+            serde_json::Value::String("postgres-orders-db".to_string())
+        );
+    }
+
+    #[test]
+    fn health_probe_redacts_secrets_and_bounds_errors() {
+        let secret = "credential-that-must-not-leave-the-agent";
+        let mut result =
+            HealthProbeResult::down(format!("auth failed for {secret} {}", "x".repeat(3_000)));
+
+        sanitize_probe_result(&mut result, &[secret.to_string()]);
+
+        let message = result.error_message.as_deref().unwrap_or_default();
+        assert!(!message.contains(secret));
+        assert!(message.contains("[REDACTED]"));
+        assert!(message.len() <= 2_051);
+    }
+
+    #[test]
+    fn existing_service_probes_never_generate_missing_credentials() {
+        let postgres = ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "5432"}),
+        };
+        let mariadb = ServiceConfig {
+            name: "orders-maria".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "3306"}),
+        };
+        let redis = ServiceConfig {
+            name: "orders-cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "6379"}),
+        };
+
+        assert_eq!(
+            missing_required_probe_credential(&postgres),
+            Some("password")
+        );
+        assert_eq!(
+            missing_required_probe_credential(&mariadb),
+            Some("root_password")
+        );
+        assert_eq!(missing_required_probe_credential(&redis), None);
+    }
+}
+
 // Integration tests for service clusters
 #[cfg(test)]
 mod cluster_integration_tests;
-
-/// Shared mutex for tests that mutate the DEPLOYMENT_MODE environment variable.
-/// This must be shared across all test modules (postgres, redis, etc.) because
-/// env vars are process-global — a module-local mutex doesn't prevent cross-module races.
-#[cfg(test)]
-pub(crate) static DEPLOYMENT_MODE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
 pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
 pub use mariadb::{BinlogManifest, MariaDbService};
 pub use mongodb::MongodbService;
+pub use naming::{legacy_managed_instance_names, managed_instance_name};
 pub use postgres::PostgresService;
 pub use postgres_cluster::PostgresClusterService;
 pub use redis::RedisService;
 pub use rustfs::RustfsService;
 pub use s3::S3Service;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeProvisioningError {
+    #[error(
+        "External-service runtime provisioning may only target the owning node loopback, got '{host}'"
+    )]
+    UnsafeTarget { host: String },
+
+    #[error("External-service runtime parameters must be a JSON object")]
+    InvalidParameters,
+
+    #[error("Failed to inspect external-service container '{container}': {source}")]
+    ContainerInspection {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("Failed to rename legacy container '{legacy}' to '{canonical}': {source}")]
+    LegacyContainerRename {
+        legacy: String,
+        canonical: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("External-service provider provisioning failed: {0}")]
+    Provider(#[source] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceHealthProbeError {
+    #[error("External-service health probe configuration is invalid: {0}")]
+    Configuration(#[source] anyhow::Error),
+
+    #[error("External-service provider health probe failed: {0}")]
+    Provider(#[source] anyhow::Error),
+
+    #[error(
+        "External-service health probes may only target the owning node loopback, got '{host}'"
+    )]
+    UnsafeTarget { host: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OwnedContainerTargetError {
+    #[error("managed service port is missing or is not a valid TCP port")]
+    InvalidPort,
+    #[error("managed service container was not found on the owning node")]
+    ContainerNotFound,
+    #[error("failed to inspect managed service container '{container}': {source}")]
+    Inspection {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error(
+        "stored port {stored_port} does not match container '{container}' published port for {internal_port}/tcp"
+    )]
+    PortMismatch {
+        container: String,
+        internal_port: String,
+        stored_port: u16,
+    },
+}
+
+/// Run a provider-authenticated health probe against a service owned by the
+/// Docker daemon supplied by the caller.
+///
+/// This is deliberately a typed provider operation rather than a generic
+/// host/port/command probe. The agent derives all network activity from the
+/// validated provider configuration, which prevents this endpoint from
+/// becoming an arbitrary TCP/HTTP/exec primitive.
+#[allow(deprecated)]
+pub async fn probe_service_health(
+    config: ServiceConfig,
+    docker: Arc<bollard::Docker>,
+) -> std::result::Result<HealthProbeResult, ServiceHealthProbeError> {
+    validate_managed_probe_target(&config)?;
+    let secret_values = probe_secret_values(&config);
+    if let Some(field) = missing_required_probe_credential(&config) {
+        return Ok(HealthProbeResult::down(format!(
+            "stored {} configuration is missing required credential field '{}'",
+            config.service_type, field
+        )));
+    }
+    let service_type = config.service_type;
+    let name = match service_type {
+        ServiceType::Kv | ServiceType::Blob => managed_instance_name(&config.name, service_type),
+        _ => config.name.clone(),
+    };
+
+    let instance: Box<dyn ExternalService> = match service_type {
+        ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker.clone())),
+        ServiceType::Mongodb => Box::new(MongodbService::new(name, docker.clone())),
+        ServiceType::Postgres => Box::new(PostgresService::new(name, docker.clone())),
+        ServiceType::Redis | ServiceType::Kv => Box::new(RedisService::new(name, docker.clone())),
+        ServiceType::S3 | ServiceType::Blob => {
+            let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)
+                .map_err(ServiceHealthProbeError::Configuration)?;
+            let encryption = request_scoped_encryption_service()
+                .map_err(ServiceHealthProbeError::Configuration)?;
+            match selection.backend {
+                ManagedS3BackendKind::Rustfs => {
+                    Box::new(RustfsService::new(name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                    Box::new(S3Service::new(name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio => {
+                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
+                        "managed S3 backend 'minio' is only supported for S3 services"
+                    )));
+                }
+                ManagedS3BackendKind::Garage => {
+                    return Err(ServiceHealthProbeError::Configuration(anyhow::anyhow!(
+                        "managed S3 backend 'garage' is not supported for health probes"
+                    )));
+                }
+            }
+        }
+        ServiceType::Rustfs => Box::new(RustfsService::new(
+            name,
+            docker.clone(),
+            request_scoped_encryption_service().map_err(ServiceHealthProbeError::Configuration)?,
+        )),
+        ServiceType::Minio => Box::new(S3Service::new(
+            name,
+            docker.clone(),
+            request_scoped_encryption_service().map_err(ServiceHealthProbeError::Configuration)?,
+        )),
+    };
+
+    validate_owned_container_port(&config, instance.as_ref(), &docker)
+        .await
+        .map_err(|error| ServiceHealthProbeError::Configuration(error.into()))?;
+
+    let mut result = instance
+        .health_probe(config)
+        .await
+        .map_err(ServiceHealthProbeError::Provider)?;
+    sanitize_probe_result(&mut result, &secret_values);
+    Ok(result)
+}
+
+/// Creation-time config parsers may generate credentials for a new service.
+/// A health probe must never do that: generated credentials cannot match an
+/// already-running container. Redis is the exception because no password is
+/// a valid, intentionally unauthenticated configuration.
+fn missing_required_probe_credential(config: &ServiceConfig) -> Option<&'static str> {
+    let present = |key: &str| {
+        config
+            .parameters
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match config.service_type {
+        ServiceType::Postgres | ServiceType::Mongodb if !present("password") => Some("password"),
+        ServiceType::Mariadb if !present("root_password") => Some("root_password"),
+        _ => None,
+    }
+}
+
+fn validate_managed_probe_target(
+    config: &ServiceConfig,
+) -> std::result::Result<(), ServiceHealthProbeError> {
+    let Some(host) = config
+        .parameters
+        .get("host")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(ServiceHealthProbeError::UnsafeTarget {
+        host: host.to_string(),
+    })
+}
+
+fn probe_secret_values(config: &ServiceConfig) -> Vec<String> {
+    let Some(parameters) = config.parameters.as_object() else {
+        return Vec::new();
+    };
+    parameters
+        .iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            key.contains("password")
+                || key.contains("secret")
+                || key.contains("token")
+                || key.contains("access_key")
+        })
+        .filter_map(|(_, value)| value.as_str().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn sanitize_probe_result(result: &mut HealthProbeResult, secret_values: &[String]) {
+    const MAX_ERROR_BYTES: usize = 2_048;
+    let Some(message) = result.error_message.as_mut() else {
+        return;
+    };
+    for secret in secret_values {
+        *message = message.replace(secret, "[REDACTED]");
+    }
+    if message.len() > MAX_ERROR_BYTES {
+        let mut boundary = MAX_ERROR_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push('…');
+    }
+}
+
+fn request_scoped_encryption_service() -> anyhow::Result<Arc<temps_core::EncryptionService>> {
+    let key = temps_core::EncryptionService::generate_raw_key()?;
+    Ok(Arc::new(temps_core::EncryptionService::new(&key)?))
+}
+
+fn is_container_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+async fn runtime_container_exists(
+    docker: &bollard::Docker,
+    container: &str,
+) -> std::result::Result<bool, RuntimeProvisioningError> {
+    match docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if is_container_not_found(&error) => Ok(false),
+        Err(source) => Err(RuntimeProvisioningError::ContainerInspection {
+            container: container.to_string(),
+            source,
+        }),
+    }
+}
+
+/// Provision one project's logical resource on the worker that owns the
+/// service container.
+///
+/// Older control planes created remote containers using the raw service name,
+/// while providers use a type-prefixed canonical name. Before initializing the
+/// provider, adopt that legacy container by renaming it in place. Docker keeps
+/// the container ID, volumes, network attachments, and published ports intact.
+/// This avoids creating a second container during the first deployment after
+/// upgrading while making subsequent provider operations use one canonical
+/// identity.
+#[allow(deprecated)]
+pub async fn provision_runtime_environment(
+    name: String,
+    service_type: ServiceType,
+    mut config: ServiceConfig,
+    project_slug: &str,
+    environment_slug: &str,
+    docker: Arc<bollard::Docker>,
+) -> std::result::Result<HashMap<String, String>, RuntimeProvisioningError> {
+    validate_runtime_target(&config)?;
+    let parameters = &config.parameters;
+    let instance_name = match service_type {
+        ServiceType::Kv | ServiceType::Blob => managed_instance_name(&name, service_type),
+        _ => name.clone(),
+    };
+
+    let instance: Box<dyn ExternalService> = match service_type {
+        ServiceType::Mariadb => Box::new(MariaDbService::new(instance_name, docker.clone())),
+        ServiceType::Mongodb => Box::new(MongodbService::new(instance_name, docker.clone())),
+        ServiceType::Postgres => Box::new(PostgresService::new(instance_name, docker.clone())),
+        ServiceType::Redis | ServiceType::Kv => {
+            Box::new(RedisService::new(instance_name, docker.clone()))
+        }
+        ServiceType::S3 | ServiceType::Blob => {
+            let selection = ManagedS3BackendSelection::from_parameters(parameters)
+                .map_err(RuntimeProvisioningError::Provider)?;
+
+            // Runtime provisioning does not use the backup encryption APIs,
+            // but these providers require the dependency at construction.
+            // Use a fresh request-local key so this narrow function cannot
+            // expose a provider carrying a fixed or reusable key.
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            match selection.backend {
+                ManagedS3BackendKind::Rustfs => Box::new(RustfsService::new(
+                    instance_name,
+                    docker.clone(),
+                    encryption,
+                )),
+                ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                    Box::new(S3Service::new(instance_name, docker.clone(), encryption))
+                }
+                ManagedS3BackendKind::Minio => {
+                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
+                        "managed S3 backend 'minio' is only supported for S3 services"
+                    )));
+                }
+                ManagedS3BackendKind::Garage => {
+                    return Err(RuntimeProvisioningError::Provider(anyhow::anyhow!(
+                        "managed S3 backend 'garage' is not supported for runtime provisioning"
+                    )));
+                }
+            }
+        }
+        ServiceType::Rustfs => {
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            Box::new(RustfsService::new(
+                instance_name,
+                docker.clone(),
+                encryption,
+            ))
+        }
+        ServiceType::Minio => {
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(
+                    &temps_core::EncryptionService::generate_raw_key()
+                        .map_err(RuntimeProvisioningError::Provider)?,
+                )
+                .map_err(RuntimeProvisioningError::Provider)?,
+            );
+            Box::new(S3Service::new(instance_name, docker.clone(), encryption))
+        }
+    };
+
+    let legacy_name = instance.get_name();
+    let canonical_name = instance.get_docker_container_name();
+    let canonical_exists = runtime_container_exists(&docker, &canonical_name).await?;
+    let legacy_exists = if legacy_name == canonical_name {
+        false
+    } else {
+        runtime_container_exists(&docker, &legacy_name).await?
+    };
+    if !canonical_exists && legacy_exists {
+        tracing::info!(
+            legacy_container = %legacy_name,
+            canonical_container = %canonical_name,
+            "Adopting legacy remote external-service container name"
+        );
+        docker
+            .rename_container(
+                &legacy_name,
+                bollard::query_parameters::RenameContainerOptions {
+                    name: canonical_name.clone(),
+                },
+            )
+            .await
+            .map_err(|source| RuntimeProvisioningError::LegacyContainerRename {
+                legacy: legacy_name,
+                canonical: canonical_name.clone(),
+                source,
+            })?;
+    }
+
+    if canonical_exists || legacy_exists {
+        set_runtime_container_name(&mut config, &canonical_name)?;
+    }
+
+    validate_owned_container_port(&config, instance.as_ref(), &docker)
+        .await
+        .map_err(|error| RuntimeProvisioningError::Provider(error.into()))?;
+
+    instance
+        .init(config.clone())
+        .await
+        .map_err(RuntimeProvisioningError::Provider)?;
+    instance
+        .get_runtime_env_vars(config, project_slug, environment_slug)
+        .await
+        .map_err(RuntimeProvisioningError::Provider)
+}
+
+fn set_runtime_container_name(
+    config: &mut ServiceConfig,
+    container_name: &str,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    let parameters = config
+        .parameters
+        .as_object_mut()
+        .ok_or(RuntimeProvisioningError::InvalidParameters)?;
+    parameters.insert(
+        "container_name".to_string(),
+        serde_json::Value::String(container_name.to_string()),
+    );
+    Ok(())
+}
+
+fn validate_runtime_target(
+    config: &ServiceConfig,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    let Some(host) = config
+        .parameters
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(RuntimeProvisioningError::UnsafeTarget {
+        host: host.to_string(),
+    })
+}
+
+async fn validate_owned_container_port(
+    config: &ServiceConfig,
+    instance: &dyn ExternalService,
+    docker: &bollard::Docker,
+) -> std::result::Result<(), OwnedContainerTargetError> {
+    let stored_port = config
+        .parameters
+        .get("port")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .or_else(|| value.as_str().and_then(|port| port.parse::<u16>().ok()))
+        })
+        .filter(|port| *port > 0)
+        .ok_or(OwnedContainerTargetError::InvalidPort)?;
+
+    let mut candidates = Vec::new();
+    if let Some(container_name) = config
+        .parameters
+        .get("container_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        candidates.push(container_name.to_string());
+    }
+    for candidate in [instance.get_docker_container_name(), instance.get_name()] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut inspected = None;
+    for candidate in candidates {
+        match docker
+            .inspect_container(
+                &candidate,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(container) => {
+                inspected = Some((candidate, container));
+                break;
+            }
+            Err(error) if is_container_not_found(&error) => {}
+            Err(source) => {
+                return Err(OwnedContainerTargetError::Inspection {
+                    container: candidate,
+                    source,
+                })
+            }
+        }
+    }
+    let (container_name, container) =
+        inspected.ok_or(OwnedContainerTargetError::ContainerNotFound)?;
+    let internal_port = instance.get_docker_internal_port();
+    let key = format!("{internal_port}/tcp");
+    let matches_published_port = container
+        .network_settings
+        .and_then(|settings| settings.ports)
+        .and_then(|ports| ports.get(&key).cloned())
+        .flatten()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|binding| binding.host_port.as_deref())
+        .filter_map(|port| port.parse::<u16>().ok())
+        .any(|port| port == stored_port);
+    if !matches_published_port {
+        return Err(OwnedContainerTargetError::PortMismatch {
+            container: container_name,
+            internal_port,
+            stored_port,
+        });
+    }
+    Ok(())
+}
 
 /// Result of a successful `backup_to_s3` call.
 ///
@@ -75,10 +742,19 @@ impl BackupOutcome {
 /// (e.g., WAL-G running inside a Docker container via `docker exec`).
 /// The `backup_to_s3` orchestrator decrypts the encrypted credentials from the
 /// `s3_sources` model and passes them through this struct.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Credentials {
     pub access_key_id: String,
     pub secret_key: String,
+    /// STS-style session token for a *temporary* credential. `None` for the
+    /// long-lived credentials operators configure themselves, which is the
+    /// only kind that existed before managed backup sources.
+    ///
+    /// SigV4 rejects a temporary key pair unless this token is signed with it
+    /// as `X-Amz-Security-Token`, so it must reach both
+    /// [`S3Credentials::build_s3_client`] and the `AWS_SESSION_TOKEN`
+    /// environment of every engine that shells out to `wal-g`/`mc`.
+    pub session_token: Option<String>,
     pub region: String,
     pub endpoint: Option<String>,
     pub bucket_name: String,
@@ -86,7 +762,249 @@ pub struct S3Credentials {
     pub force_path_style: bool,
 }
 
+/// Hand-written so a `{:?}` anywhere — a `tracing` field, an error message, a
+/// panic in a test — cannot print the secret key or the session token. The
+/// derived impl printed `secret_key` verbatim.
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("bucket_name", &self.bucket_name)
+            .field("bucket_path", &self.bucket_path)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
+}
+
+/// The `AWS_SESSION_TOKEN=<token>` entry a shelled-out engine (`wal-g`,
+/// `mariabackup`, anything using the AWS SDK's default credential chain) needs
+/// alongside `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` when — and only when —
+/// the credential is a temporary one.
+///
+/// Returns `None` for a long-lived credential so callers can
+/// `env.extend(aws_session_token_env(...))` and have the variable be *absent*
+/// rather than empty. An empty `AWS_SESSION_TOKEN` is not the same as no
+/// session token: the SDKs sign it and the provider rejects the request.
+pub fn aws_session_token_env(session_token: Option<&str>) -> Option<String> {
+    session_token
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("AWS_SESSION_TOKEN={token}"))
+}
+
+/// Bytes that cannot appear literally in the userinfo of an `MC_HOST_<alias>`
+/// URL.
+///
+/// `mc` parses that variable with Go's `net/url`, which percent-decodes
+/// userinfo, so every byte that would otherwise terminate the authority
+/// (`/ ? #`), separate the userinfo from the host (`@`), or separate the three
+/// credential fields (`:`) has to be escaped — as does `%` itself, being the
+/// escape character. `[`/`]` are gen-delims that Go rejects outright in
+/// userinfo, and a raw space or control byte is never valid there either.
+/// Non-ASCII bytes are always escaped by `utf8_percent_encode`, independent of
+/// this set.
+///
+/// Deliberately minimal. An access key or secret key drawn from the usual
+/// base64/hex alphabet contains none of these bytes, so its encoded form is the
+/// *same bytes* it has always been and every existing long-lived credential
+/// produces the exact `MC_HOST_*` string it produced before. Only a value that
+/// would otherwise have built a malformed URL changes — and STS session tokens
+/// routinely contain `/`.
+const MC_USERINFO_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b'%')
+    .add(b':')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'@')
+    .add(b'[')
+    .add(b']')
+    .add(b' ');
+
+/// Percent-encode one credential field for splicing into an `MC_HOST_*` URL.
+///
+/// Returns `Cow::Borrowed` — the identical bytes — for anything that needs no
+/// escaping, which is every ordinary access key and secret key.
+fn encode_mc_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+    percent_encoding::utf8_percent_encode(value, MC_USERINFO_ESCAPE).into()
+}
+
+/// The credential segment of an `MC_HOST_<alias>` URL.
+///
+/// `mc` takes `<scheme>://<access key>:<secret key>[:<session token>]@<host>`.
+/// The session token is a third colon-separated field rather than an
+/// environment variable, because `mc` does not read `AWS_SESSION_TOKEN` at all.
+/// A long-lived credential produces the two-field form byte-for-byte as before.
+///
+/// Each field is percent-encoded (see [`MC_USERINFO_ESCAPE`]) because an STS
+/// session token routinely contains `/` and `+`, and a raw `/` in userinfo ends
+/// the URL authority — mc would fail to parse the variable at all and report a
+/// confusing URL error instead of a credential error.
+pub fn mc_host_credential(
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> String {
+    let access_key = encode_mc_userinfo(access_key);
+    let secret_key = encode_mc_userinfo(secret_key);
+    match session_token.filter(|token| !token.is_empty()) {
+        Some(token) => {
+            let token = encode_mc_userinfo(token);
+            format!("{access_key}:{secret_key}:{token}")
+        }
+        None => format!("{access_key}:{secret_key}"),
+    }
+}
+
+/// Remove credentials from external-client output before it reaches logs,
+/// persisted restore/backup errors, or API responses. Replacing the individual
+/// key values also redacts them when `mc` echoes a credential-bearing URL.
+///
+/// Prefer [`SensitiveValues`] over calling this with a hand-rolled array: it is
+/// what guarantees no credential field is left off the list.
+pub fn redact_sensitive_output(output: &str, sensitive_values: &[&str]) -> String {
+    sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(output.to_string(), |redacted, value| {
+            redacted.replace(value, "***")
+        })
+}
+
+/// Every credential value that must not survive into a log line, a persisted
+/// `external_service_backups.error_message` / `restore_runs.error`, or an API
+/// response.
+///
+/// `mc` echoes the credential-bearing `MC_HOST_*` URL it failed to use straight
+/// into stderr, and that stderr is logged, persisted and surfaced. Each call
+/// site that captures external-client output therefore has to know *every*
+/// secret that could appear in it. Hand-rolled arrays drifted the moment a new
+/// credential field (the STS session token) was added, so this type is the one
+/// place that builds the list: [`SensitiveValues::credential`] takes the
+/// session token as a required argument precisely so a call site cannot
+/// silently omit it, and it registers the percent-encoded spelling too, because
+/// that is the form mc prints back from an `MC_HOST_*` URL.
+#[derive(Debug, Default, Clone)]
+pub struct SensitiveValues<'a> {
+    values: Vec<std::borrow::Cow<'a, str>>,
+}
+
+impl<'a> SensitiveValues<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one credential triple. `session_token` is `None` for every
+    /// long-lived, operator-configured credential — pass it explicitly rather
+    /// than omitting the argument, so adding a credential is always a decision
+    /// about all three fields.
+    #[must_use]
+    pub fn credential(
+        mut self,
+        access_key: &'a str,
+        secret_key: &'a str,
+        session_token: Option<&'a str>,
+    ) -> Self {
+        self.push(access_key);
+        self.push(secret_key);
+        if let Some(token) = session_token {
+            self.push(token);
+        }
+        self
+    }
+
+    /// Register an already-assembled [`S3Credentials`], token included.
+    #[must_use]
+    pub fn s3_credentials(self, credentials: &'a S3Credentials) -> Self {
+        self.credential(
+            &credentials.access_key_id,
+            &credentials.secret_key,
+            credentials.session_token.as_deref(),
+        )
+    }
+
+    /// Replace every registered credential value in `output` with `***`.
+    pub fn redact(&self, output: &str) -> String {
+        let values: Vec<&str> = self.values.iter().map(|value| value.as_ref()).collect();
+        redact_sensitive_output(output, &values)
+    }
+
+    fn push(&mut self, value: &'a str) {
+        // An empty needle would match at every position; skip it rather than
+        // turning the whole message into `***`.
+        if value.is_empty() {
+            return;
+        }
+        // The URL-encoded spelling first: it is the longer of the two and the
+        // form mc prints when it echoes the `MC_HOST_*` URL back.
+        let encoded = encode_mc_userinfo(value);
+        if encoded != value {
+            self.values
+                .push(std::borrow::Cow::Owned(encoded.into_owned()));
+        }
+        self.values.push(std::borrow::Cow::Borrowed(value));
+    }
+}
+
+/// An `MC_HOST_<alias>` entry that gives an mc alias a session token.
+///
+/// `mc alias set <alias> <url> <access key> <secret key>` has no positional
+/// slot for a session token, so an alias configured that way cannot use a
+/// temporary credential at all. `MC_HOST_<alias>` can, and mc resolves it ahead
+/// of its config file — so emitting this alongside the existing `alias set`
+/// call upgrades the alias in place.
+///
+/// KNOWN GAP (temporary credentials only — left for the ADR author, since it
+/// needs a decision about the whole mc invocation flow rather than a patch
+/// here): when no `--api` flag is passed, `mc alias set` auto-probes the
+/// endpoint by `Stat`-ing a random bucket with the *positional* credentials and
+/// accepts only `BucketDoesNotExist` or `AccessDenied`. It builds that probe
+/// client from the CLI arguments alone — `MC_HOST_*` is consulted when an alias
+/// is *resolved*, never while it is being set — so a key pair that needs a
+/// session token gets `InvalidAccessKeyId` and mc exits non-zero before the
+/// override is ever read. Every path here that runs `alias set` and checks its
+/// exit code therefore fails first. Long-lived credentials (every
+/// operator-configured source) are unaffected, as are the paths that pass
+/// credentials exclusively through `MC_HOST_*`
+/// (`S3Service::restore_in_place`, `S3MirrorEngine`).
+///
+/// Returns `None` when there is no session token, which is every long-lived
+/// operator-configured credential: nothing is added to the container
+/// environment and the `mc alias set` path behaves exactly as it always has.
+pub fn mc_host_alias_override(
+    alias: &str,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Option<String> {
+    let token = session_token.filter(|token| !token.is_empty())?;
+    let (scheme, hostpath) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        ("http", endpoint)
+    };
+    Some(format!(
+        "MC_HOST_{alias}={scheme}://{}@{hostpath}",
+        mc_host_credential(access_key, secret_key, Some(token))
+    ))
+}
+
 impl S3Credentials {
+    /// See [`aws_session_token_env`] — `None` unless these are temporary
+    /// credentials.
+    pub fn session_token_env(&self) -> Option<String> {
+        aws_session_token_env(self.session_token.as_deref())
+    }
+
     /// Build an `aws_sdk_s3::Client` from already-decrypted credentials.
     /// Used by post-backup steps (e.g. listing the WAL-G prefix to compute
     /// size) when we already hold a decrypted credential set and don't
@@ -95,7 +1013,10 @@ impl S3Credentials {
         let creds = aws_sdk_s3::config::Credentials::new(
             self.access_key_id.clone(),
             self.secret_key.clone(),
-            None,
+            // Third argument is the session token: `None` for a long-lived
+            // credential (unchanged behaviour), `Some` for a temporary one,
+            // which SigV4 will not accept without it.
+            self.session_token.clone(),
             None,
             "temps-backup",
         );
@@ -187,10 +1108,7 @@ impl S3Credentials {
                 for container in &containers {
                     // Skip the target container itself
                     let names = container.names.as_deref().unwrap_or(&[]);
-                    let container_name_clean = names
-                        .first()
-                        .map(|n| n.trim_start_matches('/'))
-                        .unwrap_or("");
+                    let container_name_clean = canonical_container_name(names).unwrap_or("");
                     if container_name_clean == container_name {
                         continue;
                     }
@@ -259,7 +1177,49 @@ impl S3Credentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Select the canonical Docker container name from `ContainerSummary::names`.
+///
+/// Docker's legacy `--link` support prepends aliases such as
+/// `/source-container/object-store` before the canonical `/object-store`
+/// entry. Using the first value turns the alias into a URL path and makes
+/// direct-to-S3 backup clients connect to the wrong host.
+fn canonical_container_name(names: &[String]) -> Option<&str> {
+    names
+        .iter()
+        .map(|name| name.trim_start_matches('/'))
+        .find(|name| !name.is_empty() && !name.contains('/'))
+}
+
+#[cfg(test)]
+mod s3_endpoint_tests {
+    use super::canonical_container_name;
+
+    #[test]
+    fn canonical_container_name_ignores_link_aliases() {
+        let names = vec![
+            "/mariadb-source/minio-store".to_string(),
+            "/minio-store".to_string(),
+        ];
+
+        assert_eq!(canonical_container_name(&names), Some("minio-store"));
+    }
+
+    #[test]
+    fn canonical_container_name_accepts_an_unprefixed_name() {
+        let names = vec!["minio-store".to_string()];
+
+        assert_eq!(canonical_container_name(&names), Some("minio-store"));
+    }
+
+    #[test]
+    fn canonical_container_name_rejects_empty_or_alias_only_lists() {
+        let names = vec![String::new(), "/source/minio-store".to_string()];
+
+        assert_eq!(canonical_container_name(&names), None);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceConfig {
     pub name: String,
     pub service_type: ServiceType,
@@ -484,12 +1444,17 @@ pub enum RecoveryTarget {
 pub struct RestoreContext<'a> {
     pub s3_client: &'a aws_sdk_s3::Client,
     pub s3_credentials: &'a S3Credentials,
-    /// S3 source row with DECRYPTED `access_key_id` / `secret_key` fields.
-    /// The orchestrator clones the DB row and swaps the ciphertext out before
-    /// handing it here, so trait implementations can use these values
-    /// directly (passing to mc, env vars, etc.) without calling
+    /// S3 source row with DECRYPTED `access_key_id`, `secret_key` and
+    /// `session_token` fields. The orchestrator clones the DB row and swaps the
+    /// ciphertext out before handing it here, so trait implementations can use
+    /// these values directly (passing to mc, env vars, etc.) without calling
     /// `EncryptionService::decrypt_string` again — doing so would fail
     /// because the bytes are no longer ciphertext.
+    ///
+    /// `session_token` is `None` for every long-lived operator-configured
+    /// credential and `Some` only for a temporary (STS-style) one; it is
+    /// exactly as sensitive as `secret_key` and must be redacted out of any
+    /// external-client output the implementation logs or persists.
     pub s3_source: &'a temps_entities::s3_sources::Model,
     pub backup: &'a temps_entities::backups::Model,
     pub backup_location: &'a str,
@@ -691,7 +1656,7 @@ pub struct ClusterMemberInfo {
 /// Result of a single probe against a managed external service.
 /// Returned by `ExternalService::health_probe` so the monitor can record
 /// structured health history without the trait having to know about DB rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthProbeResult {
     pub status: HealthProbeStatus,
     /// Round-trip probe latency, when measurable.
@@ -700,7 +1665,8 @@ pub struct HealthProbeResult {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthProbeStatus {
     Operational,
     Degraded,
@@ -776,6 +1742,46 @@ pub trait ExternalService: Send + Sync {
     /// The key is read from `service_config` — callers must persist it first.
     /// Default is a no-op; only OTLP-push engines (RustFS) override this.
     async fn apply_ingest_key(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
+    /// Force this service's container to be recreated so a CMD-level config
+    /// change (e.g. `shared_preload_libraries`) takes effect.
+    ///
+    /// Unlike a plain `start()` on a fresh, unhydrated instance, callers here
+    /// pass `service_config` explicitly so the engine can populate its
+    /// in-memory config before recreating — a freshly-constructed instance
+    /// (as returned by `ExternalServiceManager::create_service_instance_for_parameter_value`)
+    /// has no config until `init()`/this method hydrates it, and the normal
+    /// reconcile-on-start drift check needs that config to build the new
+    /// container once a recreate is warranted.
+    ///
+    /// Default is a no-op; only engines with CMD-baked config that can drift
+    /// post-creation (currently Postgres, for `shared_preload_libraries`)
+    /// override this.
+    async fn force_recreate(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
+    /// Enable continuous WAL/log-shipping archiving into `walg_prefix` after
+    /// a successful base backup, so a subsequent restore isn't limited to
+    /// exactly the backup's snapshot moment.
+    ///
+    /// Without this, `wal-g backup-push` alone produces a base backup whose
+    /// `backup_label` references a stop LSN/checkpoint that no WAL segment
+    /// ever gets archived for — restore then fails at Postgres startup with
+    /// "could not locate required checkpoint record", because
+    /// `wal-g wal-fetch` has nothing to fetch. Callers should treat failure
+    /// here as non-fatal to the backup itself (log and continue): the base
+    /// backup already succeeded, only continuous archiving is missing.
+    ///
+    /// Default is a no-op; only Postgres (WAL-G) overrides it.
+    async fn enable_continuous_archiving(
+        &self,
+        _service_config: ServiceConfig,
+        _s3_credentials: &S3Credentials,
+        _walg_prefix: &str,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1224,5 +2230,266 @@ mod resource_limits_tests {
         // None values must not overwrite — preserves whatever the engine set.
         assert_eq!(hc.cpu_shares, Some(1024));
         assert_eq!(hc.memory, None);
+    }
+}
+
+#[cfg(test)]
+mod temporary_credential_tests {
+    use super::*;
+
+    fn long_lived() -> S3Credentials {
+        S3Credentials {
+            access_key_id: "AKIAOPERATOR".to_string(),
+            secret_key: "operator-secret".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test".to_string()),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            force_path_style: true,
+        }
+    }
+
+    /// The guarantee for every source an operator configured themselves:
+    /// no `AWS_SESSION_TOKEN` is added to the container environment at all.
+    /// An *empty* one would be worse than none — the AWS SDKs sign it and the
+    /// provider rejects the request.
+    #[test]
+    fn a_long_lived_credential_contributes_no_session_token_env() {
+        assert_eq!(long_lived().session_token_env(), None);
+        assert_eq!(aws_session_token_env(None), None);
+        assert_eq!(aws_session_token_env(Some("")), None);
+    }
+
+    #[test]
+    fn a_temporary_credential_contributes_an_aws_session_token_env() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        assert_eq!(
+            credentials.session_token_env().as_deref(),
+            Some("AWS_SESSION_TOKEN=sts-session-token")
+        );
+    }
+
+    /// Mirrors how every engine builds its environment: extend with the
+    /// helper, then assert the variable is present or absent accordingly.
+    #[test]
+    fn extending_an_env_vector_is_a_no_op_without_a_session_token() {
+        let mut env = vec![
+            "AWS_ACCESS_KEY_ID=AKIAOPERATOR".to_string(),
+            "AWS_SECRET_ACCESS_KEY=operator-secret".to_string(),
+        ];
+        let before = env.clone();
+        env.extend(long_lived().session_token_env());
+        assert_eq!(env, before);
+        assert!(!env
+            .iter()
+            .any(|entry| entry.starts_with("AWS_SESSION_TOKEN")));
+
+        let temporary = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+        env.extend(temporary.session_token_env());
+        assert!(env
+            .iter()
+            .any(|entry| entry == "AWS_SESSION_TOKEN=sts-session-token"));
+    }
+
+    #[test]
+    fn mc_host_credential_omits_the_token_field_for_a_long_lived_credential() {
+        assert_eq!(mc_host_credential("key", "secret", None), "key:secret");
+        assert_eq!(mc_host_credential("key", "secret", Some("")), "key:secret");
+    }
+
+    #[test]
+    fn mc_host_credential_appends_the_token_as_a_third_field() {
+        assert_eq!(
+            mc_host_credential("key", "secret", Some("token")),
+            "key:secret:token"
+        );
+    }
+
+    /// The no-regression guarantee for every source an operator ever typed in:
+    /// percent-encoding must be a byte-for-byte no-op on the alphabets real
+    /// access keys and secret keys are drawn from.
+    #[test]
+    fn mc_host_credential_is_byte_identical_for_a_long_lived_credential() {
+        for (access_key, secret_key) in [
+            (
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            ),
+            ("minioadmin", "minioadmin"),
+            ("temps-dev", "a-b_c.d~e"),
+            ("0123456789", "+=,!*()'$&;"),
+        ] {
+            assert_eq!(
+                mc_host_credential(access_key, secret_key, None),
+                format!("{access_key}:{secret_key}"),
+                "encoding must not alter a credential that needs no escaping"
+            );
+        }
+    }
+
+    /// A secret key containing `/` (AWS's own example key does) used to splice
+    /// a path separator into the URL authority, which ends it — mc reported a
+    /// URL parse error rather than anything about credentials.
+    #[test]
+    fn mc_host_credential_escapes_a_slash_in_the_secret_key() {
+        assert_eq!(
+            mc_host_credential("AKIAEXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCY", None),
+            "AKIAEXAMPLE:wJalrXUtnFEMI%2FK7MDENG%2FbPxRfiCY"
+        );
+    }
+
+    /// STS session tokens are long base64 blobs: `/` must be escaped so the
+    /// authority survives, `+` must NOT be (it is a valid userinfo sub-delim
+    /// and is not decoded as a space outside a query string), and `:` must be
+    /// escaped so it cannot be mistaken for a fourth credential field.
+    #[test]
+    fn mc_host_credential_escapes_a_session_token_with_url_significant_characters() {
+        let token = "FwoGZXIvYXdzE//aB+c:d%e";
+
+        let credential = mc_host_credential("key", "secret", Some(token));
+
+        assert_eq!(credential, "key:secret:FwoGZXIvYXdzE%2F%2FaB+c%3Ad%25e");
+        // Exactly two field separators survive, so mc still sees
+        // access key / secret key / session token and nothing else.
+        assert_eq!(credential.matches(':').count(), 2);
+        assert!(!credential.contains('/'), "a raw / would end the authority");
+        assert!(!credential.contains('@'));
+
+        // And it still parses as a URL authority, which is the whole point.
+        let url = format!("https://{credential}@s3.example.test");
+        let (userinfo, host) = url
+            .trim_start_matches("https://")
+            .rsplit_once('@')
+            .expect("userinfo is separated from the host");
+        assert_eq!(host, "s3.example.test");
+        assert_eq!(userinfo, credential);
+    }
+
+    #[test]
+    fn mc_host_alias_override_escapes_the_session_token_too() {
+        assert_eq!(
+            mc_host_alias_override("bkp", "https://s3.example.test", "k", "s", Some("a/b"))
+                .as_deref(),
+            Some("MC_HOST_bkp=https://k:s:a%2Fb@s3.example.test")
+        );
+    }
+
+    #[test]
+    fn sensitive_values_redacts_every_credential_field_including_the_token() {
+        let sensitive = SensitiveValues::new()
+            .credential("live-key", "live-secret", None)
+            .credential("bkp-key", "bkp-secret", Some("sts-session-token"));
+
+        let redacted = sensitive.redact(
+            "mc: <ERROR> Unable to initialize \
+             https://bkp-key:bkp-secret:sts-session-token@s3.example.test \
+             (live alias live-key/live-secret)",
+        );
+
+        assert!(!redacted.contains("bkp-secret"));
+        assert!(!redacted.contains("sts-session-token"));
+        assert!(!redacted.contains("live-secret"));
+        assert!(!redacted.contains("bkp-key"));
+        assert!(!redacted.contains("live-key"));
+    }
+
+    /// mc echoes back the URL it was handed, so the *encoded* spelling is what
+    /// actually shows up in stderr for a token containing `/`.
+    #[test]
+    fn sensitive_values_redacts_the_percent_encoded_spelling_of_a_token() {
+        let token = "FwoGZXIvYXdzE//aB";
+        let sensitive = SensitiveValues::new().credential("key", "secret", Some(token));
+
+        let stderr = format!(
+            "mc: <ERROR> Unable to initialize https://{}@s3.example.test",
+            mc_host_credential("key", "secret", Some(token))
+        );
+        let redacted = sensitive.redact(&stderr);
+
+        assert!(!redacted.contains("FwoGZXIvYXdzE"));
+        assert!(!redacted.contains("%2F%2FaB"));
+        assert_eq!(
+            redacted,
+            "mc: <ERROR> Unable to initialize https://***:***:***@s3.example.test"
+        );
+    }
+
+    /// A `Some("")` token must never turn the whole message into `***`.
+    #[test]
+    fn sensitive_values_ignores_an_empty_credential_field() {
+        let sensitive = SensitiveValues::new().credential("key", "secret", Some(""));
+
+        assert_eq!(
+            sensitive.redact("connection refused"),
+            "connection refused",
+            "an empty needle matches everywhere and must be skipped"
+        );
+    }
+
+    #[test]
+    fn sensitive_values_can_be_built_from_s3_credentials() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        let redacted = SensitiveValues::new()
+            .s3_credentials(&credentials)
+            .redact("AKIAOPERATOR / operator-secret / sts-session-token");
+
+        assert_eq!(redacted, "*** / *** / ***");
+    }
+
+    #[test]
+    fn mc_host_alias_override_is_absent_without_a_session_token() {
+        assert_eq!(
+            mc_host_alias_override("backup-source", "https://s3.example.test", "k", "s", None),
+            None
+        );
+    }
+
+    #[test]
+    fn mc_host_alias_override_preserves_the_endpoint_scheme() {
+        assert_eq!(
+            mc_host_alias_override(
+                "backup-source",
+                "https://s3.example.test",
+                "k",
+                "s",
+                Some("token")
+            )
+            .as_deref(),
+            Some("MC_HOST_backup-source=https://k:s:token@s3.example.test")
+        );
+        assert_eq!(
+            mc_host_alias_override("bkp", "http://minio:9000", "k", "s", Some("token")).as_deref(),
+            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
+        );
+        // A bare host:port keeps the historical plain-HTTP assumption.
+        assert_eq!(
+            mc_host_alias_override("bkp", "minio:9000", "k", "s", Some("token")).as_deref(),
+            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_the_secret_key_and_the_session_token() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains("operator-secret"));
+        assert!(!rendered.contains("sts-session-token"));
+        assert!(rendered.contains("AKIAOPERATOR"));
     }
 }

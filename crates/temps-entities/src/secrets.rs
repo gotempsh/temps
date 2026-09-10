@@ -1,7 +1,10 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Secret entity.
 //!
-//! Secrets are exposed to user containers as files under `/run/secrets/<KEY>`,
-//! tmpfs-mounted with mode 0400. Values are always stored encrypted at rest
+//! Secrets are exposed to user containers as files under `/run/secrets/<KEY>`
+//! via a read-only mount. Values are always stored encrypted at rest
 //! (AES-256-GCM via EncryptionService) and are never returned in plaintext
 //! from the API after creation.
 
@@ -46,6 +49,12 @@ pub enum Relation {
         to = "super::secret_environments::Column::SecretId"
     )]
     SecretEnvironments,
+    #[sea_orm(
+        has_many = "super::secret_compose_services::Entity",
+        from = "Column::Id",
+        to = "super::secret_compose_services::Column::SecretId"
+    )]
+    SecretComposeServices,
 }
 
 impl Related<super::projects::Entity> for Entity {

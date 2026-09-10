@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Browserless is one native container with no hidden Compose dependencies.
+slug: browserless
+name: Browserless
+version: 1.0.0
+kind: service
+description: Remote Chromium for Playwright, Puppeteer, screenshots, PDFs, and browser automation. Review Browserless licensing for commercial or proprietary workloads.
+git:
+  url: https://github.com/browserless/browserless.git
+  ref: v2.56.0
+preset: dockerfile
+image_url: /templates/browserless.svg
+image: ghcr.io/browserless/chromium@sha256:6f3149efabf5e04a44385974448c85264398db416bc63f884564316d0fcadc3e
+resources:
+  cpu_request: 1000000
+  cpu_limit: 2000000
+  memory_request: 1024
+  memory_limit: 2048
+exposed_port: 3000
+health_check_path: /docs
+tags:
+  - browser-automation
+  - chromium
+  - playwright
+  - puppeteer
+  - scraping
+features:
+  - Remote Chromium over Playwright and Puppeteer protocols
+  - REST APIs for screenshots, PDFs, content, and scraping
+  - Generated access token and proxy-aware external URLs
+  - Version-pinned, multi-architecture Chromium image
+services: []
+env_vars:
+  - name: TOKEN
+    description: Access token required by every Browserless API and WebSocket connection
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: EXTERNAL
+    description: Public Temps URL used when Browserless generates HTTP and WebSocket endpoints
+    required: true
+    default_generator: app_url
+  - name: CONCURRENT
+    description: Maximum simultaneous browser sessions; raise this together with CPU and memory
+    default: "2"
+    required: true
+is_public: true
+is_featured: true
+sort_order: 1

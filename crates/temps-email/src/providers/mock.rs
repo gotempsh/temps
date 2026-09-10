@@ -1,14 +1,33 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Mock email provider for testing
 
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::errors::EmailError;
 use crate::providers::{
     DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
-    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
+    EmailProviderType, ProviderDomainIdentity, SendEmailRequest, SendEmailResponse,
+    VerificationStatus,
 };
+
+/// Pre-scripted outcome for a single `MockEmailProvider::send()` call.
+///
+/// Consumed in order from the front of the queue; when the queue is empty the
+/// provider falls back to the `should_fail_send` flag.
+#[derive(Debug, Clone)]
+pub enum MockSendResult {
+    /// Succeed and return a generated `mock-message-<uuid>` ID.
+    Succeed,
+    /// Return a `SendFailed` error with the specified retryability.
+    Fail { retryable: bool },
+    /// Return a `ProviderDeliveryUnknown` error (ambiguous — never retried).
+    Unknown,
+}
 
 /// Mock email provider for testing
 #[derive(Debug, Clone)]
@@ -23,6 +42,19 @@ pub struct MockEmailProvider {
     pub should_fail_send: bool,
     pub should_fail_verify: bool,
     pub verification_status: VerificationStatus,
+    pub send_delay: std::time::Duration,
+
+    /// Domains returned by `list_identities`. Defaults to empty (not
+    /// unsupported -- see `with_list_identities_unsupported` for that case).
+    pub list_identities_response: Vec<ProviderDomainIdentity>,
+    /// When set, `list_identities` returns `UnsupportedOperation` instead of
+    /// `list_identities_response`, mirroring SMTP's real behavior.
+    pub list_identities_unsupported: bool,
+
+    /// Pre-scripted per-call send outcomes. Consumed from the front of the
+    /// queue on each `send()` call. When the queue is exhausted the provider
+    /// falls back to `should_fail_send`.
+    scripted_responses: Arc<Mutex<VecDeque<MockSendResult>>>,
 }
 
 impl Default for MockEmailProvider {
@@ -41,11 +73,20 @@ impl MockEmailProvider {
             should_fail_send: false,
             should_fail_verify: false,
             verification_status: VerificationStatus::Verified,
+            send_delay: std::time::Duration::ZERO,
+            list_identities_response: Vec::new(),
+            list_identities_unsupported: false,
+            scripted_responses: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     pub fn with_send_failure(mut self) -> Self {
         self.should_fail_send = true;
+        self
+    }
+
+    pub fn with_send_delay(mut self, delay: std::time::Duration) -> Self {
+        self.send_delay = delay;
         self
     }
 
@@ -56,6 +97,28 @@ impl MockEmailProvider {
 
     pub fn with_verification_status(mut self, status: VerificationStatus) -> Self {
         self.verification_status = status;
+        self
+    }
+
+    pub fn with_list_identities_response(mut self, domains: Vec<ProviderDomainIdentity>) -> Self {
+        self.list_identities_response = domains;
+        self
+    }
+
+    /// Mimics SMTP: `list_identities` returns `UnsupportedOperation`.
+    pub fn with_list_identities_unsupported(mut self) -> Self {
+        self.list_identities_unsupported = true;
+        self
+    }
+
+    /// Set a queue of scripted per-call outcomes for `send()`.
+    /// They are consumed in order; when the queue is empty, `should_fail_send`
+    /// determines the outcome.
+    pub fn with_scripted_responses(
+        self,
+        responses: impl IntoIterator<Item = MockSendResult>,
+    ) -> Self {
+        *self.scripted_responses.lock().unwrap() = responses.into_iter().collect();
         self
     }
 
@@ -113,7 +176,11 @@ impl EmailProvider for MockEmailProvider {
         })
     }
 
-    async fn verify_identity(&self, _domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         self.verify_identity_count.fetch_add(1, Ordering::SeqCst);
 
         if self.should_fail_verify {
@@ -128,6 +195,7 @@ impl EmailProvider for MockEmailProvider {
     async fn get_identity_details(
         &self,
         domain: &str,
+        _provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         // Map verification status to DNS record status
         let record_status = match &self.verification_status {
@@ -165,10 +233,15 @@ impl EmailProvider for MockEmailProvider {
                 status: record_status,
             }),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         })
     }
 
-    async fn delete_identity(&self, _domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         self.delete_identity_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -176,8 +249,34 @@ impl EmailProvider for MockEmailProvider {
     async fn send(&self, _email: &SendEmailRequest) -> Result<SendEmailResponse, EmailError> {
         self.send_count.fetch_add(1, Ordering::SeqCst);
 
-        if self.should_fail_send {
-            return Err(EmailError::ProviderError("Mock send failure".to_string()));
+        if !self.send_delay.is_zero() {
+            tokio::time::sleep(self.send_delay).await;
+        }
+
+        // Consume a scripted response if one is queued, otherwise fall back to
+        // the blanket `should_fail_send` flag.
+        let scripted = self.scripted_responses.lock().unwrap().pop_front();
+
+        match scripted {
+            Some(MockSendResult::Fail { retryable }) => {
+                return Err(EmailError::SendFailed {
+                    provider: "mock".to_string(),
+                    retryable,
+                    message: format!("Mock scripted failure (retryable={retryable})"),
+                });
+            }
+            Some(MockSendResult::Unknown) => {
+                return Err(EmailError::ProviderDeliveryUnknown(
+                    "Mock scripted unknown outcome".to_string(),
+                ));
+            }
+            Some(MockSendResult::Succeed) | None => {
+                // Succeed branch also covers the queue-exhausted case;
+                // if should_fail_send was set, apply it now.
+                if scripted.is_none() && self.should_fail_send {
+                    return Err(EmailError::ProviderError("Mock send failure".to_string()));
+                }
+            }
         }
 
         Ok(SendEmailResponse {
@@ -187,6 +286,16 @@ impl EmailProvider for MockEmailProvider {
 
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Ses // Use SES as default mock type
+    }
+
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        if self.list_identities_unsupported {
+            return Err(EmailError::UnsupportedOperation {
+                provider_type: "mock".to_string(),
+                operation: "listing registered domains".to_string(),
+            });
+        }
+        Ok(self.list_identities_response.clone())
     }
 }
 
@@ -211,7 +320,7 @@ mod tests {
     async fn test_mock_provider_verify_identity() {
         let provider = MockEmailProvider::new();
 
-        let status = provider.verify_identity("example.com").await.unwrap();
+        let status = provider.verify_identity("example.com", None).await.unwrap();
 
         assert!(matches!(status, VerificationStatus::Verified));
         assert_eq!(provider.verify_identity_call_count(), 1);
@@ -222,7 +331,7 @@ mod tests {
         let provider =
             MockEmailProvider::new().with_verification_status(VerificationStatus::Pending);
 
-        let status = provider.verify_identity("example.com").await.unwrap();
+        let status = provider.verify_identity("example.com", None).await.unwrap();
 
         assert!(matches!(status, VerificationStatus::Pending));
     }
@@ -231,7 +340,7 @@ mod tests {
     async fn test_mock_provider_verify_failure() {
         let provider = MockEmailProvider::new().with_verify_failure();
 
-        let result = provider.verify_identity("example.com").await;
+        let result = provider.verify_identity("example.com", None).await;
 
         assert!(result.is_err());
     }
@@ -285,7 +394,7 @@ mod tests {
     async fn test_mock_provider_delete_identity() {
         let provider = MockEmailProvider::new();
 
-        provider.delete_identity("example.com").await.unwrap();
+        provider.delete_identity("example.com", None).await.unwrap();
 
         assert_eq!(provider.delete_identity_call_count(), 1);
     }
@@ -294,5 +403,123 @@ mod tests {
     fn test_mock_provider_type() {
         let provider = MockEmailProvider::new();
         assert_eq!(provider.provider_type(), EmailProviderType::Ses);
+    }
+
+    #[tokio::test]
+    async fn scripted_retryable_failure_is_send_failed_retryable() {
+        let provider = MockEmailProvider::new()
+            .with_scripted_responses([MockSendResult::Fail { retryable: true }]);
+
+        let request = SendEmailRequest {
+            from: "sender@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Test".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: None,
+        };
+
+        let err = provider.send(&request).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EmailError::SendFailed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "scripted retryable failure must be SendFailed {{ retryable: true }}"
+        );
+        assert_eq!(provider.send_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scripted_non_retryable_failure_is_send_failed_not_retryable() {
+        let provider = MockEmailProvider::new()
+            .with_scripted_responses([MockSendResult::Fail { retryable: false }]);
+
+        let request = SendEmailRequest {
+            from: "sender@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Test".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: None,
+        };
+
+        let err = provider.send(&request).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EmailError::SendFailed {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "scripted non-retryable failure must be SendFailed {{ retryable: false }}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_unknown_outcome_is_provider_delivery_unknown() {
+        let provider = MockEmailProvider::new().with_scripted_responses([MockSendResult::Unknown]);
+
+        let request = SendEmailRequest {
+            from: "sender@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Test".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: None,
+        };
+
+        let err = provider.send(&request).await.unwrap_err();
+        assert!(
+            matches!(err, EmailError::ProviderDeliveryUnknown(_)),
+            "scripted Unknown must be ProviderDeliveryUnknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_fail_then_succeed_succeeds_on_second_call() {
+        let provider = MockEmailProvider::new().with_scripted_responses([
+            MockSendResult::Fail { retryable: true },
+            MockSendResult::Succeed,
+        ]);
+
+        let request = SendEmailRequest {
+            from: "sender@example.com".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.com".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "Test".to_string(),
+            html: None,
+            text: Some("hi".to_string()),
+            headers: None,
+        };
+
+        // First call: fails
+        let first = provider.send(&request).await;
+        assert!(first.is_err());
+        assert_eq!(provider.send_call_count(), 1);
+
+        // Second call: succeeds (scripted Succeed)
+        let second = provider.send(&request).await;
+        assert!(second.is_ok());
+        assert_eq!(provider.send_call_count(), 2);
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -61,6 +64,42 @@ pub struct Model {
     /// the collector already resolves via the `temps.service_name` Docker
     /// label. Added by `m20260707_000002_add_external_services_container_name`.
     pub container_name: Option<String>,
+    /// Whether the AI agent may read *row data* from this service.
+    ///
+    /// Off by default and opted into per service by the operator. The agent's
+    /// read tool allowlist otherwise only exposes endpoints whose responses
+    /// carry no secrets; table rows are a different risk class (password
+    /// hashes, API tokens, customer PII) and enabling this ships those rows to
+    /// a third-party LLM provider. Schema browsing (databases, tables, column
+    /// names) is unaffected — only the row-reading endpoint is gated. Added by
+    /// `m20260804_000001_add_ai_data_access_to_external_services`.
+    #[sea_orm(default_value = false)]
+    pub ai_data_access: bool,
+    /// Human principal that created this service through the authenticated
+    /// API. This allows a newly-created, not-yet-linked service to be claimed
+    /// by that same user during project creation without trusting a guessed ID.
+    pub created_by_user_id: Option<i32>,
+    /// The one S3 source this service's continuous, standing archiving
+    /// process is pinned to: Postgres WAL-G's `archive_command`, or
+    /// MariaDB's binlog shipper. Both write to a destination that persists
+    /// across backup runs rather than being chosen fresh each time, so
+    /// unlike a one-shot snapshot engine they cannot silently move between
+    /// sources without stranding data already written under the previous
+    /// one — WAL-G needs a base backup and the WAL segments covering its
+    /// start/end LSN under the same S3 prefix to be restorable at all, and
+    /// MariaDB PITR needs an unbroken binlog chain in one place. NULL until
+    /// the first archiving run (or an explicit repoint) establishes a pin.
+    /// Added by
+    /// `m20260904_000003_add_continuous_archive_source_to_external_services`.
+    pub continuous_archive_s3_source_id: Option<i32>,
+    /// When `continuous_archive_s3_source_id` was established or last deliberately
+    /// changed. Lets the Cloud mirror (Postgres) and PITR restore (MariaDB)
+    /// tell "this data is still catching up" (its timestamp is after this)
+    /// apart from "this data was written to a since-abandoned source and can
+    /// never appear here" (its timestamp is before this) — the latter is
+    /// permanent, not worth retrying forever. Added by
+    /// `m20260904_000003_add_continuous_archive_source_to_external_services`.
+    pub continuous_archive_pinned_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

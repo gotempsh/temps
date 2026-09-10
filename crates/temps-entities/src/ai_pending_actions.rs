@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A proposed AI write-action awaiting human confirmation.
 //!
 //! When the AI SRE proposes a mutation (e.g. "redeploy this deployment"), a row
@@ -28,8 +31,10 @@ pub struct Model {
     /// The assistant message that contains the proposal (set after the message
     /// persists; `None` for actions proposed outside a message context).
     pub message_id: Option<i64>,
-    /// The project this action targets.
-    pub project_id: i32,
+    /// The project this action targets, when the operation is project-scoped.
+    /// Global operations are authorized from the confirming user's current
+    /// role/permissions and intentionally leave this unset.
+    pub project_id: Option<i32>,
     /// Groups the steps of a multi-step *plan* (chained actions). `None` for a
     /// standalone single-action proposal. All steps of one plan share this id and
     /// are confirmed one at a time in [`step_index`] order.
@@ -54,7 +59,7 @@ pub struct Model {
     /// Failure detail recorded when `status = "failed"`.
     pub error: Option<String>,
     /// User who initiated the chat session that produced this action.
-    pub created_by: Option<i32>,
+    pub created_by: i32,
     /// User who confirmed (approved or rejected) this action.
     pub confirmed_by: Option<i32>,
     pub created_at: DBDateTime,

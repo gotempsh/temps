@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,6 +69,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
             let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
+            let docker = context.require_service::<bollard::Docker>();
             let deployer = context.require_service::<dyn temps_deployer::ContainerDeployer>();
             let git_provider = context.require_service::<dyn temps_git::GitProviderManagerTrait>();
             let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
@@ -85,6 +89,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.clone(),
                 queue_service.clone(),
                 docker_log_service,
+                docker,
                 deployer.clone(),
                 encryption_service.clone(),
             ));
@@ -92,10 +97,20 @@ impl TempsPlugin for DeploymentsPlugin {
             deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
 
+            // Preserve uploaded archives until runtime cleanup succeeds, then
+            // remove them before the project rows cascade away.
+            let project_cleanup =
+                deployment_service.clone() as Arc<dyn temps_core::ProjectArchiveCleaner>;
+            context.register_service(project_cleanup);
+
             // Also register as DeploymentCanceller trait for temps-environments
             let deployment_canceller =
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
             context.register_service(deployment_canceller);
+
+            let deployment_container_cleaner =
+                deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
+            context.register_service(deployment_container_cleaner);
 
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
@@ -145,6 +160,13 @@ impl TempsPlugin for DeploymentsPlugin {
             // Register database_cron_service for handlers
             context.register_service(database_cron_service.clone());
 
+            // Create DatabaseMetricAlertConfigService for reconciling .temps.yaml alerts.
+            let database_alert_service = Arc::new(
+                crate::services::DatabaseMetricAlertConfigService::new(db.clone()),
+            );
+            let alert_service =
+                database_alert_service.clone() as Arc<dyn crate::jobs::MetricAlertConfigService>;
+
             // Start cron scheduler in background
             let scheduler_service = database_cron_service.clone();
             tokio::spawn(async move {
@@ -156,13 +178,29 @@ impl TempsPlugin for DeploymentsPlugin {
             let cas_dir = config_service.data_dir().join("cas");
             let cleanup_file_store: Arc<dyn temps_file_store::FileStore> =
                 Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
+            // Operator-configured image retention (settings row, not an env
+            // var). Falls back to the built-in default when settings cannot be
+            // read so a transient DB hiccup at boot cannot silently disable or
+            // over-aggressively enable image pruning.
+            let image_retention = match config_service.get_settings().await {
+                Ok(settings) => settings.image_retention,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Could not read image retention settings; using defaults"
+                    );
+                    temps_core::ImageRetentionSettings::default()
+                }
+            };
             let docker_cleanup = Arc::new(
                 crate::services::DockerCleanupService::new(
                     Arc::new(crate::services::DefaultDockerClient),
                     db.clone(),
                     cleanup_file_store,
                 )
-                .with_static_dir(config_service.static_dir()),
+                .with_static_dir(config_service.static_dir())
+                .with_image_retention(&image_retention)
+                .with_config_service(config_service.clone()),
             );
             tokio::spawn({
                 let cleanup_service = docker_cleanup.clone();
@@ -185,16 +223,31 @@ impl TempsPlugin for DeploymentsPlugin {
                 bollard::Docker::connect_with_local_defaults()
                     .expect("Failed to connect to Docker"),
             );
+
+            // Late-bind the Compose executor onto DeploymentService now that
+            // the Docker client exists (DeploymentService itself is
+            // constructed earlier, before `docker` is available). Lets
+            // project/environment deletion clean up Compose-managed
+            // volumes/networks, not just containers -- see
+            // `DeploymentService::cleanup_containers`.
+            deployment_service.set_compose_executor(Arc::new(
+                temps_deployer::compose::ComposeExecutor::new(
+                    docker.clone(),
+                    config_service.data_dir(),
+                ),
+            ));
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
                 queue_service.clone(),
                 git_provider,
-                image_builder,
+                image_builder.clone(),
                 deployer,
                 static_deployer,
                 log_service.clone(),
                 cron_service,
+                alert_service,
                 context
                     .get_service::<dyn crate::jobs::AgentSyncService>()
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
@@ -211,9 +264,16 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Source map service wired into workflow execution service");
             }
 
-            // Wire NodeScheduler for multi-node deployments
+            // Wire NodeScheduler for multi-node deployments. It needs the
+            // control plane's own container platform so the `Local` slot takes
+            // part in architecture filtering like any worker: on a cluster
+            // where the CP is amd64 and an arm64-only image is deployed, Local
+            // must drop out of the pool instead of taking the replica.
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
-            let node_scheduler = Arc::new(crate::services::NodeScheduler::new(node_service));
+            let node_scheduler = Arc::new(
+                crate::services::NodeScheduler::new(node_service)
+                    .with_platform_source(image_builder.clone()),
+            );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
@@ -244,20 +304,6 @@ impl TempsPlugin for DeploymentsPlugin {
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
-            // Wire the shared environment-variable resolver into DeploymentService
-            // so the inline promote/rollback deploy paths resolve env from the
-            // selected environment (the SAME set as a normal deploy) instead of
-            // starting the reused image with no config. See services::env_resolver.
-            let env_resolver = Arc::new(crate::services::env_resolver::DeploymentEnvResolver {
-                db: db.clone(),
-                encryption_service: encryption_service.clone(),
-                config_service: config_service.clone(),
-                external_service_manager: external_service_manager.clone(),
-                dsn_service: dsn_service.clone(),
-                deployment_token_service: deployment_token_service.clone(),
-            });
-            deployment_service.set_env_resolver(env_resolver);
-
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();
             let workflow_planner = Arc::new(WorkflowPlanner::new(
@@ -265,9 +311,10 @@ impl TempsPlugin for DeploymentsPlugin {
                 log_service.clone(),
                 external_service_manager.clone(),
                 config_service.clone(),
-                dsn_service,
-                encryption_service,
+                dsn_service.clone(),
+                encryption_service.clone(),
             ));
+            let source_drop_planner = workflow_planner.clone();
 
             // Capture the secrets-resolver handle BEFORE moving workflow_planner
             // into the job processor.  This is the two-phase handoff: the actual
@@ -278,12 +325,27 @@ impl TempsPlugin for DeploymentsPlugin {
             // it up here with get_service would always return None.
             let secrets_resolver_handle = workflow_planner.secrets_resolver_handle();
 
+            // Wire the shared environment-variable resolver into
+            // DeploymentService. It shares the same late-bound EE secrets
+            // resolver as WorkflowPlanner so normal, promotion, and rollback
+            // deployments use the same precedence layers.
+            let env_resolver = Arc::new(crate::services::env_resolver::DeploymentEnvResolver {
+                db: db.clone(),
+                encryption_service: encryption_service.clone(),
+                config_service: config_service.clone(),
+                external_service_manager: external_service_manager.clone(),
+                dsn_service: dsn_service.clone(),
+                deployment_token_service: deployment_token_service.clone(),
+                secrets_resolver: secrets_resolver_handle.clone(),
+            });
+            deployment_service.set_env_resolver(env_resolver);
+
             // Clone workflow_execution_service before passing to job processor
             // (the job processor takes ownership, but we need to register it too)
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
 
             let mut job_processor = JobProcessorService::with_external_service_manager(
-                db,
+                db.clone(),
                 job_receiver,
                 queue_service.clone(),
                 workflow_execution_service_for_processor,
@@ -312,6 +374,24 @@ impl TempsPlugin for DeploymentsPlugin {
             {
                 unreachable!("register_services runs exactly once per plugin instance");
             }
+
+            let deployment_gate = self.deployment_gate_slot.get().cloned().ok_or_else(|| {
+                PluginError::InitializationFailed(
+                    "deployment gate slot was not initialized for source Drop".to_string(),
+                )
+            })?;
+            let source_drop_service = Arc::new(crate::services::SourceDropService::new(
+                db.clone(),
+                config_service.data_dir(),
+                source_drop_planner,
+                workflow_execution_service.clone(),
+                queue_service.clone(),
+                deployment_gate,
+            ));
+            context.register_service(source_drop_service.clone());
+            let source_drop_deployer =
+                source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;
+            context.register_service(source_drop_deployer);
 
             // Start the job processor in a background task
             tokio::spawn(async move {
@@ -453,6 +533,11 @@ impl TempsPlugin for DeploymentsPlugin {
         // When absent (plain OSS binary), project_access_guard! is a no-op.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
+        // Central sensitive-action policy (MFA step-up), used to gate
+        // destructive node operations like drain.
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
         // Deployment-token management routes carry their own app state
         // (`DeploymentTokenAppState`), so build it here and mount the router as
         // a sub-router below. Without this wiring the token endpoints -- create,
@@ -463,11 +548,11 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_token_service,
                 audit_service: audit_service.clone(),
                 project_access_checker: project_access_checker.clone(),
+                sensitive_action_authorizer: sensitive_action_authorizer.clone(),
             });
 
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
-
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
 
@@ -488,6 +573,22 @@ impl TempsPlugin for DeploymentsPlugin {
                 Arc::new(temps_core::StandardHostnameResolver)
                     as Arc<dyn temps_core::PublicHostnameResolver>
             });
+
+        // Optional: metrics store for container CPU/memory history, present
+        // only when metrics collection is enabled on this server.
+        let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
+
+        // Deploy-failure reporting (redact + preview + send). See
+        // `crate::services::failure_report_service` -- deliberately separate
+        // from the anonymous telemetry pipeline, which never carries free text.
+        let failure_report_service = Arc::new(
+            crate::services::FailureReportService::new(
+                deployment_service.clone(),
+                log_service.clone(),
+                encryption_service.clone(),
+            )
+            .expect("Failed to build FailureReportService HTTP client"),
+        );
 
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
@@ -510,7 +611,47 @@ impl TempsPlugin for DeploymentsPlugin {
             deployment_gate,
             project_access_checker,
             hostname_resolver,
+            metrics_store,
+            failure_report_service,
+            sensitive_action_authorizer,
         });
+
+        // Traefik label discovery is an operator-level, host-scoped feature
+        // whose watcher (when enabled) is started by `temps serve`, which
+        // registers the resulting handle here. When nothing registered one —
+        // an embedded bootstrap, or a process that doesn't run the watcher —
+        // fall back to a handle that reports the environment's intent and
+        // says the watcher is not running, so the endpoints still answer
+        // `configured: false` with a reason instead of 404'ing. A feature that
+        // disappears when unconfigured is indistinguishable from one that was
+        // never built (CLAUDE.md, Feature Discoverability).
+        let traefik_discovery_handle = context
+            .get_service::<temps_deployer::traefik_discovery::TraefikDiscoveryHandle>()
+            .unwrap_or_else(|| {
+                Arc::new(
+                    temps_deployer::traefik_discovery::TraefikDiscoveryHandle::disabled_from_env(
+                        &temps_core::NETWORK_NAME,
+                    ),
+                )
+            });
+        // ADR-041 §8: the TLS provisioner bridges temps-deployments to
+        // temps-domains without introducing a direct crate dependency.
+        // It is registered by the serve wiring layer (console.rs) after all
+        // plugins have initialized, following the same pattern as
+        // AlarmServiceDriftSink. `require_service` fails loudly at startup if
+        // the provisioner was not registered, per CLAUDE.md's dependency rule.
+        let provisioner = context.require_service::<dyn crate::services::traefik_discovery_service::DiscoveredHostTlsProvisioner>();
+        let traefik_discovery_state =
+            Arc::new(handlers::traefik_discovery::TraefikDiscoveryAppState {
+                traefik_discovery_service: Arc::new(
+                    crate::services::TraefikDiscoveryAdminService::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                        traefik_discovery_handle,
+                        provisioner,
+                    ),
+                ),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            });
 
         let deployments_routes = handlers::deployments::configure_routes();
         let cron_routes = handlers::crons::configure_routes();
@@ -523,13 +664,17 @@ impl TempsPlugin for DeploymentsPlugin {
         let deployment_token_routes =
             handlers::deployment_tokens::configure_routes().with_state(deployment_token_state);
 
+        let traefik_discovery_routes =
+            handlers::traefik_discovery::configure_routes().with_state(traefik_discovery_state);
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
             .with_state(app_state)
-            .merge(deployment_token_routes);
+            .merge(deployment_token_routes)
+            .merge(traefik_discovery_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -545,6 +690,8 @@ impl TempsPlugin for DeploymentsPlugin {
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
+        let traefik_discovery_schema =
+            <handlers::traefik_discovery::TraefikDiscoveryApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -554,6 +701,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 remote_deployments_schema,
                 nodes_schema,
                 deployment_tokens_schema,
+                traefik_discovery_schema,
             ],
         ))
     }
@@ -610,5 +758,30 @@ mod tests {
             paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
             "deployment-token item route must be in the merged OpenAPI schema"
         );
+    }
+
+    // Same guard for the Traefik discovery surface: it is merged into the
+    // plugin's router and schema, and a drop from either would leave the
+    // feature invisible to the console and the CLI.
+    #[test]
+    fn openapi_schema_exposes_traefik_discovery_routes() {
+        let schema = DeploymentsPlugin::new()
+            .openapi_schema()
+            .expect("deployments plugin must expose an OpenAPI schema");
+        let paths = schema.paths.paths;
+
+        for expected in [
+            "/traefik-discovery/status",
+            "/traefik-discovery/routes",
+            "/traefik-discovery/routes/{host}/enabled",
+            "/traefik-discovery/routes/{host}/certificate",
+            "/traefik-discovery/tls/import",
+        ] {
+            assert!(
+                paths.contains_key(expected),
+                "{expected} must be in the merged OpenAPI schema; got paths: {:?}",
+                paths.keys().collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -7,8 +10,15 @@ import {
   getEmailProvider as getEmailSmtpProvider,
   deleteEmailProvider as deleteEmailSmtpProvider,
   testProvider as testEmailProvider,
+  listDiscoverableDomains as listDiscoverableDomainsSdk,
 } from '../../api/sdk.gen.js'
-import type { EmailProviderResponse, EmailProviderTypeRoute } from '../../api/types.gen.js'
+import type {
+  EmailProviderResponse,
+  EmailProviderTypeRoute,
+  ProviderDomainIdentityResponse,
+  ScalewayCredentialsRequest,
+  SesCredentialsRequest,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
@@ -48,6 +58,61 @@ interface TestOptions {
   id: string
   from?: string
   fromName?: string
+}
+
+interface DiscoverableDomainsOptions {
+  id: string
+  json?: boolean
+}
+
+// --- Credential resolution ---
+
+// Maps flags already supplied on the command line to the ses_credentials /
+// scaleway_credentials pair the API expects (exactly one populated, the
+// other null). Returns undefined when required flags are missing so the
+// caller falls back to interactive prompts — unless --yes was passed, in
+// which case automation has no prompts to fall back to and this throws the
+// same actionable error the interactive path would have avoided.
+export function resolveEmailProviderCredentials(
+  providerType: EmailProviderTypeRoute,
+  options: CreateOptions,
+): { ses_credentials: SesCredentialsRequest | null; scaleway_credentials: ScalewayCredentialsRequest | null } | undefined {
+  switch (providerType) {
+    case 'ses': {
+      if (options.accessKeyId && options.secretAccessKey) {
+        return {
+          ses_credentials: {
+            access_key_id: options.accessKeyId,
+            secret_access_key: options.secretAccessKey,
+          },
+          scaleway_credentials: null,
+        }
+      }
+      if (options.yes) {
+        throw new Error('--access-key-id and --secret-access-key are required for SES when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'scaleway': {
+      if (options.apiKey && options.projectId) {
+        return {
+          ses_credentials: null,
+          scaleway_credentials: {
+            api_key: options.apiKey,
+            project_id: options.projectId,
+          },
+        }
+      }
+      if (options.yes) {
+        throw new Error('--api-key and --project-id are required for Scaleway when using --yes flag')
+      }
+      return undefined
+    }
+
+    default:
+      return undefined
+  }
 }
 
 export function registerEmailProvidersCommands(program: Command): void {
@@ -102,6 +167,14 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--from <email>', 'Sender email address (must be verified)')
     .option('--from-name <name>', 'Sender display name')
     .action(testProviderAction)
+
+  emailProviders
+    .command('discoverable-domains')
+    .alias('discover-domains')
+    .description('List domain identities already registered on the provider\'s side, for importing')
+    .requiredOption('--id <id>', 'Provider ID')
+    .option('--json', 'Output in JSON format')
+    .action(discoverableDomainsAction)
 }
 
 async function listProvidersAction(options: { json?: boolean }): Promise<void> {
@@ -192,72 +265,59 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
   }
 
   // Build credentials based on type
-  let sesCredentials = null
-  let scalewayCredentials = null
+  let sesCredentials: SesCredentialsRequest | null = null
+  let scalewayCredentials: ScalewayCredentialsRequest | null = null
 
-  switch (providerType) {
-    case 'ses': {
-      let accessKeyId: string
-      let secretAccessKey: string
+  const resolved = resolveEmailProviderCredentials(providerType, options)
 
-      if (options.accessKeyId && options.secretAccessKey) {
-        accessKeyId = options.accessKeyId
-        secretAccessKey = options.secretAccessKey
-      } else if (options.yes) {
-        throw new Error('--access-key-id and --secret-access-key are required for SES when using --yes flag')
-      } else {
+  if (resolved) {
+    sesCredentials = resolved.ses_credentials
+    scalewayCredentials = resolved.scaleway_credentials
+  } else {
+    switch (providerType) {
+      case 'ses': {
         info('\nAmazon SES requires IAM credentials with SES send permissions.')
         info('Create credentials at: https://console.aws.amazon.com/iam/')
         newline()
 
-        accessKeyId = await promptText({
+        const accessKeyId = await promptText({
           message: 'AWS Access Key ID',
           required: true,
         })
 
-        secretAccessKey = await promptText({
+        const secretAccessKey = await promptText({
           message: 'AWS Secret Access Key',
           required: true,
         })
+
+        sesCredentials = {
+          access_key_id: accessKeyId,
+          secret_access_key: secretAccessKey,
+        }
+        break
       }
 
-      sesCredentials = {
-        access_key_id: accessKeyId,
-        secret_access_key: secretAccessKey,
-      }
-      break
-    }
-
-    case 'scaleway': {
-      let apiKey: string
-      let projectId: string
-
-      if (options.apiKey && options.projectId) {
-        apiKey = options.apiKey
-        projectId = options.projectId
-      } else if (options.yes) {
-        throw new Error('--api-key and --project-id are required for Scaleway when using --yes flag')
-      } else {
+      case 'scaleway': {
         info('\nScaleway Transactional Email requires API credentials.')
         info('Create credentials at: https://console.scaleway.com/iam/api-keys')
         newline()
 
-        apiKey = await promptText({
+        const apiKey = await promptText({
           message: 'Scaleway API Key',
           required: true,
         })
 
-        projectId = await promptText({
+        const projectId = await promptText({
           message: 'Scaleway Project ID',
           required: true,
         })
-      }
 
-      scalewayCredentials = {
-        api_key: apiKey,
-        project_id: projectId,
+        scalewayCredentials = {
+          api_key: apiKey,
+          project_id: projectId,
+        }
+        break
       }
-      break
     }
   }
 
@@ -409,4 +469,60 @@ async function testProviderAction(options: TestOptions): Promise<void> {
 
   success('Test email sent successfully!')
   info('Check your inbox for the test message')
+}
+
+async function discoverableDomainsAction(options: DiscoverableDomainsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid provider ID')
+    return
+  }
+
+  const result = await withSpinner('Listing domains from provider...', async () => {
+    const { data, error } = await listDiscoverableDomainsSdk({ client, path: { id } })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? `Failed to list domains for provider ${options.id}`)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Discoverable Domains`)
+
+  if (!result.supported) {
+    info('This provider type does not support listing registered domains.')
+    info('Use: temps email-domains import --provider-id <id> --domain <domain> to import one by name.')
+    newline()
+    return
+  }
+
+  if (result.error) {
+    warning(`Could not fetch domains from the provider: ${result.error}`)
+    info('Use: temps email-domains import --provider-id <id> --domain <domain> to import one by name.')
+    newline()
+    return
+  }
+
+  if (result.domains.length === 0) {
+    info('No domains registered with this provider')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ProviderDomainIdentityResponse>[] = [
+    { header: 'Domain', key: 'domain', color: (v) => colors.bold(v) },
+    { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'verified' ? 'active' : 'inactive') },
+    { header: 'Identity ID', key: 'provider_identity_id', color: (v) => colors.muted(v) },
+  ]
+
+  printTable(result.domains, columns, { style: 'minimal' })
+  newline()
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getEnvironmentCronsOptions,
   getEnvironmentsOptions,
@@ -24,7 +27,7 @@ import {
 import { useCallback, useMemo, useState } from 'react'
 import { EmptyState } from '@/components/ui/empty-state'
 import { CodeBlock } from '@/components/ui/code-block'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import {
   Dialog,
   DialogContent,

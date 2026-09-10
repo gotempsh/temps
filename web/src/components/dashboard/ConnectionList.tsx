@@ -1,4 +1,7 @@
-import { Link } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, GitBranch } from 'lucide-react'
 import GithubIcon from '@/icons/Github'

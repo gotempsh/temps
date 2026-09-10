@@ -12,7 +12,7 @@ This module provides a fast proof-of-work challenge solver that runs in the brow
 
 ```bash
 # Install wasm-pack if not already installed
-cargo install wasm-pack
+cargo install wasm-pack --version 0.15.0 --locked
 
 # Build the WASM module
 cd crates/temps-captcha-wasm

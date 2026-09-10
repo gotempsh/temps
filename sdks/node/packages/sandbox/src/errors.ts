@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // The API returns RFC 7807 Problem Details on every error path
 // (see `temps-core::problemdetails`). Mirror that shape here so
 // callers can `if (err instanceof SandboxError)` and read a useful

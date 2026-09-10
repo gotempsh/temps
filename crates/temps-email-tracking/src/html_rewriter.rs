@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Streaming HTML rewriter for email tracking
 //!
 //! Uses lol_html (Cloudflare's streaming HTML rewriter) to:

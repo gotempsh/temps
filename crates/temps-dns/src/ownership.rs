@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! DNS record ownership markers (ADR-031)
 //!
 //! Temps writes public A/AAAA/CNAME records into zones it does not own.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use clap::Args;
 use colored::Colorize;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
@@ -167,6 +170,12 @@ impl DoctorCommand {
             self.check_git_providers(db, &mut report).await;
             report.print();
             report.checks.clear();
+
+            println!();
+            println!("{}", "  Multi-node networking".bright_yellow().bold());
+            self.check_multi_node_networking(db, &mut report).await;
+            report.print();
+            report.checks.clear();
         }
 
         // -- External Connectivity --
@@ -187,9 +196,8 @@ impl DoctorCommand {
         } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
             PathBuf::from(d)
         } else {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".temps")
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            default_data_dir(&home)
         }
     }
 
@@ -791,6 +799,129 @@ impl DoctorCommand {
         }
     }
 
+    async fn check_multi_node_networking(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        report: &mut DiagnosticReport,
+    ) {
+        let query = "SELECT \
+            (SELECT COUNT(*) FROM nodes WHERE status = 'active') AS active_workers, \
+            nc.control_plane_compute_cidr, \
+            nc.control_plane_underlay_address, \
+            nc.control_plane_overlay_ready, \
+            (SELECT COUNT(*) FROM external_services es \
+             WHERE es.node_id IS NULL AND es.topology = 'standalone' \
+               AND NOT EXISTS (SELECT 1 FROM service_endpoints se \
+                 WHERE se.owner_kind = 'service_role' AND se.owner_id = es.id)) \
+              AS missing_service_endpoints \
+            FROM network_config nc WHERE nc.id = 1";
+        let row = match db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                query.to_string(),
+            ))
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                report.add(
+                    "Configuration",
+                    CheckResult::Warn("network_config is not initialized".to_string()),
+                );
+                return;
+            }
+            Err(error) => {
+                report.add(
+                    "Configuration",
+                    CheckResult::Warn(format!(
+                        "Could not inspect control-plane overlay state: {error}. Run `temps migrate` first."
+                    )),
+                );
+                return;
+            }
+        };
+
+        use sea_orm::TryGetable;
+        let active_workers = i64::try_get_by(&row, "active_workers").unwrap_or(0);
+        let cidr = Option::<String>::try_get_by(&row, "control_plane_compute_cidr")
+            .ok()
+            .flatten();
+        let underlay = Option::<String>::try_get_by(&row, "control_plane_underlay_address")
+            .ok()
+            .flatten();
+        let ready = bool::try_get_by(&row, "control_plane_overlay_ready").unwrap_or(false);
+        let missing = i64::try_get_by(&row, "missing_service_endpoints").unwrap_or(0);
+
+        report.add(
+            "Workers",
+            CheckResult::Info(format!("{active_workers} active")),
+        );
+        if active_workers == 0 {
+            report.add(
+                "Control-plane overlay",
+                CheckResult::Info("Not required until a worker is active".to_string()),
+            );
+            return;
+        }
+
+        match (cidr, underlay, ready) {
+            (Some(cidr), Some(underlay), true) => report.add(
+                "Control-plane overlay",
+                CheckResult::Pass(format!("{cidr} via {underlay}")),
+            ),
+            (Some(cidr), Some(underlay), false) => report.add(
+                "Control-plane overlay",
+                CheckResult::Fail(format!(
+                    "Reserved as {cidr} via {underlay}, but setup did not complete. Run `sudo temps network setup-multi-node`."
+                )),
+            ),
+            _ => report.add(
+                "Control-plane overlay",
+                CheckResult::Fail(
+                    "Not configured. Run `sudo temps network setup-multi-node` on the control plane."
+                        .to_string(),
+                ),
+            ),
+        }
+
+        let overlay_exists = match bollard::Docker::connect_with_defaults() {
+            Ok(docker) => tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|networks| {
+                networks
+                    .iter()
+                    .any(|network| network.name.as_deref() == Some("temps0"))
+            })
+            .unwrap_or(false),
+            Err(_) => false,
+        };
+        report.add(
+            "Docker overlay",
+            if overlay_exists {
+                CheckResult::Pass("temps0 exists".to_string())
+            } else {
+                CheckResult::Fail(
+                    "temps0 is missing. Run `sudo temps network setup-multi-node`.".to_string(),
+                )
+            },
+        );
+        report.add(
+            "Managed-service DNS",
+            if missing == 0 {
+                CheckResult::Pass("All local standalone services are published".to_string())
+            } else {
+                CheckResult::Fail(format!(
+                    "{missing} local service(s) have no internal endpoint. Run `sudo temps network setup-multi-node`."
+                ))
+            },
+        );
+    }
+
     // ── Git provider checks ─────────────────────────────────────────
 
     async fn check_git_providers(
@@ -854,6 +985,24 @@ impl DoctorCommand {
             report,
         )
         .await;
+    }
+}
+
+/// Resolve the default installation layout without overriding an explicit
+/// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
+/// older deployment scripts placed runtime secrets in `~/.temps/data`.
+fn default_data_dir(home: &Path) -> PathBuf {
+    let root = home.join(".temps");
+    let nested = root.join("data");
+    let root_has_runtime_files =
+        root.join("auth_secret").is_file() || root.join("encryption_key").is_file();
+    let nested_has_runtime_files =
+        nested.join("auth_secret").is_file() || nested.join("encryption_key").is_file();
+
+    if !root_has_runtime_files && nested_has_runtime_files {
+        nested
+    } else {
+        root
     }
 }
 
@@ -1031,5 +1180,29 @@ mod tests {
         assert_eq!(report.pass_count, 2);
         assert_eq!(report.warn_count, 1);
         assert_eq!(report.fail_count, 1);
+    }
+
+    #[test]
+    fn default_data_dir_detects_legacy_nested_runtime_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let nested = home.path().join(".temps/data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(nested.join("auth_secret"), "test-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), nested);
+    }
+
+    #[test]
+    fn default_data_dir_prefers_current_root_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let root = home.path().join(".temps");
+        let nested = root.join("data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(root.join("auth_secret"), "current-secret").expect("write root auth secret");
+        std::fs::write(nested.join("auth_secret"), "legacy-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), root);
     }
 }

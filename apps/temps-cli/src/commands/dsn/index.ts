@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -392,7 +395,7 @@ function displayDsnDetails(dsn: ProjectDsnResponse): void {
   newline()
 }
 
-function truncateKey(key: string): string {
+export function truncateKey(key: string): string {
   if (key.length <= 12) return key
   return `${key.substring(0, 8)}...${key.substring(key.length - 4)}`
 }

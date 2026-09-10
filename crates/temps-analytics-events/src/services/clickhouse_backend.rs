@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse implementation of [`crate::services::traits::AnalyticsEvents`].
 //!
 //! Always compiled. Operators activate it by setting `TEMPS_CLICKHOUSE_*`
@@ -277,6 +280,9 @@ fn property_breakdown_sql(col: &str, sentinel: &str, count_sql: &str) -> String 
                 WHERE project_id = ?
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
+                  -- Crawlers excluded unless the caller opts in, matching the
+                  -- Postgres impl so the two backends report one population.
+                  AND (? = 1 OR is_crawler = 0)
                   AND (? = 0 OR environment_id = ?)
                   AND (? = 0 OR deployment_id = ?)
                   AND (? = 0 OR event_name = ?)
@@ -626,6 +632,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let event_filter_value = q.event_name.clone().unwrap_or_default();
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
+        let crawler_flag: i32 = i32::from(q.include_crawlers);
 
         // Drill-down filters mirror the Postgres impl. Every filter is
         // optional; the (flag = 0 OR column = value) idiom keeps the SQL
@@ -671,6 +678,9 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .bind(q.scope.project_id)
             .bind(start_ms)
             .bind(end_ms)
+            // Must stay adjacent to the `(? = 1 OR is_crawler = 0)` gate: the
+            // CH driver binds positionally, so bind order IS the contract.
+            .bind(crawler_flag)
             .bind(env_filter_flag)
             .bind(env_filter_value)
             .bind(dep_filter_flag)
@@ -756,6 +766,9 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              -- Same crawler gate as the breakdown, so the chart and the table
+              -- rendered next to it count the same population.
+              AND (? = 1 OR is_crawler = 0)
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR deployment_id = ?)
               AND (? = 0 OR event_name = ?)
@@ -777,6 +790,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .bind(q.scope.project_id)
             .bind(start_ms)
             .bind(end_ms)
+            // Positional: must stay adjacent to its `(? = 1 OR is_crawler = 0)`.
+            .bind(i32::from(q.include_crawlers))
             .bind(env_filter_flag)
             .bind(env_filter_value)
             .bind(dep_filter_flag)
@@ -905,6 +920,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
                   AND visitor_id IS NOT NULL
+                  AND event_type = 'page_view'
+                  AND is_crawler = 0
                   AND (? = 0 OR environment_id = ?)
                   AND (? = 0 OR deployment_id = ?)
                   AND visitor_id IN (
@@ -913,6 +930,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                       WHERE project_id = ?
                         AND timestamp < fromUnixTimestamp64Milli(?)
                         AND visitor_id IS NOT NULL
+                        AND event_type = 'page_view'
+                        AND is_crawler = 0
                         AND (? = 0 OR environment_id = ?)
                         AND (? = 0 OR deployment_id = ?)
                   )
@@ -946,16 +965,20 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         // The Timescale impl validates the metric here; do the same so behavior
         // is identical.
         let count_expr = match q.metric.as_str() {
-            "sessions" => "uniq(session_id)",
-            "visitors" => "uniq(visitor_id)",
-            "page_views" | "paths" => "countIf(event_type = 'page_view')",
+            "sessions" => {
+                "uniqIf(if(startsWith(session_id, 'v2|'), splitByChar('|', session_id)[2], session_id), event_type = 'page_view' AND notEmpty(session_id))"
+            }
+            "visitors" => "uniqIf(visitor_id, event_type = 'page_view')",
+            "page_views" => "countIf(event_type = 'page_view')",
+            "paths" => "uniqIf(page_path, event_type = 'page_view')",
             other => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{other}'. Valid options: sessions, visitors, returning_visitors, page_views"
+                    "Invalid metric '{other}'. Valid options: sessions, visitors, returning_visitors, page_views, paths"
                 )))
             }
         };
 
+        // Crawler traffic excluded to match the Timescale impl.
         let sql = format!(
             r#"
             SELECT {count_expr} AS value
@@ -963,6 +986,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND is_crawler = 0
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR deployment_id = ?)
             "#
@@ -1030,6 +1054,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE has(?, project_id)
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND event_type = 'page_view'
+              AND is_crawler = 0
             GROUP BY project_id
         "#;
 
@@ -1084,6 +1110,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
               AND event_type = 'page_view'
+              AND is_crawler = 0
             GROUP BY project_id, bucket_ms
             ORDER BY project_id, bucket_ms
         "#;
@@ -1545,6 +1572,8 @@ mod tests {
         // Project 7, visitor 100: 1 visit before the reporting range, then
         // session A with 2 page_views + 1 signup inside it.
         // Project 7, session B, visitor 101: 1 page_view, 1 click.
+        // Project 7 also has one API-only session which must not count as a
+        // browser analytics session.
         // Project 8, session C, visitor 102: 1 page_view (different project — must
         // not leak into project 7 queries).
         let rows = [
@@ -1562,7 +1591,41 @@ mod tests {
             make_row(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
             make_row(4, 7, "sess-b", Some(101), "page_view", "page_view", t(30)),
             make_row(5, 7, "sess-b", Some(101), "click", "click", t(25)),
+            make_row(
+                11,
+                7,
+                "sess-api-only",
+                Some(199),
+                "api_request",
+                "api_request",
+                t(20),
+            ),
             make_row(6, 8, "sess-c", Some(102), "page_view", "page_view", t(20)),
+            // Project 9 is dedicated to the include_crawlers gate so these
+            // rows perturb none of the project 7/8 assertions above: one human
+            // visitor and one crawler visitor.
+            make_row(
+                9,
+                9,
+                "sess-human",
+                Some(903),
+                "page_view",
+                "page_view",
+                t(15),
+            ),
+            {
+                let mut bot = make_row(
+                    10,
+                    9,
+                    "sess-bot",
+                    Some(900),
+                    "page_view",
+                    "page_view",
+                    t(15),
+                );
+                bot.is_crawler = 1;
+                bot
+            },
         ];
 
         insert_rows(client, &rows).await;
@@ -1582,7 +1645,11 @@ mod tests {
     #[tokio::test]
     async fn ch_backend_full_query_surface() {
         let Some((backend, client, _container)) = setup_clickhouse().await else {
-            return; // Docker not available, skip.
+            // Say so out loud. A silent `return` here reports `ok` for a test
+            // that executed nothing, which is how an untested query change can
+            // look verified — observed while reviewing this very file.
+            println!("SKIPPED: ClickHouse container unavailable — this test asserted NOTHING");
+            return;
         };
 
         seed_rows(&client).await;
@@ -1644,8 +1711,8 @@ mod tests {
             .await
             .expect("query_events_count all");
         let total_events: i64 = counts_all.iter().map(|c| c.count).sum();
-        // 5 events on project 7. Project 8's row must not leak in.
-        assert_eq!(total_events, 5, "got {:?}", counts_all);
+        // 6 events on project 7. Project 8's row must not leak in.
+        assert_eq!(total_events, 6, "got {:?}", counts_all);
 
         // ---- query_event_type_breakdown ----
         let by_type = backend
@@ -1686,6 +1753,19 @@ mod tests {
             .expect("query_unique_counts visitors");
         // 2 distinct visitor_ids on project 7 (100, 101).
         assert_eq!(visitors.count, 2);
+
+        // ---- query_unique_counts: sessions ----
+        let sessions = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                metric: "sessions".to_string(),
+            })
+            .await
+            .expect("query_unique_counts sessions");
+        // Only sessions with a page view are browser sessions. The API-only
+        // event must not inflate the analytics headline.
+        assert_eq!(sessions.count, 2);
 
         // ---- query_unique_counts: returning visitors ----
         let returning_visitors = backend
@@ -1789,11 +1869,11 @@ mod tests {
             })
             .await
             .expect("query_aggregated_buckets");
-        assert_eq!(aggr.total, 5);
+        assert_eq!(aggr.total, 6);
 
         // ---- query_property_breakdown ----
-        // Group by channel; all 5 project-7 events have channel="direct".
-        // events level = 5 raw events, all under one bucket.
+        // Group by channel; all 6 project-7 events have channel="direct".
+        // events level = 6 raw events, all under one bucket.
         let pb = backend
             .query_property_breakdown(PropertyBreakdownSpec::new(
                 full_range(),
@@ -1807,10 +1887,49 @@ mod tests {
             .await
             .expect("query_property_breakdown channel");
         assert_eq!(pb.property, "channel");
-        assert_eq!(pb.total, 5);
+
+        // include_crawlers gate: the bot row must be invisible by default and
+        // visible on opt-in. This is what proves the positional bind lines up
+        // with the `(? = 1 OR is_crawler = 0)` placeholder — a misplaced bind
+        // would shift every later filter and change these totals.
+        let bots_off = backend
+            .query_property_breakdown(
+                PropertyBreakdownSpec::new(
+                    full_range(),
+                    project_scope(9),
+                    None,
+                    PropertyColumn::Channel,
+                    "visitors",
+                    Some(20),
+                    None,
+                )
+                .with_crawlers(false),
+            )
+            .await
+            .expect("breakdown without crawlers");
+        let bots_on = backend
+            .query_property_breakdown(
+                PropertyBreakdownSpec::new(
+                    full_range(),
+                    project_scope(9),
+                    None,
+                    PropertyColumn::Channel,
+                    "visitors",
+                    Some(20),
+                    None,
+                )
+                .with_crawlers(true),
+            )
+            .await
+            .expect("breakdown with crawlers");
+        let off_total: i64 = bots_off.items.iter().map(|i| i.count).sum();
+        let on_total: i64 = bots_on.items.iter().map(|i| i.count).sum();
+        assert_eq!(off_total, 1, "default must count only the human visitor");
+        assert_eq!(on_total, 2, "opt-in must also count the crawler visitor");
+        assert_eq!(pb.total, 6);
         assert!(
-            pb.items.iter().any(|i| i.value == "direct" && i.count == 5),
-            "expected channel=direct count=5, got {:?}",
+            pb.items.iter().any(|i| i.value == "direct" && i.count == 6),
+            "expected channel=direct count=6, got {:?}",
             pb.items
         );
 
@@ -1842,12 +1961,45 @@ mod tests {
                 group_by_column: PropertyColumn::Channel,
                 aggregation_level: "events".to_string(),
                 bucket_size: Some("1 hour".to_string()),
+                include_crawlers: false,
             })
             .await
             .expect("query_property_timeline");
         assert_eq!(pt.property, "channel");
         let pt_total: i64 = pt.items.iter().map(|i| i.count).sum();
-        assert_eq!(pt_total, 5, "got {:?}", pt.items);
+        assert_eq!(pt_total, 6, "got {:?}", pt.items);
+
+        // The timeline must honour include_crawlers exactly like the breakdown.
+        // It previously accepted the flag and silently discarded it, so the
+        // chart counted bots while the table beside it did not — asserted here
+        // on both sides so a dropped bind or a missing predicate fails loudly.
+        let timeline_spec = |include: bool| PropertyTimelineSpec {
+            range: full_range(),
+            scope: project_scope(9),
+            event_name: None,
+            group_by_column: PropertyColumn::Channel,
+            aggregation_level: "visitors".to_string(),
+            bucket_size: Some("1 hour".to_string()),
+            include_crawlers: include,
+        };
+        let tl_off: i64 = backend
+            .query_property_timeline(timeline_spec(false))
+            .await
+            .expect("timeline without crawlers")
+            .items
+            .iter()
+            .map(|i| i.count)
+            .sum();
+        let tl_on: i64 = backend
+            .query_property_timeline(timeline_spec(true))
+            .await
+            .expect("timeline with crawlers")
+            .items
+            .iter()
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(tl_off, 1, "timeline default must exclude the crawler");
+        assert_eq!(tl_on, 2, "timeline opt-in must include the crawler");
 
         // ---- query_dashboard_projects: empty short-circuit ----
         let empty_dash = backend
@@ -1912,7 +2064,11 @@ mod tests {
     #[tokio::test]
     async fn ch_dashboard_trend_omits_fabricated_percentage() {
         let Some((backend, client, _container)) = setup_clickhouse().await else {
-            return; // Docker not available, skip.
+            // Say so out loud. A silent `return` here reports `ok` for a test
+            // that executed nothing, which is how an untested query change can
+            // look verified — observed while reviewing this very file.
+            println!("SKIPPED: ClickHouse container unavailable — this test asserted NOTHING");
+            return;
         };
 
         let now = Utc::now();

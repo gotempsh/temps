@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
@@ -14,11 +17,11 @@ const SHORT_HASH_LEN: usize = 8;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicHostnameStrategy {
-    /// Preserve Temps' existing generated hostname layout (`{service}-{env}.base`).
+    /// Preserve Temps' existing generated hostname layout (`{service}--{env}.base`).
     #[default]
     Standard,
     /// Force generated service hostnames to one label below `preview_domain`
-    /// (`{env}-{service}.base`) so a single-label wildcard cert covers them.
+    /// (`{env}--{service}.base`) so a single-label wildcard cert covers them.
     Flat,
 }
 
@@ -54,8 +57,21 @@ impl PublicHostnameStrategy {
     }
 
     /// Per-service public host. This is the only layout that differs between
-    /// strategies: Standard yields `{service}-{environment}.base`, Flat yields
-    /// `{environment}-{service}.base`.
+    /// strategies: Standard yields `{service}--{environment}.base`, Flat
+    /// yields `{environment}--{service}.base`.
+    ///
+    /// The two halves are joined by a **double** hyphen, and that is a
+    /// security property rather than cosmetics. Docker Compose service names
+    /// come from the tenant's compose file, so with a single hyphen a service
+    /// named `foo` in an environment slugged `bar-prod` generates exactly the
+    /// hostname another tenant's environment `foo-bar-prod` owns — and route
+    /// insertion is first-come/vacancy-based, so whichever tenant is loaded
+    /// first captures the other's preview traffic.
+    ///
+    /// Every slug generator in the codebase collapses runs of hyphens
+    /// (`generate_slug`, `slugify_branch_name`), so no project, environment or
+    /// deployment slug can ever contain `--`. Using it as the separator makes
+    /// the collision structurally impossible instead of order-dependent.
     pub fn service_hostname(
         self,
         preview_domain: &str,
@@ -63,11 +79,11 @@ impl PublicHostnameStrategy {
         service: &str,
     ) -> String {
         let base = normalize_base_domain(preview_domain);
-        let raw = match self {
-            PublicHostnameStrategy::Standard => format!("{service}-{environment}.{base}"),
-            PublicHostnameStrategy::Flat => format!("{environment}-{service}.{base}"),
+        let label = match self {
+            PublicHostnameStrategy::Standard => namespaced_service_label(service, environment),
+            PublicHostnameStrategy::Flat => namespaced_service_label(environment, service),
         };
-        normalize_hostname(&raw, &base, self.force_single_label())
+        format!("{label}.{base}")
     }
 
     /// Deployment public host: `{deployment}.{base_domain}` (single label for both).
@@ -171,6 +187,45 @@ fn dns_label(label: &str, hash_seed: &str) -> String {
     }
 }
 
+/// Join two already-sanitized name parts into one DNS label using the
+/// double-hyphen namespace separator. Built here rather than via
+/// [`dns_label`] because that path collapses hyphen runs, which would erase
+/// the separator and reintroduce the ambiguity it exists to prevent.
+fn namespaced_service_label(first: &str, second: &str) -> String {
+    let combined = format!("{}--{}", sanitize_label(first), sanitize_label(second));
+    if combined.len() <= DNS_LABEL_MAX_LEN {
+        return combined;
+    }
+
+    // Over-long labels are truncated with a hash of the full name, so two
+    // different services that share a 55-character prefix still get distinct
+    // hostnames.
+    //
+    // The hash is joined with `--`, not `-`, and that is load-bearing. With a
+    // single hyphen the truncated form `first--second-<hash>` is a string an
+    // *untruncated* label can also produce, by picking a `second` that ends in
+    // `-<hash>` — and `short_hash` is plain SHA-256, so an attacker computes
+    // the target offline and squats another tenant's hostname, which is the
+    // exact collision this function exists to prevent. `sanitize_label`
+    // collapses hyphen runs, so neither part can itself contain `--`: an
+    // untruncated label therefore holds exactly one `--` and a truncated one
+    // holds two, making the two forms structurally impossible to confuse.
+    let suffix = format!("--{}", short_hash(&combined));
+    let max_prefix_len = DNS_LABEL_MAX_LEN.saturating_sub(suffix.len());
+    let prefix = combined
+        .chars()
+        .take(max_prefix_len)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+
+    if prefix.is_empty() {
+        short_hash(&combined)
+    } else {
+        format!("{prefix}{suffix}")
+    }
+}
+
 fn sanitize_label(label: &str) -> String {
     let mut output = String::new();
     let mut previous_hyphen = false;
@@ -212,7 +267,7 @@ mod tests {
     fn standard_service_hostname_preserves_existing_order() {
         assert_eq!(
             PublicHostnameStrategy::Standard.service_hostname("*.example.com", "staging", "files"),
-            "files-staging.example.com"
+            "files--staging.example.com"
         );
     }
 
@@ -220,8 +275,93 @@ mod tests {
     fn flat_service_hostname_uses_environment_first() {
         assert_eq!(
             PublicHostnameStrategy::Flat.service_hostname("example.com", "staging", "files"),
-            "staging-files.example.com"
+            "staging--files.example.com"
         );
+    }
+
+    /// A tenant-chosen Compose service name must not be able to generate the
+    /// hostname another tenant's environment owns. With a single-hyphen join,
+    /// service `foo` in environment `bar-prod` produced exactly
+    /// `foo-bar-prod.example.com` — the preview host of environment
+    /// `foo-bar-prod` — and whichever route was inserted first won.
+    #[test]
+    fn service_hostname_cannot_collide_with_an_environment_hostname() {
+        let squatted =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "bar-prod", "foo");
+        let victim =
+            PublicHostnameStrategy::Standard.environment_hostname("example.com", "foo-bar-prod");
+        assert_ne!(squatted, victim);
+        assert_eq!(squatted, "foo--bar-prod.example.com");
+        assert_eq!(victim, "foo-bar-prod.example.com");
+    }
+
+    /// The separator survives sanitization: a service name containing runs of
+    /// punctuation must not be able to smuggle its own `--` boundary in and
+    /// re-create the ambiguity from the other direction.
+    #[test]
+    fn service_names_cannot_forge_the_namespace_separator() {
+        let forged =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "prod", "foo--bar");
+        let genuine =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "bar-prod", "foo");
+        assert_ne!(forged, genuine);
+    }
+
+    /// Regression: a *truncated* label must not be reproducible by an
+    /// untruncated one.
+    ///
+    /// When the hash was joined with a single hyphen, `first--second-<hash>`
+    /// was a string an attacker could also produce untruncated, by choosing an
+    /// environment slug ending in `-<hash>` — and `short_hash` is plain
+    /// SHA-256, so the target is computable offline. Route insertion is
+    /// vacancy-based and cert-eligible, so whoever loads first captures the
+    /// other tenant's traffic and its on-demand certificate.
+    ///
+    /// The invariant that closes it: an untruncated label contains exactly one
+    /// `--` (sanitize_label collapses hyphen runs, so neither part can hold
+    /// one), a truncated label contains two.
+    #[test]
+    fn a_truncated_label_cannot_be_forged_by_an_untruncated_one() {
+        // Long enough to force truncation.
+        let victim_env = format!("prod-{}", "x".repeat(55));
+        let victim =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", &victim_env, "app");
+        let victim_label = victim.split('.').next().unwrap();
+        assert!(victim_label.len() <= 63);
+        assert_eq!(
+            victim_label.matches("--").count(),
+            2,
+            "a truncated label must carry both separators: {victim_label}"
+        );
+
+        // Replay the truncated label back as an attacker-chosen environment
+        // slug. Whatever it produces, it must not be the victim's hostname.
+        let stolen = victim_label
+            .strip_prefix("app--")
+            .expect("victim label starts with the service namespace");
+        let attacker =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", stolen, "app");
+        assert_ne!(
+            attacker, victim,
+            "an untruncated label reproduced a truncated one"
+        );
+    }
+
+    /// An over-long service+environment pair is truncated with a hash rather
+    /// than silently colliding on the shared prefix.
+    #[test]
+    fn overlong_service_labels_stay_distinct_and_within_dns_limits() {
+        let long_a = "a".repeat(60);
+        let long_b = format!("{}b", "a".repeat(59));
+        let host_a =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "prod", &long_a);
+        let host_b =
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "prod", &long_b);
+        assert_ne!(host_a, host_b);
+        for host in [&host_a, &host_b] {
+            let label = host.split('.').next().unwrap();
+            assert!(label.len() <= 63, "label {label} exceeds the DNS limit");
+        }
     }
 
     #[test]

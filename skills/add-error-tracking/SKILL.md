@@ -73,6 +73,49 @@ Always store the DSN in an environment variable. The exact variable name depends
 SENTRY_DSN=https://<public_key>@<temps-host>/<project_id>
 ```
 
+## Browser SDKs: also pass `tunnel`
+
+For every **browser** platform (Next.js client config, React, Vue, Svelte,
+vanilla JS — not server-side SDKs, not React Native/Flutter), also pass
+`tunnel` in the same `Sentry.init` call:
+
+```ts
+Sentry.init({
+  dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+  tunnel: process.env.NEXT_PUBLIC_SENTRY_TUNNEL,
+});
+```
+
+Why: without `tunnel`, the SDK POSTs straight to the DSN's host (the Temps
+console), which is a third-party, cross-origin request from the app's own
+domain — ad blockers commonly block it, and it costs a CORS preflight on
+every event. With `tunnel` set to a same-origin path, the browser posts to
+the app's own domain instead; Temps' proxy forwards anything under
+`/api/_temps` to the console regardless of which project domain it arrived
+on, so this works unmodified on custom domains and preview URLs.
+
+The value is a fixed path, not a secret — Temps injects it automatically as
+an env var alongside the DSN, under the same bundler-specific public prefix
+(so if the DSN reaches the client bundle, the tunnel path does too):
+
+| Platform | DSN env var | Tunnel env var |
+|---|---|---|
+| Next.js | `NEXT_PUBLIC_SENTRY_DSN` | `NEXT_PUBLIC_SENTRY_TUNNEL` |
+| Vite / React / Vue | `VITE_SENTRY_DSN` | `VITE_SENTRY_TUNNEL` |
+| SvelteKit | `PUBLIC_SENTRY_DSN` | `PUBLIC_SENTRY_TUNNEL` |
+| Angular | `SENTRY_DSN` (via `environment.ts`) | *(none — no public-prefix convention; skip `tunnel`)* |
+
+If deploying outside Temps (or the tunnel var isn't set for some other
+reason), just omit `tunnel` — the SDK falls back to posting straight to the
+DSN host, which still works, just cross-origin.
+
+Leave out `Sentry.replayIntegration()` and `tracesSampleRate` for browser
+projects unless you specifically want them — Temps doesn't yet ingest Sentry
+session replay or performance transactions, so that traffic would be
+uploaded (through the tunnel, using the visitor's bandwidth) and discarded
+server-side. Use Temps' own session replay and analytics SDKs for those
+instead (see the `add-session-recording` and `add-react-analytics` skills).
+
 ## Platform setup
 
 Every snippet below reads the DSN from an env var — do not hardcode it.
@@ -90,19 +133,23 @@ npm install @sentry/nextjs
 ```
 
 ```ts
-// sentry.client.config.ts
+// sentry.client.config.ts (or instrumentation-client.ts on newer @sentry/nextjs)
 import * as Sentry from '@sentry/nextjs';
 
 Sentry.init({
   dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-  integrations: [Sentry.replayIntegration()],
+  tunnel: process.env.NEXT_PUBLIC_SENTRY_TUNNEL,
 });
 ```
 
-Mirror the config in `sentry.server.config.ts` and `sentry.edge.config.ts` (same `dsn`, no replay).
+Mirror the `dsn` (no `tunnel`, no replay) in `sentry.server.config.ts` and
+`sentry.edge.config.ts` — those run server-side and post directly to the
+console.
+
+**Do not** set `tunnelRoute` in `withSentryConfig` — it's a different
+mechanism (forwards through a Next.js server route) and its own docs state
+it doesn't work with self-hosted Sentry, which is what Temps' DSN
+compatibility layer is. Use the `tunnel` option shown above instead.
 
 ### React (Vite, Remix, CRA)
 
@@ -116,11 +163,8 @@ import * as Sentry from '@sentry/react';
 
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,
+  tunnel: import.meta.env.VITE_SENTRY_TUNNEL,
   environment: import.meta.env.MODE,
-  integrations: [Sentry.replayIntegration()],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
 });
 ```
 
@@ -143,7 +187,7 @@ const app = createApp(App);
 Sentry.init({
   app,
   dsn: import.meta.env.VITE_SENTRY_DSN,
-  tracesSampleRate: 1.0,
+  tunnel: import.meta.env.VITE_SENTRY_TUNNEL,
 });
 
 app.mount('#app');
@@ -158,11 +202,11 @@ npx @sentry/wizard@latest -i sveltekit
 ```ts
 // src/hooks.client.ts
 import * as Sentry from '@sentry/sveltekit';
-import { PUBLIC_SENTRY_DSN } from '$env/static/public';
+import { PUBLIC_SENTRY_DSN, PUBLIC_SENTRY_TUNNEL } from '$env/static/public';
 
 Sentry.init({
   dsn: PUBLIC_SENTRY_DSN,
-  tracesSampleRate: 1.0,
+  tunnel: PUBLIC_SENTRY_TUNNEL,
 });
 
 export const handleError = Sentry.handleErrorWithSentry();
@@ -188,6 +232,8 @@ Sentry.init({
 ```
 
 Populate `environment.sentryDsn` from `process.env.SENTRY_DSN` at build time.
+No public-prefix tunnel var is injected for Angular (no bundler convention to
+mirror) — skip `tunnel` here; the SDK posts directly to the DSN host.
 
 ### Vanilla JavaScript (browser)
 
@@ -200,8 +246,7 @@ import * as Sentry from '@sentry/browser';
 
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,
-  tracesSampleRate: 1.0,
-  integrations: [Sentry.browserTracingIntegration(), Sentry.replayIntegration()],
+  tunnel: import.meta.env.VITE_SENTRY_TUNNEL,
 });
 ```
 
@@ -513,3 +558,5 @@ After wiring up:
 - **Minified stack traces**: Upload source maps (see above).
 - **Browser apps not reporting**: Make sure the env var uses the bundler's public prefix (`NEXT_PUBLIC_`, `VITE_`, `PUBLIC_`) so it reaches the client bundle.
 - **Events missing in production**: Confirm the deployment environment sets the DSN env var — local `.env` files are not copied automatically.
+- **Tunneled requests get 403**: the tunnel endpoint checks that the request's `Origin` (or `Referer`) matches the domain it arrived on — this rejects a script sending forged events to someone else's project, but also anything proxying/rewriting the request in a way that drops or rewrites `Origin`. Confirm nothing between the browser and the app strips that header.
+- **Tunneled requests get 404**: the tunnel resolves the project from the `Host` header via Temps' routing table — this only works for the domain(s) actually deployed on Temps. A `tunnel` env var used on a domain temps doesn't serve (e.g. testing against a different environment's URL) has nowhere to resolve to.

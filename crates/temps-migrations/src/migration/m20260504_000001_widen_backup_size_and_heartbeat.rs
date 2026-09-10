@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Widen `size_bytes` from INTEGER to BIGINT on `backups` and
 //! `external_service_backups`, and add a `last_heartbeat_at` column to
 //! `backups` for stuck-backup detection.

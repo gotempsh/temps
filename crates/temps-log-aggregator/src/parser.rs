@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Structured log line parser
 //!
 //! Attempts JSON parse on every incoming log line body. If valid JSON, extracts

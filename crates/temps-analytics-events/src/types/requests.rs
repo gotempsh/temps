@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::Deserialize;
 use temps_core::DateTime;
 use utoipa::ToSchema;
@@ -185,6 +188,23 @@ pub struct EventMetricsPayload {
     pub page_title: Option<String>,
     /// Referrer URL (falls back to Referer header if not provided)
     pub referrer: Option<String>,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    /// Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+    /// generates this value sends camelCase for every ingest endpoint.
+    #[serde(default, alias = "visitorId")]
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see `visitor_id`).
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// The tracked site's own domain, computed client-side by the SDK's
+    /// `resolveDomain()` and sent as a sibling of `event_data` (not nested
+    /// inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+    /// self-referrals/channels correctly: there, `Host` names the Temps
+    /// server rather than the customer's site, so it can't be used for that.
+    #[serde(default)]
+    pub domain: Option<String>,
     // Performance metrics (web vitals) - optional
     /// Time to First Byte (milliseconds)
     pub ttfb: Option<f32>,
@@ -268,6 +288,10 @@ pub struct PropertyBreakdownQuery {
     pub filter_channel: Option<String>,
     /// Filter by referrer hostname (for referrer -> pages drill-downs)
     pub filter_referrer: Option<String>,
+    /// Include crawler/bot traffic (default: false). Off by default so the
+    /// breakdown percentages share a denominator with the headline counts,
+    /// which always exclude crawlers.
+    pub include_crawlers: Option<bool>,
 }
 
 /// Optional filters for property breakdown drill-downs.
@@ -308,6 +332,9 @@ pub struct PropertyTimelineQuery {
     pub aggregation_level: AggregationLevel,
     /// Time bucket size: "hour", "day", "week", "month" (default: auto-detect)
     pub bucket_size: Option<String>,
+    /// Include crawler/bot traffic (default: false). See
+    /// [`PropertyBreakdownQuery::include_crawlers`].
+    pub include_crawlers: Option<bool>,
 }
 
 /// Query parameters for unique counts over time frame

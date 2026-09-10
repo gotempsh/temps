@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared deployment configuration for projects and environments
 //!
 //! This module defines configuration structures that can be shared between
@@ -337,6 +340,27 @@ pub struct DeploymentConfig {
     #[serde(default = "default_anti_affinity")]
     pub anti_affinity: bool,
 
+    /// Build one image per architecture the eligible nodes run.
+    ///
+    /// `None`/`false` (the default) builds exactly once, on the control
+    /// plane's native platform — byte-for-byte the behaviour of a
+    /// single-architecture cluster. When enabled and the nodes this
+    /// deployment could land on span more than one architecture, the build
+    /// job produces one image per architecture; the non-native ones go
+    /// through the daemon's `platform` option, which requires QEMU binfmt
+    /// handlers registered on the control plane.
+    ///
+    /// **Opt-in on purpose.** Cross-architecture builds are emulated and
+    /// substantially slower, and deriving them from cluster topology would
+    /// mean a single node joining silently changes build behaviour for every
+    /// deployment in the cluster. It also keeps the decision on operator
+    /// config rather than on a value each node reports about itself.
+    ///
+    /// `Option<bool>` so an environment inherits the project's setting
+    /// (`None`) or overrides it, matching `automatic_deploy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_architecture_builds: Option<bool>,
+
     /// Enable on-demand mode (scale-to-zero).
     /// When enabled, containers are stopped after `idle_timeout_seconds` of no traffic
     /// and automatically started when a new request arrives.
@@ -353,6 +377,45 @@ pub struct DeploymentConfig {
     /// Requests return 503 if exceeded. Default: 30.
     #[serde(default = "default_wake_timeout")]
     pub wake_timeout_seconds: i32,
+
+    /// Override for the proxy's upstream timeout on regular (non-streaming)
+    /// HTTP requests to this project/environment, in seconds.
+    /// `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+    /// (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+    /// "no timeout" for this project/environment, overriding a nonzero
+    /// global default. `Some(n)` for `n > 0` sets an explicit timeout,
+    /// always clamped to the global hard ceiling
+    /// (`request_timeouts.max_request_timeout_seconds`) at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's idle timeout on Server-Sent Events streams to
+    /// this project/environment, in seconds. `None` = inherit the global
+    /// `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+    /// the global hard ceiling at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_idle_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's idle timeout on WebSocket connections to this
+    /// project/environment, in seconds. `None` = inherit the global
+    /// `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+    /// the global hard ceiling at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's cap on concurrent in-flight requests to this
+    /// project/environment's upstream, independent of the timeout overrides
+    /// above. `None` = inherit the global
+    /// `connection_limits.default_max_concurrent_connections`. `Some(0)`
+    /// explicitly forces "unlimited" for this project/environment, overriding
+    /// a nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —
+    /// there is no global ceiling clamp here (unlike the timeout settings):
+    /// an operator who has explicitly set a per-project value has made a
+    /// deliberate choice and the platform should respect it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_connections: Option<i32>,
 }
 
 /// Deployment configuration snapshot for deployments
@@ -440,9 +503,14 @@ impl Default for DeploymentConfig {
             target_nodes: None,
             target_labels: None,
             anti_affinity: true,
+            cross_architecture_builds: None,
             on_demand: false,
             idle_timeout_seconds: 300,
             wake_timeout_seconds: 30,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
         }
     }
 }
@@ -469,6 +537,25 @@ impl DeploymentConfig {
     /// Create a new deployment configuration with default values
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return a node selector only when it names at least one node.
+    ///
+    /// Empty lists are the API sentinel for clearing an environment override.
+    /// Treating a legacy stored empty list as an override would either make the
+    /// workload unschedulable or erase a project-level placement constraint.
+    pub fn configured_target_nodes(&self) -> Option<&[i32]> {
+        self.target_nodes
+            .as_deref()
+            .filter(|nodes| !nodes.is_empty())
+    }
+
+    /// Return a label selector only when it contains at least one label.
+    /// Empty objects are the API sentinel for clearing an environment override.
+    pub fn configured_target_labels(&self) -> Option<&serde_json::Value> {
+        self.target_labels
+            .as_ref()
+            .filter(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
     }
 
     /// Merge this config with another, preferring values from `other`
@@ -503,17 +590,25 @@ impl DeploymentConfig {
                 (None, Some(override_security)) => Some(override_security.clone()),
                 (None, None) => None,
             },
-            // Environment-level target_nodes overrides project-level
+            // A non-empty environment selector overrides the project. Empty
+            // selectors mean "clear this override", so inherit the project
+            // selector instead of erasing its placement boundary.
             target_nodes: other
-                .target_nodes
-                .clone()
-                .or_else(|| self.target_nodes.clone()),
-            // Environment-level target_labels overrides project-level
+                .configured_target_nodes()
+                .map(<[i32]>::to_vec)
+                .or_else(|| self.configured_target_nodes().map(<[i32]>::to_vec)),
             target_labels: other
-                .target_labels
-                .clone()
-                .or_else(|| self.target_labels.clone()),
+                .configured_target_labels()
+                .cloned()
+                .or_else(|| self.configured_target_labels().cloned()),
             anti_affinity: other.anti_affinity,
+            // Env-wins, inheriting the project when unset — same semantics as
+            // `automatic_deploy`. Deliberately not `||`: an environment must be
+            // able to turn cross-builds *off* for a project that has them on,
+            // which an OR would make impossible.
+            cross_architecture_builds: other
+                .cross_architecture_builds
+                .or(self.cross_architecture_builds),
             on_demand: other.on_demand || self.on_demand,
             idle_timeout_seconds: if other.idle_timeout_seconds != 300 {
                 other.idle_timeout_seconds
@@ -525,6 +620,18 @@ impl DeploymentConfig {
             } else {
                 self.wake_timeout_seconds
             },
+            request_timeout_seconds: other
+                .request_timeout_seconds
+                .or(self.request_timeout_seconds),
+            sse_idle_timeout_seconds: other
+                .sse_idle_timeout_seconds
+                .or(self.sse_idle_timeout_seconds),
+            websocket_idle_timeout_seconds: other
+                .websocket_idle_timeout_seconds
+                .or(self.websocket_idle_timeout_seconds),
+            max_concurrent_connections: other
+                .max_concurrent_connections
+                .or(self.max_concurrent_connections),
         }
     }
 
@@ -535,6 +642,25 @@ impl DeploymentConfig {
         if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
             if limit != 0 && request > limit {
                 return Err("CPU request cannot exceed CPU limit".to_string());
+            }
+        }
+
+        // Negative values are never meaningful here, and for `memory_limit` a
+        // negative is actively dangerous: `parse_memory_mb` rejects it and the
+        // deployer then leaves Docker's memory cgroup unset, so `-1` runs the
+        // container *uncapped* while reading like a tighter limit than `0`.
+        for (name, value) in [
+            ("CPU request", self.cpu_request),
+            ("CPU limit", self.cpu_limit),
+            ("Memory request", self.memory_request),
+            ("Memory limit", self.memory_limit),
+        ] {
+            if let Some(value) = value {
+                if value < 0 {
+                    return Err(format!(
+                        "{name} cannot be negative, got {value} (use 0 for unlimited)"
+                    ));
+                }
             }
         }
 
@@ -577,7 +703,125 @@ impl DeploymentConfig {
             }
         }
 
+        // Sanity bounds only — the operator's hard ceiling
+        // (`AppSettings.request_timeouts.max_request_timeout_seconds`) is
+        // enforced separately at resolution time, since this type has no
+        // access to global settings. `0` is a valid explicit "no timeout"
+        // override (same uncapped-sentinel convention as `cpu_limit`/
+        // `memory_limit` above), so the floor is 0, not 1.
+        for (name, value) in [
+            ("Request timeout", self.request_timeout_seconds),
+            ("SSE idle timeout", self.sse_idle_timeout_seconds),
+            (
+                "WebSocket idle timeout",
+                self.websocket_idle_timeout_seconds,
+            ),
+        ] {
+            if let Some(seconds) = value {
+                if !(0..=86400).contains(&seconds) {
+                    return Err(format!(
+                        "{name} {seconds} is not in valid range (0-86400 seconds, 0 = no timeout)"
+                    ));
+                }
+            }
+        }
+
+        if let Some(max_conn) = self.max_concurrent_connections {
+            if max_conn < 0 {
+                return Err(format!(
+                    "max_concurrent_connections cannot be negative, got {}",
+                    max_conn
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Check this config against the operator's tenant resource ceilings.
+    ///
+    /// Three of the per-project overrides above use `Some(0)` as an explicit
+    /// "unlimited" sentinel that beats the instance-wide default: memory limit,
+    /// concurrent-connection cap, and the request/SSE/WebSocket timeouts. That
+    /// is deliberate — a dedicated workload sometimes needs it — but on a
+    /// shared instance it also means anyone who can edit a project's config can
+    /// opt that project out of the operator's global guardrails.
+    ///
+    /// Ceilings close that off *only when an operator has set them*. Every
+    /// field defaults to unenforced, so an upgrade changes nothing until the
+    /// operator opts in. Violations are **rejected with a reason**, never
+    /// silently clamped, so the user sees why their value did not take.
+    ///
+    /// Returns every violation rather than the first, so a form with two bad
+    /// fields does not need two round trips to fix.
+    pub fn check_against_tenant_ceilings(
+        &self,
+        ceilings: &temps_core::TenantResourceCeilings,
+    ) -> Result<(), Vec<String>> {
+        if ceilings.is_unenforced() {
+            return Ok(());
+        }
+
+        let mut violations = Vec::new();
+
+        // `<= 0`, not `== 0`, on both of these. `validate()` rejects negatives,
+        // but the ceiling must not depend on that: a negative memory limit is
+        // *also* uncapped in practice — `parse_memory_mb` returns `None` for
+        // anything below zero and the deployer then leaves Docker's cgroup cap
+        // unset entirely. Matching only the `0` sentinel would let `-1` through
+        // as "some finite value below the ceiling" and produce exactly the
+        // unlimited container the ceiling exists to prevent.
+        if ceilings.max_memory_limit_mb > 0 {
+            let ceiling = ceilings.max_memory_limit_mb as i64;
+            match self.memory_limit {
+                Some(mb) if mb <= 0 => violations.push(format!(
+                    "Memory limit cannot be set to unlimited: this instance caps it at {ceiling} MB"
+                )),
+                Some(mb) if i64::from(mb) > ceiling => violations.push(format!(
+                    "Memory limit {mb} MB exceeds this instance's maximum of {ceiling} MB"
+                )),
+                _ => {}
+            }
+        }
+
+        if ceilings.max_concurrent_connections > 0 {
+            let ceiling = ceilings.max_concurrent_connections as i64;
+            match self.max_concurrent_connections {
+                Some(n) if n <= 0 => violations.push(format!(
+                    "Concurrent connections cannot be set to unlimited: this instance caps them at {ceiling}"
+                )),
+                Some(n) if i64::from(n) > ceiling => violations.push(format!(
+                    "Concurrent connection limit {n} exceeds this instance's maximum of {ceiling}"
+                )),
+                _ => {}
+            }
+        }
+
+        // Nonzero timeouts need no ceiling here — they are already clamped to
+        // `request_timeouts.max_*` at resolution time. Only the `Some(0)`
+        // "no timeout" sentinel escapes that clamp, so that is all this checks.
+        if !ceilings.allow_unlimited_request_timeouts {
+            for (name, value) in [
+                ("Request timeout", self.request_timeout_seconds),
+                ("SSE idle timeout", self.sse_idle_timeout_seconds),
+                (
+                    "WebSocket idle timeout",
+                    self.websocket_idle_timeout_seconds,
+                ),
+            ] {
+                if value == Some(0) {
+                    violations.push(format!(
+                        "{name} cannot be set to unlimited (0) on this instance"
+                    ));
+                }
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
     }
 }
 
@@ -634,6 +878,46 @@ impl DeploymentConfigSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-architecture builds are emulated and slow, so they must stay off
+    /// until someone asks for them — and an environment must be able to turn
+    /// them off again for a project that has them on.
+    #[test]
+    fn test_cross_architecture_builds_merge_semantics() {
+        let project_on = DeploymentConfig {
+            cross_architecture_builds: Some(true),
+            ..Default::default()
+        };
+        let env_unset = DeploymentConfig::default();
+        let env_off = DeploymentConfig {
+            cross_architecture_builds: Some(false),
+            ..Default::default()
+        };
+
+        // Off by default: nobody pays for an emulated build they didn't ask for.
+        assert_eq!(env_unset.cross_architecture_builds, None);
+
+        // An environment that says nothing inherits the project.
+        assert_eq!(
+            project_on.merge(&env_unset).cross_architecture_builds,
+            Some(true)
+        );
+
+        // ...and one that says `false` overrides it. An `||` merge (which is
+        // what the neighbouring booleans use) would make this impossible.
+        assert_eq!(
+            project_on.merge(&env_off).cross_architecture_builds,
+            Some(false)
+        );
+
+        // Neither set stays unset; the read site treats that as disabled.
+        assert_eq!(
+            DeploymentConfig::default()
+                .merge(&env_unset)
+                .cross_architecture_builds,
+            None
+        );
+    }
 
     #[test]
     fn test_default_config() {
@@ -758,9 +1042,37 @@ mod tests {
         let merged2 = project_config.merge(&env_no_nodes);
         assert_eq!(merged2.target_nodes, Some(vec![1, 2]));
 
+        // A legacy persisted empty environment selector means the override was
+        // cleared; it must inherit rather than erase the project constraint.
+        let env_empty_nodes = DeploymentConfig {
+            target_nodes: Some(vec![]),
+            ..Default::default()
+        };
+        let merged3 = project_config.merge(&env_empty_nodes);
+        assert_eq!(merged3.target_nodes, Some(vec![1, 2]));
+
         // Both None → None
         let both_none = DeploymentConfig::default().merge(&DeploymentConfig::default());
         assert_eq!(both_none.target_nodes, None);
+    }
+
+    #[test]
+    fn test_empty_environment_target_labels_inherit_project_constraint() {
+        let project_config = DeploymentConfig {
+            target_labels: Some(serde_json::json!({"region": "eu"})),
+            ..Default::default()
+        };
+        let env_config = DeploymentConfig {
+            target_labels: Some(serde_json::json!({})),
+            ..Default::default()
+        };
+
+        let merged = project_config.merge(&env_config);
+
+        assert_eq!(
+            merged.target_labels,
+            Some(serde_json::json!({"region": "eu"}))
+        );
     }
 
     #[test]
@@ -780,6 +1092,89 @@ mod tests {
         };
         let json2 = serde_json::to_value(&config_no_nodes).unwrap();
         assert!(!json2.as_object().unwrap().contains_key("target_nodes"));
+    }
+
+    #[test]
+    fn request_timeout_fields_default_to_inherit() {
+        let config = DeploymentConfig::default();
+        assert_eq!(config.request_timeout_seconds, None);
+        assert_eq!(config.sse_idle_timeout_seconds, None);
+        assert_eq!(config.websocket_idle_timeout_seconds, None);
+    }
+
+    #[test]
+    fn merge_env_request_timeout_overrides_project() {
+        // Three-state semantics (like memory_limit, not the idle_timeout_seconds
+        // sentinel pattern): env None must inherit project's value, env Some
+        // must win outright.
+        let project = DeploymentConfig {
+            request_timeout_seconds: Some(30),
+            sse_idle_timeout_seconds: Some(1800),
+            websocket_idle_timeout_seconds: Some(1800),
+            ..Default::default()
+        };
+
+        let env_override = DeploymentConfig {
+            request_timeout_seconds: Some(10),
+            ..Default::default()
+        };
+        let merged = project.merge(&env_override);
+        assert_eq!(merged.request_timeout_seconds, Some(10));
+        // Env left these unset -> inherit project's values.
+        assert_eq!(merged.sse_idle_timeout_seconds, Some(1800));
+        assert_eq!(merged.websocket_idle_timeout_seconds, Some(1800));
+
+        let env_no_override = DeploymentConfig::default();
+        let merged2 = project.merge(&env_no_override);
+        assert_eq!(merged2.request_timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn request_timeout_fields_round_trip_and_omit_when_none() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(45),
+            sse_idle_timeout_seconds: Some(900),
+            websocket_idle_timeout_seconds: Some(1200),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        let deserialized: DeploymentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, config);
+
+        let default_config = DeploymentConfig::default();
+        let json2 = serde_json::to_value(&default_config).unwrap();
+        let obj = json2.as_object().unwrap();
+        assert!(!obj.contains_key("requestTimeoutSeconds"));
+        assert!(!obj.contains_key("sseIdleTimeoutSeconds"));
+        assert!(!obj.contains_key("websocketIdleTimeoutSeconds"));
+    }
+
+    #[test]
+    fn request_timeout_validation_rejects_out_of_range() {
+        // 0 is a valid explicit "no timeout" override, not a validation error.
+        let no_timeout_override = DeploymentConfig {
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert!(no_timeout_override.validate().is_ok());
+
+        let negative = DeploymentConfig {
+            request_timeout_seconds: Some(-1),
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
+
+        let too_high = DeploymentConfig {
+            sse_idle_timeout_seconds: Some(90_000),
+            ..Default::default()
+        };
+        assert!(too_high.validate().is_err());
+
+        let ok = DeploymentConfig {
+            websocket_idle_timeout_seconds: Some(3600),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
@@ -816,6 +1211,163 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid_port.validate().is_err());
+    }
+
+    /// The whole contract of the default ceilings: an instance that has never
+    /// configured them accepts exactly what it accepted before, including the
+    /// `0 = unlimited` sentinels.
+    #[test]
+    fn default_ceilings_accept_every_unlimited_sentinel() {
+        let ceilings = temps_core::TenantResourceCeilings::default();
+        let config = DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            sse_idle_timeout_seconds: Some(0),
+            websocket_idle_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+
+        assert!(config.check_against_tenant_ceilings(&ceilings).is_ok());
+    }
+
+    #[test]
+    fn configured_ceilings_reject_unlimited_and_over_ceiling_values() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            allow_unlimited_request_timeouts: false,
+        };
+
+        // `0` means "opt out of the global cap" — the exact thing a ceiling exists to stop.
+        let unlimited = DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            sse_idle_timeout_seconds: Some(0),
+            websocket_idle_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let violations = unlimited
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("unlimited overrides must be rejected under ceilings");
+        // All five reported at once, not just the first.
+        assert_eq!(violations.len(), 5, "got: {violations:?}");
+
+        let over = DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let violations = over
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("values above the ceiling must be rejected");
+        assert_eq!(violations.len(), 2, "got: {violations:?}");
+        // The message has to name the ceiling, or the user cannot pick a legal value.
+        assert!(violations[0].contains("4096"), "got: {violations:?}");
+        assert!(violations[1].contains("200"), "got: {violations:?}");
+    }
+
+    #[test]
+    fn configured_ceilings_accept_values_at_and_below_the_ceiling() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            allow_unlimited_request_timeouts: false,
+        };
+
+        let at_ceiling = DeploymentConfig {
+            memory_limit: Some(4096),
+            max_concurrent_connections: Some(200),
+            // Nonzero timeouts are clamped at resolution time, not here.
+            request_timeout_seconds: Some(3600),
+            ..Default::default()
+        };
+        assert!(at_ceiling.check_against_tenant_ceilings(&ceilings).is_ok());
+
+        // `None` = inherit the instance default, which is always within the ceiling.
+        let inheriting = DeploymentConfig::default();
+        assert!(inheriting.check_against_tenant_ceilings(&ceilings).is_ok());
+    }
+
+    /// Regression: a negative limit is uncapped in practice, so it must not be
+    /// able to slip past a ceiling by looking like "a small finite value".
+    ///
+    /// `-1` formats to `"-1Mi"`, `parse_memory_mb` returns `None` for anything
+    /// below zero, and the deployer leaves Docker's memory cgroup unset — the
+    /// exact outcome `Some(0)` is refused for.
+    #[test]
+    fn negative_limits_are_treated_as_unlimited_by_the_ceiling() {
+        let ceilings = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            max_concurrent_connections: 200,
+            ..temps_core::TenantResourceCeilings::default()
+        };
+        let negative = DeploymentConfig {
+            memory_limit: Some(-1),
+            max_concurrent_connections: Some(-1),
+            ..Default::default()
+        };
+
+        let violations = negative
+            .check_against_tenant_ceilings(&ceilings)
+            .expect_err("a negative limit is uncapped and must be refused");
+        assert_eq!(violations.len(), 2, "got: {violations:?}");
+        assert!(violations[0].contains("unlimited"), "got: {violations:?}");
+    }
+
+    /// Defence in depth for the same hole: a negative never reaches the ceiling
+    /// check because it is not a storable value in the first place.
+    #[test]
+    fn validation_rejects_negative_resource_values() {
+        for config in [
+            DeploymentConfig {
+                memory_limit: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                memory_request: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                cpu_limit: Some(-1),
+                ..Default::default()
+            },
+            DeploymentConfig {
+                cpu_request: Some(-1),
+                ..Default::default()
+            },
+        ] {
+            let error = config
+                .validate()
+                .expect_err("negative resource values must be rejected");
+            assert!(error.contains("cannot be negative"), "got: {error}");
+        }
+
+        // `0` stays valid — it is the documented "unlimited" sentinel.
+        let uncapped = DeploymentConfig {
+            memory_limit: Some(0),
+            cpu_limit: Some(0),
+            ..Default::default()
+        };
+        assert!(uncapped.validate().is_ok());
+    }
+
+    /// Ceilings are independent: setting one must not start enforcing the others.
+    #[test]
+    fn ceilings_are_enforced_independently() {
+        let memory_only = temps_core::TenantResourceCeilings {
+            max_memory_limit_mb: 4096,
+            ..temps_core::TenantResourceCeilings::default()
+        };
+        let config = DeploymentConfig {
+            memory_limit: Some(1024),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+
+        assert!(config.check_against_tenant_ceilings(&memory_only).is_ok());
     }
 
     #[test]

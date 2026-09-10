@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sea-ORM entity for the `backup_alerts` table.
 //!
 //! Backup alerts represent two failure modes that are otherwise invisible:

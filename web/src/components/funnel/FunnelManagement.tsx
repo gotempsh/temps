@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse, FunnelResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -30,7 +33,8 @@ import { format, subDays } from 'date-fns'
 import { BarChart3, Calendar as CalendarIcon, Plus } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { FunnelCard } from './FunnelCard'
 
 interface FunnelManagementProps {
@@ -77,34 +81,10 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
     },
   })
 
-  // Keyboard shortcut: press "N" (no modifiers) to create a new funnel.
-  // Skipped when typing in inputs / textareas / contenteditable.
-  React.useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (
-        e.key !== 'n' ||
-        e.metaKey ||
-        e.ctrlKey ||
-        e.shiftKey ||
-        e.altKey
-      ) {
-        return
-      }
-      const target = e.target as HTMLElement | null
-      if (
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.isContentEditable)
-      ) {
-        return
-      }
-      e.preventDefault()
-      navigate(`/projects/${project.slug}/analytics/funnels/create`)
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [navigate, project.slug])
+  useKeyboardShortcut({
+    key: 'n',
+    path: `/projects/${project.slug}/analytics/funnels/create`,
+  })
 
   const handleDelete = (funnelId: number) => {
     setDeletingId(funnelId)

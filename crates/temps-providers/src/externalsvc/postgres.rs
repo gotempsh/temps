@@ -1,8 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
 use serde::{Deserialize, Serialize};
@@ -38,6 +41,18 @@ use super::{
 /// caused the healthcheck bug this crate's `postgres_healthcheck_cmd` fixes.
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let valid_key = key
+        .chars()
+        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    valid_key.then(|| format!("export {key}={}", shell_escape(value)))
 }
 
 /// Rejections from same-version-only [`PostgresService::upgrade`]. The
@@ -151,26 +166,26 @@ pub(crate) fn validate_pg_username(name: &str) -> std::result::Result<(), String
 pub struct PostgresInputConfig {
     /// PostgreSQL host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// PostgreSQL port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// PostgreSQL database name
     #[serde(default = "default_database")]
-    #[schemars(example = "example_database", default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
     pub database: String,
 
     /// PostgreSQL username
     #[serde(default = "default_username")]
-    #[schemars(example = "example_username", default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
     pub username: String,
 
     /// PostgreSQL password (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_password")]
-    #[schemars(with = "Option<String>", example = "example_password")]
+    #[schemars(with = "Option<String>", example = example_password())]
     pub password: Option<String>,
 
     /// Maximum number of connections
@@ -179,19 +194,19 @@ pub struct PostgresInputConfig {
         deserialize_with = "deserialize_max_connections"
     )]
     #[schemars(
-        example = "example_max_connections",
+        example = example_max_connections(),
         default = "default_max_connections"
     )]
     pub max_connections: u32,
 
     /// SSL mode (disable, allow, prefer, require)
     #[serde(default = "default_ssl_mode")]
-    #[schemars(example = "example_ssl_mode", default = "default_ssl_mode_string")]
+    #[schemars(example = example_ssl_mode(), default = "default_ssl_mode_string")]
     pub ssl_mode: Option<String>,
 
     /// Docker image to use (defaults to gotempsh/postgres-walg:18-bookworm, supports timescale/timescaledb-ha:pg18)
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: Option<String>,
 
     /// Real Docker container name when this service was imported from an
@@ -303,8 +318,8 @@ fn default_username() -> String {
 }
 
 pub fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(16)
         .map(char::from)
@@ -325,6 +340,162 @@ fn default_ssl_mode_string() -> String {
 
 fn default_docker_image() -> Option<String> {
     Some("gotempsh/postgres-walg:18-bookworm".to_string())
+}
+
+/// Every PostgreSQL-flavoured image the platform is allowed to pull and run.
+///
+/// This is an exact-match allowlist on purpose (never a substring/prefix test):
+/// a service's `docker_image` comes from client-deserializable parameters, and
+/// backup/restore helpers pull and execute it in sidecar containers, so a
+/// permissive match is remote code execution.
+///
+/// Because it is exact, it must list *every* image any other part of the
+/// product can put on a service, or that service becomes permanently
+/// un-initializable — `get_postgres_config` runs this check on every read of
+/// the config, so an unlisted image doesn't just block creation, it blocks
+/// deploys of every app linked to the service. Three sources feed it:
+///
+/// - images this repo builds (`images/*-walg/Dockerfile`),
+/// - images the console offers as upgrade targets
+///   (`web/src/components/storage/UpgradeServiceDialog.tsx`),
+/// - upstream images container discovery classifies as Postgres
+///   (`services.rs`, which matches `postgres` / `timescaledb` / `pgvector`).
+///
+/// Adding an image to any of those without adding it here is the bug this
+/// list keeps regressing into.
+///
+/// Operators can extend (never shrink) this set via
+/// `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` — see
+/// [`extra_allowed_postgres_docker_images`].
+const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
+    "gotempsh/postgres-walg:15-bookworm",
+    "gotempsh/postgres-walg:16-bookworm",
+    "gotempsh/postgres-walg:17-bookworm",
+    "gotempsh/postgres-walg:18-bookworm",
+    "gotempsh/pgvector-walg:pg17",
+    "gotempsh/pgvector-walg:pg18",
+    "gotempsh/timescaledb-walg:pg18",
+    "pgvector/pgvector:pg15",
+    "pgvector/pgvector:pg16",
+    "pgvector/pgvector:pg17",
+    "pgvector/pgvector:pg18",
+    "timescale/timescaledb-ha:pg17",
+    "timescale/timescaledb-ha:pg18",
+];
+
+/// Environment variable an operator sets to allow additional PostgreSQL images
+/// (comma-separated). This is deliberately host-level rather than an API
+/// setting: which images this machine may pull and execute is the operator's
+/// policy, and keeping it off the API avoids adding a write surface that can
+/// widen container execution.
+///
+/// Requires a restart to take effect, like the other process-wide operator
+/// knobs documented in `CLAUDE.md`.
+pub(crate) const EXTRA_POSTGRES_IMAGES_ENV: &str = "TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES";
+
+/// Parse the operator-provided image list.
+///
+/// Split on commas, trim, drop empties. Entries are kept verbatim otherwise —
+/// matching stays exact, so an entry without a `:tag` or `@sha256:` digest can
+/// never match a real service image. Those are returned separately as
+/// `suspicious` so startup can warn about them instead of silently ignoring
+/// them: a self-hosted operator who typo'd the variable gets told, rather than
+/// re-reading the same rejection error with no idea why their entry did
+/// nothing.
+fn parse_extra_allowed_images(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut images = Vec::new();
+    let mut suspicious = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // A tag/digest separator must appear after the final `/`, otherwise the
+        // only `:` is a registry port (e.g. `registry.internal:5000/pg`).
+        let name_start = entry.rfind('/').map_or(0, |i| i + 1);
+        if !entry[name_start..].contains(':') && !entry.contains('@') {
+            suspicious.push(entry.to_string());
+        }
+        images.push(entry.to_string());
+    }
+    (images, suspicious)
+}
+
+/// Operator-supplied additions to [`ALLOWED_POSTGRES_DOCKER_IMAGES`], read once
+/// per process.
+///
+/// Additive by design: the built-in list stays the floor so a typo in this
+/// variable cannot strand every existing Postgres service. `get_postgres_config`
+/// validates on every read of a service's config, so shrinking the allowlist
+/// would not merely block new services — it would make existing ones
+/// permanently un-initializable and block deploys of every app linked to them.
+fn extra_allowed_postgres_docker_images() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        let Ok(raw) = std::env::var(EXTRA_POSTGRES_IMAGES_ENV) else {
+            return Vec::new();
+        };
+        let (images, suspicious) = parse_extra_allowed_images(&raw);
+        if !suspicious.is_empty() {
+            warn!(
+                "{} contains {} entr{} without a tag or digest ({}). Matching is exact, so \
+                 these can never match a service image — did you mean e.g. 'postgis/postgis:18-3.5'?",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                suspicious.len(),
+                if suspicious.len() == 1 { "y" } else { "ies" },
+                suspicious.join(", ")
+            );
+        }
+        if !images.is_empty() {
+            info!(
+                "{} allows {} additional PostgreSQL image(s): {}",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                images.len(),
+                images.join(", ")
+            );
+        }
+        images
+    })
+}
+
+/// Exact-match membership test over the built-in list plus the operator's
+/// additions.
+///
+/// Split out from [`validate_postgres_docker_image`] so the composition is
+/// testable without mutating process environment or racing the `OnceLock`.
+fn is_allowed_postgres_docker_image(docker_image: &str, extra: &[String]) -> bool {
+    ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image)
+        || extra.iter().any(|allowed| allowed == docker_image)
+}
+
+pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
+    if is_allowed_postgres_docker_image(docker_image, extra_allowed_postgres_docker_images()) {
+        Ok(())
+    } else {
+        // Name the escape hatch. A self-hosted operator hitting this has no
+        // support channel; without this sentence the error is a dead end that
+        // reads as "temps cannot run your image" rather than "temps has not
+        // been told it may".
+        let extra = extra_allowed_postgres_docker_images();
+        Err(anyhow::anyhow!(
+            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}{}. \
+             To allow additional images on this instance, set {} to a comma-separated \
+             list (e.g. {}=postgis/postgis:18-3.5) and restart temps.",
+            docker_image,
+            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", "),
+            if extra.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (plus {} from {})",
+                    extra.join(", "),
+                    EXTRA_POSTGRES_IMAGES_ENV
+                )
+            },
+            EXTRA_POSTGRES_IMAGES_ENV,
+            EXTRA_POSTGRES_IMAGES_ENV
+        ))
+    }
 }
 
 // Schema example functions
@@ -389,8 +560,13 @@ impl PostgresService {
         let input_config: PostgresInputConfig =
             serde_json::from_value(service_config.parameters)
                 .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
-        // Then convert to PostgresConfig which applies additional transformations
-        Ok(PostgresConfig::from(input_config))
+        let postgres_config = PostgresConfig::from(input_config);
+        // Imported-service metadata is client-deserializable and therefore
+        // cannot be used as an authorization signal. Every image must remain
+        // allowlisted because backup/restore helpers may pull and execute it
+        // even when the primary database container already exists.
+        validate_postgres_docker_image(&postgres_config.docker_image)?;
+        Ok(postgres_config)
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
@@ -407,6 +583,21 @@ impl PostgresService {
             .container_name
             .clone()
             .unwrap_or_else(|| self.get_container_name())
+    }
+
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_postgres_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            ),
+        })
     }
 
     /// Creates and starts the PostgreSQL container, retrying with a fresh host
@@ -475,25 +666,9 @@ impl PostgresService {
         // Pull image first
         info!("Pulling PostgreSQL image {}", config.docker_image);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (config.docker_image.clone(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let container_name = self.get_container_name();
         let volume_name = format!("{}_data", container_name);
@@ -633,6 +808,19 @@ impl PostgresService {
                 ),
                 "-c".to_string(),
                 "archive_timeout=60".to_string(),
+                // Enable pg_stat_statements at provision time so the extension
+                // can be created after startup. A restart (not just a reload)
+                // is required to change shared_preload_libraries, so this is
+                // set once at container-creation time. Existing services
+                // provisioned before this change need a container restart
+                // (via the restart endpoint) for the change to take effect.
+                // Merged with any library the image itself requires (e.g.
+                // `timescaledb`) — see `shared_preload_libraries_for_image`.
+                "-c".to_string(),
+                format!(
+                    "shared_preload_libraries={}",
+                    Self::shared_preload_libraries_for_image(&config.docker_image)
+                ),
             ]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
@@ -848,7 +1036,8 @@ impl PostgresService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -1058,115 +1247,142 @@ impl PostgresService {
     /// the exact bug we're trying to avoid.
     async fn compute_desired_enable_archiving(&self) -> bool {
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
-        self.walg_env_exists_on_volume(&volume_name).await
+        self.walg_env_exists_in_container(&container_name).await
     }
 
-    /// Returns true iff `/var/lib/postgresql/walg.env` exists on the named
-    /// Docker volume. Runs a one-shot `busybox` container with the volume
-    /// mounted read-only. Any error (image pull, exec failure) returns
-    /// false — we err on the side of not enabling archiving.
-    async fn walg_env_exists_on_volume(&self, volume_name: &str) -> bool {
-        use bollard::query_parameters::{
-            CreateContainerOptions, CreateImageOptions, RemoveContainerOptions,
-            StartContainerOptions, WaitContainerOptions,
-        };
+    /// Returns true iff `/var/lib/postgresql/walg.env` exists on this
+    /// service's data volume. Docker's archive API can read a stopped
+    /// container's mounted volume without pulling or executing a mutable
+    /// helper image against database data.
+    ///
+    /// The live container is probed directly when it exists. Otherwise
+    /// (fresh create, `force_recreate`, an externally-removed container, or
+    /// node failover) there's no container to probe, but the volume can
+    /// still hold a `walg.env` from a prior life -- probed via a throwaway
+    /// container that only mounts the named volume and is never started
+    /// (see `walg_env_exists_on_volume`).
+    async fn walg_env_exists_in_container(&self, container_name: &str) -> bool {
+        let live = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map(|containers| !containers.is_empty())
+            .unwrap_or(false);
+
+        if live {
+            return self.download_walg_env(container_name).await;
+        }
+
+        let volume_name = format!("{container_name}_data");
+        let probe_image = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.docker_image.clone())
+            .unwrap_or_else(|| {
+                let (image, tag) = self.get_default_docker_image();
+                format!("{image}:{tag}")
+            });
+        self.walg_env_exists_on_volume(&volume_name, &probe_image)
+            .await
+    }
+
+    /// Reads `/var/lib/postgresql/walg.env` from a live container's
+    /// filesystem via Docker's archive API.
+    async fn download_walg_env(&self, container_name: &str) -> bool {
+        use bollard::query_parameters::DownloadFromContainerOptions;
         use futures::StreamExt;
 
-        // Pull busybox; cheap (~700 KB) and cached after first use.
-        let mut pull_stream = self.docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some("busybox".to_string()),
-                tag: Some("latest".to_string()),
-                ..Default::default()
+        let mut archive_stream = self.docker.download_from_container(
+            container_name,
+            Some(DownloadFromContainerOptions {
+                path: "/var/lib/postgresql/walg.env".to_string(),
             }),
-            None,
-            None,
         );
-        while let Some(result) = pull_stream.next().await {
-            if result.is_err() {
-                // Best-effort; treat unavailability as "no archiving".
-                return false;
+        let mut saw_archive_data = false;
+        while let Some(chunk) = archive_stream.next().await {
+            match chunk {
+                Ok(bytes) if !bytes.is_empty() => saw_archive_data = true,
+                Ok(_) => {}
+                Err(_) => return false,
             }
         }
 
-        let probe_name = format!("temps-walg-probe-{}", uuid::Uuid::new_v4());
-        let host_config = bollard::models::HostConfig {
-            mounts: Some(vec![bollard::models::Mount {
-                target: Some("/var/lib/postgresql".to_string()),
-                source: Some(volume_name.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                read_only: Some(true),
-                ..Default::default()
-            }]),
-            auto_remove: Some(false),
-            ..Default::default()
-        };
+        saw_archive_data
+    }
+
+    /// Probes `volume_name` for `walg.env` by creating a never-started
+    /// container that mounts it at `/var/lib/postgresql`, reading it via
+    /// the same archive API `download_walg_env` uses, then removing the
+    /// probe container. The probe container is never started, so
+    /// `probe_image`'s content never executes -- it only needs to exist so
+    /// Docker can materialize the container's filesystem for the archive
+    /// read. `probe_image` is the service's own already-vetted image
+    /// (already local from the container that used to run against this
+    /// volume), so this never pulls or trusts anything new.
+    async fn walg_env_exists_on_volume(&self, volume_name: &str, probe_image: &str) -> bool {
+        let probe_name = format!("{volume_name}-walg-probe");
+
+        let _ = self
+            .docker
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
 
         let create_result = self
             .docker
             .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(probe_name.clone()),
-                    ..Default::default()
-                }),
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&probe_name)
+                        .build(),
+                ),
                 bollard::models::ContainerCreateBody {
-                    image: Some("busybox:latest".to_string()),
-                    cmd: Some(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "test -f /var/lib/postgresql/walg.env".to_string(),
-                    ]),
-                    host_config: Some(host_config),
+                    image: Some(probe_image.to_string()),
+                    host_config: Some(bollard::models::HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            target: Some("/var/lib/postgresql".to_string()),
+                            source: Some(volume_name.to_string()),
+                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )
             .await;
 
-        if create_result.is_err() {
-            return false;
-        }
-
-        // Best effort cleanup: always try to remove the probe container.
-        let cleanup = |name: String| async move {
-            let _ = self
-                .docker
-                .remove_container(
-                    &name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+        let exists = match create_result {
+            Ok(_) => self.download_walg_env(&probe_name).await,
+            Err(_) => false,
         };
 
-        if self
+        let _ = self
             .docker
-            .start_container(&probe_name, None::<StartContainerOptions>)
-            .await
-            .is_err()
-        {
-            cleanup(probe_name).await;
-            return false;
-        }
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
 
-        let mut wait_stream = self
-            .docker
-            .wait_container(&probe_name, None::<WaitContainerOptions>);
-
-        let mut exit_code: Option<i64> = None;
-        while let Some(item) = wait_stream.next().await {
-            if let Ok(resp) = item {
-                exit_code = Some(resp.status_code);
-                break;
-            }
-        }
-
-        cleanup(probe_name).await;
-
-        // `test -f` exits 0 when the file is present.
-        matches!(exit_code, Some(0))
+        exists
     }
 
     /// Returns true when the running container's CMD specifies an
@@ -1217,6 +1433,63 @@ impl PostgresService {
         }
         let actual = actual_on; // true = on, false = off
         actual != desired
+    }
+
+    /// Whether the container's `shared_preload_libraries` CMD flag disagrees
+    /// with what this image now requires (see
+    /// `shared_preload_libraries_for_image`).
+    ///
+    /// Without this check, `start()`'s drift-reconciliation only looked at
+    /// `archive_mode` — a plain restart of a container created before the
+    /// `pg_stat_statements` CMD flag existed (or with a stale library list)
+    /// would never pick up the correct flag, since the container was never
+    /// recreated, only started. `enable_pg_stat_statements` in
+    /// `pg_stat_statements.rs` relies on this drift check via its stop+start
+    /// call to actually recreate the container with the right CMD.
+    async fn container_cmd_shared_preload_libraries_differs(
+        &self,
+        container: &bollard::models::ContainerSummary,
+        desired: &str,
+    ) -> bool {
+        let id = match container.id.as_deref() {
+            Some(id) => id,
+            None => return false,
+        };
+        let info = match self
+            .docker
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        let cmd = info
+            .config
+            .as_ref()
+            .and_then(|c| c.cmd.as_ref())
+            .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let actual = cmd
+            .iter()
+            .find_map(|tok| tok.trim().strip_prefix("shared_preload_libraries="));
+
+        match actual {
+            Some(actual) => {
+                // Order-insensitive compare — "timescaledb,pg_stat_statements"
+                // and "pg_stat_statements,timescaledb" are equivalent.
+                let mut actual_libs: Vec<&str> = actual.split(',').map(str::trim).collect();
+                let mut desired_libs: Vec<&str> = desired.split(',').map(str::trim).collect();
+                actual_libs.sort_unstable();
+                desired_libs.sort_unstable();
+                actual_libs != desired_libs
+            }
+            // No flag at all predates pg_stat_statements support — drift.
+            None => true,
+        }
     }
 
     async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
@@ -1455,6 +1728,25 @@ impl PostgresService {
         Ok(format!("/var/lib/postgresql/{}/docker", version))
     }
 
+    /// Build the `shared_preload_libraries` value for this image.
+    ///
+    /// `shared_preload_libraries` is a single comma-separated GUC — the last
+    /// `-c shared_preload_libraries=...` flag on the command line wins, it
+    /// does not merge with earlier ones. Images that require their own
+    /// preload library (e.g. `timescale/timescaledb-ha` requires
+    /// `timescaledb`) must have it listed alongside `pg_stat_statements`,
+    /// never overwritten by it — dropping `timescaledb` here silently
+    /// disables hypertables' background workers, continuous aggregates, and
+    /// compression policies with no error until a Timescale feature is used.
+    fn shared_preload_libraries_for_image(docker_image: &str) -> String {
+        let mut libs = Vec::new();
+        if docker_image.contains("timescaledb") {
+            libs.push("timescaledb");
+        }
+        libs.push("pg_stat_statements");
+        libs.join(",")
+    }
+
     async fn restore_backup_file(
         &self,
         docker: &Docker,
@@ -1601,32 +1893,13 @@ impl PostgresService {
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }
@@ -1674,6 +1947,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -1807,22 +2084,7 @@ impl PostgresService {
         self.write_walg_restore_env_file(&container_name, &walg_env)
             .await?;
 
-        let recovery_target_line = match recovery_target {
-            None => "recovery_target = 'immediate'".to_string(),
-            Some(super::RecoveryTarget::Time { time }) => format!(
-                "recovery_target_time = '{}'",
-                time.format("%Y-%m-%d %H:%M:%S%:z")
-            ),
-            Some(super::RecoveryTarget::Xid { xid }) => {
-                format!("recovery_target_xid = '{}'", xid.replace('\'', ""))
-            }
-            Some(super::RecoveryTarget::Lsn { lsn }) => {
-                format!("recovery_target_lsn = '{}'", lsn.replace('\'', ""))
-            }
-            Some(super::RecoveryTarget::Name { name }) => {
-                format!("recovery_target_name = '{}'", name.replace('\'', ""))
-            }
-        };
+        let recovery_target_line = postgres_recovery_target_setting(recovery_target);
 
         // `restore_command` sources the read-only credential file. `archive_command`
         // and `archive_mode` are explicitly disabled so the restored cluster does
@@ -2252,6 +2514,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -2383,22 +2649,7 @@ impl PostgresService {
         let sidecar_image = postgres_config.docker_image.clone();
 
         info!("Pulling sidecar image {} for pg_dump", sidecar_image);
-        let (image_name, image_tag) = sidecar_image
-            .split_once(':')
-            .map(|(n, t)| (n.to_string(), t.to_string()))
-            .unwrap_or_else(|| (sidecar_image.clone(), "latest".to_string()));
-
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(image_tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, &sidecar_image, None)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -2620,6 +2871,32 @@ impl PostgresService {
     }
 }
 
+fn postgres_recovery_target_setting(recovery_target: Option<&super::RecoveryTarget>) -> String {
+    match recovery_target {
+        None => "recovery_target = 'immediate'".to_string(),
+        Some(super::RecoveryTarget::Time { time }) => format!(
+            // PostgreSQL's recovery_target_time GUC is parsed by a stricter
+            // datetime parser than SQL's ::timestamptz cast: it rejects the
+            // ISO 8601 'T' separator / 'Z' suffix (`invalid value for
+            // parameter "recovery_target_time"`), even though the same
+            // string casts fine in a query. Use the space-separated,
+            // explicit-offset form Postgres's own output uses, with
+            // microsecond precision preserved.
+            "recovery_target_time = '{}'",
+            time.format("%Y-%m-%d %H:%M:%S%.6f%:z")
+        ),
+        Some(super::RecoveryTarget::Xid { xid }) => {
+            format!("recovery_target_xid = '{}'", xid.replace('\'', ""))
+        }
+        Some(super::RecoveryTarget::Lsn { lsn }) => {
+            format!("recovery_target_lsn = '{}'", lsn.replace('\'', ""))
+        }
+        Some(super::RecoveryTarget::Name { name }) => {
+            format!("recovery_target_name = '{}'", name.replace('\'', ""))
+        }
+    }
+}
+
 /// Internal port used by PostgreSQL inside the container
 const POSTGRES_INTERNAL_PORT: &str = "5432";
 
@@ -2631,18 +2908,10 @@ impl ExternalService for PostgresService {
     }
 
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
-        let config = self.get_postgres_config(service_config)?;
-
-        if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            Ok((
-                self.get_live_container_name(&config),
-                POSTGRES_INTERNAL_PORT.to_string(),
-            ))
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            Ok(("localhost".to_string(), config.port))
-        }
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_docker_container_name(&self) -> String {
@@ -2984,6 +3253,15 @@ impl ExternalService for PostgresService {
         let schema = schemars::schema_for!(PostgresInputConfig);
         let mut schema_json = serde_json::to_value(schema).ok()?;
 
+        // `PostgresInputConfig` can deserialize absent values with defaults, but
+        // service creation deliberately requires callers to choose the database
+        // and username explicitly (see `PostgresParameterStrategy`). Schemars
+        // interprets serde defaults as "optional", so without this correction
+        // the public service-type schema contradicts the creation validator.
+        // The dashboard and AI both consume this schema; publishing the wrong
+        // required set makes them learn by failing POST /external-services.
+        schema_json["required"] = serde_json::json!(["database", "username"]);
+
         // Add metadata about which fields are editable
         if let Some(properties) = schema_json
             .get_mut("properties")
@@ -3093,15 +3371,39 @@ impl ExternalService for PostgresService {
         if let Some(container) = containers.first() {
             // Inspect the existing CMD. If it disagrees with what we'd emit
             // now, force a recreate by stopping + removing the old container
-            // and falling through to the create branch.
-            let drift = self
+            // and falling through to the create branch. Covers both
+            // archive_mode drift and shared_preload_libraries drift (e.g. a
+            // container created before pg_stat_statements support, or before
+            // an image-specific library like timescaledb was correctly
+            // merged in) — see `container_cmd_shared_preload_libraries_differs`.
+            //
+            // Desired libraries are derived from the *container's own*
+            // `Image` field, not `existing_config` — a freshly-constructed
+            // service instance (e.g. from `start_service()`'s non-imported
+            // path) has an unhydrated `self.config` (`None`), which would
+            // otherwise silently skip this drift check entirely.
+            let desired_preload_libraries = container
+                .image
+                .as_deref()
+                .map(Self::shared_preload_libraries_for_image);
+
+            let archive_drift = self
                 .container_cmd_archive_mode_differs(container, desired_enable_archiving)
                 .await;
+            let preload_drift = match &desired_preload_libraries {
+                Some(desired) => {
+                    self.container_cmd_shared_preload_libraries_differs(container, desired)
+                        .await
+                }
+                None => false,
+            };
+            let drift = archive_drift || preload_drift;
             if drift {
                 info!(
-                    "Container {} has archive_mode CMD drift (desired={}). \
+                    "Container {} has CMD drift (archive_mode drift={}, \
+                     shared_preload_libraries drift={}, desired archive_mode={}). \
                      Recreating to apply correct config.",
-                    container_name, desired_enable_archiving
+                    container_name, archive_drift, preload_drift, desired_enable_archiving
                 );
                 let _ = self
                     .docker
@@ -3176,6 +3478,46 @@ impl ExternalService for PostgresService {
             .await?;
 
         Ok(())
+    }
+
+    /// Hydrate `self.config` from `service_config` (mirroring `init()`, but
+    /// without unconditionally creating a container — a container may
+    /// already exist and only need recreating), then delegate to `start()`.
+    /// `start()`'s reconcile-on-start drift check derives desired
+    /// `shared_preload_libraries` from the *container's own* `Image` field
+    /// (see `container_cmd_shared_preload_libraries_differs`), so it will
+    /// detect drift and recreate correctly now that `self.config` is
+    /// populated for the create step.
+    async fn force_recreate(&self, service_config: ServiceConfig) -> Result<()> {
+        let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+        let postgres_config = self.get_postgres_config(service_config)?;
+        *self.config.write().await = Some(postgres_config);
+        *self.resource_limits.write().await = resource_limits;
+
+        self.start().await
+    }
+
+    async fn enable_continuous_archiving(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        // Already active from a prior backup on this service (truth source:
+        // `walg.env` on the volume, see `compute_desired_enable_archiving`).
+        // Skip the container-recreating dance entirely — this method is
+        // called before every backup, and archive_mode is postmaster-context
+        // (a live reload can't flip it), so redoing this would mean a brief
+        // outage on every single backup instead of just the first.
+        if self.compute_desired_enable_archiving().await {
+            return Ok(());
+        }
+
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+            .await
     }
 
     async fn stop(&self) -> Result<()> {
@@ -3710,6 +4052,15 @@ impl ExternalService for PostgresService {
                 source_config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                // Restoring into a new service clones the source's
+                // POSTGRES_PASSWORD into the new container's environment, so an
+                // unchecked override starts an attacker-named image holding the
+                // source database's root credentials. The instance's existing
+                // image allowlist is the right gate — it is exact `image:tag`
+                // equality and an operator can extend it, so this adds no new
+                // policy, it just stops the restore path from being the one
+                // place that skips it.
+                validate_postgres_docker_image(image)?;
                 source_config.docker_image = image.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
@@ -3906,11 +4257,66 @@ impl ExternalService for PostgresService {
     }
 }
 
+impl PostgresService {
+    /// Point continuous WAL-G archiving at `s3_credentials`/`walg_prefix`
+    /// unconditionally — the container-recreating dance
+    /// `enable_continuous_archiving` normally skips once `walg.env` already
+    /// exists on the volume, because that check is presence-only and can't
+    /// tell "already active, no need to redo this" apart from "active, but
+    /// pointed at a source we no longer want".
+    ///
+    /// Only the explicit, operator-initiated WAL archive source repoint
+    /// (`ExternalServiceManager::repoint_continuous_archive_source`) should call
+    /// this — it accepts the brief archiving outage a container recreate
+    /// causes, in exchange for actually moving where WAL segments land, not
+    /// just updating a database record that no longer matches reality.
+    pub async fn force_reenable_continuous_archiving(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+            .await
+    }
+
+    async fn write_wal_archiving_config(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        let container_name = self.get_live_container_name(&postgres_config);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+        ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
     fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
         temps_entities::backups::Model {
@@ -3978,6 +4384,226 @@ mod tests {
     fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
         let cmd = postgres_healthcheck_cmd("a'user", "a'db");
         assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
+
+    #[test]
+    fn sourced_walg_values_are_shell_quoted() {
+        assert_eq!(
+            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
+            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
+        );
+        assert_eq!(
+            shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def"),
+            Some("export AWS_SECRET_ACCESS_KEY='abc'\\''def'".to_string())
+        );
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
+    }
+
+    #[test]
+    fn managed_postgres_images_are_allowlisted() {
+        assert!(validate_postgres_docker_image("gotempsh/postgres-walg:18-bookworm").is_ok());
+        assert!(validate_postgres_docker_image("attacker/postgres:latest").is_err());
+    }
+
+    /// Every image the console offers as an upgrade target in
+    /// `web/src/components/storage/UpgradeServiceDialog.tsx` must validate.
+    /// These were offered in the UI while being rejected by the allowlist, so
+    /// picking one was a guaranteed failure.
+    #[test]
+    fn console_upgrade_target_images_are_allowlisted() {
+        for image in [
+            "gotempsh/postgres-walg:18-bookworm",
+            "gotempsh/postgres-walg:17-bookworm",
+            "gotempsh/pgvector-walg:pg18",
+            "gotempsh/pgvector-walg:pg17",
+            "gotempsh/timescaledb-walg:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "console offers {image} as an upgrade target but it is not allowlisted"
+            );
+        }
+    }
+
+    /// `services.rs` classifies any discovered container whose image contains
+    /// `pgvector` as a Postgres service, so importing one must not produce a
+    /// service that can never be initialized.
+    #[test]
+    fn discovered_pgvector_images_are_allowlisted() {
+        for image in [
+            "pgvector/pgvector:pg15",
+            "pgvector/pgvector:pg16",
+            "pgvector/pgvector:pg17",
+            "pgvector/pgvector:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "container discovery imports {image} as Postgres but it is not allowlisted"
+            );
+        }
+    }
+
+    /// The allowlist stays exact-match: a listed image must not make an
+    /// arbitrary image sharing its repository or tag prefix acceptable.
+    #[test]
+    fn allowlist_does_not_match_by_prefix_or_repository() {
+        for image in [
+            "pgvector/pgvector:latest",
+            "pgvector/pgvector",
+            "attacker/pgvector:pg18",
+            "gotempsh/pgvector-walg:pg18-evil",
+            "timescale/timescaledb-ha:pg18-attacker",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_err(),
+                "{image} must not be accepted by the exact-match allowlist"
+            );
+        }
+    }
+
+    /// pgvector needs no preload library, but the WAL-G TimescaleDB variant is
+    /// still a TimescaleDB image and must keep `timescaledb` preloaded —
+    /// dropping it silently disables hypertable background workers.
+    #[test]
+    fn shared_preload_libraries_cover_new_allowlisted_images() {
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("pgvector/pgvector:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/pgvector-walg:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/timescaledb-walg:pg18"),
+            "timescaledb,pg_stat_statements"
+        );
+    }
+
+    #[test]
+    fn extra_images_env_is_split_trimmed_and_compacted() {
+        let (images, suspicious) = parse_extra_allowed_images(
+            "  postgis/postgis:18-3.5 ,,registry.internal:5000/team/pg:18 , ",
+        );
+        assert_eq!(
+            images,
+            vec![
+                "postgis/postgis:18-3.5".to_string(),
+                "registry.internal:5000/team/pg:18".to_string(),
+            ]
+        );
+        // A registry port is not a tag separator, but both entries here are
+        // properly tagged, so neither should be flagged.
+        assert!(suspicious.is_empty(), "unexpected warnings: {suspicious:?}");
+    }
+
+    #[test]
+    fn extra_images_env_empty_or_blank_yields_nothing() {
+        assert_eq!(parse_extra_allowed_images("").0, Vec::<String>::new());
+        assert_eq!(
+            parse_extra_allowed_images("  , ,, ").0,
+            Vec::<String>::new()
+        );
+    }
+
+    /// An entry with no tag can never match, since comparison is exact. It is
+    /// still accepted verbatim, but the operator is warned rather than left to
+    /// wonder why their variable did nothing.
+    #[test]
+    fn extra_images_env_flags_entries_without_tag_or_digest() {
+        let (images, suspicious) =
+            parse_extra_allowed_images("postgis/postgis,registry.internal:5000/team/pg");
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            suspicious,
+            vec![
+                "postgis/postgis".to_string(),
+                // ':5000' is a registry port, not a tag -- must still be flagged.
+                "registry.internal:5000/team/pg".to_string(),
+            ]
+        );
+
+        let (_, ok) = parse_extra_allowed_images(
+            "postgis/postgis:18-3.5,gotempsh/postgres-walg@sha256:abc123",
+        );
+        assert!(
+            ok.is_empty(),
+            "tagged/digested entries must not warn: {ok:?}"
+        );
+    }
+
+    /// End-to-end over the parse + membership composition: a value the operator
+    /// puts in the env var makes an otherwise-rejected image acceptable, and
+    /// only that exact image.
+    #[test]
+    fn extra_images_env_admits_exactly_the_operator_listed_image() {
+        let (extra, _) = parse_extra_allowed_images("postgis/postgis:18-3.5");
+
+        assert!(
+            !is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &[]),
+            "image must be rejected without the operator override"
+        );
+        assert!(
+            is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &extra),
+            "operator-listed image must be accepted"
+        );
+
+        // Still exact-match: the override admits one image, not a repository.
+        for near_miss in [
+            "postgis/postgis:latest",
+            "postgis/postgis",
+            "postgis/postgis:18-3.5-evil",
+            "attacker/postgis:18-3.5",
+        ] {
+            assert!(
+                !is_allowed_postgres_docker_image(near_miss, &extra),
+                "{near_miss} must not be admitted by an exact-match override"
+            );
+        }
+    }
+
+    /// The operator knob extends the allowlist; it must never be able to shrink
+    /// it, or a typo would strand every existing Postgres service.
+    #[test]
+    fn extra_images_env_cannot_remove_builtin_images() {
+        // Built-ins are checked before the env list is even consulted.
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "{image} must stay allowed regardless of {EXTRA_POSTGRES_IMAGES_ENV}"
+            );
+        }
+    }
+
+    /// The rejection message must name the env var -- a self-hosted operator
+    /// has no support channel, so a bare "not supported" is a dead end.
+    #[test]
+    fn rejection_message_points_at_the_operator_override() {
+        // Deliberately an image no operator would ever allowlist, so this test
+        // cannot flip if TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES happens to be set
+        // in the environment running the suite.
+        let err = validate_postgres_docker_image("temps-test/never-allowlisted:0")
+            .expect_err("unlisted image must be rejected")
+            .to_string();
+        assert!(
+            err.contains(EXTRA_POSTGRES_IMAGES_ENV),
+            "rejection message must mention {EXTRA_POSTGRES_IMAGES_ENV}, got: {err}"
+        );
+    }
+
+    /// PGDATA is derived from the image tag, so every allowlisted image must
+    /// yield a parseable major version — otherwise the container is created
+    /// with a broken data directory path.
+    #[test]
+    fn every_allowlisted_image_yields_a_pgdata_path() {
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            let version = PostgresService::extract_postgres_version(image)
+                .unwrap_or_else(|e| panic!("no version for allowlisted image {image}: {e}"));
+            assert!(
+                (15..=18).contains(&version),
+                "unexpected major version {version} for {image}"
+            );
+        }
     }
 
     #[test]
@@ -4155,6 +4781,89 @@ mod tests {
 
         // Cleanup
         let _ = service.cleanup().await;
+    }
+
+    /// Regression test: `compute_desired_enable_archiving()` must find a
+    /// pre-existing `walg.env` on the data volume even when there is no
+    /// live container to probe directly. Without the volume-probe fallback,
+    /// `start()`'s `need_create` path (force_recreate, node failover, or an
+    /// externally-removed container) would silently bake `archive_mode=off`
+    /// into the recreated container even though WAL-G was already
+    /// configured on the volume.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_walg_env_probed_from_volume_when_container_missing() {
+        use std::net::TcpListener;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind for port allocation")
+            .local_addr()
+            .expect("failed to read local addr")
+            .port();
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-walg-volume-probe".to_string(), docker.clone());
+
+        let config = ServiceConfig {
+            name: "test-walg-volume-probe".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port.to_string(),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "max_connections": 100,
+                "ssl_mode": "disable",
+                "docker_image": "gotempsh/postgres-walg:18-bookworm"
+            }),
+        };
+
+        service.init(config).await.expect("init should succeed");
+        let container_name = service.get_container_name();
+
+        // No walg.env written yet -- archiving must read as not desired.
+        assert!(
+            !service.compute_desired_enable_archiving().await,
+            "fresh service should not have archiving enabled"
+        );
+
+        service
+            .write_walg_env_file(&container_name, &["AWS_ACCESS_KEY_ID=test".to_string()])
+            .await
+            .expect("failed to write walg.env");
+
+        // Sanity check: the live container reports archiving desired.
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "live container should report walg.env as present"
+        );
+
+        // Remove the container but keep the volume, simulating
+        // force_recreate / node failover / an externally-removed container.
+        docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("failed to remove container");
+
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "archiving must still read as desired from the volume once the container is gone"
+        );
+
+        // Cleanup: volume (container is already gone).
+        let _ = docker
+            .remove_volume(
+                &format!("{container_name}_data"),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
     }
 
     /// Regression test for a bug where `init()` persisted the *requested*
@@ -4374,6 +5083,22 @@ mod tests {
             .unwrap_or(false);
 
         assert!(is_editable, "docker_image should be editable");
+    }
+
+    #[test]
+    fn test_parameter_schema_matches_required_creation_credentials() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-required-schema".to_string(), docker);
+
+        let schema = service
+            .get_parameter_schema()
+            .expect("PostgreSQL creation schema should exist");
+        let required = schema["required"]
+            .as_array()
+            .expect("PostgreSQL creation schema should declare required fields");
+
+        assert!(required.iter().any(|field| field == "database"));
+        assert!(required.iter().any(|field| field == "username"));
     }
 
     #[test]
@@ -5304,10 +6029,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_baremetal_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear Docker mode to ensure baremetal mode
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("test-effective-addr".to_string(), docker);
 
@@ -5325,7 +6046,9 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Host)
+            .unwrap();
 
         // In baremetal mode, should return localhost with exposed port
         assert_eq!(host, "localhost");
@@ -5334,10 +6057,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Set Docker mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("test-effective-addr-docker".to_string(), docker);
 
@@ -5355,21 +6074,17 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
 
         // In Docker mode, should return container name with internal port
         assert_eq!(host, "postgres-test-effective-addr-docker");
         assert_eq!(port, "5432"); // Internal port
-
-        // Clean up
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("imported-svc".to_string(), docker);
 
@@ -5388,12 +6103,12 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // The imported container name wins over the derived `postgres-{name}`.
         assert_eq!(host, "legacy-postgres");
         assert_eq!(port, "5432");
-
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
@@ -5710,6 +6425,7 @@ mod tests {
         let s3_creds = crate::externalsvc::S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: None,
             bucket_name: "b".into(),
@@ -5723,12 +6439,18 @@ mod tests {
             bucket_path: "".into(),
             access_key_id: "enc".into(),
             secret_key: "enc".into(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".into(),
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            backing_service_id: None,
         };
         let backup = temps_entities::backups::Model {
             id: 1,
@@ -5772,7 +6494,11 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
+            ai_data_access: false,
             container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.
@@ -5844,5 +6570,125 @@ mod tests {
             "expected WAL-G requirement in error, got: {}",
             msg
         );
+    }
+
+    // -----------------------------------------------------------------
+    // PostgreSQL recovery target formatting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recovery_target_setting_preserves_fractional_seconds() {
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48.133085Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            })),
+            "recovery_target_time = '2026-09-02 17:11:48.133085+00:00'"
+        );
+    }
+
+    #[test]
+    fn recovery_target_setting_keeps_exact_whole_second_boundary() {
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            })),
+            "recovery_target_time = '2026-09-02 17:11:48.000000+00:00'"
+        );
+    }
+
+    #[test]
+    fn recovery_target_setting_preserves_microsecond_boundaries() {
+        for (input, expected) in [
+            (
+                "2026-09-02T17:11:48.000001Z",
+                "2026-09-02 17:11:48.000001+00:00",
+            ),
+            (
+                "2026-09-02T17:11:48.999999Z",
+                "2026-09-02 17:11:48.999999+00:00",
+            ),
+        ] {
+            let target = chrono::DateTime::parse_from_rfc3339(input)
+                .expect("test timestamp must parse")
+                .with_timezone(&chrono::Utc);
+            assert_eq!(
+                postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                    time: target
+                })),
+                format!("recovery_target_time = '{expected}'")
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_target_setting_never_emits_iso8601_t_or_z() {
+        // Regression test: PostgreSQL's recovery_target_time GUC rejects the
+        // ISO 8601 'T' date/time separator and 'Z' UTC suffix with
+        // `FATAL: configuration file "postgresql.auto.conf" contains errors`
+        // / `invalid value for parameter "recovery_target_time"`, even
+        // though the identical string parses fine via `::timestamptz` in
+        // SQL. Confirmed against a real postgres:18-bookworm container.
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48.133085Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+        let setting =
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            }));
+        assert!(
+            !setting.contains('T'),
+            "must not use ISO 8601 'T' separator: {setting}"
+        );
+        assert!(
+            !setting.contains('Z'),
+            "must not use ISO 8601 'Z' UTC suffix: {setting}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // shared_preload_libraries_for_image
+    // -----------------------------------------------------------------
+    //
+    // Regression coverage for the bug where this value was unconditionally
+    // overwritten to just "pg_stat_statements", silently dropping any
+    // image-required library (e.g. TimescaleDB requires "timescaledb" to be
+    // preloaded for hypertables' background workers, continuous aggregates,
+    // and compression policies to function at all).
+
+    #[test]
+    fn shared_preload_libraries_default_image_is_pg_stat_statements_only() {
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "gotempsh/postgres-walg:18-bookworm",
+        );
+        assert_eq!(libs, "pg_stat_statements");
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_merges_both() {
+        let libs =
+            PostgresService::shared_preload_libraries_for_image("timescale/timescaledb-ha:pg18");
+        assert_eq!(
+            libs, "timescaledb,pg_stat_statements",
+            "timescaledb must be preloaded alongside pg_stat_statements, never dropped"
+        );
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_any_tag() {
+        // Detection is substring-based on the image name, not tag-specific —
+        // confirm a different tag still matches.
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "timescale/timescaledb-ha:pg16-ts2.15",
+        );
+        assert!(libs.contains("timescaledb"));
+        assert!(libs.contains("pg_stat_statements"));
     }
 }

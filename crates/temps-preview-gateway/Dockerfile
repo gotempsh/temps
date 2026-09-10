@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 ## Multi-stage build for temps-preview-gateway.
 ##
 ## Builds the crate standalone (outside the temps workspace) so the image
@@ -17,6 +20,11 @@ RUN cargo build --release && \
     cp target/release/temps-preview-gateway /tmp/temps-preview-gateway
 
 FROM debian:bookworm-slim AS runtime
+
+# The supervisor refuses to route preview traffic through images that do not
+# attest the protocol which authenticates the proxy and strips its bearer
+# token before crossing into a tenant sandbox.
+LABEL sh.temps.preview-gateway-security-protocol="strip-token-v1"
 
 # Debug tooling kept in the image deliberately: the gateway sits on a
 # private docker network with no host port, so the only way to poke it

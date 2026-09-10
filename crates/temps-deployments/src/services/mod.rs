@@ -1,6 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[allow(clippy::module_inception)]
 pub mod services;
 pub use services::*;
+
+pub mod container_operations;
+pub use container_operations::*;
 
 pub mod types;
 pub use types::*;
@@ -11,8 +17,14 @@ pub use job_processor::*;
 pub mod workflow_planner;
 pub use workflow_planner::*;
 
+pub mod managed_environment_variables;
+pub use managed_environment_variables::*;
+
 pub mod env_resolver;
 pub use env_resolver::*;
+
+pub mod port_resolver;
+pub use port_resolver::*;
 
 pub mod workflow_execution_service;
 pub use workflow_execution_service::*;
@@ -25,6 +37,9 @@ pub use job_tracker::*;
 
 pub mod database_cron_service;
 pub use database_cron_service::*;
+
+pub mod database_metric_alert_service;
+pub use database_metric_alert_service::*;
 
 pub mod external_deployment;
 pub use external_deployment::*;
@@ -49,3 +64,18 @@ pub use remote_log_source::*;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;
+
+pub mod log_redaction;
+pub use log_redaction::*;
+
+pub mod failure_report_service;
+pub use failure_report_service::*;
+
+pub mod traefik_discovery_service;
+pub use traefik_discovery_service::*;
+
+pub mod cert_validator;
+pub use cert_validator::*;
+
+pub mod source_drop_service;
+pub use source_drop_service::*;

@@ -1,4 +1,7 @@
 #!/usr/bin/env tsx
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Real AI API calls through the Temps AI Gateway with OTel GenAI tracing,
  * using the Vercel AI SDK's built-in telemetry support.

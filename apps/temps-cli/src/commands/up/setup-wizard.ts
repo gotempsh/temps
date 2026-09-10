@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Setup wizard for `temps up` when no project is linked.
  * Guides the user through: detection → naming → git/manual → services → create → deploy.
@@ -559,6 +562,21 @@ interface GitSetupResult {
 }
 
 /**
+ * Match a git connection's account type (e.g. "github_app") against a
+ * detected remote host (e.g. "github.com") — GitHub connections match
+ * github.com, GitLab connections match gitlab.com, etc.
+ */
+export function matchesConnectionHost(accountType: string | null | undefined, remoteHost: string): boolean {
+  const connType = accountType?.toLowerCase() || ''
+  const host = remoteHost.toLowerCase()
+  return (
+    (connType.includes('github') && host.includes('github')) ||
+    (connType.includes('gitlab') && host.includes('gitlab')) ||
+    (connType.includes('bitbucket') && host.includes('bitbucket'))
+  )
+}
+
+/**
  * Set up git connection — tries to match detected remote to existing connections,
  * falls back to interactive selection.
  */
@@ -580,16 +598,7 @@ async function setupGitConnection(
   // Try to auto-match git remote to a connection
   if (gitRemote) {
     for (const conn of connections) {
-      // Match by host — GitHub connections match github.com, etc.
-      const connType = conn.account_type?.toLowerCase() || ''
-      const remoteHost = gitRemote.host.toLowerCase()
-
-      const isMatch =
-        (connType.includes('github') && remoteHost.includes('github')) ||
-        (connType.includes('gitlab') && remoteHost.includes('gitlab')) ||
-        (connType.includes('bitbucket') && remoteHost.includes('bitbucket'))
-
-      if (isMatch) {
+      if (matchesConnectionHost(conn.account_type, gitRemote.host)) {
         // Try to find the repository
         const repo = await withSpinner(
           `Looking for ${gitRemote.owner}/${gitRemote.repo}...`,
@@ -678,7 +687,7 @@ async function selectPresetFromAll(): Promise<string> {
  * Detect the package manager used by the project by checking for lockfiles.
  * Falls back to "npm" if no lockfile is found.
  */
-function detectPackageManager(dir?: string): string {
+export function detectPackageManager(dir?: string): string {
   const projectDir = dir ? resolve(dir) : process.cwd()
 
   if (existsSync(join(projectDir, 'pnpm-lock.yaml'))) return 'pnpm'

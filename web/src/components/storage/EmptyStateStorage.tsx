@@ -1,10 +1,13 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProviderMetadata } from '@/api/client'
 import { getProvidersMetadataOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Card } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowRight, Database } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 interface EmptyStateStorageProps {}
 

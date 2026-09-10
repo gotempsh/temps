@@ -1,325 +1,175 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { TempsClient } from './index';
-import * as clientModule from './client/client';
-import * as sdk from './client/sdk.gen';
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Mock the client module
-vi.mock('./client/client', () => ({
+import { beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { TempsClient } from "./index";
+import * as clientModule from "./client/client";
+import * as sdk from "./client/sdk.gen";
+import type {
+  ListEmailDomainProjectsErrors,
+  SendEmailData,
+  SendEmailErrors,
+} from "./client/types.gen";
+
+vi.mock("./client/client", () => ({
   createClient: vi.fn(() => ({
     get: vi.fn(),
     post: vi.fn(),
     put: vi.fn(),
     delete: vi.fn(),
-    patch: vi.fn()
+    patch: vi.fn(),
   })),
-  createConfig: vi.fn((config) => config)
+  createConfig: vi.fn((config) => config),
 }));
 
-// Mock the SDK methods
-vi.mock('./client/sdk.gen', () => {
-  const mockMethod = () => vi.fn().mockResolvedValue({ data: 'mocked' });
+vi.mock("./client/sdk.gen", () => ({
+  getPlatformInfo: vi.fn().mockResolvedValue({ data: { version: "test" } }),
+  listApiKeys: vi.fn().mockResolvedValue({ data: [] }),
+  getProjects: vi.fn().mockResolvedValue({ data: { projects: [] } }),
+  getBackup: vi.fn().mockResolvedValue({ data: { id: 17 } }),
+  sendEmail: vi
+    .fn()
+    .mockResolvedValue({ data: { id: "email-1", status: "sent" } }),
+  listEmailDomainProjects: vi.fn().mockResolvedValue({ data: [] }),
+  authorizeEmailDomainProject: vi.fn().mockResolvedValue({ data: undefined }),
+  revokeEmailDomainProject: vi.fn().mockResolvedValue({ data: undefined }),
+}));
 
-  return {
-    // Platform methods
-    getPlatformInfo: mockMethod(),
-
-    // API Keys methods
-    listApiKeys: mockMethod(),
-    createApiKey: mockMethod(),
-    getApiKeyPermissions: mockMethod(),
-    getApiKey: mockMethod(),
-    updateApiKey: mockMethod(),
-    deleteApiKey: mockMethod(),
-    activateApiKey: mockMethod(),
-    deactivateApiKey: mockMethod(),
-
-    // Analytics methods
-    enrichVisitor: mockMethod(),
-    getAnalyticsMetrics: mockMethod(),
-    getBrowsers: mockMethod(),
-    getEventsCount: mockMethod(),
-    getPathVisitors: mockMethod(),
-    getReferrers: mockMethod(),
-    getSessionDetails: mockMethod(),
-    getSessionEvents: mockMethod(),
-    getSessionLogs: mockMethod(),
-    getSessionMetrics: mockMethod(),
-    getStatusCodes: mockMethod(),
-    getViewsOverTime: mockMethod(),
-    getVisitorDetails: mockMethod(),
-    getVisitorLocations: mockMethod(),
-    getVisitors: mockMethod(),
-    getVisitorSessions: mockMethod(),
-
-    // MCP methods
-    listClients: mockMethod(),
-    addClient: mockMethod(),
-    removeClient: mockMethod(),
-    connectClient: mockMethod(),
-
-    // Projects methods
-    createProject: mockMethod(),
-    getProjects: mockMethod(),
-    getProject: mockMethod(),
-    updateProject: mockMethod(),
-    deleteProject: mockMethod(),
-
-    // Add other methods as they are used in tests
-  };
-});
-
-describe('TempsClient', () => {
+describe("TempsClient", () => {
   let client: TempsClient;
 
   beforeEach(() => {
     vi.clearAllMocks();
     client = new TempsClient({
-      baseUrl: 'https://api.test.com',
-      apiKey: 'test-api-key'
+      baseUrl: "https://api.test.com",
+      apiKey: "test-api-key",
     });
   });
 
-  describe('Client Initialization', () => {
-    it('should create a client with the correct configuration', () => {
-      expect(clientModule.createConfig).toHaveBeenCalledWith({
-        baseUrl: 'https://api.test.com',
-        headers: {
-          Authorization: 'Bearer test-api-key'
-        }
-      });
-      expect(clientModule.createClient).toHaveBeenCalled();
+  it("creates one authenticated client shared by every namespace", () => {
+    expect(clientModule.createConfig).toHaveBeenCalledWith({
+      baseUrl: "https://api.test.com",
+      headers: { Authorization: "Bearer test-api-key" },
     });
+    expect(client.rawClient).toBeDefined();
 
-    it('should create a client without auth headers when no API key is provided', () => {
-      vi.clearAllMocks();
-      new TempsClient({
-        baseUrl: 'https://api.test.com'
-      });
+    for (const namespace of [
+      "apiKeys",
+      "analytics",
+      "auditLogs",
+      "authentication",
+      "backups",
+      "crons",
+      "deployments",
+      "dns",
+      "domains",
+      "email",
+      "externalServices",
+      "files",
+      "funnels",
+      "git",
+      "loadBalancer",
+      "monitoring",
+      "notifications",
+      "performance",
+      "platform",
+      "projects",
+      "proxyLogs",
+      "repositories",
+      "sessionReplay",
+      "settings",
+      "users",
+    ]) {
+      expect(client).toHaveProperty(namespace);
+    }
+  });
 
-      expect(clientModule.createConfig).toHaveBeenCalledWith({
-        baseUrl: 'https://api.test.com',
-        headers: undefined
-      });
-    });
+  it("omits the authorization header when no API key is configured", () => {
+    vi.clearAllMocks();
+    new TempsClient({ baseUrl: "https://api.test.com" });
 
-    it('should expose rawClient getter', () => {
-      expect(client.rawClient).toBeDefined();
-      expect(client.rawClient).toEqual(expect.objectContaining({
-        get: expect.any(Function),
-        post: expect.any(Function)
-      }));
+    expect(clientModule.createConfig).toHaveBeenCalledWith({
+      baseUrl: "https://api.test.com",
+      headers: undefined,
     });
   });
 
-  describe('Namespace Structure', () => {
-    it('should have all required namespaces', () => {
-      const namespaces = [
-        'apiKeys',
-        'analytics',
-        'auditLogs',
-        'authentication',
-        'backups',
-        'crons',
-        'deployments',
-        'develop',
-        'domains',
-        'externalServices',
-        'featureFlags',
-        'files',
-        'funnels',
-        'github',
-        'loadBalancer',
-        'logs',
-        'mcp',
-        'metrics',
-        'notifications',
-        'opentelemetry',
-        'payments',
-        'pipelines',
-        'platform',
-        'projects',
-        'speedInsights',
-        'users',
-        'websocket'
-      ];
+  it("routes email-domain project reads and writes through the configured client", async () => {
+    const listOptions = { path: { id: 7 } };
+    const writeOptions = { path: { id: 7, project_id: 42 } };
 
-      namespaces.forEach(namespace => {
-        expect(client).toHaveProperty(namespace);
-        expect(client[namespace as keyof TempsClient]).toBeDefined();
-      });
+    await client.email.listAuthorizedProjects(listOptions);
+    await client.email.authorizeProject(writeOptions);
+    await client.email.revokeProject(writeOptions);
+
+    expect(sdk.listEmailDomainProjects).toHaveBeenCalledWith({
+      ...listOptions,
+      client: client.rawClient,
     });
-
-    it('should have methods in platform namespace', () => {
-      expect(client.platform.getPlatformInfo).toBeDefined();
-      expect(typeof client.platform.getPlatformInfo).toBe('function');
+    expect(sdk.authorizeEmailDomainProject).toHaveBeenCalledWith({
+      ...writeOptions,
+      client: client.rawClient,
     });
-
-    it('should have methods in apiKeys namespace', () => {
-      const apiKeysMethods = [
-        'listApiKeys',
-        'createApiKey',
-        'getApiKeyPermissions',
-        'getApiKey',
-        'updateApiKey',
-        'deleteApiKey',
-        'activateApiKey',
-        'deactivateApiKey'
-      ];
-
-      apiKeysMethods.forEach(method => {
-        expect(client.apiKeys).toHaveProperty(method);
-        expect(typeof client.apiKeys[method as keyof typeof client.apiKeys]).toBe('function');
-      });
-    });
-
-    it('should have methods in analytics namespace', () => {
-      const analyticsMethods = [
-        'enrichVisitor',
-        'getAnalyticsMetrics',
-        'getBrowsers',
-        'getEventsCount',
-        'getPathVisitors',
-        'getReferrers',
-        'getSessionDetails',
-        'getSessionEvents',
-        'getSessionLogs',
-        'getSessionMetrics',
-        'getStatusCodes',
-        'getViewsOverTime',
-        'getVisitorDetails',
-        'getVisitorLocations',
-        'getVisitors',
-        'getVisitorSessions'
-      ];
-
-      analyticsMethods.forEach(method => {
-        expect(client.analytics).toHaveProperty(method);
-        expect(typeof client.analytics[method as keyof typeof client.analytics]).toBe('function');
-      });
-    });
-
-    it('should have methods in mcp namespace', () => {
-      const mcpMethods = [
-        'listClients',
-        'addClient',
-        'removeClient',
-        'connectClient'
-      ];
-
-      mcpMethods.forEach(method => {
-        expect(client.mcp).toHaveProperty(method);
-        expect(typeof client.mcp[method as keyof typeof client.mcp]).toBe('function');
-      });
+    expect(sdk.revokeEmailDomainProject).toHaveBeenCalledWith({
+      ...writeOptions,
+      client: client.rawClient,
     });
   });
 
-  describe('Method Invocation', () => {
-    it('should call SDK methods with client instance', async () => {
-      const mockOptions = { query: { page: 1 } };
+  it("forwards representative namespace calls through the shared client", async () => {
+    await client.platform.getInfo();
+    await client.apiKeys.list();
+    await client.projects.list({ query: { page: 2, per_page: 25 } });
+    await client.backups.get({ path: { id: "backup-17" } });
 
-      await client.apiKeys.listApiKeys(mockOptions);
-
-      expect(sdk.listApiKeys).toHaveBeenCalledWith({
-        ...mockOptions,
-        client: client.rawClient
-      });
+    expect(sdk.getPlatformInfo).toHaveBeenCalledWith({
+      client: client.rawClient,
     });
-
-    it('should pass through method parameters correctly', async () => {
-      const mockOptions = {
-        path: { id: 123 },
-        body: { name: 'Test API Key' }
-      };
-
-      await client.apiKeys.updateApiKey(mockOptions as any);
-
-      expect(sdk.updateApiKey).toHaveBeenCalledWith({
-        ...mockOptions,
-        client: client.rawClient
-      });
+    expect(sdk.listApiKeys).toHaveBeenCalledWith({ client: client.rawClient });
+    expect(sdk.getProjects).toHaveBeenCalledWith({
+      query: { page: 2, per_page: 25 },
+      client: client.rawClient,
     });
-
-    it('should handle optional parameters', async () => {
-      await client.platform.getPlatformInfo();
-
-      expect(sdk.getPlatformInfo).toHaveBeenCalledWith({
-        client: client.rawClient
-      });
-    });
-
-    it('should handle required parameters', async () => {
-      const mockOptions = {
-        body: { name: 'New Project' }
-      };
-
-      await client.projects.createProject(mockOptions as any);
-
-      expect(sdk.createProject).toHaveBeenCalledWith({
-        ...mockOptions,
-        client: client.rawClient
-      });
+    expect(sdk.getBackup).toHaveBeenCalledWith({
+      path: { id: "backup-17" },
+      client: client.rawClient,
     });
   });
 
-  describe('Type Safety', () => {
-    it('should maintain type safety for method parameters', () => {
-      // This test mainly ensures TypeScript compilation works correctly
-      // The actual type checking happens at compile time
+  it("forwards deployment idempotency headers when sending email", async () => {
+    const options = {
+      body: {
+        from: "sender@example.test",
+        to: ["recipient@example.test"],
+        subject: "Status update",
+        text: "All systems operational",
+      },
+      headers: { "Idempotency-Key": "notification:status-42" },
+    };
 
-      // Example: listApiKeys accepts optional parameters
-      const validCall1 = () => client.apiKeys.listApiKeys();
-      const validCall2 = () => client.apiKeys.listApiKeys({ query: { page: 1, page_size: 20 } } as any);
+    await client.email.send(options);
 
-      expect(validCall1).not.toThrow();
-      expect(validCall2).not.toThrow();
+    expect(sdk.sendEmail).toHaveBeenCalledWith({
+      ...options,
+      client: client.rawClient,
     });
   });
 
-  describe('Error Handling', () => {
-    it('should propagate errors from SDK methods', async () => {
-      const mockError = new Error('API Error');
-      vi.mocked(sdk.listApiKeys).mockRejectedValueOnce(mockError);
-
-      await expect(client.apiKeys.listApiKeys()).rejects.toThrow('API Error');
-    });
-  });
-});
-
-describe('TempsClient Integration', () => {
-  it('should support method chaining through namespaces', async () => {
-    const client = new TempsClient({
-      baseUrl: 'https://api.test.com',
-      apiKey: 'test-key'
-    });
-
-    // Test that we can chain namespace access and method calls
-    const platformCall = client.platform.getPlatformInfo();
-    const apiKeysCall = client.apiKeys.listApiKeys();
-    const analyticsCall = client.analytics.getVisitors({} as any);
-
-    expect(platformCall).toBeDefined();
-    expect(apiKeysCall).toBeDefined();
-    expect(analyticsCall).toBeDefined();
+  it("keeps email idempotency and authorization errors in the generated contract", () => {
+    expectTypeOf<NonNullable<SendEmailData["headers"]>["Idempotency-Key"]>()
+      .toEqualTypeOf<string | null | undefined>();
+    expectTypeOf<keyof SendEmailErrors>().toEqualTypeOf<400 | 401 | 403 | 409 | 500>();
+    expectTypeOf<keyof ListEmailDomainProjectsErrors>()
+      .toEqualTypeOf<401 | 403 | 404 | 500>();
   });
 
-  it('should handle concurrent requests across different namespaces', async () => {
-    const client = new TempsClient({
-      baseUrl: 'https://api.test.com',
-      apiKey: 'test-key'
-    });
+  it("propagates authorization failures to the caller", async () => {
+    vi.mocked(sdk.authorizeEmailDomainProject).mockRejectedValueOnce(
+      new Error("forbidden"),
+    );
 
-    const promises = [
-      client.platform.getPlatformInfo(),
-      client.apiKeys.listApiKeys(),
-      client.analytics.getVisitors({} as any),
-      client.mcp.listClients()
-    ];
-
-    const results = await Promise.all(promises);
-
-    expect(results).toHaveLength(4);
-    results.forEach(result => {
-      expect(result).toEqual({ data: 'mocked' });
-    });
+    await expect(
+      client.email.authorizeProject({ path: { id: 7, project_id: 42 } }),
+    ).rejects.toThrow("forbidden");
   });
 });

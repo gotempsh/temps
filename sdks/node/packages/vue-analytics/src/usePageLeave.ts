@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import type { JsonValue } from "@temps-sdk/analytics-core";
 import { DEFAULT_BASE_PATH, sendAnalyticsReliable } from "@temps-sdk/analytics-core";
@@ -12,19 +15,27 @@ export interface UsePageLeaveOptions {
   enabled?: boolean;
   /** Override base path (falls back to the one used by the plugin). */
   basePath?: string;
+  /**
+   * Analytics ingest key (`pa_…`). This hook sends its unload beacon directly
+   * rather than through the plugin instance. Defaults to the key the plugin
+   * was initialized with (`useTempsAnalytics().ingestKey`); only pass this to
+   * override it for this hook specifically.
+   */
+  ingestKey?: string;
 }
 
 export function usePageLeave(options: UsePageLeaveOptions = {}): {
   triggerPageLeave: () => Promise<void> | void;
 } {
+  const analytics = useTempsAnalytics();
+
   const {
     eventName = "page_leave",
     eventData = {},
     enabled = true,
     basePath = DEFAULT_BASE_PATH,
+    ingestKey = analytics.ingestKey,
   } = options;
-
-  const analytics = useTempsAnalytics();
   const hasTracked = ref(false);
   const startTime = ref<number | null>(null);
 
@@ -47,7 +58,8 @@ export function usePageLeave(options: UsePageLeaveOptions = {}): {
           referrer: document.referrer,
         },
       },
-      basePath
+      basePath,
+      ingestKey
     );
   };
 

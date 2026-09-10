@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getRestoreCapabilitiesOptions,
   getRestoreRunOptions,
@@ -44,7 +47,19 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isPitrCapableFormat } from '@/lib/utils'
 import { useQuery, useMutation } from '@tanstack/react-query'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   AlertCircle,
   AlertTriangle,
@@ -61,7 +76,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
@@ -130,6 +145,9 @@ export function ServiceRestore() {
   const [confirmText, setConfirmText] = useState('')
   const [search, setSearch] = useState('')
   const [runningRunId, setRunningRunId] = useState<number | null>(null)
+  const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   // Breadcrumbs
   useEffect(() => {
@@ -279,6 +297,24 @@ export function ServiceRestore() {
         description: `Run ${r.id} (phase: ${r.phase}).`,
       })
     },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          startMutation.mutate(variables)
+        )
+      ) {
+        setShowDestructiveConfirm(false)
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        'Failed to start restore',
+        {
+          description:
+            problem.detail || problem.message || 'Unknown error',
+        }
+      )
+    },
   })
 
   const planMutation = useMutation({
@@ -287,7 +323,7 @@ export function ServiceRestore() {
   })
 
   const isOrphan = selectedBackup?.source === 's3_scan'
-  const selectedIsWalG = selectedBackup?.format === 'walg'
+  const selectedSupportsPitr = isPitrCapableFormat(selectedBackup?.format)
   const isCrossService =
     !!selectedBackup?.origin_service_name &&
     !!service?.name &&
@@ -363,7 +399,7 @@ export function ServiceRestore() {
       if (!pitrTargetTime || Number.isNaN(new Date(pitrTargetTime).getTime()))
         return false
       if (pitrToNewService && newServiceName.trim().length === 0) return false
-      if (!selectedIsWalG) return false
+      if (!selectedSupportsPitr) return false
     }
     if (!confirmOk) return false
     // Block on plan errors — user must resolve them (e.g. pick a different
@@ -372,7 +408,7 @@ export function ServiceRestore() {
     return true
   })()
 
-  const handleStart = () => {
+  const doStart = () => {
     if (!selectedBackup) return
     const base: Record<string, unknown> = isOrphan
       ? {
@@ -406,6 +442,16 @@ export function ServiceRestore() {
       path: { id: serviceId },
       body: body as never,
     })
+  }
+
+  const handleStart = () => {
+    // Destructive modes (in-place or PITR into the same service) require an
+    // explicit confirmation dialog before the request is sent.
+    if (needsTypedConfirm) {
+      setShowDestructiveConfirm(true)
+    } else {
+      doStart()
+    }
   }
 
   // ---------- Render --------------------------------------------------------
@@ -778,21 +824,24 @@ export function ServiceRestore() {
               htmlFor="mode-pitr"
               className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${
                 mode === 'pitr' ? 'border-primary bg-accent/50' : ''
-              } ${capabilities?.pitr === false || !selectedIsWalG ? 'opacity-50 cursor-not-allowed' : ''}`}
+              } ${capabilities?.pitr === false || !selectedSupportsPitr ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <RadioGroupItem
                 value="pitr"
                 id="mode-pitr"
-                disabled={capabilities?.pitr === false || !selectedIsWalG}
+                disabled={capabilities?.pitr === false || !selectedSupportsPitr}
                 className="mt-0.5"
               />
               <div className="flex-1">
                 <div className="font-medium">Point-in-time recovery</div>
                 <div className="text-xs text-muted-foreground mt-0.5">
-                  Recover to a specific timestamp via WAL replay. Requires a
-                  WAL-G backup.
-                  {selectedBackup && !selectedIsWalG
-                    ? ' Selected backup is pg_dump; PITR not available.'
+                  {service?.service_type === 'mariadb'
+                    ? 'Recover to a specific timestamp by replaying archived binlogs. Requires a physical (mariadb-backup) base backup.'
+                    : 'Recover to a specific timestamp via WAL replay. Requires a WAL-G backup.'}
+                  {selectedBackup && !selectedSupportsPitr
+                    ? selectedBackup.format === 'mariadb_dump'
+                      ? ' Selected backup is a logical dump; PITR not available.'
+                      : ' Selected backup is pg_dump; PITR not available.'
                     : ''}
                 </div>
               </div>
@@ -828,8 +877,9 @@ export function ServiceRestore() {
                   className="max-w-md"
                 />
                 <p className="text-xs text-muted-foreground">
-                  PostgreSQL will replay archived WAL from the base backup
-                  through this time.
+                  {service?.service_type === 'mariadb'
+                    ? 'MariaDB will replay archived binlogs from the base backup through this time.'
+                    : 'PostgreSQL will replay archived WAL from the base backup through this time.'}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -1002,6 +1052,43 @@ export function ServiceRestore() {
           Start restore
         </Button>
       </div>
+
+      {/* Destructive-restore confirmation dialog */}
+      <AlertDialog
+        open={showDestructiveConfirm}
+        onOpenChange={(open: boolean) => {
+          if (!startMutation.isPending) setShowDestructiveConfirm(open)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Overwrite live database?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This restore will stop <strong>{service?.name ?? 'the service'}</strong>{' '}
+              and replace its entire dataset with the selected backup. All data
+              written since the backup was taken will be permanently lost.
+              This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={startMutation.isPending}>
+              Go back
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e: { preventDefault: () => void }) => {
+                e.preventDefault()
+                doStart()
+              }}
+              disabled={startMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {startMutation.isPending ? 'Starting restore…' : 'Yes, overwrite database'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {verificationDialog}
     </div>
   )
 }
@@ -1040,6 +1127,18 @@ function FormatBadge({ format }: { format?: string | null }) {
     return (
       <Badge className="text-xs bg-emerald-600 hover:bg-emerald-700">
         WAL-G
+      </Badge>
+    )
+  if (format === 'mariadb_physical')
+    return (
+      <Badge className="text-xs bg-emerald-600 hover:bg-emerald-700">
+        mariadb-backup
+      </Badge>
+    )
+  if (format === 'mariadb_dump')
+    return (
+      <Badge variant="secondary" className="text-xs">
+        mysqldump
       </Badge>
     )
   return (

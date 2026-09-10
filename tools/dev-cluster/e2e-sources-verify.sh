@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Prove the filter-dropdown fix: available_sources lists ALL containers/nodes for
 # the scope regardless of the active container/node filter (so you can switch
 # between them without first resetting to "All").

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! SeaORM entity for the `schedule_runs` table.
 //!
 //! One row per scheduler tick (cron-triggered) or "Run now" click (manual).

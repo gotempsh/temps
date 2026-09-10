@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(test)]
 mod integration_tests {
     use std::sync::Arc;
@@ -46,6 +49,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Verify the proxy service was created successfully
@@ -93,6 +97,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Test custom route resolution
@@ -135,6 +140,7 @@ mod integration_tests {
             route_table,
             config,
             Arc::new(temps_core::FixedRetentionResolver),
+            Arc::new(temps_core::OpenIpGate),
         )?;
 
         // Test project context resolution
@@ -165,21 +171,85 @@ mod integration_tests {
         // Visitor tracking decisions are now a pure static function — no DB needed.
         use crate::proxy::LoadBalancer;
 
-        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
+        let browser_accept = Some("text/html,application/xhtml+xml");
+        let document = Some("document");
+
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
         assert!(!LoadBalancer::should_track_page(
             "/api/_temps/health",
             Some("application/json"),
-            200
+            "GET",
+            browser_accept,
+            document,
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/assets/style.css",
             Some("text/css"),
-            200
+            "GET",
+            Some("text/css,*/*;q=0.1"),
+            Some("style"),
+            None,
         ));
         assert!(LoadBalancer::should_track_page(
             "/some-page",
             Some("text/html"),
-            404
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/graphql",
+            Some("application/json"),
+            "POST",
+            Some("application/json"),
+            Some("empty"),
+            None,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/problem+json"),
+            "GET",
+            Some("application/json"),
+            Some("empty"),
+            None,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/missing-content-type",
+            None,
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+
+        // HTTP-origin navigation: no Fetch Metadata, browser Accept, and
+        // Upgrade-Insecure-Requests: 1 → track.
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            Some("1"),
+        ));
+        // HTTP-origin scraper: browser Accept, no Upgrade-Insecure-Requests
+        // → not tracked.
+        assert!(!LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            None,
         ));
         Ok(())
     }

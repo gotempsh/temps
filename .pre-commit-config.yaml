@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -24,6 +27,16 @@ repos:
         entry: python3 scripts/hooks/validate-changelog.py
         language: system
         files: ^CHANGELOG\.md$
+        pass_filenames: false
+
+      - id: openapi-canonical
+        name: openapi.json is canonical
+        # Catches the raw server response (minified, one line) being committed
+        # over the formatted file, which reports ~92,000 deletions and buries
+        # the real change. Reads only the file: no server, no network.
+        entry: bun apps/temps-cli/scripts/check-openapi.ts
+        language: system
+        files: ^apps/temps-cli/openapi\.json$
         pass_filenames: false
 
       - id: cargo-fmt

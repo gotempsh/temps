@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Simplified `BackupEngine` trait for the in-process executor.
 //!
 //! Replaces the old multi-step `BackupEngine` trait (still in `engine.rs`

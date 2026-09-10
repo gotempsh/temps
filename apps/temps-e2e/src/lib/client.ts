@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Builds a standalone @hey-api client pointed at a live Temps instance and wires
  * the bearer-token auth header. Mirrors apps/temps-cli/src/lib/api-client.ts but

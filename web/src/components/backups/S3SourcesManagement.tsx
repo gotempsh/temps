@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -19,6 +22,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
   DialogContent,
@@ -29,15 +33,14 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  setDefaultS3Source,
-  testS3SourceConnection,
-} from '@/lib/s3-sources'
+import { setDefaultS3Source, testS3SourceConnection } from '@/lib/s3-sources'
 import { cn } from '@/lib/utils'
+import { shouldShowS3SourceHeaderAction } from '@/lib/s3-source-presentation'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
   ChevronRight,
+  Cloud,
   Database,
   EllipsisVertical,
   Pencil,
@@ -48,7 +51,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   DropdownMenu,
@@ -210,10 +213,11 @@ export function S3SourcesManagement() {
     (Partial<NewS3Source> & { id?: number }) | null
   >(null)
   const [pendingDefault, setPendingDefault] = useState<S3SourceResponse | null>(
-    null,
+    null
   )
-  const [sourceToDelete, setSourceToDelete] =
-    useState<S3SourceResponse | null>(null)
+  const [sourceToDelete, setSourceToDelete] = useState<S3SourceResponse | null>(
+    null
+  )
 
   const {
     data: sources = [],
@@ -339,17 +343,18 @@ export function S3SourcesManagement() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold">S3 Sources</h2>
+          <h2 className="text-lg font-semibold">S3 sources</h2>
           <p className="text-sm text-muted-foreground">
             Configure S3 storage for backups
           </p>
         </div>
-        <Button asChild className="w-full sm:w-auto">
-          <Link to="/backups/s3-sources/new">
-            <Plus className="mr-2 h-4 w-4" />
-            Add S3 Source
-          </Link>
-        </Button>
+        {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+          <CreateActionButton
+            to="/backups/s3-sources/new"
+            label="Add S3 Source"
+            className="w-full sm:w-auto"
+          />
+        ) : null}
       </div>
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
@@ -385,8 +390,8 @@ export function S3SourcesManagement() {
               <p className="text-muted-foreground">
                 Existing backup schedules keep their explicitly-configured
                 source. External services (like Postgres WAL archiving) that
-                track the default source will begin writing to the new
-                location on their next backup.
+                track the default source will begin writing to the new location
+                on their next backup.
               </p>
             </div>
           ) : null}
@@ -413,7 +418,10 @@ export function S3SourcesManagement() {
       {isLoading ? (
         <div className="divide-y rounded-lg border">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="flex items-center gap-4 px-4 py-3 animate-pulse">
+            <div
+              key={i}
+              className="flex items-center gap-4 px-4 py-3 animate-pulse"
+            >
               <div className="size-9 shrink-0 rounded-md bg-muted" />
               <div className="flex-1 min-w-0 space-y-1.5">
                 <div className="h-4 w-48 bg-muted rounded" />
@@ -440,9 +448,8 @@ export function S3SourcesManagement() {
         <div className="overflow-hidden rounded-lg border">
           <ul role="list" className="divide-y">
             {sources.map((source) => {
-              const isDefault =
-                (source as S3SourceResponse & { is_default?: boolean })
-                  .is_default === true
+              const isDefault = source.is_default === true
+              const isManagedByCloud = source.managed_by_cloud === true
               const isTestingThis =
                 testConnectionMutation.isPending &&
                 testConnectionMutation.variables === source.id
@@ -467,7 +474,10 @@ export function S3SourcesManagement() {
                           <p className="truncate text-sm font-medium">
                             {source.name}
                           </p>
-                          <Badge variant="secondary" className="font-mono text-xs">
+                          <Badge
+                            variant="secondary"
+                            className="font-mono text-xs"
+                          >
                             {source.bucket_name}
                           </Badge>
                           {isDefault && (
@@ -477,6 +487,15 @@ export function S3SourcesManagement() {
                             >
                               <Star className="size-3 fill-current" />
                               Default
+                            </Badge>
+                          )}
+                          {isManagedByCloud && (
+                            <Badge
+                              variant="outline"
+                              className="gap-1 border-sky-400/40 text-sky-600 dark:text-sky-300"
+                            >
+                              <Cloud className="size-3 fill-current" />
+                              Managed by Temps Cloud
                             </Badge>
                           )}
                         </div>
@@ -496,15 +515,17 @@ export function S3SourcesManagement() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            handleEditSource(source)
-                          }}
-                        >
-                          <Pencil className="mr-2 h-4 w-4" />
-                          Edit
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <DropdownMenuItem
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              handleEditSource(source)
+                            }}
+                          >
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Edit
+                          </DropdownMenuItem>
+                        )}
                         <DropdownMenuItem
                           onSelect={(e) => {
                             e.preventDefault()
@@ -546,18 +567,22 @@ export function S3SourcesManagement() {
                             Set as default
                           </DropdownMenuItem>
                         )}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setSourceToDelete(source)
-                          }}
-                          className="text-destructive"
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onSelect={(e) => {
+                                e.preventDefault()
+                                setSourceToDelete(source)
+                              }}
+                              className="text-destructive"
+                              disabled={deleteMutation.isPending}
+                            >
+                              <Trash2 className="mr-2 h-4 w-4" />
+                              Delete
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>
@@ -590,11 +615,10 @@ export function S3SourcesManagement() {
                   (<code>{sourceToDelete.bucket_name}</code>)
                 </>
               ) : null}{' '}
-              from Temps. Backup schedules pointing at this source will fail
-              on their next run, and services that rely on it for WAL
-              archiving will stop shipping new data until reconfigured. Objects
-              already in the bucket will not be deleted. This action cannot be
-              undone.
+              from Temps. Backup schedules pointing at this source will fail on
+              their next run, and services that rely on it for WAL archiving
+              will stop shipping new data until reconfigured. Objects already in
+              the bucket will not be deleted. This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

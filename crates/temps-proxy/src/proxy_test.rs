@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(test)]
 pub mod proxy_tests {
     use crate::config::ProxyConfig;
@@ -203,6 +206,10 @@ pub mod proxy_tests {
         async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
             Some("round_robin".to_string())
         }
+
+        fn console_address(&self) -> &str {
+            &self.console_addr
+        }
     }
 
     #[tokio::test]
@@ -276,6 +283,7 @@ pub mod proxy_tests {
             test_db.db.clone(),
             config_service,
             ip_access_control_service,
+            Arc::new(temps_core::OpenIpGate),
             challenge_service,
             cert_host_cache,
             false,
@@ -481,35 +489,186 @@ pub mod proxy_tests {
     async fn test_proxy_visitor_tracking_decisions() -> Result<()> {
         use crate::proxy::LoadBalancer;
 
-        // HTML page → track
-        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
+        let browser_accept = Some("text/html,application/xhtml+xml");
+        let document = Some("document");
+        let uir = Some("1");
+
+        // Browser HTML navigation → track
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
 
         // Internal API → do not track
         assert!(!LoadBalancer::should_track_page(
             "/api/_temps/health",
             Some("application/json"),
-            200
+            "GET",
+            browser_accept,
+            document,
+            None,
         ));
 
         // CSS static asset → do not track
         assert!(!LoadBalancer::should_track_page(
             "/assets/style.css",
             Some("text/css"),
-            200
+            "GET",
+            Some("text/css,*/*;q=0.1"),
+            Some("style"),
+            None,
         ));
 
-        // Error page (404) → track regardless of extension
+        // HTML error page (404) → track
         assert!(LoadBalancer::should_track_page(
             "/some-page",
             Some("text/html"),
-            404
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+
+        // API-style errors outside /api must not create visitor sessions.
+        assert!(!LoadBalancer::should_track_page(
+            "/graphql",
+            Some("application/json"),
+            "POST",
+            Some("application/json"),
+            Some("empty"),
+            None,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/problem+json"),
+            "GET",
+            Some("application/json"),
+            Some("empty"),
+            None,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/missing-content-type",
+            None,
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+
+        // API-prefixed routes are never browser pages, even if misconfigured
+        // to return HTML.
+        assert!(!LoadBalancer::should_track_page(
+            "/api/report",
+            Some("text/html; charset=utf-8"),
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+
+        // A generic HTTP client receiving HTML is not a browser page view.
+        assert!(!LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            Some("*/*"),
+            None,
+            None,
+        ));
+
+        // HTTP-origin navigation: no Fetch Metadata (plain-HTTP origins never
+        // get Sec-Fetch-*), browser Accept, and Upgrade-Insecure-Requests: 1
+        // (which browsers send on top-level navigations to HTTP origins) →
+        // track. See is_browser_document_request.
+        assert!(LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            uir,
+        ));
+
+        // HTTP-origin scraper: browser-shaped Accept but no
+        // Upgrade-Insecure-Requests (curl/wget/scrapers don't send it) → not
+        // tracked, even though it evades the UA-based crawler detector.
+        assert!(!LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            None,
+        ));
+
+        // HTTPS behaviour unchanged: when Fetch Metadata is present,
+        // Sec-Fetch-Dest decides regardless of Upgrade-Insecure-Requests.
+        assert!(LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
+            None,
+        ));
+
+        // ...but that fallback is still gated on the response actually being
+        // HTML at a real page path.
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/json"),
+            "GET",
+            browser_accept,
+            None,
+            uir,
+        ));
+
+        // A JS fetch() on an HTTP origin sends no Fetch Metadata either, but
+        // defaults to Accept: */* — which is what keeps it out.
+        assert!(!LoadBalancer::should_track_page(
+            "/data",
+            Some("text/html"),
+            "GET",
+            Some("*/*"),
+            None,
+            uir,
+        ));
+
+        // The GET-only rule still holds on the no-Fetch-Metadata path: a form
+        // POST that renders HTML is not a new page view, and without this the
+        // method check is only ever exercised alongside a Sec-Fetch-Dest.
+        assert!(!LoadBalancer::should_track_page(
+            "/checkout",
+            Some("text/html"),
+            "POST",
+            browser_accept,
+            None,
+            uir,
+        ));
+
+        // Browser background fetches must not create sessions even if an
+        // upstream mistakenly responds with HTML.
+        assert!(!LoadBalancer::should_track_page(
+            "/data",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            Some("empty"),
+            None,
         ));
 
         // PNG image → do not track
         assert!(!LoadBalancer::should_track_page(
             "/images/logo.png",
             Some("image/png"),
-            200
+            "GET",
+            Some("image/avif,image/webp,*/*"),
+            Some("image"),
+            None,
         ));
 
         Ok(())
@@ -776,6 +935,7 @@ pub mod proxy_tests {
             db.clone(),
             config_service,
             ip_access_control_service,
+            Arc::new(temps_core::OpenIpGate),
             challenge_service,
             cert_host_cache,
             false,

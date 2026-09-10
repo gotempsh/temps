@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Blob Service implementation with RustFS/S3 backend
 
 use std::sync::Arc;
@@ -223,6 +226,19 @@ impl BlobService {
             let key = self.object_key(project_id, &pathname);
             debug!("DELETE {}", key);
 
+            // S3's DeleteObject is idempotent by design: it returns success
+            // whether or not the key existed, so the delete call alone can't
+            // tell us what was actually removed. HeadObject first so the
+            // returned count reflects reality -- otherwise a second delete of
+            // the same (already-gone) keys would keep reporting them deleted.
+            let existed = client
+                .head_object()
+                .bucket(DEFAULT_BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .is_ok();
+
             match client
                 .delete_object()
                 .bucket(DEFAULT_BUCKET)
@@ -230,7 +246,11 @@ impl BlobService {
                 .send()
                 .await
             {
-                Ok(_) => deleted += 1,
+                Ok(_) => {
+                    if existed {
+                        deleted += 1;
+                    }
+                }
                 Err(e) => {
                     debug!("Failed to delete {}: {}", key, e);
                     // Continue with other deletions

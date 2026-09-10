@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   getWebhookOptions,
@@ -34,7 +37,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
 
 interface WebhookDetailProps {

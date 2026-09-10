@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   deleteDomainDeliveryBinding,
   listDomainDeliveryBindings,
@@ -18,7 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { deliveryError, requireDeliveryData } from './delivery-errors'
 
 export function DomainDeliveryBindings({

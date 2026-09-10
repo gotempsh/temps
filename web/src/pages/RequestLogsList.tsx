@@ -1,4 +1,7 @@
-import { useNavigate } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { useNavigate } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import ProxyLogsList from '@/components/logs/ProxyLogsList'
 
@@ -12,15 +15,17 @@ export default function RequestLogsList({
   const navigate = useNavigate()
 
   const handleRowClick = (
-    logId: number,
+    requestId: string,
     _projectId: number,
     timestamp: string
   ) => {
-    // The row's timestamp lets the detail endpoint bound its hypertable
-    // lookup to the right chunks instead of scanning the whole retention
-    // window.
+    // Navigate by request_id, not serial id: the ClickHouse backend has no
+    // serial id column (list rows surface id=0 there), while request_id
+    // resolves under both backends. The row's timestamp lets the detail
+    // endpoint bound its lookup to the right chunks/partitions instead of
+    // scanning the whole retention window.
     navigate(
-      `/projects/${projectResponse.slug}/logs/${logId}?ts=${encodeURIComponent(timestamp)}`
+      `/projects/${projectResponse.slug}/logs/${encodeURIComponent(requestId)}?ts=${encodeURIComponent(timestamp)}`
     )
   }
 

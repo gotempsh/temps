@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-ai-chat"
 version.workspace = true
@@ -13,11 +16,17 @@ categories = ["development-tools"]
 [dependencies]
 temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
+temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
+temps-agents = { path = "../temps-agents" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
+temps-sandbox = { path = "../temps-sandbox" }
+temps-projects = { path = "../temps-projects" }
+tempfile = { workspace = true }
 
 axum = { workspace = true }
 utoipa = { workspace = true }
@@ -29,12 +38,24 @@ async-stream = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 anyhow = { workspace = true }
+regex = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
+nix = { version = "0.31", features = ["dir", "fs"] }
+walkdir = { workspace = true }
+zip = { workspace = true }
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` gives the paused clock used to exercise the turn deadline without
+# a test that actually waits fifteen minutes. Dev-only — not in the binary.
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-ai-api-tools"
 version.workspace = true
@@ -10,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 # Internal crates
 temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
 
 # Async runtime
 tokio = { workspace = true }

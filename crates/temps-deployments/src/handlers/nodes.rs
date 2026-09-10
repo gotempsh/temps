@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node Registration Handlers
 //!
 //! Internal API endpoints for worker nodes to register with the control plane
@@ -17,17 +20,20 @@ use axum::{
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::audit::NodeArchitectureChangedAudit;
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
+use crate::services::CONTROL_PLANE_NODE_ID;
 use temps_core::problemdetails::{self, Problem};
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::AuditContext;
+use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -43,9 +49,13 @@ pub struct NodeAppState {
     pub rate_limiter: Arc<RegistrationRateLimiter>,
     /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Notification pipeline — used to alert operators when a node recovers
-    /// (offline->active on heartbeat). Optional: absent if no provider is wired.
-    pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Alarm pipeline — used to resolve the node-offline alarm when a node
+    /// recovers (offline->active on heartbeat). Optional: absent if
+    /// `AlarmService` wasn't available when this state was built.
+    pub alarm_service: Option<Arc<temps_monitoring::alarm_service::AlarmService>>,
+    /// Audit trail. A node's reported architecture decides where images are
+    /// placed, so a change to it is recorded like any other write.
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 /// Fixed-window rate limiter for the public node-registration endpoint
@@ -139,6 +149,10 @@ pub struct RegisterNodeApiRequest {
     pub labels: Option<serde_json::Value>,
     /// X25519 public key for ECIES certificate encryption (base64-encoded, edge nodes only)
     pub edge_public_key: Option<String>,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). Optional: agents older than multi-arch support omit it
+    /// and the value is learned from the first heartbeat instead.
+    pub architecture: Option<String>,
     /// The node's *current* token, supplied to prove possession when
     /// re-registering (changing the identity of) a node that already exists.
     /// Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
@@ -156,6 +170,8 @@ pub struct RegisterNodeResponse {
     pub name: String,
     pub status: String,
     pub message: String,
+    /// Whether this node must serve mTLS and reject plaintext agent traffic.
+    pub mtls_required: bool,
     /// The signed per-node leaf certificate (PEM) the agent serves as its TLS
     /// server cert. Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +191,47 @@ pub struct HeartbeatApiRequest {
     /// Container inventory for reconciliation (sent on first heartbeat after agent startup).
     /// Each entry has `container_id` and `container_name` of temps-managed containers.
     pub containers: Option<Vec<ContainerInventoryItem>>,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`), read from `docker info` by the agent. Absent from
+    /// pre-multi-arch agents; the stored value is then left untouched.
+    pub architecture: Option<String>,
+    /// Per-node DNS resolver health (ADR-024), reported by agents new enough
+    /// to have it. `None` means either an older agent binary, or a
+    /// heartbeat that raced before the agent's network-sync loop first
+    /// ran — a true single-host node with no `compute_cidr` allocation
+    /// never touches cluster DNS and always reports `None` here, which is
+    /// expected, not stale data. The stored columns are left untouched when
+    /// `None`, same treatment as `architecture` above.
+    pub dns_resolver: Option<DnsResolverHeartbeat>,
+}
+
+/// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
+/// `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+/// declared separately rather than shared: the agent and control-plane
+/// crates don't depend on each other (the agent avoids pulling in
+/// `temps-deployments`' sea-orm dependency tree), matching the existing
+/// `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct DnsResolverHeartbeat {
+    /// `false` when cluster DNS is disabled on the control plane, the
+    /// resolver failed to start, or it was shut down. `true` only while a
+    /// resolver handle currently exists and cluster DNS is enabled.
+    #[serde(default)]
+    pub running: bool,
+    /// `false` means the resolver's sync or DNS server task crashed. Only
+    /// meaningful when `running`.
+    #[serde(default)]
+    pub tasks_alive: bool,
+    #[serde(default)]
+    pub last_sync_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub consecutive_sync_failures: u32,
+    /// Most recent resolver-related error: a sync tick failure, or (when the
+    /// resolver never started at all) the startup error itself.
+    #[serde(default)]
+    pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub record_count: i64,
 }
 
 /// A container reported by the agent during heartbeat reconciliation.
@@ -203,6 +260,9 @@ pub struct NodeInfoResponse {
     pub labels: serde_json::Value,
     /// Resource capacity/usage metrics from the latest heartbeat
     pub capacity: serde_json::Value,
+    /// Container platform this node runs (`linux/amd64`, `linux/arm64`).
+    /// `None` until an agent that reports it has heartbeated.
+    pub architecture: Option<String>,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
 }
@@ -257,7 +317,8 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
-    /// Whether the drain is complete (all containers migrated)
+    /// Whether the source node is empty and safe to remove. Replacement
+    /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
     /// Can the node be safely removed?
     pub can_remove: bool,
@@ -327,6 +388,46 @@ pub struct S3CredentialsResponse {
     pub force_path_style: bool,
 }
 
+/// Per-node DNS resolver health, as last reported by that node's heartbeat.
+/// Part of `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct NodeDnsStatusEntry {
+    pub node_id: i32,
+    pub node_name: String,
+    /// The node's own status field (`active`, `offline`, `draining`, …) —
+    /// included so an operator can tell "resolver down" apart from "node
+    /// down" at a glance, without a second request.
+    pub node_status: String,
+    /// `None` = never reported (older agent, or a single-host node that
+    /// never allocates a `compute_cidr` and so never touches cluster DNS).
+    pub dns_resolver_running: Option<bool>,
+    pub dns_resolver_tasks_alive: Option<bool>,
+    pub dns_resolver_last_sync_at: Option<String>,
+    /// Computed from `dns_resolver_last_sync_at` against "now" server-side —
+    /// a raw timestamp makes an operator do the subtraction themselves for
+    /// every node; a staleness age is what actually answers "is this
+    /// healthy right now". `None` when `dns_resolver_last_sync_at` is `None`.
+    pub seconds_since_last_sync: Option<i64>,
+    pub dns_resolver_consecutive_failures: i32,
+    pub dns_resolver_last_error: Option<String>,
+    pub dns_resolver_record_count: Option<i32>,
+}
+
+/// Response from `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ClusterDnsStatusResponse {
+    /// Whether cluster DNS is currently enabled cluster-wide
+    /// (`AppSettings.cluster_dns.enabled`). When `false`, every node's
+    /// per-node values below are expected to show `dns_resolver_running:
+    /// Some(false)` (or `None` if a node has never reported).
+    pub cluster_dns_enabled: bool,
+    /// Total `*.temps.local` records currently registered across the whole
+    /// cluster (`service_endpoints` row count), independent of any single
+    /// node's resolver health.
+    pub total_record_count: i64,
+    pub nodes: Vec<NodeDnsStatusEntry>,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -341,12 +442,14 @@ pub struct S3CredentialsResponse {
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
+        cluster_dns_status,
     ),
     components(schemas(
         RegisterNodeApiRequest,
         RegisterNodeResponse,
         HeartbeatApiRequest,
         HeartbeatResponse,
+        DnsResolverHeartbeat,
         S3CredentialsResponse,
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
@@ -359,6 +462,8 @@ pub struct S3CredentialsResponse {
         UndrainNodeResponse,
         RemoveNodeResponse,
         DrainStatusResponse,
+        NodeDnsStatusEntry,
+        ClusterDnsStatusResponse,
     )),
     info(
         title = "Node Registration API",
@@ -422,12 +527,78 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
             get(proxy_edge_analytics_timeseries),
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
+        .route("/cluster/dns/status", get(cluster_dns_status))
 }
 
 /// SHA-256 hash a token string
 fn sha256_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     hex::encode(digest)
+}
+
+/// Maximum accepted length of an agent-reported platform string.
+///
+/// `linux/amd64` is 11 chars and the longest realistic value (`linux/arm/v7`)
+/// is 12; 64 leaves generous room while keeping an authenticated-but-buggy (or
+/// hostile) agent from writing an arbitrarily large blob into a column that is
+/// rendered in the admin UI.
+const MAX_REPORTED_PLATFORM_LEN: usize = 64;
+
+/// Validate and canonicalize the platform an agent reports.
+///
+/// This is a system boundary: the value arrives over the network from the
+/// agent, is persisted, later compared against image platforms to decide
+/// scheduling, and is displayed in the console. We accept only the shape a
+/// platform string can legitimately have (`[a-z0-9._/-]`, bounded length),
+/// canonicalize spellings (`aarch64` → `arm64`) so comparisons are plain
+/// string equality, and drop anything else rather than storing junk that would
+/// silently never match any image.
+fn normalize_reported_platform(reported: Option<&str>) -> Option<String> {
+    let raw = reported?.trim();
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.len() > MAX_REPORTED_PLATFORM_LEN {
+        warn!(
+            length = raw.len(),
+            max = MAX_REPORTED_PLATFORM_LEN,
+            "Ignoring agent-reported platform: too long"
+        );
+        return None;
+    }
+
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+    {
+        warn!("Ignoring agent-reported platform: unexpected characters");
+        return None;
+    }
+
+    Some(temps_deployer::platform::canonicalize_platform(raw))
+}
+
+/// Convert the wire DTO into the service-layer request, per the three-layer
+/// architecture (handlers never hand their own DTOs to the service layer).
+/// `u32`/`i64` wire counters are clamped rather than rejected when they
+/// exceed the DB's `i32` columns — the counts involved (DNS records on one
+/// node, consecutive sync failures) are nowhere near that range in practice,
+/// and a clamp is a better failure mode for a heartbeat than dropping the
+/// whole report.
+fn dns_resolver_heartbeat_update(
+    wire: DnsResolverHeartbeat,
+) -> crate::services::node_service::DnsResolverHeartbeatUpdate {
+    crate::services::node_service::DnsResolverHeartbeatUpdate {
+        running: wire.running,
+        tasks_alive: wire.tasks_alive,
+        last_sync_success_at: wire.last_sync_success_at,
+        consecutive_sync_failures: i32::try_from(wire.consecutive_sync_failures)
+            .unwrap_or(i32::MAX),
+        last_sync_error: wire.last_sync_error,
+        record_count: i32::try_from(wire.record_count).unwrap_or(i32::MAX),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +642,21 @@ impl std::fmt::Display for NodeAddressError {
 /// Workers that use public IPs with a WireGuard underlay are intentionally
 /// allowed — the goal is to block dangerous special-purpose ranges, not enforce
 /// private-only addressing.
-fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+///
+/// `pub`: also called from `temps-cli`'s `temps agent --private-address`/
+/// `TEMPS_AGENT_PRIVATE_ADDRESS` override resolution, so a manually supplied
+/// address gets the identical rejection of dangerous ranges (in particular
+/// `0.0.0.0`, which would otherwise silently reproduce the all-interface
+/// container-port exposure this whole registration check exists to prevent)
+/// that a `temps join`-registered address already gets server-side.
+///
+/// Returns the bare `IpAddr` with any port suffix stripped (registration
+/// tolerates `host:port`/`[ipv6]:port`, matching `node_address_host`'s
+/// scheme+port stripping below, but a caller that binds Docker container
+/// ports to this address — see `temps-agent` — needs the bare host: passing
+/// a `host:port` string straight to Docker's `PortBinding.host_ip` is not a
+/// valid IP and fails every container creation).
+pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, NodeAddressError> {
     use std::net::IpAddr;
 
     // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
@@ -481,15 +666,19 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         // Bracketed IPv6 — either "[::1]" or "[::1]:port"
         stripped.split(']').next().unwrap_or(addr)
     } else {
-        // Plain IPv4 or bare IPv6: split on last ':' to strip port, but only
-        // if what remains before the ':' parses as an IP (so we don't strip
-        // the last group of a bare IPv6 address like "fc00::1").
-        if let Some((before, _after)) = addr.rsplit_once(':') {
-            if before.parse::<IpAddr>().is_ok() {
-                before
-            } else {
-                addr
-            }
+        // Disambiguate by colon count, not by "does the prefix also happen
+        // to parse as an IP" -- that heuristic is unsound for unbracketed
+        // IPv6: plenty of valid bare addresses (e.g. "2001:db8::1:2") have a
+        // last hextet that looks like a "port" AND a prefix that is itself
+        // an independently valid IPv6 address, so it would silently
+        // truncate them to the wrong host. RFC 3986 requires brackets for
+        // an IPv6 host:port, so an unbracketed address is unambiguous by
+        // colon count alone: any bare IPv6 address needs at least two
+        // colons (minimum form "::"), so exactly one colon can only mean
+        // IPv4:port.
+        if addr.matches(':').count() == 1 {
+            addr.rsplit_once(':')
+                .map_or(addr, |(before, _after)| before)
         } else {
             addr
         }
@@ -573,7 +762,46 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         }
     }
 
-    Ok(())
+    Ok(ip)
+}
+
+/// Extract the host from a validated node agent URL or private address for use
+/// as a server-authoritative certificate SAN.
+fn node_address_host(address: &str) -> String {
+    let address = address.trim();
+    let authority = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address)
+        .split('/')
+        .next()
+        .unwrap_or(address);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        if let Some(end) = bracketed.find(']') {
+            return bracketed[..end].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => authority.to_string(),
+    }
+}
+
+fn mtls_agent_address(address: &str) -> String {
+    let address = address.trim();
+    if address.starts_with("https://") {
+        address.to_string()
+    } else if let Some(authority) = address.strip_prefix("http://") {
+        format!("https://{authority}")
+    } else {
+        format!("https://{address}")
+    }
+}
+
+fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -> bool {
+    cluster_requires_mtls || csr_present
 }
 
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
@@ -803,21 +1031,40 @@ async fn register_node(
         }
     }
 
+    if settings.multi_node.require_mtls && request.csr_pem.is_none() {
+        warn!(
+            node = %request.name,
+            "Node registration rejected: this cluster requires mTLS but no CSR was supplied"
+        );
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Node Certificate Required")
+            .with_detail(
+                "This cluster requires mTLS. Upgrade the Temps CLI and re-run `temps join` so the worker can generate a key and certificate signing request.",
+            ));
+    }
+
     let token_hash = sha256_hash(&request.token);
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
     // Reject private_address values in reserved/dangerous ranges before they
-    // can be persisted and later used to build health-check URLs.
-    validate_node_private_address(request.private_address.trim()).map_err(|e| {
-        warn!(
-            "Node registration rejected: invalid private_address '{}': {}",
-            request.private_address.trim(),
-            e
-        );
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Node Address")
-            .with_detail(e.to_string())
-    })?;
+    // can be persisted and later used to build health-check URLs. Store the
+    // normalized bare IP, not the raw request value: route_table.rs's
+    // build_container_backend_addr appends its own port to whatever is
+    // stored here (`format!("{private_addr}:{port}")`), so a port-suffixed
+    // value persisted verbatim would corrupt every proxy backend address
+    // built for this node.
+    let private_address = validate_node_private_address(request.private_address.trim())
+        .map_err(|e| {
+            warn!(
+                "Node registration rejected: invalid private_address '{}': {}",
+                request.private_address.trim(),
+                e
+            );
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Address")
+                .with_detail(e.to_string())
+        })?
+        .to_string();
 
     // The `address` field is also user-supplied (used as the deployer agent URL).
     // Extract the host portion and apply the same check.
@@ -852,17 +1099,70 @@ async fn register_node(
                 .with_detail("Failed to process node registration")
         })?;
 
+    // Every modern CLI supplies a CSR. Treat that as an explicit request for
+    // a per-node mTLS identity even while a cluster is in the migration window
+    // where CSR-less legacy workers remain allowed. Fresh clusters additionally
+    // set `require_mtls`, which rejects clients that cannot supply a CSR.
+    let node_uses_mtls =
+        node_registration_uses_mtls(settings.multi_node.require_mtls, request.csr_pem.is_some());
+
+    let registered_address = if node_uses_mtls {
+        mtls_agent_address(&request.address)
+    } else {
+        request.address.trim().to_string()
+    };
+
+    // Issue the certificate before persisting the node. If CA provisioning or
+    // CSR validation fails, enrollment must not leave a ghost HTTPS node that
+    // can never start its agent listener.
+    let (cert_pem, ca_cert_pem) = if let Some(csr_pem) = request.csr_pem.as_ref() {
+        let ca = crate::cluster_ca::ensure_cluster_ca(
+            app_state.config_service.as_ref(),
+            app_state.encryption_service.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to provision cluster CA: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to provision the cluster certificate authority")
+        })?;
+
+        // Server-authoritative SANs: the node's reachable host (the IP the
+        // control plane connects to) + its registered name. The worker's own
+        // CSR SANs are discarded by sign_node_csr so one worker cannot mint a
+        // certificate valid for another cluster identity.
+        let mut allowed_sans = vec![request.name.trim().to_string()];
+        for address in [&registered_address, &private_address] {
+            let host = node_address_host(address);
+            if !host.is_empty() && !allowed_sans.contains(&host) {
+                allowed_sans.push(host);
+            }
+        }
+        let signed =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, csr_pem, &allowed_sans)
+                .map_err(|e| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid CSR")
+                        .with_detail(format!("Failed to sign certificate signing request: {}", e))
+                })?;
+        (Some(signed.cert_pem), Some(ca.cert_pem))
+    } else {
+        (None, None)
+    };
+
     let register_request = RegisterNodeRequest {
         name: request.name.trim().to_string(),
         token_hash,
         token_encrypted: Some(token_encrypted),
-        address: request.address.trim().to_string(),
-        private_address: request.private_address.trim().to_string(),
+        address: registered_address,
+        private_address,
         public_endpoint: request.public_endpoint,
         wg_public_key: request.wg_public_key,
         role: request.role.unwrap_or_else(|| "worker".to_string()),
         labels: request.labels.unwrap_or(serde_json::json!({})),
         edge_public_key: request.edge_public_key,
+        architecture: normalize_reported_platform(request.architecture.as_deref()),
         // Hash the proof-of-possession token (if any) so the service can
         // constant-time compare it against the stored hash. (ADR-020 WS-1.2.)
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
@@ -901,103 +1201,6 @@ async fn register_node(
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
 
-    // ── mTLS: sign the node's CSR with the cluster CA (ADR-020 WS-2.1) ──
-    // Only when mTLS is enforced AND the worker supplied a CSR: mint/load the
-    // per-cluster CA and return a signed per-node leaf plus the CA cert. With
-    // require_mtls off (default) we ignore the CSR and the node keeps using
-    // plaintext HTTP behind the bearer token — zero behavior change.
-    let (cert_pem, ca_cert_pem) = if let (true, Some(csr_pem)) =
-        (settings.multi_node.require_mtls, request.csr_pem.as_ref())
-    {
-        match crate::cluster_ca::ensure_cluster_ca(
-            app_state.config_service.as_ref(),
-            app_state.encryption_service.as_ref(),
-        )
-        .await
-        {
-            Ok(ca) => {
-                // Server-authoritative SANs: the node's reachable host (the IP
-                // the control plane connects to) + its registered name. The
-                // worker's own CSR SANs are discarded by sign_node_csr — a
-                // compromised worker must not be able to mint a leaf valid for
-                // the CP's or another node's identity (cluster-wide CA trust).
-                let host_only = |addr: &str| -> String {
-                    let a = addr.trim();
-                    let a = a
-                        .strip_prefix("https://")
-                        .or_else(|| a.strip_prefix("http://"))
-                        .unwrap_or(a);
-                    let a = a.split('/').next().unwrap_or(a);
-                    if let Some(rest) = a.strip_prefix('[') {
-                        if let Some(end) = rest.find(']') {
-                            return rest[..end].to_string();
-                        }
-                    }
-                    match a.rsplit_once(':') {
-                        Some((host, port))
-                            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
-                        {
-                            host.to_string()
-                        }
-                        _ => a.to_string(),
-                    }
-                };
-                let mut allowed_sans = vec![node.name.clone()];
-                let addr_host = host_only(&node.address);
-                if !addr_host.is_empty() && !allowed_sans.contains(&addr_host) {
-                    allowed_sans.push(addr_host);
-                }
-                let priv_host = host_only(&node.private_address);
-                if !priv_host.is_empty() && !allowed_sans.contains(&priv_host) {
-                    allowed_sans.push(priv_host);
-                }
-                match temps_core::node_pki::sign_node_csr(
-                    &ca.cert_pem,
-                    &ca.key_pem,
-                    csr_pem,
-                    &allowed_sans,
-                ) {
-                    Ok(signed) => {
-                        info!(node_id = node.id, "Signed node CSR for mTLS");
-                        // Switch the node's stored address to https:// so the
-                        // control plane uses its mTLS client for every CP->agent
-                        // call to this now-TLS-serving node.
-                        let https_address = node.address.replacen("http://", "https://", 1);
-                        if https_address != node.address {
-                            use sea_orm::{ActiveModelTrait, Set};
-                            let mut active: temps_entities::nodes::ActiveModel =
-                                node.clone().into();
-                            active.address = Set(https_address);
-                            if let Err(e) = active.update(app_state.db.as_ref()).await {
-                                warn!(
-                                    node_id = node.id,
-                                    "Failed to switch node address to https for mTLS: {}", e
-                                );
-                            }
-                        }
-                        (Some(signed.cert_pem), Some(ca.cert_pem))
-                    }
-                    Err(e) => {
-                        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                            .with_title("Invalid CSR")
-                            .with_detail(format!(
-                                "Failed to sign certificate signing request: {}",
-                                e
-                            )));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to provision cluster CA: {}", e);
-                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Server Error")
-                    .with_detail("Failed to provision the cluster certificate authority"));
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     Ok((
         StatusCode::CREATED,
         Json(RegisterNodeResponse {
@@ -1005,6 +1208,7 @@ async fn register_node(
             name: node.name,
             status: node.status,
             message: "Node registered successfully. Send heartbeats to stay active.".to_string(),
+            mtls_required: node_uses_mtls,
             cert_pem,
             ca_cert_pem,
         }),
@@ -1086,6 +1290,12 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
 async fn node_heartbeat(
     State(app_state): State<Arc<NodeAppState>>,
     headers: HeaderMap,
+    // Same source as `register_node`: the router is served with
+    // `into_make_service_with_connect_info`, so the peer address is always
+    // present in production and injected by `MockConnectInfo` in tests. Needed
+    // for the architecture-change audit — without it, an operator repointing a
+    // daemon and something impersonating the node produce identical records.
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(node_id): Path<i32>,
     Json(request): Json<HeartbeatApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1113,23 +1323,54 @@ async fn node_heartbeat(
     let heartbeat = HeartbeatRequest {
         capacity: request.capacity.unwrap_or(serde_json::json!({})),
         labels: request.labels,
+        architecture: normalize_reported_platform(request.architecture.as_deref()),
+        dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
     };
 
-    app_state
+    let architecture_change = app_state
         .node_service
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
 
+    // The architecture decides where images are placed and is supplied by the
+    // node itself, so a change is an event an operator may need to explain
+    // later — a repointed daemon, or something impersonating the node. The
+    // heartbeat is unauthenticated in the user sense (a node token, not a
+    // session), hence no user context.
+    if let Some(change) = architecture_change {
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                // No user: this is a node authenticating with its own token,
+                // not a session. `0` is the codebase's convention for an
+                // actor that isn't a user (see the failed-login audit).
+                user_id: 0,
+                // The peer that sent the heartbeat. This is the field that
+                // separates "an operator repointed this node's daemon" from
+                // "something else is reporting as this node" — the reason the
+                // change is audited at all.
+                ip_address: Some(addr.ip().to_string()),
+                user_agent: format!("temps-agent/node-{}", change.node_id),
+            },
+            node_id: change.node_id,
+            node_name: change.node_name,
+            from: change.from,
+            to: change.to,
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
+
     // The node just came back: it was offline and this heartbeat flipped it to
     // active. Alert operators (recovery counterpart to the node-offline alert).
     if was_offline {
         info!(node_id, node_name = %node.name, "Node recovered (offline -> active)");
-        if let Some(ref notification_service) = app_state.notification_service {
+        if let Some(ref alarm_service) = app_state.alarm_service {
             crate::jobs::node_health_check::notify_node_recovered(
                 node_id,
                 &node.name,
-                notification_service,
+                alarm_service,
             )
             .await;
         }
@@ -1628,16 +1869,12 @@ async fn edge_routes(
     }))
 }
 
-/// Reserved node id for the control plane itself. Real nodes are serial and
-/// start at 1, so `0` is a safe sentinel.
-const CONTROL_PLANE_NODE_ID: i32 = 0;
-
 /// Synthetic node entry for the control plane itself. The CP is always a
 /// scheduling target (`NodeAssignment::Local`), but it is not a row in the
 /// `nodes` table; containers placed there are stored with `node_id = NULL`.
 /// Surfacing it as node `0` makes those containers visible in the node list /
 /// per-node views instead of silently invisible (ADR-020 observability).
-fn control_plane_node_response() -> NodeInfoResponse {
+fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
     // The CP self-samples its own host metrics in the 60s health loop (it isn't
     // a worker agent, so it has no heartbeat). Surface them like any node;
     // empty until the first sample lands.
@@ -1655,6 +1892,16 @@ fn control_plane_node_response() -> NodeInfoResponse {
         status: "active".to_string(),
         labels: serde_json::json!({}),
         capacity,
+        // The control plane is a scheduling target like any node, so it must
+        // advertise the platform its own Docker daemon runs — otherwise the
+        // console shows every worker's architecture but a blank for the one
+        // machine that builds the images.
+        //
+        // Only the *confirmed* platform: `get_native_platform()` falls back to
+        // this binary's architecture, which would show the wrong value to the
+        // one person debugging a mixed cluster. The UI renders `None` as
+        // "Unknown", which is the honest answer until the daemon answers.
+        architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -1694,6 +1941,7 @@ async fn admin_list_nodes(
             status: n.status,
             labels: n.labels,
             capacity: n.capacity,
+            architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
         })
@@ -1701,7 +1949,7 @@ async fn admin_list_nodes(
 
     // Always surface the control plane itself as a node so containers it runs
     // (the `Local` scheduling slot, stored with node_id = NULL) are visible.
-    node_responses.insert(0, control_plane_node_response());
+    node_responses.insert(0, control_plane_node_response(&app_state));
 
     let total = node_responses.len();
     Ok(Json(NodeListResponse {
@@ -1733,7 +1981,7 @@ async fn admin_get_node(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
     if node_id == CONTROL_PLANE_NODE_ID {
-        return Ok(Json(control_plane_node_response()));
+        return Ok(Json(control_plane_node_response(&app_state)));
     }
     let node = app_state
         .node_service
@@ -1750,8 +1998,86 @@ async fn admin_get_node(
         status: node.status,
         labels: node.labels,
         capacity: node.capacity,
+        architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
+    }))
+}
+
+/// Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
+/// enabled, the total record count, and per-node resolver status as last
+/// reported by each node's heartbeat. Lets an operator answer "is cluster
+/// DNS actually healthy right now" without SSHing into a node to read logs.
+///
+/// Same permission as the other node visibility endpoints in this file
+/// (`admin_list_nodes`, `admin_get_node`) — this is operational/infra
+/// visibility, not a new privilege tier.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/cluster/dns/status",
+    responses(
+        (status = 200, description = "Cluster DNS resolver health", body = ClusterDnsStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn cluster_dns_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    // Best-effort, matches `list_peers`: a transient settings-read hiccup
+    // must not turn an operational status page into a 500 — default to the
+    // safe-to-display side and let the per-node data (which is unaffected)
+    // still answer the question.
+    let cluster_dns_enabled = match app_state.config_service.get_settings().await {
+        Ok(settings) => settings.cluster_dns.enabled,
+        Err(e) => {
+            warn!(
+                "could not read cluster_dns setting: {}; defaulting to disabled",
+                e
+            );
+            false
+        }
+    };
+
+    let total_record_count = app_state
+        .node_service
+        .total_dns_record_count()
+        .await
+        .map_err(Problem::from)?;
+
+    let nodes = app_state
+        .node_service
+        .list_all()
+        .await
+        .map_err(Problem::from)?;
+
+    let now = chrono::Utc::now();
+    let node_entries = nodes
+        .into_iter()
+        .map(|n| NodeDnsStatusEntry {
+            node_id: n.id,
+            node_name: n.name,
+            node_status: n.status,
+            dns_resolver_running: n.dns_resolver_running,
+            dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
+            dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
+            seconds_since_last_sync: n.dns_resolver_last_sync_at.map(|t| (now - t).num_seconds()),
+            dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
+            dns_resolver_last_error: n.dns_resolver_last_error,
+            dns_resolver_record_count: n.dns_resolver_record_count,
+        })
+        .collect();
+
+    Ok(Json(ClusterDnsStatusResponse {
+        cluster_dns_enabled,
+        total_record_count,
+        nodes: node_entries,
     }))
 }
 
@@ -1922,6 +2248,13 @@ async fn admin_drain_node(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DrainNode { node_id },
+    )
+    .await?;
+
     let node = app_state
         .node_service
         .get_by_id(node_id)
@@ -1956,7 +2289,7 @@ async fn admin_drain_node(
             // All replicas are on this node — must redeploy to maintain availability
             match app_state
                 .deployment_service
-                .redeploy_environment(dep.project_id, dep.environment_id)
+                .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
                 .await
             {
                 Ok(_) => {
@@ -2513,11 +2846,40 @@ impl From<NodeError> for Problem {
                      proof of the current token, or the node must be drained/removed first",
                     name
                 )),
+            NodeError::IdentityClaimed {
+                ref claimed,
+                ref owner,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Identity Already Claimed")
+                .with_detail(format!(
+                    "Identity '{}' is already held by node '{}'; a node cannot register under \
+                     another node's name or address",
+                    claimed, owner
+                )),
             NodeError::Validation { ref message } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(message.clone()),
+            NodeError::NoCompatibleNode { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("No Compatible Node")
+                .with_detail(error.to_string()),
+            NodeError::InsufficientCompatibleNodes { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Insufficient Compatible Nodes")
+                    .with_detail(error.to_string())
+            }
+            NodeError::PlacementConstraintsUnsatisfied { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Placement Constraints Unsatisfied")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("An internal error occurred")
+            }
+            NodeError::DnsRegistry(ref e) => {
+                error!("DNS registry error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail("An internal error occurred")
@@ -2537,6 +2899,7 @@ mod tests {
 
     fn sample_node() -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id: 1,
             name: "worker-1".to_string(),
             token_hash: sha256_hash("test-token"),
@@ -2553,6 +2916,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2600,6 +2969,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(
             server_config,
@@ -2630,7 +3000,8 @@ mod tests {
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
                 test_db_for_enrollment,
             )),
-            notification_service: None,
+            alarm_service: None,
+            audit_service: Arc::new(RecordingAuditLogger::default()),
         });
         // The production router is served with connect info; tests use `oneshot`
         // (no peer address), so inject a mock so the `ConnectInfo` extractor
@@ -2644,7 +3015,209 @@ mod tests {
     fn settings_with_join_token() -> temps_core::AppSettings {
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
+        // Most registration tests exercise the explicit legacy migration mode;
+        // mTLS enforcement has dedicated tests below.
+        settings.multi_node.require_mtls = false;
         settings
+    }
+
+    // ── Agent-reported platform sanitization ────────────────────────────
+
+    /// Captures audit operations so tests can assert one was written.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    /// A node's architecture decides where images are placed and is supplied
+    /// by the node itself, so a change to it is auditable — a repointed daemon
+    /// looks identical to something impersonating the node.
+    #[test]
+    fn test_architecture_change_is_an_auditable_operation() {
+        use temps_core::audit::AuditOperation;
+
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                user_id: 0,
+                ip_address: Some("10.100.0.7".to_string()),
+                user_agent: "temps-agent/node-7".to_string(),
+            },
+            node_id: 7,
+            node_name: "worker-arm".to_string(),
+            from: Some("linux/amd64".to_string()),
+            to: "linux/arm64".to_string(),
+        };
+
+        assert_eq!(
+            audit.operation_type(),
+            "NODE_ARCHITECTURE_CHANGED".to_string()
+        );
+        let serialized = AuditOperation::serialize(&audit).expect("serializes");
+        // Both sides of the transition have to be in the record, or it can't
+        // answer "what changed" months later.
+        assert!(serialized.contains("linux/amd64"), "got: {serialized}");
+        assert!(serialized.contains("linux/arm64"), "got: {serialized}");
+        assert!(serialized.contains("worker-arm"), "got: {serialized}");
+        // The peer address is what distinguishes an operator repointing the
+        // daemon from something else reporting as this node.
+        assert!(
+            serialized.contains("10.100.0.7"),
+            "the peer address must be recorded: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_canonicalizes_spellings() {
+        // `docker info` kernel spellings become the OCI ones, so later
+        // comparisons are plain string equality.
+        assert_eq!(
+            normalize_reported_platform(Some("linux/x86_64")).as_deref(),
+            Some("linux/amd64")
+        );
+        assert_eq!(
+            normalize_reported_platform(Some("linux/aarch64")).as_deref(),
+            Some("linux/arm64")
+        );
+        assert_eq!(
+            normalize_reported_platform(Some("  Linux/ARM64  ")).as_deref(),
+            Some("linux/arm64")
+        );
+        // Bare architecture: Linux is the only OS Temps deploys containers on.
+        assert_eq!(
+            normalize_reported_platform(Some("arm64")).as_deref(),
+            Some("linux/arm64")
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_rejects_junk() {
+        // Absent / blank means "not reported", never an empty platform.
+        assert_eq!(normalize_reported_platform(None), None);
+        assert_eq!(normalize_reported_platform(Some("")), None);
+        assert_eq!(normalize_reported_platform(Some("   ")), None);
+
+        // This is a network boundary: an authenticated-but-hostile agent must
+        // not be able to write markup, control characters, or an unbounded
+        // blob into a column the admin console renders.
+        assert_eq!(
+            normalize_reported_platform(Some("<script>alert(1)</script>")),
+            None
+        );
+        assert_eq!(normalize_reported_platform(Some("linux/amd64\n\rX")), None);
+        assert_eq!(
+            normalize_reported_platform(Some("linux/amd64; DROP TABLE")),
+            None
+        );
+        assert_eq!(
+            normalize_reported_platform(Some(&"a".repeat(MAX_REPORTED_PLATFORM_LEN + 1))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_passes_through_unknown_architectures() {
+        // A platform we don't know about must survive verbatim rather than be
+        // coerced to amd64 — it has to fail a comparison, not fake a match.
+        assert_eq!(
+            normalize_reported_platform(Some("linux/riscv64")).as_deref(),
+            Some("linux/riscv64")
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_api_request_deserializes_without_dns_resolver_field() {
+        // Older agent binaries never send `dns_resolver` at all — the field
+        // must default to `None` rather than fail deserialization, same
+        // treatment as every other optional heartbeat field.
+        let json = r#"{"capacity": {"cpu_percent": 10}}"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        assert!(req.dns_resolver.is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_api_request_deserializes_dns_resolver_field() {
+        let json = r#"{
+            "capacity": {},
+            "dns_resolver": {
+                "running": true,
+                "tasks_alive": false,
+                "last_sync_success_at": null,
+                "consecutive_sync_failures": 3,
+                "last_sync_error": "sync tick failed: connection refused",
+                "record_count": 12
+            }
+        }"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        let dns = req.dns_resolver.expect("dns_resolver must deserialize");
+        assert!(dns.running);
+        assert!(!dns.tasks_alive);
+        assert!(dns.last_sync_success_at.is_none());
+        assert_eq!(dns.consecutive_sync_failures, 3);
+        assert_eq!(
+            dns.last_sync_error.as_deref(),
+            Some("sync tick failed: connection refused")
+        );
+        assert_eq!(dns.record_count, 12);
+    }
+
+    #[test]
+    fn test_dns_resolver_heartbeat_update_converts_wire_to_service_dto() {
+        let wire = DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: true,
+            last_sync_success_at: None,
+            consecutive_sync_failures: 5,
+            last_sync_error: Some("boom".to_string()),
+            record_count: 100,
+        };
+        let update = dns_resolver_heartbeat_update(wire);
+        assert!(update.running);
+        assert!(update.tasks_alive);
+        assert_eq!(update.consecutive_sync_failures, 5);
+        assert_eq!(update.last_sync_error.as_deref(), Some("boom"));
+        assert_eq!(update.record_count, 100);
+    }
+
+    /// A wire counter that somehow exceeds `i32::MAX` must clamp rather than
+    /// silently wrap or panic — the heartbeat is best-effort telemetry, not
+    /// something worth dropping the whole report over.
+    #[test]
+    fn test_dns_resolver_heartbeat_update_clamps_oversized_counters() {
+        let wire = DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: true,
+            last_sync_success_at: None,
+            consecutive_sync_failures: u32::MAX,
+            last_sync_error: None,
+            record_count: i64::MAX,
+        };
+        let update = dns_resolver_heartbeat_update(wire);
+        assert_eq!(update.consecutive_sync_failures, i32::MAX);
+        assert_eq!(update.record_count, i32::MAX);
+    }
+
+    #[test]
+    fn test_no_compatible_node_maps_to_conflict() {
+        let problem: Problem = NodeError::NoCompatibleNode {
+            image_platforms: "linux/arm64".to_string(),
+            local_platform: "linux/amd64".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
     }
 
     #[test]
@@ -2670,6 +3243,8 @@ mod tests {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // Check for duplicate name (returns empty)
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            // Identity guard: name/address not claimed by another node
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Insert returns the new node
             .append_query_results(vec![vec![node.clone()]])
@@ -2697,6 +3272,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_missing_csr_when_mtls_is_required() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.multi_node.require_mtls = true;
+        let app = make_app_with_settings(db, settings);
+        let body = serde_json::json!({
+            "name": "worker-1",
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": "http://10.100.0.2:3100",
+            "private_address": "10.100.0.2"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["title"], "Node Certificate Required");
     }
 
     #[tokio::test]
@@ -2857,12 +3466,14 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])
             .into_connection();
 
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("valid-join-token"));
+        settings.multi_node.require_mtls = false;
 
         let app = make_app_with_settings(db, settings);
         let body = serde_json::json!({
@@ -3288,6 +3899,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_node_private_address_strips_port_from_returned_ip() {
+        // Regression guard: a caller that binds Docker container ports to
+        // this address (temps-agent) needs the bare host, since Docker's
+        // PortBinding.host_ip is not a valid IP with a port suffix attached
+        // -- every container creation would fail if the raw "host:port"
+        // input were forwarded unchanged instead of the parsed IpAddr.
+        let ip = validate_node_private_address("10.0.5.20:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "10.0.5.20");
+
+        let ip = validate_node_private_address("[fc00::1]:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "fc00::1");
+    }
+
+    #[test]
     fn test_validate_node_private_address_accepts_rfc1918_bare() {
         assert!(
             validate_node_private_address("192.168.1.50").is_ok(),
@@ -3302,6 +3927,37 @@ mod tests {
             validate_node_private_address("8.8.8.8").is_ok(),
             "8.8.8.8 must be accepted (public IP, valid WireGuard underlay use case)"
         );
+    }
+
+    #[test]
+    fn test_node_address_host_extracts_certificate_sans() {
+        assert_eq!(node_address_host("https://10.0.5.20:3100"), "10.0.5.20");
+        assert_eq!(node_address_host("[fc00::20]:3100"), "fc00::20");
+        assert_eq!(node_address_host("10.0.5.20"), "10.0.5.20");
+    }
+
+    #[test]
+    fn test_mtls_agent_address_always_uses_https() {
+        assert_eq!(
+            mtls_agent_address("http://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("https://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+    }
+
+    #[test]
+    fn test_modern_csr_enrollment_uses_mtls_during_legacy_migration_window() {
+        assert!(node_registration_uses_mtls(false, true));
+        assert!(node_registration_uses_mtls(true, true));
+        assert!(node_registration_uses_mtls(true, false));
+        assert!(!node_registration_uses_mtls(false, false));
     }
 
     #[test]
@@ -3338,6 +3994,21 @@ mod tests {
             validate_node_private_address("fc00::1").is_ok(),
             "fc00::1 must be accepted (unique-local IPv6)"
         );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_never_truncates_bare_ipv6_with_ambiguous_prefix() {
+        // Regression guard: "2001:db8::1:2"'s prefix before the last colon
+        // ("2001:db8::1") is itself a valid, DIFFERENT IPv6 address, so a
+        // naive "does the prefix parse as an IP" port-stripping heuristic
+        // would wrongly truncate this bare address down to that prefix,
+        // silently changing which host gets used. Any multi-colon
+        // unbracketed address must be preserved whole.
+        let ip = validate_node_private_address("2001:db8::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "2001:db8::1:2");
+
+        let ip = validate_node_private_address("fc00::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "fc00::1:2");
     }
 
     #[test]

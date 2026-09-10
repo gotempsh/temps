@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service layer for the log aggregator
 
 mod chunk_writer;
 mod collector;
+pub(crate) mod global_search;
 mod metadata;
 mod remote_collector;
 mod retention;

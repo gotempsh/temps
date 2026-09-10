@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Emails entity
 
 use sea_orm::entity::prelude::*;
@@ -33,6 +36,13 @@ pub struct Model {
     pub error_message: Option<String>,
     pub sent_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
+    /// Which email provider was used for this delivery attempt.
+    /// NULL when the email was captured without attempting delivery.
+    pub provider_id: Option<i32>,
+    /// Number of provider `send()` calls made before the email reached a
+    /// terminal state. 1 = first attempt succeeded or was definitively
+    /// rejected. 2 = the retry path ran. NULL when no provider call was made.
+    pub attempt_count: Option<i32>,
     pub track_opens: bool,
     pub track_clicks: bool,
     pub open_count: i32,

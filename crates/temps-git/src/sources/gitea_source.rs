@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Gitea API implementation of ProjectSource
 //!
 //! Fetches files directly from the Gitea REST API on-demand,

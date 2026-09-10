@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The [`AnalyticsBackend`] trait.
 //!
 //! Phase 1 starts deliberately small: only the contract surface is sketched, so

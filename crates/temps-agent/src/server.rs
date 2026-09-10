@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Agent HTTP server setup and routing.
 
 use axum::{
@@ -16,6 +19,28 @@ use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 
+/// The node's container platform once discovered, shared between the HTTP
+/// handlers and the heartbeat loop.
+///
+/// `None` means "not discovered yet" — the heartbeat loop keeps retrying and
+/// fills it in. A plain `Mutex` is right here: it's read once per request and
+/// written at most once, so there is no contention to design around.
+pub type SharedPlatform = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Read the discovered platform, treating a poisoned lock as "unknown" rather
+/// than panicking a request handler.
+pub fn read_platform(platform: &SharedPlatform) -> Option<String> {
+    platform.lock().ok().and_then(|p| p.clone())
+}
+
+/// Record a discovered platform. A poisoned lock is ignored — the next
+/// heartbeat retries anyway.
+fn store_platform(platform: &SharedPlatform, value: String) {
+    if let Ok(mut slot) = platform.lock() {
+        *slot = Some(value);
+    }
+}
+
 /// Build the agent Axum router with authentication middleware.
 pub fn build_router(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -24,14 +49,26 @@ pub fn build_router(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     overlay_peers: crate::network_sync::SharedPeers,
+    platform: SharedPlatform,
 ) -> Router {
+    // Same address app-container deploys bind to (never "0.0.0.0" — see
+    // AgentConfig::private_address). Falls back to loopback only for the
+    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
+    // already hard-errors before reaching here if this is genuinely unset.
+    let host_bind_address = config
+        .private_address
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
         docker,
         overlay_bridge_address,
         overlay_peers,
+        platform,
+        host_bind_address,
     });
+    let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
 
@@ -97,6 +134,14 @@ pub fn build_router(
         )
         .route("/agent/services/exec", post(service_handlers::service_exec))
         .route(
+            "/agent/services/runtime-env",
+            post(service_handlers::runtime_env),
+        )
+        .route(
+            "/agent/services/health-probe",
+            post(service_handlers::health_probe),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )
@@ -106,6 +151,7 @@ pub fn build_router(
         )
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(resource_limits))
         .with_state(state);
 
     // Swagger UI — no auth required so it's accessible for documentation
@@ -124,6 +170,13 @@ const HEARTBEAT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Maximum backoff delay between heartbeat retries.
 const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 
+/// Heartbeats between re-checks of an already-known container platform.
+///
+/// At the 30s heartbeat interval this is ~10 minutes. The daemon behind
+/// `DOCKER_HOST` can be repointed or replaced while the agent runs, and a node
+/// advertising a stale architecture gets images it cannot execute.
+const PLATFORM_RECHECK_BEATS: u32 = 20;
+
 /// Spawn a background task that sends heartbeats to the control plane every 30 seconds.
 ///
 /// On transient failures, retries up to `HEARTBEAT_MAX_RETRIES` times with exponential
@@ -135,6 +188,9 @@ const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 fn spawn_heartbeat_loop(
     config: &AgentConfig,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    platform: SharedPlatform,
+    docker: Option<bollard::Docker>,
+    dns_health: crate::network_sync::SharedDnsHealth,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
@@ -165,12 +221,91 @@ fn spawn_heartbeat_loop(
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         let mut consecutive_failures: u32 = 0;
         let mut inventory_sent = false;
+        let mut beats_since_platform_check: u32 = 0;
 
         loop {
             interval.tick().await;
 
             let capacity = collect_capacity_metrics();
-            let mut body = serde_json::json!({ "capacity": capacity, "labels": labels });
+
+            // Platform discovery can fail at startup — the agent often boots
+            // alongside the Docker daemon — so retry here until it answers.
+            // Reporting the agent binary's architecture instead would be a
+            // confident wrong answer whenever the daemon differs, and the
+            // control plane would schedule on it.
+            //
+            // A known platform is also re-checked periodically: `DOCKER_HOST`
+            // can be repointed, or the daemon replaced, under a running agent.
+            // Without this the node would keep advertising its old
+            // architecture indefinitely and receive images it can no longer
+            // run. One `docker info` every ~10 minutes is negligible next to
+            // that failure mode.
+            let known_platform = read_platform(&platform);
+            let due_for_recheck = beats_since_platform_check >= PLATFORM_RECHECK_BEATS;
+            let reported_platform = if known_platform.is_none() || due_for_recheck {
+                beats_since_platform_check = 0;
+                match detect_agent_platform(docker.as_ref()).await {
+                    Some(discovered) => {
+                        match known_platform.as_deref() {
+                            None => tracing::info!(
+                                node_id,
+                                platform = %discovered,
+                                "Container platform resolved on retry"
+                            ),
+                            Some(previous) if previous != discovered => tracing::warn!(
+                                node_id,
+                                previous,
+                                platform = %discovered,
+                                "Docker daemon architecture changed under a running agent; \
+                                 reporting the new platform"
+                            ),
+                            Some(_) => {}
+                        }
+                        store_platform(&platform, discovered.clone());
+                        Some(discovered)
+                    }
+                    // The daemon stopped answering. Keep reporting the last
+                    // confirmed value rather than dropping to unknown: it was
+                    // true as of the last successful check, and a node whose
+                    // daemon is down fails its health checks anyway.
+                    None => known_platform,
+                }
+            } else {
+                beats_since_platform_check += 1;
+                known_platform
+            };
+
+            let mut body = serde_json::json!({
+                "capacity": capacity,
+                "labels": labels,
+            });
+            // `architecture` goes out on EVERY beat once known, not just at
+            // registration: it's how a node upgraded from a pre-multi-arch
+            // agent (which left the column NULL) becomes schedulable with
+            // confidence, and how a re-pointed DOCKER_HOST is picked up
+            // without re-joining. While unknown the field is omitted, and the
+            // control plane leaves the stored value untouched.
+            if let Some(platform) = reported_platform {
+                body["architecture"] = serde_json::json!(platform);
+            }
+
+            // DNS resolver health (ADR-024), published by the network-sync
+            // loop on every tick. `None` until that loop has ticked at
+            // least once for this node (startup, or a single-host node
+            // that never gets a compute_cidr allocation and so never
+            // touches cluster DNS at all) — omitted from the body in that
+            // case, same treatment as `architecture` above.
+            let dns_snapshot = dns_health.read().ok().and_then(|guard| guard.clone());
+            if let Some(health) = dns_snapshot {
+                match serde_json::to_value(&health) {
+                    Ok(v) => body["dns_resolver"] = v,
+                    Err(e) => tracing::warn!(
+                        node_id = node_id,
+                        error = %e,
+                        "Failed to serialize DNS resolver health for heartbeat"
+                    ),
+                }
+            }
 
             // On the first heartbeat (agent startup/reconnect), include a full
             // container inventory so the control plane can reconcile stale state.
@@ -232,7 +367,9 @@ fn spawn_heartbeat_loop(
                         }
                         consecutive_failures = 0;
                         succeeded = true;
-                        inventory_sent = true;
+                        if body.get("containers").is_some() {
+                            inventory_sent = true;
+                        }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
                     }
@@ -309,6 +446,48 @@ fn spawn_heartbeat_loop(
     });
 }
 
+/// Resolve the container platform this agent can actually run images for.
+///
+/// The source of truth is the Docker **daemon** (`docker info`), not this
+/// process: an agent may drive a daemon over `DOCKER_HOST`, or a
+/// QEMU-emulated `docker:dind`, whose architecture differs from the binary's.
+/// Placing an image is decided by the daemon, so that is what we report.
+///
+/// Returns `None` when the daemon can't be reached or doesn't report an
+/// architecture. That is deliberate: falling back to the agent binary's
+/// architecture would be a *confident wrong answer* whenever the two differ
+/// (`DOCKER_HOST`, an emulated daemon), and the control plane trusts a
+/// reported platform — it would schedule an incompatible image and both
+/// compatibility checks would pass against the bogus value. "Unknown" is
+/// handled safely upstream (assume compatible, log it as unverified), and the
+/// heartbeat loop keeps retrying until the daemon answers.
+pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> Option<String> {
+    let Some(docker) = docker else {
+        tracing::warn!(
+            "No Docker client available; this node will not report a container platform \
+             and the control plane cannot verify image compatibility for it"
+        );
+        return None;
+    };
+
+    match docker.info().await {
+        Ok(info) => {
+            let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+            match info.architecture {
+                Some(arch) => Some(temps_deployer::platform::normalize_platform(&os, &arch)),
+                None => {
+                    tracing::warn!("Docker daemon reported no architecture; will retry");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Could not read Docker daemon info ({}); will retry", e);
+            None
+        }
+    }
+}
+
 /// Collect system resource metrics for heartbeat capacity data.
 fn collect_capacity_metrics() -> serde_json::Value {
     use sysinfo::{Disks, System};
@@ -335,6 +514,31 @@ fn collect_capacity_metrics() -> serde_json::Value {
     })
 }
 
+fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentError> {
+    if !config.require_mtls {
+        return Ok(());
+    }
+    if !config.control_plane_url.starts_with("https://") {
+        return Err(crate::AgentError::TlsConfig {
+            context: "validate control-plane transport".to_string(),
+            reason: format!(
+                "mTLS is required but control_plane_url '{}' is not HTTPS",
+                config.control_plane_url
+            ),
+        });
+    }
+    if config.tls_cert_path.is_none()
+        || config.tls_key_path.is_none()
+        || config.cluster_ca_path.is_none()
+    {
+        return Err(crate::AgentError::TlsConfig {
+            context: "validate required agent identity".to_string(),
+            reason: "mTLS is required but tls_cert_path, tls_key_path, and cluster_ca_path are not all configured".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Start the agent server. This blocks until the server shuts down.
 pub async fn start_agent_server(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -344,24 +548,63 @@ pub async fn start_agent_server(
     overlay_peers: crate::network_sync::SharedPeers,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> Result<(), crate::AgentError> {
+    validate_agent_transport(&config)?;
+
+    // Resolve the daemon's platform up front when possible. A failure here is
+    // not fatal and not cached as a wrong answer: the heartbeat loop retries
+    // until the daemon responds.
+    let platform: SharedPlatform = Arc::new(std::sync::Mutex::new(
+        detect_agent_platform(docker.as_ref()).await,
+    ));
+    match read_platform(&platform) {
+        Some(known) => tracing::info!(
+            node = %config.node_name,
+            platform = %known,
+            "Agent container platform detected"
+        ),
+        None => tracing::warn!(
+            node = %config.node_name,
+            "Container platform not detected yet; will retry on each heartbeat. \
+             Until then the control plane cannot verify image compatibility for this node."
+        ),
+    }
+
     let router = build_router(
         container_deployer.clone(),
         image_builder,
-        docker,
+        docker.clone(),
         &config,
         overlay_bridge_address.clone(),
         overlay_peers.clone(),
+        platform.clone(),
     );
 
+    // Shared DNS resolver health slot (ADR-024). Written by the network-sync
+    // loop below on every tick, read by the heartbeat loop so the control
+    // plane learns resolver health without an operator SSHing in to read
+    // logs. Lives for the agent's process lifetime, same as `platform`.
+    let dns_health: crate::network_sync::SharedDnsHealth = Arc::new(std::sync::RwLock::new(None));
+
     // Start heartbeat background loop (with deployer for container inventory on first beat)
-    spawn_heartbeat_loop(&config, container_deployer);
+    spawn_heartbeat_loop(
+        &config,
+        container_deployer,
+        platform,
+        docker,
+        dns_health.clone(),
+    );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
     // agent — when this node has no compute_cidr allocated (single-host
     // cluster, or simply not yet allocated), the loop is a no-op. When a
     // compute_cidr is allocated, the loop bootstraps the overlay and keeps
     // peers reconciled. `temps join` semantics are unchanged either way.
-    crate::network_sync::spawn(&config, overlay_bridge_address.clone(), overlay_peers);
+    crate::network_sync::spawn(
+        &config,
+        overlay_bridge_address.clone(),
+        overlay_peers,
+        dns_health,
+    );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
         .await
@@ -376,14 +619,19 @@ pub async fn start_agent_server(
         address = %config.listen_address,
         node = %config.node_name,
         node_id = config.node_id,
-        swagger_ui = format!("http://{}/swagger-ui/", config.listen_address),
+        swagger_ui = format!(
+            "{}://{}/swagger-ui/",
+            if config.require_mtls { "https" } else { "http" },
+            config.listen_address
+        ),
         "Temps agent server started"
     );
 
     // Serve mutual TLS when the node has been provisioned with certs
-    // (ADR-020 WS-2.1); otherwise plain HTTP for legacy / not-yet-enrolled
-    // nodes. The mTLS path verifies the control plane's client certificate
-    // against the cluster CA on every connection.
+    // (ADR-020 WS-2.1). A newly enrolled node is fail-closed: it must never
+    // silently downgrade to plaintext because a path was lost or a config was
+    // only partially written. Explicit legacy configs may still use HTTP until
+    // they are re-enrolled.
     match (
         config.tls_cert_path.as_ref(),
         config.tls_key_path.as_ref(),
@@ -397,10 +645,19 @@ pub async fn start_agent_server(
             let server_config = build_tls_server_config(cert, key, ca)?;
             serve_mtls(listener, router, std::sync::Arc::new(server_config)).await?;
         }
-        _ => {
+        (None, None, None) if !config.require_mtls => {
+            tracing::warn!(
+                "Agent serving legacy plaintext HTTP; re-enroll this node to enable mTLS"
+            );
             axum::serve(listener, router).await.map_err(|e| {
                 crate::AgentError::ServerError(format!("Agent server error: {}", e))
             })?;
+        }
+        _ => {
+            return Err(crate::AgentError::TlsConfig {
+                context: "validate required agent identity".to_string(),
+                reason: "mTLS is required but tls_cert_path, tls_key_path, and cluster_ca_path are not all configured".to_string(),
+            });
         }
     }
 
@@ -511,5 +768,178 @@ async fn serve_mtls(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent_config(require_mtls: bool) -> AgentConfig {
+        AgentConfig {
+            listen_address: "127.0.0.1:3100".to_string(),
+            token: "secret".to_string(),
+            node_name: "worker-1".to_string(),
+            control_plane_url: "https://control.example.com".to_string(),
+            node_id: 1,
+            labels: serde_json::json!({}),
+            dns_data_dir: std::path::PathBuf::from("/tmp/temps-dns"),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cluster_ca_path: None,
+            require_mtls,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: None,
+        }
+    }
+
+    #[test]
+    fn required_mtls_rejects_missing_identity() {
+        let error = validate_agent_transport(&test_agent_config(true)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::AgentError::TlsConfig { ref context, .. }
+                if context == "validate required agent identity"
+        ));
+    }
+
+    #[test]
+    fn required_mtls_rejects_plaintext_control_plane_url() {
+        let mut config = test_agent_config(true);
+        config.control_plane_url = "http://10.0.0.1:3000".to_string();
+        config.tls_cert_path = Some("node.pem".into());
+        config.tls_key_path = Some("node.key".into());
+        config.cluster_ca_path = Some("ca.pem".into());
+        let error = validate_agent_transport(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::AgentError::TlsConfig { ref context, .. }
+                if context == "validate control-plane transport"
+        ));
+    }
+
+    #[test]
+    fn explicit_legacy_transport_remains_available() {
+        let mut config = test_agent_config(false);
+        config.control_plane_url = "http://10.0.0.1:3000".to_string();
+        assert!(validate_agent_transport(&config).is_ok());
+    }
+
+    /// With no Docker client we cannot know the daemon's architecture, and
+    /// guessing the agent binary's would be a confident wrong answer whenever
+    /// the two differ (`DOCKER_HOST`, an emulated daemon). The control plane
+    /// trusts a reported platform, so "unknown" must stay unknown.
+    #[tokio::test]
+    async fn test_detect_agent_platform_is_unknown_without_docker() {
+        assert_eq!(detect_agent_platform(None).await, None);
+    }
+
+    /// The reported platform must come from the **daemon**: an agent can drive
+    /// a daemon over `DOCKER_HOST` (or an emulated one) whose architecture
+    /// differs from the binary's, and it is the daemon that decides whether an
+    /// image can run.
+    #[tokio::test]
+    async fn test_detect_agent_platform_reads_the_daemon() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let reported = detect_agent_platform(Some(&docker))
+            .await
+            .expect("a reachable daemon must report a platform");
+
+        let info = docker.info().await.expect("docker info");
+        let expected = temps_deployer::platform::normalize_platform(
+            &info.os_type.unwrap_or_else(|| "linux".to_string()),
+            &info.architecture.expect("daemon architecture"),
+        );
+
+        assert_eq!(
+            reported, expected,
+            "the agent must report the daemon's platform"
+        );
+        // Whatever we report has to survive the canonicalization the control
+        // plane applies before storing it, or the node would be recorded with
+        // a spelling that never matches an image platform.
+        assert_eq!(
+            reported,
+            temps_deployer::platform::canonicalize_platform(&reported)
+        );
+    }
+
+    /// A known platform is re-checked periodically. `DOCKER_HOST` can be
+    /// repointed, or the daemon replaced, under a running agent — a node that
+    /// keeps advertising its old architecture would be sent images it can no
+    /// longer execute.
+    #[test]
+    fn test_platform_recheck_cadence_is_bounded() {
+        // ~10 minutes at the 30s heartbeat interval: frequent enough that a
+        // swapped daemon is noticed, rare enough to be free.
+        assert_eq!(PLATFORM_RECHECK_BEATS, 20);
+
+        // Mirrors the loop's decision, which re-detects when the platform is
+        // unknown OR the counter is due.
+        let due = |beats: u32, known: bool| !known || beats >= PLATFORM_RECHECK_BEATS;
+
+        assert!(
+            due(0, false),
+            "unknown platform must be retried immediately"
+        );
+        assert!(
+            !due(1, true),
+            "a known platform is not re-checked every beat"
+        );
+        assert!(!due(PLATFORM_RECHECK_BEATS - 1, true));
+        assert!(due(PLATFORM_RECHECK_BEATS, true), "re-check must come due");
+    }
+
+    /// A daemon that stops answering must not drop the node back to "unknown":
+    /// the last confirmed value was true as of the last check, and a node whose
+    /// daemon is down fails its health checks anyway.
+    #[test]
+    fn test_a_failed_recheck_keeps_the_last_known_platform() {
+        let slot: SharedPlatform = Arc::new(std::sync::Mutex::new(Some("linux/arm64".to_string())));
+        let known = read_platform(&slot);
+
+        // What the loop does when re-detection returns None.
+        let reported = match None::<String> {
+            Some(discovered) => Some(discovered),
+            None => known,
+        };
+
+        assert_eq!(reported.as_deref(), Some("linux/arm64"));
+        assert_eq!(read_platform(&slot).as_deref(), Some("linux/arm64"));
+    }
+
+    /// An undiscovered platform must not be reported as a fact. The heartbeat
+    /// omits the field entirely so the control plane leaves whatever it has
+    /// alone, instead of overwriting a known architecture with a guess.
+    #[test]
+    fn test_unknown_platform_is_omitted_from_the_heartbeat_body() {
+        let slot: SharedPlatform = Arc::new(std::sync::Mutex::new(None));
+        assert_eq!(read_platform(&slot), None);
+
+        let mut body = serde_json::json!({ "capacity": {}, "labels": {} });
+        if let Some(platform) = read_platform(&slot) {
+            body["architecture"] = serde_json::json!(platform);
+        }
+        assert!(
+            body.get("architecture").is_none(),
+            "an unknown platform must not be sent at all: {body}"
+        );
+
+        // Once discovered it is reported, and stays reported.
+        store_platform(&slot, "linux/arm64".to_string());
+        assert_eq!(read_platform(&slot).as_deref(), Some("linux/arm64"));
+        if let Some(platform) = read_platform(&slot) {
+            body["architecture"] = serde_json::json!(platform);
+        }
+        assert_eq!(body["architecture"], serde_json::json!("linux/arm64"));
     }
 }

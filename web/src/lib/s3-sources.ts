@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Hand-written helpers for S3 source endpoints that are not yet reflected in the
  * generated OpenAPI client. Once `bun run openapi-ts` is re-run against a server

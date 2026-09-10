@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — these builders/types come from the new
 // /otel/dashboards endpoints (operationIds get_dashboard / create_dashboard /
@@ -51,7 +54,8 @@ import {
   useWatch,
   type Control,
 } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -117,6 +121,7 @@ function emptyDefaults(): DashboardFormData {
 
 export default function DashboardBuilder({ project }: DashboardBuilderProps) {
   const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/metrics/dashboards`)
   const queryClient = useQueryClient()
   const { dashboardId } = useParams()
   const isEditing = !!dashboardId
@@ -213,7 +218,7 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
           return key === 'listDashboards' || key === 'getDashboard'
         },
       })
-      navigate(-1)
+      goBack()
     },
   })
 
@@ -263,7 +268,7 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
   return (
     <div className="w-full space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="size-4" />
         </Button>
         <div>
@@ -345,7 +350,7 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
             <Button
               type="button"
               variant="outline"
-              onClick={() => navigate(-1)}
+              onClick={() => goBack()}
             >
               Cancel
             </Button>

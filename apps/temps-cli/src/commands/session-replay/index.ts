@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import chalk from 'chalk'
 import { requireAuth } from '../../config/store.js'
@@ -29,7 +32,7 @@ import type { SessionReplayWithVisitorDto, SessionEventDto } from '../../api/typ
 // Helpers
 // ---------------------------------------------------------------------------
 
-function formatDuration(ms: number | null | undefined): string {
+export function formatDuration(ms: number | null | undefined): string {
   if (ms == null) return chalk.gray('—')
   const s = Math.round(ms / 1000)
   if (s < 60) return `${s}s`
@@ -38,12 +41,22 @@ function formatDuration(ms: number | null | undefined): string {
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`
 }
 
-function deviceIcon(device: string | null | undefined): string {
+export function deviceIcon(device: string | null | undefined): string {
   if (!device) return '?'
   const d = device.toLowerCase()
   if (d.includes('mobile')) return '📱'
   if (d.includes('tablet')) return '📟'
   return '🖥'
+}
+
+/**
+ * Strip scheme+host from a session URL for the table column, falling back to
+ * `/` when only a bare origin was recorded (a bare `.replace()` result would
+ * otherwise print as an empty, confusing cell).
+ */
+export function formatSessionUrl(url: string | null | undefined): string {
+  if (!url) return '—'
+  return url.replace(/^https?:\/\/[^/]+/, '') || '/'
 }
 
 function paginationFooter(page: number, perPage: number, total: number): void {
@@ -156,7 +169,7 @@ async function listSessions(options: ListOptions): Promise<void> {
     },
     {
       header: 'URL',
-      accessor: (s) => (s.url ? s.url.replace(/^https?:\/\/[^/]+/, '') || '/' : '—'),
+      accessor: (s) => formatSessionUrl(s.url),
       width: 28,
     },
     {
@@ -227,7 +240,7 @@ async function listVisitorSessions(visitorId: string, options: ListVisitorOption
     { header: 'Dev', accessor: (s) => deviceIcon(s.device_type), width: 5 },
     { header: 'Browser', accessor: (s) => s.browser ?? '—', width: 16 },
     { header: 'Duration', accessor: (s) => formatDuration(s.duration), align: 'right', width: 10 },
-    { header: 'URL', accessor: (s) => (s.url ? s.url.replace(/^https?:\/\/[^/]+/, '') || '/' : '—'), width: 32 },
+    { header: 'URL', accessor: (s) => formatSessionUrl(s.url), width: 32 },
     { header: 'Started', accessor: (s) => (s.created_at ? formatRelativeTime(s.created_at) : '—'), width: 14 },
   ]
 
@@ -302,7 +315,7 @@ interface EventsOptions {
   page?: string
 }
 
-function eventTypeName(type: number | null | undefined): string {
+export function eventTypeName(type: number | null | undefined): string {
   // rrweb event types: https://github.com/rrweb-io/rrweb/blob/master/packages/types/src/index.ts
   const names: Record<number, string> = {
     0: 'DomContentLoaded',

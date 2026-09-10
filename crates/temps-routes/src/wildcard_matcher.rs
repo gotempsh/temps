@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Efficient wildcard pattern matcher for DNS-style domain matching
 //!
 //! This module provides wildcard matching following DNS/Cloudflare conventions:

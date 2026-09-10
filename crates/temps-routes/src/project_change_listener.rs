@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Project route change listener
 //!
 //! Listens to PostgreSQL `project_route_change` channel for notifications when:
@@ -11,6 +14,18 @@ use crate::route_table::CachedPeerTable;
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::{debug, error, info};
+
+/// How long to wait for a route-change notification before reconciling the
+/// route table anyway.
+///
+/// This is the upper bound on how stale routing can get if the `LISTEN`
+/// connection dies without reporting an error. It is deliberately short because
+/// the failure it guards is a *withdrawn* public port still being served: the
+/// window is the window in which a route the operator removed is still
+/// reachable. The cost is one route-table load per minute on an otherwise idle
+/// control plane, which is well below what an active install already does —
+/// every deployment triggers a reload through this same path.
+const IDLE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Listens for project route changes and updates the route cache
 pub struct ProjectChangeListener {
@@ -51,18 +66,40 @@ impl ProjectChangeListener {
         let queue = self.queue.clone();
 
         let handle = tokio::spawn(async move {
-            // Pure event-driven loop: react to PG NOTIFY only. After a
-            // listener error we reconnect and do a single reload to catch
-            // anything missed during the gap. No periodic timer.
+            // Event-driven loop with a bounded wait. Reacting to PG NOTIFY
+            // alone is not sufficient: a `LISTEN` connection dropped by a NAT,
+            // firewall, or load balancer idle-timeout leaves `recv()` parked on
+            // a half-open socket forever, so no error is ever observed, the
+            // reconnect path never runs, and the route table stays stale
+            // indefinitely. That fails open — a withdrawn public port would
+            // remain reachable. Capping the wait converts that unbounded
+            // staleness into a reconcile that is at worst
+            // `IDLE_RECONCILE_INTERVAL` behind the database.
+            //
+            // sqlx 0.8 exposes no TCP keepalive setting, so this timeout is the
+            // only mechanism available to bound a silently dead listener.
             loop {
-                match pg_listener.recv().await {
-                    Ok(n) => {
+                match tokio::time::timeout(IDLE_RECONCILE_INTERVAL, pg_listener.recv()).await {
+                    Ok(Ok(n)) => {
                         // handle_project_change_static parses the payload,
                         // calls load_routes, and broadcasts the event.
                         Self::handle_project_change_static(&peer_table, &queue, n.payload()).await;
                         continue;
                     }
-                    Err(e) => {
+                    Err(_elapsed) => {
+                        // No notification arrived within the window. Either the
+                        // system is genuinely idle (the reload is a cheap no-op
+                        // resync) or the listener is silently dead (the reload
+                        // is the only thing keeping routes correct). We cannot
+                        // tell the two apart — sqlx gives no way to probe the
+                        // listener's own connection — so reconcile either way
+                        // and fall through to the reload below.
+                        debug!(
+                            "No project route change within {}s; reconciling route table",
+                            IDLE_RECONCILE_INTERVAL.as_secs()
+                        );
+                    }
+                    Ok(Err(e)) => {
                         error!("Error receiving project change notification: {}", e);
 
                         // Attempt to reconnect after error
@@ -85,9 +122,10 @@ impl ProjectChangeListener {
                     }
                 }
 
-                // Recovery reload after a listener error / reconnect
+                // Safety reload: reached after a listener error/reconnect, or
+                // after an idle window elapsed without a notification.
                 if let Err(e) = peer_table.load_routes().await {
-                    error!("Failed to reload routes after listener reconnect: {}", e);
+                    error!("Failed to reload routes during listener reconcile: {}", e);
                 } else {
                     let route_count = peer_table.len();
                     debug!("Project route table synchronized ({} entries)", route_count);
@@ -344,6 +382,28 @@ mod tests {
             }
         }
         Arc::new(NoOpQueue)
+    }
+
+    /// The reconcile interval is the upper bound on how long a public port the
+    /// operator removed can still be served if the `LISTEN` connection dies
+    /// silently. The loop that consumes it needs a live PostgreSQL listener to
+    /// exercise, so this pins the one part that can be checked in isolation:
+    /// that the bound stays a bound. Widening it to tens of minutes would
+    /// quietly restore the fail-open window it exists to close.
+    #[test]
+    fn test_idle_reconcile_interval_bounds_route_staleness() {
+        assert!(
+            IDLE_RECONCILE_INTERVAL <= std::time::Duration::from_secs(120),
+            "reconcile interval must stay short enough to bound a withdrawn \
+             route's reachability, got {:?}",
+            IDLE_RECONCILE_INTERVAL
+        );
+        assert!(
+            IDLE_RECONCILE_INTERVAL >= std::time::Duration::from_secs(15),
+            "reconcile interval must not be so short that idle control planes \
+             reload the route table constantly, got {:?}",
+            IDLE_RECONCILE_INTERVAL
+        );
     }
 
     #[test]

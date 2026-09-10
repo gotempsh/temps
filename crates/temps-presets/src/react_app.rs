@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::path::Path;
 
 use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
@@ -9,6 +12,10 @@ pub struct CreateReactApp;
 impl Preset for CreateReactApp {
     fn slug(&self) -> String {
         "react-app".to_string()
+    }
+
+    fn stored_preset(&self) -> Option<temps_entities::preset::Preset> {
+        Some(temps_entities::preset::Preset::React)
     }
 
     fn project_type(&self) -> ProjectType {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -9,6 +12,12 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let dist_dir = manifest_dir.join("dist");
+
+    // These must be emitted on EVERY path, including the skip paths below —
+    // otherwise a debug build that skipped the web build never reruns when
+    // FORCE_WEB_BUILD is set later, and the flag silently does nothing.
+    println!("cargo:rerun-if-env-changed=SKIP_WEB_BUILD");
+    println!("cargo:rerun-if-env-changed=FORCE_WEB_BUILD");
 
     // Allow skipping web build during development
     if env::var("SKIP_WEB_BUILD").is_ok() {

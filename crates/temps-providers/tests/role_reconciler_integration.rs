@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration test: reconciler-shaped DNS records survive a failover.
 //!
 //! Drives the DnsRegistry against a real Postgres with the same drafts the

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 #
 # Import the *.localho.st cert + encryption key from your local
 # `temps_development` Postgres + ~/.temps/encryption_key into the dev

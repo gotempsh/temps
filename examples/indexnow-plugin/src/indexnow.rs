@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! IndexNow API client.
 //!
 //! Handles submission of URLs to the IndexNow API (single or batch).

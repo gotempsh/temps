@@ -1,5 +1,8 @@
-use crate::client_ip::resolve_client_ip;
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::permissions::Role;
+use crate::resolve_client_ip;
 use crate::{
     auth_service::AuthService, context::AuthContext, user_service::UserService, AuthState,
 };
@@ -32,10 +35,20 @@ pub async fn auth_middleware(
             user = ctx.user.clone();
             Some(ctx)
         }
-        Err(_) => {
-            // For routes that don't require auth, continue without context
-            // The RequireAuth extractor will handle the error later
-            None
+        // Genuinely no/expired/invalid credentials: for routes that don't
+        // require auth, continue without context. The RequireAuth extractor
+        // will handle the error later with the correct 401.
+        Err(AuthError::Unauthorized(_)) => None,
+        // The auth backend itself failed to answer (DB error surfaced while
+        // validating a session/API key/token). Treating this as "no auth
+        // context" would let RequireAuth reject with a generic "Authentication
+        // Required" 401, which the frontend cannot distinguish from a real
+        // logout -- it force-redirects to the login screen. Surface the
+        // actual failure instead so a transient backend issue doesn't look
+        // like every session died at once.
+        Err(AuthError::InternalServerError(reason)) => {
+            warn!("Auth validation failed due to an internal error, refusing to treat the request as unauthenticated: {}", reason);
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
@@ -211,14 +224,26 @@ async fn validate_session_cookie(
     let session_token = extract_session_from_cookies(req.headers(), crypto)?;
 
     if let Some(token) = session_token {
-        match auth_service.verify_session(&token).await {
-            Ok(user) => {
-                let user_role = determine_user_role(&user, user_service)
+        match auth_service.verify_session_details(&token).await {
+            Ok(verified) => {
+                let user_role = determine_user_role(&verified.user, user_service)
                     .await
                     .unwrap_or(Role::User);
-                return Ok(Some(AuthContext::new_session(user.clone(), user_role)));
+                return Ok(Some(AuthContext::new_persisted_session(
+                    verified.user,
+                    user_role,
+                    verified.session_id,
+                )));
             }
-            Err(_) => return Ok(None),
+            // A session row that genuinely doesn't exist (never created,
+            // expired, or the user was deleted) is the only case that means
+            // "not authenticated". Every other error here is the session
+            // store itself failing to answer (DB connection drop, pool
+            // exhaustion, timeout) -- that must NOT be reported as "no
+            // session", or a transient DB blip silently logs every active
+            // user out and bounces them to the login screen.
+            Err(crate::auth_service::AuthError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
     }
 

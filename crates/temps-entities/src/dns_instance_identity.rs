@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! DNS ownership instance identity (ADR-031)
 //!
 //! Single-row table holding the random, install-scoped ID this temps

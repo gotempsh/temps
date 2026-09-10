@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-query-mongodb"
 version = "0.1.0"
@@ -31,3 +34,6 @@ async-trait = "0.1"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+testcontainers = { workspace = true }

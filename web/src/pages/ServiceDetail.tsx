@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   deleteServiceMutation,
   getProjectsOptions,
@@ -8,6 +11,7 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealServiceParameter } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
@@ -22,7 +26,12 @@ import {
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
-import { listPgUpgrades, phaseIndex, PG_UPGRADE_PHASES, isTerminal } from '@/lib/pg-upgrades'
+import {
+  listPgUpgrades,
+  phaseIndex,
+  PG_UPGRADE_PHASES,
+  isTerminal,
+} from '@/lib/pg-upgrades'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,6 +63,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { Input } from '@/components/ui/input'
@@ -62,14 +72,14 @@ import { ServiceLogo } from '@/components/ui/service-logo'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { maskValue, shouldMaskValue } from '@/lib/masking'
+import {
+  createCredentialRevealGuard,
+  credentialValueForScope,
+} from '@/lib/credential-reveal-state'
+import { maskValue } from '@/lib/masking'
 import { formatBytes } from '@/lib/utils'
 import { iconForServiceType } from '@/lib/serviceIcons'
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -83,6 +93,7 @@ import {
   ArrowLeft,
   ArrowUpCircle,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -90,8 +101,8 @@ import {
   Eye,
   EyeOff,
   HardDrive,
+  Link2,
   Loader2,
-  MoreVertical,
   Pencil,
   Plus,
   Radio,
@@ -101,10 +112,11 @@ import {
   Server,
   Trash2,
   XCircle,
+  BarChart2,
 } from 'lucide-react'
 import { format } from 'date-fns'
-import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 /**
@@ -158,13 +170,15 @@ function memberDisplayRole(member: {
 
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
+  const location = useLocation()
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
-  const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] = useState(false)
+  const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] =
+    useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false)
   const [isStopDialogOpen, setIsStopDialogOpen] = useState(false)
@@ -178,10 +192,22 @@ export function ServiceDetail() {
     container_name: string
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [prevStatus, setPrevStatus] = useState<string | undefined>(undefined)
+  const prevStatusRef = useRef<string | undefined>(undefined)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
     new Set()
   )
+  const [revealedParameters, setRevealedParameters] = useState<
+    Record<string, { value: string; scope: string }>
+  >({})
+  const [revealingParameters, setRevealingParameters] = useState<
+    Record<string, { token: string; scope: string }>
+  >({})
+  const parameterRevealGuard = useRef(createCredentialRevealGuard())
+  const clearParameterReveals = useCallback(() => {
+    setVisibleParameters(new Set())
+    setRevealedParameters({})
+    setRevealingParameters({})
+  }, [])
 
   const {
     data: service,
@@ -198,6 +224,15 @@ export function ServiceDetail() {
       return status === 'creating' ? 2000 : false
     },
   })
+  const parameterRevealScope = `${id}:${location.key}:${service?.service.updated_at ?? 'loading'}`
+
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    parameterRevealGuard.current = guard
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    clearParameterReveals()
+    return () => guard.invalidate()
+  }, [parameterRevealScope, clearParameterReveals])
 
   // Query for PostgreSQL major-version upgrades. Only relevant for postgres
   // services; harmless for others (the query is enabled conditionally below).
@@ -214,7 +249,6 @@ export function ServiceDetail() {
       return rows.some((u) => !isTerminal(u.status)) ? 3000 : false
     },
   })
-
 
   // Query for environment variables
   const {
@@ -259,18 +293,25 @@ export function ServiceDetail() {
     isFetching: isFetchingBackups,
     refetch: refetchBackups,
   } = useQuery({
-    ...listExternalServiceBackupsOptions(serviceId, backupsPage, BACKUPS_PAGE_SIZE),
+    ...listExternalServiceBackupsOptions(
+      serviceId,
+      backupsPage,
+      BACKUPS_PAGE_SIZE
+    ),
     enabled: !!serviceId,
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
   const backupsTotalPages = Math.max(
     1,
-    Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE),
+    Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE)
   )
 
   useEffect(() => {
     if (backupsPage > backupsTotalPages) {
+      // The server total can shrink after a backup is removed while this page
+      // is open; synchronize the requested page back into the valid range.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBackupsPage(backupsTotalPages)
     }
   }, [backupsPage, backupsTotalPages])
@@ -283,13 +324,20 @@ export function ServiceDetail() {
       1,
       Math.min(
         backupsPage - Math.floor(windowSize / 2),
-        backupsTotalPages - windowSize + 1,
-      ),
+        backupsTotalPages - windowSize + 1
+      )
     )
     return Array.from({ length: windowSize }, (_, idx) => start + idx)
   }, [backupsPage, backupsTotalPages])
 
-  const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(false)
+  const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(
+    () =>
+      (
+        location.state as {
+          openLinkedProjects?: boolean
+        } | null
+      )?.openLinkedProjects === true
+  )
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
@@ -323,15 +371,14 @@ export function ServiceDetail() {
   // Notify when cluster creation completes or fails
   useEffect(() => {
     const currentStatus = service?.service?.status
+    const prevStatus = prevStatusRef.current
     if (prevStatus === 'creating' && currentStatus === 'running') {
       toast.success('Cluster created successfully')
     } else if (prevStatus === 'creating' && currentStatus === 'failed') {
       toast.error('Cluster creation failed')
     }
-    if (currentStatus) {
-      setPrevStatus(currentStatus)
-    }
-  }, [service?.service?.status, prevStatus])
+    prevStatusRef.current = currentStatus
+  }, [service?.service?.status])
 
   const startService = useMutation({
     ...startServiceMutation(),
@@ -390,10 +437,7 @@ export function ServiceDetail() {
   // monitor / current primary / quorum-violating removals — surface the
   // detail message verbatim when that happens.
   const removeMember = useMutation({
-    mutationFn: async (options: {
-      serviceId: number
-      memberId: number
-    }) => {
+    mutationFn: async (options: { serviceId: number; memberId: number }) => {
       const response = await fetch(
         `/api/external-services/${options.serviceId}/members/${options.memberId}`,
         {
@@ -426,10 +470,7 @@ export function ServiceDetail() {
   // the chosen container; the monitor demotes the current primary and
   // the role reconciler refreshes role-aliased VIPs on its next tick.
   const promoteMember = useMutation({
-    mutationFn: async (options: {
-      serviceId: number
-      memberId: number
-    }) => {
+    mutationFn: async (options: { serviceId: number; memberId: number }) => {
       const response = await fetch(
         `/api/external-services/${options.serviceId}/members/${options.memberId}/promote`,
         {
@@ -499,17 +540,14 @@ export function ServiceDetail() {
       // Start can take 5–15s for Postgres (reconcile + recreate path).
       // toast.promise surfaces all three states without blocking the UI,
       // matching the rollback/promote patterns elsewhere in the app.
-      toast.promise(
-        startService.mutateAsync({ path: { id: parseInt(id!) } }),
-        {
-          loading: `Starting ${service.service.name}…`,
-          success: `${service.service.name} started`,
-          error: (err: Error) =>
-            err?.message
-              ? `Failed to start ${service.service.name}: ${err.message}`
-              : `Failed to start ${service.service.name}`,
-        }
-      )
+      toast.promise(startService.mutateAsync({ path: { id: parseInt(id!) } }), {
+        loading: `Starting ${service.service.name}…`,
+        success: `${service.service.name} started`,
+        error: (err: Error) =>
+          err?.message
+            ? `Failed to start ${service.service.name}: ${err.message}`
+            : `Failed to start ${service.service.name}`,
+      })
     }
   }
 
@@ -636,15 +674,16 @@ export function ServiceDetail() {
               onOpenChange={setIsLinkPopoverOpen}
             >
               <PopoverTrigger asChild>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Plus className="h-4 w-4" />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  <Link2 className="h-4 w-4" />
                   {linkedProjectsLoading ? (
                     <Loader2 className="h-3 w-3 animate-spin" />
                   ) : (
-                    <>
-                      <span className="hidden sm:inline">{linkedProjectsResponse?.length || 0} linked</span>
-                      <span className="sm:hidden">{linkedProjectsResponse?.length || 0}</span>
-                    </>
+                    <span>{linkedProjectsResponse?.length || 0} linked</span>
                   )}
                 </Button>
               </PopoverTrigger>
@@ -673,9 +712,7 @@ export function ServiceDetail() {
                           key={link.id}
                           className="flex items-center justify-between gap-2 text-sm"
                         >
-                          <span className="truncate">
-                            {link.project.slug}
-                          </span>
+                          <span className="truncate">{link.project.slug}</span>
                           <Link
                             to={`/projects/${link.project.slug}`}
                             className="text-xs text-muted-foreground hover:text-foreground"
@@ -700,8 +737,8 @@ export function ServiceDetail() {
                         ?.filter(
                           (p) =>
                             !linkedProjectsResponse?.some(
-                              (lp) => lp.project.id === p.id,
-                            ),
+                              (lp) => lp.project.id === p.id
+                            )
                         )
                         .map((project) => (
                           <CommandItem
@@ -723,53 +760,92 @@ export function ServiceDetail() {
               </PopoverContent>
             </Popover>
 
-            {service.service.status === 'running' && (
-              <Link to={`/storage/${id}/monitoring`}>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Activity className="h-4 w-4" />
-                  <span className="hidden sm:inline">Monitoring</span>
-                </Button>
-              </Link>
-            )}
-            <Link to={`/storage/${id}/browse`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <Database className="h-4 w-4" />
-                <span className="hidden sm:inline">Browse Data</span>
-              </Button>
-            </Link>
-            <Link to={`/storage/${id}/logs`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <ScrollText className="h-4 w-4" />
-                <span className="hidden sm:inline">Logs</span>
-              </Button>
-            </Link>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" className="h-8 w-8">
-                  <MoreVertical className="h-4 w-4" />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  <Eye className="h-4 w-4" />
+                  Explore
+                  <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-48">
+                {service.service.status === 'running' && (
+                  <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                    <Link to={`/storage/${id}/monitoring`}>
+                      <Activity className="mr-2 h-4 w-4" />
+                      Monitoring
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                  <Link to={`/storage/${id}/browse`}>
+                    <Database className="mr-2 h-4 w-4" />
+                    Browse data
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                  <Link to={`/storage/${id}/logs`}>
+                    <ScrollText className="mr-2 h-4 w-4" />
+                    Logs
+                  </Link>
+                </DropdownMenuItem>
+                {service.service.service_type === 'postgres' && (
+                  <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                    <Link to={`/storage/${id}/query-performance`}>
+                      <BarChart2 className="mr-2 h-4 w-4" />
+                      Query performance
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  Actions
+                  <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => setIsBackupDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsBackupDialogOpen(true)}
+                >
                   <HardDrive className="h-4 w-4 mr-2" />
                   Backup
                 </DropdownMenuItem>
                 <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
                   onClick={() => navigate(`/storage/${parseInt(id!)}/restore`)}
                 >
                   <RotateCcw className="h-4 w-4 mr-2" />
                   Restore…
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setIsEditDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsEditDialogOpen(true)}
+                >
                   <Pencil className="h-4 w-4 mr-2" />
                   Edit
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setIsUpgradeDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsUpgradeDialogOpen(true)}
+                >
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
                     onClick={() => setIsMajorUpgradeDialogOpen(true)}
                   >
                     <ArrowUpCircle className="h-4 w-4 mr-2" />
@@ -784,13 +860,13 @@ export function ServiceDetail() {
                     startService.isPending ||
                     stopService.isPending
                   }
-                  className={
-                    service.service.status === 'running'
-                      ? 'text-destructive focus:text-destructive'
-                      : ''
-                  }
+                  className={cn(
+                    'min-h-12 sm:min-h-8',
+                    service.service.status === 'running' &&
+                      'text-destructive focus:text-destructive'
+                  )}
                 >
-                  {(startService.isPending || stopService.isPending) ? (
+                  {startService.isPending || stopService.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                   ) : service.service.status === 'running' ? (
                     <AlertCircle className="h-4 w-4 mr-2" />
@@ -806,7 +882,7 @@ export function ServiceDetail() {
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => setIsDeleteDialogOpen(true)}
-                  className="text-destructive focus:text-destructive"
+                  className="min-h-12 text-destructive focus:text-destructive sm:min-h-8"
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
                   Delete
@@ -843,6 +919,7 @@ export function ServiceDetail() {
             <WalHealthPanel
               serviceId={parseInt(id!)}
               serviceType={service.service.service_type}
+              onUpgrade={() => setIsUpgradeDialogOpen(true)}
             />
           ) : null}
 
@@ -850,7 +927,9 @@ export function ServiceDetail() {
             <MonitoringCard
               serviceId={service.service.id}
               engine={service.service.service_type}
-              dockerImage={service.current_parameters?.docker_image ?? undefined}
+              dockerImage={
+                service.current_parameters?.docker_image ?? undefined
+              }
               metricsEnabled={service.service.metrics_enabled ?? false}
               onMonitoringChange={() => refetch()}
             />
@@ -899,7 +978,10 @@ export function ServiceDetail() {
                         service.service.members &&
                         service.service.members.length > 0
                           ? service.service.members.map(
-                              (m: { role: string; node_id?: number | null }) => ({
+                              (m: {
+                                role: string
+                                node_id?: number | null
+                              }) => ({
                                 role: m.role,
                                 node_id: m.node_id ?? undefined,
                               })
@@ -1113,8 +1195,19 @@ export function ServiceDetail() {
                 <dl className="divide-y divide-border">
                   {Object.entries(service.current_parameters).map(
                     ([key, value]) => {
-                      const isSensitive = shouldMaskValue(key)
-                      const isVisible = visibleParameters.has(key)
+                      const isSensitive =
+                        service.sensitive_parameters?.includes(key) ?? false
+                      const revealScope = parameterRevealScope
+                      const revealedParameter = revealedParameters[key]
+                      const revealedValue = credentialValueForScope(
+                        revealedParameter,
+                        revealScope
+                      )
+                      const isVisible =
+                        visibleParameters.has(key) &&
+                        revealedValue !== undefined
+                      const isRevealing =
+                        revealingParameters[key]?.scope === revealScope
                       // Coerce non-primitive values to a JSON string so a
                       // future structured sub-block (`resources`, etc.)
                       // doesn't crash the page with "Objects are not valid
@@ -1123,10 +1216,11 @@ export function ServiceDetail() {
                         value != null && typeof value === 'object'
                           ? JSON.stringify(value)
                           : value
-                      const displayValue =
-                        isSensitive && !isVisible
-                          ? maskValue(safeValue)
-                          : safeValue
+                      const displayValue = isSensitive
+                        ? isVisible
+                          ? (revealedValue ?? maskValue(safeValue))
+                          : maskValue(safeValue)
+                        : safeValue
                       const hasValue = Boolean(safeValue)
 
                       return (
@@ -1152,20 +1246,91 @@ export function ServiceDetail() {
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 shrink-0"
-                                onClick={() => {
-                                  setVisibleParameters((prev) => {
-                                    const next = new Set(prev)
-                                    if (next.has(key)) {
+                                disabled={isRevealing}
+                                onClick={async () => {
+                                  if (isVisible) {
+                                    parameterRevealGuard.current.cancel(key)
+                                    setVisibleParameters((prev) => {
+                                      const next = new Set(prev)
                                       next.delete(key)
-                                    } else {
-                                      next.add(key)
+                                      return next
+                                    })
+                                    setRevealedParameters((prev) => {
+                                      const next = { ...prev }
+                                      delete next[key]
+                                      return next
+                                    })
+                                    return
+                                  }
+
+                                  const requestToken = crypto.randomUUID()
+                                  const revealRequest =
+                                    parameterRevealGuard.current.begin(key)
+                                  setRevealingParameters((prev) => ({
+                                    ...prev,
+                                    [key]: {
+                                      token: requestToken,
+                                      scope: revealScope,
+                                    },
+                                  }))
+                                  try {
+                                    const response =
+                                      await revealServiceParameter({
+                                        path: {
+                                          id: service.service.id,
+                                          param_name: key,
+                                        },
+                                        throwOnError: true,
+                                      })
+                                    if (
+                                      !parameterRevealGuard.current.isCurrent(
+                                        key,
+                                        revealRequest
+                                      )
+                                    ) {
+                                      return
                                     }
-                                    return next
-                                  })
+                                    setRevealedParameters((prev) => ({
+                                      ...prev,
+                                      [key]: {
+                                        value: response.data.value,
+                                        scope: revealScope,
+                                      },
+                                    }))
+                                    setVisibleParameters((prev) => {
+                                      const next = new Set(prev)
+                                      next.add(key)
+                                      return next
+                                    })
+                                  } catch {
+                                    toast.error(
+                                      `Failed to reveal ${key.replace(/_/g, ' ')}`
+                                    )
+                                  } finally {
+                                    if (
+                                      parameterRevealGuard.current.finish(
+                                        key,
+                                        revealRequest
+                                      )
+                                    ) {
+                                      setRevealingParameters((prev) => {
+                                        if (prev[key]?.token !== requestToken) {
+                                          return prev
+                                        }
+                                        const next = { ...prev }
+                                        delete next[key]
+                                        return next
+                                      })
+                                    }
+                                  }
                                 }}
-                                title={isVisible ? 'Hide value' : 'Show value'}
+                                title={
+                                  isVisible ? 'Hide value' : 'Reveal value'
+                                }
                               >
-                                {isVisible ? (
+                                {isRevealing ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : isVisible ? (
                                   <EyeOff className="h-4 w-4" />
                                 ) : (
                                   <Eye className="h-4 w-4" />
@@ -1174,7 +1339,11 @@ export function ServiceDetail() {
                             )}
                             {hasValue && (!isSensitive || isVisible) && (
                               <CopyButton
-                                value={String(value)}
+                                value={
+                                  isSensitive
+                                    ? (revealedValue ?? '')
+                                    : String(value)
+                                }
                                 minimal
                                 className="h-8 w-8 shrink-0"
                               />
@@ -1192,7 +1361,6 @@ export function ServiceDetail() {
               )}
             </CardContent>
           </Card>
-
           {/* Backups Section */}
           <Card>
             <CardHeader>
@@ -1204,7 +1372,7 @@ export function ServiceDetail() {
                       {isLoadingBackups ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
                       ) : (
-                        serviceBackupsData?.total ?? 0
+                        (serviceBackupsData?.total ?? 0)
                       )}
                     </Badge>
                   </CardTitle>
@@ -1225,7 +1393,7 @@ export function ServiceDetail() {
                     <RefreshCcw
                       className={cn(
                         'h-4 w-4',
-                        isFetchingBackups && 'animate-spin',
+                        isFetchingBackups && 'animate-spin'
                       )}
                     />
                   </Button>
@@ -1259,7 +1427,8 @@ export function ServiceDetail() {
                 <ul role="list" className="divide-y divide-border">
                   {paginatedBackups.map((backup) => {
                     const key =
-                      backup.backup_id || String(backup.external_service_backup_id)
+                      backup.backup_id ||
+                      String(backup.external_service_backup_id)
                     const state = backup.state || 'unknown'
                     const isCompleted = state === 'completed'
                     const isFailed = state === 'failed'
@@ -1289,7 +1458,7 @@ export function ServiceDetail() {
                     // the backend hasn't surfaced an `engine` field on
                     // this entry yet (legacy rows).
                     const ServiceIcon = iconForServiceType(
-                      service.service.service_type,
+                      service.service.service_type
                     )
 
                     return (
@@ -1320,7 +1489,7 @@ export function ServiceDetail() {
                               <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
                                 {format(
                                   new Date(backup.started_at),
-                                  'MMM d, p',
+                                  'MMM d, p'
                                 )}
                               </span>
                               {backup.backup_type ? (
@@ -1345,7 +1514,10 @@ export function ServiceDetail() {
                                   {state === 'pending' ? 'Pending' : 'Running'}
                                 </Badge>
                               ) : isFailed ? (
-                                <Badge variant="destructive" className="gap-1 text-xs">
+                                <Badge
+                                  variant="destructive"
+                                  className="gap-1 text-xs"
+                                >
                                   <XCircle className="h-3 w-3" />
                                   Failed
                                 </Badge>
@@ -1419,7 +1591,7 @@ export function ServiceDetail() {
                       Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
                       {Math.min(
                         backupsPage * BACKUPS_PAGE_SIZE,
-                        serviceBackupsData?.total ?? 0,
+                        serviceBackupsData?.total ?? 0
                       )}{' '}
                       of {serviceBackupsData?.total ?? 0} backups
                     </span>
@@ -1431,9 +1603,7 @@ export function ServiceDetail() {
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() =>
-                        setBackupsPage((p) => Math.max(1, p - 1))
-                      }
+                      onClick={() => setBackupsPage((p) => Math.max(1, p - 1))}
                       disabled={backupsPage === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
@@ -1459,7 +1629,7 @@ export function ServiceDetail() {
                       size="sm"
                       onClick={() =>
                         setBackupsPage((p) =>
-                          Math.min(backupsTotalPages, p + 1),
+                          Math.min(backupsTotalPages, p + 1)
                         )
                       }
                       disabled={backupsPage === backupsTotalPages}
@@ -1534,18 +1704,16 @@ export function ServiceDetail() {
                     const pct =
                       u.status === 'completed'
                         ? 100
-                        : Math.round(
-                            (phaseIndex(u.phase) / totalPhases) * 100,
-                          )
+                        : Math.round((phaseIndex(u.phase) / totalPhases) * 100)
                     const statusVariant =
                       u.status === 'completed'
                         ? 'default'
                         : u.status === 'failed'
-                        ? 'destructive'
-                        : u.status === 'cancelled' ||
-                          u.status === 'rolled_back'
-                        ? 'secondary'
-                        : 'outline'
+                          ? 'destructive'
+                          : u.status === 'cancelled' ||
+                              u.status === 'rolled_back'
+                            ? 'secondary'
+                            : 'outline'
                     const isActive = !isTerminal(u.status)
                     return (
                       <Link
@@ -1555,9 +1723,7 @@ export function ServiceDetail() {
                       >
                         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                           <div className="flex flex-wrap items-center gap-2 min-w-0">
-                            <span className="font-medium text-sm">
-                              #{u.id}
-                            </span>
+                            <span className="font-medium text-sm">#{u.id}</span>
                             <span className="text-sm text-muted-foreground truncate">
                               {u.from_version} → {u.to_version}
                             </span>
@@ -1577,9 +1743,7 @@ export function ServiceDetail() {
                         {isActive ? (
                           <div className="mt-2">
                             <div className="flex justify-between text-xs text-muted-foreground mb-1">
-                              <span className="truncate">
-                                Phase: {u.phase}
-                              </span>
+                              <span className="truncate">Phase: {u.phase}</span>
                               <span className="whitespace-nowrap ml-2">
                                 {pct}%
                               </span>
@@ -1657,11 +1821,7 @@ export function ServiceDetail() {
           </DialogHeader>
           <div className="space-y-2">
             <Label htmlFor="confirm-delete-service-name">
-              Type{' '}
-              <span className="font-mono font-semibold text-foreground">
-                {service.service.name}
-              </span>{' '}
-              to confirm
+              Type <ConfirmNameBadge value={service.service.name} /> to confirm
             </Label>
             <Input
               id="confirm-delete-service-name"
@@ -1711,10 +1871,10 @@ export function ServiceDetail() {
                 {memberToRemove?.container_name}
               </span>{' '}
               from this cluster. The container, its data volume, and the
-              member's DNS record will be deleted. The pg_auto_failover
+              member&apos;s DNS record will be deleted. The pg_auto_failover
               monitor will mark the node as unreachable; run{' '}
-              <span className="font-mono">pg_autoctl drop node</span>{' '}
-              manually if you want a fully-clean monitor view.
+              <span className="font-mono">pg_autoctl drop node</span> manually
+              if you want a fully-clean monitor view.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1759,12 +1919,11 @@ export function ServiceDetail() {
               <span className="font-mono text-foreground">
                 {memberToPromote?.container_name}
               </span>{' '}
-              becomes the new primary. The current primary will be
-              demoted to a replica. Brief write unavailability is
-              expected during the transition (typically a few seconds).
-              The role reconciler refreshes the role-aliased VIP DNS
-              records on its next tick (≤30s) so app connections that
-              use the FQDN follow without restart.
+              becomes the new primary. The current primary will be demoted to a
+              replica. Brief write unavailability is expected during the
+              transition (typically a few seconds). The role reconciler
+              refreshes the role-aliased VIP DNS records on its next tick (≤30s)
+              so app connections that use the FQDN follow without restart.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1818,6 +1977,7 @@ export function ServiceDetail() {
         service={service.service}
         currentParameters={service.current_parameters}
         onSuccess={() => {
+          clearParameterReveals()
           refetch()
           queryClient.invalidateQueries({
             queryKey: getServiceOptions({
@@ -1852,7 +2012,6 @@ export function ServiceDetail() {
           })
         }}
       />
-
     </div>
   )
 }

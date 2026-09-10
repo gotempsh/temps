@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /** Preserve the server's contextual Problem Details message in setup errors. */
 export function deliveryError(error: unknown): string {
   if (error instanceof Error) return error.message

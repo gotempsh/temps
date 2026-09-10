@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-domains"
 version.workspace = true
@@ -14,6 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
+temps-monitoring = { path = "../temps-monitoring" }
 axum = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
@@ -53,8 +57,11 @@ uuid = { workspace = true }
 [dev-dependencies]
 testcontainers = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-axum-test = "16.3"
+axum-test = "21.0"
 webpki-roots = "1.0"
 bollard = { workspace = true }
 futures-util = { workspace = true }
 tar = { workspace = true }
+tower.workspace = true
+wiremock = "0.6"
+serial_test = "4.0"

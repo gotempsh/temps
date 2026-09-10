@@ -1,0 +1,33 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! ADR-037: subscription-backed agent CLI providers for the Temps AI foundation.
+//!
+//! This crate introduces two types:
+//!
+//! - [`AgentCliAiService`]: implements [`temps_ai::AiService`] by delegating
+//!   to an [`temps_agents::ai_cli::AiCliProvider`] (Claude Code, Codex,
+//!   OpenCode). Subscription credentials are ambient on the host — no API key
+//!   is read or forwarded.
+//!
+//! - [`DispatchingAiService`]: routes `is_available`/`complete`/`chat_stream`
+//!   to whichever provider is active (BYOK gateway or a subscription agent
+//!   CLI), read through the [`ActiveProviderReader`] seam so this crate stays
+//!   free of a DB dependency. Multi-turn tool-calling is exposed to agent CLIs
+//!   through a per-turn, authenticated loopback MCP bridge.
+
+pub mod dispatch;
+pub mod model_relay;
+pub mod service;
+
+pub use dispatch::{
+    ActiveProviderReader, AiProviderRegistry, AiSummaryPreference, DispatchingAiService,
+};
+pub use model_relay::{
+    sandbox_model_relay_routes, SandboxHarnessCredentials, SandboxModelRelayService,
+};
+pub use service::{
+    AgentCliAiService, ResolvedSandboxWorkspace, SandboxCredentialResolver,
+    SandboxWorkspaceResolver, SandboxWorkspaceResolverSlot, SandboxWorkspaceStopper,
+    ScopedMcpBridge,
+};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Evergreen workflow memory primitives for Temps.
 //!
 //! This crate owns the contract for "memory" — the persistent,

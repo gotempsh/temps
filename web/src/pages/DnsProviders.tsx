@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   deleteDnsProvider as deleteProvider,
   listDnsProviders as listProviders,
@@ -45,7 +48,7 @@ import {
 } from 'lucide-react'
 import { getDnsProviderIcon } from '@/components/icons/DnsProviderIcons'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 // Helper function to get provider icon

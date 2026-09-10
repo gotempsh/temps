@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { execSync } from 'node:child_process'
 import { cloudFetch } from '../../lib/cloud-client.js'
@@ -53,12 +56,12 @@ function openBrowser(url: string): void {
   }
 }
 
-function formatPrice(cents: number): string {
+export function formatPrice(cents: number): string {
   if (cents === 0) return colors.success('free')
   return `€${(cents / 100).toFixed(2)}/mo`
 }
 
-function usageBar(used: number, limit: number): string {
+export function usageBar(used: number, limit: number): string {
   const pct = limit > 0 ? Math.min(used / limit, 1) : 0
   const width = 20
   const filled = Math.round(pct * width)

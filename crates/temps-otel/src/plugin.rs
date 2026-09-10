@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin registration for the OTel subsystem.
 
 use std::future::Future;
@@ -14,13 +17,20 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
+use crate::handlers::cloud_backfill_handler;
+use crate::handlers::cloud_bulk_activation_handler;
+use crate::handlers::cloud_telemetry_handler;
 use crate::handlers::dashboard_handler;
+use crate::handlers::facet_handler;
 use crate::handlers::ingest_handler;
 use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::memory::OtelMemoryProfile;
+use crate::relay::OtelRelay;
 use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
+use crate::services::facet_service::FacetService;
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -59,6 +69,17 @@ pub struct OtelConfig {
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
+
+    // Ingest backpressure. Process-wide operational tuning knob (not
+    // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
+    pub max_concurrent_ingest_requests: usize,
+
+    /// Startup-derived memory bounds shared by ingest and relay queues.
+    pub memory_profile: OtelMemoryProfile,
+
+    /// Whether the ingest concurrency was explicitly configured instead of
+    /// selected from effective memory.
+    pub ingest_concurrency_overridden: bool,
 }
 
 impl Default for OtelConfig {
@@ -77,6 +98,10 @@ impl Default for OtelConfig {
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
+            max_concurrent_ingest_requests:
+                crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+            memory_profile: OtelMemoryProfile::fallback(),
+            ingest_concurrency_overridden: false,
         }
     }
 }
@@ -84,7 +109,12 @@ impl Default for OtelConfig {
 impl OtelConfig {
     /// Read configuration from `TEMPS_OTEL_*` environment variables.
     pub fn from_env() -> Self {
-        let mut config = Self::default();
+        let memory_profile = OtelMemoryProfile::detect();
+        let mut config = Self {
+            max_concurrent_ingest_requests: memory_profile.max_concurrent_ingest_requests,
+            memory_profile,
+            ..Self::default()
+        };
 
         if let Ok(v) = std::env::var("TEMPS_OTEL_S3_REGION") {
             config.s3_region = Some(v);
@@ -138,6 +168,20 @@ impl OtelConfig {
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
             config.enable_anomaly_detection = v != "0" && v != "false";
         }
+        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
+            match parse_max_concurrent_ingest_requests(&v) {
+                Some(limit) => {
+                    config.max_concurrent_ingest_requests = limit;
+                    config.ingest_concurrency_overridden = true;
+                }
+                None => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+                     integer within the supported range; keeping the automatically selected ingest \
+                     concurrency ceiling"
+                ),
+            }
+        }
 
         config
     }
@@ -149,6 +193,151 @@ impl OtelConfig {
             && self.s3_secret_key.is_some()
             && self.s3_bucket.is_some()
     }
+}
+
+/// Parses `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`. Returns `None` (caller
+/// keeps the default) for anything that isn't a positive integer within
+/// `Semaphore::MAX_PERMITS` — `Semaphore::new` asserts on that bound and would
+/// otherwise panic the process at startup on a mistyped value.
+///
+/// A free function (rather than inline in `from_env`) so this parsing/bounds
+/// logic is unit-testable without mutating process-global environment
+/// variables, which the other `TEMPS_OTEL_*` fields in this file don't do.
+fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
+    let limit = v.parse::<usize>().ok()?;
+    (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
+}
+
+/// Number of counters the OTel pipeline-stats sampler publishes each cycle —
+/// one per [`crate::types::PipelineStats`] field.
+pub const OTEL_PIPELINE_STAT_COUNT: usize = 15;
+
+/// How often the pipeline-stats sampler snapshots the counters, in seconds.
+///
+/// Public because a stored point is a *delta over this interval*, so any
+/// reader charting the series has to state the unit — see
+/// `PipelineHistoryResponse::sample_interval_seconds`. A chart that says
+/// "12 dropped spans" without saying "per minute" is not interpretable.
+pub const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
+
+/// Synthetic node ID of the control plane (mirrors the proxy metrics sampler).
+///
+/// The pipeline counters are process-wide, not per-node and not per-project,
+/// so they are written against `SourceKind::Node` / id 0 — the same synthetic
+/// source the `proxy.*` metrics use.
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// Every metric name the pipeline-stats sampler writes, in display order.
+///
+/// The **single source of truth** shared by the writer
+/// ([`pipeline_stat_deltas`]) and the reader
+/// (`GET /otel/pipeline-history`). Without this, adding a counter to
+/// [`crate::types::PipelineStats`] would mean editing the sampler, the query
+/// handler and the UI separately — and the failure mode of forgetting one is
+/// silent: a metric that is written but never charted, or charted but never
+/// written. `pipeline_stat_deltas_match_metric_names` pins the two together.
+///
+/// Order is deliberate — received/stored/dropped triplets stay adjacent so the
+/// UI can render them as one panel per signal.
+pub const OTEL_PIPELINE_METRIC_NAMES: [&str; OTEL_PIPELINE_STAT_COUNT] = [
+    "otel.rate_limited_requests",
+    "otel.quota_exceeded_requests",
+    "otel.metrics_received",
+    "otel.metrics_stored",
+    "otel.metrics_dropped",
+    "otel.spans_received",
+    "otel.spans_stored",
+    "otel.spans_dropped",
+    "otel.logs_received",
+    "otel.logs_stored_db",
+    "otel.logs_stored_s3",
+    "otel.logs_dropped",
+    "otel.ingest_errors",
+    "otel.relay_dropped_batches",
+    "otel.relay_dropped_items",
+];
+
+/// Turn a pipeline-stats snapshot plus the previous cycle's checkpoint into the
+/// `(metric name, delta)` pairs the sampler writes to the metrics store.
+///
+/// Deltas rather than cumulative values, so a point reads as "events in the
+/// last sample window" and an alert threshold like `> 10` means what an
+/// operator expects. `saturating_sub` guards the one case where the sequence
+/// is not monotonic: a process restart zeroes every atomic, which would
+/// otherwise underflow into a nonsense value.
+///
+/// A free function so the naming and the arithmetic are unit-testable without
+/// standing up the sampler task, a metrics store, or a 60-second timer.
+fn pipeline_stat_deltas(
+    snap: &crate::types::PipelineStats,
+    prev: &crate::types::PipelineStats,
+) -> [(&'static str, u64); OTEL_PIPELINE_STAT_COUNT] {
+    [
+        (
+            "otel.rate_limited_requests",
+            snap.rate_limited_requests
+                .saturating_sub(prev.rate_limited_requests),
+        ),
+        (
+            "otel.quota_exceeded_requests",
+            snap.quota_exceeded_requests
+                .saturating_sub(prev.quota_exceeded_requests),
+        ),
+        (
+            "otel.metrics_received",
+            snap.metrics_received.saturating_sub(prev.metrics_received),
+        ),
+        (
+            "otel.metrics_stored",
+            snap.metrics_stored.saturating_sub(prev.metrics_stored),
+        ),
+        (
+            "otel.metrics_dropped",
+            snap.metrics_dropped.saturating_sub(prev.metrics_dropped),
+        ),
+        (
+            "otel.spans_received",
+            snap.spans_received.saturating_sub(prev.spans_received),
+        ),
+        (
+            "otel.spans_stored",
+            snap.spans_stored.saturating_sub(prev.spans_stored),
+        ),
+        (
+            "otel.spans_dropped",
+            snap.spans_dropped.saturating_sub(prev.spans_dropped),
+        ),
+        (
+            "otel.logs_received",
+            snap.logs_received.saturating_sub(prev.logs_received),
+        ),
+        (
+            "otel.logs_stored_db",
+            snap.logs_stored_db.saturating_sub(prev.logs_stored_db),
+        ),
+        (
+            "otel.logs_stored_s3",
+            snap.logs_stored_s3.saturating_sub(prev.logs_stored_s3),
+        ),
+        (
+            "otel.logs_dropped",
+            snap.logs_dropped.saturating_sub(prev.logs_dropped),
+        ),
+        (
+            "otel.ingest_errors",
+            snap.ingest_errors.saturating_sub(prev.ingest_errors),
+        ),
+        (
+            "otel.relay_dropped_batches",
+            snap.relay_dropped_batches
+                .saturating_sub(prev.relay_dropped_batches),
+        ),
+        (
+            "otel.relay_dropped_items",
+            snap.relay_dropped_items
+                .saturating_sub(prev.relay_dropped_items),
+        ),
+    ]
 }
 
 // ── OpenAPI Schema ──────────────────────────────────────────────────
@@ -168,16 +357,35 @@ impl OtelConfig {
         query_handler::list_metric_label_values,
         query_handler::query_traces,
         query_handler::query_trace_summaries,
+        crate::handlers::global_traces::query_global_trace_summaries,
+        crate::handlers::global_traces::query_global_traces,
+        query_handler::query_span_stats,
         query_handler::get_trace,
         query_handler::query_logs,
         query_handler::list_insights,
         query_handler::get_health,
         query_handler::get_quota,
+        query_handler::has_traces,
+        cloud_backfill_handler::get_cloud_backfill_status,
+        cloud_telemetry_handler::get_cloud_telemetry_status,
+        cloud_telemetry_handler::get_project_cloud_telemetry,
+        cloud_telemetry_handler::update_project_cloud_telemetry,
+        cloud_bulk_activation_handler::estimate_bulk_activation,
+        cloud_bulk_activation_handler::create_bulk_activation_job,
+        cloud_bulk_activation_handler::get_bulk_activation_job,
+        cloud_bulk_activation_handler::get_current_bulk_activation_job,
+        cloud_bulk_activation_handler::cancel_bulk_activation_job,
         query_handler::get_pipeline_stats,
+        query_handler::get_ingest_errors,
+        query_handler::get_pipeline_history,
         query_handler::query_genai_traces,
         query_handler::get_genai_trace,
         query_handler::get_cross_project_trace_siblings,
         query_handler::get_unified_trace,
+        facet_handler::list_facets,
+        facet_handler::create_facet,
+        facet_handler::delete_facet,
+        facet_handler::retry_facet_backfill,
         dashboard_handler::list_dashboards,
         dashboard_handler::create_dashboard,
         dashboard_handler::get_dashboard,
@@ -198,12 +406,28 @@ impl OtelConfig {
             query_handler::OtelMetricLabelValuesResponse,
             query_handler::TracesResponse,
             query_handler::TraceSummariesResponse,
+            crate::handlers::global_traces::GlobalTraceSummariesResponse,
+            crate::handlers::global_traces::GlobalTracesResponse,
+            crate::handlers::global_traces::TraceProject,
+            crate::handlers::global_traces::GlobalTraceWindow,
+            crate::storage::global_traces::GlobalTraceSummary,
             crate::types::TraceSummary,
+            query_handler::SpanStatsResponse,
+            crate::types::SpanStats,
             query_handler::LogsResponse,
             query_handler::InsightsResponse,
             query_handler::HealthResponse,
             query_handler::QuotaResponse,
+            query_handler::HasTracesResponse,
+            cloud_backfill_handler::CloudBackfillStatusResponse,
+            temps_entities::cloud_telemetry_backfills::CloudTelemetryBackfillStatus,
+            temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity,
             query_handler::PipelineStatsResponse,
+        query_handler::IngestErrorsResponse,
+        crate::types::IngestErrorSummary,
+        query_handler::PipelineHistoryResponse,
+        query_handler::PipelineSeries,
+        query_handler::PipelineHistoryPoint,
             crate::types::MetricBucket,
             crate::types::HistogramSummary,
             crate::types::MetricAggregation,
@@ -235,6 +459,29 @@ impl OtelConfig {
             crate::services::cross_project::ProjectRef,
             crate::services::cross_project::SiblingRef,
             crate::services::cross_project::TraceProjectRef,
+            cloud_telemetry_handler::ProjectCloudTelemetryResponse,
+            cloud_telemetry_handler::CloudTelemetryWriteStatusResponse,
+            cloud_telemetry_handler::UpdateProjectCloudTelemetryRequest,
+            cloud_telemetry_handler::TelemetryGapWindowResponse,
+            cloud_telemetry_handler::TelemetryWriteIntervalResponse,
+            temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode,
+            temps_entities::project_telemetry_write_intervals::TelemetryWriteIntervalReason,
+            cloud_bulk_activation_handler::EstimateBulkActivationRequest,
+            cloud_bulk_activation_handler::BulkActivationEstimateResponse,
+            cloud_bulk_activation_handler::BulkActivationProjectEstimateResponse,
+            cloud_bulk_activation_handler::CreateBulkActivationJobRequest,
+            cloud_bulk_activation_handler::BulkActivationJobResponse,
+            cloud_bulk_activation_handler::BulkActivationJobProjectResponse,
+            cloud_bulk_activation_handler::BulkActivationEtaState,
+            temps_entities::cloud_telemetry_bulk_jobs::BulkJobStatus,
+            temps_entities::cloud_telemetry_bulk_jobs::BulkJobTrigger,
+            temps_entities::cloud_telemetry_bulk_job_projects::BulkJobProjectStatus,
+            facet_handler::CreateFacetRequest,
+            facet_handler::FacetsResponse,
+            crate::services::facet_service::FacetCapability,
+            crate::services::FacetInfo,
+            crate::services::FacetStatus,
+            crate::services::FacetBackendKind,
             dashboard_handler::CreateDashboardRequest,
             dashboard_handler::UpdateDashboardRequest,
             dashboard_handler::OtelDashboardResponse,
@@ -272,6 +519,7 @@ impl OtelConfig {
     tags(
         (name = "OTel Ingest", description = "OTLP/HTTP ingest endpoints (protobuf)"),
         (name = "OTel", description = "Query endpoints for the monitoring UI"),
+        (name = "OTel Facets", description = "Span attribute facet registration (fast-filter slots)"),
         (name = "GenAI", description = "GenAI agent activity tracing endpoints")
     )
 )]
@@ -290,12 +538,21 @@ pub struct OtelPlugin {
     /// per-project retention) gets a chance to provide a resolver — same
     /// two-phase handoff `DeploymentsPlugin` uses for `DeploymentGate`.
     retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+    /// Handle to the `OtelRelaySlot` captured in `register_services` and
+    /// written into from `initialize_plugin_services` — same two-phase
+    /// handoff as `retention_resolver_slot`. The background relay consumer
+    /// (spawned in `register_services`) holds its own `Arc` clone and calls
+    /// `relay_slot.relay(msg)` for each batch received from `otel_relay_tx`.
+    /// When no plugin provides an `Arc<dyn OtelRelay>`, the slot stays loaded
+    /// with `NoopOtelRelay` and the relay loop is a cheap no-op.
+    relay_slot: tokio::sync::OnceCell<Arc<crate::relay::OtelRelaySlot>>,
 }
 
 impl OtelPlugin {
     pub fn new() -> Self {
         Self {
             retention_resolver_slot: tokio::sync::OnceCell::new(),
+            relay_slot: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -317,6 +574,16 @@ impl TempsPlugin for OtelPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let config = OtelConfig::from_env();
+            info!(
+                effective_memory_bytes = config.memory_profile.effective_memory_bytes,
+                memory_limit_source = config.memory_profile.source.as_str(),
+                max_concurrent_ingest_requests = config.max_concurrent_ingest_requests,
+                ingest_concurrency_overridden = config.ingest_concurrency_overridden,
+                relay_queue_max_bytes = config.memory_profile.relay_queue_max_bytes,
+                external_relay_max_bytes = config.memory_profile.external_relay_max_bytes,
+                "OTel startup memory limits selected"
+            );
+            context.register_service(Arc::new(config.memory_profile));
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
             // Create S3 archiver if configured
@@ -363,14 +630,27 @@ impl TempsPlugin for OtelPlugin {
             // used for everything — the default, unchanged path.
             let ch_config = read_clickhouse_otel_config_from_env();
 
+            // ── Facet cache ──────────────────────────────────────────────────
+            //
+            // Created before both storage backends so ClickHouse, TimescaleDB
+            // (whichever is the ingest/query fast-path) and FacetService
+            // (create/delete) all share the same Arc. The cache starts empty;
+            // FacetService loads initial data from Postgres below.
+            let facet_cache: crate::services::FacetCache = Arc::new(
+                arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            );
+
             // TimescaleDbStorage is always constructed: it is the sole
             // backend when CH is disabled, and the inner delegate when
-            // CH is enabled.
+            // CH is enabled. It also needs the facet cache directly since
+            // it's the default backend and handles its own slot-column
+            // ingest/query when ClickHouse isn't configured.
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
                 config.retention_days,
                 config.quota_bytes_per_project,
+                Some(facet_cache.clone()),
             ));
 
             let storage: Arc<dyn crate::storage::OtelStorage> = if let Some(ch_cfg) = ch_config {
@@ -390,6 +670,7 @@ impl TempsPlugin for OtelPlugin {
                     ch_cfg.clone(),
                     timescale_storage,
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    Some(facet_cache.clone()),
                 ));
                 // Run migrations in a background task so plugin init
                 // returns promptly. If migrations fail, the first
@@ -431,10 +712,140 @@ impl TempsPlugin for OtelPlugin {
                 );
                 timescale_storage as Arc<dyn crate::storage::OtelStorage>
             };
+
+            // Per-project Temps Cloud telemetry fidelity *and* write mode
+            // (ADR-040 §1, ADR-041 §1). Reads
+            // `projects.cloud_telemetry_fidelity` /
+            // `..._attribute_allowlist` / `..._write_mode` behind a short TTL
+            // so a change takes effect without restarting the binary.
+            // Registered as a service so the settings path can invalidate a
+            // project's entry the moment the operator changes it.
+            let cloud_policy_cache = Arc::new(crate::services::CloudPolicyCache::new(db.clone()));
+            context.register_service(cloud_policy_cache.clone());
+
+            // `local_storage` is kept separately for the callers that must
+            // bypass routing on purpose: the disconnect, quota and
+            // settings-change spills, which write previously-Cloud-bound spans
+            // back to disk and would otherwise send them straight back out.
+            let local_storage = storage.clone();
+            let cloud_link = context.get_service::<temps_cloud_client::CloudLink>();
+
+            // ── ADR-041 §3: the durable Cloud-primary span outbox ─────────
+            //
+            // Constructed whenever a Cloud link exists, and empty on every
+            // instance where no project is Cloud-primary. Its byte cap comes
+            // from the singleton `settings` row (never an environment
+            // variable); the worker refreshes it so an operator watching a
+            // queue fill up can raise it without restarting the binary.
+            //
+            // Built before the write-mode service because that service needs
+            // the spiller: taking a project off Cloud-primary, or lowering its
+            // fidelity, has to reach the spans already sitting in this queue,
+            // not only the ones not yet captured.
+            let span_outbox = match cloud_link.as_ref() {
+                Some(_) => {
+                    let cap = match context.get_service::<temps_config::ConfigService>() {
+                        Some(config) => read_outbox_cap(&config).await,
+                        None => temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                    };
+                    Some(Arc::new(temps_cloud_client::SpanOutbox::new(
+                        db.clone(),
+                        cap,
+                    )))
+                }
+                None => None,
+            };
+            let outbox_spiller = span_outbox.clone().map(|outbox| {
+                Arc::new(crate::services::OutboxSpiller::new(
+                    outbox,
+                    local_storage.clone(),
+                ))
+            });
+
+            // ── ADR-043 §3 Phase C1: the durable Cloud-primary metric outbox ──
+            //
+            // Same construction shape as `span_outbox` above, over the generic
+            // accessor rather than a per-entity type. The byte cap reuses the
+            // span cap setting for now — ADR-043 §2d's proposal of a dedicated
+            // `max_pending_bytes_metric` operator setting (distinct from the
+            // span cap, so a high-volume metric backlog cannot crowd out span
+            // writes sharing the same table) has not shipped yet; this is a
+            // known interim gap, not a design decision.
+            let metric_outbox = match cloud_link.as_ref() {
+                Some(_) => {
+                    let cap = match context.get_service::<temps_config::ConfigService>() {
+                        Some(config) => read_outbox_cap(&config).await,
+                        None => temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                    };
+                    Some(Arc::new(temps_cloud_client::TelemetryOutbox::new(
+                        db.clone(),
+                        temps_entities::cloud_telemetry_outbox::CloudTelemetryOutboxEntityType::Metric,
+                        cap,
+                    )))
+                }
+                None => None,
+            };
+
+            // ADR-041 §1: the write-mode gate and the interval ledger. Always
+            // constructed, even with no Cloud link — the write-mode control
+            // renders in every project's settings and must onboard rather than
+            // disappear, which needs an endpoint that answers.
+            let telemetry_write_modes = Arc::new({
+                let mut service = crate::services::TelemetryWriteModeService::new(db.clone())
+                    .with_policy_cache(cloud_policy_cache.clone());
+                if let Some(spiller) = outbox_spiller.clone() {
+                    service = service.with_spiller(
+                        spiller as Arc<dyn crate::services::telemetry_write_mode::TelemetrySpiller>,
+                    );
+                }
+                service
+            });
+            context.register_service(telemetry_write_modes.clone());
+
+            // ── ADR-041 §8: install the routing decorator HERE ────────────
+            //
+            // At the `register_service` call site, not inside the three query
+            // handlers that obviously need it. `HealthComputeService`,
+            // `CrossProjectTraceService` (ADR-027), `TraceReader` (the AI
+            // chat's trace tools) and `temps-observability` all read spans
+            // through this same `Arc<dyn OtelStorage>`; installing the
+            // decorator anywhere narrower leaves all four silently returning
+            // nothing for a Cloud-primary project, with no error and no badge.
+            let storage: Arc<dyn crate::storage::OtelStorage> = match cloud_link.clone() {
+                Some(link) => {
+                    info!(
+                        "Cloud-primary telemetry read routing installed (ADR-041 §8) — health, \
+                         cross-project traces, the AI chat's trace tools and the Observe page all \
+                         inherit it"
+                    );
+                    Arc::new(
+                        crate::storage::CloudRoutedOtelStorage::new(
+                            storage,
+                            Arc::new(crate::storage::CloudTelemetrySpanSource::new(link.clone())),
+                            telemetry_write_modes.clone(),
+                        )
+                        // ADR-043 §3 Phase C1: metric reads route on the
+                        // independent `cloud_analytics_write_mode` ledger.
+                        // Installed unconditionally alongside the span source
+                        // — an instance with no metrics ever Cloud-primary
+                        // simply never resolves anything but `Local` for it.
+                        .with_cloud_metrics(Arc::new(
+                            crate::storage::CloudTelemetryMetricSource::new(link),
+                        )),
+                    )
+                }
+                // No Cloud integration on this instance: nothing to route to,
+                // and wrapping would add a ledger lookup to every span read for
+                // an answer that is always `Local`.
+                None => storage,
+            };
             context.register_service(storage.clone());
 
-            // Create auth service
+            // Create auth service. Also registered in the context so
+            // `configure_routes` can inject the ADR-028 ProjectAccessChecker
+            // (registered by a later plugin) into the `tk_`-key ingest path.
             let auth_service = Arc::new(OtelAuthService::new(db.clone()));
+            context.register_service(auth_service.clone());
 
             // Create rate limiter
             let rate_limiter = Arc::new(RateLimiter::new(
@@ -442,12 +853,38 @@ impl TempsPlugin for OtelPlugin {
                 Duration::from_secs(config.rate_limit_window_secs),
             ));
 
+            // Shared progress record for `temps backfill cloud-telemetry`. The
+            // backfill itself runs out of process (ADR-040 §1), so this service
+            // is read-only here — it exists so the Console can see a run the
+            // CLI is driving instead of the operator having to watch a
+            // terminal they may not have open.
+            let cloud_backfill_progress = Arc::new(
+                crate::services::CloudBackfillProgressService::new(db.clone()),
+            );
+            context.register_service(cloud_backfill_progress.clone());
+
             // Create the main OTel service
-            let otel_service = Arc::new(OtelService::new(
-                storage.clone(),
-                auth_service,
-                rate_limiter,
-            ));
+            let otel_service = Arc::new({
+                // The service writes and reads through the **routed** storage
+                // so every consumer sees one view; the ingest path never calls
+                // `store_spans` for a Cloud-primary project anyway (ADR-041 §2).
+                let mut service = OtelService::new(
+                    storage.clone(),
+                    auth_service,
+                    rate_limiter,
+                    config.max_concurrent_ingest_requests,
+                )
+                .with_cloud_link(context.require_service::<temps_cloud_client::CloudLink>())
+                .with_cloud_policy_cache(cloud_policy_cache.clone())
+                .with_write_mode_service(telemetry_write_modes.clone());
+                if let Some(outbox) = span_outbox.clone() {
+                    service = service.with_span_outbox(outbox);
+                }
+                if let Some(outbox) = metric_outbox.clone() {
+                    service = service.with_metric_outbox(outbox);
+                }
+                service
+            });
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
             // contract so read-only consumers (e.g. the AI debugging chat in
@@ -474,13 +911,31 @@ impl TempsPlugin for OtelPlugin {
             // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
             //
             // A bounded mpsc channel (capacity 1,000) decouples span ingest
-            // latency from the Postgres hint write.  When the channel is full,
+            // latency from the hint write.  When the channel is full,
             // `do_ingest_traces` drops the hint (non-blocking try_send) and
             // warns.  The background consumer below drains the channel and
-            // calls `record_hint`, which issues a single multi-row
-            // `INSERT … ON CONFLICT DO NOTHING`.
+            // calls `record_hint`, which routes through the active storage
+            // backend: a multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+            // Postgres control table, or a batched insert into the compressed
+            // ClickHouse `cross_project_trace_refs` table when CH is enabled.
             let (trace_hint_tx, mut trace_hint_rx) =
                 tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
+
+            // ── OtelRelay extension point ────────────────────────────────────
+            //
+            // Slot defaults to NoopOtelRelay; a plugin (e.g. one implementing
+            // OTLP batch forwarding) is wired in later from
+            // `initialize_plugin_services` — see `relay_slot` field doc for
+            // why a direct `get_service` call here would never find it.
+            let relay_slot = Arc::new(crate::relay::OtelRelaySlot::new_default());
+            let _ = self.relay_slot.set(relay_slot.clone());
+
+            // Count- and byte-bounded handoff for fire-and-forget relay of
+            // decoded OTLP batches. Ingest handlers never wait for capacity.
+            let (otel_relay_tx, mut otel_relay_rx) = crate::relay::bounded_relay_queue(
+                crate::relay::RELAY_QUEUE_MAX_BATCHES,
+                config.memory_profile.relay_queue_max_bytes,
+            );
 
             let cross_project_service =
                 Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
@@ -493,6 +948,43 @@ impl TempsPlugin for OtelPlugin {
             let metric_alert_service =
                 Arc::new(crate::services::MetricAlertService::new(db.clone()));
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
+            // ── Facet service ────────────────────────────────────────────────
+            //
+            // Obtain a ClickHouse client for DDL mutations (backfill/clear).
+            // When CH is not configured, `ch_client_for_facets` is None and
+            // create/delete operations warn and skip the mutation step.
+            let ch_client_for_facets: Option<::clickhouse::Client> = {
+                let ch_cfg = read_clickhouse_otel_config_from_env();
+                ch_cfg.map(|cfg| {
+                    ::clickhouse::Client::default()
+                        .with_url(&cfg.url)
+                        .with_database(&cfg.database)
+                        .with_user(&cfg.user)
+                        .with_password(&cfg.password)
+                })
+            };
+            let facet_service = Arc::new(
+                FacetService::new(db.clone(), ch_client_for_facets, facet_cache.clone())
+                    // ADR-041 §8: facets are slot columns on the *local* span
+                    // table and Cloud has no counterpart, so registering one for
+                    // a Cloud-primary project would consume a shared slot and
+                    // populate nothing. This is what lets the service refuse
+                    // with a reason and a setup path instead.
+                    .with_write_mode_service(telemetry_write_modes.clone()),
+            );
+            // Load initial facet→slot mapping from Postgres into the shared cache.
+            // Non-fatal: if Postgres is unavailable at startup, the cache stays
+            // empty and facet filtering falls back to JSONExtractString.
+            if let Err(e) = facet_service.refresh_cache().await {
+                warn!(
+                    error = %e,
+                    "Failed to load initial OTel facet cache from Postgres; \
+                     facet-accelerated filtering will not be available until the next successful \
+                     create/delete or server restart"
+                );
+            }
+            context.register_service(facet_service.clone());
 
             // 5. Metric alert evaluator
             //
@@ -537,21 +1029,313 @@ impl TempsPlugin for OtelPlugin {
                 ))
             };
 
+            // ── ADR-042 §8/§9: bulk Cloud activation state ────────────────
+            //
+            // Registered unconditionally so P2's endpoints and P3's enroll hook
+            // have a service to call, and so an instance can *read* a job's
+            // history whether or not a link exists today. The worker below is
+            // the part that needs a link.
+            let bulk_activation =
+                Arc::new(crate::services::CloudBulkActivationService::new(db.clone()));
+            context.register_service(bulk_activation.clone());
+
+            // The span source an activation estimate reads history from, and
+            // the one its worker ships from — built once and shared, so a quote
+            // and the shipment it authorizes can never disagree about which
+            // table holds the history. Reading an empty `otel_spans` on a
+            // ClickHouse instance would quote "0 spans" and look like success.
+            //
+            // Only with a Cloud link: without one there is nowhere to activate
+            // to, and the estimate endpoint answers `configured: false`.
+            let cloud_backfill_source = cloud_link.as_ref().map(|_| {
+                Arc::new(match read_clickhouse_otel_config_from_env() {
+                    Some(cfg) => crate::services::CloudBackfillSource::ClickHouse(Arc::new(
+                        ::clickhouse::Client::default()
+                            .with_url(&cfg.url)
+                            .with_database(&cfg.database)
+                            .with_user(&cfg.user)
+                            .with_password(&cfg.password),
+                    )),
+                    None => crate::services::CloudBackfillSource::Timescale(db.clone()),
+                })
+            });
+
+            // ── ADR-042 P3: the purchase-triggered activation seam ────────
+            //
+            // Registered as `Arc<dyn CloudTelemetryActivationTrigger>` so
+            // `POST /cloud/enroll` can start the activation the customer just
+            // paid for without `temps-cloud` depending on this crate. Registered
+            // only alongside a link and a span source, which is exactly when
+            // there is somewhere to activate to and something to ship — with
+            // neither, enroll behaves precisely as it did before, which is what
+            // ADR-042's enroll-path coupling risk requires.
+            //
+            // This is the **only** registration of the purchase path. There is
+            // no HTTP route for it: the sole caller is enrollment itself
+            // (ADR-042 §9), and the operator path keeps its `plan_token` gate.
+            if let (Some(link), Some(source)) = (cloud_link.clone(), cloud_backfill_source.clone())
+            {
+                let trigger = Arc::new(crate::services::PurchaseActivationTrigger::new(
+                    bulk_activation.clone(),
+                    telemetry_write_modes.clone(),
+                    cloud_policy_cache.clone(),
+                    link,
+                    source,
+                    // The same "everything local storage holds" the operator
+                    // path defaults to, from one place, so the two cannot
+                    // disagree about how far back an activation reaches.
+                    crate::handlers::cloud_telemetry_handler::local_retention_days(),
+                ));
+                context.register_service(
+                    trigger as Arc<dyn temps_core::CloudTelemetryActivationTrigger>,
+                );
+            }
+
+            // The `plan_token` signing key (ADR-042 §9). Its own `derive_subkey`
+            // domain, so a signature minted for an activation plan can never be
+            // confused with any other HMAC on this instance.
+            let plan_signing_key = Arc::new(
+                context
+                    .require_service::<temps_core::EncryptionService>()
+                    .derive_subkey(crate::services::PLAN_TOKEN_KEY_DOMAIN),
+            );
+
             // Create app state for handlers. The `project_access_checker` is
             // injected in `configure_routes` (after all services register).
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
                 metrics_write_tx: Some(metrics_write_tx),
+                facet_service: facet_service.clone(),
                 dashboard_service: dashboard_service.clone(),
                 metric_alert_service: metric_alert_service.clone(),
                 metric_alert_evaluator: metric_alert_evaluator.clone(),
                 audit_service: audit_service.clone(),
                 trace_hint_tx: Some(trace_hint_tx),
                 cross_project_service: cross_project_service.clone(),
+                otel_relay_tx: Some(otel_relay_tx),
                 project_access_checker: None,
+                cloud_backfill_progress: cloud_backfill_progress.clone(),
+                telemetry_write_modes: telemetry_write_modes.clone(),
+                cloud_link: cloud_link.clone(),
+                bulk_activation: bulk_activation.clone(),
+                cloud_backfill_source: cloud_backfill_source.clone(),
+                plan_signing_key,
             };
             context.register_service(Arc::new(app_state.clone()));
+
+            // ── ADR-041 §3b/§7c: the Cloud-primary outbox worker ──────────
+            //
+            // Spawned alongside — never instead of — the mirror flusher. The
+            // two serve different projects: the flusher drains the in-memory
+            // spool for `Local`-mode projects at its 15-second cadence, and
+            // this drains the durable queue until idle for Cloud-primary ones.
+            if let (Some(outbox), Some(link)) = (span_outbox.clone(), cloud_link.clone()) {
+                // The link needs to be able to hand Cloud-primary projects back
+                // to local storage when it goes away. Registered before the
+                // worker starts so a disconnect during startup is still handled.
+                let spiller = outbox_spiller.clone().unwrap_or_else(|| {
+                    // Unreachable in practice — the spiller is built from the
+                    // same `Some(outbox)` this branch matched on — but building
+                    // a second one is strictly better than an `expect` on a
+                    // startup path.
+                    Arc::new(crate::services::OutboxSpiller::new(
+                        outbox.clone(),
+                        local_storage.clone(),
+                    ))
+                });
+                link.set_telemetry_fallback(Arc::new(
+                    crate::services::CloudPrimaryFallback::with_spiller(
+                        telemetry_write_modes.clone(),
+                        outbox.clone(),
+                        spiller,
+                        link.clone(),
+                    ),
+                ));
+
+                let cap_source: Option<Arc<dyn temps_cloud_client::OutboxCapSource>> = context
+                    .get_service::<temps_config::ConfigService>()
+                    .map(|config| {
+                        Arc::new(SettingsOutboxCap { config })
+                            as Arc<dyn temps_cloud_client::OutboxCapSource>
+                    });
+
+                // ADR-041 §7b: the worker moves rows and knows nothing about
+                // projects. This is what turns a `QuotaExhausted` acceptance
+                // into a ledger entry and a resumption of local span writes.
+                let observer: Arc<dyn temps_cloud_client::DrainObserver> =
+                    Arc::new(crate::services::CloudWriteSuspensionObserver::new(
+                        telemetry_write_modes.clone(),
+                    ));
+
+                let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                let worker_link = link.clone();
+                let worker_outbox = outbox.clone();
+                tokio::spawn(async move {
+                    // The sender is moved into the task so it lives exactly as
+                    // long as the loop that reads it. Dropping it out here would
+                    // signal an immediate shutdown; forgetting it would leak.
+                    // This background task is process-lifetime, like the
+                    // retention loop below.
+                    let _cancel = cancel;
+                    temps_cloud_client::outbox_worker::run(
+                        worker_link,
+                        worker_outbox,
+                        cap_source,
+                        Some(observer),
+                        cancel_rx,
+                    )
+                    .await;
+                });
+            }
+
+            // ── ADR-043 §2b/§4: the Cloud-primary metric outbox worker ─────
+            //
+            // Sibling of the span outbox worker above, not a replacement —
+            // spans and metrics have independent write-mode switches
+            // (`cloud_telemetry_write_mode` vs `cloud_analytics_write_mode`)
+            // and independent outbox rows (`entity_type = 'metric'`), so they
+            // drain on independent loops. The concrete insert logic lives in
+            // `temps-otel` (see `storage::cloud_metrics`) rather than
+            // `temps_cloud_client::outbox_worker` because shipping a metric
+            // batch needs the concrete `CloudMetricRow` type that
+            // `temps-cloud-client` cannot depend on without creating a
+            // circular crate dependency.
+            if let (Some(outbox), Some(link)) = (metric_outbox.clone(), cloud_link.clone()) {
+                let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                let worker_link = link.clone();
+                let worker_outbox = outbox.clone();
+                tokio::spawn(async move {
+                    let _cancel = cancel;
+                    crate::storage::run_metric_outbox_worker(worker_link, worker_outbox, cancel_rx)
+                        .await;
+                });
+            }
+
+            // ── ADR-042 §2: the bulk Cloud activation worker ───────────────
+            //
+            // Spawned alongside — never instead of — the outbox worker above.
+            // The two never overlap on the wire: the link hands out one
+            // submission scope at a time, globally (ADR-042 P0), so a bulk
+            // backfill and the live Cloud-primary drain interleave between
+            // chunks rather than competing (ADR-042 §3, "the live outbox always
+            // wins").
+            //
+            // Only with a Cloud link: without one there is nowhere to activate
+            // to, and a poll loop that can never find eligible work is pure
+            // cost on a 4 GB box.
+            if let (Some(link), Some(backfill_source)) =
+                (cloud_link.clone(), cloud_backfill_source.clone())
+            {
+                let mut worker = crate::services::CloudBulkActivationWorker::new(
+                    bulk_activation.clone(),
+                    link,
+                    telemetry_write_modes.clone(),
+                    cloud_policy_cache.clone(),
+                    cloud_backfill_progress.clone(),
+                    backfill_source,
+                );
+
+                // ADR-042 §3: `rate_limit_spans_per_sec` lives on the singleton
+                // `settings` row, and the worker re-reads it per project. That
+                // is the whole point of it not being an environment variable —
+                // an operator who finds an activation competing with their own
+                // read IO can throttle it without stopping a job they have
+                // already paid for.
+                if let Some(config) = context.get_service::<temps_config::ConfigService>() {
+                    worker = worker
+                        .with_rate_limits(Arc::new(SettingsBulkRateLimit {
+                            config: config.clone(),
+                        }))
+                        // ADR-042 §6.3: the byte-budget guard, on the same
+                        // runtime-settable footing. Its *absence* is never a
+                        // state the worker can be in — a missing settings
+                        // service leaves the compiled default in place, not "no
+                        // budget" — but wiring it is what lets an operator widen
+                        // a budget that is wrong for their spans without
+                        // stopping an activation they have already paid for.
+                        .with_anomaly_factors(Arc::new(SettingsBulkAnomalyFactor { config }));
+                }
+
+                let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                tokio::spawn(async move {
+                    // Same ownership shape as the outbox worker: the sender
+                    // lives exactly as long as the loop that reads it.
+                    let _cancel = cancel;
+                    crate::services::cloud_bulk_activation_worker::run(worker, cancel_rx).await;
+                });
+            }
+
+            // ── ADR-041 §3a: purge a deleted project's queued telemetry ───
+            //
+            // `cloud_span_outbox` deliberately has no foreign key to `projects`
+            // (a project deleted mid-outage must not wedge the queue), which
+            // also means `ON DELETE CASCADE` does not reach it. Without this,
+            // deleting a project leaves its already-serialized spans queued and
+            // the worker keeps exporting them to Cloud afterwards.
+            //
+            // Spawned whether or not a Cloud link exists: the rows outlive the
+            // link that created them, so an instance that linked, queued spans
+            // and later disconnected still has them on disk and still has to
+            // clean them up.
+            {
+                let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+                let purge_db = db.clone();
+                let purge_outbox = span_outbox.clone();
+                let mut receiver = job_queue.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok(temps_core::Job::ProjectDeleted(job)) => {
+                                match temps_cloud_client::SpanOutbox::purge_project_rows(
+                                    purge_db.as_ref(),
+                                    job.project_id,
+                                )
+                                .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(rows) => {
+                                        info!(
+                                            project_id = job.project_id,
+                                            rows,
+                                            "Removed queued Temps Cloud telemetry for a deleted \
+                                             project"
+                                        );
+                                        // Free the byte cap immediately rather
+                                        // than waiting for the worker's next
+                                        // idle resync.
+                                        if let Some(outbox) = purge_outbox.as_ref() {
+                                            if let Err(e) = outbox.resync().await {
+                                                debug!(
+                                                    error = %e,
+                                                    "Could not re-read the Cloud telemetry queue \
+                                                     size after purging a deleted project"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => error!(
+                                        project_id = job.project_id,
+                                        error = %e,
+                                        "Failed to remove queued Temps Cloud telemetry for a \
+                                         deleted project; the rows are skipped by the shipping \
+                                         worker and will be swept on its next idle cycle"
+                                    ),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "Cloud telemetry outbox purge listener lost its job \
+                                     subscription; retrying"
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                });
+            }
 
             // ── Background Tasks ────────────────────────────────────
 
@@ -580,6 +1364,34 @@ impl TempsPlugin for OtelPlugin {
                     if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
+                }
+            });
+
+            // 1a2. Facet backfill/clear poller.
+            //
+            // Advances every non-terminal facet (pending/running/deleting) by
+            // one bounded unit of work per tick — see
+            // `FacetService::advance_pending_facets` for why this is a poller
+            // rather than a task spawned from the create/delete HTTP handlers
+            // (a handler-spawned task's progress would be lost on a process
+            // restart; this poller's progress lives entirely in the
+            // `otel_span_facets` row, so a restart just resumes).
+            //
+            // 5s keeps facet creation feeling responsive (an admin pinning an
+            // attribute sees `running` within a few seconds) without adding
+            // meaningful load: each tick is a handful of cheap Postgres/CH
+            // status queries plus at most one bounded batch/mutation per
+            // in-flight facet, and there are at most 20 facets ever (one per
+            // slot).
+            const FACET_POLL_INTERVAL_SECS: u64 = 5;
+            let facet_poller_service = facet_service.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(FACET_POLL_INTERVAL_SECS));
+                interval.tick().await; // discard the immediate first tick
+                loop {
+                    interval.tick().await;
+                    facet_poller_service.advance_pending_facets().await;
                 }
             });
 
@@ -624,8 +1436,183 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
-            //     older than 90 days (matching the OTel span TTL on both backends).
+            // 1c-relay. Background consumer for the OtelRelay extension point.
+            //
+            // Drains `otel_relay_rx` and calls `relay_slot.relay(msg)` for
+            // each batch, dispatching to whichever `OtelRelay` implementation
+            // was registered by a plugin (NoopOtelRelay when none registered).
+            // Errors are not possible here (relay is infallible by contract).
+            // The task exits cleanly when all senders drop.
+            {
+                tokio::spawn(async move {
+                    info!("OTel relay consumer started");
+                    while let Some(msg) = otel_relay_rx.recv().await {
+                        relay_slot.relay(msg).await;
+                    }
+                    info!("OTel relay consumer stopped (channel closed)");
+                });
+            }
+
+            // 1c-stats. Background sampler: OTel pipeline stats → MetricsStore.
+            //
+            // Reads `otel_service.pipeline_stats()` every 60 seconds, computes
+            // the delta since the previous sample, and writes one counter point
+            // per field to the unified MetricsStore (SourceKind::Node, node_id 0):
+            //
+            //   otel.rate_limited_requests   — ingest rejections from the rate limiter
+            //   otel.quota_exceeded_requests — ingest rejections from quota enforcement
+            //   otel.metrics_received / _stored / _dropped
+            //   otel.spans_received   / _stored / _dropped
+            //   otel.logs_received    / _stored_db / _stored_s3 / _dropped
+            //   otel.ingest_errors    — storage writes that failed after retries
+            //
+            // The received/stored/dropped triplets are what make a data-loss
+            // incident visible: `dropped > 0` (or `received - stored` drifting)
+            // is the signal that batches are being thrown away, which was
+            // previously only observable by reading the process's own logs.
+            //
+            // Using delta values (not cumulative) matches the proxy metrics sampler
+            // pattern: each store point represents "events in the last N seconds"
+            // so the AlertEvaluator threshold (e.g. "> 10") is intuitive to an
+            // operator ("more than 10 dropped spans this sample window").
+            //
+            // The 60-second interval is independent of `monitoring.scrape_interval_secs`
+            // because the pipeline stats are process-internal counters rather than
+            // externally-scraped ones; re-reading the config each cycle would add an
+            // unnecessary DB round-trip on an ingest-hot path.
+            //
+            // Every cycle writes every point, even when the delta is zero. The
+            // AlertEvaluator's `query_latest` only looks back 15 minutes
+            // (`LATEST_WINDOW`), so if a burst of drops is followed by
+            // silence, skipping the zero-delta write would leave that burst's
+            // non-zero point as the "latest" value for up to 15 minutes,
+            // keeping the alarm falsely active. Always writing — including
+            // zeros — lets the metric self-resolve on the next cycle, exactly
+            // like the proxy sampler's fixed-size point set does. The storage
+            // cost is a fixed 18 rows per minute (15 counters plus three
+            // resource-limit gauges) regardless of ingest volume.
+            {
+                let stats_otel_service = otel_service.clone();
+                let stats_metrics_store = metrics_store.clone();
+                let stats_memory_profile = config.memory_profile;
+                let stats_ingest_limit = config.max_concurrent_ingest_requests;
+                tokio::spawn(async move {
+                    use chrono::Utc;
+                    use std::collections::HashMap;
+                    use temps_metrics::{MetricKind, MetricPoint, SourceKind};
+
+                    info!(
+                        "OTel pipeline stats sampler started (interval={}s)",
+                        OTEL_STATS_SAMPLE_INTERVAL_SECS
+                    );
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(OTEL_STATS_SAMPLE_INTERVAL_SECS));
+                    interval.tick().await; // discard the immediate first tick
+
+                    // Previous-cycle checkpoint for every sampled counter. Held
+                    // in one struct so `PipelineStats` and the checkpoints can
+                    // never drift apart field-by-field.
+                    let mut prev = crate::types::PipelineStats::default();
+
+                    loop {
+                        interval.tick().await;
+                        let snap = stats_otel_service.pipeline_stats();
+
+                        let deltas = pipeline_stat_deltas(&snap, &prev);
+
+                        let now = Utc::now();
+                        let mut points: Vec<MetricPoint> = deltas
+                            .iter()
+                            .map(|(name, delta)| MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: (*name).to_string(),
+                                value: *delta as f64,
+                                kind: MetricKind::Counter,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            })
+                            .collect();
+                        points.extend([
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.effective_memory_limit_bytes".to_string(),
+                                value: stats_memory_profile.effective_memory_bytes as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.ingest_concurrency_limit".to_string(),
+                                value: stats_ingest_limit as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.relay_buffer_limit_bytes".to_string(),
+                                value: stats_memory_profile.relay_queue_max_bytes as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                        ]);
+                        let point_count = points.len();
+
+                        // Only advance the checkpoints once the write actually lands.
+                        // Advancing them unconditionally would discard this cycle's
+                        // deltas forever on a transient store failure; leaving them
+                        // in place means the next successful write's delta widens to
+                        // cover the missed cycle too, so no rejection is lost from
+                        // the series.
+                        if let Err(e) = stats_metrics_store.write_batch(points).await {
+                            warn!(
+                                error = %e,
+                                "OTel pipeline stats write failed (non-fatal); \
+                                 checkpoints held back so the next successful write \
+                                 includes this cycle's deltas"
+                            );
+                        } else {
+                            let spans_dropped =
+                                snap.spans_dropped.saturating_sub(prev.spans_dropped);
+                            let ingest_errors =
+                                snap.ingest_errors.saturating_sub(prev.ingest_errors);
+                            prev = snap;
+                            debug!(
+                                points = point_count,
+                                spans_dropped,
+                                ingest_errors,
+                                "OTel pipeline stats sampled and written"
+                            );
+                        }
+                    }
+                });
+            }
+
+            // 1d. ADR-027 Phase 0: daily prune of POSTGRES cross_project_trace_refs
+            //     rows older than 90 days (matching the OTel span TTL on both
+            //     backends). Runs unconditionally: on the TimescaleDB backend it
+            //     is the retention mechanism; on the ClickHouse backend (where
+            //     new refs expire via native per-row TTL) it drains the legacy
+            //     Postgres rows written before the cutover and becomes a no-op
+            //     after one retention window.
             //
             // Deliberately uses a periodic tokio::spawn loop rather than a
             // Job enum variant to keep the scheduler dependency minimal.
@@ -716,6 +1703,24 @@ impl TempsPlugin for OtelPlugin {
                     }
                 }
             }
+
+            // Wire in an optional OtelRelay implementation registered by a
+            // plugin. When no plugin registers one, the slot stays loaded with
+            // NoopOtelRelay and the relay background consumer is a cheap no-op.
+            if let Some(slot) = self.relay_slot.get() {
+                if let Some(relay) = context.get_service::<dyn crate::relay::OtelRelay>() {
+                    if slot.set(relay) {
+                        debug!("otel: OtelRelay wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "otel: OtelRelay slot was already claimed; \
+                             this plugin's relay was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+
             Ok(())
         })
     }
@@ -726,6 +1731,14 @@ impl TempsPlugin for OtelPlugin {
         app_state.project_access_checker =
             context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
+        // Same checker feeds the `tk_`-key ingest auth path, so team-based
+        // project access is enforced on writes exactly as on reads.
+        if let Some(checker) = app_state.project_access_checker.clone() {
+            context
+                .require_service::<OtelAuthService>()
+                .set_project_access_checker(checker);
+        }
+
         let router = handlers::configure_routes().with_state(app_state);
 
         Some(PluginRoutes::new(router))
@@ -733,6 +1746,94 @@ impl TempsPlugin for OtelPlugin {
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
+    }
+}
+
+/// The Cloud-primary telemetry outbox's byte cap, from the singleton `settings`
+/// row (ADR-041 §3d).
+///
+/// **Deliberately not an environment variable.** CLAUDE.md forbids new
+/// environment variables for configuration, and this one in particular is a
+/// value the operator needs to change *while watching a queue fill up* — which
+/// is exactly when restarting the binary is the worst available option.
+///
+/// A read failure falls back to the compiled default rather than to "no limit":
+/// an unbounded queue on a 4 GB box is an outage, and a default cap that is
+/// briefly wrong is visible in the same status view that shows the depth.
+async fn read_outbox_cap(config: &Arc<temps_config::ConfigService>) -> u64 {
+    match config.get_settings().await {
+        Ok(settings) => settings.cloud.effective_outbox_max_bytes(),
+        Err(error) => {
+            warn!(
+                %error,
+                default_bytes = temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                "Could not read the Cloud telemetry outbox byte cap from settings; \
+                 using the default until the next refresh"
+            );
+            temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
+        }
+    }
+}
+
+/// Feeds the outbox worker the current cap so a change takes effect without a
+/// restart.
+struct SettingsOutboxCap {
+    config: Arc<temps_config::ConfigService>,
+}
+
+#[async_trait::async_trait]
+impl temps_cloud_client::OutboxCapSource for SettingsOutboxCap {
+    async fn outbox_max_bytes(&self) -> Option<u64> {
+        // `None` on failure keeps whatever cap the worker already has. Silently
+        // widening or narrowing a data-loss boundary because a database read
+        // blipped would be worse than being briefly stale.
+        self.config
+            .get_settings()
+            .await
+            .ok()
+            .map(|settings| settings.cloud.effective_outbox_max_bytes())
+    }
+}
+
+/// ADR-042 §3's bulk-activation throttle, read from the singleton `settings`
+/// row each time the worker picks up a project.
+struct SettingsBulkRateLimit {
+    config: Arc<temps_config::ConfigService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::BulkRateLimitSource for SettingsBulkRateLimit {
+    async fn bulk_rate_limit_spans_per_sec(&self) -> Option<u32> {
+        // A failed read yields `None`, which the worker treats as "unthrottled"
+        // — the same answer a fresh instance gives. Inventing a throttle
+        // because a database read blipped would silently change how fast the
+        // customer's money is being spent.
+        self.config
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|settings| settings.cloud.effective_bulk_rate_limit_spans_per_sec())
+    }
+}
+
+/// ADR-042 §6.3's byte-budget anomaly factor, read from the singleton `settings`
+/// row each time the worker picks up a project.
+struct SettingsBulkAnomalyFactor {
+    config: Arc<temps_config::ConfigService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::BulkAnomalyFactorSource for SettingsBulkAnomalyFactor {
+    async fn bulk_anomaly_factor(&self) -> Option<f32> {
+        // `None` means "could not read", and the worker answers that by keeping
+        // its configured factor. It must never mean "no guard": a database blip
+        // is not consent to spend without a budget on a path that has no human
+        // confirm behind it.
+        self.config
+            .get_settings()
+            .await
+            .ok()
+            .map(|settings| settings.cloud.effective_bulk_anomaly_factor())
     }
 }
 
@@ -788,6 +1889,129 @@ mod tests {
         assert_eq!(plugin.name(), "otel");
     }
 
+    // ── Pipeline-stats sampler ──────────────────────────────────────────
+
+    /// Every counter in `PipelineStats` must get a series; a field added to
+    /// the struct without a matching entry here is a metric that silently
+    /// never gets published.
+    #[test]
+    fn test_pipeline_stat_deltas_covers_every_counter() {
+        let zero = crate::types::PipelineStats::default();
+        let snap = crate::types::PipelineStats {
+            metrics_received: 1,
+            metrics_stored: 2,
+            metrics_dropped: 3,
+            spans_received: 4,
+            spans_stored: 5,
+            spans_dropped: 6,
+            logs_received: 7,
+            logs_stored_db: 8,
+            logs_stored_s3: 9,
+            logs_dropped: 10,
+            ingest_errors: 11,
+            rate_limited_requests: 12,
+            quota_exceeded_requests: 13,
+            relay_dropped_batches: 14,
+            relay_dropped_items: 15,
+        };
+
+        let deltas = pipeline_stat_deltas(&snap, &zero);
+        assert_eq!(deltas.len(), OTEL_PIPELINE_STAT_COUNT);
+
+        let by_name: std::collections::HashMap<&str, u64> = deltas.iter().copied().collect();
+        assert_eq!(by_name.len(), OTEL_PIPELINE_STAT_COUNT, "duplicate names");
+        assert_eq!(by_name["otel.metrics_received"], 1);
+        assert_eq!(by_name["otel.metrics_stored"], 2);
+        assert_eq!(by_name["otel.metrics_dropped"], 3);
+        assert_eq!(by_name["otel.spans_received"], 4);
+        assert_eq!(by_name["otel.spans_stored"], 5);
+        assert_eq!(by_name["otel.spans_dropped"], 6);
+        assert_eq!(by_name["otel.logs_received"], 7);
+        assert_eq!(by_name["otel.logs_stored_db"], 8);
+        assert_eq!(by_name["otel.logs_stored_s3"], 9);
+        assert_eq!(by_name["otel.logs_dropped"], 10);
+        assert_eq!(by_name["otel.ingest_errors"], 11);
+        assert_eq!(by_name["otel.rate_limited_requests"], 12);
+        assert_eq!(by_name["otel.quota_exceeded_requests"], 13);
+        assert_eq!(by_name["otel.relay_dropped_batches"], 14);
+        assert_eq!(by_name["otel.relay_dropped_items"], 15);
+    }
+
+    /// The writer's names and the reader's published list must be identical,
+    /// in the same order. If this fails, the sampler is writing a series the
+    /// history endpoint will never chart (or vice versa) — silently.
+    #[test]
+    fn test_pipeline_stat_deltas_match_metric_names() {
+        let zero = crate::types::PipelineStats::default();
+        let written: Vec<&str> = pipeline_stat_deltas(&zero, &zero)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(written, OTEL_PIPELINE_METRIC_NAMES.to_vec());
+    }
+
+    /// Names must all share the existing `otel.` prefix so the series sit
+    /// together in the metric picker alongside the two originals.
+    #[test]
+    fn test_pipeline_stat_delta_names_share_the_otel_prefix() {
+        let zero = crate::types::PipelineStats::default();
+        for (name, _) in pipeline_stat_deltas(&zero, &zero) {
+            assert!(name.starts_with("otel."), "unprefixed metric name: {name}");
+        }
+    }
+
+    /// Deltas are relative to the previous checkpoint, not cumulative.
+    #[test]
+    fn test_pipeline_stat_deltas_are_relative_to_checkpoint() {
+        let prev = crate::types::PipelineStats {
+            spans_received: 100,
+            spans_dropped: 10,
+            ..Default::default()
+        };
+        let snap = crate::types::PipelineStats {
+            spans_received: 175,
+            spans_dropped: 12,
+            ..Default::default()
+        };
+
+        let by_name: std::collections::HashMap<&str, u64> =
+            pipeline_stat_deltas(&snap, &prev).iter().copied().collect();
+        assert_eq!(by_name["otel.spans_received"], 75);
+        assert_eq!(by_name["otel.spans_dropped"], 2);
+    }
+
+    /// A quiet window must still produce a full set of zero-valued points so
+    /// the AlertEvaluator's 15-minute lookback can self-resolve rather than
+    /// keeping a stale burst as the "latest" value.
+    #[test]
+    fn test_pipeline_stat_deltas_emit_zeros_when_idle() {
+        let snap = crate::types::PipelineStats {
+            spans_received: 500,
+            spans_stored: 500,
+            ..Default::default()
+        };
+        let deltas = pipeline_stat_deltas(&snap, &snap);
+        assert_eq!(deltas.len(), OTEL_PIPELINE_STAT_COUNT);
+        assert!(deltas.iter().all(|(_, delta)| *delta == 0));
+    }
+
+    /// A process restart zeroes the atomics while the checkpoint still holds
+    /// the pre-restart totals; that must clamp to 0, never underflow.
+    #[test]
+    fn test_pipeline_stat_deltas_clamp_on_counter_reset() {
+        let prev = crate::types::PipelineStats {
+            spans_received: 9_000,
+            ingest_errors: 42,
+            ..Default::default()
+        };
+        let snap = crate::types::PipelineStats::default();
+
+        let by_name: std::collections::HashMap<&str, u64> =
+            pipeline_stat_deltas(&snap, &prev).iter().copied().collect();
+        assert_eq!(by_name["otel.spans_received"], 0);
+        assert_eq!(by_name["otel.ingest_errors"], 0);
+    }
+
     #[test]
     fn test_otel_plugin_default() {
         let plugin = OtelPlugin::default();
@@ -804,6 +2028,41 @@ mod tests {
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);
+        assert_eq!(
+            config.max_concurrent_ingest_requests,
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_accepts_positive_integers() {
+        assert_eq!(parse_max_concurrent_ingest_requests("1"), Some(1));
+        assert_eq!(parse_max_concurrent_ingest_requests("128"), Some(128));
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_zero_and_garbage() {
+        assert_eq!(parse_max_concurrent_ingest_requests("0"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("-1"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("not-a-number"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests(""), None);
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_values_above_semaphore_max() {
+        // A value that parses as `usize` but exceeds `Semaphore::MAX_PERMITS`
+        // must fall back to the default rather than panicking `Semaphore::new`
+        // at startup — the regression this fix targets.
+        let too_large = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+        assert_eq!(parse_max_concurrent_ingest_requests(&too_large), None);
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&usize::MAX.to_string()),
+            None
+        );
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+            Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]

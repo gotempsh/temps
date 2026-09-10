@@ -1,8 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-node DNS resolver for the internal `*.temps.local` zone (ADR-011).
 //!
-//! Embedded in `temps-agent`. Listens on the bridge gateway IP (so every
-//! container on the node sees it as their first nameserver) and on
-//! `127.0.0.53` (so the host itself can `dig` for debugging).
+//! Embedded in `temps-agent`. Listens only on the bridge gateway IP so every
+//! container on the node sees it as its first nameserver without competing
+//! with host-local DNS stubs such as `systemd-resolved` on `127.0.0.53`.
+//! Operators can query the bridge address explicitly when debugging.
 //!
 //! The resolver is fully decoupled from the control plane's database. It:
 //!
@@ -29,9 +33,9 @@ pub mod zone_store;
 
 pub use config::ResolverConfig;
 pub use error::ResolverError;
-pub use handle::ResolverHandle;
+pub use handle::{ResolverHandle, ResolverStatus};
 pub use record::{OwnerKind, RecordKind, ZoneRecord};
-pub use sync_client::SyncClient;
+pub use sync_client::{SyncClient, SyncStatus};
 pub use zone_store::ZoneStore;
 
 pub type Result<T> = std::result::Result<T, ResolverError>;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, FromJsonQueryResult};
@@ -90,6 +93,19 @@ pub struct DeploymentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_bundle_content_type: Option<String>,
 
+    /// Uploaded source archive ID. Source archives are extracted before the
+    /// regular preset build pipeline and do not require Git metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_id: Option<i32>,
+
+    /// Uploaded source archive path in the Temps data directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_path: Option<String>,
+
+    /// Uploaded source archive content type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_content_type: Option<String>,
+
     /// Source type for THIS specific deployment (for Manual/flexible projects)
     /// This allows Manual projects to have deployments via different methods
     /// (docker_image, static_files, or git) while keeping per-deployment tracking
@@ -112,6 +128,12 @@ pub struct DeploymentMetadata {
     /// priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_path: Option<String>,
+
+    /// Command passed to a prebuilt image entrypoint. Stored in deployment
+    /// metadata so redeploy, rollback, and node failover reproduce the exact
+    /// workload rather than falling back to the image default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]

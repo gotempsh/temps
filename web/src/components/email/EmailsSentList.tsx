@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -8,11 +11,9 @@ import {
   type EmailStatsResponse,
   type PaginatedEmailsResponse,
 } from '@/api/client'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
-import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -32,7 +33,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
-  AlertCircle,
+  AlertTriangle,
   Archive,
   CheckCircle2,
   ChevronLeft,
@@ -42,25 +43,16 @@ import {
   Mail,
   MailX,
   MousePointerClick,
-  Search,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
+import { StatusBadge } from './shared'
+import { problemMessage } from './sharedUtils'
 
 // Types (aliases over SDK)
 type PaginatedEmails = PaginatedEmailsResponse
 type EmailStats = EmailStatsResponse
 type EmailDomain = EmailDomainResponse
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
 
 async function fetchEmails(params: {
   domain_id?: number
@@ -91,41 +83,6 @@ async function listEmailDomains(): Promise<EmailDomain[]> {
     throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
   }
   return response.data ?? []
-}
-
-function StatusBadge({ status }: { status: string }) {
-  switch (status) {
-    case 'sent':
-      return (
-        <Badge variant="default" className="gap-1">
-          <CheckCircle2 className="h-3 w-3" />
-          Sent
-        </Badge>
-      )
-    case 'queued':
-      return (
-        <Badge variant="secondary" className="gap-1">
-          <Clock className="h-3 w-3" />
-          Queued
-        </Badge>
-      )
-    case 'failed':
-      return (
-        <Badge variant="destructive" className="gap-1">
-          <AlertCircle className="h-3 w-3" />
-          Failed
-        </Badge>
-      )
-    case 'captured':
-      return (
-        <Badge variant="outline" className="gap-1 border-blue-500 text-blue-600">
-          <Archive className="h-3 w-3" />
-          Captured
-        </Badge>
-      )
-    default:
-      return <Badge variant="outline">{status}</Badge>
-  }
 }
 
 function StatsCard({
@@ -231,7 +188,7 @@ export function EmailsSentList() {
 
       {/* Stats Cards */}
       {stats && (
-        <div className="grid gap-4 md:grid-cols-5">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-7">
           <StatsCard
             title="Total Emails"
             value={stats.total}
@@ -257,6 +214,18 @@ export function EmailsSentList() {
             description="Pending delivery"
           />
           <StatsCard
+            title="Sending"
+            value={stats.sending}
+            icon={Clock}
+            description="Provider request active"
+          />
+          <StatsCard
+            title="Unknown"
+            value={stats.delivery_unknown}
+            icon={AlertTriangle}
+            description="Needs manual review"
+          />
+          <StatsCard
             title="Failed"
             value={stats.failed}
             icon={MailX}
@@ -266,17 +235,7 @@ export function EmailsSentList() {
       )}
 
       {/* Filters */}
-      <div className="flex flex-col sm:flex-row gap-4">
-        <div className="flex-1">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              placeholder="Search emails..."
-              className="pl-9"
-              disabled
-            />
-          </div>
-        </div>
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         <Select
           value={filters.domain_id?.toString() ?? 'all'}
           onValueChange={(value) =>
@@ -309,6 +268,8 @@ export function EmailsSentList() {
             <SelectItem value="sent">Sent</SelectItem>
             <SelectItem value="captured">Captured</SelectItem>
             <SelectItem value="queued">Queued</SelectItem>
+            <SelectItem value="sending">Sending</SelectItem>
+            <SelectItem value="delivery_unknown">Delivery unknown</SelectItem>
             <SelectItem value="failed">Failed</SelectItem>
           </SelectContent>
         </Select>

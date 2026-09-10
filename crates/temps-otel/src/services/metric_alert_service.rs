@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for first-class, metric-centric alert rules.
 //!
 //! An alert rule is defined on a *signal* (project + metric + aggregation +
@@ -23,13 +26,13 @@ use temps_entities::metric_alert_rules::{ActiveModel, Column, Entity, Model};
 use crate::detectors::DetectionConfig;
 use crate::error::OtelError;
 
-const MAX_LABEL_FILTERS: usize = 10;
+pub const MAX_LABEL_FILTERS: usize = 10;
 const MAX_LABEL_VALUE_LEN: usize = 500;
 
 /// Max `group_by` keys (ADR-026 Phase 3). More than two is unreadable in the
 /// per-series alarm label and multiplies cardinality; the dashboard tile applies
 /// the same limit (Phase 2).
-const MAX_GROUP_BY_KEYS: usize = 2;
+pub const MAX_GROUP_BY_KEYS: usize = 2;
 
 /// Inclusive bounds on `max_series` (the dynamic-alerting cardinality cap). The
 /// hard upper bound of 100 is the ADR's ceiling on per-rule alarm fan-out.
@@ -52,12 +55,12 @@ pub const ALLOWED_AGGREGATIONS: &[&str] = &[
 pub const ALLOWED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 
 const MAX_NAME_LEN: usize = 200;
-const MAX_METRIC_NAME_LEN: usize = 256;
+pub const MAX_METRIC_NAME_LEN: usize = 256;
 
 /// Validate `label_filters` pairs: at most [`MAX_LABEL_FILTERS`] pairs, each
 /// key passing the OTel metric-name character allowlist `[a-zA-Z0-9_.:-]`, each
 /// value at most [`MAX_LABEL_VALUE_LEN`] characters.
-fn validate_label_filters(filters: &[(String, String)]) -> Result<(), OtelError> {
+pub fn validate_label_filters(filters: &[(String, String)]) -> Result<(), OtelError> {
     if filters.len() > MAX_LABEL_FILTERS {
         return Err(OtelError::Validation {
             message: format!(
@@ -87,7 +90,7 @@ fn validate_label_filters(filters: &[(String, String)]) -> Result<(), OtelError>
 
 /// Validate `group_by` keys: at most [`MAX_GROUP_BY_KEYS`] keys, each passing the
 /// same OTel metric-name character allowlist as `label_filters`.
-fn validate_group_by(group_by: &[String]) -> Result<(), OtelError> {
+pub fn validate_group_by(group_by: &[String]) -> Result<(), OtelError> {
     if group_by.len() > MAX_GROUP_BY_KEYS {
         return Err(OtelError::Validation {
             message: format!(
@@ -148,6 +151,21 @@ fn validate_rule(
     if trimmed_metric.len() > MAX_METRIC_NAME_LEN {
         return Err(OtelError::Validation {
             message: format!("Alert rule metric_name exceeds {MAX_METRIC_NAME_LEN} characters"),
+        });
+    }
+    // Same allowlist the label-filter and group_by keys already use. Length
+    // alone was not enough: `metric_name` is interpolated into the alert
+    // summary prompt (`purpose: alert.summary`), and when the configured
+    // summary provider is an agent CLI that prompt is handed to a host
+    // process. A metric name is a machine identifier, so restricting it to
+    // `[a-zA-Z0-9_.:-]` costs nothing and removes the injection surface
+    // (newlines, quotes and instruction-shaped prose can no longer appear).
+    if temps_metrics::validate_metric_name(trimmed_metric).is_err() {
+        return Err(OtelError::Validation {
+            message: format!(
+                "Alert rule metric_name '{trimmed_metric}' contains characters outside the \
+                 allowed set [a-zA-Z0-9_.:-]"
+            ),
         });
     }
     let agg = aggregation.trim().to_ascii_lowercase();
@@ -545,6 +563,7 @@ mod tests {
         Model {
             id,
             project_id: 7,
+            environment_id: None,
             name: "High latency".to_string(),
             metric_name: "http.server.duration".to_string(),
             aggregation: "p95".to_string(),

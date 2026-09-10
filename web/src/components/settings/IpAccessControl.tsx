@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -50,20 +53,11 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
 const ipAccessControlSchema = z.object({
-  ip_address: z
-    .string()
-    .min(1, 'IP address is required')
-    .refine(
-      (val) => {
-        // Basic IPv4 validation (including CIDR)
-        const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/
-        return ipv4Regex.test(val)
-      },
-      {
-        message:
-          'Invalid IP address format. Use format: 192.168.1.1 or 10.0.0.0/24',
-      }
-    ),
+  // IPv4/IPv6 + CIDR format is validated server-side (temps_proxy's
+  // IpAccessControlService parses via ipnetwork::IpNetwork); a client-side
+  // regex here would either reject valid IPv6 forms or need to reimplement
+  // that parser, so invalid input surfaces via the mutation's error toast.
+  ip_address: z.string().min(1, 'IP address is required'),
   action: z.enum(['block', 'allow'], {
     message: 'Action is required',
   }),
@@ -383,7 +377,7 @@ export function IpAccessControl() {
                   <Label htmlFor="create-ip">IP Address</Label>
                   <Input
                     id="create-ip"
-                    placeholder="192.168.1.1 or 10.0.0.0/24"
+                    placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"
                     {...registerCreate('ip_address')}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
@@ -399,7 +393,7 @@ export function IpAccessControl() {
                     </p>
                   )}
                   <p className="text-xs text-muted-foreground">
-                    Supports IPv4 addresses and CIDR notation
+                    Supports IPv4 and IPv6 addresses, and CIDR notation
                   </p>
                 </div>
 
@@ -481,7 +475,7 @@ export function IpAccessControl() {
                   <Label htmlFor="edit-ip">IP Address</Label>
                   <Input
                     id="edit-ip"
-                    placeholder="192.168.1.1 or 10.0.0.0/24"
+                    placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"
                     {...registerEdit('ip_address')}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — these option/mutation builders are generated from
 // the new /otel/dashboards endpoints (operationIds list_dashboards /
@@ -11,6 +14,7 @@ import {
 // REGEN: OtelDashboardResponse comes from the regenerated types.gen.
 import type { OtelDashboardResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,7 +44,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { StatusDot } from '@/components/metrics/alert-format'
 import {
@@ -115,10 +119,13 @@ export default function Dashboards({ project }: DashboardsProps) {
             Saved metric dashboards for {project.name}.
           </p>
         </div>
-        <Button size="sm" onClick={goToNew} className="gap-1.5 self-start">
-          <Plus className="size-4" />
-          New dashboard
-        </Button>
+        <CreateActionButton
+          size="sm"
+          onClick={goToNew}
+          label="New dashboard"
+          icon={<Plus className="size-4" />}
+          className="gap-1.5 self-start"
+        />
       </div>
 
       {dashboardsQuery.isPending ? (

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getCronByIdOptions,
   getCronExecutionsOptions,
@@ -21,7 +24,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { format } from 'date-fns'
 
 interface CronJobDetailProps {
@@ -29,7 +33,7 @@ interface CronJobDetailProps {
 }
 
 export function CronJobDetail({ project }: CronJobDetailProps) {
-  const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/settings/cron-jobs`)
   const { environmentId, cronId } = useParams<{
     environmentId: string
     cronId: string
@@ -63,7 +67,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>

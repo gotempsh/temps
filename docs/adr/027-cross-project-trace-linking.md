@@ -116,6 +116,15 @@ DELETE FROM cross_project_trace_refs WHERE first_seen < NOW() - INTERVAL '90 day
 
 **Size estimate:** Each row is approximately 50 bytes (32-char hex `trace_id` + `i32` + `timestamptz`). An installation generating one million distinct traces per day across ten projects with a 90-day window accumulates roughly 4.5 million rows — approximately 225 MB on a standard B-tree index. Cross-project propagation requires explicit SDK configuration by developers, so the table will be sparse on most installations. A primary-key lookup on `(trace_id)` plus a single Postgres JOIN is sub-millisecond at this row count; no hash partitioning is required at this scale. If row counts exceed 50 million (approximately 550K distinct cross-project traces per day across a 90-day window), converting to a TimescaleDB hypertable partitioned by `first_seen` is the Phase 3 follow-up.
 
+#### Amendment (2026-07-24) — ClickHouse-backed refs when CH is enabled
+
+The size estimate above did not hold in production: a high-ingest installation accumulated **125 GB** (39 GB heap + 87 GB b-tree) of `cross_project_trace_refs` in three weeks. The tuples themselves are the shape ClickHouse compresses best, so ref storage now routes through the `OtelStorage` trait (`record_trace_refs` / `get_trace_ref_projects`):
+
+- **TimescaleDB backend (default):** unchanged — Postgres control table, daily prune.
+- **ClickHouse backend:** refs are written to a CH `cross_project_trace_refs` table (`0006_trace_refs.sql`), `ORDER BY (trace_id, project_id)` — the key order the `spans` table cannot serve — with `ReplacingMergeTree` over an *inverted* `_version` so first-write-wins/`first_seen` semantics survive merges. Per-row `retention_days` is stamped from the same `RetentionTable::Spans` resolver value as span rows, keeping ref TTL locked to trace TTL by construction (this supersedes the manual coupling note above on the CH backend).
+
+Reads union CH with any legacy Postgres rows, so the cutover needs **no data migration**: pre-cutover refs resolve from Postgres until the daily prune drains them (one retention window), and `temps backfill clickhouse --domain trace-refs` exists for operators who want history copied immediately. The prune job keeps running unconditionally; on the CH backend it only drains legacy rows and then becomes a no-op.
+
 ### 3. Phase 1 — Follow navigation (cross-project banner and discovery endpoint)
 
 **New endpoint — sibling project discovery:**

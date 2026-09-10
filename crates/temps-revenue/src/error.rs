@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use thiserror::Error;
 
 use crate::providers::ProviderError;
@@ -56,6 +59,9 @@ pub enum RevenueError {
 
     #[error("Failed to decrypt signing secret for integration {integration_id}: {reason}")]
     DecryptionFailed { integration_id: i32, reason: String },
+
+    #[error("OS randomness failed while {operation}: {reason}")]
+    RandomnessFailed { operation: String, reason: String },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),

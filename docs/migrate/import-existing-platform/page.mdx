@@ -1,0 +1,290 @@
+export const metadata = {
+  title: "Import from Coolify, Dokploy, CapRover, Portainer, Kamal & Kubernetes",
+  description:
+    "Migrate an existing self-hosted platform to Temps. Connect your Coolify, Dokploy, CapRover, Portainer, Kamal, Kubernetes, or Docker host, review a plan, and import apps, databases, environment variables, and domains.",
+  alternates: {
+    canonical: "/docs/import-existing-platform",
+  },
+};
+
+# Import from an existing platform
+
+Temps can read an existing platform and recreate its projects for you: the
+apps, their environment variables, the databases behind them, and the domains
+in front of them. You connect the source, review a plan describing exactly what
+will happen, and then execute it.
+
+Nothing is changed on the source platform. The import only reads.
+
+## Supported sources
+
+| Source | What you provide | Project boundary |
+| --- | --- | --- |
+| **Coolify** | Instance URL + API token | A Coolify environment |
+| **Dokploy** | Instance URL + API key | A Dokploy environment |
+| **CapRover** | Instance URL + admin password | One app (CapRover has no grouping) |
+| **Portainer** | Instance URL + admin password | A compose stack, or one container |
+| **Kamal** | Your `config/deploy.yml` | The whole config (roles + accessories) |
+| **Kubernetes** | A kubeconfig | A namespace |
+| **Docker** | Nothing (local socket) | One container |
+
+Kamal is the odd one out and deliberately so: it has no control plane, so the
+importer reads the config file instead of calling an API. See
+[Importing from Kamal](#importing-from-kamal).
+
+## Before you start
+
+1. **Connect a Git provider.** Apps built from source are re-deployed by Temps
+   from your repository, so the wizard asks you to link it. Add a connection
+   under **Settings → Git providers** first — without one the wizard stops at
+   the *Select Repository* step.
+2. **Decide about your databases.** Temps copies data by connecting to your
+   source database from the Temps server. That requires the database to be
+   reachable — see [Databases and data](#databases-and-data) for what happens
+   when it is not.
+3. **Keep the old platform running.** Nothing forces a cutover. Import, verify
+   on the Temps preview domain, and only then move DNS.
+
+## Step 1 — Choose the source
+
+Go to **Projects → Import** and pick the platform you are migrating from.
+
+![Choosing an import source: CapRover, Dokploy, Coolify, Kamal, Kubernetes, Portainer and Docker are listed, each showing availability](/docs/images/migrate/01-select-source.png)
+
+## Step 2 — Connect
+
+Each source asks for what it needs. Credentials are used **for this import
+only** — they are never stored.
+
+![Connecting to Coolify with an instance URL and API token](/docs/images/migrate/02-credentials.png)
+
+Where to find the credential for each source:
+
+- **Coolify** — *Keys & Tokens → API tokens*. The instance API must be enabled
+  (*Settings → Advanced → API*).
+- **Dokploy** — *Settings → API/CLI → Generate API key*. **Turn rate limiting
+  off on the key**: Dokploy's default is 10 requests per day, which is not
+  enough to finish a discovery.
+- **CapRover** — the admin password you log into the dashboard with.
+- **Portainer** — the admin password. A non-admin user can be used through the
+  API by setting `credentials.extra.username`.
+- **Kubernetes** — a kubeconfig with an embedded token or client certificate.
+  `exec`-based auth (EKS/GKE helper plugins) cannot run server-side; mint a
+  ServiceAccount token instead with `kubectl create token`.
+- **Kamal** — paste the contents of `config/deploy.yml`.
+
+## Step 3 — Discover
+
+Temps lists what it found. Databases are identified separately from
+applications, so you can see the whole shape of the project before importing.
+
+![Three discovered workloads: lab-shop and lab-whoami containers, and lab-db identified as a database](/docs/images/migrate/03-discover.png)
+
+Select the application you want to migrate. Its siblings — the other apps in the
+same environment or stack, plus the databases and domains attached to it — are
+pulled in with it. You do not import a database on its own; it comes along with
+the app that uses it.
+
+## Step 4 — Link the repository
+
+Apps that were built from source on the old platform are rebuilt by Temps from
+your repository, so pick the matching repo here.
+
+![Selecting a repository to link with the imported workload](/docs/images/migrate/04-repository.png)
+
+If this list is empty, add a Git provider connection first (see
+[Before you start](#before-you-start)). Apps deployed from a prebuilt container
+image do not need a build, but the wizard still asks for a repository to attach
+the project to.
+
+## Step 5 — Review the plan
+
+The plan is the contract. Before anything is created, it tells you every step
+that will run, the risk of each, and what will *not* be migrated automatically.
+
+A plan for a Coolify environment with two apps and one database looks like this:
+
+```text
+Migrate 'lab' from Coolify: 2 application(s), 1 database(s), 0 custom domain(s)
+
+1. create-project          Create project 'lab'                    no risk
+2. configure-env-vars      Copy 3 environment variables            low
+3. create-service-lab-db   Create managed postgres service         high
+4. deploy-application      Deploy 'lab-shop'                       low
+```
+
+Read the **data implications** on any database step and the **critical
+warnings** in the summary. They tell you, in advance, exactly which data cannot
+be copied automatically and what to run by hand instead.
+
+## Step 6 — Execute
+
+Execution runs in this order:
+
+1. **Managed services are created first**, so the app can point at them from its
+   very first deployment.
+2. **Data is copied** from the source database into the new managed service (see
+   below).
+3. **Environment variables are rewritten** — connection strings that pointed at
+   the old database now point at the new managed one, and addresses that
+   embedded the old server's IP now point at your Temps preview domain.
+4. **The project, environment, and deployment are created.**
+5. **Domains are registered** on the new environment.
+
+Every step reports its own outcome. A failed data copy does not abort the
+import: the service is still created, and the step tells you to run the dump
+and restore yourself.
+
+## Databases and data
+
+This is the part that deserves the most attention, so the importer is explicit
+about it rather than optimistic.
+
+**When the source database is reachable** from your Temps server — Coolify
+databases with a public port, Dokploy databases with an `externalPort`, CapRover
+or Portainer containers publishing a host port — Temps copies the data for you.
+It runs a one-off `pg_dump | psql` (or the MySQL/MongoDB equivalent) directly
+from the source into the newly created service.
+
+**When it is not reachable**, the plan says so before you execute, marks the
+service `data not migrated`, and gives you the exact commands to run. Nothing is
+silently skipped. You have two options:
+
+- Publish the database port on the source platform temporarily, then re-run the
+  import; or
+- Dump on the source machine and restore into the Temps service:
+
+  ```bash
+  # on the source machine
+  docker exec <db-container> pg_dump -U <user> -d <database> --no-owner -Fc > dump.pgc
+
+  # from anywhere that can reach both
+  pg_restore --no-owner -d "<temps database url>" dump.pgc
+  ```
+
+Always verify afterwards — row counts are the quickest check:
+
+```bash
+psql "<temps database url>" -c "SELECT count(*) FROM orders"
+```
+
+**Redis and other caches** are created empty on purpose. Cache contents are
+disposable, and copying them is rarely worth it.
+
+## Domains
+
+Two kinds of address show up, and they are treated differently.
+
+**Real domains** (`shop.example.com`) are registered on the new environment. The
+certificate is issued automatically the first time the domain is requested,
+once its DNS points at your Temps server. Move DNS only after you have verified
+the app on the preview domain.
+
+**Generated domains** (`*.sslip.io`, `*.traefik.me`, CapRover's
+`<app>.<root-domain>`) embed the old server's IP address. They cannot follow you
+— they would keep resolving to the old machine. Temps marks them as skipped and
+tells you the address that replaces each one:
+
+```text
+lab-shop.167.233.136.173.sslip.io
+  skipped → lab.preview.example.com
+  "embeds the source server's IP and would keep pointing at the old machine —
+   on temps this app will be served at 'lab.preview.example.com' instead"
+```
+
+Any environment variable that referenced the old generated domain is rewritten
+to the new preview address during execution.
+
+Portainer has no domain management at all, so an import from Portainer produces
+no domains — the plan says so and reminds you to point DNS at Temps yourself.
+
+## Importing from Kamal
+
+Kamal has no server to connect to: everything it knows lives in your
+repository. Paste `config/deploy.yml` into the wizard and Temps reads it
+directly.
+
+The mapping is unusually clean, because Kamal is declarative:
+
+| In `deploy.yml` | Becomes in Temps |
+| --- | --- |
+| `service`, `image` | Project and deployment image |
+| `servers.web` | The main deployment |
+| Other roles with a `cmd` | Additional worker deployments |
+| `proxy.host` | A real custom domain |
+| `env.clear` | Environment variables |
+| `env.secret` | Environment variables **flagged as secrets, with empty values** |
+| `accessories.*` | Managed database/cache services |
+| `builder.dockerfile` | Build configuration |
+
+Two things to know:
+
+**Secrets import empty.** Kamal keeps secret *values* in `.kamal/secrets`, which
+is deliberately not part of `deploy.yml`. Temps imports the names as secret
+placeholders and warns you — the app will not boot until you paste the values in
+from wherever you keep them (password manager, environment, 1Password).
+
+**Accessories are never copied automatically.** Their passwords are Kamal
+secrets too, so Temps cannot authenticate to them. The plan gives you the dump
+command to run instead:
+
+```bash
+kamal accessory exec db 'pg_dump -U lab -d labdb --no-owner -Fc' > dump.pgc
+pg_restore --no-owner -d "<temps database url>" dump.pgc
+```
+
+**ERB is rejected.** If your `deploy.yml` uses `<%= ... %>`, Temps cannot
+evaluate it (Kamal resolves it at deploy time against your local environment).
+Run `kamal config` and paste the resolved output instead — importing an
+unevaluated template would silently produce wrong values.
+
+## What does not transfer
+
+The plan lists these per source, but in general:
+
+- **Volume contents.** Only databases have a dump/restore path. Files on disk in
+  a non-database container must be copied manually.
+- **Secrets stored outside the platform** — Kamal's `.kamal/secrets`, and any
+  variable your old platform marked write-only.
+- **Replica counts and placement rules.** Temps deploys one container per
+  environment. If you were running a role across several hosts, the plan warns
+  you; use Temps worker nodes for horizontal scale.
+- **Platform-specific extras** — Coolify one-click services, CapRover one-click
+  apps that aren't databases, Kubernetes sidecars and HPAs. They are reported as
+  unsupported features so you can re-create them deliberately.
+
+## Verify before cutting over
+
+1. Open the app on its Temps preview domain and exercise a real path — a login,
+   a checkout, something that touches the database.
+2. Check the row counts in the migrated database against the source.
+3. Confirm every secret placeholder has a value.
+4. Only then move DNS, and leave the old platform running for a day or two as a
+   fallback.
+
+## Troubleshooting
+
+**"Dokploy rejected the API key (HTTP 401)" partway through discovery.**
+The key hit its rate limit. Dokploy's default API keys allow 10 requests per
+day; create a new one with rate limiting disabled.
+
+**"The instance has its API disabled" (Coolify).**
+Enable the API under *Settings → Advanced*, then retry.
+
+**"exec-based auth is not supported" (Kubernetes).**
+Your kubeconfig calls out to `aws eks get-token` or a GKE plugin, which cannot
+run on the Temps server. Create a ServiceAccount token instead:
+
+```bash
+kubectl create token <serviceaccount> --duration=1h
+```
+
+**The database service was created but stayed empty.**
+The data copy failed — read the step's message, which includes the reason. The
+service is usable; run the dump and restore from the plan manually.
+
+**Imported app cannot reach its database.**
+Check the environment variables on the new project. Anything that referenced the
+old platform's internal hostname (`srv-captain--*`, a Coolify container name, a
+compose service name) should have been rewritten; if one was missed, point it at
+the managed service's connection string from **Services → your database**.

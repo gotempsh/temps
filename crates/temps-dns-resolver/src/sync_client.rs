@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Long-poll sync loop against the control plane's
 //! `GET /api/internal/nodes/{id}/dns/changes` and `POST .../dns/ack`
 //! endpoints.
@@ -14,8 +17,8 @@
 //! 4. Sleep `poll_interval`. On any HTTP error, exponential backoff up to
 //!    `max_backoff`. The zone keeps serving the last successful state.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -40,6 +43,45 @@ struct AckBody {
     applied_generation: i64,
 }
 
+/// Cap for `SyncBadResponse::reason`. Enough to see a Problem+JSON detail or
+/// a short plaintext error; not enough for a proxy's full HTML error page to
+/// bloat the `nodes.dns_resolver_last_error` column it eventually lands in.
+const SYNC_ERROR_REASON_MAX_BYTES: usize = 512;
+
+/// Truncate to a char boundary at or before `SYNC_ERROR_REASON_MAX_BYTES`,
+/// tagging the result so a reader knows text was cut rather than complete.
+fn truncate_reason(reason: &str) -> String {
+    if reason.len() <= SYNC_ERROR_REASON_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = SYNC_ERROR_REASON_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &reason[..end])
+}
+
+/// Point-in-time health of the sync loop, read by `ResolverHandle::status()`
+/// for the agent heartbeat and any local troubleshooting surface. Cloned out
+/// of a shared lock rather than computed on demand, so a stuck loop (e.g.
+/// blocked on a slow control-plane response) still reports its last known
+/// good state instead of blocking the reader.
+#[derive(Debug, Clone, Default)]
+pub struct SyncStatus {
+    /// When the last sync tick completed without error. `None` before the
+    /// first successful tick — this is the "never synced" state, distinct
+    /// from "synced a while ago", which callers should treat as unhealthy.
+    pub last_success_at: Option<SystemTime>,
+    /// Resets to 0 on every successful tick. A node reporting a large,
+    /// growing count here has lost contact with the control plane's DNS
+    /// change feed and is serving an increasingly stale zone.
+    pub consecutive_failures: u32,
+    /// The most recent tick error, kept even after a subsequent success so
+    /// "it failed once and recovered" stays visible for one heartbeat cycle
+    /// rather than disappearing the instant it clears.
+    pub last_error: Option<String>,
+}
+
 pub struct SyncClient {
     config: ResolverConfig,
     zone: Arc<ZoneStore>,
@@ -47,6 +89,7 @@ pub struct SyncClient {
     /// Notified when shutdown is requested. The loop checks this between
     /// poll cycles and during backoff sleeps.
     shutdown: Arc<Notify>,
+    status: Arc<RwLock<SyncStatus>>,
 }
 
 impl SyncClient {
@@ -54,6 +97,7 @@ impl SyncClient {
         config: ResolverConfig,
         zone: Arc<ZoneStore>,
         shutdown: Arc<Notify>,
+        status: Arc<RwLock<SyncStatus>>,
     ) -> Result<Self, ResolverError> {
         let http = reqwest::Client::builder()
             .timeout(config.http_timeout)
@@ -64,6 +108,7 @@ impl SyncClient {
             zone,
             http,
             shutdown,
+            status,
         })
     }
 
@@ -76,6 +121,10 @@ impl SyncClient {
             match self.tick_once().await {
                 Ok(()) => {
                     backoff = self.config.initial_backoff;
+                    if let Ok(mut s) = self.status.write() {
+                        s.last_success_at = Some(SystemTime::now());
+                        s.consecutive_failures = 0;
+                    }
                     if select_sleep(self.config.poll_interval, &self.shutdown).await {
                         info!(node_id = self.config.node_id, "DNS sync loop shutting down");
                         return;
@@ -88,6 +137,10 @@ impl SyncClient {
                         backoff_ms = backoff.as_millis(),
                         "DNS sync tick failed; backing off"
                     );
+                    if let Ok(mut s) = self.status.write() {
+                        s.consecutive_failures += 1;
+                        s.last_error = Some(e.to_string());
+                    }
                     if select_sleep(backoff, &self.shutdown).await {
                         info!(
                             node_id = self.config.node_id,
@@ -128,7 +181,14 @@ impl SyncClient {
             return Err(ResolverError::SyncBadResponse {
                 node_id: self.config.node_id,
                 status: status.as_u16(),
-                reason: resp.text().await.unwrap_or_default(),
+                // Truncated: a non-2xx body can be an arbitrarily large
+                // intervening proxy/WAF error page rather than a small
+                // Problem+JSON detail, and this reason round-trips through
+                // the agent heartbeat into the `nodes.dns_resolver_last_error`
+                // column and back out through `GET /cluster/dns/status` — an
+                // unbounded body here would bloat that row and every reader
+                // of it, not just this log line.
+                reason: truncate_reason(&resp.text().await.unwrap_or_default()),
             });
         }
         let body: ChangesResponse = resp.json().await.map_err(|e| ResolverError::SyncHttp {
@@ -271,7 +331,13 @@ mod tests {
 
         let zone = Arc::new(ZoneStore::new(PathBuf::from("/dev/null")));
         let shutdown = Arc::new(Notify::new());
-        let client = SyncClient::new(config_for(&server.uri()), zone.clone(), shutdown).unwrap();
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            shutdown,
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
 
         client.tick_once().await.expect("tick succeeds");
 
@@ -311,7 +377,13 @@ mod tests {
             .await;
 
         let shutdown = Arc::new(Notify::new());
-        let client = SyncClient::new(config_for(&server.uri()), zone.clone(), shutdown).unwrap();
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            shutdown,
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
         client.tick_once().await.expect("tick succeeds");
 
         assert_eq!(zone.generation(), 7);
@@ -351,10 +423,88 @@ mod tests {
             .await;
 
         let shutdown = Arc::new(Notify::new());
-        let client = SyncClient::new(config_for(&server.uri()), zone.clone(), shutdown).unwrap();
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            shutdown,
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
         client.tick_once().await.expect("tick succeeds");
 
         assert_eq!(zone.generation(), 9);
+    }
+
+    #[tokio::test]
+    async fn run_tracks_failure_then_recovers_in_status() {
+        let server = MockServer::start().await;
+
+        // First tick fails (503); second and later ticks succeed. Wiremock
+        // matches registration order and `up_to_n_times` exhausts a mock
+        // before falling through to the next one for the same route.
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generation": 1,
+                "full_snapshot": true,
+                "records": [],
+                "removed_ids": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": 1, "applied_generation": 1, "server_generation": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let zone = Arc::new(ZoneStore::new(
+            std::env::temp_dir().join("zone-status-test.json"),
+        ));
+        let shutdown = Arc::new(Notify::new());
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone,
+            shutdown.clone(),
+            status.clone(),
+        )
+        .unwrap();
+
+        let handle = tokio::spawn(client.run());
+
+        // Poll until the second (successful) tick has landed, rather than a
+        // fixed sleep — avoids flaking under slow CI schedulers.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if status.read().unwrap().last_success_at.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sync loop never recorded a successful tick"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        shutdown.notify_waiters();
+        handle.await.unwrap();
+
+        let final_status = status.read().unwrap().clone();
+        assert!(final_status.last_success_at.is_some());
+        assert_eq!(
+            final_status.consecutive_failures, 0,
+            "a later success must reset the failure counter"
+        );
     }
 
     #[tokio::test]
@@ -370,7 +520,13 @@ mod tests {
             std::env::temp_dir().join("zone-503-test.json"),
         ));
         let shutdown = Arc::new(Notify::new());
-        let client = SyncClient::new(config_for(&server.uri()), zone.clone(), shutdown).unwrap();
+        let client = SyncClient::new(
+            config_for(&server.uri()),
+            zone.clone(),
+            shutdown,
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+        .unwrap();
         let err = client.tick_once().await.unwrap_err();
         assert!(matches!(
             err,

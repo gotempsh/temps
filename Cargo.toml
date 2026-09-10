@@ -1,10 +1,17 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [workspace]
 resolver = "2"
 members = [
     # Application crates
     "crates/temps-cli",
+    "crates/temps-vm-agent",
     # Library crates
     "crates/temps-core",
+    "crates/temps-cloud-protocol",
+    "crates/temps-cloud-client",
+    "crates/temps-cloud",
     "crates/temps-ai",
     "crates/temps-ai-chat",
     "crates/temps-entities",
@@ -49,7 +56,14 @@ members = [
     "crates/temps-import-types",
     "crates/temps-import",
     "crates/temps-import-docker",
+    "crates/temps-import-kubernetes",
+    "crates/temps-import-coolify",
+    "crates/temps-import-dokploy",
+    "crates/temps-import-caprover",
+    "crates/temps-import-portainer",
+    "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
+    "crates/temps-teams",
     "crates/temps-webhooks",
     "crates/temps-email",
     "crates/temps-email-tracking",
@@ -57,6 +71,7 @@ members = [
     "crates/temps-dns-resolver",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
+    "crates/temps-flags",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-otel",
@@ -66,6 +81,7 @@ members = [
     "crates/temps-embeddings",
     "crates/temps-plugin-sdk",
     "crates/temps-wireguard",
+    "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
     "crates/temps-agents",
     "crates/temps-agents-mcp-proxy",
@@ -81,6 +97,7 @@ members = [
     "crates/temps-observability",
     "crates/temps-metrics",
     "crates/temps-ai-api-tools",
+    "crates/temps-mcp-server",
     "examples/example-plugin",
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",
@@ -88,9 +105,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.46"
+version = "0.1.0-beta.56"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
@@ -119,6 +136,7 @@ serde_path_to_error = "0.1.20"
 serde_test = "1.0.177"
 serde-transcode = "1.1.1"
 serde-vars = "0.2.0"
+semver = "1.0.28"
 
 # ============================================================================
 # Error Handling & Logging
@@ -167,7 +185,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6.2", features = ["cors", "fs", "catch-panic", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs", "catch-panic", "trace"] }
 tower-cookies = "0.11"
 cookie = "0.18"
 http = "1.3.1"
@@ -184,18 +202,19 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 # ============================================================================
 utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
-schemars = { version = "0.8", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
+jsonschema = { version = "0.53.0", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
 # ============================================================================
-argon2 = "0.5"
-aes-gcm = "0.10.3"
+argon2 = "0.6"
+aes-gcm = "0.11.0"
 hkdf = "0.13"
-totp-rs = "5.7.0"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+totp-rs = "6.0.0"
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
 # rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via
@@ -268,7 +287,7 @@ redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager"] }
 lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "tokio1-native-tls"] }
 
 # Git Providers (GitHub, GitLab)
-octocrab = "0.49.5"
+octocrab = "0.54.1"
 
 # ============================================================================
 # Container Management (Docker)
@@ -278,13 +297,14 @@ bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless",
 # ============================================================================
 # Scheduling & Background Jobs
 # ============================================================================
-cron = "0.15.0"
+cron = "0.17.0"
 
 # ============================================================================
 # String & URL Utilities
 # ============================================================================
 url = "2.5.4"
 urlencoding = "2.1"
+percent-encoding = "2.3"
 slug = "0.1.6"
 regex = "1.11"
 
@@ -294,7 +314,8 @@ regex = "1.11"
 flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
-zip = "2.2"
+include_dir = "0.7"
+zip = "8.6"
 zstd = "0.13"
 
 # ============================================================================
@@ -311,9 +332,9 @@ libc = "0.2"
 # decay returns freed pages to the OS. "profiling"/"stats" are inert unless
 # _RJEM_MALLOC_CONF is set at process start (see temps-cli/src/main.rs).
 tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-rand = "0.8"
-sysinfo = "0.33.1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rand = "0.10"
+sysinfo = "0.39.6"
 tempfile = "3.12.0"
 once_cell = "1.20"
 notify = "8.2"
@@ -367,46 +388,99 @@ debug = false
 #    - Fix: needs prometheus 0.14+ (protobuf 3.7.2+). pingora-core 0.8.0 AND 0.8.1
 #      both pin prometheus ^0.13, and a [patch.crates-io] to protobuf 3.x fails to
 #      compile (prometheus 0.13's generated code uses 2.x-only RepeatedField /
-#      CodedInputStream APIs). Total upstream block until pingora bumps prometheus.
+#      CodedInputStream APIs).
+#    - Upstream status (checked 2026-08-04): FIXED ON pingora main, NOT YET RELEASED.
+#      pingora main @402acae (2026-07-27) removed prometheus from pingora-core
+#      entirely and split it into a new `pingora-prometheus` crate that declares
+#      `prometheus = "0.14"` (i.e. protobuf 3.x). crates.io latest is still 0.8.1,
+#      which predates the split, so the released graph still pulls protobuf 2.28.0.
+#      ACTION: bump pingora as soon as the release carrying the split ships (0.9.0).
+#      Deliberately NOT pinning pingora to a git rev in the meantime -- putting the
+#      whole proxy/edge hot path on unreleased upstream code is a materially larger
+#      risk than an advisory verified unreachable below.
 #    - Reachability: the vuln is a recursion crash when PARSING untrusted protobuf.
 #      pingora emits metrics via TextEncoder (not ProtobufEncoder); its
 #      PrometheusServer is not wired into any temps listener; the OTLP ingest path
 #      uses prost, not protobuf 2.x. The 2.x parse code is compiled in but never
-#      fed attacker input -> not reachable. (verified 2026-06-29)
-#
-# 2. RUSTSEC-2023-0018 / GHSA-mc8h-8q98-g5hr: remove_dir_all 0.5.3 (LOW)
-#    - Path: nixpacks 1.41.0 → tempdir 0.3.7 → remove_dir_all 0.5.3
-#    - Fix: needs nixpacks to drop deprecated tempdir for tempfile. nixpacks 1.41.0
-#      is the crates.io latest and still uses tempdir, which hard-requires
-#      remove_dir_all ^0.5 (so `--precise 0.8.0` is impossible).
-#    - Reachability: the TOCTOU race lives in nixpacks get_output_dir()'s
-#      TempDir::new()/remove_dir_all(output.root) branch, taken only when out_dir
-#      is None. temps-presets always passes out_dir: Some(...) (nixpacks_preset.rs
-#      ~L507), so that branch never executes -> dead code here. (verified 2026-06-29)
+#      fed attacker input -> not reachable. (re-verified 2026-08-04: no
+#      ProtobufEncoder/TextEncoder/protobuf::/PrometheusServer reference anywhere
+#      under crates/. Root cause of the pull is structural: pingora-core 0.8.1
+#      declares `prometheus = "0.13"` with default features, and `protobuf` is a
+#      DEFAULT feature of prometheus 0.13 -- features are additive, so it cannot be
+#      turned off from this workspace without vendoring a pingora fork.)
 #
 # 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
 #    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
 #      → opentelemetry_sdk 0.30.0
-#    - Fix: needs the pinned relay git rev moved to one using opentelemetry 0.32+;
-#      the pin locks opentelemetry-proto to ^0.30 -> opentelemetry_sdk 0.30, with no
-#      [patch] override possible. Bumping the relay rev is out of scope for a patch.
+#    - Fix: needs opentelemetry_sdk >= 0.32.1, which requires opentelemetry-proto
+#      0.32. relay-event-schema enables `opentelemetry-proto = ["gen-tonic","trace"]`
+#      and the `trace` feature is what drags in opentelemetry_sdk; there is no
+#      [patch] override possible (0.30 -> 0.32 is semver-incompatible).
+#    - Upstream status (checked 2026-08-04): BUMPING THE RELAY REV DOES NOT FIX THIS.
+#      relay master @3215baa is on opentelemetry-proto 0.31, and 0.31's `trace`
+#      feature still resolves opentelemetry_sdk 0.31 -- below the 0.32.1 fix
+#      (verified by probe build). So the block is not "we haven't moved the pin":
+#      relay must first adopt opentelemetry-proto 0.32. Moving the pin 897 commits
+#      forward would buy relay-protocol API churn and still leave the alert open.
 #    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
 #      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
 #      module is compiled in (trace feature) but BaggagePropagator is never
 #      instantiated and .extract() is never called on attacker headers anywhere in
-#      the workspace -> not reachable. (verified 2026-06-29)
+#      the workspace -> not reachable. (re-verified 2026-08-04: no case-insensitive
+#      match for `baggage` anywhere under crates/.)
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)
 #    - Path: testcontainers → russh → libcrux-ml-kem → libcrux-intrinsics 0.0.3
 #    - Fix: Requires russh to upgrade libcrux dependencies
 #    - Status: Dev-dependency only, zero production impact
 #
+# 5. RUSTSEC-2026-0235: rkyv 0.7.46 (out-of-bounds read, lockfile-only)
+#    - Path: sea-orm 1.1.20 → rust_decimal 1.42.0 → rkyv 0.7.46 (OPTIONAL)
+#    - Fix: patched in rkyv 0.8.17; upstream no longer supports the 0.7 series,
+#      and rust_decimal 1.42.1 (latest) still declares `rkyv ^0.7.46`. A
+#      [patch.crates-io] to 0.8 is semver-incompatible and rejected. Removing
+#      the entry from Cargo.lock by hand does not stick -- cargo re-adds it on
+#      the next resolve. Total upstream block until rust_decimal bumps it.
+#    - Reachability: NOT COMPILED AT ALL. rkyv is an optional feature of
+#      rust_decimal that nothing in this workspace enables. It appears in
+#      Cargo.lock because cargo resolves the lock over the maximal feature set,
+#      but `cargo tree --target all -e normal` has zero occurrences of rkyv
+#      (verified 2026-08-04, contrast rust_decimal itself with 9). The
+#      vulnerability requires validating an untrusted archive containing
+#      Rc/Arc; temps neither compiles nor calls rkyv.
+#    - Tooling note: this is a false positive of the gate, not of the advisory.
+#      cargo-audit reads Cargo.lock rather than the built artifact. Moving the
+#      job to cargo-auditable + `cargo audit bin` would remove the need for
+#      this exception entirely, and is the preferred long-term fix.
+#
 # 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
+#
+# 5. RUSTSEC-2026-0253: lru 0.16.4 (unsound use-after-free in LruCache::pop())
+#    - Path: aws-sdk-s3 1.138.1 → lru 0.16.4 (aws-sdk-s3 declares `lru = "^0.16.3"`)
+#    - Fix: patched in lru 0.18.2.
+#    - Upstream status (checked 2026-08-24): BLOCKED. aws-sdk-s3 1.143.0
+#      (crates.io latest as of that date) still declares `lru = "^0.16.3"` --
+#      confirmed via `cargo update -p aws-sdk-s3 --precise 1.143.0 --dry-run
+#      --verbose`, which does not touch the lru entry. No newer aws-sdk-s3
+#      release has moved past lru 0.16 yet. A [patch.crates-io] override to
+#      0.18.2 would violate aws-sdk-s3's own semver requirement and risks
+#      breaking whatever internal caching it does with the crate.
+#    - Reachability: the bug requires a panicking `Drop` impl on a cache key
+#      type, unwound through `catch_unwind`, during `LruCache::pop()`. Not
+#      yet audited which key type aws-sdk-s3/aws-smithy-runtime uses for this
+#      cache or whether panicking-Drop keys are reachable from request
+#      handling -- re-verify this before renewing the exception long-term.
 #
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
 # - lru 0.12.5: RESOLVED by upgrading aws-sdk-s3 (new version dropped lru 0.12)
+# - get_if_addrs 0.5.3 (RUSTSEC-2025-0121, gcc build-dep unmaintained):
+#     RESOLVED by replacing get_if_addrs with the maintained if-addrs 0.15.0
+#     fork in temps-infra (single call site, platform_info.rs). Same API
+#     (`if_addrs::get_if_addrs()`, `Interface.name/.ip()/.is_loopback()`),
+#     depends only on libc/windows-sys -- no C build step, so gcc/cc drop
+#     out of the tree entirely.
 # - aws-lc-sys 0.38.0 (RUSTSEC-2026-0044, RUSTSEC-2026-0048): RESOLVED by cargo update aws-lc-rs → 1.16.2
 # - rustls-webpki 0.103.7 (RUSTSEC-2026-0049): RESOLVED by cargo update rustls-webpki → 0.103.10
 # - tar 0.4.44 (RUSTSEC-2026-0067, RUSTSEC-2026-0068): RESOLVED by bumping tar to 0.4.45
@@ -426,6 +500,16 @@ debug = false
 #     out-of-order stream reassembly): RESOLVED by cargo update quinn-proto →
 #     0.11.15. (Orphaned lock entry with no active dependents — bumped for hygiene
 #     so `cargo audit` stays clean.)
+# - remove_dir_all 0.5.3 (RUSTSEC-2023-0018 / GHSA-mc8h-8q98-g5hr) and
+#     serde_with 2.3.3 (GHSA-8wf9-4rjw-8j9r): RESOLVED by replacing the nixpacks
+#     build engine with autopack. Both reached the tree only through
+#     nixpacks 1.41.0 (→ tempdir 0.3.7, and → serde_with ^2.1.0 respectively);
+#     neither had an upstream fix available, so removing the dependency was the
+#     only way to clear them. autopack pulls neither.
+# - serde_with 3.20.0 (GHSA-8wf9-4rjw-8j9r KeyValueMap serialize panic on empty
+#     sequence/map entries): RESOLVED by cargo update serde_with@3.20.0 --precise
+#     3.21.0 (pulls serde_with_macros → 3.21.0). Reached via cloudflare 0.14 →
+#     temps-dns. The 2.x copy came from nixpacks and left with it.
 # - rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) on rustls 0.21:
 #     RESOLVED by disabling default features on aws-sdk-s3, aws-sdk-sesv2, and
 #     aws-config so the deprecated `rustls` feature (which activates

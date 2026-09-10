@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! High-level, reusable AI helpers that pair a prompt with a schema.
 //!
 //! [`diagnose_failure`] is the one-call entry point for "explain this failed

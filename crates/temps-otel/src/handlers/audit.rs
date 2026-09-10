@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Audit operations for metric dashboard write endpoints.
 
 use anyhow::Result;
@@ -35,8 +38,8 @@ impl AuditOperation for OtelDashboardCreatedAudit {
         "OTEL_DASHBOARD_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -58,8 +61,8 @@ impl AuditOperation for OtelDashboardUpdatedAudit {
         "OTEL_DASHBOARD_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -81,8 +84,8 @@ impl AuditOperation for OtelDashboardDeletedAudit {
         "OTEL_DASHBOARD_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -118,8 +121,8 @@ impl AuditOperation for CrossProjectTraceSiblingsReadAudit {
         "CROSS_PROJECT_TRACE_SIBLINGS_READ".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -152,8 +155,278 @@ impl AuditOperation for UnifiedTraceReadAudit {
         "UNIFIED_TRACE_READ".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+// ── Facet audit events ────────────────────────────────────────────────
+
+/// Audit event for registering a new OTel span attribute facet.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetCreatedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key that was registered.
+    pub attribute_key: String,
+    /// The slot column index assigned (1..=20).
+    pub slot: u8,
+}
+
+/// Audit event for deleting an OTel span attribute facet.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetDeletedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key that was removed.
+    pub attribute_key: String,
+}
+
+/// Audit event for retrying a failed OTel span attribute facet backfill.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetBackfillRetriedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key whose backfill is being retried.
+    pub attribute_key: String,
+}
+
+impl AuditOperation for FacetCreatedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+impl AuditOperation for FacetDeletedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+impl AuditOperation for FacetBackfillRetriedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_BACKFILL_RETRIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+// ── Cloud telemetry write-mode audit events (ADR-041 §1) ────────────
+
+/// Audit event for changing where a project's spans are written.
+///
+/// Both the previous and the new value of *both* settings are recorded, not
+/// just what changed. This is the one setting whose effect is "this project's
+/// spans stop being stored on this machine", and reconstructing that from a
+/// diff of two audit rows written minutes apart is exactly the reconstruction
+/// an operator should not have to do after an incident.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudTelemetryWriteModeChangedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_write_mode: String,
+    pub write_mode: String,
+    pub previous_fidelity: String,
+    pub fidelity: String,
+}
+
+impl AuditOperation for CloudTelemetryWriteModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_TELEMETRY_WRITE_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+// ── Cloud analytics write-mode audit events (ADR-043 §1) ─────────────
+
+/// Audit event for changing where a project's non-span telemetry (metrics
+/// under Phase C1) is written. Independent of
+/// [`CloudTelemetryWriteModeChangedAudit`] — the two switches are orthogonal,
+/// so each records its own trail rather than sharing one event shape that
+/// would leave a reader guessing which switch actually moved.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudAnalyticsWriteModeChangedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_analytics_write_mode: String,
+    pub analytics_write_mode: String,
+}
+
+impl AuditOperation for CloudAnalyticsWriteModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_ANALYTICS_WRITE_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+// ── Bulk Cloud telemetry activation audit events (ADR-042 §9) ───────
+
+/// Audit event for queueing a bulk Cloud-telemetry activation job.
+///
+/// This is the record of an operator authorizing an egress that costs real
+/// money, so it carries the whole authorization, not a pointer to it: which
+/// projects, over what window, at what estimated size, and which confirmed
+/// estimate (`plan_hash`) the numbers came from. A customer disputing an
+/// invoice, or an operator asking "who switched all forty projects", must be
+/// able to answer it from this row alone — the job row can be deleted, and the
+/// per-project rows cascade with it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudTelemetryBulkActivationStartedAudit {
+    pub context: AuditContext,
+    /// The job id, so the audit row and the status endpoint agree.
+    pub batch_id: String,
+    /// `operator` here; `purchase` jobs are queued by the enroll path.
+    pub trigger: String,
+    /// Identity of the confirmed estimate this job was created from.
+    pub plan_hash: String,
+    pub project_ids: Vec<i32>,
+    pub project_count: usize,
+    /// What the operator was quoted before confirming. The actuals land on the
+    /// job row; both are needed to tell an over-run from a bad estimate.
+    pub estimated_spans: i64,
+    pub estimated_bytes: i64,
+    pub window_from: String,
+    pub window_to: String,
+}
+
+impl AuditOperation for CloudTelemetryBulkActivationStartedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_TELEMETRY_BULK_ACTIVATION_STARTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+/// Audit event for asking a bulk Cloud-telemetry activation job to stop.
+///
+/// Records what had already been spent at the moment the cancel was requested,
+/// because a cancel does not undo it: projects already switched stay
+/// Cloud-primary and spans already shipped are already billed (ADR-042 §7).
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudTelemetryBulkActivationCancelledAudit {
+    pub context: AuditContext,
+    pub batch_id: String,
+    /// The job's status when the cancel arrived. `completed`/`cancelled` here
+    /// means the request was a no-op, and the row says so rather than implying
+    /// an operator stopped something that had already finished.
+    pub status_at_request: String,
+    pub spans_shipped: i64,
+    pub bytes_shipped: i64,
+}
+
+impl AuditOperation for CloudTelemetryBulkActivationCancelledAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_TELEMETRY_BULK_ACTIVATION_CANCELLED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -202,8 +475,8 @@ impl AuditOperation for OtelMetricAlertCreatedAudit {
         "OTEL_METRIC_ALERT_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -225,8 +498,8 @@ impl AuditOperation for OtelMetricAlertUpdatedAudit {
         "OTEL_METRIC_ALERT_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -248,8 +521,8 @@ impl AuditOperation for OtelMetricAlertDeletedAudit {
         "OTEL_METRIC_ALERT_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

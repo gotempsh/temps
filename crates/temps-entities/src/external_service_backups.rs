@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -21,6 +24,9 @@ pub struct Model {
     pub compression_type: String,
     pub created_by: i32,
     pub expires_at: Option<DBDateTime>,
+    /// Immutable service identity retained after the live service is deleted.
+    pub service_name_snapshot: Option<String>,
+    pub service_type_snapshot: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

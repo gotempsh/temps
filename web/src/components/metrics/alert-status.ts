@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Shared alert-status model for the metrics surfaces.
 //
 // One `listAlerts` fetch, turned into a Datadog-style status model that the

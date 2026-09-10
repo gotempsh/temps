@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-node applied-state for the internal DNS resolver (ADR-011).
 //!
 //! Each row tracks the highest `service_endpoints.generation` a node's

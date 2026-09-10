@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Change `deploy_id` from `uuid` to `integer` on the log aggregator tables.
 //!
 //! A Temps deployment is identified by `deployments.id` (an `i32` auto-increment

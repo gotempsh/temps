@@ -6,6 +6,12 @@ Guidance for Claude Code when working with the Temps codebase.
 ## Critical Rules
 
 ### NEVER
+- Put a real user's, customer's, or third party's identity into anything that leaves this machine. This repository is **public**. Company names, product names, internal hostnames, account names, contract/method names, real trace/span/request IDs, and any other detail that identifies whose system produced a payload must never appear in code, comments, test fixtures, commit messages, branch names, file names, PR titles, PR descriptions, PR comments, or issue text. This applies with full force to bug reports: a customer sends you a captured payload to get it fixed, not to have it published, and "it is just a fixture" is exactly how it gets published
+  - **Reproducing a reported bug**: keep the *shape* that makes the payload valuable (timings, ordering, precision, nesting, sizes, edge cases) and replace everything that names anyone. Rename services, operations, and hosts to generic equivalents, and regenerate every identifier. A fixture that reproduces the bug and identifies nobody is strictly better -- it is also readable by someone who has never heard of the reporter
+  - **Describing the bug**: say "a reported cross-project trace", never who reported it. The fix is reviewed on its merits; the reporter's identity adds nothing to a reviewer and cannot be taken back once pushed
+  - **A live task example is the same rule, not an exception**: when a user hands you a real URL, repo, or account to work against (e.g. "deploy this: github.com/someone/their-repo"), that target is scratch input for the task, not something to cite as evidence. It must not end up in test comments, fixture data, commit messages, or PR descriptions as an illustrative example -- write the test/PR against a generic case ("a repo with no build manifest, just an `index.html`") instead of naming the real one, even though the user themselves supplied it and it feels like harmless context
+  - **Before pushing**: grep the diff for the reporter's names and identifiers. Once it reaches GitHub it is effectively permanent -- force-pushing does not remove a pull request's recorded commits or its Files-changed diff, pull requests cannot be deleted, and forks may retain the objects. Removal at that point requires GitHub Support
+- Commit `.env` files, credentials, or secrets -- this includes local dev-instance artifacts (encryption keys, auth secrets, generated tokens, `temps_data`-style data directories) created while running a local server for manual testing/verification. Before staging changes, run `git status` and scrutinize every path outside the files you intentionally edited -- a broad `git add` after spinning up a local test instance is the most common way this happens. If a secret is committed, treat it as compromised: remove it from tracking going forward at minimum, and flag to the user whether history needs rewriting (don't force-push without asking)
 - Access database directly from HTTP handlers -- ALWAYS use services
 - Return untyped JSON (`serde_json::Value`) -- ALWAYS use typed structs
 - Use `.context()` from anyhow -- ALWAYS use `.map_err()` with typed errors
@@ -16,6 +22,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
 - Use plain text logging -- ALWAYS use structured JSONL logging
+- Overwrite `apps/temps-cli/openapi.json` with the raw server response (`curl ... > openapi.json`) -- the committed file is ~92,000 lines of sorted, indented JSON and the server serves it minified on one line, so a direct write reports **-92,000 deletions** and buries the real change. ALWAYS use `cd apps/temps-cli && bun run spec:update` (see [Regenerating the OpenAPI clients](#regenerating-the-openapi-clients))
 - Create markdown documentation files unless explicitly requested
 - Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead
 - Create error types with generic messages -- ALWAYS include IDs, names, and operation context
@@ -25,6 +32,16 @@ Guidance for Claude Code when working with the Temps codebase.
 - Add new runtime configuration as environment variables -- environment variables for configuration are forbidden. ALWAYS model it as a column on the relevant entity row (e.g. `oidc_providers.trust_idp_email`, not `TEMPS_OIDC_SKIP_EMAIL_VERIFIED`) so the admin can change it per-record at runtime via the API/UI, gets audit logging for free, and operators don't have to restart the binary to change a single tenant's behaviour. If the value is sensitive (credentials, tokens, private keys), the column MUST be encrypted at rest via `EncryptionService`, never stored as plaintext -- this applies even where env vars might otherwise seem tempting for secrets (e.g. a Vault CA bundle or auth token: store it encrypted on the provider row, not as `TEMPS_VAULT_CA_BUNDLE`). The only legitimate exception is bootstrap-time config needed before a database connection exists (e.g. `DATABASE_URL`, `TEMPS_DATA_DIR`, `--license-path`)
 
 ### ALWAYS
+- Add the Temps SPDX attribution header to every new first-party source or
+  commentable configuration file, using the file's comment syntax:
+  `SPDX-FileCopyrightText: 2024-2026 Temps Contributors` and
+  `SPDX-License-Identifier: MIT OR Apache-2.0`. Run
+  `python3 scripts/source_attribution.py annotate path/to/file` to apply it.
+  Before every commit that adds or regenerates source files, run
+  `python3 scripts/source_attribution.py check`; attribution failures are
+  blocking and must be fixed before committing.
+  Generated files must receive the header from their generator or generation
+  command. Never replace or misattribute third-party copyright notices.
 - Run `cargo check --lib` after every modification
 - New functionality must compile without warnings
 - Write tests for all new functionality AND verify they run successfully
@@ -43,6 +60,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Use `require_service` in plugins for dependencies the app can't function without
 - Let the user configure and control their setup -- show status, give instructions, don't do things silently on their behalf
 - Design new features to be scalable on a small resource footprint -- see [Scalability & Efficiency](#scalability--efficiency)
+- Give every new feature a visible surface, and make unconfigured features onboard rather than disappear -- see [Feature Discoverability](#feature-discoverability)
 
 ---
 
@@ -271,6 +289,58 @@ Classify every piece of new code. The bar differs by an order of magnitude:
 - **Pull over push for telemetry.** Prefer scrape/interval collection (existing `MetricsScraper` pattern) over per-event emission.
 - **Background loops must be O(changes), not O(total).** Reconciliation/polling loops should query deltas (updated_at cursors, NOTIFY) rather than rescanning entire tables each tick.
 - **Justify it in the PR.** For any feature touching the hot path or a high-volume data flow, the PR description must state the expected load, the memory bound, and what happens at saturation (drop, degrade, backpressure).
+
+---
+
+## Feature Discoverability
+
+A feature the user cannot find does not exist. Self-hosted operators debug alone — there is no support channel to ask "does temps do X?". Every capability must therefore announce itself in the UI at the point where the user would want it.
+
+### Always give a feature a visible surface
+
+- A keyboard shortcut is an accelerator, never the only entry point. If `⌘.` opens a palette, there must also be a visible control that does the same thing.
+- Put the entry point where the task happens, not in a settings page the user visits once.
+- Name the outcome, not the mechanism: "Ask a question about this data", not "LLM query interface".
+
+### Unconfigured features onboard — they never disappear
+
+Many features depend on optional operator configuration: an AI provider, S3 credentials, an SMTP server, a DNS API token. **Never gate the UI surface on that configuration being present.** Conditionally rendering nothing means the user never learns the feature exists and concludes temps can't do it.
+
+Render the surface unconditionally and switch it into an onboarding state that:
+
+1. **Shows what it would do** — with a concrete example, not an abstract description.
+2. **States precisely what is missing** — "No AI provider is configured", never a bare disabled control.
+3. **Links directly to the fix** — deep-link into the settings page/section that configures it, not to documentation.
+4. **Never silently no-ops** — if the user triggers it anyway, explain the gap; don't fail quietly or hang in a loading state.
+
+```tsx
+// BAD -- the feature vanishes; the user never learns it exists
+{aiConfigured && <AiQueryBar />}
+
+// GOOD -- always visible, onboards when unconfigured
+<AiQueryBar
+  configured={aiConfigured}
+  onboardingHref="/settings/ai"
+  example="show me the users created last week"
+/>
+```
+
+### Expose configuration state through the API
+
+Back the UI with a typed capability/status endpoint rather than letting the client infer availability from errors:
+
+```rust
+pub struct AiCapabilityResponse {
+    /// Whether a usable provider is configured
+    pub configured: bool,
+    /// Why it is unavailable, when `configured` is false
+    pub reason: Option<String>,
+    /// Console path the operator should visit to configure it
+    pub setup_path: Option<String>,
+}
+```
+
+A `404`/`500` leaves the client unable to distinguish "this feature does not exist" from "this feature is not set up yet" — and those need completely different UI. Returning `configured: false` with a reason and a setup path makes the onboarding state renderable without guesswork.
 
 ---
 
@@ -673,6 +743,60 @@ async fn create_backup(
 - Convert entities to response DTOs via `From` trait
 - Register all handlers in `ApiDoc` with `#[openapi(...)]`
 
+### Regenerating the OpenAPI clients
+
+Two generated clients consume the spec, and they are refreshed differently:
+
+| Client | Source of truth | Refresh with |
+|---|---|---|
+| `web/src/api/client/` | the **live server** | `cd web && bun run openapi-ts` |
+| `apps/temps-cli/src/api/` | the **committed** `apps/temps-cli/openapi.json` | `cd apps/temps-cli && bun run spec:update && bun run generate:api` |
+
+After any change to handlers, request/response shapes, schemas or routes:
+restart `temps serve`, then refresh both. Commit the regenerated files --
+they are tracked so reviewers see the API delta.
+
+`apps/temps-cli/openapi.json` must stay in its canonical shape: **keys sorted
+recursively, two-space indent, trailing newline**. `bun run spec:update` is the
+only supported way to write it. Sorting is what keeps a diff proportional to
+the API change instead of to serde's iteration order, which is not stable
+between builds.
+
+This is enforced, not just documented. `bun run spec:check` verifies the
+committed file -- it reads only what is on disk, so it needs no server and no
+`bun install`, and it runs both as a pre-commit hook and as the
+**OpenAPI Spec Format** job on every pull request:
+
+```bash
+cd apps/temps-cli
+bun run spec:check          # verify; exits 1 with the reason
+bun run spec:check --fix    # reformat what is already committed (does not fetch)
+```
+
+`--fix` only reformats. When the API itself changed you still need
+`bun run spec:update` against a running server, then `bun run generate:api`.
+
+Sanity-check the size before committing -- adding a few endpoints is a few
+hundred changed lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+Merge conflicts in either client are conflicts in build output. Never
+hand-merge them: take one side to clear the conflict, then regenerate from a
+server built off the merged source and typecheck both packages.
+
+**Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`.**
+Some backend endpoints are served by a plugin crate that isn't part of this
+repository, so their schema doesn't exist in the spec this file's generated
+client is built from, and it must stay that way. For CLI parity on those
+endpoints, hand-write local request/response interfaces mirroring the
+plugin's shapes and call the shared `client` object directly via its generic
+`.get/.post/.patch/.delete` methods — same call shape every generated SDK
+function already uses, just without codegen. See
+`apps/temps-cli/src/commands/otel-forward/index.ts` for the pattern.
+
 ### Permission System
 
 ```rust
@@ -809,6 +933,15 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 
 `git revert` defaults to a non-conventional subject (`Revert "original message"`). Never accept that default — always pass an explicit conventional message, e.g. `git revert --no-edit` then `git commit --amend -m "test: drop temporary failing test"`, or better, pass `-m` directly on the revert itself.
 
+### DCO Sign-off
+
+**Every commit must be signed off** (`Signed-off-by: Name <email>` trailer) —
+this is the Developer Certificate of Origin required on this OSS repo. Always
+commit with `git commit -s` (or `-s` on `git commit --amend`/`git revert`).
+A PR with an unsigned commit fails the DCO check regardless of how many
+commits are on the branch — every commit in `base..HEAD` needs its own
+trailer, not just the final one.
+
 ---
 
 ## Workspace Structure
@@ -888,6 +1021,9 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 - React + TypeScript, Tanstack Query, shadcn/ui, Tailwind CSS, Rsbuild
 - Package manager: `bun` (not npm/yarn)
 
+### Design system (redesign)
+- New screens on the operator design system use `@temps-sdk/ds` (`web/packages/ds`) and follow `design-system/docs/RULES.md`. Use the `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) for the procedure and the scope boundary; the rules below still govern the legacy `web/src` console.
+
 ### Critical React Rules
 
 **No IFEs in JSX** -- extract to helper functions or separate components:
@@ -930,7 +1066,7 @@ if (isLoading) return <Spinner />
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
-- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
@@ -954,6 +1090,16 @@ All use `TEMPS_` prefix:
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
+
+Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
+
+| Variable | Default | Required |
+|---|---|---|
+| `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` | unset (clean up) | No -- set to any value to keep `/tmp/temps-deployments/deployment-*` directories after a deployment finishes or fails, for inspecting a build/download issue. Restart the server to change. |
+| `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` | unset (built-in list only) | No -- comma-separated PostgreSQL images this instance may additionally pull and run, e.g. `postgis/postgis:18-3.5,registry.internal:5000/team/pg:18`. **Additive**: it extends the built-in allowlist in `crates/temps-providers/src/externalsvc/postgres.rs` and can never shrink it, so a typo cannot strand existing services. Matching is exact -- no globs or prefixes -- so each entry needs a `:tag` or `@sha256:` digest. Deliberately host-level rather than an API setting: which images this machine may execute is operator policy. Restart the server to change. |
+| `TEMPS_ALLOWED_MARIADB_DOCKER_IMAGES`, `TEMPS_ALLOWED_MONGODB_DOCKER_IMAGES` | unset (built-in list only) | No -- comma-separated **repositories** this instance may additionally accept as a restore-time `docker_image` override, e.g. `ghcr.io/acme/mariadb`. Restoring into a new service clones the source's root credentials into the new container, so the override is constrained to the source's own repository or a known-good one; these variables widen that set. **Additive** like the PostgreSQL variable above -- a typo can never block a restore that worked before. Unlike it, the unit is the repository rather than `image:tag`, because a restore must be able to retag (10.11 backup onto 11.4); a `:tag` in an entry is accepted and ignored. Restart the server to change. |
+| `TEMPS_TRAEFIK_DISCOVERY_ENABLED` | unset (**off**) | No -- set to `true` to let this host adopt containers it did **not** deploy into the route table by reading their Traefik labels (`traefik.enable=true` + `traefik.http.routers.<n>.rule=Host(...)`), so an existing docker-compose / Coolify / Dokploy stack is routable with no changes to those containers. Deliberately host-level and opt-in: it changes routing for workloads that never went through Temps, so which containers this machine may adopt is operator policy, not a per-tenant API setting. Discovered routes never displace a deployment, custom route, custom domain, environment subdomain, or the console hostname, and containers carrying `sh.temps.deploy_id` are always skipped. Three limits follow from the labels being workload-controlled data: a `loadbalancer.server.port` label is only honoured when the container actually exposes that port (otherwise the router is dropped and logged -- an unvalidated label would let a container point a hostname at an arbitrary port on the Temps host); on a baremetal install (`DEPLOYMENT_MODE` unset/`baremetal`) the container must **publish** a host port, since there is no other address that reaches it and guessing the container port would land on an unrelated host service; and a container's `traefik...tls` label is recorded but never triggers certificate issuance by itself -- HTTPS for a discovered host is opt-in, via an explicit ACME request or an `acme.json` import through the `/traefik-discovery/routes/{host}/certificate` and `/traefik-discovery/tls/import` endpoints (see `docs/adr/041-discovered-route-tls-certificate-handling.md`). Discovered routes are also scoped to the network configured below: turn discovery off, or repoint it, and previously adopted routes stop being served on the next reload. See `crates/temps-deployer/src/traefik_discovery.rs`. Restart the server to change. |
+| `TEMPS_TRAEFIK_DISCOVERY_NETWORK` | the Temps workload network (`temps`) | No -- Docker network whose containers are watched when the variable above is enabled. Defaults to the network Temps' own workloads run on, which is the one the proxy can reach; point it at an existing stack's network (e.g. `myapp_default`) to adopt that stack. Restart the server to change. |
 
 ---
 

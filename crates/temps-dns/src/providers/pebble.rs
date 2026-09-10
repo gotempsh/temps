@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pebble challtestsrv-backed DNS provider (LOCAL DEV/TEST ONLY)
 //!
 //! Publishes DNS-01 challenge TXT records to `pebble-challtestsrv`'s

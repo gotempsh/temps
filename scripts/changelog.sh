@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Regenerate or preview CHANGELOG.md from Conventional Commits with git-cliff.
 #
 # CHANGELOG.md is a generated artifact — never hand-edit it. All entries come

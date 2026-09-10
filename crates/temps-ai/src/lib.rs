@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The Temps AI foundation (ADR-022).
 //!
 //! A single, governed, provider-agnostic way for any crate to ask the configured
@@ -19,14 +22,20 @@
 //! operation — callers wrap calls in a timeout.
 
 pub mod diagnostics;
+pub mod provider;
 pub mod schemas;
 pub mod service;
 pub mod streaming;
 pub mod typed;
 
+pub use provider::{
+    ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
+    ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,
+};
 pub use service::{AiError, AiRequest, AiResponse, AiService};
 pub use streaming::{
     ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    TokenStream, ToolCall,
+    HarnessMcpServer, HarnessWorkspace, InteractionExecutor, PermissionDecision, PermissionKind,
+    PermissionRequest, SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
 pub use typed::{complete_text, complete_typed, extract_json_block};

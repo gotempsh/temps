@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Project-scoped traffic delivery planning and application.
 //!
 //! Delivery profiles describe how traffic reaches an origin. DNS hosting is a

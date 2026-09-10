@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Pre-aggregated 5-minute rollups for dashboard widgets.
 -- Streams from `events` automatically — every insert into events triggers
 -- the SummingMergeTree state update.

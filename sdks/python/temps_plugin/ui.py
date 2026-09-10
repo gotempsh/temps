@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Embedded UI serving.
 
 Mirrors: sdks/node/packages/plugin-sdk/src/ui.ts

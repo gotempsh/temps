@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{CertificateRepository, DomainService, TlsService};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -6,6 +9,7 @@ use temps_dns::services::DnsProviderService;
 
 use utoipa::ToSchema;
 
+#[derive(Clone)]
 pub struct DomainAppState {
     pub tls_service: Arc<TlsService>,
     pub repository: Arc<dyn CertificateRepository>,
@@ -14,6 +18,10 @@ pub struct DomainAppState {
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Central policy evaluator for sensitive mutations (e.g. deleting a
+    /// domain) — challenges with MFA step-up when the acting user has one
+    /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 pub fn create_domain_app_state(
@@ -22,6 +30,7 @@ pub fn create_domain_app_state(
     domain_service: Arc<DomainService>,
     audit_service: Arc<dyn AuditLogger>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<DomainAppState> {
     Arc::new(DomainAppState {
         tls_service,
@@ -30,6 +39,7 @@ pub fn create_domain_app_state(
         dns_provider_service: None,
         audit_service,
         telemetry,
+        sensitive_action_authorizer,
     })
 }
 
@@ -40,6 +50,7 @@ pub fn create_domain_app_state_with_dns(
     dns_provider_service: Arc<DnsProviderService>,
     audit_service: Arc<dyn AuditLogger>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<DomainAppState> {
     Arc::new(DomainAppState {
         tls_service,
@@ -48,6 +59,7 @@ pub fn create_domain_app_state_with_dns(
         dns_provider_service: Some(dns_provider_service),
         audit_service,
         telemetry,
+        sensitive_action_authorizer,
     })
 }
 
@@ -446,4 +458,44 @@ pub struct CertStatusResponse {
     pub backoff_until: Option<i64>,
     /// The most recent on-demand issuance attempt for this hostname, if any.
     pub last_attempt: Option<OnDemandCertAttemptResponse>,
+}
+
+/// One row of the standard (non-on-demand) renewal-attempt audit log, backing
+/// the domain detail page's renewal timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RenewalAttemptResponse {
+    pub id: i32,
+    /// `"request_challenge"` | `"complete_challenge"`.
+    pub stage: String,
+    /// `"http-01"` | `"dns-01"`.
+    pub verification_method: String,
+    /// `"success"` | `"failed"`.
+    pub outcome: String,
+    pub error: Option<String>,
+    pub error_type: Option<String>,
+    /// When the attempt was recorded (epoch millis).
+    pub created_at: i64,
+}
+
+impl From<temps_entities::renewal_attempts::Model> for RenewalAttemptResponse {
+    fn from(m: temps_entities::renewal_attempts::Model) -> Self {
+        Self {
+            id: m.id,
+            stage: m.stage,
+            verification_method: m.verification_method,
+            outcome: m.outcome,
+            error: m.error,
+            error_type: m.error_type,
+            created_at: m.created_at.timestamp_millis(),
+        }
+    }
+}
+
+/// Paginated renewal-attempt history for one domain, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListRenewalAttemptsResponse {
+    pub attempts: Vec<RenewalAttemptResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
 }

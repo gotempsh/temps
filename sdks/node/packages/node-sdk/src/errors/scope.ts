@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Breadcrumb, Event, Scope as IScope, User } from './types.js';
 
 export class Scope implements IScope {

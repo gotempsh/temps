@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::sync::Arc;
 
 use axum::{
@@ -10,7 +13,7 @@ use axum::{
 use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use temps_core::problemdetails::Problem;
-use temps_core::{AuditContext, RequestMetadata};
+use temps_core::{AuditContext, RequestMetadata, SensitiveAction};
 use tracing::{error, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -296,10 +299,74 @@ async fn complete_oidc_login(
 
     let return_to = OidcService::sanitize_return_to(login_state.return_to);
 
+    if user.must_change_password {
+        let reset_token = state
+            .auth_service
+            .create_required_password_change_token(user.id)
+            .await
+            .map_err(|error| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to create required password-change session for user {}: {error}",
+                    user.id
+                ),
+            })?;
+        let encrypted_token = state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
+            OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to encrypt required password-change session for user {}: {error}",
+                    user.id
+                ),
+            }
+        })?;
+        let password_change_cookie = Cookie::build(("password_change_session", encrypted_token))
+            .http_only(true)
+            .path("/")
+            .max_age(cookie::time::Duration::minutes(15))
+            .same_site(cookie::SameSite::Strict)
+            .secure(metadata.is_secure)
+            .build();
+        let cookie_header = password_change_cookie
+            .to_string()
+            .parse()
+            .map_err(|error| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to build required password-change cookie for user {}: {error}",
+                    user.id
+                ),
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(SET_COOKIE, cookie_header);
+
+        if let Err(error) = state
+            .audit_service
+            .create_audit_log(&LoginAudit {
+                context: AuditContext {
+                    user_id: user.id,
+                    ip_address: Some(metadata.ip_address.to_string()),
+                    user_agent: metadata.user_agent.as_str().to_string(),
+                },
+                success: true,
+                login_method: "oidc-password-change-required".to_string(),
+            })
+            .await
+        {
+            error!(
+                user_id = user.id,
+                error = %error,
+                "Failed to audit OIDC required password-change redirect"
+            );
+        }
+
+        return Ok((headers, Redirect::to("/auth/change-password")).into_response());
+    }
+
     if user.mfa_enabled {
         let mfa_token = state
             .auth_service
-            .create_mfa_session(user.id)
+            .create_mfa_session(user.id, "oidc")
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
@@ -432,6 +499,12 @@ pub async fn create_oidc_provider(
     Json(request): Json<CreateOidcProviderRequest>,
 ) -> Result<(StatusCode, Json<OidcProviderResponse>), Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::CreateOidcProvider,
+    )
+    .await?;
     let provider = state.oidc_service.create_provider(request).await?;
 
     if let Err(e) = state
@@ -508,6 +581,12 @@ pub async fn update_oidc_provider(
     Json(request): Json<UpdateOidcProviderRequest>,
 ) -> Result<Json<OidcProviderResponse>, Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::UpdateOidcProvider { provider_id },
+    )
+    .await?;
 
     // Capture which fields the PATCH touched *before* moving the
     // request into the service. The audit row is most useful when an
@@ -710,6 +789,12 @@ pub async fn create_oidc_role_mapping(
     Json(request): Json<CreateOidcRoleMappingRequest>,
 ) -> Result<(StatusCode, Json<OidcRoleMappingResponse>), Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::CreateOidcRoleMapping { provider_id },
+    )
+    .await?;
     let mapping = state
         .oidc_service
         .create_role_mapping(provider_id, request)
@@ -751,6 +836,12 @@ pub async fn delete_oidc_role_mapping(
     Path(mapping_id): Path<i32>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteOidcRoleMapping { mapping_id },
+    )
+    .await?;
     state.oidc_service.delete_role_mapping(mapping_id).await?;
 
     if let Err(e) = state

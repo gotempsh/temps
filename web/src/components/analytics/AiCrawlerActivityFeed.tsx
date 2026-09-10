@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
@@ -12,11 +15,12 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
+import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { Bot, ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
 import { useMemo } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router'
 
 const ALL = '__all__'
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const
@@ -196,7 +200,7 @@ export function AiCrawlerActivityFeed({
       ) : (
         <div className="divide-y rounded-md border">
           {logs.map((log) => (
-            <FeedRow key={log.id} log={log} />
+            <FeedRow key={log.request_id} log={log} />
           ))}
         </div>
       )}
@@ -268,7 +272,11 @@ function FeedRow({ log }: { log: ProxyLogResponse }) {
 
   return (
     <Link
-      to={`/proxy-logs/${log.id}?ts=${encodeURIComponent(log.timestamp)}`}
+      to={proxyLogDetailUrl({
+        requestId: log.request_id,
+        timestamp: log.timestamp,
+        projectId: log.project_id,
+      })}
       className="flex items-center gap-3 px-3 py-2.5 text-sm transition-colors hover:bg-muted/50"
     >
       <AiAgentLogo provider={providerName} agent={log.bot_name} size={22} />

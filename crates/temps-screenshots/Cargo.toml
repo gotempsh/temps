@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-screenshots"
 version.workspace = true
@@ -22,7 +25,7 @@ utoipa = { workspace = true }
 headless_chrome = {version ="1.0.18", features = ["fetch", "offline"] }
 reqwest = { workspace = true }
 url = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use serde_json;
 use temps_core::UtcDateTime;
@@ -297,4 +300,17 @@ pub trait Analytics: Send + Sync {
         page: u64,
         per_page: u64,
     ) -> Result<crate::types::responses::EventVisitorsResponse, AnalyticsError>;
+
+    /// Get a paginated list of raw event occurrences for a specific event name,
+    /// including each occurrence's custom JSON properties
+    async fn get_event_entries(
+        &self,
+        project_id: i32,
+        event_name: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        page: u64,
+        per_page: u64,
+    ) -> Result<crate::types::responses::EventEntriesResponse, AnalyticsError>;
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
@@ -8,6 +11,11 @@ use utoipa::ToSchema;
 pub enum StatusPageError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+    #[error("failed to construct the status-monitor HTTP client: {source}")]
+    HttpClientBuild {
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("Not found")]
     NotFound,
     #[error("Validation error: {0}")]
@@ -16,6 +24,41 @@ pub enum StatusPageError {
     InvalidRequest(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("environment {environment_id} does not belong to project {project_id}")]
+    EnvironmentNotInProject {
+        environment_id: i32,
+        project_id: i32,
+    },
+    #[error("monitor {monitor_id} does not belong to project {project_id}")]
+    MonitorNotInProject { monitor_id: i32, project_id: i32 },
+    #[error(
+        "failed to validate environment {environment_id} ownership for project {project_id}: {source}"
+    )]
+    EnvironmentOwnershipLookup {
+        environment_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to {operation} the managed monitor for environment {environment_id} in project {project_id}: {source}"
+    )]
+    ManagedMonitorReconciliation {
+        operation: &'static str,
+        environment_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to validate monitor {monitor_id} ownership for project {project_id}: {source}"
+    )]
+    MonitorOwnershipLookup {
+        monitor_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
 }
 
 /// Validate a status-monitor `check_path` to prevent URL/header injection
@@ -26,6 +69,8 @@ pub enum StatusPageError {
 /// - Must not contain `@` (prevents userinfo injection turning the probe
 ///   into a request against a different host)
 /// - Must not contain `://` (prevents scheme injection)
+/// - Must not contain query parameters or fragments (prevents credentials in
+///   the path from being copied into logs and persisted check errors)
 /// - Must not contain CR, LF, NUL, or tab (prevents request smuggling)
 /// - Capped at 2048 bytes
 pub fn validate_check_path(path: &str) -> Result<(), StatusPageError> {
@@ -48,6 +93,12 @@ pub fn validate_check_path(path: &str) -> Result<(), StatusPageError> {
     if path.contains("://") {
         return Err(StatusPageError::Validation(
             "check_path must not contain '://' (scheme injection)".to_string(),
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(StatusPageError::Validation(
+            "check_path must not contain query parameters or fragments; use a secret-free path"
+                .to_string(),
         ));
     }
     if path
@@ -97,8 +148,9 @@ mod check_path_tests {
     }
 
     #[test]
-    fn accepts_path_with_query_chars() {
-        assert!(validate_check_path("/api/v1/health?check=1&deep=true").is_ok());
+    fn rejects_path_with_query_or_fragment() {
+        assert!(validate_check_path("/api/v1/health?token=secret").is_err());
+        assert!(validate_check_path("/api/v1/health#details").is_err());
     }
 }
 

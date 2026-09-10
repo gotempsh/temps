@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-dns"
 version.workspace = true
@@ -42,10 +45,10 @@ hex = "0.4"
 
 # GCP service account authentication
 rsa = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 
 # XML parsing for Route53
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # URL encoding
 urlencoding = "2.1"
@@ -72,8 +75,9 @@ testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 temps-projects = { path = "../temps-projects" }
 wiremock = "0.6"
-serial_test = "3.2"
+serial_test = "4.0"
 mockall = "0.15"
+tower.workspace = true
 # ADR-024 integration test: in-process DNS client to query the real
 # control-plane resolver over a UDP socket (mirrors temps-dns-resolver's
 # own end_to_end.rs client).

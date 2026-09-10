@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end OTLP decode -> native ClickHouse store fidelity test.
 //!
 //! This proves the full claim "metrics are being stored": it feeds a *real*
@@ -226,8 +229,12 @@ async fn setup() -> Option<(
 
     let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
     let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
-    let storage =
-        ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
+    let storage = ClickHouseOtelStorage::new(
+        config,
+        inner,
+        Arc::new(temps_core::FixedRetentionResolver),
+        None,
+    );
 
     Some((storage, probe, Box::new(container)))
 }

@@ -1,6 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link, useNavigate } from 'react-router'
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   Box,
   ChevronDown,
@@ -40,13 +48,25 @@ import {
 } from '@/components/ui/alert-dialog'
 import {
   extendTimeoutMutation,
+  getApplicationWorkspaceOptions,
+  getGlobalAiWorkspaceOptions,
+  listApplicationsOptions,
   listSandboxesOptions,
   pauseSandboxMutation,
   restartSandboxMutation,
   resumeSandboxMutation,
   stopSandboxMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { toSandboxView, type SandboxView } from '@/components/sandboxes/helpers'
+import type {
+  ApplicationResponse,
+  ApplicationWorkspaceResponse,
+} from '@/api/client'
+import {
+  toSandboxView,
+  isSandboxExpired,
+  isWorkspace,
+  type SandboxView,
+} from '@/components/sandboxes/helpers'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
 
 function statusVariant(
@@ -56,7 +76,11 @@ function statusVariant(
     case 'running':
       return 'success'
     case 'stopped':
+    case 'sleeping':
       return 'warning'
+    case 'recovering':
+      return 'secondary'
+    case 'failed':
     case 'destroyed':
       return 'destructive'
     default:
@@ -127,15 +151,6 @@ const PAGE_SIZE = 20
 
 type StatusFilter = 'active' | 'expired' | 'all'
 
-// Expired = either status explicitly says so OR the timer has elapsed.
-// Stopped sandboxes whose timer is still running count as active — they
-// can still be resumed. Destroyed rows are hidden from Active but live
-// under Expired for audit.
-function isExpired(s: SandboxView, now: number): boolean {
-  if (s.status === 'destroyed') return true
-  return new Date(s.expires_at).getTime() <= now
-}
-
 export default function Sandboxes() {
   usePageTitle('Sandboxes')
   const [page, setPage] = useState(1)
@@ -150,6 +165,48 @@ export default function Sandboxes() {
     ...listQuery,
     refetchInterval: 15_000,
   })
+
+  const applicationsQuery = useQuery({
+    ...listApplicationsOptions(),
+    refetchInterval: 15_000,
+  })
+  const applications = applicationsQuery.data ?? []
+  const applicationWorkspaceQueries = useQueries({
+    queries: applications.map((application) => ({
+      ...getApplicationWorkspaceOptions({
+        path: { application_public_id: application.public_id },
+      }),
+      refetchInterval: 15_000,
+    })),
+  })
+  const managedWorkspaces = applications.map((application, index) => ({
+    application,
+    workspace: applicationWorkspaceQueries[index]?.data ?? null,
+  }))
+  const globalWorkspaceQuery = useQuery({
+    ...getGlobalAiWorkspaceOptions(),
+    refetchInterval: 15_000,
+  })
+  const managedWorkspacesLoading =
+    applicationsQuery.isLoading ||
+    applicationWorkspaceQueries.some((query) => query.isLoading) ||
+    globalWorkspaceQuery.isLoading
+  const managedWorkspacesError =
+    applicationsQuery.isError ||
+    applicationWorkspaceQueries.some((query) => query.isError) ||
+    globalWorkspaceQuery.isError
+  const refreshing =
+    isFetching ||
+    applicationsQuery.isFetching ||
+    applicationWorkspaceQueries.some((query) => query.isFetching) ||
+    globalWorkspaceQuery.isFetching
+
+  const refreshAll = () => {
+    void refetch()
+    void applicationsQuery.refetch()
+    void globalWorkspaceQuery.refetch()
+    for (const query of applicationWorkspaceQueries) void query.refetch()
+  }
 
   const items: SandboxView[] = (data?.sandboxes ?? []).map(toSandboxView)
   const hasNext = data?.pagination?.next != null
@@ -169,7 +226,7 @@ export default function Sandboxes() {
     let expired = 0
     const visible: SandboxView[] = []
     for (const s of items) {
-      const exp = isExpired(s, now)
+      const exp = isSandboxExpired(s, now)
       if (exp) expired += 1
       else active += 1
       if (
@@ -197,13 +254,14 @@ export default function Sandboxes() {
   })
 
   return (
-    <div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8 space-y-6">
+    <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
       {/* Page header — canonical pattern from DESIGN.md §4.4 */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Sandboxes</h1>
           <p className="text-sm text-muted-foreground">
-            Standalone containers for one-off commands, tests, or agent work.
+            Isolated compute for persistent application workspaces and one-off
+            tasks.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -244,15 +302,32 @@ export default function Sandboxes() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => refetch()}
-            disabled={isFetching}
+            onClick={refreshAll}
+            disabled={refreshing}
           >
             <RefreshCw
-              className={`mr-1.5 h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+              className={`mr-1.5 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
             />
             <span className="hidden sm:inline">Refresh</span>
           </Button>
         </div>
+      </div>
+
+      <ManagedApplicationWorkspaces
+        entries={managedWorkspaces}
+        error={managedWorkspacesError}
+        globalWorkspace={globalWorkspaceQuery.data ?? null}
+        loading={managedWorkspacesLoading}
+      />
+
+      <div className="space-y-1 border-t pt-6">
+        <h2 className="text-base font-semibold tracking-tight">
+          Standalone sandboxes
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Sandboxes you create and control directly through the CLI, API, or
+          SDK.
+        </p>
       </div>
 
       {isLoading ? (
@@ -399,6 +474,208 @@ export default function Sandboxes() {
   )
 }
 
+type ManagedWorkspaceEntry = {
+  application: ApplicationResponse
+  workspace: ApplicationWorkspaceResponse | null
+}
+
+function ManagedApplicationWorkspaces({
+  entries,
+  globalWorkspace,
+  loading,
+  error,
+}: {
+  entries: ManagedWorkspaceEntry[]
+  globalWorkspace: ApplicationWorkspaceResponse | null
+  loading: boolean
+  error: boolean
+}) {
+  if (!loading && !error && entries.length === 0 && !globalWorkspace)
+    return null
+
+  return (
+    <section
+      aria-labelledby="application-workspaces-title"
+      className="space-y-3"
+    >
+      <div className="flex items-end justify-between gap-3">
+        <div className="space-y-1">
+          <h2
+            className="text-base font-semibold tracking-tight"
+            id="application-workspaces-title"
+          >
+            Managed AI workspaces
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Persistent sandboxes that Temps wakes and recovers for global and
+            application chats.
+          </p>
+        </div>
+        {entries.length > 0 && (
+          <Badge variant="secondary" className="shrink-0 tabular-nums">
+            {entries.length + (globalWorkspace ? 1 : 0)}
+          </Badge>
+        )}
+      </div>
+
+      {loading && entries.length === 0 ? (
+        <div className="space-y-3" aria-label="Loading application workspaces">
+          {Array.from({ length: 2 }).map((_, index) => (
+            <Card key={index}>
+              <CardContent className="space-y-3 py-4">
+                <div className="h-5 w-52 animate-pulse rounded bg-muted" />
+                <div className="h-3 w-36 animate-pulse rounded bg-muted" />
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {globalWorkspace && (
+            <ManagedGlobalWorkspaceRow workspace={globalWorkspace} />
+          )}
+          {entries.map(({ application, workspace }) => (
+            <ManagedApplicationWorkspaceRow
+              application={application}
+              key={application.public_id}
+              workspace={workspace}
+            />
+          ))}
+        </div>
+      )}
+
+      {error && (
+        <p className="text-sm text-destructive">
+          Some managed workspaces could not be loaded with your current
+          permissions.
+        </p>
+      )}
+    </section>
+  )
+}
+
+export function ManagedApplicationWorkspaceRow({
+  application,
+  workspace,
+}: ManagedWorkspaceEntry) {
+  return (
+    <ManagedWorkspaceRow
+      href={`/ai-first?application=${encodeURIComponent(application.public_id)}`}
+      name={application.name}
+      notStartedMessage="Sandbox starts on the first application turn"
+      workspace={workspace}
+    />
+  )
+}
+
+export function ManagedGlobalWorkspaceRow({
+  workspace,
+}: {
+  workspace: ApplicationWorkspaceResponse
+}) {
+  return (
+    <ManagedWorkspaceRow
+      href="/ai-first?scope=global"
+      name="Global AI workspace"
+      notStartedMessage="Sandbox starts on the first global AI turn"
+      workspace={workspace}
+    />
+  )
+}
+
+function ManagedWorkspaceRow({
+  name,
+  href,
+  notStartedMessage,
+  workspace,
+}: {
+  name: string
+  href: string
+  notStartedMessage: string
+  workspace: ApplicationWorkspaceResponse | null
+}) {
+  const state = workspace?.sandbox_public_id
+    ? workspace.state
+    : workspace
+      ? 'not started'
+      : 'loading'
+  const sleeping = state === 'sleeping'
+
+  return (
+    <Card>
+      <CardContent className="space-y-3 py-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <Link
+                className="truncate font-semibold leading-none hover:underline"
+                to={href}
+              >
+                {name}
+              </Link>
+              <Badge
+                title={
+                  sleeping
+                    ? 'Compute is suspended while idle and wakes automatically on the next AI turn or workspace operation'
+                    : undefined
+                }
+                variant={statusVariant(state)}
+              >
+                {sleeping ? 'sleeping · wakes automatically' : state}
+              </Badge>
+              <Badge
+                title="Lifecycle, recovery, and persistent storage are controlled by Temps"
+                variant="outline"
+              >
+                Managed by Temps
+              </Badge>
+            </div>
+            <p className="truncate font-mono text-xs text-muted-foreground">
+              {workspace?.sandbox_public_id ?? notStartedMessage}
+            </p>
+            {sleeping && (
+              <p className="text-xs text-muted-foreground">
+                Files stay persistent. The next AI turn, terminal, file, or
+                preview request resumes this workspace.
+              </p>
+            )}
+          </div>
+          <Button asChild className="shrink-0" size="sm" variant="outline">
+            <Link to={href}>Manage workspace</Link>
+          </Button>
+        </div>
+
+        {workspace && (
+          <dl className="grid grid-cols-1 gap-2 border-t pt-3 text-sm sm:grid-cols-3">
+            <div className="min-w-0">
+              <dt className="text-xs text-muted-foreground">Runtime</dt>
+              <dd className="truncate font-mono text-xs">
+                {workspace.runtime}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-xs text-muted-foreground">Databases</dt>
+              <dd className="text-xs tabular-nums">
+                {workspace.data_network_service_count} connected
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-xs text-muted-foreground">
+                Persistent files
+              </dt>
+              <dd className="text-xs">
+                {workspace.persistent_volume_healthy
+                  ? 'Healthy'
+                  : 'Needs attention'}
+              </dd>
+            </div>
+          </dl>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 /**
  * One sandbox row-card. Each row owns its own mutations so a slow
  * operation on one sandbox doesn't block actions on another (a pending
@@ -471,7 +748,10 @@ function SandboxRow({
   const hasPreview = Boolean(sandbox.preview_url_template) && running
 
   const timeLeft = !destroyed ? formatCountdown(sandbox.expires_at, now) : '—'
-  const expired = !destroyed && new Date(sandbox.expires_at).getTime() <= now
+  const workspace = isWorkspace(sandbox)
+  const expired = isSandboxExpired(sandbox, now)
+  const idleDeadlineReached =
+    workspace && new Date(sandbox.expires_at).getTime() <= now
 
   const openPort = (port: number) => {
     if (!sandbox.preview_url_template || port < 1 || port > 65535) return
@@ -511,8 +791,19 @@ function SandboxRow({
                 {sandbox.name}
               </Link>
               <Badge variant={statusVariant(sandbox.status)}>
-                {sandbox.status}
+                {workspace && stopped ? 'sleeping' : sandbox.status}
               </Badge>
+              {/* A workspace behaves differently from an ephemeral sandbox —
+                  it wakes on access instead of erroring — so it has to look
+                  different, or "stopped" reads as broken rather than idle. */}
+              {isWorkspace(sandbox) && (
+                <Badge
+                  variant="outline"
+                  title="Persistent workspace: suspends when idle, wakes on the next command"
+                >
+                  workspace
+                </Badge>
+              )}
               {sandbox.image && (
                 <span className="font-mono text-xs text-muted-foreground truncate">
                   {sandbox.image}
@@ -656,18 +947,29 @@ function SandboxRow({
           >
             <div className="flex items-center gap-4 flex-wrap pt-2">
               <div className="flex items-center gap-2">
+                {/* For a workspace this clock counts down to *suspension*,
+                    not destruction, and a suspended one wakes on the next
+                    command — so it is never shown in destructive red. */}
                 <Timer
                   className={`h-4 w-4 ${
-                    expired ? 'text-destructive' : 'text-muted-foreground'
+                    expired && !workspace
+                      ? 'text-destructive'
+                      : 'text-muted-foreground'
                   }`}
                 />
                 <div className="leading-tight">
                   <div
                     className={`font-mono text-xs tabular-nums ${
-                      expired ? 'text-destructive' : ''
+                      expired && !workspace ? 'text-destructive' : ''
                     }`}
                   >
-                    {expired ? 'expired' : `${timeLeft} left`}
+                    {workspace && stopped
+                      ? 'sleeping — wakes on next use'
+                      : idleDeadlineReached
+                        ? 'suspending idle compute…'
+                        : expired
+                          ? 'expired'
+                          : `${timeLeft} ${workspace ? 'to suspend' : 'left'}`}
                   </div>
                   <div className="text-xs text-muted-foreground">
                     created {formatAge(sandbox.created_at, now)}

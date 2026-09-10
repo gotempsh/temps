@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node management service — CRUD operations for the `nodes` table.
 
 use sea_orm::{
@@ -26,8 +29,49 @@ pub enum NodeError {
     #[error("Node '{name}' is currently active; re-registering a different identity (token/address/WireGuard key) requires proof of the current token, or the node must be drained/removed first")]
     IdentityConflict { name: String },
 
+    #[error("Identity '{claimed}' is already held by node '{owner}'; a node cannot register under another node's name or address")]
+    IdentityClaimed { claimed: String, owner: String },
+
+    #[error(
+        "No node can run this image: it was built for [{image_platforms}], \
+         the control plane runs {local_platform}, and no active worker node \
+         reports a matching architecture"
+    )]
+    NoCompatibleNode {
+        /// Platforms the image exists for, comma-separated.
+        image_platforms: String,
+        /// Platform of the control plane, or "unknown" when not declared.
+        local_platform: String,
+    },
+
+    #[error(
+        "{replicas} replicas requested with anti-affinity, but only {available} node(s) \
+         can run this image ({excluded}). Set replicas to {available}, add a compatible \
+         node, or disable anti-affinity to stack replicas on the nodes you have"
+    )]
+    InsufficientCompatibleNodes {
+        /// Replicas the deployment asked for.
+        replicas: u32,
+        /// Nodes that can actually run the image.
+        available: usize,
+        /// What was dropped from the pool and why, already formatted.
+        excluded: String,
+    },
+
+    #[error(
+        "Placement constraints selected node(s) that cannot run this image ({excluded}); \
+         refusing to ignore the requested placement"
+    )]
+    PlacementConstraintsUnsatisfied {
+        /// Constrained nodes that were dropped from the pool and why.
+        excluded: String,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("Failed to read DNS registry: {0}")]
+    DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
 /// Request to register a new worker node.
@@ -45,11 +89,25 @@ pub struct RegisterNodeRequest {
     pub labels: serde_json::Value,
     /// X25519 public key for ECIES certificate encryption (edge nodes only)
     pub edge_public_key: Option<String>,
+    /// Container platform of the node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). `None` from agents older than multi-arch support —
+    /// the next heartbeat fills it in.
+    pub architecture: Option<String>,
     /// SHA-256 hash of the node's *current* token, supplied to prove possession
     /// when re-registering (changing identity) a node that already exists.
     /// `None` for first-time registration or when no proof is offered.
     /// (ADR-020 WS-1.2 / enroll-1.)
     pub prior_token_hash: Option<String>,
+}
+
+/// A node's container platform changed (or was reported for the first time).
+#[derive(Debug, Clone)]
+pub struct ArchitectureChange {
+    pub node_id: i32,
+    pub node_name: String,
+    /// `None` when the node had never reported a platform.
+    pub from: Option<String>,
+    pub to: String,
 }
 
 /// Request to update a node's heartbeat.
@@ -58,6 +116,29 @@ pub struct HeartbeatRequest {
     pub capacity: serde_json::Value,
     /// Updated labels from the agent (allows runtime label changes without re-registration).
     pub labels: Option<serde_json::Value>,
+    /// Container platform reported by the agent (`linux/amd64`, `linux/arm64`).
+    /// `None` from a pre-multi-arch agent; in that case the stored value is
+    /// left untouched rather than cleared, so an operator-set value survives.
+    pub architecture: Option<String>,
+    /// DNS resolver health reported by the agent (ADR-024). `None` from an
+    /// agent binary older than this feature, or a tick that raced before the
+    /// agent's network-sync loop first ran — in both cases the stored
+    /// columns are left untouched rather than cleared, same treatment as
+    /// `architecture` above.
+    pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+}
+
+/// Service-layer view of the agent-reported DNS resolver health, decoupled
+/// from the wire DTO (`handlers::nodes::DnsResolverHeartbeat`) per the
+/// three-layer architecture — handlers convert one to the other.
+#[derive(Debug, Clone)]
+pub struct DnsResolverHeartbeatUpdate {
+    pub running: bool,
+    pub tasks_alive: bool,
+    pub last_sync_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub consecutive_sync_failures: i32,
+    pub last_sync_error: Option<String>,
+    pub record_count: i32,
 }
 
 /// A node whose last heartbeat is within this window (and still marked
@@ -78,6 +159,48 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Which of the identities a registration claims collides with `owner`'s.
+/// Pure so the cross-field matching rule (a *name* may collide with another
+/// node's *address*, and vice versa) is testable without a database.
+fn identity_conflict_value(
+    claimed: &[String],
+    owner_name: &str,
+    owner_address: &str,
+    owner_private_address: &str,
+) -> Option<String> {
+    // Case-insensitive, matching the DB-side comparison. DNS name verification
+    // in rustls is case-insensitive, so `Worker-1` and `worker-1` are the same
+    // identity for mTLS server-name checking even though Postgres `=` on text
+    // says otherwise.
+    let matches = |value: &String, other: &str| value.eq_ignore_ascii_case(other);
+    claimed
+        .iter()
+        .find(|value| {
+            matches(value, owner_name)
+                || matches(value, owner_address)
+                || matches(value, owner_private_address)
+        })
+        .cloned()
+}
+
+/// Cap for `nodes.dns_resolver_last_error`, mirrored from
+/// `temps_dns_resolver::sync_client::SYNC_ERROR_REASON_MAX_BYTES` — the
+/// agent should already send a short reason, but the control plane must not
+/// trust that unconditionally.
+const DNS_ERROR_MAX_BYTES: usize = 512;
+
+/// Truncate to a char boundary at or before `DNS_ERROR_MAX_BYTES`.
+fn truncate_dns_error(reason: &str) -> String {
+    if reason.len() <= DNS_ERROR_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = DNS_ERROR_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &reason[..end])
+}
+
 pub struct NodeService {
     db: Arc<DatabaseConnection>,
 }
@@ -85,6 +208,95 @@ pub struct NodeService {
 impl NodeService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    /// Reject a registration that claims an identity another node already
+    /// holds — its name, its reachable address, or its mesh address.
+    ///
+    /// The cluster CA derives every SAN from these three fields, and
+    /// `san_from_str` emits an *IP* SAN when the value parses as an address,
+    /// so a name is as much an identity as an address is. Cross-checking all
+    /// three against all three is what makes "register under a fresh name,
+    /// claim the victim's IP" impossible rather than merely awkward.
+    ///
+    /// `self_node_id` is the row this registration legitimately owns (the
+    /// same-name reconnection resolved by the caller), excluded so a node
+    /// re-registering with its own unchanged identity is not blocked by
+    /// itself.
+    async fn assert_identity_unclaimed(
+        &self,
+        request: &RegisterNodeRequest,
+        self_node_id: Option<i32>,
+    ) -> Result<(), NodeError> {
+        let claimed: Vec<String> = [
+            request.name.trim(),
+            request.address.trim(),
+            request.private_address.trim(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect();
+
+        if claimed.is_empty() {
+            return Ok(());
+        }
+
+        // Compare case-insensitively. `is_in` is Postgres `=` on text, which is
+        // case-sensitive — so registering as `Worker-1` while `worker-1` exists
+        // walked straight past this guard and still got a CA-signed certificate
+        // whose DNS SAN matches the victim's name, which is the SAN-squatting
+        // the guard exists to stop.
+        let claimed_lower: Vec<String> = claimed.iter().map(|v| v.to_lowercase()).collect();
+        let mut query = nodes::Entity::find().filter(
+            sea_orm::Condition::any()
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::Name),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                )
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::Address),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                )
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::PrivateAddress),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                ),
+        );
+        if let Some(self_node_id) = self_node_id {
+            query = query.filter(nodes::Column::Id.ne(self_node_id));
+        }
+
+        let owner = query.one(self.db.as_ref()).await?;
+        if let Some(owner) = owner {
+            let conflict = identity_conflict_value(
+                &claimed,
+                &owner.name,
+                &owner.address,
+                &owner.private_address,
+            )
+            .unwrap_or_else(|| request.name.clone());
+
+            tracing::warn!(
+                owner_node_id = owner.id,
+                owner_node_name = %owner.name,
+                claimed = %conflict,
+                requested_name = %request.name,
+                "Rejected node registration: identity already held by another node (possible CA SAN squatting)"
+            );
+            return Err(NodeError::IdentityClaimed {
+                claimed: conflict,
+                owner: owner.name,
+            });
+        }
+
+        Ok(())
     }
 
     /// Register a new node in the cluster.
@@ -118,6 +330,19 @@ impl NodeService {
         let existing = nodes::Entity::find()
             .filter(nodes::Column::Name.eq(&request.name))
             .one(self.db.as_ref())
+            .await?;
+
+        // Nothing about the enrollment proves the caller *owns* the identity
+        // it asks for, and the cluster CA signs SANs derived from exactly
+        // these three fields — including the name, which `san_from_str` turns
+        // into an IP SAN when it parses as an address. So a holder of a valid
+        // join token could register under a fresh name while claiming a
+        // victim node's address and walk away with a CA-signed certificate for
+        // the victim's identity, good enough to satisfy mTLS server-name
+        // verification. Identities are therefore exclusive: no registration
+        // may name, or address itself as, an identity another node already
+        // holds.
+        self.assert_identity_unclaimed(&request, existing.as_ref().map(|node| node.id))
             .await?;
 
         if let Some(existing_node) = existing {
@@ -181,6 +406,12 @@ impl NodeService {
             active.wg_public_key = Set(request.wg_public_key);
             active.labels = Set(request.labels);
             active.edge_public_key = Set(request.edge_public_key);
+            // Only overwrite a known architecture when the agent actually
+            // reported one — a pre-multi-arch agent re-joining must not wipe
+            // the platform we already learned.
+            if let Some(architecture) = request.architecture {
+                active.architecture = Set(Some(architecture));
+            }
             active.status = Set("active".to_string());
             active.last_heartbeat = Set(Some(chrono::Utc::now()));
 
@@ -210,6 +441,7 @@ impl NodeService {
             capacity: Set(serde_json::json!({})),
             last_heartbeat: Set(Some(chrono::Utc::now())),
             edge_public_key: Set(request.edge_public_key),
+            architecture: Set(request.architecture),
             ..Default::default()
         };
 
@@ -227,11 +459,18 @@ impl NodeService {
     }
 
     /// Update a node's heartbeat timestamp and capacity metrics.
+    /// Record a heartbeat.
+    ///
+    /// Returns the architecture transition when the node reported a platform
+    /// different from the stored one (`None` on the left the first time it
+    /// reports at all). The caller audits it: the field decides where images
+    /// are placed and is supplied by the node itself, so a change is a
+    /// security-relevant event, not just a log line.
     pub async fn heartbeat(
         &self,
         node_id: i32,
         request: HeartbeatRequest,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Option<ArchitectureChange>, NodeError> {
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await?
@@ -248,9 +487,58 @@ impl NodeService {
         if let Some(labels) = request.labels {
             active.labels = Set(labels);
         }
+        // Same rule as registration: absent means "not reported", not "unset".
+        let mut architecture_change = None;
+        if let Some(architecture) = request.architecture {
+            if node.architecture.as_deref() != Some(architecture.as_str()) {
+                tracing::info!(
+                    node_id,
+                    node_name = %node.name,
+                    previous = ?node.architecture,
+                    architecture = %architecture,
+                    "Node container platform recorded"
+                );
+                architecture_change = Some(ArchitectureChange {
+                    node_id,
+                    node_name: node.name.clone(),
+                    from: node.architecture.clone(),
+                    to: architecture.clone(),
+                });
+            }
+            active.architecture = Set(Some(architecture));
+        }
+        // Same rule as architecture: absent means "not reported this beat",
+        // not "resolver is down" — an older agent binary, or a heartbeat
+        // that raced ahead of the agent's own network-sync loop, must not
+        // wipe out the last known resolver state.
+        if let Some(dns) = request.dns_resolver {
+            active.dns_resolver_running = Set(Some(dns.running));
+            active.dns_resolver_tasks_alive = Set(Some(dns.tasks_alive));
+            // A resolver that just self-healed after a crash is `running`
+            // but hasn't completed its first sync yet, so this heartbeat's
+            // `last_sync_success_at` is `None` even though the DB already
+            // holds a good prior timestamp. Only overwrite when there's a
+            // real newer timestamp, or when the resolver isn't running at
+            // all (in which case the old timestamp is genuinely stale) —
+            // never regress a known-good sync time to NULL just because
+            // the resolver is mid-recovery, which downstream consumers
+            // (the CLI's health classifier) would misread as "healthy".
+            if dns.last_sync_success_at.is_some() || !dns.running {
+                active.dns_resolver_last_sync_at = Set(dns.last_sync_success_at);
+            }
+            active.dns_resolver_consecutive_failures = Set(dns.consecutive_sync_failures);
+            // Defensive clamp on top of the agent's own truncation
+            // (`temps_dns_resolver::sync_client::truncate_reason`) — an
+            // older or buggy agent binary shouldn't be able to write an
+            // unbounded string into this column just because it skipped
+            // that step.
+            active.dns_resolver_last_error =
+                Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
+            active.dns_resolver_record_count = Set(Some(dns.record_count));
+        }
         active.update(self.db.as_ref()).await?;
 
-        Ok(())
+        Ok(architecture_change)
     }
 
     /// Get a node by its ID.
@@ -318,6 +606,17 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
         Ok(nodes)
+    }
+
+    /// Total DNS records currently registered in the cluster zone (ADR-024).
+    /// Thin delegation to `temps_dns::DnsRegistry` — kept here so the
+    /// `cluster_dns_status` handler goes through this service like it
+    /// already does for `list_all`, rather than constructing the
+    /// data-access-layer `DnsRegistry` type directly.
+    pub async fn total_dns_record_count(&self) -> Result<i64, NodeError> {
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        let count = dns_registry.total_record_count().await?;
+        Ok(count)
     }
 
     /// List only active nodes (heartbeat within the threshold).
@@ -417,7 +716,7 @@ impl NodeService {
 
             tracing::info!(
                 node_id = node_id,
-                "Node drain complete — all containers migrated, status set to drained"
+                "Node drain source cleanup complete — no containers remain, status set to drained"
             );
             return Ok(true);
         }
@@ -695,12 +994,98 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    /// A node registering under a fresh name must not be able to claim
+    /// another node's address — the cluster CA signs SANs built from exactly
+    /// these fields, so that certificate would be good for the victim's
+    /// identity. Name-vs-address is checked crosswise because `san_from_str`
+    /// emits an IP SAN for a name that parses as an address.
+    #[test]
+    fn identity_conflicts_are_detected_across_fields() {
+        let owner_name = "worker-1";
+        let owner_address = "203.0.113.7";
+        let owner_private = "10.44.0.2";
+
+        // Claiming the victim's public address under a different name.
+        assert_eq!(
+            super::identity_conflict_value(
+                &["attacker".to_string(), "203.0.113.7".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("203.0.113.7".to_string())
+        );
+
+        // Claiming the victim's address as a *name* (becomes an IP SAN).
+        assert_eq!(
+            super::identity_conflict_value(
+                &["10.44.0.2".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("10.44.0.2".to_string())
+        );
+
+        // Claiming the victim's name.
+        assert_eq!(
+            super::identity_conflict_value(
+                &["worker-1".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("worker-1".to_string())
+        );
+
+        // A genuinely distinct identity is not a conflict.
+        assert_eq!(
+            super::identity_conflict_value(
+                &[
+                    "worker-2".to_string(),
+                    "203.0.113.9".to_string(),
+                    "10.44.0.3".to_string()
+                ],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            None
+        );
+    }
+
+    /// Node names are matched case-insensitively: DNS labels are, and the
+    /// database column is not `citext`, so `Worker-1` would otherwise register
+    /// alongside `worker-1` and get a certificate for the same identity.
+    #[test]
+    fn identity_conflicts_ignore_name_case() {
+        assert_eq!(
+            super::identity_conflict_value(
+                &["Worker-1".to_string()],
+                "worker-1",
+                "203.0.113.7",
+                "10.44.0.2",
+            ),
+            Some("Worker-1".to_string())
+        );
+        assert_eq!(
+            super::identity_conflict_value(
+                &["worker-1".to_string()],
+                "WORKER-1",
+                "203.0.113.7",
+                "10.44.0.2",
+            ),
+            Some("worker-1".to_string())
+        );
+    }
+
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::deployments;
 
     fn sample_node() -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id: 1,
             name: "worker-1".to_string(),
             token_hash: "hash123".to_string(),
@@ -717,6 +1102,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -725,6 +1116,7 @@ mod tests {
     /// Build a register request with sensible defaults for tests.
     fn register_req(name: &str, token_hash: &str, address: &str) -> RegisterNodeRequest {
         RegisterNodeRequest {
+            architecture: None,
             name: name.to_string(),
             token_hash: token_hash.to_string(),
             token_encrypted: None,
@@ -770,6 +1162,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![offline]]) // find by name
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -792,6 +1185,7 @@ mod tests {
         // is not an identity change and is always allowed, even while live.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -803,12 +1197,34 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// End-to-end through `register`: a brand-new name whose address belongs
+    /// to an existing node is refused, so the cluster CA is never asked to
+    /// sign a SAN for the victim's address.
+    #[tokio::test]
+    async fn test_register_rejects_claiming_another_nodes_address() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // no node named "attacker"
+            .append_query_results(vec![vec![sample_node()]]) // ...but its address is taken
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let result = service
+            .register(register_req("attacker", "hash", "https://10.100.0.2:3100"))
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            NodeError::IdentityClaimed { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn test_register_rejects_identity_change_on_live_node() {
         // A live node (active + recent heartbeat) cannot have its identity
         // silently rebound by a join-token holder with no proof. (enroll-1.)
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
@@ -832,6 +1248,7 @@ mod tests {
         // of the node's current token.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -1121,8 +1538,10 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
+                    dns_resolver: None,
                 },
             )
             .await;
@@ -1147,12 +1566,213 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
+                    dns_resolver: None,
                 },
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Heartbeat DNS resolver health persistence ──────────────────
+
+    /// A heartbeat carrying `dns_resolver: Some(..)` must write every one of
+    /// its fields onto the node row.
+    #[tokio::test]
+    async fn test_heartbeat_persists_dns_resolver_fields_when_present() {
+        let node = sample_node();
+        let updated = sample_node();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: Some(DnsResolverHeartbeatUpdate {
+                        running: true,
+                        tasks_alive: false,
+                        last_sync_success_at: None,
+                        consecutive_sync_failures: 4,
+                        last_sync_error: Some("resolver crashed: too many open files".into()),
+                        record_count: 37,
+                    }),
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        let sql = &update.statements()[0].sql;
+        for column in [
+            "\"dns_resolver_running\" =",
+            "\"dns_resolver_tasks_alive\" =",
+            "\"dns_resolver_consecutive_failures\" =",
+            "\"dns_resolver_last_error\" =",
+            "\"dns_resolver_record_count\" =",
+        ] {
+            assert!(sql.contains(column), "UPDATE must assign {column}: {sql}");
+        }
+        // The SET clause only carries bound placeholders ($N); the actual
+        // reported values live in `Statement::values`, so check those
+        // (bare, no quoting concerns — unlike the SQL text above).
+        let rendered = format!("{:?}", update.statements()[0]);
+        assert!(
+            rendered.contains("resolver crashed: too many open files"),
+            "UPDATE must carry the reported error text: {rendered}"
+        );
+        assert!(
+            rendered.contains("37"),
+            "UPDATE must carry the reported record count: {rendered}"
+        );
+    }
+
+    /// A heartbeat with `dns_resolver: None` (older agent, or a tick that
+    /// raced ahead of the agent's own network-sync loop) must NOT blank out
+    /// previously reported resolver health. Sea-ORM's `Model -> ActiveModel`
+    /// conversion marks every column `Unchanged` by default, so a column we
+    /// never call `.set()` on is dropped from the `UPDATE ... SET` clause
+    /// entirely — the strongest form of "leave unchanged": the existing DB
+    /// value is never even sent, let alone overwritten.
+    #[tokio::test]
+    async fn test_heartbeat_preserves_dns_resolver_fields_when_absent() {
+        let mut node = sample_node();
+        node.dns_resolver_running = Some(true);
+        node.dns_resolver_tasks_alive = Some(true);
+        node.dns_resolver_consecutive_failures = 2;
+        node.dns_resolver_last_error = Some("stale error from three beats ago".into());
+        node.dns_resolver_record_count = Some(9);
+        let updated = node.clone();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: None,
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        // Raw `sql` (not the Debug-formatted `Statement`, whose embedded
+        // double-quoted identifiers get backslash-escaped by `String`'s
+        // `Debug` impl and would make a literal `"col" =` pattern never
+        // match) so the SET-clause check below compares real characters.
+        let sql = &update.statements()[0].sql;
+        assert!(
+            sql.contains("SET \"capacity\""),
+            "sanity check: the UPDATE must still exist and set capacity: {sql}"
+        );
+        for column in [
+            "\"dns_resolver_running\" =",
+            "\"dns_resolver_tasks_alive\" =",
+            "\"dns_resolver_last_sync_at\" =",
+            "\"dns_resolver_consecutive_failures\" =",
+            "\"dns_resolver_last_error\" =",
+            "\"dns_resolver_record_count\" =",
+        ] {
+            assert!(
+                !sql.contains(column),
+                "a None dns_resolver must not assign {column} at all: {sql}"
+            );
+        }
+    }
+
+    /// A resolver that just self-healed after a crash reports `running:
+    /// true` but `last_sync_success_at: None` (it hasn't completed its
+    /// first sync tick yet). This must NOT regress a previously stored,
+    /// known-good `dns_resolver_last_sync_at` to NULL — that would make
+    /// the CLI's health classifier misreport the mid-recovery window as
+    /// "healthy" instead of showing the resolver is still catching up.
+    #[tokio::test]
+    async fn test_heartbeat_does_not_wipe_last_sync_at_when_restarted_resolver_has_not_synced_yet()
+    {
+        let mut node = sample_node();
+        node.dns_resolver_running = Some(true);
+        node.dns_resolver_last_sync_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let updated = node.clone();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: Some(DnsResolverHeartbeatUpdate {
+                        running: true,
+                        tasks_alive: true,
+                        last_sync_success_at: None,
+                        consecutive_sync_failures: 0,
+                        last_sync_error: None,
+                        record_count: 0,
+                    }),
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        let sql = &update.statements()[0].sql;
+        // The resolver is still `running`, so the "just went down" escape
+        // hatch doesn't apply — `last_sync_success_at` being `None` must
+        // NOT be assigned onto the row, leaving the previously stored
+        // timestamp untouched.
+        assert!(
+            !sql.contains("\"dns_resolver_last_sync_at\" ="),
+            "a restarted-but-not-yet-synced resolver must not wipe the \
+             existing dns_resolver_last_sync_at: {sql}"
+        );
+        // Other DNS fields on a real heartbeat still update normally.
+        assert!(
+            sql.contains("\"dns_resolver_running\" ="),
+            "dns_resolver_running must still be assigned: {sql}"
+        );
     }
 
     // ── AffectedDeployment unit tests ──────────────────────────────

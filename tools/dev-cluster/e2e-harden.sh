@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # From-scratch e2e for the multi-node hardening branch: fresh cluster (rebuilt
 # from this worktree), require_mtls on, 2 workers join over mTLS, deploy a
 # 2-replica app spread across them, verify it serves. Plus the new security

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared host-port selection helpers for Docker-backed services.
 //!
 //! Picking a free host port for a container is inherently racy: we can check
@@ -32,8 +35,26 @@ static NEXT_OFFSET: AtomicU16 = AtomicU16::new(0);
 
 /// Returns `true` if the OS will let us bind the port right now. This does not
 /// reserve the port — see the module docs for why that matters.
+///
+/// Both the wildcard address and loopback are probed, because these containers
+/// publish to `127.0.0.1` (see `utils::local_port_binding`) and a successful
+/// `0.0.0.0` bind is not evidence that `127.0.0.1` is free. `TcpListener::bind`
+/// sets `SO_REUSEADDR` on Unix, so binding the wildcard address can succeed
+/// while another process already holds the same port on loopback — an SSH
+/// tunnel forwarding it, for example. Checking only `0.0.0.0` therefore hands
+/// back a port Docker then fails to bind when the container starts:
+/// `ports are not available: exposing port TCP 127.0.0.1:<port>`.
 pub fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
+    // Probe one address at a time and release each listener before the next:
+    // holding the wildcard binding open while testing loopback would collide
+    // with ourselves and report every port as taken.
+    for addr in ["0.0.0.0", "127.0.0.1"] {
+        match TcpListener::bind((addr, port)) {
+            Ok(listener) => drop(listener),
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Find an OS-bindable host port at or after `start_port`.
@@ -77,7 +98,13 @@ pub async fn find_available_port_async(docker: &Docker, start_port: u16) -> Opti
 /// another allocator grabbed it first. Safe to retry with a fresh port when
 /// this returns true; any other error should propagate as-is.
 pub fn is_port_conflict_error(message: &str) -> bool {
-    message.contains("port is already allocated") || message.contains("address already in use")
+    let message = message.to_ascii_lowercase();
+    message.contains("port is already allocated")
+        || message.contains("address already in use")
+        || message.contains("port is already in use")
+        || message.contains("ports are not available")
+        || message.contains("failed to bind host port")
+        || message.contains("only one usage of each socket address")
 }
 
 /// Collect every host port currently published by a Docker container. Returns
@@ -119,6 +146,39 @@ mod tests {
         assert!(is_port_available(port), "returned port must be bindable");
     }
 
+    /// A port held on loopback only — an SSH tunnel forwarding it, say — must
+    /// read as unavailable. Probing just `0.0.0.0` misses this, because
+    /// `TcpListener::bind` sets `SO_REUSEADDR` on Unix and the wildcard bind
+    /// succeeds anyway; the finder then returns a port Docker cannot publish
+    /// to `127.0.0.1`, and container creation dies at start with
+    /// `ports are not available`.
+    #[test]
+    fn loopback_only_listener_makes_a_port_unavailable() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral loopback port");
+        let port = held.local_addr().expect("local addr").port();
+
+        assert!(
+            !is_port_available(port),
+            "port {port} is held on 127.0.0.1, which is exactly where containers publish"
+        );
+    }
+
+    /// The loopback probe must not reject ports that are genuinely free —
+    /// otherwise the fix above would starve every allocation.
+    #[test]
+    fn a_free_port_is_still_reported_available() {
+        let port = {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            probe.local_addr().expect("local addr").port()
+            // listener dropped here, so the port is free again
+        };
+
+        assert!(
+            is_port_available(port),
+            "port {port} was released and should be usable"
+        );
+    }
+
     #[test]
     fn test_concurrent_allocations_diverge() {
         // Two back-to-back allocations from the same base should not collide,
@@ -129,5 +189,19 @@ mod tests {
             a, b,
             "consecutive allocations must not return the same port"
         );
+    }
+
+    #[test]
+    fn recognizes_docker_port_conflict_variants() {
+        for message in [
+            "Ports are not available: exposing port TCP 127.0.0.1:27017",
+            "failed to bind host port for 127.0.0.1:27017: port is already in use",
+            "Only one usage of each socket address is normally permitted",
+        ] {
+            assert!(
+                is_port_conflict_error(message),
+                "Docker port conflict was not recognized: {message}"
+            );
+        }
     }
 }

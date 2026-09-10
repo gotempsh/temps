@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-deployment DNS publisher for the internal `*.temps.local` zone.
 //!
 //! ADR-012-lite: every environment with a current deployment gets a

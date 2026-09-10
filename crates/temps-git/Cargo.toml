@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-git"
 version.workspace = true
@@ -17,8 +20,9 @@ tokio = { workspace = true }
 hmac = "0.13"
 sha2 = { workspace = true }
 hex = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 futures = { workspace = true }
+rustls = { workspace = true }
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
@@ -26,6 +30,7 @@ temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-presets = { path = "../temps-presets" }
 temps-queue = { path = "../temps-queue" }
 octocrab = { workspace = true }
@@ -48,14 +53,15 @@ sha2 = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
-jsonwebtoken = "10.3.0"
+# Keep this aligned with Octocrab's public GitHub App key type.
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 uuid = { workspace = true }
 http-body-util = { workspace = true }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 regex = "1.11"
 hyper = { workspace = true }
 flate2 = "1.0"

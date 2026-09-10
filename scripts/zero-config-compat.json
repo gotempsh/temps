@@ -1,0 +1,74 @@
+[
+  {
+    "name": "nextjs-app-playground",
+    "repo_owner": "vercel",
+    "repo_name": "app-playground",
+    "git_url": "https://github.com/vercel/app-playground.git",
+    "branch": "main",
+    "directory": ".",
+    "preset": "nextjs"
+  },
+  {
+    "name": "nextjs-tailwind-blog",
+    "repo_owner": "timlrx",
+    "repo_name": "tailwind-nextjs-starter-blog",
+    "git_url": "https://github.com/timlrx/tailwind-nextjs-starter-blog.git",
+    "branch": "main",
+    "directory": ".",
+    "preset": "nextjs"
+  },
+  {
+    "name": "nextjs-boilerplate",
+    "repo_owner": "ixartz",
+    "repo_name": "Next-js-Boilerplate",
+    "git_url": "https://github.com/ixartz/Next-js-Boilerplate.git",
+    "branch": "main",
+    "directory": ".",
+    "preset": "nextjs"
+  },
+  {
+    "name": "nextjs-enterprise",
+    "repo_owner": "Blazity",
+    "repo_name": "next-enterprise",
+    "git_url": "https://github.com/Blazity/next-enterprise.git",
+    "branch": "main",
+    "directory": ".",
+    "preset": "nextjs"
+  },
+  {
+    "name": "node-express",
+    "repo_owner": "IBM",
+    "repo_name": "nodejs-express-app",
+    "git_url": "https://github.com/IBM/nodejs-express-app.git",
+    "branch": "master",
+    "directory": ".",
+    "preset": "nodejs"
+  },
+  {
+    "name": "node-fastify",
+    "repo_owner": "fastify",
+    "repo_name": "example",
+    "git_url": "https://github.com/fastify/example.git",
+    "branch": "main",
+    "directory": "typescript-decorators",
+    "preset": "nodejs"
+  },
+  {
+    "name": "node-nestjs",
+    "repo_owner": "nestjs",
+    "repo_name": "typescript-starter",
+    "git_url": "https://github.com/nestjs/typescript-starter.git",
+    "branch": "master",
+    "directory": ".",
+    "preset": "nodejs"
+  },
+  {
+    "name": "vite-react",
+    "repo_owner": "SafdarJamal",
+    "repo_name": "vite-template-react",
+    "git_url": "https://github.com/SafdarJamal/vite-template-react.git",
+    "branch": "main",
+    "directory": ".",
+    "preset": "vite"
+  }
+]

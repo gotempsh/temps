@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   updateProjectDeploymentConfigMutation,
@@ -25,6 +28,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { InfoIcon, MessageSquare, Shield } from 'lucide-react'
+import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
@@ -58,9 +62,9 @@ interface SecurityConfig {
 interface FormData {
   security: SecurityConfig
   attack_mode?: boolean
-  ai_debug_chat_enabled?: boolean
   ai_alert_summaries_enabled?: boolean
-  ai_write_actions_enabled?: boolean
+  ai_api_traffic_summary_enabled?: boolean
+  vulnerability_scanning_enabled?: boolean
 }
 
 export function ProjectSecuritySettings({
@@ -87,13 +91,16 @@ export function ProjectSecuritySettings({
     handleSubmit,
     setValue,
     watch,
+    reset,
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
     defaultValues: {
       attack_mode: project.attack_mode ?? false,
-      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? false,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
-      ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
+      ai_api_traffic_summary_enabled:
+        project.ai_api_traffic_summary_enabled ?? false,
+      vulnerability_scanning_enabled:
+        project.vulnerability_scanning_enabled ?? false,
       security: {
         enabled: project.deployment_config?.security?.enabled ?? undefined,
         headers: {
@@ -130,6 +137,63 @@ export function ProjectSecuritySettings({
     },
   })
 
+  // `defaultValues` are only read on mount, but this component stays mounted
+  // when the route switches between two projects' settings pages. Without
+  // this reset the form would still hold the previous project's toggles, and
+  // Save would apply the old project's attack mode / AI / vulnerability
+  // scanning choices to the newly-selected project.
+  //
+  // Keyed on the project *identity*, not its values: a plain refetch of the
+  // same project must not overwrite whatever the user is currently editing.
+  const syncedProjectId = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (project?.id === undefined || syncedProjectId.current === project.id) {
+      return
+    }
+    syncedProjectId.current = project.id
+    reset({
+      attack_mode: project.attack_mode ?? false,
+      ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
+      ai_api_traffic_summary_enabled:
+        project.ai_api_traffic_summary_enabled ?? false,
+      vulnerability_scanning_enabled:
+        project.vulnerability_scanning_enabled ?? false,
+      security: {
+        enabled: project.deployment_config?.security?.enabled ?? undefined,
+        headers: {
+          preset:
+            project.deployment_config?.security?.headers?.preset ?? undefined,
+          contentSecurityPolicy:
+            project.deployment_config?.security?.headers
+              ?.contentSecurityPolicy ?? undefined,
+          xFrameOptions:
+            project.deployment_config?.security?.headers?.xFrameOptions ??
+            undefined,
+          strictTransportSecurity:
+            project.deployment_config?.security?.headers
+              ?.strictTransportSecurity ?? undefined,
+          referrerPolicy:
+            project.deployment_config?.security?.headers?.referrerPolicy ??
+            undefined,
+        },
+        rateLimiting: {
+          maxRequestsPerMinute:
+            project.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerMinute ?? undefined,
+          maxRequestsPerHour:
+            project.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerHour ?? undefined,
+          whitelistIps:
+            project.deployment_config?.security?.rateLimiting?.whitelistIps ??
+            [],
+          blacklistIps:
+            project.deployment_config?.security?.rateLimiting?.blacklistIps ??
+            [],
+        },
+      },
+    })
+  }, [project, reset])
+
   const securityConfig = useWatch({ control, name: 'security' })
 
   const onSubmit = async (data: FormData) => {
@@ -139,18 +203,12 @@ export function ProjectSecuritySettings({
       // Collect changed project-level toggles (attack mode + AI opt-ins).
       const projectSettings: {
         attack_mode?: boolean
-        ai_debug_chat_enabled?: boolean
         ai_alert_summaries_enabled?: boolean
-        ai_write_actions_enabled?: boolean
+        ai_api_traffic_summary_enabled?: boolean
+        vulnerability_scanning_enabled?: boolean
       } = {}
       if (data.attack_mode !== project.attack_mode) {
         projectSettings.attack_mode = data.attack_mode
-      }
-      if (
-        (data.ai_debug_chat_enabled ?? false) !==
-        (project.ai_debug_chat_enabled ?? false)
-      ) {
-        projectSettings.ai_debug_chat_enabled = data.ai_debug_chat_enabled
       }
       if (
         (data.ai_alert_summaries_enabled ?? false) !==
@@ -160,13 +218,19 @@ export function ProjectSecuritySettings({
           data.ai_alert_summaries_enabled
       }
       if (
-        (data.ai_write_actions_enabled ?? false) !==
-        (project.ai_write_actions_enabled ?? false)
+        (data.ai_api_traffic_summary_enabled ?? false) !==
+        (project.ai_api_traffic_summary_enabled ?? false)
       ) {
-        projectSettings.ai_write_actions_enabled =
-          data.ai_write_actions_enabled
+        projectSettings.ai_api_traffic_summary_enabled =
+          data.ai_api_traffic_summary_enabled
       }
-
+      if (
+        (data.vulnerability_scanning_enabled ?? false) !==
+        (project.vulnerability_scanning_enabled ?? false)
+      ) {
+        projectSettings.vulnerability_scanning_enabled =
+          data.vulnerability_scanning_enabled
+      }
       if (Object.keys(projectSettings).length > 0) {
         await toast.promise(
           updateProjectSettings.mutateAsync({
@@ -327,30 +391,13 @@ export function ProjectSecuritySettings({
             AI Assistance
           </CardTitle>
           <CardDescription>
-            Opt in to AI features powered by your configured AI provider. Off by
-            default; uses your own provider key and counts against its budget.
+            AI features powered by your configured AI provider, using your own
+            provider key and budget. Chat access follows the user&apos;s project
+            permissions. Tool changes follow the chat permission mode; alert
+            summaries remain opt-in.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="ai-debug-chat">AI debugging chat</Label>
-              <p className="text-sm text-muted-foreground">
-                Offer a “Debug with AI” chat on failed deployments to
-                investigate and fix problems.
-              </p>
-            </div>
-            <Switch
-              id="ai-debug-chat"
-              checked={watch('ai_debug_chat_enabled') ?? false}
-              onCheckedChange={(checked) =>
-                setValue('ai_debug_chat_enabled', checked, {
-                  shouldDirty: true,
-                })
-              }
-            />
-          </div>
-          <Separator />
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="ai-alert-summaries">AI alert summaries</Label>
@@ -372,18 +419,20 @@ export function ProjectSecuritySettings({
           <Separator />
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="ai-write-actions">AI write actions</Label>
+              <Label htmlFor="ai-api-traffic-summary">
+                AI API traffic summary
+              </Label>
               <p className="text-sm text-muted-foreground">
-                Let the AI assistant <strong>propose</strong> changes
-                (redeploys, env vars, domains). Nothing runs automatically —
-                every action waits for you to review and confirm it in chat.
+                Summarize the API Traffic tab&apos;s routes, callers, and error
+                rates into a plain-language headline with findings and
+                anomalies.
               </p>
             </div>
             <Switch
-              id="ai-write-actions"
-              checked={watch('ai_write_actions_enabled') ?? false}
+              id="ai-api-traffic-summary"
+              checked={watch('ai_api_traffic_summary_enabled') ?? false}
               onCheckedChange={(checked) =>
-                setValue('ai_write_actions_enabled', checked, {
+                setValue('ai_api_traffic_summary_enabled', checked, {
                   shouldDirty: true,
                 })
               }
@@ -393,6 +442,48 @@ export function ProjectSecuritySettings({
         <CardFooter>
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save AI Settings
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* Vulnerability Scanning Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Vulnerability Scanning
+          </CardTitle>
+          <CardDescription>
+            Automatically scan deployed Docker images for known vulnerabilities
+            using Trivy, after every deployment and daily
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="vulnerability-scanning">
+                Enable vulnerability scanning
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                Scan this project&apos;s deployed Docker images for known CVEs,
+                categorized by severity, after every deploy and once daily. Off
+                by default.
+              </p>
+            </div>
+            <Switch
+              id="vulnerability-scanning"
+              checked={watch('vulnerability_scanning_enabled') ?? false}
+              onCheckedChange={(checked) =>
+                setValue('vulnerability_scanning_enabled', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <Button type="submit" disabled={!isDirty || isSubmitting}>
+            Save Vulnerability Scanning Settings
           </Button>
         </CardFooter>
       </Card>

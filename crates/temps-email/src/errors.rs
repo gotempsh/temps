@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error types for the email service
 
 use thiserror::Error;
@@ -19,11 +22,40 @@ pub enum EmailError {
     #[error("Domain not verified: {0}")]
     DomainNotVerified(String),
 
+    #[error("Domain '{domain}' already exists for provider {provider_id}")]
+    DomainAlreadyExists { domain: String, provider_id: i32 },
+
+    /// The domain's row was removed from Temps, but the provider-side identity
+    /// could not be deleted (network failure, revoked credentials, or the
+    /// identity-domain mismatch guard rejecting a stale `provider_identity_id`).
+    /// Deliberately not rolled back: an unreachable provider must not strand
+    /// the local row forever, but the operator still needs to know a manual
+    /// cleanup on the provider's side may be required.
+    #[error(
+        "Domain '{domain}' was removed from Temps, but the provider-side identity could not be \
+         deleted and may still exist: {reason}"
+    )]
+    ProviderCleanupFailed { domain: String, reason: String },
+
+    #[error("Email domain '{domain}' is not authorized for project {project_id}")]
+    DomainNotAuthorized { domain: String, project_id: i32 },
+
+    #[error("Project not found: {0}")]
+    ProjectNotFound(i32),
+
+    #[error("Idempotency key '{key}' was reused with a different email payload")]
+    IdempotencyConflict { key: String },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 
     #[error("Provider error: {0}")]
     ProviderError(String),
+
+    /// The provider request may have been accepted, but no definitive response
+    /// reached Temps. Retrying this outcome could deliver a duplicate email.
+    #[error("Provider delivery outcome is unknown: {0}")]
+    ProviderDeliveryUnknown(String),
 
     #[error("Encryption error: {0}")]
     Encryption(String),
@@ -43,6 +75,12 @@ pub enum EmailError {
     #[error("Scaleway error: {0}")]
     Scaleway(String),
 
+    #[error("Failed to build Scaleway HTTP client")]
+    ScalewayClientBuild {
+        #[source]
+        source: reqwest::Error,
+    },
+
     #[error("SMTP error: {0}")]
     Smtp(String),
 
@@ -51,6 +89,49 @@ pub enum EmailError {
 
     #[error("Tracking rewrite failed for email {email_id}: {reason}")]
     TrackingRewrite { email_id: String, reason: String },
+
+    /// A definitive provider rejection where the provider confirmed it did not
+    /// accept the message. `retryable` distinguishes transient throttles
+    /// (e.g. TooManyRequestsException, 4xx SMTP reply codes) from permanent
+    /// rejections (MessageRejected, 5xx SMTP). Only constructed inside each
+    /// provider's `send()` method; never used for domain-verification paths.
+    #[error("Provider '{provider}' send rejected: {message}")]
+    SendFailed {
+        provider: String,
+        retryable: bool,
+        message: String,
+    },
+
+    /// The provider's API definitively rejected the supplied credentials during
+    /// the read-only verification check that runs before persisting a new or
+    /// updated provider. This is a client input error, not an internal failure —
+    /// the user typed the wrong key, secret, or project ID.
+    #[error("Invalid {provider_type} credentials: {reason}")]
+    InvalidCredentials {
+        provider_type: String,
+        reason: String,
+    },
+
+    /// A lightweight credential check could not reach the provider's API,
+    /// most likely due to a network or DNS issue on the Temps host. The
+    /// credentials themselves may be valid. The operator should verify that
+    /// the Temps server can reach the provider's API endpoint.
+    #[error("Could not reach {provider_type} to verify credentials: {reason}")]
+    ProviderUnreachable {
+        provider_type: String,
+        reason: String,
+    },
+
+    /// The provider has no API to perform this operation at all (e.g. SMTP
+    /// has no domain-management API to list registered domains against).
+    /// Distinct from `ProviderUnreachable` and other transient failures:
+    /// retrying can never succeed, so callers must fall back to a manual
+    /// path instead of surfacing this as a retryable error.
+    #[error("{provider_type} does not support {operation}")]
+    UnsupportedOperation {
+        provider_type: String,
+        operation: String,
+    },
 }
 
 impl From<serde_json::Error> for EmailError {

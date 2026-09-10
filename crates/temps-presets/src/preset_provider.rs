@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Preset provider system
 //!
 //! Provides a provider-based architecture for preset detection and configuration.

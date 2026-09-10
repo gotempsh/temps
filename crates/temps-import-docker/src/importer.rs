@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker workload importer implementation
 
 use async_trait::async_trait;
@@ -267,12 +270,7 @@ impl WorkloadImporter for DockerImporter {
             .env
             .iter()
             .map(|(k, v)| {
-                // Heuristic: treat variables with "SECRET", "PASSWORD", "TOKEN", "KEY" as secrets
-                let is_secret = k.to_uppercase().contains("SECRET")
-                    || k.to_uppercase().contains("PASSWORD")
-                    || k.to_uppercase().contains("TOKEN")
-                    || k.to_uppercase().contains("KEY")
-                    || k.to_uppercase().contains("API_KEY");
+                let is_secret = temps_import_types::plan::looks_like_secret_env_key(k);
 
                 EnvironmentVariable {
                     key: k.clone(),
@@ -415,6 +413,7 @@ impl WorkloadImporter for DockerImporter {
             entrypoint: snapshot.entrypoint.clone(),
             working_dir: snapshot.working_dir.clone(),
             health_check,
+            git: None,
         };
 
         // Calculate plan complexity
@@ -546,7 +545,15 @@ impl WorkloadImporter for DockerImporter {
                 domains: 0,
             },
             critical_warnings: vec![],
-            manual_actions_required: vec![],
+            // Docker's API exposes no repository metadata for a container, so
+            // the imported project is never linked to a git repo and the
+            // first deployment cannot start automatically.
+            manual_actions_required: vec![temps_import_types::ManualAction {
+                timing: temps_import_types::ManualActionTiming::AfterMigration,
+                description: "Link a git repository or trigger the first deployment manually"
+                    .to_string(),
+                reason: "Docker has no repository metadata for this container — the import records configuration only, so temps has nothing to build from yet".to_string(),
+            }],
             unsupported_features: vec![],
         };
 
@@ -563,6 +570,7 @@ impl WorkloadImporter for DockerImporter {
             steps,
             summary,
             metadata,
+            cost_analysis: None, // Docker imports are container-level, no cluster to price
         })
     }
 
@@ -642,6 +650,7 @@ impl WorkloadImporter for DockerImporter {
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
+            expected_slug: None,
             repo_name: context.repo_name.clone(),
             repo_owner: context.repo_owner.clone(),
             directory: context.directory.clone(),
@@ -653,16 +662,28 @@ impl WorkloadImporter for DockerImporter {
                     .env_vars
                     .iter()
                     .filter(|ev| !ev.is_secret)
-                    .map(|ev| (ev.key.clone(), ev.value.clone()))
+                    .map(|ev| {
+                        temps_projects::services::types::CreateProjectEnvVar::plain(
+                            ev.key.clone(),
+                            ev.value.clone(),
+                        )
+                    })
                     .collect(),
             ),
             automatic_deploy: true,
             storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         let project = project_service
@@ -887,6 +908,7 @@ impl WorkloadImporter for DockerImporter {
             supports_services: false,         // Docker doesn't have managed services
             supports_domains: false,          // Docker doesn't have managed domains
             supports_project_snapshot: false, // Docker uses workload-level snapshots
+            supports_cost_analysis: false,    // No cluster/node inventory to price
         }
     }
 }
@@ -1237,6 +1259,23 @@ mod tests {
         assert!(
             !plan.metadata.warnings.is_empty(),
             "Should have warnings for bind mount"
+        );
+    }
+
+    #[test]
+    fn plan_warns_the_first_deployment_needs_a_manual_trigger() {
+        let importer = DockerImporter {
+            docker: Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            version: "1.0.0".to_string(),
+        };
+        let plan = importer.generate_plan(create_test_snapshot()).unwrap();
+        assert!(
+            plan.summary
+                .manual_actions_required
+                .iter()
+                .any(|a| a.description.contains("trigger the first deployment")),
+            "Docker has no repository metadata, so the plan must tell the user \
+             the first deployment won't start automatically"
         );
     }
 
@@ -1617,6 +1656,7 @@ mod tests {
                 entrypoint: None,
                 working_dir: None,
                 health_check: None,
+                git: None,
             },
             services: vec![],
             domains: vec![],
@@ -1636,6 +1676,7 @@ mod tests {
                 complexity: PlanComplexity::Low,
                 warnings: vec![],
             },
+            cost_analysis: None,
         }
     }
 

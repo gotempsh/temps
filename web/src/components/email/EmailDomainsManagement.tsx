@@ -1,27 +1,21 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
-  createEmailDomain as createEmailDomainSdk,
   deleteEmailDomain as deleteEmailDomainSdk,
   listEmailDomains as listEmailDomainsSdk,
   listEmailProviders as listEmailProvidersSdk,
   verifyDomain,
-  type CreateEmailDomainRequest,
   type EmailDomainResponse,
   type EmailDomainWithDnsResponse,
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,23 +25,6 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { EmailProviderLogo, type EmailProviderType } from '@/components/ui/email-provider-logo'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -58,7 +35,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
-import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
@@ -69,15 +45,12 @@ import {
   EllipsisVertical,
   Globe,
   HelpCircle,
-  Loader2,
-  Plus,
   RefreshCw,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router-dom'
+import { useMemo } from 'react'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
-import { z } from 'zod'
+import { problemMessage } from './sharedUtils'
 
 // Types
 type DnsRecordStatus = 'unknown' | 'verified' | 'pending' | 'failed'
@@ -86,29 +59,6 @@ type EmailDomainWithDns = EmailDomainWithDnsResponse
 type EmailProvider = EmailProviderResponse
 type DnsRecord = EmailDomainWithDnsResponse['dns_records'][number]
 
-const createDomainSchema = z.object({
-  provider_id: z.number().min(1, 'Provider is required'),
-  domain: z
-    .string()
-    .min(1, 'Domain is required')
-    .regex(
-      /^[a-zA-Z0-9][a-zA-Z0-9-_.]*\.[a-zA-Z]{2,}$/,
-      'Please enter a valid domain (e.g., mail.example.com)'
-    ),
-})
-
-type CreateDomainFormData = z.infer<typeof createDomainSchema>
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
-
 // API functions
 async function listEmailDomains(): Promise<EmailDomain[]> {
   const response = await listEmailDomainsSdk()
@@ -116,20 +66,6 @@ async function listEmailDomains(): Promise<EmailDomain[]> {
     throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
   }
   return response.data ?? []
-}
-
-async function createEmailDomain(
-  data: CreateDomainFormData
-): Promise<EmailDomainWithDns> {
-  const body: CreateEmailDomainRequest = {
-    provider_id: data.provider_id,
-    domain: data.domain,
-  }
-  const response = await createEmailDomainSdk({ body })
-  if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to create email domain'))
-  }
-  return response.data
 }
 
 async function verifyEmailDomain(id: number): Promise<EmailDomainWithDns> {
@@ -275,20 +211,36 @@ function DnsRecordStatusBadge({ status }: { status?: DnsRecordStatus }) {
 }
 
 export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
-  const verifiedCount = records.filter(r => r.status === 'verified').length
-  const pendingCount = records.filter(r => r.status === 'pending').length
-  const failedCount = records.filter(r => r.status === 'failed').length
-  const unknownCount = records.filter(r => !r.status || r.status === 'unknown').length
-  const totalCount = records.length
+  // MX and DMARC are both excluded from the "required" count, matching the
+  // backend's are_all_records_verified gate exactly: MX is a deliverability
+  // aid rather than a sending/auth prerequisite, and DMARC is a plain TXT
+  // record the domain owner sets independently (no provider API manages it),
+  // so requiring it here would report a domain as unverified even though the
+  // backend already considers SPF+DKIM sufficient and marked it "verified".
+  // Both rows still appear in DnsRecordsTable with their real status.
+  const requiredRecords = records.filter(
+    r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+  )
+  const verifiedCount = requiredRecords.filter(r => r.status === 'verified').length
+  const pendingCount = requiredRecords.filter(r => r.status === 'pending').length
+  const failedCount = requiredRecords.filter(r => r.status === 'failed').length
+  const unknownCount = requiredRecords.filter(r => !r.status || r.status === 'unknown').length
+  const totalCount = requiredRecords.length
 
   const allVerified = verifiedCount === totalCount && totalCount > 0
+
+  // Nothing to summarize for domains with no DNS records to manage (e.g.
+  // an SMTP-imported domain) — the empty state below already explains that.
+  if (totalCount === 0) {
+    return null
+  }
 
   if (allVerified) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/30">
         <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-500" />
         <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
-          All {totalCount} DNS records verified successfully
+          All {totalCount} required DNS records verified successfully
         </span>
       </div>
     )
@@ -327,62 +279,98 @@ export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
 
 export function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
   if (!records || records.length === 0) {
-    return <p className="text-sm text-muted-foreground">No DNS records available.</p>
+    return (
+      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+        No DNS records to manage for this domain.
+      </div>
+    )
   }
 
+  // Deterministic order regardless of what the API returns: TXT records
+  // first (sorted by value), then everything else (e.g. MX).
+  const sortedRecords = [...records].sort((a, b) => {
+    const aIsTxt = a.record_type === 'TXT' ? 0 : 1
+    const bIsTxt = b.record_type === 'TXT' ? 0 : 1
+    if (aIsTxt !== bIsTxt) return aIsTxt - bIsTxt
+    return a.value.localeCompare(b.value)
+  })
+
   return (
-    <div className="rounded-md border">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-[100px]">Type</TableHead>
-            <TableHead>Name</TableHead>
-            <TableHead>Value</TableHead>
-            <TableHead className="w-[80px]">Priority</TableHead>
-            <TableHead className="w-[100px]">Status</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {records.map((record, index) => (
-            <TableRow
-              key={index}
-              className={
-                record.status === 'verified'
-                  ? 'bg-emerald-50/50 dark:bg-emerald-950/20'
-                  : record.status === 'failed'
-                    ? 'bg-red-50/50 dark:bg-red-950/20'
-                    : ''
-              }
-            >
-              <TableCell>
-                <Badge variant="outline">{record.record_type}</Badge>
-              </TableCell>
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <span className="break-all font-mono text-xs">{record.name}</span>
-                  <CopyButton
-                    value={record.name}
-                    className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
-                  />
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <span className="break-all font-mono text-xs">{record.value}</span>
-                  <CopyButton
-                    value={record.value}
-                    className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
-                  />
-                </div>
-              </TableCell>
-              <TableCell>{record.priority ?? '-'}</TableCell>
-              <TableCell>
-                <DnsRecordStatusBadge status={record.status} />
-              </TableCell>
+    <div className="-mx-6 sm:mx-0 sm:rounded-md sm:border">
+      <div className="px-6 sm:px-0">
+        <Table className="table-fixed">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[64px]">Type</TableHead>
+              <TableHead className="w-[130px] sm:w-[220px]">Name</TableHead>
+              <TableHead>Value</TableHead>
+              <TableHead className="hidden w-[70px] sm:table-cell">
+                Priority
+              </TableHead>
+              <TableHead className="w-[90px] sm:w-[110px]">Status</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {sortedRecords.map((record, index) => (
+              <TableRow
+                key={index}
+                className={
+                  record.status === 'verified'
+                    ? 'bg-emerald-50/50 dark:bg-emerald-950/20'
+                    : record.status === 'failed'
+                      ? 'bg-red-50/50 dark:bg-red-950/20'
+                      : ''
+                }
+              >
+                <TableCell>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge variant="outline">{record.record_type}</Badge>
+                    {record.record_type === 'MX' && (
+                      <span className="rounded px-1 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
+                        Optional
+                      </span>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="truncate font-mono text-xs"
+                      title={record.name}
+                    >
+                      {record.name}
+                    </span>
+                    <CopyButton
+                      value={record.name}
+                      className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
+                    />
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="truncate font-mono text-xs"
+                      title={record.value}
+                    >
+                      {record.value}
+                    </span>
+                    <CopyButton
+                      value={record.value}
+                      className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
+                    />
+                  </div>
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  {record.priority ?? '-'}
+                </TableCell>
+                <TableCell>
+                  <DnsRecordStatusBadge status={record.status} />
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
     </div>
   )
 }
@@ -412,16 +400,8 @@ function LoadingSkeleton() {
 }
 
 export function EmailDomainsManagement() {
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const queryClient = useQueryClient()
   const navigate = useNavigate()
-
-  const form = useForm<CreateDomainFormData>({
-    resolver: zodResolver(createDomainSchema),
-    defaultValues: {
-      domain: '',
-    },
-  })
 
   const { data: domains, isLoading: isLoadingDomains } = useQuery({
     queryKey: ['email-domains'],
@@ -433,49 +413,35 @@ export function EmailDomainsManagement() {
     queryFn: listEmailProviders,
   })
 
-  const createMutation = useMutation({
-    mutationFn: createEmailDomain,
-    onSuccess: (data) => {
-      toast.success('Domain added', {
-        description:
-          'Configure the DNS records to finish verification.',
-      })
-      queryClient.invalidateQueries({ queryKey: ['email-domains'] })
-      queryClient.setQueryData(['email-domain', data.domain.id], data)
-      setIsCreateDialogOpen(false)
-      form.reset()
-      // Navigate straight to the detail page so the DNS setup is the next thing
-      // the user sees — far less fragile than leaving them on the list.
-      navigate(`/email/domains/${data.domain.id}`)
-    },
-    onError: (error: Error) => {
-      toast.error('Failed to add domain', { description: error.message })
-    },
-  })
-
   const verifyMutation = useMutation({
     mutationFn: verifyEmailDomain,
     onSuccess: (data) => {
-      const verifiedCount = data.dns_records.filter(r => r.status === 'verified').length
-      const totalCount = data.dns_records.length
-      const pendingCount = data.dns_records.filter(r => r.status === 'pending').length
-      const failedCount = data.dns_records.filter(r => r.status === 'failed').length
+      // MX and DMARC are both excluded — see DnsVerificationSummary's comment.
+      // Exclude them from the counts shown here too, so the toast reflects
+      // the records that actually gate the domain status.
+      const required = data.dns_records.filter(
+        r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+      )
+      const verifiedCount = required.filter(r => r.status === 'verified').length
+      const totalCount = required.length
+      const pendingCount = required.filter(r => r.status === 'pending').length
+      const failedCount = required.filter(r => r.status === 'failed').length
 
       if (data.domain.status === 'verified') {
         toast.success('Domain verified', {
-          description: `All ${totalCount} DNS records are properly configured.`,
+          description: `All ${totalCount} required DNS records are properly configured.`,
         })
       } else if (failedCount > 0) {
         toast.error('Some DNS records failed verification', {
-          description: `${failedCount} of ${totalCount} records failed.`,
+          description: `${failedCount} of ${totalCount} required records failed.`,
         })
       } else if (pendingCount > 0) {
         toast.warning('Verification in progress', {
-          description: `${verifiedCount} of ${totalCount} records verified. DNS propagation can take up to 48 hours.`,
+          description: `${verifiedCount} of ${totalCount} required records verified. DNS propagation can take up to 48 hours.`,
         })
       } else {
         toast.info('Verification status updated', {
-          description: `${verifiedCount} of ${totalCount} records verified.`,
+          description: `${verifiedCount} of ${totalCount} required records verified.`,
         })
       }
 
@@ -502,10 +468,6 @@ export function EmailDomainsManagement() {
       toast.error('Failed to delete domain', { description: error.message })
     },
   })
-
-  const onSubmit = (data: CreateDomainFormData) => {
-    createMutation.mutate(data)
-  }
 
   const handleVerify = (id: number) => verifyMutation.mutate(id)
   const handleDelete = (id: number) => deleteMutation.mutate(id)
@@ -538,19 +500,19 @@ export function EmailDomainsManagement() {
           title="No email domains configured"
           description="Add a domain to start sending emails. You'll need to configure DNS records for verification."
           action={
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Add domain
-            </Button>
+            <CreateActionButton
+              to="/email/domains/new"
+              label="Add domain"
+            />
           }
         />
       ) : (
         <>
           <div className="mb-4 flex items-center justify-end">
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Add Domain
-            </Button>
+            <CreateActionButton
+              to="/email/domains/new"
+              label="Add Domain"
+            />
           </div>
 
           <div className="overflow-hidden rounded-lg border">
@@ -671,110 +633,6 @@ export function EmailDomainsManagement() {
           </div>
         </>
       )}
-
-      {/* Create Domain Dialog */}
-      <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Add email domain</DialogTitle>
-            <DialogDescription>
-              Add a domain for sending emails. You'll need to configure DNS records
-              after adding.
-            </DialogDescription>
-          </DialogHeader>
-
-          <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-              <FormField
-                control={form.control}
-                name="provider_id"
-                render={({ field }) => {
-                  const selectedProvider = providers?.find(p => p.id === field.value)
-                  return (
-                    <FormItem>
-                      <FormLabel>Provider</FormLabel>
-                      <Select
-                        onValueChange={(value) => field.onChange(parseInt(value))}
-                        value={field.value?.toString()}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            {selectedProvider ? (
-                              <div className="flex items-center gap-2">
-                                <EmailProviderLogo
-                                  provider={selectedProvider.provider_type as EmailProviderType}
-                                  size={20}
-                                />
-                                <span>{selectedProvider.name}</span>
-                              </div>
-                            ) : (
-                              <SelectValue placeholder="Select a provider" />
-                            )}
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {providers?.map((provider) => (
-                            <SelectItem
-                              key={provider.id}
-                              value={provider.id.toString()}
-                            >
-                              <div className="flex items-center gap-2">
-                                <EmailProviderLogo
-                                  provider={provider.provider_type as EmailProviderType}
-                                  size={20}
-                                />
-                                <span>{provider.name}</span>
-                              </div>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>
-                        The email provider to use for this domain.
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )
-                }}
-              />
-
-              <FormField
-                control={form.control}
-                name="domain"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Domain</FormLabel>
-                    <FormControl>
-                      <Input placeholder="send.example.com" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      Use a subdomain (e.g., send.example.com) to isolate your
-                      email sending reputation and protect your primary domain.
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setIsCreateDialogOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button type="submit" disabled={createMutation.isPending}>
-                  {createMutation.isPending && (
-                    <Loader2 className="mr-2 size-4 animate-spin" />
-                  )}
-                  Add domain
-                </Button>
-              </DialogFooter>
-            </form>
-          </Form>
-        </DialogContent>
-      </Dialog>
 
     </div>
   )

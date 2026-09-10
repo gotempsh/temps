@@ -1,4 +1,7 @@
-import { Routes, Route, Link, Navigate, useLocation } from 'react-router-dom'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { Routes, Route, Link, Navigate, useLocation } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import { Bell, ChevronRight, LayoutDashboard, LineChart } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'

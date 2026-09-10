@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -9,8 +12,9 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    /// IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
-    /// Stored as PostgreSQL inet type
+    /// IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+    /// "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
+    /// Stored as PostgreSQL inet type (dual-stack)
     pub ip_address: String,
     /// Action to take: "block" or "allow"
     pub action: String,

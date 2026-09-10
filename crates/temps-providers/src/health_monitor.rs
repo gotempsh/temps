@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External service health monitor.
 //!
 //! Periodically probes every `external_services` row where `status = 'running'`
@@ -10,26 +13,27 @@
 //! the monitor sends a notification via the shared `NotificationService`.
 //! A recovery notification is sent when the service returns to `operational`.
 
+use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
-use crate::externalsvc::{HealthProbeStatus, S3Credentials, ServiceType};
+use crate::externalsvc::{HealthProbeStatus, S3Credentials};
 use crate::services::ExternalServiceManager;
 use bollard::Docker;
 use chrono::Utc;
+use futures::{stream, StreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
 use temps_core::EncryptionService;
 use temps_entities::{
-    backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
-    s3_sources,
+    backup_schedule_services, backup_schedules, external_service_backups,
+    external_service_health_checks, external_services, project_services, s3_sources,
 };
+use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -71,6 +75,19 @@ pub enum HealthMonitorError {
 
     #[error("External service {id} not found")]
     ServiceNotFound { id: i32 },
+
+    /// The MariaDB binlog-retention anchor could not be established, so no
+    /// archived segment may be deleted this run. Carries the service and the
+    /// concrete reason because the only signal an operator gets is the log
+    /// line — an unexplained "not pruning" is indistinguishable from a bug.
+    #[error(
+        "MariaDB binlog retention anchor for service {service_id} ('{service_name}') is undetermined: {reason}"
+    )]
+    BinlogRetentionAnchor {
+        service_id: i32,
+        service_name: String,
+        reason: String,
+    },
 }
 
 /// Background loop that keeps `external_services.health_status` in sync with
@@ -78,7 +95,7 @@ pub enum HealthMonitorError {
 pub struct ExternalServiceHealthMonitor {
     db: Arc<DatabaseConnection>,
     manager: Arc<ExternalServiceManager>,
-    notification_service: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     config: ExternalServiceHealthConfig,
     /// Docker handle used by the per-service MariaDB binlog archiver to read
     /// closed binlog segments out of the container.
@@ -89,13 +106,24 @@ pub struct ExternalServiceHealthMonitor {
     /// service id. The health loop ticks every `poll_interval_secs`; we gate
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
+    /// Optional metrics store. When set, container CPU/memory samples for
+    /// running services with `metrics_enabled` are written to it on every
+    /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
+    /// `container.memory_percent` with `source_kind = database`).
+    metrics_store: Option<Arc<dyn MetricsStore>>,
+    /// Previous raw docker-stats sample per service (`service_id` →
+    /// `container_name` → sample). The 30s poll interval is the CPU delta
+    /// window; the first tick per container seeds the baseline and emits
+    /// memory only.
+    stats_baselines:
+        Arc<Mutex<HashMap<i32, HashMap<String, bollard::models::ContainerStatsResponse>>>>,
 }
 
 impl ExternalServiceHealthMonitor {
     pub fn new(
         db: Arc<DatabaseConnection>,
         manager: Arc<ExternalServiceManager>,
-        notification_service: Arc<dyn NotificationService>,
+        alarm_service: Arc<AlarmService>,
         config: ExternalServiceHealthConfig,
         docker: Arc<Docker>,
         encryption_service: Arc<EncryptionService>,
@@ -103,12 +131,23 @@ impl ExternalServiceHealthMonitor {
         Self {
             db,
             manager,
-            notification_service,
+            alarm_service,
             config,
             docker,
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
+            metrics_store: None,
+            stats_baselines: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a metrics store. When set, the monitor writes container
+    /// CPU/memory samples for every running service with `metrics_enabled`
+    /// alongside its health probes, giving external services the same
+    /// resource-usage history deployment containers already have.
+    pub fn with_metrics_store(mut self, store: Arc<dyn MetricsStore>) -> Self {
+        self.metrics_store = Some(store);
+        self
     }
 
     /// Run forever. Spawn this onto a background task.
@@ -152,13 +191,25 @@ impl ExternalServiceHealthMonitor {
 
         debug!("Health-checking {} external service(s)", services.len());
 
-        for service in services {
-            if let Err(e) = self.check_service(&service).await {
-                warn!(
-                    "Health check error for service {} ({}): {}",
-                    service.id, service.name, e
-                );
-            }
+        let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
+
+        const MAX_CONCURRENT_HEALTH_CHECKS: usize = 8;
+        stream::iter(services)
+            .for_each_concurrent(MAX_CONCURRENT_HEALTH_CHECKS, |service| async move {
+                if let Err(e) = self.check_service(&service).await {
+                    warn!(
+                        "Health check error for service {} ({}): {}",
+                        service.id, service.name, e
+                    );
+                }
+            })
+            .await;
+
+        // Drop stats baselines for services that no longer exist so the map
+        // doesn't grow forever as services are created and deleted.
+        {
+            let mut baselines = self.stats_baselines.lock().await;
+            baselines.retain(|id, _| service_ids.contains(id));
         }
 
         Ok(())
@@ -204,6 +255,7 @@ impl ExternalServiceHealthMonitor {
         // Degraded but never escalate Down upward — liveness wins.
         let wal_snapshot = if service.service_type == "postgres"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && !matches!(status, HealthProbeStatus::Down)
         {
             self.run_postgres_wal_probe(service).await
@@ -255,7 +307,18 @@ impl ExternalServiceHealthMonitor {
             wal_snapshot.as_ref(),
         );
 
-        let mut active: external_services::ActiveModel = service.clone().into();
+        // Partial update, not `service.clone().into()`: that stamps every
+        // column from this cycle's snapshot, including
+        // `continuous_archive_s3_source_id`/`continuous_archive_pinned_at`.
+        // Since those can be written concurrently (by this same tick's own
+        // binlog-archive step below, by a backup run's pin, or by a
+        // deliberate repoint), a full-model save here would silently revert
+        // a pin set after this cycle's snapshot was fetched but before this
+        // update runs.
+        let mut active = external_services::ActiveModel {
+            id: Set(service.id),
+            ..Default::default()
+        };
         active.health_status = Set(Some(status.as_str().to_string()));
         active.last_health_check_at = Set(Some(now));
         active.last_health_error = Set(error_message.clone());
@@ -290,13 +353,110 @@ impl ExternalServiceHealthMonitor {
         //    Failures here never affect health monitoring of other services.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
             self.maybe_archive_mariadb_binlogs(service).await;
         }
 
+        // 5. Container resource metrics: sample docker stats for every
+        //    member container and write CPU/memory points to the metrics
+        //    store. Gated on the same per-service `metrics_enabled` flag the
+        //    engine-metrics scraper uses. Failures are logged and swallowed —
+        //    metrics must never disrupt health monitoring.
+        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
+            if let Some(store) = self.metrics_store.clone() {
+                self.record_container_metrics(&store, service).await;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Sample container stats for one service and write the resulting
+    /// CPU/memory points to the metrics store.
+    ///
+    /// Written points (all `Gauge`, `source_kind = database`,
+    /// `source_id = external_services.id`):
+    /// - `container.cpu_percent` — docker-CLI formula, 100% == one core.
+    ///   Absent on the first tick per container (no delta baseline yet).
+    /// - `container.memory_used_bytes` — RSS excluding page cache.
+    /// - `container.memory_percent` — usage relative to the container's
+    ///   memory limit (host RAM when no limit is set — same semantics as
+    ///   the live stats endpoint).
+    ///
+    /// Cluster members are distinguished by the `role` / `container_name`
+    /// labels. Containers whose sample failed (stopped, remote node) emit
+    /// no points rather than zeros.
+    async fn record_container_metrics(
+        &self,
+        store: &Arc<dyn MetricsStore>,
+        service: &external_services::Model,
+    ) {
+        let report = {
+            let mut baselines = self.stats_baselines.lock().await;
+            let service_baselines = baselines.entry(service.id).or_default();
+            match self
+                .manager
+                .sample_service_stats(service, service_baselines)
+                .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        service = %service.name,
+                        "Container stats sampling failed: {}", e
+                    );
+                    return;
+                }
+            }
+        };
+
+        let now = Utc::now();
+        let mut points = Vec::with_capacity(report.members.len() * 3);
+
+        for member in &report.members {
+            let mut labels = HashMap::new();
+            labels.insert("role".to_string(), member.role.clone());
+            labels.insert("container_name".to_string(), member.container_name.clone());
+
+            let make_point = |name: &str, value: f64| MetricPoint {
+                time: now,
+                source_kind: SourceKind::Database,
+                source_id: service.id,
+                name: name.to_string(),
+                value,
+                kind: MetricKind::Gauge,
+                engine: Some(service.service_type.clone()),
+                environment: None,
+                node_id: service.node_id,
+                labels: labels.clone(),
+            };
+
+            if let Some(cpu) = member.cpu_percent {
+                points.push(make_point("container.cpu_percent", cpu));
+            }
+            if let Some(mem) = member.memory_usage_bytes {
+                points.push(make_point("container.memory_used_bytes", mem as f64));
+            }
+            if let Some(mem_pct) = member.memory_percent {
+                points.push(make_point("container.memory_percent", mem_pct));
+            }
+        }
+
+        if points.is_empty() {
+            return;
+        }
+
+        if let Err(e) = store.write_batch(points).await {
+            warn!(
+                service_id = service.id,
+                service = %service.name,
+                "Failed to write container metrics: {}", e
+            );
+        }
     }
 
     /// Per-service MariaDB binlog archiver tick. Gated so the actual ship only
@@ -338,24 +498,73 @@ impl ExternalServiceHealthMonitor {
             return;
         }
 
-        // Discover the S3 destination from a backup schedule covering this
-        // service. No schedule = no PITR destination configured = skip.
-        let s3_source = match self.find_s3_source_for_service(service.id).await {
-            Ok(Some(src)) => src,
-            Ok(None) => {
-                debug!(
+        // Once pinned, always ship to the pinned source — never re-resolve
+        // from the current schedule state. Re-resolving every tick (the
+        // previous behavior) meant editing *any* enabled schedule that
+        // covers this service, even one unrelated via `target_all_services`,
+        // could silently redirect an in-progress binlog stream mid-flight,
+        // splitting the chain a PITR restore needs across buckets.
+        let s3_source = if let Some(pinned_id) = service.continuous_archive_s3_source_id {
+            match s3_sources::Entity::find_by_id(pinned_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    warn!(
+                        service_id = service.id,
+                        "MariaDB service's pinned continuous archive S3 source {} no longer exists; skipping binlog archive",
+                        pinned_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to load pinned S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            }
+        } else {
+            // Unpinned yet: fall back to discovering a destination from a
+            // backup schedule covering this service (no schedule = no PITR
+            // destination configured = skip), then establish the pin —
+            // deferring to the instance's Cloud-managed source when one
+            // exists rather than whichever schedule happened to resolve
+            // first, exactly like a WAL-G backup's first run.
+            let candidate = match self.find_s3_source_for_service(service.id).await {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    debug!(
+                        service_id = service.id,
+                        "MariaDB service has no backup schedule; skipping binlog archive"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to resolve S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = continuous_archive::ensure_continuous_archive_source_pin(
+                self.db.as_ref(),
+                service,
+                candidate.id,
+                "MariaDB binlog archiving",
+            )
+            .await
+            {
+                warn!(
                     service_id = service.id,
-                    "MariaDB service has no backup schedule; skipping binlog archive"
+                    "MariaDB binlog archiving destination is ambiguous, skipping this tick: {}", e
                 );
                 return;
             }
-            Err(e) => {
-                debug!(
-                    service_id = service.id,
-                    "Failed to resolve S3 source for MariaDB binlog archive: {}", e
-                );
-                return;
-            }
+            candidate
         };
 
         // Build a decrypted S3 client from the source row.
@@ -384,6 +593,11 @@ impl ExternalServiceHealthMonitor {
                         shipped,
                         "Archived MariaDB binlog segment(s) to S3"
                     );
+                    // Retention counterpart to the ship. Only after something
+                    // new landed — a no-op tick cannot have made an older
+                    // segment newly unreachable, so there is nothing to prune.
+                    self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
+                        .await;
                 }
             }
             Err(e) => {
@@ -394,6 +608,148 @@ impl ExternalServiceHealthMonitor {
                 );
             }
         }
+    }
+
+    /// Delete archived binlog segments that no retained base backup can reach.
+    ///
+    /// `archive_binlogs` only ever uploads, so without this the `binlog/`
+    /// prefix grows for the life of the service. The anchor is the recorded
+    /// `binlog_file` of the OLDEST retained physical base backup: PITR replay
+    /// always starts at its base's own coordinate, so nothing older than the
+    /// oldest base is reachable from any retained backup.
+    ///
+    /// Failures are logged and swallowed, like the archive itself — losing a
+    /// prune run costs storage, never data.
+    async fn prune_mariadb_binlogs(
+        &self,
+        service: &external_services::Model,
+        mariadb: &MariaDbService,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &s3_sources::Model,
+    ) {
+        let anchor = match self
+            .oldest_retained_mariadb_base_anchor(service, mariadb, s3_client, s3_source)
+            .await
+        {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => {
+                debug!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "No retained MariaDB physical base with a binlog anchor; keeping all archived \
+                     binlog segments"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "Could not determine MariaDB binlog retention anchor; keeping all archived \
+                     segments: {}", e
+                );
+                return;
+            }
+        };
+
+        match mariadb
+            .prune_stale_binlogs(s3_client, s3_source, &anchor)
+            .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => {
+                info!(
+                    service_id = service.id,
+                    service = %service.name,
+                    pruned,
+                    anchor = %anchor,
+                    "Pruned stale MariaDB binlog segments from S3"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    service = %service.name,
+                    anchor = %anchor,
+                    "MariaDB binlog prune run failed: {}", e
+                );
+            }
+        }
+    }
+
+    /// Resolve the retention anchor: the `binlog_file` recorded by the OLDEST
+    /// still-retained physical base backup of this service.
+    ///
+    /// Backups are hard-deleted (`delete_backup_model` removes the rows), so
+    /// "retained" is simply "the row still exists in a completed state".
+    ///
+    /// Every ambiguous case returns `Ok(None)` / `Err` — i.e. "do not prune":
+    /// - no completed physical base at all (nothing anchors retention yet, and
+    ///   a base backup may be about to run);
+    /// - a completed physical-engine row whose `s3_location` we cannot read as
+    ///   a base object, which would mean the true oldest base is invisible to
+    ///   us and any anchor we picked would be too new;
+    /// - the oldest base has no binlog coordinate (`pitr: false`), so we
+    ///   cannot say which segments it would have needed.
+    async fn oldest_retained_mariadb_base_anchor(
+        &self,
+        service: &external_services::Model,
+        mariadb: &MariaDbService,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &s3_sources::Model,
+    ) -> Result<Option<String>, HealthMonitorError> {
+        use sea_orm::QueryOrder;
+
+        let rows = external_service_backups::Entity::find()
+            .filter(external_service_backups::Column::ServiceId.eq(service.id))
+            .filter(external_service_backups::Column::State.eq("completed"))
+            .order_by_asc(external_service_backups::Column::StartedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut oldest_base: Option<&temps_entities::external_service_backups::Model> = None;
+        for row in &rows {
+            let is_physical_engine = row
+                .metadata
+                .get("engine")
+                .and_then(|v| v.as_str())
+                .is_some_and(|engine| engine == "mariadb_physical");
+            let is_base_object = MariaDbService::is_physical_base_location(&row.s3_location);
+
+            if is_physical_engine && !is_base_object {
+                // A physical backup we can't locate. Its base could be older
+                // than anything else we found, so we have no trustworthy
+                // anchor — decline rather than prune against a newer one.
+                return Err(HealthMonitorError::BinlogRetentionAnchor {
+                    service_id: service.id,
+                    service_name: service.name.clone(),
+                    reason: format!(
+                        "completed mariadb_physical backup row {} has no usable base location ('{}')",
+                        row.id, row.s3_location
+                    ),
+                });
+            }
+            if is_base_object {
+                oldest_base = Some(row);
+                break;
+            }
+        }
+
+        let Some(base) = oldest_base else {
+            return Ok(None);
+        };
+
+        mariadb
+            .base_binlog_anchor(s3_client, &s3_source.bucket_name, &base.s3_location)
+            .await
+            .map_err(|e| HealthMonitorError::BinlogRetentionAnchor {
+                service_id: service.id,
+                service_name: service.name.clone(),
+                reason: format!(
+                    "failed to read binlog anchor from base backup row {}: {}",
+                    base.id, e
+                ),
+            })
     }
 
     /// Check the per-service interval gate and, if elapsed, record `now` as the
@@ -471,9 +827,14 @@ impl ExternalServiceHealthMonitor {
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 secret key: {}", e))?;
 
+        let session_token =
+            temps_entities::s3_sources::decrypt_session_token(&self.encryption_service, s3_source)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 session token: {}", e))?;
+
         Ok(S3Credentials {
             access_key_id,
             secret_key,
+            session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -513,17 +874,6 @@ impl ExternalServiceHealthMonitor {
         &self,
         service: &external_services::Model,
     ) -> (HealthProbeStatus, Option<i32>, Option<String>) {
-        let service_type = match ServiceType::from_str(&service.service_type) {
-            Ok(t) => t,
-            Err(_) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Unknown service type: {}", service.service_type)),
-                );
-            }
-        };
-
         // Cluster services need a fan-out probe — the standalone
         // ExternalService::health_probe path can't reach a multi-host
         // cluster (it falls through to localhost:5432). Route through the
@@ -533,22 +883,7 @@ impl ExternalServiceHealthMonitor {
             return (result.status, result.response_time_ms, result.error_message);
         }
 
-        let service_config = match self.manager.get_service_config(service.id).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Failed to load service config: {}", e)),
-                );
-            }
-        };
-
-        let instance = self
-            .manager
-            .get_service_instance(service.name.clone(), service_type);
-
-        match instance.health_probe(service_config).await {
+        match self.manager.probe_service_health(service).await {
             Ok(result) => (result.status, result.response_time_ms, result.error_message),
             Err(e) => (
                 HealthProbeStatus::Down,
@@ -556,6 +891,19 @@ impl ExternalServiceHealthMonitor {
                 Some(format!("health_probe raised an error: {}", e)),
             ),
         }
+    }
+
+    /// Resolve the project a service belongs to, for scoping its alarm.
+    /// External services have no `project_id` column of their own — it's
+    /// only known via the `project_services` join table.
+    async fn resolve_project_id(&self, service_id: i32) -> Option<i32> {
+        project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|ps| ps.project_id)
     }
 
     async fn send_down_alert(
@@ -573,76 +921,61 @@ impl ExternalServiceHealthMonitor {
             error_message.unwrap_or("(no details)")
         );
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let project_id = self.resolve_project_id(service.id).await;
+        let request = FireAlarmRequest {
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(service.id),
+            alarm_type: AlarmType::ExternalServiceDown,
+            severity: AlarmSeverity::Critical,
             title,
             message,
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::Critical,
-            severity: Some("critical".to_string()),
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("service_type".to_string(), service.service_type.clone()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: true,
+            metadata: Some(serde_json::json!({
+                "service_name": service.name,
+                "service_type": service.service_type,
+            })),
         };
 
-        if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
-            .await
-        {
-            error!(
-                "Failed to send down-alert notification for service {}: {}",
-                service.id, e
-            );
-        } else {
-            info!(
+        match self.alarm_service.fire_alarm(request).await {
+            Ok(Some(_)) => info!(
                 "Sent health-check down alert for service {} ({})",
                 service.id, service.name
-            );
+            ),
+            Ok(None) => debug!(
+                "Down alert for service {} suppressed by cooldown/silence",
+                service.id
+            ),
+            Err(e) => error!(
+                "Failed to fire down-alert alarm for service {}: {}",
+                service.id, e
+            ),
         }
     }
 
     async fn send_recovered_alert(&self, service: &external_services::Model) {
-        let title = format!("Service recovered: {}", service.name);
-        let message = format!(
-            "External service '{}' ({}) is responding to health checks again.",
-            service.name, service.service_type,
-        );
-
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
-            title,
-            message,
-            notification_type: NotificationType::Info,
-            priority: NotificationPriority::Normal,
-            severity: None,
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("status".to_string(), "recovered".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: false,
-        };
-
+        let project_id = self.resolve_project_id(service.id).await;
         if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
+            .alarm_service
+            .resolve_alarms_by_scope(
+                project_id,
+                None,
+                None,
+                None,
+                Some(service.id),
+                AlarmType::ExternalServiceDown,
+            )
             .await
         {
             error!(
-                "Failed to send recovery notification for service {}: {}",
+                "Failed to resolve down-alert alarm(s) for recovered service {}: {}",
                 service.id, e
+            );
+        } else {
+            info!(
+                "Service {} ({}) recovered — resolved its down alarm(s)",
+                service.id, service.name
             );
         }
     }

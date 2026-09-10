@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add hosting-provider classification to `ip_geolocations`.
 //!
 //! The live-visitors view was showing datacenter/scraper traffic as real human

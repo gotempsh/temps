@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   deleteProjectMutation,
-  updateProjectDeploymentConfigMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -16,6 +18,7 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import {
   Card,
   CardContent,
@@ -24,7 +27,8 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { DeploymentSourceCard } from './DeploymentSourceCard'
+import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
+import { MonitoringCard } from './MonitoringCard'
 import {
   Form,
   FormControl,
@@ -32,15 +36,16 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -50,53 +55,23 @@ interface GeneralSettingsProps {
 }
 
 const projectSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
+  name: z
+    .string()
+    .trim()
+    .min(1, 'Project name is required')
+    .max(100, 'Project name must be 100 characters or fewer'),
+  slug: z
+    .string()
+    .trim()
+    .min(1, 'Project slug is required')
+    .max(63, 'Project slug must be 63 characters or fewer')
+    .regex(
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      'Use lowercase letters, numbers and single hyphens (no leading or trailing hyphen)'
+    ),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
-
-const deploymentConfigSchema = z.object({
-  cpuRequest: z.string().optional(),
-  cpuLimit: z.string().optional(),
-  memoryRequest: z.string().optional(),
-  memoryLimit: z.string().optional(),
-  replicas: z.string().optional(),
-  port: z.string().optional(),
-  automaticDeploy: z.boolean(),
-  performanceMetricsEnabled: z.boolean(),
-  sessionRecordingEnabled: z.boolean(),
-})
-
-type DeploymentConfigFormValues = z.infer<typeof deploymentConfigSchema>
-
-const previewEnvironmentsSchema = z
-  .object({
-    enablePreviewEnvironments: z.boolean(),
-    previewEnvsOnDemand: z.boolean(),
-    previewEnvsIdleTimeoutSeconds: z.string(),
-    previewEnvsWakeTimeoutSeconds: z.string(),
-  })
-  .superRefine((values, ctx) => {
-    if (!values.previewEnvsOnDemand) return
-    const idle = parseInt(values.previewEnvsIdleTimeoutSeconds, 10)
-    if (Number.isNaN(idle) || idle < 60 || idle > 86400) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['previewEnvsIdleTimeoutSeconds'],
-        message: 'Must be between 60 and 86400 seconds',
-      })
-    }
-    const wake = parseInt(values.previewEnvsWakeTimeoutSeconds, 10)
-    if (Number.isNaN(wake) || wake < 5 || wake > 120) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['previewEnvsWakeTimeoutSeconds'],
-        message: 'Must be between 5 and 120 seconds',
-      })
-    }
-  })
-
-type PreviewEnvironmentsFormValues = z.infer<typeof previewEnvironmentsSchema>
 
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
@@ -108,155 +83,62 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     },
   })
 
-  const updateDeploymentConfig = useMutation({
-    ...updateProjectDeploymentConfigMutation(),
-    meta: {
-      errorTitle: 'Failed to update deployment configuration',
-    },
-  })
-
   const projectForm = useForm<ProjectFormValues>({
     resolver: zodResolver(projectSchema),
     defaultValues: {
-      name: project?.slug || '',
+      name: project?.name || '',
+      slug: project?.slug || '',
     },
   })
 
-  const deploymentForm = useForm<DeploymentConfigFormValues>({
-    resolver: zodResolver(deploymentConfigSchema),
-    defaultValues: {
-      cpuRequest:
-        project?.deployment_config?.cpuRequest != null
-          ? (project.deployment_config.cpuRequest / 1_000_000).toString()
-          : '',
-      cpuLimit:
-        project?.deployment_config?.cpuLimit != null
-          ? (project.deployment_config.cpuLimit / 1_000_000).toString()
-          : '',
-      memoryRequest:
-        project?.deployment_config?.memoryRequest?.toString() ?? '',
-      memoryLimit: project?.deployment_config?.memoryLimit?.toString() ?? '',
-      replicas: project?.deployment_config?.replicas?.toString() ?? '',
-      port: project?.deployment_config?.exposedPort?.toString() ?? '',
-      automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
-      performanceMetricsEnabled:
-        project?.deployment_config?.performanceMetricsEnabled ?? false,
-      sessionRecordingEnabled: false,
-    },
-  })
-
-  const previewForm = useForm<PreviewEnvironmentsFormValues>({
-    resolver: zodResolver(previewEnvironmentsSchema),
-    defaultValues: {
-      enablePreviewEnvironments: project?.enable_preview_environments ?? false,
-      previewEnvsOnDemand: project?.preview_envs_on_demand ?? false,
-      previewEnvsIdleTimeoutSeconds: (
-        project?.preview_envs_idle_timeout_seconds ?? 300
-      ).toString(),
-      previewEnvsWakeTimeoutSeconds: (
-        project?.preview_envs_wake_timeout_seconds ?? 30
-      ).toString(),
-    },
-  })
-
-  const previewEnabled = previewForm.watch('enablePreviewEnvironments')
-  const onDemandEnabled = previewForm.watch('previewEnvsOnDemand')
+  // `defaultValues` are only read on mount, but this component stays mounted
+  // when the route switches between two projects' settings pages. Without this
+  // reset the form would still hold the previous project's identity, and Save
+  // would rename the newly-selected project to the old one's name and slug.
+  //
+  // Keyed on the project *identity*, not its values: a plain refetch of the
+  // same project must not overwrite whatever the user is currently typing.
+  const syncedProjectId = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (project?.id === undefined || syncedProjectId.current === project.id) {
+      return
+    }
+    syncedProjectId.current = project.id
+    projectForm.reset({
+      name: project.name || '',
+      slug: project.slug || '',
+    })
+  }, [project?.id, project?.name, project?.slug, projectForm])
 
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return
 
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          slug: values.name,
-        },
-      }),
-      {
-        loading: 'Updating project...',
-        success: 'Project updated successfully',
-        error: 'Failed to update project',
-      }
-    )
+    const request = updateProjectSettings.mutateAsync({
+      path: { project_id: project.id! },
+      body: {
+        name: values.name,
+        slug: values.slug,
+      },
+    })
+    toast.promise(request, {
+      loading: 'Updating project...',
+      success: 'Project updated successfully',
+      error: 'Failed to update project',
+    })
+    // The toast surfaces the failure; bail out here so a rejected save never
+    // falls through to refetch/navigate, and never escapes as an unhandled
+    // rejection.
+    let updated
+    try {
+      updated = await request
+    } catch {
+      return
+    }
     refetch()
-    navigate(`/projects/${values.name}/settings/general`)
-  }
-
-  const handleSaveDeploymentConfig = async (
-    values: DeploymentConfigFormValues
-  ) => {
-    if (!project?.id) return
-
-    await toast.promise(
-      updateDeploymentConfig.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          cpuRequest:
-            values.cpuRequest && values.cpuRequest.trim() !== ''
-              ? Math.round(parseFloat(values.cpuRequest) * 1_000_000)
-              : null,
-          cpuLimit:
-            values.cpuLimit && values.cpuLimit.trim() !== ''
-              ? Math.round(parseFloat(values.cpuLimit) * 1_000_000)
-              : null,
-          memoryRequest:
-            values.memoryRequest && values.memoryRequest.trim() !== ''
-              ? parseInt(values.memoryRequest)
-              : null,
-          memoryLimit:
-            values.memoryLimit && values.memoryLimit.trim() !== ''
-              ? parseInt(values.memoryLimit)
-              : null,
-          replicas:
-            values.replicas && values.replicas.trim() !== ''
-              ? parseInt(values.replicas)
-              : null,
-          exposedPort:
-            values.port && values.port.trim() !== ''
-              ? parseInt(values.port)
-              : null,
-          automaticDeploy: values.automaticDeploy,
-          performanceMetricsEnabled: values.performanceMetricsEnabled,
-          sessionRecordingEnabled: values.sessionRecordingEnabled,
-        },
-      }),
-      {
-        loading: 'Updating deployment configuration...',
-        success: 'Deployment configuration updated successfully',
-        error: 'Failed to update deployment configuration',
-      }
-    )
-    refetch()
-  }
-
-  const handleSavePreviewEnvironments = async (
-    values: PreviewEnvironmentsFormValues
-  ) => {
-    if (!project?.id) return
-
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
-        body: {
-          enable_preview_environments: values.enablePreviewEnvironments,
-          preview_envs_on_demand: values.previewEnvsOnDemand,
-          preview_envs_idle_timeout_seconds: parseInt(
-            values.previewEnvsIdleTimeoutSeconds,
-            10
-          ),
-          preview_envs_wake_timeout_seconds: parseInt(
-            values.previewEnvsWakeTimeoutSeconds,
-            10
-          ),
-        },
-      }),
-      {
-        loading: 'Updating preview environment settings...',
-        success: 'Preview environment settings updated successfully',
-        error: 'Failed to update preview environment settings',
-      }
-    )
-    refetch()
+    // Navigate to the slug the server persisted, not the one submitted: the
+    // server normalizes it, so routing on the raw input can land on a URL that
+    // does not exist.
+    navigate(`/projects/${updated?.slug ?? values.slug}/settings/general`)
   }
 
   const handleToggleCrossProjectTraceSharing = async (enabled: boolean) => {
@@ -273,6 +155,25 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         loading: 'Updating cross-project trace sharing...',
         success: 'Cross-project trace sharing updated',
         error: 'Failed to update cross-project trace sharing',
+      }
+    )
+    refetch()
+  }
+
+  const handleToggleErrorSourceContext = async (enabled: boolean) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          error_source_context_enabled: enabled,
+        },
+      }),
+      {
+        loading: 'Updating source context setting...',
+        success: 'Error tracking source context updated',
+        error: 'Failed to update source context setting',
       }
     )
     refetch()
@@ -311,9 +212,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
   return (
     <div className="space-y-6">
-      {/* Deployment source — how the project is built/deployed */}
-      <DeploymentSourceCard project={project} refetch={refetch} />
-
       {/* Project Settings Card */}
       <Form {...projectForm}>
         <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
@@ -331,6 +229,26 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
+                    <FormLabel>Project Name</FormLabel>
+                    <FormControl>
+                      <Input {...field} className="max-w-[400px]" />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      The display name shown on the dashboard, in alerts, and in
+                      notifications. Also used as the OpenTelemetry service name
+                      for future deployments, so renaming starts a new series in
+                      traces and metrics.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={projectForm.control}
+                name="slug"
+                render={({ field }) => (
+                  <FormItem>
                     <FormLabel>Project Slug</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
@@ -338,11 +256,10 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                     <FormDescription className="text-muted-foreground">
                       This will be used in your project&apos;s URL
                     </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
-
-
             </CardContent>
             <CardFooter>
               <Button type="submit" disabled={updateProjectSettings.isPending}>
@@ -353,367 +270,13 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         </form>
       </Form>
 
-      {/* Deployment Configuration Card */}
-      <Form {...deploymentForm}>
-        <form
-          onSubmit={deploymentForm.handleSubmit(handleSaveDeploymentConfig)}
-        >
-          <Card className="bg-background text-foreground">
-            <CardHeader>
-              <CardTitle>Default Deployment Configuration</CardTitle>
-              <CardDescription>
-                Configure default resource limits and deployment settings for
-                all environments. These can be overridden per environment.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              {/* Resource Limits */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-medium">Resource Limits</h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <FormField
-                    control={deploymentForm.control}
-                    name="cpuRequest"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>CPU Request (cores)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            step="any"
-                            min="0.01"
-                            placeholder="e.g., 0.1"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Minimum CPU cores (e.g., 0.25, 0.5, 1, 2)
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
+      {/* Monitoring — what deployments report about themselves */}
+      <MonitoringCard project={project} refetch={refetch} />
 
-                  <FormField
-                    control={deploymentForm.control}
-                    name="cpuLimit"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>CPU Limit (cores)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            step="any"
-                            min="0.01"
-                            placeholder="e.g., 1"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Maximum CPU cores (e.g., 0.5, 1, 2)
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={deploymentForm.control}
-                    name="memoryRequest"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Memory Request (MB)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            min="1"
-                            placeholder="e.g., 128"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Minimum memory allocation
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={deploymentForm.control}
-                    name="memoryLimit"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Memory Limit (MB)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            min="0"
-                            placeholder="e.g., 256"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Maximum memory allocation. Leave empty to use the
-                          default, or set <code>0</code> to run uncapped.
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={deploymentForm.control}
-                    name="replicas"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Default Replicas</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            min="1"
-                            placeholder="e.g., 1"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Default number of container instances
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={deploymentForm.control}
-                    name="port"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Default Port</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            type="number"
-                            min="1"
-                            max="65535"
-                            placeholder="e.g., 3000"
-                          />
-                        </FormControl>
-                        <FormDescription className="text-muted-foreground">
-                          Default port your application listens on
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-                </div>
-              </div>
-
-              {/* Automation Settings */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-medium">Automation</h3>
-                <FormField
-                  control={deploymentForm.control}
-                  name="automaticDeploy"
-                  render={({ field }) => (
-                    <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                      <div className="space-y-0.5">
-                        <FormLabel className="text-base">
-                          Automatic Deployments
-                        </FormLabel>
-                        <FormDescription>
-                          Automatically deploy when changes are pushed to the
-                          main branch
-                        </FormDescription>
-                      </div>
-                      <FormControl>
-                        <Switch
-                          checked={field.value}
-                          onCheckedChange={field.onChange}
-                        />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-              </div>
-
-              {/* Monitoring Settings */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-medium">Monitoring</h3>
-                <div className="space-y-4">
-                  <FormField
-                    control={deploymentForm.control}
-                    name="performanceMetricsEnabled"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                        <div className="space-y-0.5">
-                          <FormLabel className="text-base">
-                            Performance Metrics
-                          </FormLabel>
-                          <FormDescription>
-                            Collect and display performance metrics for your
-                            deployments
-                          </FormDescription>
-                        </div>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={deploymentForm.control}
-                    name="sessionRecordingEnabled"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                        <div className="space-y-0.5">
-                          <FormLabel className="text-base">
-                            Session Recording
-                          </FormLabel>
-                          <FormDescription>
-                            Record user sessions for debugging and analytics
-                          </FormDescription>
-                        </div>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-                </div>
-              </div>
-            </CardContent>
-            <CardFooter>
-              <Button type="submit" disabled={updateDeploymentConfig.isPending}>
-                Save Configuration
-              </Button>
-            </CardFooter>
-          </Card>
-        </form>
-      </Form>
-
-      {/* Preview Environments Card */}
-      <Form {...previewForm}>
-        <form
-          onSubmit={previewForm.handleSubmit(handleSavePreviewEnvironments)}
-        >
-          <Card className="bg-background text-foreground">
-            <CardHeader>
-              <CardTitle>Preview Environments</CardTitle>
-              <CardDescription>
-                Automatically create preview environments for each branch. When
-                enabled, deployments to branches that don't match any existing
-                environment will create temporary preview environments.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <FormField
-                control={previewForm.control}
-                name="enablePreviewEnvironments"
-                render={({ field }) => (
-                  <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                    <div className="space-y-0.5">
-                      <FormLabel className="text-base">
-                        Enable Preview Environments
-                      </FormLabel>
-                      <FormDescription>
-                        Automatically create environments for feature branches,
-                        pull requests, and other non-production branches
-                      </FormDescription>
-                    </div>
-                    <FormControl>
-                      <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                )}
-              />
-
-              <FormField
-                control={previewForm.control}
-                name="previewEnvsOnDemand"
-                render={({ field }) => (
-                  <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                    <div className="space-y-0.5">
-                      <FormLabel className="text-base">
-                        On-Demand Preview Environments
-                      </FormLabel>
-                      <FormDescription>
-                        Save resources by sleeping preview environments when
-                        idle. Containers stop after the idle timeout and start
-                        again on the next request. Applies only to previews
-                        created after this is enabled.
-                      </FormDescription>
-                    </div>
-                    <FormControl>
-                      <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
-                        disabled={!previewEnabled}
-                      />
-                    </FormControl>
-                  </FormItem>
-                )}
-              />
-
-              {onDemandEnabled && previewEnabled && (
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <FormField
-                    control={previewForm.control}
-                    name="previewEnvsIdleTimeoutSeconds"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Idle timeout (seconds)</FormLabel>
-                        <FormControl>
-                          <Input
-                            type="number"
-                            min={60}
-                            max={86400}
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Seconds of inactivity before containers are stopped.
-                          Min 60, max 86400 (24h). Default 300 (5 min).
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-                  <FormField
-                    control={previewForm.control}
-                    name="previewEnvsWakeTimeoutSeconds"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Wake timeout (seconds)</FormLabel>
-                        <FormControl>
-                          <Input
-                            type="number"
-                            min={5}
-                            max={120}
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Max time to wait for containers to start on wake.
-                          Min 5, max 120. Default 30.
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-                </div>
-              )}
-            </CardContent>
-            <CardFooter>
-              <Button type="submit" disabled={updateProjectSettings.isPending}>
-                Save Settings
-              </Button>
-            </CardFooter>
-          </Card>
-        </form>
-      </Form>
+      {/* ADR-040 — where this project's telemetry history stands with Temps
+          Cloud. Always rendered: the backfill is a deliberate CLI action, so
+          this card is the only place it is discoverable from the Console. */}
+      <CloudTelemetryBackfillCard project={project} />
 
       {/* Cross-Project Trace Sharing Card */}
       <Card className="bg-background text-foreground">
@@ -737,6 +300,37 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <Switch
               checked={project?.cross_project_trace_sharing ?? true}
               onCheckedChange={handleToggleCrossProjectTraceSharing}
+              disabled={updateProjectSettings.isPending}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Error Tracking Source Context Card */}
+      <Card className="bg-background text-foreground">
+        <CardHeader>
+          <CardTitle>Error Tracking Source Context</CardTitle>
+          <CardDescription>
+            Show the actual source code around each stack frame in error
+            reports. JavaScript source maps always resolve; enable this to also
+            store uploaded source files and render code for native stack traces
+            (Go, Rust, Python, and more).
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
+            <div className="space-y-0.5 pr-4">
+              <Label className="text-base">Source code in stack traces</Label>
+              <p className="text-sm text-muted-foreground">
+                Off by default. When enabled, upload your application source per
+                release (via the CLI or API, keyed by the deployed commit/tag)
+                and Temps shows the code around each frame. Source files are
+                only accepted and stored while this is on.
+              </p>
+            </div>
+            <Switch
+              checked={project?.error_source_context_enabled ?? false}
+              onCheckedChange={handleToggleErrorSourceContext}
               disabled={updateProjectSettings.isPending}
             />
           </div>
@@ -771,11 +365,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             </AlertDialogHeader>
             <div className="space-y-2">
               <Label htmlFor="confirm-delete-project-name">
-                Type{' '}
-                <span className="font-mono font-semibold text-foreground">
-                  {project?.name}
-                </span>{' '}
-                to confirm
+                Type <ConfirmNameBadge value={project?.name ?? ''} /> to confirm
               </Label>
               <Input
                 id="confirm-delete-project-name"

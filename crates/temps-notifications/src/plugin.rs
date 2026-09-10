@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Notifications Plugin implementation for the Temps plugin system
 //!
 //! This plugin provides notification services including:
@@ -21,6 +24,7 @@ use crate::{
     digest::{DigestScheduler, DigestService},
     handlers::{configure_routes, NotificationProvidersApiDoc, NotificationState},
     services::{NotificationPreferencesService, NotificationService},
+    NotificationRoutingService,
 };
 
 /// Notifications Plugin for managing notification providers and services
@@ -51,13 +55,19 @@ impl TempsPlugin for NotificationsPlugin {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let cloud_service = context.require_service::<temps_cloud::CloudService>();
 
             // Create NotificationService
-            let notification_service = Arc::new(NotificationService::new(
+            let notification_service = Arc::new(NotificationService::new_with_cloud(
                 db.clone(),
                 encryption_service.clone(),
+                cloud_service,
             ));
             context.register_service(notification_service.clone());
+
+            let notification_routing_service =
+                Arc::new(NotificationRoutingService::new(db.clone()));
+            context.register_service(notification_routing_service.clone());
 
             // Register the notification service as the trait object directly
             // This avoids double-wrapping since the plugin system will wrap it in Arc
@@ -81,6 +91,7 @@ impl TempsPlugin for NotificationsPlugin {
             // Create NotificationState for handlers
             let notification_state = Arc::new(NotificationState::new(
                 notification_service.clone(),
+                notification_routing_service,
                 notification_preferences_service.clone(),
                 digest_service.clone(),
                 audit_service,

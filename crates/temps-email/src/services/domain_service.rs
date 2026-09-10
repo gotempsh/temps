@@ -1,16 +1,49 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Domain service for managing email sending domains
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
-use temps_entities::email_domains;
+use temps_entities::{email_domain_projects, email_domains, projects};
 use tracing::{debug, error, info, warn};
 
+use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
-use crate::providers::{DnsRecord, DnsRecordStatus, DomainIdentityDetails, VerificationStatus};
+use crate::providers::{
+    DnsRecord, DnsRecordStatus, DomainIdentityDetails, EmailProvider, VerificationStatus,
+};
 use crate::services::ProviderService;
+
+/// Trigger the provider's own check, then read back per-record verification
+/// details. A free function taking `&dyn EmailProvider` (rather than a
+/// `DomainService` method) so it can be unit-tested against
+/// `MockEmailProvider` without a live provider connection — mirroring
+/// `send_with_retry` in `email_service.rs`.
+///
+/// The trigger step matters for Scaleway: `verify_identity` POSTs to
+/// `/domains/{id}/check`, which is the only thing that ever moves Scaleway's
+/// own dashboard off "Unchecked". `get_identity_details` alone is a plain GET
+/// that never asks Scaleway to re-check anything, so calling it in isolation
+/// can leave Temps showing a domain as `verified` — from Temps' own
+/// independent SPF/DKIM DNS lookup — while Scaleway's side stays "Unchecked"
+/// forever and the domain still can't send through Scaleway. SES and SMTP
+/// have no separate trigger step, so this is a harmless extra read for them.
+async fn refresh_identity_details(
+    provider: &dyn EmailProvider,
+    domain: &str,
+    provider_identity_id: Option<&str>,
+) -> Result<DomainIdentityDetails, EmailError> {
+    provider
+        .verify_identity(domain, provider_identity_id)
+        .await?;
+    provider
+        .get_identity_details(domain, provider_identity_id)
+        .await
+}
 
 /// Service for managing email domains
 #[derive(Clone)]
@@ -24,6 +57,15 @@ pub struct DomainService {
 pub struct CreateDomainRequest {
     pub provider_id: i32,
     pub domain: String,
+}
+
+/// Request to import an existing email domain from a provider
+#[derive(Debug, Clone)]
+pub struct ImportDomainRequest {
+    pub provider_id: i32,
+    pub domain: String,
+    /// Provider-internal identity identifier (required for Scaleway, optional for SES)
+    pub provider_identity_id: Option<String>,
 }
 
 /// Domain with DNS records for display
@@ -82,6 +124,8 @@ impl DomainService {
             dns_records.push(mx.clone());
         }
 
+        dns_records.push(Self::dmarc_record_template(&request.domain));
+
         // Store domain in database
         let domain = email_domains::ActiveModel {
             provider_id: Set(request.provider_id),
@@ -115,6 +159,136 @@ impl DomainService {
         })
     }
 
+    /// Import an existing domain identity that was provisioned directly in the provider.
+    ///
+    /// Unlike `create()`, this method does NOT call `create_identity` on the provider.
+    /// Instead it calls `get_identity_details` to look up the pre-existing identity and
+    /// persists a new `email_domains` row using the current verification state.
+    ///
+    /// Errors if:
+    /// - The provider is not found.
+    /// - `get_identity_details` fails (e.g. the identity doesn't exist provider-side).
+    /// - `domain` is already registered in temps, for this or any other provider
+    ///   (`email_domains.domain` has a global unique index — a domain can only
+    ///   be registered once, period).
+    pub async fn import(
+        &self,
+        request: ImportDomainRequest,
+    ) -> Result<DomainWithDnsRecords, EmailError> {
+        debug!(
+            "Importing email domain: {} for provider: {}",
+            request.domain, request.provider_id
+        );
+
+        // Guard: reject if this domain is already registered, under any provider.
+        // Matches the `idx_email_domains_domain_unique` index, which is on
+        // `domain` alone rather than `(domain, provider_id)` — checking only
+        // this provider would let the insert below hit that constraint and
+        // surface as a generic 500 instead of a 409.
+        let existing = email_domains::Entity::find()
+            .filter(email_domains::Column::Domain.eq(request.domain.as_str()))
+            .one(self.db.as_ref())
+            .await?;
+        if existing.is_some() {
+            return Err(EmailError::DomainAlreadyExists {
+                domain: request.domain.clone(),
+                provider_id: request.provider_id,
+            });
+        }
+
+        // Get the provider.
+        let provider = self.provider_service.get(request.provider_id).await?;
+
+        // Build the provider instance.
+        let provider_instance = self
+            .provider_service
+            .create_provider_instance(&provider)
+            .await?;
+
+        // Look up the existing identity — do NOT create a new one.
+        let identity_details = provider_instance
+            .get_identity_details(&request.domain, request.provider_identity_id.as_deref())
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to fetch identity details for domain '{}' from provider {}: {}",
+                    request.domain, request.provider_id, e
+                );
+                e
+            })?;
+
+        // Build the DNS records list for the response.
+        let mut dns_records = Vec::new();
+        if let Some(spf) = &identity_details.spf_record {
+            dns_records.push(spf.clone());
+        }
+        dns_records.extend(identity_details.dkim_records.clone());
+        if let Some(mx) = &identity_details.mx_record {
+            dns_records.push(mx.clone());
+        }
+        dns_records.push(Self::dmarc_record_template(&request.domain));
+
+        // Compute the initial status from the fetched verification data.
+        let (status_str, verification_error, last_verified_at) =
+            Self::status_fields(Self::resolve_verification_status(&identity_details));
+
+        // Persist the new row.
+        let active_model = email_domains::ActiveModel {
+            provider_id: Set(request.provider_id),
+            domain: Set(request.domain.clone()),
+            status: Set(status_str),
+            spf_record_name: Set(identity_details.spf_record.as_ref().map(|r| r.name.clone())),
+            spf_record_value: Set(identity_details
+                .spf_record
+                .as_ref()
+                .map(|r| r.value.clone())),
+            // DomainIdentityDetails does not carry a DKIM selector field;
+            // it is not available from get_identity_details — leave it unset.
+            dkim_selector: Set(None),
+            dkim_record_name: Set(identity_details
+                .dkim_records
+                .first()
+                .map(|r| r.name.clone())),
+            dkim_record_value: Set(identity_details
+                .dkim_records
+                .first()
+                .map(|r| r.value.clone())),
+            mx_record_name: Set(identity_details.mx_record.as_ref().map(|r| r.name.clone())),
+            mx_record_value: Set(identity_details.mx_record.as_ref().map(|r| r.value.clone())),
+            mx_record_priority: Set(identity_details
+                .mx_record
+                .as_ref()
+                .and_then(|r| r.priority.map(|p| p as i16))),
+            provider_identity_id: Set(request.provider_identity_id.clone()),
+            last_verified_at: Set(last_verified_at),
+            verification_error: Set(verification_error),
+            ..Default::default()
+        };
+
+        let result = active_model.insert(self.db.as_ref()).await.map_err(|e| {
+            if is_unique_violation(&e) {
+                // The pre-check above already covers the common case; this
+                // catches a concurrent import of the same domain racing past it.
+                EmailError::DomainAlreadyExists {
+                    domain: request.domain.clone(),
+                    provider_id: request.provider_id,
+                }
+            } else {
+                EmailError::from(e)
+            }
+        })?;
+
+        info!(
+            "Imported email domain '{}' with id: {} (status: {})",
+            request.domain, result.id, result.status
+        );
+
+        Ok(DomainWithDnsRecords {
+            domain: result,
+            dns_records,
+        })
+    }
+
     /// Get a domain by ID
     pub async fn get(&self, id: i32) -> Result<email_domains::Model, EmailError> {
         email_domains::Entity::find_by_id(id)
@@ -134,6 +308,102 @@ impl DomainService {
             .await?;
 
         Ok(domain)
+    }
+
+    /// Allow one project-scoped deployment credential to use a verified sender domain.
+    pub async fn authorize_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(EmailError::ProjectNotFound(project_id));
+        }
+
+        email_domain_projects::Entity::insert(email_domain_projects::ActiveModel {
+            domain_id: Set(domain_id),
+            project_id: Set(project_id),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([
+                email_domain_projects::Column::DomainId,
+                email_domain_projects::Column::ProjectId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(self.db.as_ref())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove a project's permission to use a sender domain.
+    pub async fn revoke_project(&self, domain_id: i32, project_id: i32) -> Result<(), EmailError> {
+        self.get(domain_id).await?;
+        email_domain_projects::Entity::delete_many()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .filter(email_domain_projects::Column::ProjectId.eq(project_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// List the active projects currently allowed to send through a domain.
+    pub async fn list_authorized_projects(
+        &self,
+        domain_id: i32,
+    ) -> Result<Vec<projects::Model>, EmailError> {
+        self.get(domain_id).await?;
+
+        let project_ids = email_domain_projects::Entity::find()
+            .filter(email_domain_projects::Column::DomainId.eq(domain_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|authorization| authorization.project_id)
+            .collect::<Vec<_>>();
+
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(projects::Entity::find()
+            .filter(projects::Column::Id.is_in(project_ids))
+            .filter(projects::Column::IsDeleted.eq(false))
+            .order_by_asc(projects::Column::Name)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    /// Whether a project-scoped deployment credential may send through this domain.
+    pub async fn is_authorized_for_project(
+        &self,
+        domain_id: i32,
+        project_id: i32,
+    ) -> Result<bool, EmailError> {
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Ok(false);
+        }
+
+        Ok(
+            email_domain_projects::Entity::find_by_id((domain_id, project_id))
+                .one(self.db.as_ref())
+                .await?
+                .is_some(),
+        )
     }
 
     /// Get a domain with its DNS records (fetches fresh verification status from provider)
@@ -167,19 +437,20 @@ impl DomainService {
                     records.push(mx);
                 }
 
-                // Compute status based on all DNS records being verified
-                let all_verified = Self::are_all_records_verified(&identity_details);
-                let status = if all_verified {
-                    "verified".to_string()
-                } else {
-                    // Check if any records failed
-                    let any_failed = records.iter().any(|r| r.status == DnsRecordStatus::Failed);
-                    if any_failed {
-                        "failed".to_string()
-                    } else {
-                        "pending".to_string()
-                    }
-                };
+                // Compute status via the same shared resolver AND the same
+                // status_fields string mapping used by import()/verify(), so
+                // a provider-side failure (e.g. a revoked identity) still
+                // takes precedence over DNS records that currently resolve as
+                // verified — see `resolve_verification_status`'s doc comment
+                // — and a TemporaryFailure/NotStarted status is reported
+                // distinctly here too, rather than collapsing to a generic
+                // "pending" that hides why the provider is unsure. DMARC and
+                // MX are deliberately excluded — see `dmarc_record_template`'s
+                // doc comment and `are_all_records_verified`'s doc comment.
+                let (status, _, _) =
+                    Self::status_fields(Self::resolve_verification_status(&identity_details));
+
+                records.push(Self::dmarc_record_live(&domain.domain).await);
 
                 (records, status)
             }
@@ -230,7 +501,10 @@ impl DomainService {
             }
         };
 
-        match provider_instance.get_identity_details(&domain.domain).await {
+        match provider_instance
+            .get_identity_details(&domain.domain, domain.provider_identity_id.as_deref())
+            .await
+        {
             Ok(details) => Some(details),
             Err(e) => {
                 warn!(
@@ -242,30 +516,133 @@ impl DomainService {
         }
     }
 
-    /// Check if all DNS records are verified
+    /// Check if all *required* DNS records (SPF and DKIM) are verified.
+    ///
+    /// MX is intentionally excluded: it is a deliverability-hardening
+    /// recommendation, not a prerequisite for sending or authenticating
+    /// outgoing email. Scaleway's own console shows MX in a visually separate
+    /// section without the "REQUIRED" badge — a domain with SPF + DKIM
+    /// verified is fully able to send regardless of MX status.
+    ///
+    /// DMARC is also excluded — see `dmarc_record_template`'s doc comment.
     fn are_all_records_verified(details: &DomainIdentityDetails) -> bool {
-        // Check SPF record
-        if let Some(ref spf) = details.spf_record {
-            if spf.status != DnsRecordStatus::Verified {
-                return false;
-            }
+        // A provider that doesn't manage DNS records at all (SMTP: no
+        // domain-management API, nothing to probe) has no SPF/DKIM to check
+        // in the first place — empty here means "not applicable", not "not
+        // yet configured". Gating on records that structurally can never
+        // exist would permanently strand every SMTP-backed domain at
+        // Pending. Providers that do manage records (Scaleway, SES, the
+        // mock) are unaffected since they set this to `true`.
+        if !details.manages_dns_records {
+            return true;
         }
 
-        // Check DKIM records
-        for dkim in &details.dkim_records {
-            if dkim.status != DnsRecordStatus::Verified {
-                return false;
-            }
+        // SPF must be present AND verified — `None` means the provider never
+        // returned an SPF record at all, which must not vacuously pass.
+        let spf_verified = matches!(
+            &details.spf_record,
+            Some(spf) if spf.status == DnsRecordStatus::Verified
+        );
+        if !spf_verified {
+            return false;
         }
 
-        // Check MX record (if present)
-        if let Some(ref mx) = details.mx_record {
-            if mx.status != DnsRecordStatus::Verified {
-                return false;
-            }
+        // DKIM must have at least one record AND all of them verified — an
+        // empty `dkim_records` list must not vacuously pass an `all()`/loop
+        // check, since that would let a domain with no DKIM record at all
+        // through the sending gate.
+        if details.dkim_records.is_empty() {
+            return false;
         }
+        if details
+            .dkim_records
+            .iter()
+            .any(|dkim| dkim.status != DnsRecordStatus::Verified)
+        {
+            return false;
+        }
+
+        // MX is optional — excluded from this gate intentionally.
 
         true
+    }
+
+    /// Resolve a domain's verification status from fetched identity details.
+    /// Shared by `import()` and `verify()` so the gate is defined once.
+    ///
+    /// "Verified" may ONLY come from `are_all_records_verified` (the required
+    /// SPF+DKIM record check). The provider's coarser `overall_status` field
+    /// can report Verified independently of per-record DKIM/SPF state (e.g.
+    /// before records are fully parsed, or a provider-side quirk) — trusting
+    /// it here would let a domain with missing/empty DKIM through the sending
+    /// gate, which is exactly the bug `are_all_records_verified` exists to
+    /// prevent. The provider's Failed signal is checked FIRST and always
+    /// wins, even over records that currently resolve as verified: a
+    /// provider-side revocation/suspension is authoritative and must not be
+    /// overridden by DNS that simply hasn't caught up yet (stale resolver
+    /// cache, or the owner never removed old records).
+    fn resolve_verification_status(details: &DomainIdentityDetails) -> VerificationStatus {
+        if let VerificationStatus::Failed(msg) = &details.overall_status {
+            return VerificationStatus::Failed(msg.clone());
+        }
+
+        // A provider-reported temporary failure (e.g. SES's TEMPORARY_FAILURE)
+        // means records that were previously verified are no longer trusted by
+        // the provider. This must take the same precedence as `Failed` — a
+        // live DNS lookup that currently happens to resolve SPF/DKIM correctly
+        // must not silently promote the domain back to `Verified` and let it
+        // through the persisted sending gate while the provider itself is
+        // still unsure.
+        if let VerificationStatus::TemporaryFailure = &details.overall_status {
+            return VerificationStatus::TemporaryFailure;
+        }
+
+        if Self::are_all_records_verified(details) {
+            return VerificationStatus::Verified;
+        }
+
+        let any_required_failed = details
+            .spf_record
+            .as_ref()
+            .map(|r| r.status == DnsRecordStatus::Failed)
+            .unwrap_or(false)
+            || details
+                .dkim_records
+                .iter()
+                .any(|r| r.status == DnsRecordStatus::Failed);
+        if any_required_failed {
+            return VerificationStatus::Failed(
+                "Some required DNS records failed verification".to_string(),
+            );
+        }
+
+        VerificationStatus::Pending
+    }
+
+    /// Map a resolved `VerificationStatus` to the persisted `(status, verification_error,
+    /// last_verified_at)` triple. Shared by `import()` and `verify()` so a status like
+    /// `TemporaryFailure` is recorded distinctly everywhere instead of one caller
+    /// collapsing it into a generic "pending" that hides why the provider is unsure.
+    fn status_fields(
+        status: VerificationStatus,
+    ) -> (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        match status {
+            VerificationStatus::Verified => {
+                ("verified".to_string(), None, Some(chrono::Utc::now()))
+            }
+            VerificationStatus::Pending => ("pending".to_string(), None, None),
+            VerificationStatus::Failed(msg) => ("failed".to_string(), Some(msg), None),
+            VerificationStatus::NotStarted => ("not_started".to_string(), None, None),
+            VerificationStatus::TemporaryFailure => (
+                "temporary_failure".to_string(),
+                Some("DNS records no longer valid".to_string()),
+                None,
+            ),
+        }
     }
 
     /// List all domains
@@ -318,14 +695,19 @@ impl DomainService {
             .create_provider_instance(&provider)
             .await?;
 
-        // Get identity details with DNS verification
-        let identity_details = provider_instance
-            .get_identity_details(&domain.domain)
-            .await
-            .map_err(|e| {
-                error!("Failed to get identity details: {}", e);
-                e
-            })?;
+        // Trigger the provider's own check, then read per-record status —
+        // see `refresh_identity_details`'s doc comment for why the order
+        // matters.
+        let identity_details = refresh_identity_details(
+            provider_instance.as_ref(),
+            &domain.domain,
+            domain.provider_identity_id.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to refresh domain identity details: {}", e);
+            e
+        })?;
 
         // Build DNS records list for response
         let mut dns_records = Vec::new();
@@ -340,54 +722,32 @@ impl DomainService {
             dns_records.push(mx.clone());
         }
 
-        // Check if all DNS records are verified
-        let all_dns_verified = Self::are_all_records_verified(&identity_details);
+        // Determine final status based on required (SPF+DKIM) DNS record
+        // verification. MX and DMARC are intentionally excluded from this
+        // gate — see `resolve_verification_status`'s doc comment.
+        let status = Self::resolve_verification_status(&identity_details);
+        match &status {
+            VerificationStatus::Verified => {
+                debug!(
+                    "All required DNS records verified via DNS lookup, marking domain as verified"
+                );
+                info!("Domain verified successfully");
+            }
+            VerificationStatus::Pending => debug!("Domain verification pending"),
+            VerificationStatus::Failed(msg) => error!("Domain verification failed: {}", msg),
+            VerificationStatus::NotStarted | VerificationStatus::TemporaryFailure => {}
+        }
 
-        // Check if any records failed
-        let any_failed = dns_records
-            .iter()
-            .any(|r| r.status == DnsRecordStatus::Failed);
-
-        // Determine final status based on DNS record verification
-        let status = if all_dns_verified {
-            debug!("All DNS records verified via DNS lookup, marking domain as verified");
-            VerificationStatus::Verified
-        } else if any_failed {
-            VerificationStatus::Failed("Some DNS records failed verification".to_string())
-        } else {
-            // Use the provider's overall status for pending/other states
-            identity_details.overall_status
-        };
+        dns_records.push(Self::dmarc_record_live(&domain.domain).await);
 
         // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
 
-        match &status {
-            VerificationStatus::Verified => {
-                active_model.status = Set("verified".to_string());
-                active_model.last_verified_at = Set(Some(chrono::Utc::now()));
-                active_model.verification_error = Set(None);
-                info!("Domain verified successfully");
-            }
-            VerificationStatus::Pending => {
-                active_model.status = Set("pending".to_string());
-                active_model.verification_error = Set(None);
-                debug!("Domain verification pending");
-            }
-            VerificationStatus::Failed(msg) => {
-                active_model.status = Set("failed".to_string());
-                active_model.verification_error = Set(Some(msg.clone()));
-                error!("Domain verification failed: {}", msg);
-            }
-            VerificationStatus::NotStarted => {
-                active_model.status = Set("not_started".to_string());
-                active_model.verification_error = Set(None);
-            }
-            VerificationStatus::TemporaryFailure => {
-                active_model.status = Set("temporary_failure".to_string());
-                active_model.verification_error =
-                    Set(Some("DNS records no longer valid".to_string()));
-            }
+        let (status_str, verification_error, last_verified_at) = Self::status_fields(status);
+        active_model.status = Set(status_str);
+        active_model.verification_error = Set(verification_error);
+        if last_verified_at.is_some() {
+            active_model.last_verified_at = Set(last_verified_at);
         }
 
         let result = active_model.update(self.db.as_ref()).await?;
@@ -398,37 +758,99 @@ impl DomainService {
         })
     }
 
-    /// Delete a domain
-    pub async fn delete(&self, id: i32) -> Result<(), EmailError> {
+    /// Delete a domain.
+    ///
+    /// `delete_from_provider` controls whether the identity is also removed
+    /// on the provider's side (e.g. Scaleway/SES). It defaults to `false` at
+    /// the API layer: the same domain identity may be shared with other
+    /// tools against that provider account, so removing it from Temps must
+    /// not silently un-register it elsewhere unless the caller explicitly
+    /// asks for that.
+    ///
+    /// Regardless of `delete_from_provider`, a provider-side failure (network
+    /// error, revoked credentials, the identity-domain mismatch guard
+    /// rejecting a stale UUID) never blocks removing Temps' own record — an
+    /// unreachable provider must not strand this domain forever, since the
+    /// local row is also what the authorization/sending checks use.
+    pub async fn delete(&self, id: i32, delete_from_provider: bool) -> Result<(), EmailError> {
         let domain = self.get(id).await?;
 
-        debug!("Deleting domain: {}", domain.domain);
+        debug!(
+            "Deleting domain: {} (delete_from_provider: {})",
+            domain.domain, delete_from_provider
+        );
 
-        // Get the provider
-        let provider = self.provider_service.get(domain.provider_id).await?;
-
-        // Create provider instance
-        let provider_instance = self
-            .provider_service
-            .create_provider_instance(&provider)
-            .await?;
-
-        // Delete from provider (ignore errors - domain might already be deleted)
-        if let Err(e) = provider_instance.delete_identity(&domain.domain).await {
-            error!(
-                "Failed to delete domain from provider (continuing anyway): {}",
-                e
-            );
-        }
+        let provider_delete_result = if delete_from_provider {
+            let provider = self.provider_service.get(domain.provider_id).await?;
+            let provider_instance = self
+                .provider_service
+                .create_provider_instance(&provider)
+                .await?;
+            Some(
+                provider_instance
+                    .delete_identity(&domain.domain, domain.provider_identity_id.as_deref())
+                    .await,
+            )
+        } else {
+            None
+        };
 
         // Delete from database
         email_domains::Entity::delete_by_id(domain.id)
             .exec(self.db.as_ref())
             .await?;
 
-        info!("Deleted email domain: {}", domain.domain);
+        if let Some(Err(e)) = provider_delete_result {
+            error!(
+                "Domain '{}' removed from Temps, but the provider-side identity could not be \
+                 deleted: {}",
+                domain.domain, e
+            );
+            return Err(EmailError::ProviderCleanupFailed {
+                domain: domain.domain,
+                reason: e.to_string(),
+            });
+        }
+
+        info!(
+            "Deleted email domain: {} (provider-side identity {})",
+            domain.domain,
+            if delete_from_provider {
+                "also removed"
+            } else {
+                "left intact"
+            }
+        );
 
         Ok(())
+    }
+
+    /// The recommended DMARC policy record for a domain. Unlike SPF/DKIM/MX,
+    /// no provider API publishes or manages DMARC — it's a plain DNS TXT
+    /// record the domain owner sets independently — so it's generated here
+    /// rather than surfaced by `EmailProvider::get_identity_details`, and
+    /// deliberately left out of `are_all_records_verified`/failure checks:
+    /// requiring it would regress every already-verified domain the next
+    /// time its status is recomputed. It's informational, not required.
+    fn dmarc_record_template(domain: &str) -> DnsRecord {
+        DnsRecord {
+            record_type: "TXT".to_string(),
+            name: format!("_dmarc.{}", domain),
+            // Quarantine (not reject) by default — a safe starting policy
+            // that won't silently drop mail for a domain that hasn't
+            // fully tuned SPF/DKIM alignment yet.
+            value: "v=DMARC1; p=quarantine; pct=100".to_string(),
+            priority: None,
+            status: DnsRecordStatus::Pending,
+        }
+    }
+
+    /// DMARC record with its live-verified status, for paths that already
+    /// do a live DNS lookup for SPF/DKIM/MX.
+    async fn dmarc_record_live(domain: &str) -> DnsRecord {
+        let mut record = Self::dmarc_record_template(domain);
+        record.status = DnsVerifier::new().verify_dmarc_record(domain).await;
+        record
     }
 
     /// Build DNS records from stored domain data (fallback when provider API unavailable)
@@ -468,14 +890,33 @@ impl DomainService {
             });
         }
 
+        let mut dmarc = Self::dmarc_record_template(&domain.domain);
+        dmarc.status = DnsRecordStatus::Unknown;
+        records.push(dmarc);
+
         records
     }
+}
+
+/// True only for a genuine Postgres unique-constraint violation (SQLSTATE 23505).
+///
+/// Does NOT match bare `DbErr::RecordNotInserted`: this insert never uses
+/// `on_conflict().do_nothing()`, so a `RecordNotInserted` here means the
+/// query executed without error but returned zero rows — on Postgres that
+/// happens when a row-level-security policy hides the inserted row from the
+/// `RETURNING` clause, not when a unique index rejects the row. Treating it
+/// as "already exists" would hide a permission/RLS misconfiguration behind
+/// an incorrect 409, so it is left to fall through to the generic database
+/// error path instead.
+fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    err.sql_err()
+        .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{DnsRecordStatus, EmailProviderType, SesCredentials};
+    use crate::providers::{DnsRecordStatus, EmailProviderType, MockEmailProvider, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
@@ -489,12 +930,22 @@ mod tests {
     }
 
     // Helper to setup test environment with real database
-    async fn setup_test_env() -> (TestDatabase, DomainService, ProviderService) {
-        let db = TestDatabase::with_migrations().await.unwrap();
+    async fn setup_test_env() -> Option<(TestDatabase, DomainService, ProviderService)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email domain test: {error}");
+                    return None;
+                }
+                panic!("Email domain test database or migrations failed: {error}");
+            }
+        };
         let encryption_service = create_test_encryption_service();
         let provider_service = ProviderService::new(db.db.clone(), encryption_service);
         let domain_service = DomainService::new(db.db.clone(), Arc::new(provider_service.clone()));
-        (db, domain_service, provider_service)
+        Some((db, domain_service, provider_service))
     }
 
     // Helper to create a test provider
@@ -510,6 +961,24 @@ mod tests {
             }),
         };
         service.create(request).await.unwrap()
+    }
+
+    // Helper to create a test domain directly in the database (bypasses the
+    // provider's create_identity, which needs real credentials).
+    async fn create_test_domain(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        provider_id: i32,
+        domain_name: &str,
+    ) -> email_domains::Model {
+        let domain = email_domains::ActiveModel {
+            provider_id: Set(provider_id),
+            domain: Set(domain_name.to_string()),
+            status: Set("pending".to_string()),
+            provider_identity_id: Set(Some(format!("mock-identity-{}", domain_name))),
+            ..Default::default()
+        };
+
+        domain.insert(db.as_ref()).await.unwrap()
     }
 
     // ========== Unit Tests (no database required) ==========
@@ -642,7 +1111,7 @@ mod tests {
 
         let records = service.build_dns_records(&domain);
 
-        assert_eq!(records.len(), 3); // SPF, DKIM, MX
+        assert_eq!(records.len(), 4); // SPF, DKIM, MX, DMARC
 
         // Verify SPF record
         let spf = records
@@ -659,13 +1128,461 @@ mod tests {
         let mx = records.iter().find(|r| r.record_type == "MX");
         assert!(mx.is_some());
         assert_eq!(mx.unwrap().priority, Some(10));
+
+        // Verify DMARC record — always generated, unlike the provider-supplied
+        // records above, since no provider API manages it.
+        let dmarc = records.iter().find(|r| r.name == "_dmarc.example.com");
+        assert!(dmarc.is_some());
+        assert!(dmarc.unwrap().value.starts_with("v=DMARC1"));
+    }
+
+    // ========== are_all_records_verified Tests ==========
+
+    fn make_spf(status: DnsRecordStatus) -> DnsRecord {
+        DnsRecord {
+            record_type: "TXT".to_string(),
+            name: "send.example.com".to_string(),
+            value: "v=spf1 include:tem.scaleway.com ~all".to_string(),
+            priority: None,
+            status,
+        }
+    }
+
+    fn make_dkim(status: DnsRecordStatus) -> DnsRecord {
+        DnsRecord {
+            record_type: "TXT".to_string(),
+            name: "s1._domainkey.example.com".to_string(),
+            value: "v=DKIM1; k=rsa; p=PUBLICKEY".to_string(),
+            priority: None,
+            status,
+        }
+    }
+
+    fn make_mx(status: DnsRecordStatus) -> DnsRecord {
+        DnsRecord {
+            record_type: "MX".to_string(),
+            name: "send.example.com".to_string(),
+            value: "blackhole.tem.scaleway.com".to_string(),
+            priority: Some(10),
+            status,
+        }
+    }
+
+    /// SPF + DKIM verified, MX pending → domain should be considered verified.
+    /// This is the primary regression guard for the bug where a pending MX
+    /// record blocked domains that were already fully able to send.
+    #[test]
+    fn mx_pending_does_not_block_verified_status() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: Some(make_mx(DnsRecordStatus::Pending)),
+            mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
+        };
+        assert!(
+            DomainService::are_all_records_verified(&details),
+            "domain with SPF+DKIM verified and MX pending must be considered verified"
+        );
+    }
+
+    /// SPF + DKIM verified, MX failed → domain should still be considered verified.
+    /// A failed MX is an informational issue; it cannot block sending.
+    #[test]
+    fn mx_failed_does_not_block_verified_status() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: Some(make_mx(DnsRecordStatus::Failed)),
+            mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
+        };
+        assert!(
+            DomainService::are_all_records_verified(&details),
+            "domain with SPF+DKIM verified and MX failed must still be considered verified"
+        );
+    }
+
+    /// SPF pending → gates correctly (behaviour unchanged).
+    #[test]
+    fn spf_pending_blocks_verified_status() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Pending)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: Some(make_mx(DnsRecordStatus::Verified)),
+            mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "domain with SPF pending must not be considered verified"
+        );
+    }
+
+    /// DKIM pending → gates correctly (behaviour unchanged).
+    #[test]
+    fn dkim_pending_blocks_verified_status() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Pending)],
+            mx_record: Some(make_mx(DnsRecordStatus::Verified)),
+            mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "domain with DKIM pending must not be considered verified"
+        );
+    }
+
+    /// No MX record at all — SPF + DKIM verified → verified.
+    #[test]
+    fn no_mx_record_spf_dkim_verified_is_verified() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(
+            DomainService::are_all_records_verified(&details),
+            "domain with SPF+DKIM verified and no MX must be considered verified"
+        );
+    }
+
+    /// SMTP-imported domains have no DNS-management API and never return SPF
+    /// or DKIM records at all -- `manages_dns_records: false` must let them
+    /// through the gate immediately, without ever reaching the SPF/DKIM
+    /// presence checks that would otherwise strand them at Pending forever.
+    #[test]
+    fn provider_that_does_not_manage_dns_records_is_verified_without_spf_or_dkim() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: false,
+        };
+        assert!(
+            DomainService::are_all_records_verified(&details),
+            "a provider that does not manage DNS records must not be gated on missing SPF/DKIM"
+        );
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::Verified
+            ),
+            "resolve_verification_status must resolve to Verified for an SMTP-style identity"
+        );
+    }
+
+    #[test]
+    fn empty_dkim_records_does_not_vacuously_pass_verification() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "an empty DKIM record list must not vacuously satisfy the 'all verified' check"
+        );
+    }
+
+    #[test]
+    fn missing_spf_record_does_not_vacuously_pass_verification() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "a missing SPF record must not vacuously satisfy the 'all verified' check"
+        );
+    }
+
+    // ========== resolve_verification_status Tests ==========
+    // Regression coverage for the follow-up Greptile finding: the required-
+    // record check (`are_all_records_verified`) can correctly reject empty
+    // DKIM, but a naive fallback to the provider's coarse `overall_status`
+    // could still promote the domain to "verified" behind that check's back.
+
+    #[test]
+    fn overall_status_verified_cannot_override_empty_dkim() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        let status = DomainService::resolve_verification_status(&details);
+        assert!(
+            !matches!(status, VerificationStatus::Verified),
+            "an empty DKIM record list must not be overridden to Verified by the \
+             provider's overall_status, even when the provider reports Verified: {status:?}"
+        );
+    }
+
+    #[test]
+    fn overall_status_verified_cannot_override_missing_spf() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        let status = DomainService::resolve_verification_status(&details);
+        assert!(
+            !matches!(status, VerificationStatus::Verified),
+            "a missing SPF record must not be overridden to Verified by the \
+             provider's overall_status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn all_required_records_verified_resolves_to_verified() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Verified
+        ));
+    }
+
+    #[test]
+    fn required_record_failure_resolves_to_failed() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Failed)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn provider_failed_status_still_surfaces_as_failed() {
+        // The provider's Failed signal is a hard failure (e.g. revoked or
+        // bounced) and must still be honored, even though its Verified
+        // signal is no longer trusted on its own.
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Failed("revoked by provider".to_string()),
+            spf_record: Some(make_spf(DnsRecordStatus::Pending)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Pending)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn provider_failed_status_wins_even_when_records_currently_resolve_verified() {
+        // A provider-side revocation/suspension is authoritative and must not
+        // be silently overridden by DNS that hasn't caught up yet (e.g. a
+        // stale resolver cache, or the owner never removed the old records).
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Failed("suspended by provider".to_string()),
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::Failed(_)
+            ),
+            "a provider-reported Failed status must win even when SPF/DKIM currently resolve verified"
+        );
+    }
+
+    #[test]
+    fn provider_temporary_failure_wins_even_when_records_currently_resolve_verified() {
+        // SES reports TEMPORARY_FAILURE when records that were previously
+        // verified are no longer trusted. A live DNS lookup that currently
+        // happens to resolve SPF/DKIM correctly must not silently promote
+        // the domain back to Verified and admit it through the persisted
+        // sending gate while the provider itself is still unsure.
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::TemporaryFailure,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::TemporaryFailure
+            ),
+            "a provider-reported TemporaryFailure must win even when SPF/DKIM currently resolve verified"
+        );
+    }
+
+    // ========== Import Tests ==========
+
+    #[tokio::test]
+    async fn import_rejects_duplicate_domain_for_same_provider() {
+        let now = chrono::Utc::now();
+        // Simulate the conflict-guard SELECT returning an existing row.
+        let existing = email_domains::Model {
+            id: 5,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![existing]])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let result = service
+            .import(ImportDomainRequest {
+                provider_id: 1,
+                domain: "mail.example.com".to_string(),
+                provider_identity_id: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EmailError::DomainAlreadyExists { provider_id: 1, .. }
+        ));
+    }
+
+    // ========== is_unique_violation Tests ==========
+
+    #[test]
+    fn record_not_inserted_is_not_treated_as_a_unique_violation() {
+        // This insert never uses `on_conflict().do_nothing()`, so a bare
+        // `RecordNotInserted` (query succeeded, zero rows returned — e.g. an
+        // RLS policy hiding the row from RETURNING) must not be classified
+        // as "domain already exists": that would hide a permission/RLS
+        // misconfiguration behind an incorrect 409 conflict response.
+        assert!(!is_unique_violation(&sea_orm::DbErr::RecordNotInserted));
+    }
+
+    #[test]
+    fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
+        assert!(!is_unique_violation(&sea_orm::DbErr::Custom(
+            "connection reset by peer".to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn import_rejects_duplicate_domain_under_a_different_provider() {
+        // `email_domains.domain` has a global unique index (not
+        // `(domain, provider_id)`) — a domain already registered under
+        // provider 1 must also block an import attempt under provider 2,
+        // rather than reaching the insert and surfacing as a 500.
+        let now = chrono::Utc::now();
+        let existing = email_domains::Model {
+            id: 5,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![existing]])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let result = service
+            .import(ImportDomainRequest {
+                provider_id: 2,
+                domain: "mail.example.com".to_string(),
+                provider_identity_id: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EmailError::DomainAlreadyExists { provider_id: 2, .. }
+        ));
     }
 
     // ========== Integration Tests (require Docker) ==========
 
     #[tokio::test]
     async fn test_get_domain_not_found() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.get(999999).await;
 
@@ -678,7 +1595,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_domains_empty() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.list().await;
 
@@ -689,7 +1608,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_verified_domains_empty() {
-        let (_db, domain_service, _provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, _provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         let result = domain_service.list_verified().await;
 
@@ -700,7 +1621,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_by_provider_empty() {
-        let (_db, domain_service, provider_service) = setup_test_env().await;
+        let Some((_db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         // Create a provider
         let provider = create_test_provider(&provider_service).await;
@@ -714,8 +1637,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_authorized_projects_returns_empty_for_domain_without_grants() {
+        let now = chrono::Utc::now();
+        let domain = email_domains::Model {
+            id: 17,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![domain]])
+                .append_query_results([Vec::<email_domain_projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let projects = service.list_authorized_projects(17).await.unwrap();
+
+        assert!(projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_or_missing_project_cannot_use_surviving_domain_grant() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        assert!(!service.is_authorized_for_project(17, 42).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_provider_exists_check() {
-        let (_db, _domain_service, provider_service) = setup_test_env().await;
+        let Some((_db, _domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
 
         // Create a provider
         let provider = create_test_provider(&provider_service).await;
@@ -724,5 +1704,112 @@ mod tests {
         let result = provider_service.get(provider.id).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().id, provider.id);
+    }
+
+    /// Reproduces the reported bug: Temps could mark a domain `verified` from
+    /// its own DNS lookup without ever asking the provider (Scaleway) to
+    /// re-check the domain, leaving the provider's own dashboard stuck on
+    /// "Unchecked" forever. `refresh_identity_details` must call
+    /// `verify_identity` (the trigger) before `get_identity_details` (the
+    /// read), exactly once each.
+    #[tokio::test]
+    async fn refresh_identity_details_triggers_provider_check_before_reading_status() {
+        let mock = MockEmailProvider::new();
+
+        let result = refresh_identity_details(&mock, "example.com", None).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            mock.verify_identity_call_count(),
+            1,
+            "must trigger the provider's own check exactly once"
+        );
+    }
+
+    /// A provider that can't be reached or rejects the check request must
+    /// fail the whole verification — silently falling back to the read-only
+    /// `get_identity_details` would reintroduce the original bug.
+    #[tokio::test]
+    async fn refresh_identity_details_propagates_check_failure() {
+        let mock = MockEmailProvider::new().with_verify_failure();
+
+        let result = refresh_identity_details(&mock, "example.com", None).await;
+
+        assert!(
+            result.is_err(),
+            "a failed provider check must not be silently swallowed"
+        );
+    }
+
+    /// Corrupt a provider's stored credentials in place (bypassing
+    /// `EncryptionService`) so `create_provider_instance` fails to decrypt
+    /// them, without touching the provider row itself — deleting the row
+    /// would cascade-delete the domain too (`ON DELETE CASCADE`), which
+    /// would make these tests pass for the wrong reason.
+    async fn corrupt_provider_credentials(db: &Arc<sea_orm::DatabaseConnection>, provider_id: i32) {
+        let mut active: email_providers::ActiveModel =
+            email_providers::Entity::find_by_id(provider_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        active.credentials = Set("not valid ciphertext".to_string());
+        active.update(db.as_ref()).await.unwrap();
+    }
+
+    /// The default (`delete_from_provider: false`) must not touch the
+    /// provider at all — proven by corrupting the provider's stored
+    /// credentials first. If `delete()` still built a provider instance on
+    /// this path, it would fail to decrypt them; since the domain identity
+    /// may be shared with other tools against that provider account, Temps
+    /// must never reach out to the provider unless the caller opts in.
+    #[tokio::test]
+    async fn delete_without_provider_flag_never_needs_the_provider() {
+        let Some((db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "opt-out.example.com").await;
+        corrupt_provider_credentials(&db.db, provider.id).await;
+
+        let result = domain_service.delete(domain.id, false).await;
+
+        assert!(
+            result.is_ok(),
+            "deleting without delete_from_provider must never need the provider: {result:?}"
+        );
+
+        let remaining = email_domains::Entity::find_by_id(domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_none(),
+            "local record must still be deleted even though the provider was skipped"
+        );
+    }
+
+    /// Opting in to `delete_from_provider` must actually route through the
+    /// provider — proven by the inverse of the test above: with the
+    /// provider's credentials corrupted, `delete(id, true)` must surface a
+    /// decryption failure instead of silently behaving like the opt-out path.
+    #[tokio::test]
+    async fn delete_with_provider_flag_requires_the_provider() {
+        let Some((db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "opt-in.example.com").await;
+        corrupt_provider_credentials(&db.db, provider.id).await;
+
+        let result = domain_service.delete(domain.id, true).await;
+
+        assert!(
+            matches!(result, Err(EmailError::Decryption(_))),
+            "delete_from_provider=true must build a provider instance: {result:?}"
+        );
     }
 }

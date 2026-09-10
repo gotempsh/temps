@@ -1,8 +1,31 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod docker;
+pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod local;
+pub mod managed;
 pub mod pty_agent_bundle;
+pub mod routing;
 pub mod user;
+
+/// The Docker named volume holding `/home/temps` for a sandbox whose
+/// container suffix is `label`.
+///
+/// Public because the standalone sandbox service derives that label itself
+/// (it strips `sbx_` off the `public_id`) and a test needs to prove the two
+/// crates still agree — the leak this replaced was precisely two places
+/// deriving one identity independently. Production code goes through
+/// `DockerSandboxProvider::sandbox_names`.
+pub fn home_volume_name_for_label(label: &str) -> String {
+    format!(
+        "{}{}{}",
+        docker::HOME_VOLUME_PREFIX,
+        docker::HOME_VOLUME_SCHEME,
+        label
+    )
+}
 
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
@@ -10,12 +33,14 @@ pub use user::{
 };
 
 use async_trait::async_trait;
+use futures::Stream;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWrite;
 
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -59,6 +84,40 @@ impl KillSignal {
     }
 }
 
+/// Which isolation backend a sandbox runs on (ADR-029). Docker containers
+/// and Firecracker microVMs coexist on the same host behind the same
+/// `SandboxProvider` seam; `routing::RoutingSandboxProvider` dispatches
+/// between them. `Local` is the dev-only fork-exec fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    Docker,
+    Firecracker,
+    Local,
+}
+
+impl std::str::FromStr for SandboxBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "docker" => Ok(Self::Docker),
+            "firecracker" => Ok(Self::Firecracker),
+            "local" => Ok(Self::Local),
+            other => Err(format!("unknown sandbox backend '{}'", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Docker => "docker",
+            Self::Firecracker => "firecracker",
+            Self::Local => "local",
+        })
+    }
+}
+
 /// A handle to an active sandbox. Opaque to callers — the internal fields
 /// are provider-specific (Docker container ID, Vercel sandbox ID, etc.).
 #[derive(Debug, Clone)]
@@ -69,6 +128,17 @@ pub struct SandboxHandle {
     pub sandbox_name: String,
     /// Path to the repository inside the sandbox. See `sandbox::user::SANDBOX_WORK_DIR`.
     pub work_dir: PathBuf,
+    /// Which backend owns this sandbox, stamped by the concrete provider
+    /// that created or recovered it. Callers read this instead of parsing
+    /// the container-name prefix: the routing provider dispatches on it and
+    /// the standalone API persists it to `sandboxes.backend` for display.
+    pub backend: SandboxBackend,
+    /// The image the provider actually resolved to. When the request omitted
+    /// an image, this is the backend's default (e.g. `alpine:3.20` for
+    /// Firecracker) rather than empty — so the API can show what really
+    /// booted instead of a vague "platform default". Empty on recovered
+    /// handles (the DB already holds the recorded value).
+    pub image: String,
 }
 
 /// Configuration for creating a new sandbox.
@@ -108,12 +178,125 @@ pub struct SandboxCreateConfig {
     /// Maximum number of processes / threads (PID cgroup limit). When None
     /// the provider default applies.
     pub pids_limit: Option<i64>,
+    /// Root disk size in megabytes. Only the Firecracker backend honors it
+    /// (the per-VM ext4 is grown to this size); Docker ignores it. `None`
+    /// uses the provider default (1 GiB). Values below the image's content
+    /// size are clamped up so the image always fits.
+    pub disk_size_mb: Option<u64>,
     /// Network access: "full", "restricted", "none"
     pub network_mode: Option<String>,
     /// Environment variables to inject (ANTHROPIC_API_KEY, etc.)
     pub env_vars: HashMap<String, String>,
     /// Maximum time the sandbox should stay alive without activity
     pub idle_timeout: Duration,
+    /// Isolation backend for this sandbox. `None` = the host's configured
+    /// default. Only meaningful when the registered provider is the
+    /// routing provider; single-backend hosts ignore it.
+    pub backend: Option<SandboxBackend>,
+    /// User to attribute the sandbox to in the standalone sandbox API
+    /// (`sandboxes.user_id`). Only read by the managed run-sandbox path
+    /// ([`managed::RunSandboxService`]); providers ignore it. `None` for
+    /// webhook-triggered runs with no acting user.
+    pub owner_user_id: Option<i32>,
+}
+
+fn direct_model_relay_base_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/api/ai/sandbox-models",
+        control_plane_url.trim_end_matches('/')
+    )
+}
+
+/// Artifact produced by a successful [`SandboxProvider::take_snapshot`] call.
+///
+/// Contains everything the service layer needs to persist the snapshot row and
+/// to re-hydrate the snapshot on restore. It is a plain data struct, not a
+/// trait object — no provider-specific types leak across the boundary.
+///
+/// ADR-037 §2 describes the full design.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SnapshotCompanionArtifact {
+    /// Absolute path to the companion artifact on the host.
+    pub content_path: std::path::PathBuf,
+    /// SHA-256 hex of this companion file.
+    pub content_digest: String,
+    /// Size of this companion file in bytes.
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotArtifact {
+    /// Content-addressed path on the host. Docker stores an image tarball;
+    /// Firecracker stores a sanitized sparse ext4 filesystem. Providers write
+    /// to a temporary path and publish the artifact atomically.
+    pub content_path: std::path::PathBuf,
+    /// SHA-256 hex of the complete logical snapshot state. The canonical
+    /// store key — two snapshots with identical content share files on disk.
+    pub content_digest: String,
+    /// SHA-256 of the primary artifact file. For a single-file snapshot this
+    /// equals `content_digest`; multi-file snapshots use `content_digest` as
+    /// the combined logical key and retain this checksum for restore-time
+    /// verification.
+    pub primary_digest: String,
+    /// Total size of the primary artifact and every companion artifact.
+    pub size_bytes: u64,
+    /// Which backend produced this artifact. Cross-backend restore is rejected
+    /// with 422 at the service layer (a Docker tar cannot boot as a Firecracker
+    /// rootfs, and vice versa).
+    pub backend: SandboxBackend,
+    /// For Docker: the daemon image tag `temps-snapshot/<logical_digest>:latest`
+    /// that was committed before exporting. Stored so the restore path can
+    /// confirm (or re-import) the image in the daemon without parsing the
+    /// tarball name.
+    pub image_ref: Option<String>,
+    /// Immutable Docker image ID captured before export. Restore verifies that
+    /// a mutable `image_ref` still resolves to this ID before using it.
+    pub image_id: Option<String>,
+    /// Workspace bytes stored separately from the provider's primary
+    /// artifact. Docker needs this because its workspace is a bind mount and
+    /// `docker commit` deliberately excludes mounts. Firecracker leaves this
+    /// as `None` because its sanitized ext4 artifact contains the workspace.
+    pub workspace: Option<SnapshotCompanionArtifact>,
+}
+
+/// A cached rootfs image (Firecracker backend). Digest-keyed build artifact
+/// shared by all VMs created from the same image.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsCacheEntry {
+    /// Image digest this rootfs was built from (the cache key).
+    pub digest: String,
+    /// Actual on-disk size in bytes (sparse-aware).
+    pub bytes: u64,
+    /// IDs of live sandboxes whose per-VM disk was cloned from this entry.
+    /// Empty means the entry is reclaimable — no sandbox needs it.
+    pub referenced_by: Vec<String>,
+}
+
+/// A per-sandbox rootfs disk (Firecracker backend). One per non-destroyed
+/// sandbox — the authoritative storage, independent of the cache.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsVmEntry {
+    pub sandbox_name: String,
+    pub bytes: u64,
+    pub running: bool,
+}
+
+/// Snapshot of a backend's rootfs storage for the management API. Backends
+/// without a rootfs concept (Docker, local) return an empty report.
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsReport {
+    pub cache_bytes: u64,
+    pub cache: Vec<RootfsCacheEntry>,
+    pub vm_bytes: u64,
+    pub vms: Vec<RootfsVmEntry>,
+}
+
+/// Outcome of a rootfs garbage-collection pass.
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsGcReport {
+    /// Digests of cache entries removed because no sandbox referenced them.
+    pub removed_digests: Vec<String>,
+    pub freed_bytes: u64,
 }
 
 /// Result of executing a command inside a sandbox.
@@ -131,6 +314,29 @@ pub struct SandboxExecResult {
     /// (e.g. `LocalSandboxProvider`) or when no stderr was produced.
     pub stderr: String,
 }
+
+/// A live bidirectional byte channel into a sandbox's PTY agent.
+///
+/// Returned by [`SandboxProvider::attach_pty`]. The two halves are separate
+/// so a caller can split them across tasks — a terminal needs to pump both
+/// directions concurrently, which a single `AsyncRead + AsyncWrite` object
+/// makes awkward behind `dyn`.
+///
+/// The bytes are `temps-pty-agent`'s framed protocol (see ADR-008), not raw
+/// PTY output. Framing is the caller's job; the provider only moves bytes.
+pub struct PtyAttachment {
+    /// Frames from the agent. Ends when the underlying exec exits.
+    pub output: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, AgentError>> + Send>>,
+    /// Frames to the agent. Dropping this closes the agent-side stdin,
+    /// which makes the in-container relay exit and the attach terminate.
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+}
+
+/// Absolute path of the PTY agent's control socket inside every sandbox.
+///
+/// Fixed by the sandbox Dockerfile (`RUN mkdir -p /run/temps-pty …`), so it
+/// is a property of the image rather than something a caller chooses.
+pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 
 /// Pluggable sandbox backend. Implementations provide container/VM isolation
 /// for agent runs. The executor and autofixer interact only with this trait,
@@ -158,6 +364,52 @@ pub struct SandboxExecResult {
 pub trait SandboxProvider: Send + Sync {
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
+
+    /// Return the base URL a process inside `handle` must use for its
+    /// turn-scoped model relay. Backends with ordinary reachability can use
+    /// the control-plane URL directly. Network-isolated backends override
+    /// this with a capability-only bridge owned by that backend.
+    async fn model_relay_base_url(
+        &self,
+        _handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(direct_model_relay_base_url(control_plane_url))
+    }
+
+    /// Return the URL a process inside `handle` must use for a turn-scoped
+    /// harness MCP server. Backends with ordinary control-plane reachability
+    /// can use the registered URL directly. Network-isolated backends override
+    /// this with a capability-only relay owned by that backend.
+    async fn harness_mcp_url(
+        &self,
+        _handle: &SandboxHandle,
+        _control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(registered_url.to_string())
+    }
+
+    /// Attach a sandbox and a bounded set of application-owned data services
+    /// to an isolated per-application network. The default rejects the
+    /// operation; only providers capable of enforcing network membership
+    /// should implement it.
+    async fn configure_application_network(
+        &self,
+        handle: &SandboxHandle,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        let _ = (network_name, service_containers);
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "application networks are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
 
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
@@ -299,6 +551,134 @@ pub trait SandboxProvider: Send + Sync {
         signal: KillSignal,
     ) -> Result<(), AgentError>;
 
+    /// Strictly fence matching process trees before adopting compute from a
+    /// previous control-plane generation.
+    ///
+    /// Unlike [`SandboxProvider::kill_processes`], this operation is not
+    /// best-effort. It freezes matching roots, discovers and freezes their
+    /// descendants, sends SIGTERM, escalates survivors to SIGKILL, and only
+    /// succeeds after every recorded PID is absent. Provider exec failures,
+    /// timeouts, and surviving processes are errors so callers can fail
+    /// closed instead of running a second harness in the same workspace.
+    async fn fence_process_trees(
+        &self,
+        handle: &SandboxHandle,
+        patterns: &[&str],
+    ) -> Result<(), AgentError> {
+        const FENCE_SCRIPT: &str = r#"
+set -eu
+
+roots=""
+self_pid=$$
+for pattern in "$@"; do
+  set +e
+  matches=$(pgrep -f "$pattern" 2>/dev/null)
+  match_status=$?
+  set -e
+  [ "$match_status" -le 1 ] || exit 71
+  for pid in $matches; do
+    [ "$pid" = "$self_pid" ] && continue
+    case " $roots " in
+      *" $pid "*) ;;
+      *) roots="$roots $pid" ;;
+    esac
+  done
+done
+
+[ -n "$roots" ] || exit 0
+
+# Freeze roots before walking the tree so a stale harness cannot keep
+# spawning children while the fence is being established.
+kill -STOP $roots 2>/dev/null || true
+targets="$roots"
+frontier="$roots"
+while [ -n "$frontier" ]; do
+  next=""
+  process_table=$(ps -eo pid=,ppid=)
+  for parent in $frontier; do
+    for child in $(printf '%s\n' "$process_table" | awk -v parent="$parent" '$2 == parent { print $1 }'); do
+      case " $targets " in
+        *" $child "*) ;;
+        *)
+          kill -STOP "$child" 2>/dev/null || true
+          targets="$targets $child"
+          next="$next $child"
+          ;;
+      esac
+    done
+  done
+  frontier="$next"
+done
+
+# SIGTERM is queued while the processes are stopped. SIGCONT lets graceful
+# handlers run; processes that ignore TERM are killed after the deadline.
+kill -TERM $targets 2>/dev/null || true
+kill -CONT $targets 2>/dev/null || true
+
+is_running() {
+  state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+  case "$state" in
+    ""|Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+attempt=0
+remaining="$targets"
+while [ "$attempt" -lt 30 ]; do
+  remaining=""
+  for pid in $targets; do
+    if is_running "$pid"; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -n "$remaining" ] || exit 0
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+
+kill -KILL $remaining 2>/dev/null || true
+sleep 0.1
+for pid in $remaining; do
+  if is_running "$pid"; then
+    exit 70
+  fi
+done
+"#;
+
+        let mut command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            FENCE_SCRIPT.to_string(),
+            "temps-process-fence".to_string(),
+        ];
+        command.extend(patterns.iter().map(|pattern| (*pattern).to_string()));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.exec(handle, command, HashMap::new(), None),
+        )
+        .await
+        .map_err(|_| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "verified process fencing timed out".to_string(),
+        })??;
+
+        if result.exit_code != 0 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "verified process fencing failed with exit code {}",
+                    result.exit_code
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Destroy sandbox and clean up its container.
     ///
     /// When `purge_volumes` is true, the provider also removes any per-run
@@ -308,6 +688,22 @@ pub trait SandboxProvider: Send + Sync {
     /// uses this to preserve Claude auth / shell history across a session
     /// close+reopen cycle.
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError>;
+
+    // NOTE: there is deliberately no background "reclaim orphaned storage"
+    // hook here. Sandbox storage is freed only by an explicit destroy,
+    // which knows exactly which volume belongs to the sandbox being
+    // deleted. A sweep has to *infer* that instead, and every predicate we
+    // tried infers it wrong somewhere: "no container references it" also
+    // describes a sandbox mid-recreate whose image is still pulling, and
+    // "no database row claims it" also describes every sandbox belonging to
+    // a second temps instance sharing the same Docker daemon, or to a
+    // database that was restored, swapped, or cascade-deleted. Getting it
+    // wrong destroys a user's `/home/temps` — Claude credentials, shell
+    // history, project state — silently and irreversibly.
+    //
+    // Volumes stranded by older builds are reclaimed by the operator with
+    // `docker volume prune --filter label=sh.temps.sandbox.home`, which is
+    // explicit, reviewable, and cannot run while they aren't looking.
 
     /// Stop a running sandbox without removing it. Default implementation
     /// reports the operation as unsupported so non-Docker backends compile
@@ -342,6 +738,28 @@ pub trait SandboxProvider: Send + Sync {
         self.start(handle).await
     }
 
+    /// Grow the sandbox's root disk to `new_size_mb`. Only the Firecracker
+    /// backend supports this (Docker containers have no fixed disk to
+    /// resize). Grow-only — shrinking is rejected. The Firecracker impl
+    /// stops the VM, grows the backing ext4 offline, and restarts it, so the
+    /// filesystem is resized without any in-guest tooling; the VM reboots
+    /// (data persists) rather than resizing fully live. Default: unsupported.
+    async fn resize_disk(
+        &self,
+        handle: &SandboxHandle,
+        new_size_mb: u64,
+    ) -> Result<(), AgentError> {
+        let _ = new_size_mb;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "resize_disk is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
     /// Attempt to recover a sandbox after server restart (by naming convention).
     /// Returns `None` if no recoverable sandbox exists for this run.
     async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError>;
@@ -358,6 +776,123 @@ pub trait SandboxProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this provider can create sandboxes on `backend`. Consumers
+    /// call this before create so a request for an unprovisioned backend
+    /// (e.g. `firecracker` on a Docker-only host) fails with a clear error
+    /// instead of silently downgrading. Concrete single-backend providers
+    /// answer for their own backend; the routing provider answers for every
+    /// backend it has registered. Default is permissive for backwards
+    /// compatibility, so every concrete provider overrides it.
+    fn supports_backend(&self, backend: SandboxBackend) -> bool {
+        let _ = backend;
+        true
+    }
+
+    /// Open a bidirectional channel to the sandbox's PTY agent (ADR-008).
+    ///
+    /// Powers interactive terminals: the caller speaks the agent's framed
+    /// protocol over the returned stream to open a tab, send keystrokes,
+    /// forward resizes, and receive output.
+    ///
+    /// Default: unsupported. Backends that can't reach an in-sandbox unix
+    /// socket say so explicitly rather than returning an empty stream that
+    /// looks like a terminal which simply never echoes — a user facing that
+    /// has no way to tell "not implemented" from "my shell is broken".
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let _ = handle;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: String::new(),
+            reason: format!(
+                "interactive terminals are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Capture the current state of `handle` as a reusable [`SnapshotArtifact`].
+    ///
+    /// The sandbox should be stopped before calling this (the service layer is
+    /// responsible for quiescing). For Docker, this executes the three-step
+    /// credential-scrubbing protocol from ADR-037 §4 before committing:
+    ///
+    /// 1. Shred `/etc/temps/credential-daemon.env` inside the container.
+    /// 2. Strip injected env vars from the committed image config.
+    /// 3. Reject the snapshot if any known-sensitive key pattern survives.
+    ///
+    /// `label` is a human-readable annotation stored on the DB row; it is
+    /// **not** used as part of the content-addressed file name.
+    /// `max_size_bytes` is a hard cap for all artifacts produced by this
+    /// operation; providers must abort and clean up before crossing it.
+    ///
+    /// Docker and Firecracker override this method. Providers without a
+    /// persistent snapshot format leave the default implementation in place.
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        label: Option<String>,
+        max_size_bytes: u64,
+    ) -> Result<SnapshotArtifact, AgentError> {
+        let _ = label;
+        let _ = max_size_bytes;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "take_snapshot is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Create and start a new sandbox seeded from a previously-taken
+    /// [`SnapshotArtifact`] instead of a base image.
+    ///
+    /// For Docker: ensures the snapshot image tag is present in the daemon
+    /// (loading from the tarball if absent), then passes `artifact.image_ref`
+    /// as the `image` in the container create config. For Firecracker: clones
+    /// the captured sparse root disk into a new VM and boots it.
+    ///
+    /// The caller is responsible for verifying that `artifact.backend` matches
+    /// the target provider's backend before calling — the service layer does
+    /// this check and returns 422 on mismatch.
+    ///
+    /// **Default: returns `AgentError::SandboxExecFailed` ("not supported").**
+    async fn create_from_snapshot(
+        &self,
+        artifact: &SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let _ = artifact;
+        let _ = config;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: String::new(),
+            reason: format!(
+                "create_from_snapshot is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Remove a snapshot image from the backend's image store.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted. Failure is logged but does not fail the delete — the
+    /// tarball (the source of truth) is already removed; an orphaned image
+    /// tag is cleaned up on the next GC or by the operator.
+    ///
+    /// **Default: a no-op with a debug log.** Backends other than Docker (e.g.
+    /// Local, Firecracker) have no image store concept and leave this default.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(
+            image_ref = %image_ref,
+            provider = %self.name(),
+            "delete_image: provider does not support image deletion (no-op)"
+        );
+        Ok(())
+    }
+
     /// Provider name for logging and error messages.
     fn name(&self) -> &str;
 
@@ -370,6 +905,20 @@ pub trait SandboxProvider: Send + Sync {
 
     /// Delete and rebuild the sandbox image. Returns the image name.
     async fn rebuild_image(&self) -> Result<String, AgentError>;
+
+    /// Report rootfs storage for the management API. Default: empty —
+    /// backends without a rootfs cache (Docker, local) have nothing to show.
+    async fn rootfs_report(&self) -> Result<RootfsReport, AgentError> {
+        Ok(RootfsReport::default())
+    }
+
+    /// Reclaim rootfs cache entries not backing any live sandbox. Default:
+    /// a no-op empty report. Safe to call any time — live VMs hold their own
+    /// per-VM disks, so evicting an unreferenced cache entry only forces a
+    /// reconversion on the next create from that image.
+    async fn gc_rootfs(&self) -> Result<RootfsGcReport, AgentError> {
+        Ok(RootfsGcReport::default())
+    }
 
     /// Rebuild the image with progress reporting. Each build log line is sent
     /// via `on_progress`. Default implementation delegates to `rebuild_image`
@@ -395,6 +944,8 @@ pub trait SandboxProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     #[test]
     fn kill_signal_term_is_15() {
@@ -430,5 +981,103 @@ mod tests {
         // We never actually construct one here — the type check alone is
         // the guard. The closure is never invoked.
         let _ = |p: Arc<dyn SandboxProvider>| assert_object_safe(&p);
+    }
+
+    #[test]
+    fn direct_model_relay_base_includes_the_registered_api_route() {
+        assert_eq!(
+            direct_model_relay_base_url("http://control-plane.test:8080/"),
+            "http://control-plane.test:8080/api/ai/sandbox-models"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fence_kills_a_term_resistant_process_tree() {
+        let marker = format!("temps-fence-test-{}", std::process::id());
+        let child_marker = format!("{marker}-child");
+        let root_marker = format!("{marker}-root");
+        let script = format!(
+            "trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' {child_marker} & echo $!; while :; do sleep 1; done"
+        );
+        let mut root = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&root_marker)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-resistant process tree");
+        let root_pid = root.id().expect("root process id");
+        let child_pid: u32 = BufReader::new(root.stdout.take().expect("child pid pipe"))
+            .lines()
+            .next_line()
+            .await
+            .expect("read child pid")
+            .expect("child pid line")
+            .parse()
+            .expect("numeric child pid");
+
+        let probe = Command::new("pgrep")
+            .args(["-f", &format!("{root_marker}$")])
+            .output()
+            .await
+            .expect("run process discovery probe");
+        if !probe.status.success() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+            let _ = root.wait().await;
+            eprintln!("skipping strict fence process-tree test: process discovery unavailable");
+            return;
+        }
+
+        let handle = SandboxHandle {
+            sandbox_id: marker.clone(),
+            sandbox_name: marker.clone(),
+            work_dir: std::env::current_dir().expect("current directory"),
+            backend: SandboxBackend::Local,
+            image: String::new(),
+        };
+        let provider = local::LocalSandboxProvider::new();
+        let fence_result = provider
+            .fence_process_trees(&handle, &[&format!("{root_marker}$")])
+            .await;
+
+        if fence_result.is_err() {
+            // Test cleanup must not leave an intentionally TERM-resistant
+            // process behind when an assertion fails.
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+
+        let root_wait = tokio::time::timeout(Duration::from_secs(1), root.wait()).await;
+        if root_wait.is_err() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+        let root_status = match root_wait {
+            Ok(status) => status.expect("wait for root process"),
+            Err(error) => {
+                let _ = root.wait().await;
+                panic!("root process must exit: {error}")
+            }
+        };
+        fence_result.expect("verified fence must escalate TERM-resistant processes");
+        assert!(!root_status.success());
+        let child_state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &child_pid.to_string()])
+            .output()
+            .await
+            .expect("inspect child state");
+        let state = String::from_utf8_lossy(&child_state.stdout);
+        assert!(
+            state.trim().is_empty() || state.trim_start().starts_with('Z'),
+            "child process remained active with state {state:?}"
+        );
     }
 }

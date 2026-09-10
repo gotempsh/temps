@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ProjectSource implementations for GitHub, GitLab, Gitea, and Bitbucket
 //!
 //! These implementations allow framework detection and preset configuration

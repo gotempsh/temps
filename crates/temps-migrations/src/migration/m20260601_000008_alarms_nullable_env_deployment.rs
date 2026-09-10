@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Make `alarms.environment_id` and `alarms.deployment_id` nullable.
 //!
 //! Database-/service-scoped alarms (from `AlertEvaluator` rules with a

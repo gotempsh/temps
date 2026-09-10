@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service layer for external plugin management.
 //!
 //! Orchestrates plugin lifecycle (discovery, proxy creation, event delivery)
@@ -31,6 +34,20 @@ pub struct ExternalPluginsService {
 }
 
 impl ExternalPluginsService {
+    /// Install the bridge plugins use to call the platform's own HTTP API.
+    ///
+    /// The console builds its router *after* plugins start (the router
+    /// contains this crate's routes), so this is how the two are joined up
+    /// once both exist.
+    pub async fn set_host_api(&self, bridge: Arc<dyn crate::channel::HostApiBridge>) {
+        self.manager.set_host_api(bridge).await;
+    }
+
+    /// Supply the key material used to mint per-caller actor tokens.
+    pub async fn set_actor_crypto(&self, crypto: Arc<temps_core::CookieCrypto>) {
+        self.manager.set_actor_crypto(crypto).await;
+    }
+
     /// Create a "shell" service with no discovered plugins yet.
     ///
     /// This returns immediately — plugin discovery (which can take up to

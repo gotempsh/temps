@@ -1,11 +1,19 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Public repository service for accessing public repositories without authentication
 //!
 //! This module provides a generic interface for fetching data from public repositories
 //! across different Git providers (GitHub, GitLab, etc.) without requiring authentication.
 
+use crate::services::git_provider::FileContent;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Errors that can occur when accessing public repositories
 #[derive(Error, Debug)]
@@ -13,8 +21,19 @@ pub enum PublicRepoError {
     #[error("Repository not found: {0}")]
     NotFound(String),
 
+    #[error("Repository is not public: {0}")]
+    RepositoryNotPublic(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
+
+    #[error(
+        "Permission denied while trying to {operation}. Required permission: {required_permission}"
+    )]
+    PermissionDenied {
+        operation: String,
+        required_permission: String,
+    },
 
     #[error("API error: {0}")]
     ApiError(String),
@@ -27,6 +46,9 @@ pub enum PublicRepoError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Provider response for {context} exceeded the {limit_bytes}-byte safety limit")]
+    ResponseTooLarge { context: String, limit_bytes: usize },
 }
 
 /// Information about a public repository
@@ -40,6 +62,10 @@ pub struct PublicRepoInfo {
     pub language: Option<String>,
     pub stars: i32,
     pub forks: i32,
+    /// Whether an authenticated provider reported that this repository is
+    /// private. Credential-backed public routes must reject these repositories
+    /// before their data can enter shared public caches.
+    pub is_private: bool,
 }
 
 /// Branch information
@@ -60,6 +86,11 @@ pub struct DetectedPreset {
     pub icon_url: Option<String>,
     pub project_type: String,
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`. See
+    /// [`temps_presets::DetectedPreset::dockerfile_path`] for the full
+    /// explanation.
+    pub dockerfile_path: Option<String>,
 }
 
 /// Trait for public repository providers
@@ -89,13 +120,48 @@ pub trait PublicRepoProvider: Send + Sync {
         repo: &str,
         reference: &str,
     ) -> Result<Vec<String>, PublicRepoError>;
+
+    /// Get the raw content of a single file (e.g. a `.env.example` path
+    /// found via [`Self::get_file_tree`]).
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError>;
 }
 
 /// GitHub public repository provider
 pub struct GitHubPublicProvider {
     client: reqwest::Client,
-    /// Optional auth token to avoid rate limits (from any configured GitHub connection)
+    api_url: String,
+    /// Optional auth token to avoid rate limits. Callers must only provide a
+    /// credential owned by the authenticated request user.
     token: Option<String>,
+}
+
+fn github_rate_limit_remaining(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn ensure_repository_is_public(
+    is_public: bool,
+    owner: &str,
+    repo: &str,
+) -> Result<(), PublicRepoError> {
+    if is_public {
+        Ok(())
+    } else {
+        Err(PublicRepoError::RepositoryNotPublic(format!(
+            "{}/{}",
+            owner, repo
+        )))
+    }
 }
 
 impl GitHubPublicProvider {
@@ -108,6 +174,7 @@ impl GitHubPublicProvider {
 
         Self {
             client,
+            api_url: "https://api.github.com".to_string(),
             token: None,
         }
     }
@@ -122,8 +189,16 @@ impl GitHubPublicProvider {
 
         Self {
             client,
+            api_url: "https://api.github.com".to_string(),
             token: Some(token),
         }
+    }
+
+    #[cfg(test)]
+    fn with_token_and_api_url(token: String, api_url: String) -> Self {
+        let mut provider = Self::with_token(token);
+        provider.api_url = api_url;
+        provider
     }
 
     /// Apply auth header if token is available
@@ -179,12 +254,24 @@ impl GitHubPublicProvider {
 
     fn check_response_status(
         status: reqwest::StatusCode,
+        rate_limit_remaining: Option<u64>,
+        authenticated: bool,
         context: &str,
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            429 => Err(PublicRepoError::RateLimitExceeded),
+            403 if rate_limit_remaining == Some(0) => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: if authenticated {
+                    "Contents: read and access to the target repository".to_string()
+                } else {
+                    "authenticate with a token that has Contents: read and access to the target repository"
+                        .to_string()
+                },
+            }),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -210,11 +297,16 @@ impl PublicRepoProvider for GitHubPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError> {
-        let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+        let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
         let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
-        Self::check_response_status(response.status(), &format!("Repository {}/{}", owner, repo))?;
+        Self::check_response_status(
+            response.status(),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read repository {}/{}", owner, repo),
+        )?;
 
         #[derive(Deserialize)]
         struct GitHubRepo {
@@ -226,6 +318,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             stargazers_count: Option<u32>,
             forks_count: Option<u32>,
             owner: Option<GitHubOwner>,
+            #[serde(default)]
+            private: bool,
         }
 
         #[derive(Deserialize)]
@@ -237,6 +331,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .json()
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        ensure_repository_is_public(!repo_data.private, owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: repo_data
@@ -254,6 +350,7 @@ impl PublicRepoProvider for GitHubPublicProvider {
                 .and_then(|v| v.as_str().map(|s| s.to_string())),
             stars: repo_data.stargazers_count.unwrap_or(0) as i32,
             forks: repo_data.forks_count.unwrap_or(0) as i32,
+            is_private: repo_data.private,
         })
     }
 
@@ -280,15 +377,17 @@ impl PublicRepoProvider for GitHubPublicProvider {
 
         loop {
             let url = format!(
-                "https://api.github.com/repos/{}/{}/branches?per_page={}&page={}",
-                owner, repo, per_page, page
+                "{}/repos/{}/{}/branches?per_page={}&page={}",
+                self.api_url, owner, repo, per_page, page
             );
 
             let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
             Self::check_response_status(
                 response.status(),
-                &format!("Branches for {}/{}", owner, repo),
+                github_rate_limit_remaining(&response),
+                self.token.is_some(),
+                &format!("list branches for {}/{}", owner, repo),
             )?;
 
             let branches: Vec<GitHubBranch> = response.json().await.map_err(|e| {
@@ -319,15 +418,17 @@ impl PublicRepoProvider for GitHubPublicProvider {
         reference: &str,
     ) -> Result<Vec<String>, PublicRepoError> {
         let url = format!(
-            "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-            owner, repo, reference
+            "{}/repos/{}/{}/git/trees/{}?recursive=1",
+            self.api_url, owner, repo, reference
         );
 
         let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
         Self::check_response_status(
             response.status(),
-            &format!("File tree for {}/{} at {}", owner, repo, reference),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read the file tree for {}/{} at {}", owner, repo, reference),
         )?;
 
         #[derive(Deserialize)]
@@ -355,26 +456,134 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .map(|entry| entry.path)
             .collect())
     }
+
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError> {
+        // Percent-encode each path segment individually so the `/` separators
+        // are preserved (mirrors the authenticated GitHubProvider impl).
+        let encoded_path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}?ref={}",
+            self.api_url,
+            owner,
+            repo,
+            encoded_path,
+            urlencoding::encode(reference)
+        );
+
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+
+        Self::check_response_status(
+            response.status(),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read file {} in {}/{} at {}", path, owner, repo, reference),
+        )?;
+
+        #[derive(Deserialize)]
+        struct GitHubFile {
+            path: String,
+            content: String,
+            encoding: String,
+        }
+
+        let file: GitHubFile = response.json().await.map_err(|e| {
+            PublicRepoError::ApiError(format!("Failed to parse file content: {}", e))
+        })?;
+
+        Ok(FileContent {
+            path: file.path,
+            content: file.content,
+            encoding: file.encoding,
+        })
+    }
 }
 
 /// GitLab public repository provider
 pub struct GitLabPublicProvider {
     client: reqwest::Client,
     base_url: String,
+    custom_egress_limiter: Option<Arc<Semaphore>>,
+}
+
+fn custom_gitlab_egress_limiter() -> Arc<Semaphore> {
+    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(Semaphore::new(16))).clone()
 }
 
 impl GitLabPublicProvider {
-    pub fn new(base_url: Option<String>) -> Self {
+    const MAX_METADATA_BYTES: usize = 1024 * 1024;
+    const MAX_LIST_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_TREE_FILES: usize = 100_000;
+    const MAX_TREE_ENTRIES: usize = 100_000;
+    const MAX_TREE_PATH_BYTES: usize = 4 * 1024;
+    const MAX_TREE_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_TREE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+    pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // Public repository URLs are user-controlled. Never allow an
+            // otherwise safe GitLab origin to redirect requests into an
+            // internal network.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
             client,
-            base_url: base_url.unwrap_or_else(|| "https://gitlab.com".to_string()),
+            base_url: "https://gitlab.com".to_string(),
+            custom_egress_limiter: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_base_url(base_url: String) -> Self {
+        let mut provider = Self::new();
+        provider.base_url = base_url;
+        provider
+    }
+
+    /// Build a provider for a validated self-hosted GitLab origin and pin its
+    /// hostname to the addresses checked by the caller. Pinning closes the
+    /// DNS-rebinding window between validation and the outbound request.
+    pub fn with_resolved_base_url(
+        base_url: String,
+        hostname: &str,
+        addresses: &[SocketAddr],
+    ) -> Result<Self, PublicRepoError> {
+        let client = reqwest::Client::builder()
+            .user_agent("Temps-Engine/1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            // `resolve_to_addrs` only pins direct connections. A system HTTPS
+            // proxy would resolve the hostname itself and reopen the DNS-
+            // rebinding window, so custom origins must bypass proxy settings.
+            .no_proxy()
+            .resolve_to_addrs(hostname, addresses)
+            .build()
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for GitLab instance {base_url}: {error}"
+                ))
+            })?;
+
+        Ok(Self {
+            client,
+            base_url,
+            custom_egress_limiter: Some(custom_gitlab_egress_limiter()),
+        })
     }
 
     /// Send an HTTP request with retry logic for transient failures.
@@ -395,11 +604,9 @@ impl GitLabPublicProvider {
 
                     let status = response.status();
                     if status.is_server_error() || status.as_u16() == 429 {
-                        let error_text = response.text().await.unwrap_or_default();
-                        return Err(PublicRepoError::ApiError(format!(
-                            "HTTP {}: {}",
-                            status, error_text
-                        )));
+                        // Do not buffer or log an attacker-controlled response
+                        // body. Status is sufficient to drive the retry.
+                        return Err(PublicRepoError::ApiError(format!("HTTP {status}")));
                     }
 
                     Ok(response)
@@ -429,7 +636,11 @@ impl GitLabPublicProvider {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: "read_api and read_repository".to_string(),
+            }),
+            429 => Err(PublicRepoError::RateLimitExceeded),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -440,11 +651,126 @@ impl GitLabPublicProvider {
     fn encode_project_path(owner: &str, repo: &str) -> String {
         urlencoding::encode(&format!("{}/{}", owner, repo)).to_string()
     }
+
+    async fn acquire_custom_egress_permit(
+        &self,
+    ) -> Result<Option<OwnedSemaphorePermit>, PublicRepoError> {
+        match &self.custom_egress_limiter {
+            Some(limiter) => limiter
+                .clone()
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    PublicRepoError::Internal(format!(
+                        "Custom GitLab request limiter is unavailable: {error}"
+                    ))
+                }),
+            None => Ok(None),
+        }
+    }
+
+    async fn decode_bounded_json<T>(
+        response: reqwest::Response,
+        limit_bytes: usize,
+        context: &str,
+    ) -> Result<(T, usize), PublicRepoError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit_bytes as u64)
+        {
+            return Err(PublicRepoError::ResponseTooLarge {
+                context: context.to_string(),
+                limit_bytes,
+            });
+        }
+
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(limit_bytes as u64) as usize,
+        );
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                PublicRepoError::ApiError(format!(
+                    "Failed to read provider response for {context}: {error}"
+                ))
+            })?;
+            if body.len().saturating_add(chunk.len()) > limit_bytes {
+                return Err(PublicRepoError::ResponseTooLarge {
+                    context: context.to_string(),
+                    limit_bytes,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let body_len = body.len();
+        serde_json::from_slice(&body)
+            .map(|value| (value, body_len))
+            .map_err(|error| {
+                PublicRepoError::ApiError(format!(
+                    "Failed to parse provider response for {context}: {error}"
+                ))
+            })
+    }
+
+    fn append_bounded_tree_paths<I>(
+        files: &mut Vec<String>,
+        retained_path_bytes: &mut usize,
+        paths: I,
+        max_files: usize,
+        max_path_bytes: usize,
+        max_total_path_bytes: usize,
+    ) -> Result<(), PublicRepoError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for path in paths {
+            let path_bytes = path.len();
+            if path_bytes > max_path_bytes
+                || files.len() >= max_files
+                || retained_path_bytes.saturating_add(path_bytes) > max_total_path_bytes
+            {
+                return Err(PublicRepoError::ResponseTooLarge {
+                    context: "repository tree paths".to_string(),
+                    limit_bytes: max_total_path_bytes,
+                });
+            }
+            *retained_path_bytes += path_bytes;
+            files.push(path);
+        }
+        Ok(())
+    }
+
+    fn record_tree_page_budget(
+        total_entries: &mut usize,
+        total_response_bytes: &mut usize,
+        page_entries: usize,
+        page_response_bytes: usize,
+        max_entries: usize,
+        max_response_bytes: usize,
+    ) -> Result<(), PublicRepoError> {
+        *total_entries = total_entries.saturating_add(page_entries);
+        *total_response_bytes = total_response_bytes.saturating_add(page_response_bytes);
+        if *total_entries > max_entries || *total_response_bytes > max_response_bytes {
+            return Err(PublicRepoError::ResponseTooLarge {
+                context: "repository tree operation".to_string(),
+                limit_bytes: max_response_bytes,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for GitLabPublicProvider {
     fn default() -> Self {
-        Self::new(None)
+        Self::new()
     }
 }
 
@@ -459,6 +785,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
         let encoded_path = Self::encode_project_path(owner, repo);
         let url = format!("{}/api/v4/projects/{}", self.base_url, encoded_path);
 
@@ -475,6 +802,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
             star_count: Option<i32>,
             forks_count: Option<i32>,
             namespace: Option<GitLabNamespace>,
+            visibility: String,
         }
 
         #[derive(Deserialize)]
@@ -482,10 +810,11 @@ impl PublicRepoProvider for GitLabPublicProvider {
             path: String,
         }
 
-        let project: GitLabProject = response
-            .json()
-            .await
-            .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+        let (project, _): (GitLabProject, _) =
+            Self::decode_bounded_json(response, Self::MAX_METADATA_BYTES, "repository metadata")
+                .await?;
+
+        ensure_repository_is_public(project.visibility == "public", owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: project
@@ -499,6 +828,9 @@ impl PublicRepoProvider for GitLabPublicProvider {
             language: None, // GitLab doesn't return primary language in basic project info
             stars: project.star_count.unwrap_or(0),
             forks: project.forks_count.unwrap_or(0),
+            // GitLab's public provider is intentionally unauthenticated, so a
+            // successful response cannot represent a private project.
+            is_private: false,
         })
     }
 
@@ -507,6 +839,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
         #[derive(Deserialize)]
         struct GitLabBranch {
             name: String,
@@ -537,9 +870,9 @@ impl PublicRepoProvider for GitLabPublicProvider {
                 &format!("Branches for {}/{}", owner, repo),
             )?;
 
-            let branches: Vec<GitLabBranch> = response.json().await.map_err(|e| {
-                PublicRepoError::ApiError(format!("Failed to parse branches: {}", e))
-            })?;
+            let (branches, _): (Vec<GitLabBranch>, _) =
+                Self::decode_bounded_json(response, Self::MAX_LIST_BYTES, "repository branches")
+                    .await?;
 
             let count = branches.len();
             all_branches.extend(branches.into_iter().map(|b| PublicBranch {
@@ -563,11 +896,15 @@ impl PublicRepoProvider for GitLabPublicProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Vec<String>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
         let encoded_path = Self::encode_project_path(owner, repo);
         let encoded_ref = urlencoding::encode(reference);
 
         // GitLab requires pagination for tree, fetch all files recursively
         let mut all_files = Vec::new();
+        let mut retained_path_bytes = 0usize;
+        let mut total_entries = 0usize;
+        let mut total_response_bytes = 0usize;
         let mut page = 1;
         let per_page = 100;
 
@@ -591,19 +928,31 @@ impl PublicRepoProvider for GitLabPublicProvider {
                 entry_type: String,
             }
 
-            let entries: Vec<TreeEntry> = response
-                .json()
-                .await
-                .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse tree: {}", e)))?;
+            let (entries, page_response_bytes): (Vec<TreeEntry>, _) =
+                Self::decode_bounded_json(response, Self::MAX_LIST_BYTES, "repository tree")
+                    .await?;
 
             let count = entries.len();
+            Self::record_tree_page_budget(
+                &mut total_entries,
+                &mut total_response_bytes,
+                count,
+                page_response_bytes,
+                Self::MAX_TREE_ENTRIES,
+                Self::MAX_TREE_RESPONSE_BYTES,
+            )?;
 
-            // Filter only blobs (files)
-            for entry in entries {
-                if entry.entry_type == "blob" {
-                    all_files.push(entry.path);
-                }
-            }
+            Self::append_bounded_tree_paths(
+                &mut all_files,
+                &mut retained_path_bytes,
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.entry_type == "blob")
+                    .map(|entry| entry.path),
+                Self::MAX_TREE_FILES,
+                Self::MAX_TREE_PATH_BYTES,
+                Self::MAX_TREE_TOTAL_PATH_BYTES,
+            )?;
 
             // If we got fewer entries than per_page, we've reached the end
             if count < per_page {
@@ -620,6 +969,48 @@ impl PublicRepoProvider for GitLabPublicProvider {
 
         Ok(all_files)
     }
+
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
+        let encoded_project = Self::encode_project_path(owner, repo);
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/files/{}?ref={}",
+            self.base_url,
+            encoded_project,
+            encoded_path,
+            urlencoding::encode(reference)
+        );
+
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+
+        Self::check_response_status(
+            response.status(),
+            &format!("File {} in {}/{} at {}", path, owner, repo, reference),
+        )?;
+
+        #[derive(Deserialize)]
+        struct GitLabFile {
+            file_path: String,
+            content: String,
+            encoding: String,
+        }
+
+        let (file, _): (GitLabFile, _) =
+            Self::decode_bounded_json(response, Self::MAX_FILE_BYTES, "repository file").await?;
+
+        Ok(FileContent {
+            path: file.file_path,
+            content: file.content,
+            encoding: file.encoding,
+        })
+    }
 }
 
 /// Factory for creating public repo providers
@@ -630,7 +1021,7 @@ impl PublicRepoProviderFactory {
     pub fn create(provider: &str) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
             "github" => Ok(Box::new(GitHubPublicProvider::new())),
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new(None))),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
             _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
         }
     }
@@ -645,14 +1036,38 @@ impl PublicRepoProviderFactory {
                 Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t))),
                 None => Ok(Box::new(GitHubPublicProvider::new())),
             },
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new(None))),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
             _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
         }
     }
 
-    /// Create a GitLab provider with a custom base URL (for self-hosted instances)
-    pub fn create_gitlab_with_url(base_url: &str) -> Box<dyn PublicRepoProvider> {
-        Box::new(GitLabPublicProvider::new(Some(base_url.to_string())))
+    /// Create a provider and optionally target a validated, DNS-pinned
+    /// self-hosted GitLab instance.
+    pub fn create_with_gitlab_instance(
+        provider: &str,
+        token: Option<String>,
+        gitlab_instance: Option<(String, String, Vec<SocketAddr>)>,
+    ) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
+        match provider.to_lowercase().as_str() {
+            "github" => {
+                if gitlab_instance.is_some() {
+                    return Err(PublicRepoError::ProviderNotSupported(
+                        "Custom base URLs are supported only for GitLab".to_string(),
+                    ));
+                }
+                match token {
+                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token))),
+                    None => Ok(Box::new(GitHubPublicProvider::new())),
+                }
+            }
+            "gitlab" => match gitlab_instance {
+                Some((base_url, hostname, addresses)) => Ok(Box::new(
+                    GitLabPublicProvider::with_resolved_base_url(base_url, &hostname, &addresses)?,
+                )),
+                None => Ok(Box::new(GitLabPublicProvider::new())),
+            },
+            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+        }
     }
 }
 
@@ -663,22 +1078,33 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
     detected
         .into_iter()
         .map(|preset| {
-            let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
-
-            let exposed_port = preset_enum
+            let runtime_preset = temps_presets::get_preset_by_slug(&preset.slug);
+            let preset_enum = runtime_preset
                 .as_ref()
-                .and_then(|p| p.exposed_port())
-                .map(|p| p as i32)
-                .or(preset.exposed_port.map(|p| p as i32));
+                .and_then(|preset| preset.stored_preset());
 
-            let icon_url = preset_enum
-                .as_ref()
-                .and_then(|p| p.icon_url())
-                .map(|s| s.to_string());
+            // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
+            let exposed_port = preset.exposed_port.map(|p| p as i32).or_else(|| {
+                preset_enum
+                    .as_ref()
+                    .and_then(|p| p.exposed_port())
+                    .map(|p| p as i32)
+            });
 
-            let project_type = preset_enum
+            let icon_url = runtime_preset
                 .as_ref()
-                .map(|p| p.project_type().to_string())
+                .map(|preset| preset.icon_url())
+                .or_else(|| {
+                    preset_enum
+                        .as_ref()
+                        .and_then(|p| p.icon_url())
+                        .map(|s| s.to_string())
+                });
+
+            let project_type = runtime_preset
+                .as_ref()
+                .map(|preset| preset.project_type().to_string())
+                .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                 .unwrap_or_else(|| "unknown".to_string());
 
             DetectedPreset {
@@ -689,6 +1115,7 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
                 icon_url,
                 project_type,
                 compose_files: preset.compose_files,
+                dockerfile_path: preset.dockerfile_path,
             }
         })
         .collect()
@@ -697,6 +1124,119 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_public_provider_rejects_private_repository_metadata() {
+        let error = ensure_repository_is_public(false, "owner", "private")
+            .expect_err("private repositories must never pass through public endpoints");
+        assert!(matches!(
+            error,
+            PublicRepoError::RepositoryNotPublic(name) if name == "owner/private"
+        ));
+    }
+
+    #[tokio::test]
+    async fn gitlab_rejects_oversized_metadata_without_decoding_it() {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/api/v4/projects/platform%2Fexample-service")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(vec![b' '; GitLabPublicProvider::MAX_METADATA_BYTES + 1])
+            .create_async()
+            .await;
+        let provider = GitLabPublicProvider::with_test_base_url(server.url());
+
+        let error = provider
+            .get_repository("platform", "example-service")
+            .await
+            .expect_err("oversized provider metadata must be rejected before decoding");
+
+        response.assert_async().await;
+        assert!(matches!(error, PublicRepoError::ResponseTooLarge { .. }));
+    }
+
+    #[test]
+    fn gitlab_tree_limits_are_cumulative_across_pages() {
+        let mut files = Vec::new();
+        let mut retained_path_bytes = 0;
+        GitLabPublicProvider::append_bounded_tree_paths(
+            &mut files,
+            &mut retained_path_bytes,
+            ["one".to_string(), "two".to_string()],
+            3,
+            16,
+            32,
+        )
+        .expect("the first full page should fit");
+
+        let error = GitLabPublicProvider::append_bounded_tree_paths(
+            &mut files,
+            &mut retained_path_bytes,
+            ["three".to_string(), "four".to_string()],
+            3,
+            16,
+            32,
+        )
+        .expect_err("a later page must share the same cumulative limit");
+
+        assert!(matches!(error, PublicRepoError::ResponseTooLarge { .. }));
+        assert_eq!(files, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn gitlab_tree_budget_counts_directory_only_page_bytes() {
+        let mut entries = 0;
+        let mut response_bytes = 0;
+        GitLabPublicProvider::record_tree_page_budget(
+            &mut entries,
+            &mut response_bytes,
+            100,
+            8,
+            150,
+            15,
+        )
+        .expect("the first directory-only page should fit");
+
+        let error = GitLabPublicProvider::record_tree_page_budget(
+            &mut entries,
+            &mut response_bytes,
+            100,
+            8,
+            150,
+            15,
+        )
+        .expect_err("the next directory-only page must share the raw response budget");
+
+        assert!(matches!(error, PublicRepoError::ResponseTooLarge { .. }));
+    }
+
+    #[test]
+    fn github_forbidden_response_is_not_misreported_as_rate_limit() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(4_999),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("a non-rate-limited 403 must report the missing permission");
+
+        assert!(matches!(error, PublicRepoError::PermissionDenied { .. }));
+        assert!(error.to_string().contains("Contents: read"));
+    }
+
+    #[test]
+    fn github_exhausted_rate_limit_remains_rate_limit_error() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(0),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("an exhausted GitHub limit must report rate limiting");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+    }
 
     // =============================================================================
     // Unit Tests - Provider Factory
@@ -735,13 +1275,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gitlab_custom_url() {
-        let provider =
-            PublicRepoProviderFactory::create_gitlab_with_url("https://gitlab.example.com");
-        assert_eq!(provider.provider_name(), "gitlab");
-    }
-
     // =============================================================================
     // Unit Tests - Error Types
     // =============================================================================
@@ -773,6 +1306,7 @@ mod tests {
             language: Some("JavaScript".to_string()),
             stars: 200000,
             forks: 40000,
+            is_private: false,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -782,6 +1316,48 @@ mod tests {
         let deserialized: PublicRepoInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.owner, "facebook");
         assert_eq!(deserialized.stars, 200000);
+    }
+
+    #[tokio::test]
+    async fn github_repository_lookup_uses_token_and_rejects_private_repository() {
+        let mut server = mockito::Server::new_async().await;
+        let repository = server
+            .mock("GET", "/repos/example/private-repository")
+            .match_header("authorization", "token request-user-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "name": "private-repository",
+                    "full_name": "example/private-repository",
+                    "description": null,
+                    "default_branch": "main",
+                    "language": "Rust",
+                    "stargazers_count": 0,
+                    "forks_count": 0,
+                    "private": true,
+                    "owner": { "login": "example" }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let provider = GitHubPublicProvider::with_token_and_api_url(
+            "request-user-token".to_string(),
+            server.url(),
+        );
+
+        let error = provider
+            .get_repository("example", "private-repository")
+            .await
+            .expect_err("public repository endpoints must reject private repositories");
+
+        assert!(matches!(
+            error,
+            PublicRepoError::RepositoryNotPublic(name)
+                if name == "example/private-repository"
+        ));
+        repository.assert_async().await;
     }
 
     #[test]
@@ -807,6 +1383,7 @@ mod tests {
             icon_url: Some("https://example.com/icon.svg".to_string()),
             project_type: "frontend".to_string(),
             compose_files: None,
+            dockerfile_path: None,
         };
 
         let json = serde_json::to_string(&preset).unwrap();
@@ -814,8 +1391,83 @@ mod tests {
         assert!(json.contains("\"exposed_port\":3000"));
     }
 
+    #[test]
+    fn test_detected_preset_serialization_with_dockerfile_path() {
+        let preset = DetectedPreset {
+            path: "".to_string(),
+            preset: "dockerfile".to_string(),
+            preset_label: "Dockerfile".to_string(),
+            exposed_port: None,
+            icon_url: None,
+            project_type: "backend".to_string(),
+            compose_files: None,
+            dockerfile_path: Some("docker/Dockerfile".to_string()),
+        };
+
+        let json = serde_json::to_string(&preset).unwrap();
+        assert!(json.contains("\"dockerfile_path\":\"docker/Dockerfile\""));
+
+        let round_tripped: DetectedPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.dockerfile_path,
+            Some("docker/Dockerfile".to_string())
+        );
+    }
+
+    /// A bare Dockerfile in a `docker/`-named subdirectory, with something
+    /// else at the repository root, must be rolled up into a repo-root
+    /// candidate that records where the Dockerfile actually lives.
+    #[test]
+    fn test_detect_presets_from_files_bare_dockerfile_in_docker_dir_roots_at_repo_root() {
+        let files = vec!["package.json".to_string(), "docker/Dockerfile".to_string()];
+
+        let detected = detect_presets_from_files(&files);
+        let dockerfile_preset = detected
+            .iter()
+            .find(|p| p.preset == "dockerfile")
+            .expect("dockerfile preset should be detected");
+
+        assert_eq!(dockerfile_preset.path, "./");
+        assert_eq!(
+            dockerfile_preset.dockerfile_path,
+            Some("docker/Dockerfile".to_string())
+        );
+    }
+
+    /// A genuine monorepo service directory (its own Dockerfile plus its own
+    /// manifest, in a directory name that isn't a conventional Docker-tooling
+    /// name) keeps today's behavior: its own root, `dockerfile_path: None`.
+    #[test]
+    fn test_detect_presets_from_files_service_dockerfile_keeps_own_root() {
+        let files = vec![
+            "apps/api/Dockerfile".to_string(),
+            "apps/api/package.json".to_string(),
+        ];
+
+        let detected = detect_presets_from_files(&files);
+        let dockerfile_preset = detected
+            .iter()
+            .find(|p| p.preset == "dockerfile")
+            .expect("dockerfile preset should be detected");
+
+        assert_eq!(dockerfile_preset.path, "apps/api");
+        assert_eq!(dockerfile_preset.dockerfile_path, None);
+    }
+
     // =============================================================================
     // Integration Tests - GitHub API
+    //
+    // The `*_real_api` tests below call github.com / gitlab.com for real, with
+    // no credentials, so they are subject to a per-IP rate limit shared with
+    // everything else running on the CI fleet. They are EXCLUDED from the
+    // unit-b job in .github/workflows/rust-tests.yml for that reason: a
+    // throttled provider returns a body these parsers can't decode, which
+    // arrives as `ApiError`, not `RateLimitExceeded`, and fails the build on
+    // PRs that never touched this crate.
+    //
+    // They are not dead: `cargo test -p temps-git` runs them, and they still
+    // assert strictly there. Keep them that way -- if you add one, expect it
+    // to run locally and on demand, not on every PR.
     // =============================================================================
 
     #[tokio::test]
@@ -898,7 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_repository_real_api() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -916,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_list_branches_real_api() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -942,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_file_tree_real_api() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         // Using a smaller repo for file tree test
         match provider
@@ -968,7 +1620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_nonexistent_repo() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")

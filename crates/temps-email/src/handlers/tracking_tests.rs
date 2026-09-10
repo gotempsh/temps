@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for email tracking HTTP endpoints
 //!
 //! Tests the actual HTTP routes using tower::ServiceExt::oneshot.
@@ -24,8 +27,8 @@ mod tests {
     use crate::handlers::tracking::{public_routes, routes};
     use crate::handlers::types::AppState;
     use crate::services::{
-        DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-        ValidationService,
+        DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+        ValidationConfig, ValidationService,
     };
 
     // ============================================
@@ -71,6 +74,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -82,8 +86,18 @@ mod tests {
         }
     }
 
-    async fn setup_test_env() -> (TestDatabase, Arc<AppState>) {
-        let db = TestDatabase::with_migrations().await.unwrap();
+    async fn setup_test_env() -> Option<(TestDatabase, Arc<AppState>)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
+                {
+                    eprintln!("Skipping Docker-dependent email tracking test: {error}");
+                    return None;
+                }
+                panic!("Email tracking test database or migrations failed: {error}");
+            }
+        };
         let encryption_service = create_test_encryption_service();
         let provider_service = Arc::new(ProviderService::new(db.db.clone(), encryption_service));
         let domain_service = Arc::new(DomainService::new(db.db.clone(), provider_service.clone()));
@@ -110,21 +124,28 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(
             server_config,
             db.db.clone(),
         ));
+        let tracking_setup_service = Arc::new(crate::services::TrackingSetupService::new(
+            provider_service.clone(),
+            db.db.clone(),
+        ));
         let tracking_service = Arc::new(TrackingService::with_base_url(
             db.db.clone(),
-            config_service,
+            config_service.clone(),
             "http://localhost:3000".to_string(),
         ));
+        let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
         let email_service = Arc::new(EmailService::new(
             db.db.clone(),
             provider_service.clone(),
             domain_service.clone(),
             tracking_service.clone(),
+            suppression_service,
         ));
         let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
 
@@ -135,11 +156,14 @@ mod tests {
             validation_service,
             tracking_service,
             audit_service: Arc::new(MockAuditLogger),
+            project_access_checker: None,
             dns_provider_service: None,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            tracking_setup_service,
+            config_service,
         });
 
-        (db, app_state)
+        Some((db, app_state))
     }
 
     /// Build public routes with RequestMetadata middleware (no auth)
@@ -213,7 +237,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_open_returns_gif_pixel() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, true, false).await;
 
         let app = build_public_app(state);
@@ -247,7 +273,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_open_returns_gif_even_for_invalid_uuid() {
-        let (_db, state) = setup_test_env().await;
+        let Some((_db, state)) = setup_test_env().await else {
+            return;
+        };
 
         let app = build_public_app(state);
         let response = app
@@ -268,7 +296,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_open_does_not_increment_when_tracking_disabled() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, false, false).await;
 
         let app = build_public_app(state);
@@ -296,7 +326,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_open_sets_no_cache_headers() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, true, false).await;
 
         let app = build_public_app(state);
@@ -323,7 +355,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_click_redirects_to_original_url() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, false, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -357,7 +391,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_click_second_link() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, false, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -382,7 +418,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_click_invalid_link_index_returns_404() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, false, true).await;
         // No links stored
 
@@ -403,7 +441,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_click_invalid_uuid_returns_400() {
-        let (_db, state) = setup_test_env().await;
+        let Some((_db, state)) = setup_test_env().await else {
+            return;
+        };
 
         let app = build_public_app(state);
         let response = app
@@ -426,7 +466,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_tracking_returns_summary() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, true, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -488,7 +530,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_tracking_invalid_uuid_returns_400() {
-        let (_db, state) = setup_test_env().await;
+        let Some((_db, state)) = setup_test_env().await else {
+            return;
+        };
 
         let app = build_authed_app(state);
         let response = app
@@ -511,7 +555,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_events_returns_all_events() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, true, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -549,9 +595,9 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "1.1.1.1");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["ip_address"], "2.2.2.2");
         assert_eq!(events[1]["link_index"], 0);
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
@@ -559,7 +605,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_events_filtered_by_type() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, true, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -600,7 +648,7 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2, "Should only return open events");
-        assert!(events.iter().all(|e| e["event_type"] == "open"));
+        assert!(events.iter().all(|e| e["event_type"] == "opened"));
     }
 
     // ============================================
@@ -609,7 +657,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_email_links_returns_tracked_links() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
         let email_id = create_test_email(&db.db, false, true).await;
         create_test_links(&db.db, email_id).await;
 
@@ -655,7 +705,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_tracking_flow_open_then_click() {
-        let (db, state) = setup_test_env().await;
+        let Some((db, state)) = setup_test_env().await else {
+            return;
+        };
 
         // Step 1: Create email with both tracking enabled
         let email_id = create_test_email(&db.db, true, true).await;
@@ -745,10 +797,10 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "127.0.0.1"); // from RequestMetadata
         assert_eq!(events[0]["user_agent"], "test-agent");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
 
         // Step 6: Verify the database state directly

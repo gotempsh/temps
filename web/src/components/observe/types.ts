@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Re-exports for the observability page. The shapes live in the generated
  * SDK; this module exists so call-sites import from one stable path.

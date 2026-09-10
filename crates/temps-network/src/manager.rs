@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [`NetworkManager`] — orchestrates the full per-node networking lifecycle.
 //!
 //! On Linux, it drives `crate::linux` to manipulate the kernel data plane.
@@ -7,6 +10,9 @@
 use crate::config::{NetworkConfig, NodeAlloc, Peer};
 use crate::error::NetworkError;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex;
 #[cfg(target_os = "linux")]
 use tracing::info;
@@ -50,7 +56,15 @@ struct State {
     /// Last peer list we successfully reconciled to.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     peers: Vec<Peer>,
+    /// Last successful firewall installation or drift check. Peer polling is
+    /// frequent, but spawning `nft` on every unchanged poll would create
+    /// needless production load.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    last_firewall_check: Option<Instant>,
 }
+
+#[cfg(target_os = "linux")]
+const FIREWALL_DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 impl NetworkManager {
     /// Construct without doing any I/O. The config is validated immediately.
@@ -93,6 +107,7 @@ impl NetworkManager {
             let mut state = self.inner.state.lock().await;
             state.alloc = Some(alloc);
             state.peers = peers;
+            state.last_firewall_check = Some(Instant::now());
             info!("network manager bootstrapped");
             Ok(())
         }
@@ -121,14 +136,21 @@ impl NetworkManager {
 
         #[cfg(target_os = "linux")]
         {
-            let current = {
+            let (current, firewall_check_due) = {
                 let state = self.inner.state.lock().await;
-                state.peers.clone()
+                let due = state
+                    .last_firewall_check
+                    .is_none_or(|checked| checked.elapsed() >= FIREWALL_DRIFT_CHECK_INTERVAL);
+                (state.peers.clone(), due)
             };
+            if current == peers && !firewall_check_due {
+                return Ok(false);
+            }
             let changed =
                 crate::linux::reconcile_peers(&self.inner.config, &alloc, &current, &peers).await?;
             let mut state = self.inner.state.lock().await;
             state.peers = peers;
+            state.last_firewall_check = Some(Instant::now());
             Ok(changed)
         }
     }
@@ -149,6 +171,7 @@ impl NetworkManager {
             let mut state = self.inner.state.lock().await;
             state.alloc = None;
             state.peers.clear();
+            state.last_firewall_check = None;
             Ok(())
         }
     }

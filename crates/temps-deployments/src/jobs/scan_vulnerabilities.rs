@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Vulnerability Scan Job
 //!
 //! Scans the deployed application for security vulnerabilities using Trivy.
@@ -198,7 +201,7 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
                 Some(self.environment_id),
                 Some(self.deployment_id),
                 Some(self.branch.clone()),
-                Some(self.commit_hash.clone()),
+                (!self.commit_hash.is_empty()).then(|| self.commit_hash.clone()),
             )
             .await
         {

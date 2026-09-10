@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Git operations using libgit2 (git2 crate).
 //!
 //! Provides safe, typed wrappers around common git operations
@@ -25,6 +28,13 @@ pub enum GitOpsError {
         repo_path: String,
         reason: String,
     },
+}
+
+fn clone_failed(url: &str, reason: String) -> GitOpsError {
+    GitOpsError::CloneFailed {
+        url: temps_core::url_validation::redact_url_password(url),
+        reason,
+    }
 }
 
 /// Snapshot of a clone's network transfer, surfaced from libgit2's
@@ -96,10 +106,7 @@ fn clone_repo_inner(
 
     builder
         .clone(url, target_dir)
-        .map_err(|e| GitOpsError::CloneFailed {
-            url: url.to_string(),
-            reason: e.message().to_string(),
-        })
+        .map_err(|e| clone_failed(url, e.message().to_string()))
 }
 
 /// Wire libgit2's `transfer_progress` callback to a [`ProgressCallback`].
@@ -211,10 +218,7 @@ fn clone_repo_with_credentials_inner(
 
     builder
         .clone(url, target_dir)
-        .map_err(|e| GitOpsError::CloneFailed {
-            url: url.to_string(),
-            reason: e.message().to_string(),
-        })
+        .map_err(|e| clone_failed(url, e.message().to_string()))
 }
 
 /// Create a new local branch at HEAD and check it out. Equivalent to
@@ -495,6 +499,20 @@ mod tests {
             }
             Err(other) => panic!("Expected CloneFailed, got {:?}", other),
             Ok(_) => panic!("Expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_clone_error_never_exposes_url_credentials() {
+        for url in [
+            "https://token:secret@example.com/repo.git",
+            "https://token@example.com/repo.git",
+        ] {
+            let error = clone_failed(url, "connection failed".to_string());
+            let rendered = error.to_string();
+            assert!(!rendered.contains("token"), "leaked username: {rendered}");
+            assert!(!rendered.contains("secret"), "leaked password: {rendered}");
+            assert!(rendered.contains("***"));
         }
     }
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Chunk writer service: buffers log lines and flushes to storage as compressed NDJSON chunks
 //!
 //! Flush triggers:
@@ -80,10 +83,10 @@ impl ContainerBuffer {
             self.has_errors = true;
         }
 
-        if self.first_timestamp.is_none() {
-            self.first_timestamp = Some(line.ts);
-        }
-        self.last_timestamp = Some(line.ts);
+        // Chunk bounds describe event time, not arrival order. Global search
+        // uses these bounds to select files even when logs arrive out of order.
+        self.first_timestamp = Some(self.first_timestamp.map_or(line.ts, |ts| ts.min(line.ts)));
+        self.last_timestamp = Some(self.last_timestamp.map_or(line.ts, |ts| ts.max(line.ts)));
         self.lines.push(line);
     }
 
@@ -396,6 +399,20 @@ mod tests {
             node_id: None,
             node_name: None,
         }
+    }
+
+    #[test]
+    fn chunk_bounds_cover_out_of_order_event_times() {
+        let mut buffer = ContainerBuffer::new();
+        let origin = Utc::now();
+        for seconds in [10, 30, 0, 20] {
+            let mut line = make_line("bounds", LogLevel::Info);
+            line.ts = origin + chrono::Duration::seconds(seconds);
+            buffer.add_line(line);
+        }
+        let flush = buffer.take_flush_data().unwrap();
+        assert_eq!(flush.started_at, origin);
+        assert_eq!(flush.ended_at, origin + chrono::Duration::seconds(30));
     }
 
     #[tokio::test]

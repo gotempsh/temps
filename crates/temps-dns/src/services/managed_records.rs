@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Ownership-guarded DNS record management (ADR-031)
 //!
 //! [`ManagedDnsRecordService`] is the ONLY path other crates should use to

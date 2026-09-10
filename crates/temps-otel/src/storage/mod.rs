@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pluggable storage backend for OTel data.
 //!
 //! The [`OtelStorage`] trait defines the contract for storing and querying
@@ -6,19 +9,86 @@
 //! implementing this trait.
 
 pub mod clickhouse;
+/// Reads mirrored metrics back out of Temps Cloud through its read proxy
+/// (ADR-043 §3 Phase C1).
+pub mod cloud_metrics;
+/// ADR-040 §2 / ADR-041 §8: routes span reads for Cloud-primary projects.
+/// Extended in ADR-043 §3 to also route metric reads.
+pub mod cloud_routed;
+/// Reads mirrored spans back out of Temps Cloud through its read proxy.
+pub mod cloud_spans;
+pub mod global_traces;
 pub mod timescaledb;
+
+pub use cloud_metrics::{
+    project_cloud_metric_row, run_metric_outbox_worker, CloudMetricRow, CloudTelemetryMetricSource,
+};
+pub use cloud_routed::{CloudMetricSource, CloudRoutedOtelStorage, CloudSpanSource};
+pub use cloud_spans::CloudTelemetrySpanSource;
 
 use async_trait::async_trait;
 
 use crate::error::OtelError;
 use crate::types::{
-    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, Insight, InsightStatus,
-    LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord, StorageQuota,
-    TraceQuery, TraceSummary,
+    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, IngestErrorSummary, Insight,
+    InsightStatus, LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord,
+    SpanStats, SpanStatsQuery, StorageQuota, TraceQuery, TraceSummary,
 };
 
 /// Result type for storage operations.
 pub type StorageResult<T> = Result<T, OtelError>;
+
+// ── Ingest error reporting: shared bounds ───────────────────────────
+
+/// How far back [`OtelStorage::recent_ingest_errors`] looks.
+///
+/// A group whose `last_seen` is older than this is treated as resolved and
+/// hidden, so a failure mode that was fixed last month does not sit on the
+/// dashboard forever. The row itself is left in place — the table is bounded
+/// by its unique constraint, so there is nothing to reclaim.
+pub(crate) const INGEST_ERROR_WINDOW_DAYS: u32 = 7;
+
+/// Default number of ingest-error groups returned when the caller does not
+/// specify one. Matches the workspace pagination convention.
+pub(crate) const INGEST_ERROR_DEFAULT_LIMIT: u32 = 20;
+
+/// Hard ceiling on ingest-error groups per request. Matches the workspace
+/// pagination convention.
+pub(crate) const INGEST_ERROR_MAX_LIMIT: u32 = 100;
+
+/// Longest `sample_message` persisted per group.
+///
+/// A backend can return a very large error body (a full DDL statement, a
+/// serialized row). Truncating keeps one pathological failure from writing an
+/// unbounded blob into a control table that is otherwise a few dozen tiny rows.
+pub(crate) const INGEST_ERROR_MESSAGE_MAX_CHARS: usize = 500;
+
+/// Clamp a caller-supplied limit into `1..=INGEST_ERROR_MAX_LIMIT`, mapping
+/// `0` to the default so a missing/zero query param behaves as "unspecified"
+/// rather than returning nothing.
+pub(crate) fn clamp_ingest_error_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        INGEST_ERROR_DEFAULT_LIMIT
+    } else {
+        limit.min(INGEST_ERROR_MAX_LIMIT)
+    }
+}
+
+/// Truncate an error message to [`INGEST_ERROR_MESSAGE_MAX_CHARS`], appending
+/// an ellipsis when it was cut.
+///
+/// Counts *characters*, not bytes, so a multi-byte message can never be split
+/// mid-codepoint (which would make the column invalid UTF-8).
+pub(crate) fn truncate_sample_message(message: &str) -> String {
+    let mut out: String = message
+        .chars()
+        .take(INGEST_ERROR_MESSAGE_MAX_CHARS)
+        .collect();
+    if message.chars().count() > INGEST_ERROR_MESSAGE_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
 
 /// The pluggable storage backend trait for OTel data.
 ///
@@ -40,6 +110,23 @@ pub type StorageResult<T> = Result<T, OtelError>;
 /// ```
 #[async_trait]
 pub trait OtelStorage: Send + Sync {
+    /// One storage-wide ordered cursor; implementations must never fan out by project.
+    async fn global_trace_stream(
+        &self,
+        _query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTraceStream> {
+        Err(global_traces::invalid(
+            "Global trace reads are not supported by this storage backend",
+        ))
+    }
+    async fn global_trace_page(
+        &self,
+        mut query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTracePage> {
+        query.source_offset = query.filter.offset.unwrap_or(0);
+        let stream = self.global_trace_stream(query.clone()).await?;
+        global_traces::merge(vec![stream], &query).await
+    }
     // ── Write operations ────────────────────────────────────────────
 
     /// Batch-insert metric data points.
@@ -59,6 +146,44 @@ pub trait OtelStorage: Send + Sync {
     /// All severity levels are archived.
     /// Returns the number of records archived.
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64>;
+
+    // ── Ingest error reporting ──────────────────────────────────────
+    //
+    // Both methods are backed by Postgres on *every* backend — the
+    // ClickHouse implementation delegates to its inner TimescaleDB store,
+    // exactly as it already does for logs, insights and health summaries.
+    //
+    // That is a deliberate choice, not an oversight: the failure being
+    // recorded is most often "ClickHouse is unreachable". Writing the record
+    // to ClickHouse would lose it in precisely the case it exists to explain,
+    // leaving the operator with a rising `dropped` counter and no reason. If
+    // Postgres is unreachable the control plane is down anyway, so there is no
+    // equivalent blind spot.
+
+    /// Record that an ingest batch was dropped after its retries were
+    /// exhausted, grouped by `(signal_type, error_class)`.
+    ///
+    /// Callers must treat this as **best-effort**: it is invoked on a path
+    /// that is already failing, so implementations should expect it to
+    /// sometimes fail too, and callers must not let that change the outcome of
+    /// the ingest request. See `OtelService::record_ingest_failure`.
+    ///
+    /// `error_class` must be a stable, low-cardinality label
+    /// (`OtelError::error_class`) — never a raw error message, which would
+    /// make the group set unbounded.
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()>;
+
+    /// Recent ingest-failure groups, most recently seen first.
+    ///
+    /// Implementations bound the result by `limit` and exclude groups whose
+    /// `last_seen` is outside the reporting window, so a failure mode that was
+    /// fixed weeks ago does not linger on the dashboard.
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>>;
 
     // ── Read operations ─────────────────────────────────────────────
 
@@ -103,11 +228,47 @@ pub trait OtelStorage: Send + Sync {
     /// Count distinct traces matching the given filters (for pagination).
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64>;
 
+    /// Whether `project_id` has ever received at least one span. A pure
+    /// existence check for onboarding/setup UI — cheap on both backends
+    /// because it needs no aggregation, no time bound, and no sorting;
+    /// see the implementations for why each is O(1) rather than a scan.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool>;
+
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
+    /// Aggregate spans into per-operation latency statistics — one row per
+    /// `(project, service, span name)` — for the queried window.
+    ///
+    /// This is the "which operations are slow, and which are *erratic*"
+    /// report. Rows are already sorted and paginated by the query; use
+    /// [`OtelStorage::count_span_stats`] for the total.
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>>;
+
+    /// Count the distinct operations a span-stats query matches, for
+    /// pagination. Must apply exactly the same filters — including
+    /// `min_count` — as [`OtelStorage::query_span_stats`].
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64>;
+
     /// Query log records from the fast-query store.
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>>;
+
+    // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────
+
+    /// Record that `project_id` holds spans for each `trace_id` — the
+    /// reverse index behind cross-project trace discovery. First write
+    /// per `(trace_id, project_id)` pair wins; re-recording an existing
+    /// pair must not move its `first_seen`.
+    ///
+    /// Returns the number of pairs submitted (duplicates included — both
+    /// backends dedupe internally).
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64>;
+
+    /// Return every `(project_id, first_seen)` pair recorded for
+    /// `trace_id`, at most one entry per project (earliest `first_seen`
+    /// wins), in no guaranteed order. Project metadata (name, slug,
+    /// sharing flag) is NOT resolved here — callers join it from Postgres.
+    async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>>;
 
     // ── GenAI queries ────────────────────────────────────────────────
 
@@ -220,6 +381,39 @@ pub trait OtelStorage: Send + Sync {
     ) -> StorageResult<f64>;
 }
 
+/// A `(project_id, first_seen)` pair from the cross-project trace ref index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRefProject {
+    pub project_id: i32,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+}
+
+/// Merge trace-ref lookups from two sources into one entry per project,
+/// keeping the earliest `first_seen` when both sources know a project.
+///
+/// Used by the ClickHouse backend to union its native rows with legacy rows
+/// still sitting in the Postgres `cross_project_trace_refs` table, so
+/// enabling ClickHouse needs no data migration: old traces resolve from
+/// Postgres until they age out, new traces resolve from ClickHouse.
+pub fn merge_trace_ref_projects(
+    a: Vec<TraceRefProject>,
+    b: Vec<TraceRefProject>,
+) -> Vec<TraceRefProject> {
+    let mut by_project: std::collections::HashMap<i32, TraceRefProject> =
+        std::collections::HashMap::new();
+    for r in a.into_iter().chain(b) {
+        by_project
+            .entry(r.project_id)
+            .and_modify(|existing| {
+                if r.first_seen < existing.first_seen {
+                    existing.first_seen = r.first_seen;
+                }
+            })
+            .or_insert(r);
+    }
+    by_project.into_values().collect()
+}
+
 /// A baseline data point for anomaly detection.
 #[derive(Debug, Clone)]
 pub struct BaselinePoint {
@@ -246,4 +440,110 @@ pub struct DeployEvent {
     pub environment_id: Option<i32>,
     pub deployed_at: chrono::DateTime<chrono::Utc>,
     pub service_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn r(project_id: i32, secs: i64) -> TraceRefProject {
+        TraceRefProject {
+            project_id,
+            first_seen: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn merge_unions_disjoint_projects() {
+        let merged = merge_trace_ref_projects(vec![r(1, 100)], vec![r(2, 200)]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    // ── Ingest error reporting bounds ───────────────────────────────
+
+    /// Zero/absent means "unspecified" and must yield the default page, not an
+    /// empty result — a client that omits `limit` should still see data.
+    #[test]
+    fn ingest_error_limit_zero_becomes_the_default() {
+        assert_eq!(
+            clamp_ingest_error_limit(0),
+            INGEST_ERROR_DEFAULT_LIMIT,
+            "0 must mean 'unspecified', never 'return nothing'"
+        );
+    }
+
+    #[test]
+    fn ingest_error_limit_is_capped_at_the_max() {
+        assert_eq!(clamp_ingest_error_limit(101), INGEST_ERROR_MAX_LIMIT);
+        assert_eq!(clamp_ingest_error_limit(u32::MAX), INGEST_ERROR_MAX_LIMIT);
+    }
+
+    #[test]
+    fn ingest_error_limit_passes_through_in_range_values() {
+        assert_eq!(clamp_ingest_error_limit(1), 1);
+        assert_eq!(clamp_ingest_error_limit(50), 50);
+        assert_eq!(
+            clamp_ingest_error_limit(INGEST_ERROR_MAX_LIMIT),
+            INGEST_ERROR_MAX_LIMIT
+        );
+    }
+
+    /// Matches the workspace pagination convention (default 20, max 100).
+    #[test]
+    fn ingest_error_limits_match_the_pagination_convention() {
+        assert_eq!(INGEST_ERROR_DEFAULT_LIMIT, 20);
+        assert_eq!(INGEST_ERROR_MAX_LIMIT, 100);
+    }
+
+    #[test]
+    fn short_sample_messages_are_left_alone() {
+        let msg = "ClickHouse store_spans failed: timeout expired";
+        assert_eq!(truncate_sample_message(msg), msg);
+    }
+
+    #[test]
+    fn long_sample_messages_are_truncated_with_an_ellipsis() {
+        let msg = "x".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 50);
+        let out = truncate_sample_message(&msg);
+        assert_eq!(out.chars().count(), INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    /// Truncation counts characters, not bytes, so a multi-byte message can
+    /// never be split mid-codepoint into invalid UTF-8.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        let msg = "é".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 10);
+        let out = truncate_sample_message(&msg);
+        assert_eq!(out.chars().count(), INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(out.starts_with('é'));
+    }
+
+    #[test]
+    fn truncation_boundary_is_exact() {
+        let exact = "y".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS);
+        assert_eq!(truncate_sample_message(&exact), exact, "no ellipsis at N");
+
+        let over = "y".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(truncate_sample_message(&over).ends_with('…'));
+    }
+
+    #[test]
+    fn merge_keeps_earliest_first_seen_for_shared_project() {
+        // Same project known to both sources — earliest observation wins,
+        // regardless of which side holds it.
+        let merged = merge_trace_ref_projects(vec![r(1, 300)], vec![r(1, 100)]);
+        assert_eq!(merged, vec![r(1, 100)]);
+
+        let merged = merge_trace_ref_projects(vec![r(1, 100)], vec![r(1, 300)]);
+        assert_eq!(merged, vec![r(1, 100)]);
+    }
+
+    #[test]
+    fn merge_handles_empty_sides() {
+        assert!(merge_trace_ref_projects(vec![], vec![]).is_empty());
+        assert_eq!(merge_trace_ref_projects(vec![r(1, 1)], vec![]).len(), 1);
+        assert_eq!(merge_trace_ref_projects(vec![], vec![r(1, 1)]).len(), 1);
+    }
 }

@@ -5,18 +5,1077 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0-beta.56] - 2026-08-21
 
 ### Added
 
-- **Project domain delivery setup:** Add reusable Direct and Cloudflare delivery profiles, project defaults with environment overrides, and project-domain DNS preview and explicit adoption through the shared ownership service. Existing DNS and origin certificates are preserved until a setup is applied.
-- **Managed DNS and proxied origins:** Add signed, ownership-guarded A/AAAA/CNAME automation, per-domain Cloudflare proxy defaults, flat generated-hostname sync, conflict/import states, and self-signed origin TLS that avoids per-hostname ACME issuance.
-- **Daily returning-visitor metric**: The analytics overview now reports visitors active in the selected period who were previously seen in the same project and environment, making daily audience retention visible across TimescaleDB and ClickHouse backends.
+- **Temps Cloud:** Connect a self-hosted instance to the optional managed control plane in two steps from Settings, mirror OpenTelemetry spans without putting the managed service on the ingest path, and surface connection, buffering, and credential health through the console and CLI.
+- **providers:** Reset all accumulated `pg_stat_statements` statistics from the Query Performance page through a write-protected, audited API with explicit destructive-action confirmation.
+- **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** self-service "Enable & Restart" action to load `pg_stat_statements` on standalone Postgres services that predate this feature — clustered/HA services are rejected with a clear error instead, since a blind single-container restart bypasses controlled failover ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
+- **funnels:** Add time-range shortcuts and show exact completion seconds ([#750](https://github.com/gotempsh/temps/issues/750))
+- **projects:** Always show a health indicator on the project card ([#747](https://github.com/gotempsh/temps/issues/747))
+
+### Documentation
+
+- Require DCO sign-off on every commit, add Code of Conduct ([#752](https://github.com/gotempsh/temps/issues/752))
 
 ### Fixed
 
-- **Local preview-gateway isolation:** Allow an installation to disable preview-gateway reconciliation in persisted settings before starting a second local instance, preventing that instance from managing the shared gateway container.
-- **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
+- **projects:** Report the connected Git provider instead of guessing it ([#740](https://github.com/gotempsh/temps/issues/740))
+- **web:** Open the highlighted command palette row on Enter ([#751](https://github.com/gotempsh/temps/issues/751))
+- **proxy:** Scope the traffic aggregation window cap to unique counts ([#755](https://github.com/gotempsh/temps/issues/755))
+- **web:** Handle mutation and fetch errors in ErrorGroupDetail and ErrorEventDetail ([#746](https://github.com/gotempsh/temps/issues/746))
+
+### Testing
+
+- Fix flaky Postgres/Chrome tests and make MongoDB health timeouts diagnosable ([#754](https://github.com/gotempsh/temps/issues/754))
+
+## [0.1.0-nightly.20260821.cdad16f9] - 2026-08-20
+
+### Added
+
+- **flags:** Allow TEMPS_FLAGS_REFRESH_INTERVAL_MS to override the 30s poll ([#733](https://github.com/gotempsh/temps/issues/733))
+- **web:** Searchable, refreshable project select on the Proxy page ([#734](https://github.com/gotempsh/temps/issues/734))
+
+### Fixed
+
+- **email:** Scope deployment delivery to authorized projects ([#685](https://github.com/gotempsh/temps/issues/685))
+- **web:** Handle fetch errors in BackupDetail and ScheduleDetail with actionable error state. ([#737](https://github.com/gotempsh/temps/issues/737))
+- **session-replay:** Stop duplicating and over-recording replay events ([#739](https://github.com/gotempsh/temps/issues/739))
+
+## [0.1.0-nightly.20260820.bfa3b1e2] - 2026-08-19
+
+### Added
+
+- **projects:** Opt in to deploying a project from alternate sources ([#716](https://github.com/gotempsh/temps/issues/716))
+- **settings:** Bound project resource overrides with operator ceilings ([#713](https://github.com/gotempsh/temps/issues/713))
+- **otel:** Count and alarm on rate-limited/quota-exceeded ingest requests ([#730](https://github.com/gotempsh/temps/issues/730))
+- **ai-chat:** Expand read allowlist with ~130 safe GET endpoints ([#732](https://github.com/gotempsh/temps/issues/732))
+
+### CI
+
+- **rust-tests:** Verify temps-captcha-wasm pkg/ is a reproducible build ([#731](https://github.com/gotempsh/temps/issues/731))
+
+### Documentation
+
+- **installation:** Pin wasm-pack to required version 0.13.1 ([#706](https://github.com/gotempsh/temps/issues/706))
+
+### Fixed
+
+- **compose:** Make sandbox capability denials and override rejections actionable ([#723](https://github.com/gotempsh/temps/issues/723))
+- **security:** Close 14 open findings from the security review ([#709](https://github.com/gotempsh/temps/issues/709))
+- **web:** Support RFC3339 Sentry timestamps ([#727](https://github.com/gotempsh/temps/issues/727))
+- **cli:** Honor --data-dir when starting the proxy alongside the console ([#724](https://github.com/gotempsh/temps/issues/724))
+- **funnels:** Match CustomData filters against the props column ([#729](https://github.com/gotempsh/temps/issues/729))
+
+### Performance
+
+- **cli:** Build the serve runtime once, before the database pool ([#722](https://github.com/gotempsh/temps/issues/722))
+- **geo:** Load the GeoLite2 city database once per process ([#721](https://github.com/gotempsh/temps/issues/721))
+
+## [0.1.0-nightly.20260819.c2d15ad4] - 2026-08-18
+
+### Added
+
+- **monitoring:** Alert when file descriptors/sockets near exhaustion ([#712](https://github.com/gotempsh/temps/issues/712))
+- **web:** Deep-link into plugin routes from the console ([#720](https://github.com/gotempsh/temps/issues/720))
+
+### Fixed
+
+- **monitoring:** Normalise uncapped container CPU alerts against host cores ([#714](https://github.com/gotempsh/temps/issues/714))
+- **proxy:** Keep tracking page views when Fetch Metadata is absent ([#711](https://github.com/gotempsh/temps/issues/711))
+- **web:** Hide Git configuration for projects with no repository ([#717](https://github.com/gotempsh/temps/issues/717))
+- **proxy:** Honour the configured preview gateway host port ([#719](https://github.com/gotempsh/temps/issues/719))
+
+## [0.1.0-nightly.20260818.86db3048] - 2026-08-17
+
+### Added
+
+- **onboarding:** Surface the next setup step
+- **onboarding:** Add navigable copyable setup prompts
+- **email:** Generate DMARC recommendation, fix DNS TXT-record verification precision ([#304](https://github.com/gotempsh/temps/issues/304))
+- **analytics:** Select page timeframe from charts ([#696](https://github.com/gotempsh/temps/issues/696))
+- **deployments:** Per-project Docker image retention with nightly pruning ([#172](https://github.com/gotempsh/temps/issues/172))
+- **cli:** Deploy a drop archive into an existing project ([#703](https://github.com/gotempsh/temps/issues/703))
+
+### Documentation
+
+- **readme:** Fix star history chart across all locales ([#690](https://github.com/gotempsh/temps/issues/690))
+
+### Fixed
+
+- **projects:** Show traffic and deployment media
+- **ui:** Keep preset icons visible in dark mode
+- **monitoring:** Separate and widen alert rules
+- **onboarding:** Anchor checklist navigation controls
+- **projects:** Rollback failed domain reassignments
+- **ci:** Grant missing permissions for dependency-scan scheduled/manual runs ([#691](https://github.com/gotempsh/temps/issues/691))
+- **proxy:** Bucket projects-health summary hours without toUnixTimestamp64Milli ([#698](https://github.com/gotempsh/temps/issues/698))
+- **providers:** Allowlist pgvector images, and let operators extend the list ([#697](https://github.com/gotempsh/temps/issues/697))
+- **docker:** Bump Alpine base images off EOL 3.19/3.20 to 3.22 ([#692](https://github.com/gotempsh/temps/issues/692))
+- **session-replay:** Batch event inserts instead of one round-trip per event ([#701](https://github.com/gotempsh/temps/issues/701))
+- **dashboard:** Correct sessions and project navigation ([#700](https://github.com/gotempsh/temps/issues/700))
+- **migrate:** Show post-migration maintenance progress and cancel the right backend ([#707](https://github.com/gotempsh/temps/issues/707))
+- **proxy:** Redact credentials from persisted proxy logs ([#699](https://github.com/gotempsh/temps/issues/699))
+- **compose:** Deliver project secrets to Docker Compose stacks ([#702](https://github.com/gotempsh/temps/issues/702))
+- **skills:** Repin the temps skill to the published 0.1.34 integrity ([#710](https://github.com/gotempsh/temps/issues/710))
+
+### Miscellaneous
+
+- **cli:** Release @temps-sdk/cli v0.1.34 and repin skills ([#708](https://github.com/gotempsh/temps/issues/708))
+
+### Performance
+
+- **proxy:** Bound preview limiter flood work
+
+## [0.1.0-nightly.20260817.651f4a16] - 2026-08-16
+
+### Added
+
+- **web:** Redesign project navigation
+- **web:** Simplify platform sidebar
+- **web:** Restore monitoring workspace
+- **web:** Prioritize AI activation in onboarding
+- **web:** Verify AI harness activation
+- **platform:** Expose feature maturity labels
+- **web:** Streamline AI harness onboarding
+- **web:** Add platform tool section icons
+- **web:** Redesign project list
+
+### Documentation
+
+- **readme:** Tag temps.sh links with UTM parameters ([#688](https://github.com/gotempsh/temps/issues/688))
+- **cli:** Sync analytics command references
+
+### Fixed
+
+- **deps:** Patch event-listener RustSec finding ([#97](https://github.com/gotempsh/temps/issues/97))
+- **environments:** Allow clearing node placement
+- **deployments:** Treat an empty target_nodes list as unconstrained
+- **security:** Close final placement and preview gaps
+- **providers:** Restore redis database allocation isolation ([#683](https://github.com/gotempsh/temps/issues/683))
+- **ai-gateway:** Allow re-enabling a disabled provider model via add ([#687](https://github.com/gotempsh/temps/issues/687))
+- **ci:** Keep tag releases from writing Actions caches ([#686](https://github.com/gotempsh/temps/issues/686))
+- **web:** Widen service creation layout
+- **web:** Clarify platform tools group label
+- **platform:** Address navigation redesign review blockers
+- **security:** Scope redesign resource access
+
+### Refactor
+
+- **web:** Replace monitoring page with proxy
+- **web:** Group platform navigation by intent
+- **web:** Promote git providers in navigation
+- **web:** Open monitoring on alerts
+- **web:** Separate AI harness onboarding
+- **web:** Move AI harness out of sidebar
+
+### Testing
+
+- **e2e:** Focus multinode scenario on worker deployment
+
+## [0.1.0-nightly.20260816.3bf831a1] - 2026-08-16
+
+### Added
+
+- **analytics:** Add generic API traffic drilldowns ([#669](https://github.com/gotempsh/temps/issues/669))
+- **otel:** Span attribute facets for fast filtering at scale
+- **otel:** Production-harden facet backfill + add TimescaleDB parity
+- **otel,cli:** Regenerate API clients for facet status/retry, add CLI retry
+- **proxy:** Add scoped API traffic drilldowns ([#675](https://github.com/gotempsh/temps/issues/675))
+
+### Documentation
+
+- **providers:** Describe structured MariaDB filters
+- **e2e:** Describe HA probe callers
+
+### Fixed
+
+- **otel:** Harden claimed project slug diagnostics ([#666](https://github.com/gotempsh/temps/issues/666))
+- **presets:** Upgrade Autopack Python source builds ([#667](https://github.com/gotempsh/temps/issues/667))
+- **projects:** Stop mislabeling git connection errors as project-not-found ([#668](https://github.com/gotempsh/temps/issues/668))
+- **web:** Chart deploy-marker overlap and Cmd+K palette drift ([#671](https://github.com/gotempsh/temps/issues/671))
+- **projects:** Scope env detection and improve repository connections ([#665](https://github.com/gotempsh/temps/issues/665))
+- **projects:** Harden shared git settings follow-up ([#673](https://github.com/gotempsh/temps/issues/673))
+- **analytics:** Cast ClickHouse traffic percentiles ([#672](https://github.com/gotempsh/temps/issues/672))
+- **security:** Harden critical trust boundaries
+- **security:** Bundle high severity hardening
+- **security:** Address integration review findings
+- **security:** Close residual tenant identity races
+- **security:** Centralize tenant hostname claims
+- **security:** Canonicalize tenant identity claims
+- **security:** Isolate proxy inspection quotas
+- **ci:** Align tests with security hardening
+- **security:** Close upgrade and placement bypasses
+- **security:** Validate upgrade recovery paths
+- **security:** Fail closed on invalid placement
+- **security:** Enforce constrained scheduling
+- **tests:** Use supported postgres images in upgrade guard
+- **tests:** Use an allowlisted postgres image that actually exists
+- **tests:** Use allowlisted postgres image for image-update tests
+- **providers:** Probe walg.env from the volume when no live container exists
+- **proxy:** Scope production-HTTPS default to resolved project traffic
+- **e2e:** Enroll multinode workers over https
+- **e2e:** Emit portable probe images
+- **e2e:** Use valid control-plane probe placement
+- **otel:** Address review findings on facet backfill hardening
+- **auth:** Block admin MFA enrollment during password login ([#678](https://github.com/gotempsh/temps/issues/678))
+- **deployments:** Enforce project access on cron reads ([#679](https://github.com/gotempsh/temps/issues/679))
+- **providers:** Constrain legacy managed service sweep ([#680](https://github.com/gotempsh/temps/issues/680))
+
+### Miscellaneous
+
+- **cli,web:** Regenerate API clients against the merged backend
+- **cli,web:** Regenerate API clients after second main merge
+
+### Performance
+
+- **ci:** Inherit trusted nextest target cache ([#674](https://github.com/gotempsh/temps/issues/674))
+
+### Styling
+
+- **providers:** Satisfy rustfmt on wal-probe test helper call
+- **proxy:** Satisfy rustfmt on new production-https tests
+
+### Testing
+
+- **providers:** Use managed postgres images
+- **e2e:** Expect cross-project DNS isolation
+
+## [0.1.0-nightly.20260815.a23a4903] - 2026-08-14
+
+### Added
+
+- **web:** Redesign project deployment actions ([#660](https://github.com/gotempsh/temps/issues/660))
+- **analytics:** Add AI-powered API traffic insights ([#661](https://github.com/gotempsh/temps/issues/661))
+- **cli:** Expose performance insights filters ([#662](https://github.com/gotempsh/temps/issues/662))
+
+### Fixed
+
+- **web:** Show branch selector on Connect repository page ([#657](https://github.com/gotempsh/temps/issues/657))
+- **analytics:** Preserve events backfill progress output ([#658](https://github.com/gotempsh/temps/issues/658))
+- **proxy:** Add per-project/environment concurrent-connection cap ([#655](https://github.com/gotempsh/temps/issues/655))
+- **git:** Share live preset/env-example/compose fetches across users ([#659](https://github.com/gotempsh/temps/issues/659))
+- **web:** Simplify project header links ([#663](https://github.com/gotempsh/temps/issues/663))
+- **otel:** Include project slug in auth warnings ([#664](https://github.com/gotempsh/temps/issues/664))
+
+## [0.1.0-nightly.20260814.af018b31] - 2026-08-13
+
+### Added
+
+- **web:** Surface cluster DNS toggle in Worker Nodes settings ([#647](https://github.com/gotempsh/temps/issues/647))
+- **cli:** Add metrics command to query OTel project metrics ([#649](https://github.com/gotempsh/temps/issues/649))
+- **web:** Add copy URL on project deployment information ([#651](https://github.com/gotempsh/temps/issues/651))
+- **proxy:** Add per-project latency percentiles and custom time ranges ([#652](https://github.com/gotempsh/temps/issues/652))
+- **deployments:** Send redacted failure trace to Temps, or open a GitHub issue ([#653](https://github.com/gotempsh/temps/issues/653))
+
+### Build
+
+- **deps:** Bump axum-test from 18.7.0 to 21.0.0 ([#614](https://github.com/gotempsh/temps/issues/614))
+- **deps:** Bump schemars from 0.8.22 to 1.2.1 ([#615](https://github.com/gotempsh/temps/issues/615))
+- **deps:** Bump totp-rs from 5.7.2 to 6.0.0 ([#607](https://github.com/gotempsh/temps/issues/607))
+- **deps:** Bump jsonwebtoken from 10.4.0 to 11.0.0 ([#608](https://github.com/gotempsh/temps/issues/608))
+
+### Fixed
+
+- **proxy:** Keep RouteTableListener alive in split-mode proxy ([#644](https://github.com/gotempsh/temps/issues/644))
+- **cli:** Watch the newly triggered deployment, not the previous one ([#637](https://github.com/gotempsh/temps/issues/637))
+- **deployments:** Reclaim Docker build cache and old deployment images ([#645](https://github.com/gotempsh/temps/issues/645))
+- **web:** Re-measure AI composer height once the dock's open transition settles ([#654](https://github.com/gotempsh/temps/issues/654))
+- **database:** Replace testcontainers flat-sleep with real postgres readiness wait ([#648](https://github.com/gotempsh/temps/issues/648))
+- **git:** Make git connections shared across all users ([#656](https://github.com/gotempsh/temps/issues/656))
+
+### Miscellaneous
+
+- **cli:** Bump @temps-sdk/cli to 0.1.33 ([#650](https://github.com/gotempsh/temps/issues/650))
+
+## [0.1.0-nightly.20260813.e22f5ddf] - 2026-08-12
+
+### Added
+
+- **proxy:** Configurable request timeouts (global ceiling + per-project override, SSE/WebSocket-aware) ([#642](https://github.com/gotempsh/temps/issues/642))
+
+## [0.1.0-nightly.20260812.86c4c52e] - 2026-08-12
+
+### Added
+
+- **deployments:** Make public readiness check configurable per project/environment
+- **cli:** Add public readiness timeout/disable flags to projects config
+- **skills:** Add Temps workflow router
+- **sandbox:** Sandbox snapshots — take/restore for Docker backend (ADR-037) ([#622](https://github.com/gotempsh/temps/issues/622))
+- **skills:** Add start-temps dev skill for local server bootstrap ([#634](https://github.com/gotempsh/temps/issues/634))
+- **ai:** Add subscription-backed agent CLI provider foundation
+- **ai:** Add provider-aware interactive chat controls
+
+### CI
+
+- **skills:** Secure Temps router
+
+### Fixed
+
+- **cli:** Require target context in write examples
+- **deployer:** Require published ports reachable before compose readiness
+- **cli:** Pass detected composePath through on drop deploys
+- **deployments:** Guard TempDirGuard against removing paths outside safe temp roots ([#633](https://github.com/gotempsh/temps/issues/633))
+- **web:** Match new-project repo picker to compact project-settings design
+- **skills:** Harden Temps router generation
+- **skills:** Contain capability detector reads
+- **skills:** Ignore blocking special files ([#638](https://github.com/gotempsh/temps/issues/638))
+- **ci:** Fix three unrelated main CI failures ([#632](https://github.com/gotempsh/temps/issues/632))
+- **status-page:** Don't collapse degraded monitors into project-down status ([#640](https://github.com/gotempsh/temps/issues/640))
+- **deployments:** Remove the always-broken public-readiness rollback gate ([#641](https://github.com/gotempsh/temps/issues/641))
+- **ai:** Harden AgentCliAiService against security review findings
+- **web:** Restore global AI chat access
+- **ai:** Stabilize cli provider chat
+- **ai:** Refresh chat model capabilities
+- **ai:** Make harness controls and tools reliable
+- **ai:** Render API timestamps as dates in answers
+- **ai:** Isolate subscription chat tool runtime
+- **ai:** Enforce provider runtime boundaries
+
+### Performance
+
+- **otel:** Fix unbounded ClickHouse scans ([#639](https://github.com/gotempsh/temps/issues/639))
+
+### Refactor
+
+- **ai:** Unify provider capabilities and turn runtime
+
+### Testing
+
+- **database:** Derive latest migration in round-trip test
+- **ai:** Add infrastructure prompt catalog
+
+## [0.1.0-nightly.20260812.73dbd99e] - 2026-08-12
+
+### Added
+
+- **external-plugins:** Add caller-scoped platform API
+- **compose:** Make Git deployments usable end to end ([#592](https://github.com/gotempsh/temps/issues/592))
+- **error-tracking:** Add same-origin Sentry tunnel for browser SDKs
+- **self-update:** Apply pending migrations before restarting ([#629](https://github.com/gotempsh/temps/issues/629))
+
+### Build
+
+- **deps:** Bump docker/setup-buildx-action from 3 to 4 ([#604](https://github.com/gotempsh/temps/issues/604))
+- **deps:** Bump nanoid from 3.3.18 to 6.0.1 in /web ([#601](https://github.com/gotempsh/temps/issues/601))
+- **deps:** Bump tower from 0.4.13 to 0.5.3 ([#611](https://github.com/gotempsh/temps/issues/611))
+- **deps:** Bump the web-minor-patch group across 1 directory with 12 updates
+- **deps:** Bump tokio-tungstenite from 0.29.0 to 0.30.0
+- **deps:** Bump the cargo-minor-patch group across 1 directory with 8 updates
+- **deps:** Bump actions/checkout from 5 to 7
+- **deps:** Bump pem from 3.0.6 to 4.0.0 ([#612](https://github.com/gotempsh/temps/issues/612))
+- **deps:** Bump tower-http from 0.6.11 to 0.7.0 ([#613](https://github.com/gotempsh/temps/issues/613))
+- **deps:** Bump octocrab from 0.49.9 to 0.54.1 ([#610](https://github.com/gotempsh/temps/issues/610))
+- **deps:** Bump framer-motion from 12.43.0 to 13.0.0 in /web
+
+### Documentation
+
+- **cli:** Restructure skill references
+- **cli:** Use pinned zero-install commands
+
+### Fixed
+
+- **web:** Redirect to login on expired session instead of hanging on stale screen
+- **error-tracking:** Stop leaking DB error detail on tunnel path, fix wildcard route resolution
+- **proxy:** Canonicalize Google and Bing crawler names ([#625](https://github.com/gotempsh/temps/issues/625))
+- **proxy:** Stop leaking raw HTML under a text/markdown Content-Type ([#626](https://github.com/gotempsh/temps/issues/626))
+- **domains:** Persist request_challenge renewal failures, add attempt history
+- **deployments:** Clean up leaked /tmp/temps-deployments dirs on download failure ([#630](https://github.com/gotempsh/temps/issues/630))
+- **cli:** Generate complete Node-compatible command docs
+- **ci:** Pin readiness probes to local proxy
+- **deployments:** Probe HTTPS routes via local HTTP listener
+
+### Miscellaneous
+
+- **sdk:** Regenerate CLI and web SDKs after merging main
+- **cli:** Release v0.1.31
+- **web:** Remove framer-motion dependency
+
+### Testing
+
+- **e2e:** Verify internal application and database DNS ([#619](https://github.com/gotempsh/temps/issues/619))
+- Align GitHub and migration expectations
+- **e2e:** Wait for deployment completion
+
+## [0.1.0-nightly.20260811.7f6037c7] - 2026-08-10
+
+### Added
+
+- **ai-agents:** Classify plain Googlebot as Google/Mixed
+- **cli:** Add otel-forward commands for OTLP relay destinations ([#591](https://github.com/gotempsh/temps/issues/591))
+
+### Documentation
+
+- **security:** Design PostgreSQL datasource TLS trust ([#337](https://github.com/gotempsh/temps/issues/337))
+
+### Fixed
+
+- **ai-agents:** Add ClickHouse backfill counterpart, closes coverage gap
+- **cli:** Align apikeys create role vocabulary with backend Role enum ([#616](https://github.com/gotempsh/temps/issues/616))
+- **analytics:** Show real duration on bounce/exit pageviews instead of blank ([#618](https://github.com/gotempsh/temps/issues/618))
+
+### Testing
+
+- **e2e:** Close remaining scenario gaps (mariadb restore, env vars, api keys) ([#599](https://github.com/gotempsh/temps/issues/599))
+- **e2e:** Add multinode mTLS coverage and scenario CI ([#617](https://github.com/gotempsh/temps/issues/617))
+
+## [0.1.0-nightly.20260810.ccf9c612] - 2026-08-10
+
+### Added
+
+- **e2e:** Otel-quota-scenario + fix silently-inert OTel storage quota ([#586](https://github.com/gotempsh/temps/issues/586))
+- **providers:** MongoDB restore_in_place, restore_to_new_service, restore_capabilities ([#596](https://github.com/gotempsh/temps/issues/596))
+- **redis:** Implement restore_capabilities, restore_in_place, restore_to_new_service ([#597](https://github.com/gotempsh/temps/issues/597))
+- **restore:** S3/MinIO managed-service restore_in_place ([#595](https://github.com/gotempsh/temps/issues/595))
+
+### Fixed
+
+- Correct dual-license metadata and stale redirect status doc ([#598](https://github.com/gotempsh/temps/issues/598))
+
+### Testing
+
+- **e2e:** Add pitr-scenario for point-in-time postgres recovery ([#585](https://github.com/gotempsh/temps/issues/585))
+- **e2e:** Deploy-lifecycle-scenario (rollback/pause/resume/promote) + fix 3 real bugs ([#587](https://github.com/gotempsh/temps/issues/587))
+- **e2e:** Add db-ha-failover-scenario for Postgres HA/pg_auto_failover ([#588](https://github.com/gotempsh/temps/issues/588))
+- **e2e:** Add pg-upgrade-scenario for Postgres major-version upgrades ([#593](https://github.com/gotempsh/temps/issues/593))
+
+## [0.1.0-nightly.20260809.a6a711b9] - 2026-08-08
+
+### Added
+
+- **projects:** Mark environment variables as secrets at project creation
+- **otel:** Add OtelRelay extension point for telemetry forwarding plugins ([#583](https://github.com/gotempsh/temps/issues/583))
+- **teams:** Add ProjectAccessChecker::invalidate_permissions_cache ([#589](https://github.com/gotempsh/temps/issues/589))
+
+### Fixed
+
+- **security:** Harden postgres credential transport
+- **security:** Enforce private postgres consumers
+
+### Styling
+
+- **web:** Drop incidental prettier reformatting from the env-var change
+
+### Testing
+
+- **e2e:** DNS/TLS/email/CLI + observability/data-storage e2e coverage ([#582](https://github.com/gotempsh/temps/issues/582))
+
+## [0.1.0-nightly.20260808.e02f5881] - 2026-08-07
+
+### Added
+
+- **sandbox:** Add persistent workspace sandboxes with wake-on-access
+- **cli:** Resolve workspace source from project, repo, or local checkout
+- **sandbox:** Add interactive terminal and `sandbox shell`
+- **web:** Regenerate the SDK and surface workspaces in the console
+- **deployer:** Satisfy compose env_file references automatically
+
+### Build
+
+- **cli:** Add spec:update to refresh openapi.json canonically
+
+### CI
+
+- **cli:** Enforce canonical openapi.json in a hook and in CI
+- **sandbox:** Install protoc in the beta image prepare job
+
+### Documentation
+
+- **adr:** Add ADR-036 for persistent workspace sandboxes
+
+### Fixed
+
+- **settings:** Close the review findings on console updates
+- **auth:** Only require step-up from users who have enrolled MFA
+- **sandbox:** Restore terminal echo, work dir, and CLI response shapes
+- **sandbox:** Address review findings on the terminal and step-up policy
+- **sandbox:** Address review findings on workspaces and the terminal
+- **sandbox:** Normalise the PTY from the host so terminals echo on any image
+- **web:** Raise the js-yaml override past the advisory, and make detach honest
+- **sandbox:** Repair compound --cmd, bound agent writes, surface oversized input
+- **projects:** Normalize blank directory on settings and git updates
+- **web:** Detect presets and prefill the URL on the public-repo path
+- **auth:** Audit permission denials safely
+- **auth:** Bound permission denial audit storage
+- **security:** Bound query memory and audit data
+- **security:** Reject oversized rows before encoding
+- **security:** Redact audited data identifiers
+- **cli:** Sanitize untrusted terminal output
+- **cli:** Sanitize invalid filter errors
+- **security:** Resolve PR review findings
+- **security:** Enforce pre-wire Redis budgets
+- **redis:** Bound aggregate admission work
+- **security:** Close final review gaps
+- **security:** Bound metadata scan work
+- **redis:** Preserve bounded cursor paging
+- **review:** Close final compatibility gap
+
+### Miscellaneous
+
+- **cli:** Regenerate openapi spec and client
+- **sdk:** Release analytics-core v0.0.3, react-analytics v0.0.5, analytics-browser v0.0.3, svelte-analytics v0.0.2, vue-analytics v0.0.2 ([#575](https://github.com/gotempsh/temps/issues/575))
+- **cli:** Release v0.1.30, release node-sdk v0.0.7 ([#574](https://github.com/gotempsh/temps/issues/574))
+
+### Styling
+
+- **cli:** Canonicalize openapi.json key order and formatting
+
+### Testing
+
+- **e2e:** Make console/CLI e2e suite parallel-safe, add API-key coverage
+
+## [0.1.0-nightly.20260807.146be0c2] - 2026-08-06
+
+### Added
+
+- **analytics:** Crawler opt-in for breakdowns, and prune NULL keys early
+- **settings:** Apply releases and restart from the console
+- **settings:** Version page, release channels, and install without a restart
+- **providers:** Read-only GET rows endpoint and per-service AI data access opt-in
+- **cli:** Add 'temps data' for read-only browsing of service data
+- **query-postgres,web:** Show views, list-level stats, and per-engine labels
+- **web:** Independent tree scroll, column selection, and row detail panel
+- **web:** Container overview, sidebar sizes, per-tab scroll, and S3 fixes
+- **otel:** Rank operations by latency, volume, and variability
+- **cli:** Add `traces span-stats` for operation latency
+- **web:** Add an Operations view to Traces
+
+### Documentation
+
+- **analytics:** Declare include_crawlers on the timeline endpoint
+- Require features to be discoverable and onboard when unconfigured
+- **cli:** Document the data command group
+- **skills:** Document the data command group in the temps-cli skill
+
+### Fixed
+
+- **analytics:** Classify self-referrals as Direct, not Referral
+- **analytics:** Exclude crawler traffic from breakdowns and top pages
+- **cli:** Make analytics overview locations and sparkline respect --period
+- **analytics:** Populate visitor language instead of always "Unknown"
+- **analytics:** Send language from the shared browser SDK core too
+- **analytics:** Close review findings on attribution, language and CH parity
+- **cli:** Reject release tags that escape the temps repository
+- **web:** Restore deep paths on reload and compact the data browser
+- **providers:** Clamp row limit for every caller and cover the AI gate with tests
+- **web:** Drop a sort field the current table does not have
+- **query-postgres,web:** Count views in entity_count, inline the entity breadcrumb
+- **security:** Close connection-string injection, SQL denylist bypass, and markdown exfiltration
+- **security:** Share one SQL validator, close MariaDB bypasses and a remote panic
+- **security:** Close the nine findings from the data-browser audit
+- **security:** Close the review findings, and make the TLS ladder actually work
+- **security:** Close the re-audit findings, including a UNION injection I added
+- **web:** Give sole create actions an N shortcut and guard it behind overlays
+- **web:** Rank palette results by relevance, add Teams, resizable data-browser tree
+- **web:** Show unified-trace projects as a colour legend, not a slug per span
+- **web:** Make Back work on deep-linked pages
+- **web:** Address self-review findings on the shortcut hook and project dot
+- **web:** Order sibling spans correctly and show exact durations
+- **config,proxy:** Stop settings writes from wiping the admin gate
+- **proxy:** Close fail-open paths in the admin gate reload
+- **ci:** Unbreak the two checks that are red on every PR
+- **otel:** Bound span-stats project count and time window
+
+### Miscellaneous
+
+- Use neutral placeholder names in examples and comments
+- **scripts:** Seed OTel traces across projects and services
+- **scripts:** Replay a captured trace into a local instance
+
+### Performance
+
+- **query-postgres:** Use planner stats for row count, and report table size
+- **query:** Avoid full scans for MariaDB row counts, add MongoDB size
+
+### Revert
+
+- **web:** Drop the data-browser tree navigateTo routing
+
+## [0.1.0-nightly.20260806.c64e8f98] - 2026-08-06
+
+### Added
+
+- **console:** Improve user and project onboarding ([#552](https://github.com/gotempsh/temps/issues/552))
+- **flags:** Multi-language integration guide, and shiki-highlighted code blocks ([#556](https://github.com/gotempsh/temps/issues/556))
+- **env-vars:** Convert an existing variable to a write-only secret ([#555](https://github.com/gotempsh/temps/issues/555))
+- **dns:** Govern unattended provider automation ([#554](https://github.com/gotempsh/temps/issues/554))
+
+### Fixed
+
+- **git:** Stop invisible connections from blocking provider deletion ([#553](https://github.com/gotempsh/temps/issues/553))
+- **telemetry:** Report git-describe version, not static Cargo.toml version ([#558](https://github.com/gotempsh/temps/issues/558))
+- **sandbox:** Free volumes and work dirs when a sandbox is destroyed ([#523](https://github.com/gotempsh/temps/issues/523))
+
+## [0.1.0-nightly.20260805.c6bd08de] - 2026-08-04
+
+### Added
+
+- **presets:** Replace the nixpacks build engine with autopack ([#530](https://github.com/gotempsh/temps/issues/530))
+- **auth:** Add step-up verification for sensitive actions ([#547](https://github.com/gotempsh/temps/issues/547))
+- **flags:** Feature flags Phase 1 — backend, CLI, SDK and console UI ([#526](https://github.com/gotempsh/temps/issues/526))
+- **ai:** Let the assistant propose metric alert rules from a project's own telemetry ([#521](https://github.com/gotempsh/temps/issues/521))
+- **teams:** Teams and project-scoped RBAC in OSS ([#486](https://github.com/gotempsh/temps/issues/486))
+- **drop:** Deploy uploaded source archives ([#549](https://github.com/gotempsh/temps/issues/549))
+
+### Fixed
+
+- **proxy:** Keep backend latency for streaming sessions ([#545](https://github.com/gotempsh/temps/issues/545))
+- **web:** Advance traces time window on refresh and skip it for trace-id search ([#550](https://github.com/gotempsh/temps/issues/550))
+- **deps:** Patch aiohttp and cryptography Dependabot advisories ([#551](https://github.com/gotempsh/temps/issues/551))
+- **otel:** Bound ingest memory under exporter bursts ([#544](https://github.com/gotempsh/temps/issues/544))
+
+## [0.1.0-nightly.20260804.c51ac6c2] - 2026-08-03
+
+### Added
+
+- **providers:** Reset pg_stat_statements statistics ([#527](https://github.com/gotempsh/temps/issues/527))
+- **sandbox:** Mint shareable preview links with expiring session grants ([#525](https://github.com/gotempsh/temps/issues/525))
+- **telemetry:** Add deployment failure taxonomy and template context ([#546](https://github.com/gotempsh/temps/issues/546))
+
+### Fixed
+
+- **web:** Stop env var edit modal showing blank value after save ([#524](https://github.com/gotempsh/temps/issues/524))
+- **web:** Add icons and prioritize projects in command search
+- **deps:** Bump brace-expansion override to ^5.0.9 for GHSA-rgw5-rvv9-x895 ([#548](https://github.com/gotempsh/temps/issues/548))
+
+### Miscellaneous
+
+- **deps-dev:** Bump @types/react-dom in /web in the react group ([#528](https://github.com/gotempsh/temps/issues/528))
+
+### Refactor
+
+- **web:** Move project setup into project sidebar ([#541](https://github.com/gotempsh/temps/issues/541))
+
+## [0.1.0-nightly.20260803.ae960395] - 2026-08-02
+
+### Added
+
+- **providers:** Warn when a cluster has no node accepting writes
+- **audit:** Support events whose actor has no resolvable account ([#411](https://github.com/gotempsh/temps/issues/411))
+- **audit:** Record failed logins and rejected MFA codes ([#412](https://github.com/gotempsh/temps/issues/412))
+- **environments:** Per-environment HTTP→HTTPS redirect override, with an unconditional ACME bypass ([#522](https://github.com/gotempsh/temps/issues/522))
+- **security:** Block cloud-metadata egress from app containers
+
+### CI
+
+- Fix the cache-budget leak that makes Compose Security take 92 minutes ([#516](https://github.com/gotempsh/temps/issues/516))
+
+### Fixed
+
+- **providers:** Make cluster creation survive bad placement and stay retryable
+- **deployments:** Write the clone failure into the deploy log
+- **projects:** Reject repo changes that would strand the clone URL
+- **web:** Stop claiming a project deployed when its only run failed
+- **providers:** Treat unreachable cluster nodes as leaderless
+- **proxy:** Exclude streaming sessions from latency metrics ([#514](https://github.com/gotempsh/temps/issues/514))
+- **domains:** Validate custom-domain input and scope it to the caller's project ([#515](https://github.com/gotempsh/temps/issues/515))
+- **cli:** Repo lookup by search, nested group paths, and --secret for env vars ([#517](https://github.com/gotempsh/temps/issues/517))
+- **core:** Make Visit links reachable on sslip.io installs ([#488](https://github.com/gotempsh/temps/issues/488))
+- **web:** Show a back button in the collapsed sidebar's sub-navigation ([#520](https://github.com/gotempsh/temps/issues/520))
+- **git:** Keep clone credentials out of errors
+- **auth:** Remove code-execution permissions from PlatformAdmin
+- **auth:** Close platform admin sandbox creation gap
+- **web:** Make the AI chat page fill the content area exactly ([#518](https://github.com/gotempsh/temps/issues/518))
+- **providers:** Persist inferred parameters on the plugin init path
+- **providers:** Check loopback when picking host ports, and report real service health
+- **providers:** Route MariaDB port selection through the shared finder
+- **providers:** Persist cluster topology atomically
+- **email:** Close SSRF hole and DNS-rebinding gap in SMTP deliverability probe
+- **email:** Complete SMTP SSRF hardening
+- **email:** Keep validation configuration database-ready
+- **email:** Close remaining SMTP proxy SSRF gaps
+- **security:** Make metadata egress blocking atomic
+
+### Testing
+
+- **web:** Verify project deployment labels
+
+## [0.1.0-nightly.20260802.ba96c0f7] - 2026-08-02
+
+### Added
+
+- **deployer:** Attach app containers to required extra Docker networks ([#501](https://github.com/gotempsh/temps/issues/501))
+- **deployments:** Support worker nodes of a different architecture
+- **deployments:** Make cross-architecture builds opt-in
+- **deployments:** Report skipped nodes and refuse impossible replica counts
+- **projects:** Expose cross-architecture builds in the deployment config API
+
+### Documentation
+
+- **multi-node:** Document opt-in cross-builds and replica shortfall
+- **multi-node:** Correct the config key and regenerate the SDK
+
+### Fixed
+
+- **web:** Align react with react-dom at 19.2.8 and guard against future drift ([#505](https://github.com/gotempsh/temps/issues/505))
+- **deployments:** Reject cross-builds the legacy Docker builder mislabels
+- **deployments:** Never record a guessed node architecture
+- **deployments:** Close two paths that still trusted a guessed platform
+- **deployments:** Bound cross-build targets and record per-replica images
+- **deployments:** Act only on a confirmed control-plane platform
+- **deployments:** Discover the daemon platform on paths that never build
+- **deployer:** Keep the ARM variant through discovery and verification
+- **deployments:** Degrade instead of failing the cluster's builds
+- **deployments:** Check replica shortfall before the local-only fallback
+- **deployments:** Record the peer address on architecture-change audits
+- **deployments:** Clean up containers before owner deletion
+- **deployments:** Remove unsafe cross-instance orphan sweep
+- **providers:** Derive managed service container names in one place ([#503](https://github.com/gotempsh/temps/issues/503))
+
+### Testing
+
+- **web:** Add console end-to-end UI tests, and fix the post-login 404 they found ([#511](https://github.com/gotempsh/temps/issues/511))
+
+## [0.1.0-nightly.20260801.324ad120] - 2026-08-01
+
+### CI
+
+- Run temps-otel and four other crates' integration tests
+
+### Documentation
+
+- **contributing:** Specify temps binary for running server
+
+### Fixed
+
+- **auth:** Gate user administration on a dedicated users:manage permission
+- **auth:** Restrict audit:read to administration roles
+- **web:** Gate audit-log UI to roles with audit:read
+- **web:** Import Navigate from react-router, not react-router-dom
+- **otel:** Restore exact span dedup after dropping FINAL
+- **sdk:** Regenerate clients for the include_total contract
+- **imports:** Make repository link optional, add Portainer TLS skip
+- **cli:** Environments resources ignored -p, always resolving "Project not found"
+- **providers:** Enforce project scoping for session/API-key/CLI callers
+- **import:** Deploy docker-source imports for real instead of leaving them pending
+- **domains:** Reserve the console hostname from project domains
+- **kv,blob:** Confine data-plane access to the caller's projects
+- **auth:** Select jsonwebtoken crypto provider ([#497](https://github.com/gotempsh/temps/issues/497))
+
+### Performance
+
+- **otel:** Make trace-summaries scale with the query window
+
+### Styling
+
+- **kv,blob:** Apply rustfmt
+
+### Testing
+
+- **audit:** Add authorization tests for audit-log endpoints
+- **auth:** Relocate audit:read matrix test to avoid overlap with #350
+
+## [0.1.0-nightly.20260731.42fe6068] - 2026-07-30
+
+### Fixed
+
+- **ci:** Pin privileged workflow actions ([#473](https://github.com/gotempsh/temps/issues/473))
+- **auth:** Enforce privilege ceiling on key rotation ([#472](https://github.com/gotempsh/temps/issues/472))
+- **security:** Audit explicit credential reveals ([#459](https://github.com/gotempsh/temps/issues/459))
+- **providers:** Sort slow queries server-side instead of client-side ([#480](https://github.com/gotempsh/temps/issues/480))
+- **projects:** Resolve nixpacks variants to base nixpacks preset
+- **presets:** Generalize nixpacks provider selection
+- **web:** Align preset config request types
+- **deployments:** Persist terminal status for jobs that never run
+- **screenshots:** Redact credentials from remote provider health-check errors
+- **core:** Cancel jobs left pending when a workflow aborts mid-batch
+
+### Miscellaneous
+
+- **web:** Regenerate Nixpacks preset types
+
+### Testing
+
+- **presets:** Remove ineffective struct update
+
+## [0.1.0-nightly.20260730.e145a940] - 2026-07-30
+
+### Fixed
+
+- **release:** Install protoc for sandbox helpers ([#479](https://github.com/gotempsh/temps/issues/479))
+
+## [0.1.0-nightly.20260730.ed853d3a] - 2026-07-30
+
+### Fixed
+
+- **release:** Use git cli for dependencies ([#476](https://github.com/gotempsh/temps/issues/476))
+
+## [0.1.0-nightly.20260729.347ef444] - 2026-07-29
+
+### Fixed
+
+- **release:** Identify repository for nightly dispatch ([#475](https://github.com/gotempsh/temps/issues/475))
+
+## [0.1.0-nightly.20260729.bd382d68] - 2026-07-29
+
+### Added
+
+- **skills:** Add temps-best-practices skill ([#453](https://github.com/gotempsh/temps/issues/453))
+- **providers:** Pg_stat_statements slow-query monitoring + service log filtering ([#460](https://github.com/gotempsh/temps/issues/460))
+
+### Documentation
+
+- **skills:** Add runtime and telemetry guardrails ([#469](https://github.com/gotempsh/temps/issues/469))
+
+### Fixed
+
+- **otel:** Warn AI chat that only duration_ms is milliseconds, not raw attributes ([#461](https://github.com/gotempsh/temps/issues/461))
+- **skills:** Harden skill security and add full audit gate ([#462](https://github.com/gotempsh/temps/issues/462))
+- **web:** Duplicate day-label tooltip + cli: --connection flag for projects git ([#456](https://github.com/gotempsh/temps/issues/456))
+- **deployments:** Scope job metadata to projects ([#465](https://github.com/gotempsh/temps/issues/465))
+- **web:** Portal DropdownMenuSubContent to escape clipped parent ([#467](https://github.com/gotempsh/temps/issues/467))
+- **release:** Dispatch builds for nightly tags ([#470](https://github.com/gotempsh/temps/issues/470))
+- **release:** Recover failed nightly dispatches ([#471](https://github.com/gotempsh/temps/issues/471))
+
+### Performance
+
+- **build:** Isolate BuildKit cache mounts ([#463](https://github.com/gotempsh/temps/issues/463))
+
+## [0.1.0-nightly.20260729.419505e0] - 2026-07-28
+
+### Added
+
+- **monitoring:** Metric alerts as config-as-code in .temps.yaml ([#454](https://github.com/gotempsh/temps/issues/454))
+- **cli:** Add `temps projects secrets` subcommand ([#458](https://github.com/gotempsh/temps/issues/458))
+
+### Documentation
+
+- **readme:** Move why-statement above the fold, add stop-paying banner ([#457](https://github.com/gotempsh/temps/issues/457))
+
+### Fixed
+
+- **cli:** Add per-command --context flag to avoid silent wrong-server runs ([#455](https://github.com/gotempsh/temps/issues/455))
+
+## [0.1.0-nightly.20260727.32b7f235] - 2026-07-27
+
+### Added
+
+- **agents:** Configurable AI autofix runs with per-provider turn limits ([#435](https://github.com/gotempsh/temps/issues/435))
+- **email:** Choose provider type on a dedicated page before configuring ([#438](https://github.com/gotempsh/temps/issues/438))
+- **web:** Onboard users into AI autofix from error tracking ([#439](https://github.com/gotempsh/temps/issues/439))
+- **sandbox:** Track agent-run sandboxes as first-class sandbox items ([#436](https://github.com/gotempsh/temps/issues/436))
+- **import:** Kubernetes, Coolify, Dokploy, CapRover, Portainer, and Kamal importers with deploy-and-verify ([#441](https://github.com/gotempsh/temps/issues/441))
+
+### CI
+
+- **release:** Add nightly build workflow ([#452](https://github.com/gotempsh/temps/issues/452))
+
+### Documentation
+
+- README overhaul, unified project creation, provider brand logos ([#446](https://github.com/gotempsh/temps/issues/446))
+
+### Fixed
+
+- **web:** Stop analytics/errors setup-redirect from breaking project tour ([#434](https://github.com/gotempsh/temps/issues/434))
+- **agents:** Stop dumping raw CLI JSONL as autofix error messages ([#437](https://github.com/gotempsh/temps/issues/437))
+- **web:** Clear all high-severity bun audit advisories ([#443](https://github.com/gotempsh/temps/issues/443))
+- **deps:** Patch Dependabot advisories in next, setuptools and serde_with ([#442](https://github.com/gotempsh/temps/issues/442))
+- **import:** Trim session credential lifetime + drop stale web cast ([#448](https://github.com/gotempsh/temps/issues/448))
+- **monitoring:** Close race that fires false ContainerCrash alerts on deploy ([#451](https://github.com/gotempsh/temps/issues/451))
+
+### Performance
+
+- **observe:** Stop proxy-log and span listings scanning the whole retention window ([#447](https://github.com/gotempsh/temps/issues/447))
+
+## [0.1.0-beta.54] - 2026-07-24
+
+### Added
+
+- **otel:** Store cross-project trace refs in ClickHouse when enabled ([#429](https://github.com/gotempsh/temps/issues/429))
+
+### Fixed
+
+- **web:** Bump rrweb-player to 2.1.1 (broken 2.1.0 dist → blank replays) ([#430](https://github.com/gotempsh/temps/issues/430))
+
+## [0.1.0-beta.53] - 2026-07-23
+
+### Added
+
+- **error-tracking:** Source context for native stack traces (Go/Rust/all languages) ([#419](https://github.com/gotempsh/temps/issues/419))
+- **web:** Add project onboarding tour
+- **web:** Add subtle "Take a tour" relaunch on project overview
+- **error-tracking:** Default source capture to the Docker build context + configurable root ([#423](https://github.com/gotempsh/temps/issues/423))
+
+### Fixed
+
+- **web:** Ignore spurious empty-string onValueChange from Radix Select ([#424](https://github.com/gotempsh/temps/issues/424))
+- **deployments:** Stop infinite reconnect loop on container logs ([#425](https://github.com/gotempsh/temps/issues/425))
+- **observability:** Read Observe feed through ClickHouse-aware storage backends ([#426](https://github.com/gotempsh/temps/issues/426))
+
+### Miscellaneous
+
+- **templates:** Update observability-starter entry for Cadence demo
+
+## [0.1.0-beta.52] - 2026-07-22
+
+### Added
+
+- **containers:** Show metrics history in container detail ([#415](https://github.com/gotempsh/temps/issues/415))
+- **config:** Expose sandbox backend selection in settings API and UI ([#414](https://github.com/gotempsh/temps/issues/414))
+
+### Fixed
+
+- **web:** Override brace-expansion and js-yaml to patched versions ([#409](https://github.com/gotempsh/temps/issues/409))
+- **observability:** Prevent ClickHouse Array(Nothing) decode failures ([#408](https://github.com/gotempsh/temps/issues/408))
+- **clickhouse:** Align query result integer types ([#416](https://github.com/gotempsh/temps/issues/416))
+
+## [0.1.0-beta.51] - 2026-07-21
+
+### Added
+
+- **deployments:** Preview commits before deployment ([#379](https://github.com/gotempsh/temps/issues/379))
+- **email:** Dedup shared email UI helpers, working event filters, per-domain delivery stats ([#307](https://github.com/gotempsh/temps/issues/307))
+- **deployments:** Preview tag commits before deployment ([#383](https://github.com/gotempsh/temps/issues/383))
+- **email:** Add provider detail page with domains and delivery tracking setup ([#382](https://github.com/gotempsh/temps/issues/382))
+- **telemetry:** Add deploy_cancelled event ([#385](https://github.com/gotempsh/temps/issues/385))
+- **web:** Add metrics storage backend selector to monitoring settings ([#399](https://github.com/gotempsh/temps/issues/399))
+- **sandbox:** Firecracker microVM backend alongside Docker (ADR-029)
+
+### Fixed
+
+- **cli:** Type email command output and sanitize rendered bodies ([#306](https://github.com/gotempsh/temps/issues/306))
+- **email:** Secure SES SNS event processing with one-click tracking setup ([#297](https://github.com/gotempsh/temps/issues/297))
+- **email:** Stop leaking suppressed recipient addresses via logs/error_message ([#380](https://github.com/gotempsh/temps/issues/380))
+- **web:** Make DNS records table horizontally scroll on mobile ([#381](https://github.com/gotempsh/temps/issues/381))
+- **email:** Correct SES IAM action namespace from sesv2: to ses: ([#384](https://github.com/gotempsh/temps/issues/384))
+- **analytics:** Derive bounce/entry/exit from session pageviews at query time ([#398](https://github.com/gotempsh/temps/issues/398))
+- **sandbox:** Address PR #400 review — CI, OpenAPI/SDK, guard, security
+- **sandbox:** Satisfy clippy + vercel-compat guardrail (PR #400 CI)
+- **cli:** Update sandbox_url tests to canonical plural route
+- **proxy:** Resolve request-log detail by request_id across storage backends ([#402](https://github.com/gotempsh/temps/issues/402))
+- **audit:** Keep audit history when a user account is deleted ([#386](https://github.com/gotempsh/temps/issues/386))
+
+### Miscellaneous
+
+- **auth:** Remove magic-link login ([#375](https://github.com/gotempsh/temps/issues/375))
+
+## [0.1.0-beta.50] - 2026-07-17
+
+### Added
+
+- **backup:** Dump only critical table data in control-plane backups ([#367](https://github.com/gotempsh/temps/issues/367))
+- **proxy:** Trust CF-Connecting-IP from verified Cloudflare egress ranges ([#368](https://github.com/gotempsh/temps/issues/368))
+- **monitoring:** Track container CPU/memory for external services ([#371](https://github.com/gotempsh/temps/issues/371))
+- **observability:** Compress immutable telemetry after 24h ([#370](https://github.com/gotempsh/temps/issues/370))
+- **telemetry:** Aggregated anonymous error_summary event ([#373](https://github.com/gotempsh/temps/issues/373))
+- **telemetry-api:** Accept error_summary event ([#374](https://github.com/gotempsh/temps/issues/374))
+- **auth:** Let deployment tokens call the AI gateway (ai_gateway:execute) ([#377](https://github.com/gotempsh/temps/issues/377))
+
+### CI
+
+- **compose-security:** Cache Docker toolchain layers and prebuild with fast profile ([#362](https://github.com/gotempsh/temps/issues/362))
+
+### Documentation
+
+- **skill:** Add remote-over-SSH install method to temps-platform-setup ([#366](https://github.com/gotempsh/temps/issues/366))
+
+### Fixed
+
+- **core:** Resolve request IP trust-awarely for audit/logging ([#363](https://github.com/gotempsh/temps/issues/363))
+- **skill:** Remove piped shell install and explicit credential paths from docs ([#365](https://github.com/gotempsh/temps/issues/365))
+- **deployments:** Emit deploy_succeeded telemetry on the real success path ([#372](https://github.com/gotempsh/temps/issues/372))
+- **webhooks:** Pin delivery to validated IP to close DNS-rebinding SSRF ([#332](https://github.com/gotempsh/temps/issues/332))
+- **observability:** Read active Timescale policies ([#378](https://github.com/gotempsh/temps/issues/378))
+
+## [0.1.0-beta.49] - 2026-07-16
+
+### Added
+
+- **analytics:** Add insights panel with stat and AI insights
+- **analytics:** Put insights behind a compact toggle button
+- **ai-chat:** Default-on read-only chat; route analytics AI insights through project chat
+- **analytics:** Add raw event entries drill-down with JSON props view ([#359](https://github.com/gotempsh/temps/issues/359))
+- **settings:** Show web-console banner when a newer release is available ([#353](https://github.com/gotempsh/temps/issues/353))
+
+### Fixed
+
+- **analytics:** Harden AI insights prompt + warn on partial AI disable
+- **proxy:** Harden preview cookie session handling ([#361](https://github.com/gotempsh/temps/issues/361))
+
+### Miscellaneous
+
+- **web:** Replace rocketship logo assets with the t brand mark ([#358](https://github.com/gotempsh/temps/issues/358))
+
+### Performance
+
+- **metrics:** Time-bound external-service latest-metric queries ([#364](https://github.com/gotempsh/temps/issues/364))
+
+## [0.1.0-beta.48] - 2026-07-15
+
+### Added
+
+- **skills:** Add estimate-temps-savings skill ([#357](https://github.com/gotempsh/temps/issues/357))
+
+### Fixed
+
+- **backup:** Stop stranding failed uploads that block retention cleanup ([#356](https://github.com/gotempsh/temps/issues/356))
+
+### Miscellaneous
+
+- **mcp:** Remove @temps-sdk/mcp package ([#355](https://github.com/gotempsh/temps/issues/355)) [**BREAKING**]
+
+## [0.1.0-beta.47] - 2026-07-15
+
+### Added
+
+- **error-tracking:** Deep-link error alert emails, verify Slack stays HTML-free ([#308](https://github.com/gotempsh/temps/issues/308))
+- **analytics:** Add daily returning visitor metric ([#346](https://github.com/gotempsh/temps/issues/346))
+- **backups:** Add retention cleanup and manual deletion ([#336](https://github.com/gotempsh/temps/issues/336))
+- **monitoring:** Monitor all mounted disks for disk-space alerts ([#349](https://github.com/gotempsh/temps/issues/349))
+- **settings:** Add flat public hostname strategy ([#146](https://github.com/gotempsh/temps/issues/146))
+
+### CI
+
+- Remove dependabot auto-merge workflow ([#345](https://github.com/gotempsh/temps/issues/345))
+
+### Fixed
+
+- **metrics:** Don't UNION checkpoint queries across pg_stat_checkpointer/bgwriter ([#290](https://github.com/gotempsh/temps/issues/290))
+- **metrics:** Use mongodb's re-exported bson instead of a standalone dep ([#291](https://github.com/gotempsh/temps/issues/291))
+- **migrations:** Skip empty visitor deduplication rewrites ([#294](https://github.com/gotempsh/temps/issues/294))
+- **deployer:** Harden compose deployments
+- **deployer:** Close compose security policy bypasses from review
+- **deployer:** Reject interpolation bypass and confine compose paths
+- **deployer:** Prevent compose conflict container deletion
+- **deployer:** Fold inline compose override allow-list into host-escape hardening
+- **deployer:** Close compose host-escape bypasses found in review
+- **core:** Update node pki for rcgen 0.14
+- **deps:** Resolve RustSec advisory updates
+- **proxy:** Update test cert generation for rcgen 0.14
+- **deployer:** Close volumes_from and absolute bind-mount host-escape bypasses
+- **deployer:** Close remaining compose host-escape gaps from review
+- **deployer:** Close compose symlink escape paths
+- **deployments:** Cap hosted website memory by default ([#164](https://github.com/gotempsh/temps/issues/164))
+- **deps:** Unbreak build — pin aws-smithy (schema 0.1.0) and revert sqlx to 0.8 ([#333](https://github.com/gotempsh/temps/issues/333))
+- **auth:** Prevent MFA challenge session from authenticating real requests ([#326](https://github.com/gotempsh/temps/issues/326))
+- **web:** Satisfy ESLint 10 assignment rules
+- **git:** Constant-time comparison for GitHub webhook HMAC signatures ([#334](https://github.com/gotempsh/temps/issues/334))
+- **auth:** Close assign_role privilege-escalation (admin gate + single target) ([#324](https://github.com/gotempsh/temps/issues/324))
+- **webhooks:** Close retry_delivery cross-tenant IDOR ([#329](https://github.com/gotempsh/temps/issues/329))
+- **otel:** Make otel_spans compression effective by dropping trace_id from segmentby ([#348](https://github.com/gotempsh/temps/issues/348))
+- **compose:** Require DB/Redis secrets, stop publishing internal ports on 0.0.0.0 ([#330](https://github.com/gotempsh/temps/issues/330))
+- **git:** Bind webhook tokens to projects ([#335](https://github.com/gotempsh/temps/issues/335))
+- **query-postgres:** Block function-call SQLi bypass in data-explorer WHERE clauses ([#328](https://github.com/gotempsh/temps/issues/328))
+
+### Miscellaneous
+
+- **deployer:** Narrow compose hardening scope
+- **deps-dev:** Bump @eslint/js from 9.37.0 to 10.0.1 in /web
+
+### Performance
+
+- **web:** Lazy-load and paginate proxy traffic-by-project table ([#292](https://github.com/gotempsh/temps/issues/292))
+
+### Styling
+
+- **deployer:** Cargo fmt compose policy
+
+### Testing
+
+- **metrics:** Regression coverage for pg_stat_checkpointer/bgwriter query ([#293](https://github.com/gotempsh/temps/issues/293))
 
 ## [0.1.0-beta.46] - 2026-07-12
 

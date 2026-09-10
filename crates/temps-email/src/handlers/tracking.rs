@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email tracking handlers for open tracking (pixel) and click tracking (redirect)
 
 use std::sync::Arc;
@@ -10,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error, not_found},
     problemdetails::Problem,
@@ -131,7 +134,7 @@ pub async fn track_open(
     get,
     path = "/emails/{email_id}/track/click/{link_index}",
     responses(
-        (status = 302, description = "Redirect to original URL"),
+        (status = 307, description = "Redirect to original URL"),
         (status = 404, description = "Link not found")
     ),
     params(
@@ -263,6 +266,15 @@ pub async fn get_global_events(
     Query(query): Query<GlobalEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsRead);
+    // This endpoint is instance-wide by design (an operator view over every
+    // email's opens/clicks, including recipient IPs, user agents and clicked
+    // URLs) and carries no project_id to scope against. Deployment tokens are
+    // project-scoped machine credentials handed to deployed application code,
+    // so they must never reach it. Today `AuthContext::has_permission` already
+    // refuses to map any deployment-token permission onto `EmailsRead`; this
+    // states the requirement at the endpoint instead of relying on that
+    // allowlist never gaining an `EmailsRead` entry.
+    deny_deployment_token!(auth);
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
@@ -396,14 +408,14 @@ pub async fn get_email_tracking(
     // Count unique IPs for opens/clicks
     let unique_opens = events
         .iter()
-        .filter(|e| e.event_type == "open")
+        .filter(|e| e.event_type == "opened")
         .filter_map(|e| e.ip_address.as_ref())
         .collect::<std::collections::HashSet<_>>()
         .len() as u64;
 
     let unique_clicks = events
         .iter()
-        .filter(|e| e.event_type == "click")
+        .filter(|e| e.event_type == "clicked")
         .filter_map(|e| e.ip_address.as_ref())
         .collect::<std::collections::HashSet<_>>()
         .len() as u64;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add `alarms.service_id` so service-scoped (database) alarms record which
 //! external service triggered them.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # cleanup-testcontainers.sh — Remove orphaned `testcontainers`-managed
 # Docker containers left over from interrupted `cargo test` runs.
 #

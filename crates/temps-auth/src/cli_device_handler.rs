@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CLI device-authorization flow (OAuth 2.0 RFC 8628-style).
 //!
 //! This is the only interactive login path the CLI exposes — credentials are
 //! always entered in the web UI. The legacy password endpoint was removed:
 //! workspace/sandbox terminals have nothing reasonable to prompt into, and
-//! SSO / magic-link users have no password to type anyway. Headless callers
+//! SSO users have no password to type anyway. Headless callers
 //! authenticate with a pre-minted API key from the dashboard.
 //!
 //! Flow:
@@ -35,9 +38,10 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::problemdetails::{new as problem_new, Problem};
@@ -48,6 +52,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::apikey_service::{ApiKeyServiceError, CreateApiKeyRequest};
 use crate::audit::LoginAudit;
+use crate::permission_guard;
 use crate::permissions::Role;
 use crate::state::AuthState;
 use crate::RequireAuth;
@@ -194,13 +199,15 @@ impl From<CliDeviceFlowError> for Problem {
             CliDeviceFlowError::NotFound { .. }
             | CliDeviceFlowError::NotFoundByDeviceCode { .. } => problem_new(StatusCode::NOT_FOUND)
                 .with_title("Device Session Not Found")
-                .with_detail(err.to_string()),
+                .with_detail(err.to_string())
+                .with_value("error_code", "CLI_DEVICE_SESSION_NOT_FOUND"),
             CliDeviceFlowError::AlreadyResolved { .. } => problem_new(StatusCode::CONFLICT)
                 .with_title("Device Session Already Resolved")
                 .with_detail(err.to_string()),
             CliDeviceFlowError::Expired { .. } => problem_new(StatusCode::GONE)
                 .with_title("Device Session Expired")
-                .with_detail(err.to_string()),
+                .with_detail(err.to_string())
+                .with_value("error_code", "CLI_DEVICE_SESSION_EXPIRED"),
             CliDeviceFlowError::NoRoleAssigned { .. } => problem_new(StatusCode::FORBIDDEN)
                 .with_title("No Role Assigned")
                 .with_detail(err.to_string()),
@@ -396,9 +403,11 @@ pub async fn cli_device_lookup(
     responses(
         (status = 200, description = "Session approved; CLI can now claim the API key", body = CliDeviceApproveResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Browser session required"),
         (status = 404, description = "Unknown user_code"),
         (status = 409, description = "Already resolved"),
         (status = 410, description = "Session expired"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication",
@@ -410,6 +419,18 @@ pub async fn cli_device_approve(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CliDeviceApproveRequest>,
 ) -> Result<Json<CliDeviceApproveResponse>, Problem> {
+    // Approving a device login mints a fresh API key carrying the approver's
+    // primary role. This must be an interactive, in-person consent action —
+    // never delegable to a machine credential — independent of whatever
+    // step-up policy is installed. Machine credentials (API keys, CLI
+    // tokens, deployment tokens) deliberately bypass step-up (see
+    // DefaultSensitiveActionAuthorizer), so this endpoint cannot rely on
+    // `require_cli_device_approval` below for that guarantee.
+    require_browser_session(&auth)?;
+    permission_guard!(auth, ApiKeysCreate);
+
+    require_cli_device_approval(state.sensitive_action_authorizer.as_ref(), &auth).await?;
+
     let user = auth.require_user().map_err(|msg| {
         problem_new(StatusCode::FORBIDDEN)
             .with_title("User Required")
@@ -447,6 +468,11 @@ pub async fn cli_device_approve(
 
     let role_name = pick_primary_role(&user_with_roles)
         .ok_or(CliDeviceFlowError::NoRoleAssigned { user_id: user.id })?;
+
+    // Same ceiling create_api_key/rotate_api_key enforce: the minted key must
+    // never grant more than the approver's own effective permissions, even
+    // though the approver is authenticating this device as themselves.
+    crate::apikey_handler::enforce_permission_ceiling_for_role(&auth, &role_name, None)?;
 
     let device_label = session
         .client_name
@@ -521,6 +547,32 @@ pub async fn cli_device_approve(
         user_code: session.user_code,
         status: status::APPROVED.to_string(),
     }))
+}
+
+/// Device-login approval is an interactive consent action. Machine
+/// credentials (API keys, CLI tokens, deployment tokens) deliberately bypass
+/// the step-up check below by policy, so this endpoint's own authorization
+/// cannot rest on that check alone — it must independently refuse anything
+/// that is not a live browser session, the same way it did before machine
+/// credentials were allowed to bypass step-up.
+fn require_browser_session(auth: &crate::AuthContext) -> Result<(), Problem> {
+    if !auth.is_session() {
+        return Err(problem_new(StatusCode::FORBIDDEN)
+            .with_title("Browser Session Required")
+            .with_detail(
+                "Approving a device login requires an interactive browser session; \
+                 API keys, CLI tokens, and deployment tokens cannot approve device logins.",
+            ));
+    }
+    Ok(())
+}
+
+async fn require_cli_device_approval(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &crate::AuthContext,
+) -> Result<(), Problem> {
+    crate::require_sensitive_action(authorizer, auth, temps_core::SensitiveAction::CreateApiKey)
+        .await
 }
 
 #[utoipa::path(
@@ -612,7 +664,17 @@ async fn deliver_approved(
     session: temps_entities::cli_login_sessions::Model,
 ) -> Result<Json<CliDevicePollResponse>, Problem> {
     let session_id = session.id;
-    let Some(encrypted_api_key) = session.api_key_plaintext.clone() else {
+    let transaction = db.begin().await.map_err(CliDeviceFlowError::Database)?;
+    let locked_session = temps_entities::cli_login_sessions::Entity::find_by_id(session_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(CliDeviceFlowError::Database)?
+        .ok_or_else(|| CliDeviceFlowError::NotFound {
+            user_code: session.user_code.clone(),
+        })?;
+
+    let Some(encrypted_api_key) = locked_session.api_key_plaintext.clone() else {
         warn!(
             "cli device poll: session {} approved but ciphertext already consumed",
             session_id
@@ -627,7 +689,7 @@ async fn deliver_approved(
             reason: e.to_string(),
         })?;
 
-    let user_id = session
+    let user_id = locked_session
         .user_id
         .ok_or_else(|| CliDeviceFlowError::UserLoadFailed {
             user_id: 0,
@@ -637,21 +699,22 @@ async fn deliver_approved(
             ),
         })?;
 
-    // Clear plaintext immediately so a subsequent poll cannot replay it.
+    // Clear the credential while holding the row lock. The lock and update
+    // commit together, so only one concurrent poll can observe ciphertext.
     let clear = temps_entities::cli_login_sessions::ActiveModel {
         id: Set(session_id),
         api_key_plaintext: Set(None),
         ..Default::default()
     };
     clear
-        .update(db.as_ref())
+        .update(&transaction)
         .await
         .map_err(CliDeviceFlowError::Database)?;
 
     // Look up email + role for the response. We don't fail the delivery if
     // the role lookup fails — but we do need the user to exist.
     let user = temps_entities::users::Entity::find_by_id(user_id)
-        .one(db.as_ref())
+        .one(&transaction)
         .await
         .map_err(CliDeviceFlowError::Database)?
         .ok_or_else(|| CliDeviceFlowError::UserLoadFailed {
@@ -659,9 +722,9 @@ async fn deliver_approved(
             reason: "user record missing".into(),
         })?;
 
-    let api_key_row = match session.api_key_id {
+    let api_key_row = match locked_session.api_key_id {
         Some(id) => temps_entities::api_keys::Entity::find_by_id(id)
-            .one(db.as_ref())
+            .one(&transaction)
             .await
             .map_err(CliDeviceFlowError::Database)?,
         None => None,
@@ -675,6 +738,11 @@ async fn deliver_approved(
             None,
         ),
     };
+
+    transaction
+        .commit()
+        .await
+        .map_err(CliDeviceFlowError::Database)?;
 
     Ok(Json(CliDevicePollResponse::Approved {
         user_id,
@@ -699,7 +767,7 @@ fn effective_status(stored: &str, expires_at: temps_core::UtcDateTime) -> String
 /// Generate a 32-byte hex-encoded device_code. ~10^77 entropy.
 fn generate_device_code() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -708,9 +776,9 @@ fn generate_device_code() -> String {
 /// which is fine given expiry and rate-limit protection.
 fn generate_user_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let pick = |rng: &mut rand::rngs::ThreadRng| -> char {
-        let idx = rng.gen_range(0..ALPHABET.len());
+        let idx = rng.random_range(0..ALPHABET.len());
         ALPHABET[idx] as char
     };
     let mut out = String::with_capacity(9);
@@ -788,6 +856,93 @@ fn sanitize_device_label(raw: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_entities::users;
+
+    fn test_user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 7,
+            name: "CLI Approver".to_string(),
+            email: "approver@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn browser_session_required_rejects_machine_credentials() {
+        // require_browser_session is the endpoint's own authorization check,
+        // independent of step-up policy — it must reject every non-session
+        // principal even though require_cli_device_approval (the step-up
+        // layer) now allows machine credentials through by policy.
+        let api_key_auth = crate::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "automation".to_string(),
+            9,
+        );
+        require_browser_session(&api_key_auth)
+            .expect_err("API keys must not approve device logins");
+
+        let cli_token_auth = crate::AuthContext::new_cli_token(test_user(), Role::Admin);
+        require_browser_session(&cli_token_auth)
+            .expect_err("CLI tokens must not approve device logins");
+
+        let deployment_token_auth = crate::AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            2,
+            "deploy-token".to_string(),
+            vec![],
+        );
+        require_browser_session(&deployment_token_auth)
+            .expect_err("deployment tokens must not approve device logins");
+    }
+
+    #[test]
+    fn browser_session_required_allows_session() {
+        let session_auth = crate::AuthContext::new_persisted_session(test_user(), Role::Admin, 11);
+        require_browser_session(&session_auth).expect("browser sessions may approve");
+    }
+
+    #[tokio::test]
+    async fn api_key_bypasses_step_up_for_device_session_approval() {
+        // Machine credentials (API keys, CLI tokens, deployment tokens) skip
+        // step-up entirely rather than being denied — see the doc comment on
+        // DefaultSensitiveActionAuthorizer for the full rationale. This test
+        // verifies that an API key is allowed through (not blocked with
+        // FORBIDDEN) so that automation workflows are not silently broken when
+        // new gated endpoints are added.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let authorizer = crate::DefaultSensitiveActionAuthorizer::new(db);
+        let auth = crate::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "automation".to_string(),
+            9,
+        );
+
+        require_cli_device_approval(&authorizer, &auth)
+            .await
+            .expect("machine credentials must bypass step-up, not be denied");
+    }
 
     #[test]
     fn user_code_is_dashed_eight_plus_dash() {
@@ -852,6 +1007,10 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            p.body.get("error_code"),
+            Some(&serde_json::json!("CLI_DEVICE_SESSION_NOT_FOUND"))
+        );
 
         let p: Problem = CliDeviceFlowError::AlreadyResolved {
             user_code: "ABCD-1234".into(),
@@ -866,6 +1025,10 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::GONE);
+        assert_eq!(
+            p.body.get("error_code"),
+            Some(&serde_json::json!("CLI_DEVICE_SESSION_EXPIRED"))
+        );
 
         let p: Problem = CliDeviceFlowError::NoRoleAssigned { user_id: 7 }.into();
         assert_eq!(p.status_code, StatusCode::FORBIDDEN);
@@ -886,6 +1049,83 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn approved_credential_is_claimed_under_an_exclusive_row_lock() {
+        let now = Utc::now();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test-master-key-for-cli-device-delivery",
+        ));
+        let plaintext = "tk_abcdefghijklmnopqrstuvwxyz0123456789abcd";
+        let ciphertext = encryption_service
+            .encrypt_string(plaintext)
+            .expect("encrypt test credential");
+        let session = temps_entities::cli_login_sessions::Model {
+            id: 42,
+            device_code: "device-code".to_string(),
+            user_code: "ABCD-1234".to_string(),
+            status: status::APPROVED.to_string(),
+            user_id: Some(7),
+            api_key_id: Some(9),
+            api_key_plaintext: Some(ciphertext),
+            client_name: Some("test-client".to_string()),
+            requested_ip: Some("127.0.0.1".to_string()),
+            expires_at: now + Duration::minutes(5),
+            last_polled_at: None,
+            approved_at: Some(now),
+            denied_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let api_key = temps_entities::api_keys::Model {
+            id: 9,
+            name: "CLI login".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_abcde".to_string(),
+            user_id: 7,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: Some(now + Duration::days(90)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let mut consumed_session = session.clone();
+        consumed_session.api_key_plaintext = None;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![session.clone()]])
+                .append_query_results([vec![consumed_session]])
+                .append_query_results([vec![test_user()]])
+                .append_query_results([vec![api_key]])
+                .into_connection(),
+        );
+
+        let Json(response) = deliver_approved(&db, &encryption_service, session)
+            .await
+            .expect("deliver approved credential");
+        assert!(matches!(
+            response,
+            CliDevicePollResponse::Approved { api_key, .. } if api_key == plaintext
+        ));
+
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 1, "credential claim must use one transaction");
+        let statements = log[0].statements();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("FOR UPDATE")),
+            "credential claim must lock the device session row"
+        );
+        assert!(statements.iter().any(|statement| {
+            statement.sql.starts_with("UPDATE \"cli_login_sessions\"")
+                && statement.sql.contains("api_key_plaintext")
+        }));
     }
 
     /// Regression test for the 0.1.0 hardening pass.

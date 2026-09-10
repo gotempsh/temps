@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Generic restore orchestrator.
 //!
 //! Takes a restore request (backup id + mode), writes a `restore_runs` row,
@@ -13,6 +16,7 @@ use sea_orm::{
     QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use temps_providers::externalsvc::{RecoveryTarget, RestoreContext, ServiceType};
 use temps_providers::{ExternalServiceManager, S3Credentials};
@@ -146,7 +150,9 @@ pub enum RestoreRequestMode {
         #[serde(default)]
         parameter_overrides: serde_json::Value,
     },
-    /// Point-in-time recovery. Only valid on WAL-G backups (Postgres).
+    /// Point-in-time recovery. Only valid on a backup that anchors a
+    /// continuous change stream: a WAL-G base (Postgres) or a physical
+    /// `mariadb-backup` base with archived binary logs (MariaDB).
     Pitr {
         /// Whether PITR restores in place or creates a new service.
         to_new_service: bool,
@@ -184,6 +190,24 @@ pub struct RestoreRunView {
     pub created_at: String,
 }
 
+/// Non-sensitive service identity used by restore handlers for response
+/// labels and audit records. Loading stays in the service layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreServiceIdentity {
+    pub id: i32,
+    pub name: String,
+    pub service_type: String,
+}
+
+/// External services that produced one backup, resolved in a batched service
+/// query for authorization. An empty `service_ids` list is authoritative and
+/// identifies a control-plane/ownerless backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupProducerServices {
+    pub backup_id: i32,
+    pub service_ids: Vec<i32>,
+}
+
 impl From<temps_entities::restore_runs::Model> for RestoreRunView {
     fn from(m: temps_entities::restore_runs::Model) -> Self {
         Self {
@@ -216,7 +240,7 @@ pub struct RestorePlan {
     /// Backup we'll read from.
     pub source_backup: PlanSourceBackup,
     /// How the restore will be performed: "walg_restore", "pg_dump_restore",
-    /// or "unsupported".
+    /// "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
     pub strategy: String,
     /// Ordered list of human-readable actions the orchestrator will take.
     pub steps: Vec<String>,
@@ -250,7 +274,7 @@ pub struct PlanSourceBackup {
     /// True when the original row's `s3_location` was empty and we resolved
     /// a location by probing S3. The UI shows this as a warning.
     pub location_was_resolved: bool,
-    /// "walg", "pg_dump", "unknown".
+    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
     pub format: String,
     pub size_bytes: Option<i64>,
     pub created_at: Option<String>,
@@ -379,15 +403,17 @@ impl RestoreService {
         let mut resolved_location = backup_location.clone();
         let mut location_was_resolved = false;
         if resolved_location.is_empty() {
-            let origin = backup_row
-                .as_ref()
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-                .and_then(|v| {
-                    v.get("service_name")
-                        .and_then(|s| s.as_str())
-                        .map(String::from)
-                });
-            if let Some(origin) = origin {
+            let origin_and_uuid = backup_row.as_ref().and_then(|b| {
+                serde_json::from_str::<serde_json::Value>(&b.metadata)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("service_name")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .map(|origin| (origin, b.backup_id.clone()))
+            });
+            if let Some((origin, backup_uuid)) = origin_and_uuid {
                 if let Ok(s3_source) = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
                     .one(self.db.as_ref())
                     .await
@@ -403,10 +429,21 @@ impl RestoreService {
                         .encryption_service
                         .decrypt_string(&s3_source.secret_key)
                         .ok();
+                    // A source without a session token yields `None` here; a
+                    // decrypt failure is also treated as "no token" on this
+                    // best-effort probe path, exactly like the two keys above.
+                    let decrypted_session_token =
+                        temps_entities::s3_sources::decrypt_session_token(
+                            self.encryption_service.as_ref(),
+                            &s3_source,
+                        )
+                        .ok()
+                        .flatten();
                     if let (Some(a), Some(s)) = (decrypted_access_key, decrypted_secret_key) {
                         let creds = S3Credentials {
                             access_key_id: a,
                             secret_key: s,
+                            session_token: decrypted_session_token,
                             region: s3_source.region.clone(),
                             endpoint: s3_source.endpoint.clone(),
                             bucket_name: s3_source.bucket_name.clone(),
@@ -419,6 +456,7 @@ impl RestoreService {
                             &s3_source,
                             &target.service_type,
                             &origin,
+                            &backup_uuid,
                         )
                         .await
                         {
@@ -442,23 +480,60 @@ impl RestoreService {
         }
 
         // Strategy classification.
-        let strategy = if resolved_location.starts_with("s3://") {
+        //
+        // MariaDB is classified FIRST and entirely on its own terms. Its
+        // logical dump object is named `dump.sql.gz`, so the generic
+        // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
+        // would describe a `pg_restore` that never runs. Its physical base is
+        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
+        // object), neither of which matches a generic arm — both would land
+        // in `unsupported` even though they are the engine's PITR format.
+        let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
+        let engine_lower = target.service_type.to_ascii_lowercase();
+        let strategy = if target_is_mariadb {
+            // Same predicate the MariaDB engine itself dispatches on, so the
+            // preview cannot promise a restore shape the executor won't take.
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+                &resolved_location,
+            ) {
+                "mariadb_physical_restore"
+            } else if resolved_location.ends_with(".sql.gz") {
+                "mariadb_dump_restore"
+            } else {
+                "unsupported"
+            }
+        } else if resolved_location.starts_with("s3://") {
             "walg_restore"
         } else if resolved_location.ends_with(".sql.gz")
             || resolved_location.ends_with(".pgdump.gz")
         {
             "pg_dump_restore"
+        } else if engine_lower == "redis"
+            && temps_providers::externalsvc::redis::classify_redis_backup_location(
+                &resolved_location,
+            ) == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip
+        {
+            "redis_rdb_restore"
         } else {
             "unsupported"
         };
 
-        // PITR requires a WAL-G backup.
+        // PITR needs a continuous change stream anchored to the base backup:
+        // WAL-G's WAL archive for Postgres, archived binary logs for MariaDB's
+        // physical base. A logical dump anchors nothing in either engine.
         let is_pitr = matches!(mode, RestoreRequestMode::Pitr { .. });
-        if is_pitr && strategy != "walg_restore" {
-            errors.push(
-                "PITR requires a WAL-G backup. The selected backup is pg_dump; choose a WAL-G backup or a different mode."
-                    .into(),
-            );
+        if is_pitr && !matches!(strategy, "walg_restore" | "mariadb_physical_restore") {
+            if target_is_mariadb {
+                errors.push(
+                    "PITR requires a physical (mariadb-backup) base backup. The selected backup is a logical dump; choose a physical backup or a different mode."
+                        .into(),
+                );
+            } else {
+                errors.push(
+                    "PITR requires a WAL-G backup. The selected backup is pg_dump; choose a WAL-G backup or a different mode."
+                        .into(),
+                );
+            }
         }
 
         // Cross-service warning.
@@ -487,16 +562,29 @@ impl RestoreService {
         //              and we run `mongorestore --archive --drop` without
         //              excluding the admin database, so post-restore the
         //              target authenticates with the source's root password.
+        //   MariaDB  — only for a PHYSICAL base. `mariadb-backup --copy-back`
+        //              replaces the entire datadir, `mysql` system schema
+        //              included, so `mysql.user` (the password-hash table)
+        //              becomes the source's. The logical `mariadb_dump`
+        //              backup explicitly excludes the `mysql` schema
+        //              (`SCHEMA_NAME NOT IN (... 'mysql' ...)` in
+        //              temps-backup/src/engines/mariadb_dump.rs), so a dump
+        //              restore leaves the target's credentials untouched —
+        //              which is why `mariadb_dump_restore` is absent from
+        //              the strategy list below.
         //
         // Redis RDB and S3 object copies don't carry auth, so the warning
         // would be misleading for those.
         let engine_preserves_source_credentials = matches!(
             target.service_type.to_ascii_lowercase().as_str(),
-            "postgres" | "mongodb"
+            "postgres" | "mongodb" | "mariadb"
         );
 
         if engine_preserves_source_credentials
-            && (strategy == "walg_restore" || strategy == "pg_dump_restore")
+            && matches!(
+                strategy,
+                "walg_restore" | "pg_dump_restore" | "mariadb_physical_restore"
+            )
         {
             let origin_still_known = backup_row
                 .as_ref()
@@ -534,7 +622,6 @@ impl RestoreService {
         // Build step list. Engine-first, because each engine has its own
         // container naming, data format, and recovery mechanics. Within an
         // engine we further branch on strategy + mode.
-        let engine_lower = target.service_type.to_ascii_lowercase();
         let container_name = engine_container_name(&engine_lower, &target.name);
         let mut steps: Vec<String> = Vec::new();
         let mut destructive = false;
@@ -564,6 +651,17 @@ impl RestoreService {
             }
             "mongodb" => {
                 build_mongodb_steps(
+                    strategy,
+                    &mode,
+                    &container_name,
+                    &resolved_location,
+                    &mut steps,
+                    &mut destructive,
+                    &mut errors,
+                );
+            }
+            "mariadb" => {
+                build_mariadb_steps(
                     strategy,
                     &mode,
                     &container_name,
@@ -619,6 +717,11 @@ impl RestoreService {
                 format: match strategy {
                     "walg_restore" => "walg".into(),
                     "pg_dump_restore" => "pg_dump".into(),
+                    // Match the engine keys the MariaDB backup engines
+                    // register under, so the plan's `format` lines up with
+                    // `classify_backup_format` and the backup list UI.
+                    "mariadb_physical_restore" => "mariadb_physical".into(),
+                    "mariadb_dump_restore" => "mariadb_dump".into(),
                     _ => "unknown".into(),
                 },
                 size_bytes: backup_row.as_ref().and_then(|b| b.size_bytes),
@@ -641,6 +744,23 @@ impl RestoreService {
         &self,
         service_id: i32,
     ) -> Result<temps_providers::externalsvc::RestoreCapabilities, RestoreError> {
+        self.get_capabilities_with_identity(service_id)
+            .await
+            .map(|(capabilities, _)| capabilities)
+    }
+
+    /// Read restore capabilities and the already-loaded service identity in
+    /// one service-layer operation so the handler does not repeat the query.
+    pub async fn get_capabilities_with_identity(
+        &self,
+        service_id: i32,
+    ) -> Result<
+        (
+            temps_providers::externalsvc::RestoreCapabilities,
+            RestoreServiceIdentity,
+        ),
+        RestoreError,
+    > {
         let service = self.load_service(service_id).await?;
         let service_type =
             ServiceType::from_str(&service.service_type).map_err(|e| RestoreError::Validation {
@@ -656,12 +776,18 @@ impl RestoreService {
         let instance = self
             .external_service_manager
             .get_service_instance(service.name.clone(), service_type);
-        instance
+        let capabilities = instance
             .restore_capabilities(service_config)
             .await
             .map_err(|e| RestoreError::ExternalService {
                 reason: format!("Failed to read restore capabilities: {}", e),
-            })
+            })?;
+        let identity = RestoreServiceIdentity {
+            id: service.id,
+            name: service.name,
+            service_type: service.service_type,
+        };
+        Ok((capabilities, identity))
     }
 
     /// Validate a restore request, insert a `restore_runs` row, spawn the
@@ -684,56 +810,74 @@ impl RestoreService {
     ) -> Result<RestoreRunView, RestoreError> {
         // Resolve the backup: either via the DB row, or synthesize one
         // from a raw S3 location (orphan from another Temps instance).
-        let (resolved_backup_id, backup_location, backup_engine_hint, s3_source_id) =
-            match &selector {
-                BackupSelector::Id(id) => {
-                    let backup = temps_entities::backups::Entity::find_by_id(*id)
+        let (
+            resolved_backup_id,
+            backup_location,
+            backup_engine_hint,
+            s3_source_id,
+            backup_started_at,
+        ) = match &selector {
+            BackupSelector::Id(id) => {
+                let backup = temps_entities::backups::Entity::find_by_id(*id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+
+                // Try to infer the engine from the external_service_backups
+                // link OR from the metadata blob. This is advisory — used
+                // only for engine-compat checking.
+                let engine = if let Some(es_backup) =
+                    temps_entities::external_service_backups::Entity::find()
+                        .filter(temps_entities::external_service_backups::Column::BackupId.eq(*id))
                         .one(self.db.as_ref())
                         .await?
-                        .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
-
-                    // Try to infer the engine from the external_service_backups
-                    // link OR from the metadata blob. This is advisory — used
-                    // only for engine-compat checking.
-                    let engine = if let Some(es_backup) =
-                        temps_entities::external_service_backups::Entity::find()
-                            .filter(
-                                temps_entities::external_service_backups::Column::BackupId.eq(*id),
-                            )
-                            .one(self.db.as_ref())
-                            .await?
-                    {
-                        let svc = self.load_service(es_backup.service_id).await.ok();
-                        svc.map(|s| s.service_type)
-                    } else {
-                        serde_json::from_str::<serde_json::Value>(&backup.metadata)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("service_type")
-                                    .and_then(|t| t.as_str())
-                                    .map(String::from)
-                            })
-                    };
-                    (
-                        Some(backup.id),
-                        backup.s3_location.clone(),
-                        engine,
-                        backup.s3_source_id,
-                    )
-                }
-                BackupSelector::Location {
-                    location,
+                {
+                    let svc = self.load_service(es_backup.service_id).await.ok();
+                    svc.map(|s| s.service_type)
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&backup.metadata)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("service_type")
+                                .and_then(|t| t.as_str())
+                                .map(String::from)
+                        })
+                };
+                (
+                    Some(backup.id),
+                    backup.s3_location.clone(),
                     engine,
-                    s3_source_id,
-                } => {
-                    if location.trim().is_empty() {
-                        return Err(RestoreError::Validation {
-                            message: "backup_location cannot be empty".into(),
-                        });
-                    }
-                    (None, location.clone(), Some(engine.clone()), *s3_source_id)
+                    backup.s3_source_id,
+                    Some(backup.started_at),
+                )
+            }
+            BackupSelector::Location {
+                location,
+                engine,
+                s3_source_id,
+            } => {
+                if location.trim().is_empty() {
+                    return Err(RestoreError::Validation {
+                        message: "backup_location cannot be empty".into(),
+                    });
                 }
-            };
+                // Orphan restores (backup discovered by S3 scan, produced
+                // by another Temps instance) have no DB row and thus no
+                // known `started_at` to validate a PITR target against —
+                // we can't range-check what we don't know. The engine
+                // (Postgres, via `restore_pitr`) still protects against a
+                // target the WAL can't reach: it FATALs out of recovery
+                // rather than promoting, which the container health
+                // check surfaces as a failed restore run.
+                (
+                    None,
+                    location.clone(),
+                    Some(engine.clone()),
+                    *s3_source_id,
+                    None,
+                )
+            }
+        };
 
         // Target service: where the restored data goes.
         let target = self.load_service(target_service_id).await?;
@@ -779,7 +923,7 @@ impl RestoreService {
             RestoreRequestMode::Pitr {
                 to_new_service,
                 new_service_name,
-                ..
+                target: recovery_target,
             } => {
                 if !caps.pitr {
                     return Err(RestoreError::UnsupportedMode {
@@ -787,14 +931,7 @@ impl RestoreService {
                         service_type: target.service_type.clone(),
                     });
                 }
-                if !backup_location.starts_with("s3://") {
-                    return Err(RestoreError::Validation {
-                        message: format!(
-                            "PITR requires a WAL-G backup (s3:// prefix); location was '{}'",
-                            backup_location
-                        ),
-                    });
-                }
+                validate_pitr_backup_location(&target.service_type, &backup_location)?;
                 if *to_new_service
                     && new_service_name
                         .as_ref()
@@ -805,6 +942,7 @@ impl RestoreService {
                         message: "new_service_name is required when to_new_service=true".into(),
                     });
                 }
+                validate_pitr_recovery_target(recovery_target, backup_started_at)?;
             }
         }
 
@@ -929,6 +1067,73 @@ impl RestoreService {
         Ok(runs.into_iter().map(RestoreRunView::from).collect())
     }
 
+    /// Resolve every external service that produced a backup. An empty result
+    /// identifies a control-plane/ownerless backup and must remain
+    /// administrators-only at the authorization layer.
+    pub async fn backup_source_service_ids(
+        &self,
+        backup_id: i32,
+    ) -> Result<Vec<i32>, RestoreError> {
+        Ok(self
+            .backup_source_services_for_backups(&[backup_id])
+            .await?
+            .into_iter()
+            .next()
+            .map(|mapping| mapping.service_ids)
+            .unwrap_or_default())
+    }
+
+    /// Resolve producer services for many backup ids in one database query.
+    /// The result contains one deterministic entry for every requested id,
+    /// including backups with no producer-service rows.
+    pub async fn backup_source_services_for_backups(
+        &self,
+        backup_ids: &[i32],
+    ) -> Result<Vec<BackupProducerServices>, RestoreError> {
+        let unique_backup_ids: BTreeSet<i32> = backup_ids.iter().copied().collect();
+        if unique_backup_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = temps_entities::external_service_backups::Entity::find()
+            .filter(
+                temps_entities::external_service_backups::Column::BackupId
+                    .is_in(unique_backup_ids.iter().copied()),
+            )
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut services_by_backup: BTreeMap<i32, BTreeSet<i32>> = unique_backup_ids
+            .into_iter()
+            .map(|backup_id| (backup_id, BTreeSet::new()))
+            .collect();
+        for row in rows {
+            if let Some(service_ids) = services_by_backup.get_mut(&row.backup_id) {
+                service_ids.insert(row.service_id);
+            }
+        }
+
+        Ok(services_by_backup
+            .into_iter()
+            .map(|(backup_id, service_ids)| BackupProducerServices {
+                backup_id,
+                service_ids: service_ids.into_iter().collect(),
+            })
+            .collect())
+    }
+
+    pub async fn get_service_identity(
+        &self,
+        service_id: i32,
+    ) -> Result<RestoreServiceIdentity, RestoreError> {
+        let service = self.load_service(service_id).await?;
+        Ok(RestoreServiceIdentity {
+            id: service.id,
+            name: service.name,
+            service_type: service.service_type,
+        })
+    }
+
     async fn load_service(
         &self,
         id: i32,
@@ -955,6 +1160,150 @@ fn engines_compatible(a: &str, b: &str) -> bool {
     }
     let object_store = ["s3", "rustfs", "minio", "blob"];
     object_store.contains(&a.as_str()) && object_store.contains(&b.as_str())
+}
+
+/// Reject a PITR recovery target that's provably out of range BEFORE we
+/// ever touch the target container: nothing in a backup's WAL can predate
+/// the base backup itself starting, so a target before that can never be a
+/// real, honored recovery point.
+///
+/// Root-cause context: without this check, Postgres itself does NOT error
+/// on a too-early `recovery_target_time` — it silently stops recovery at
+/// the earliest point it CAN reach (immediately after the base backup's own
+/// consistency checkpoint) and reports success, discarding the requested
+/// target with no warning surfaced anywhere. A restore run would come back
+/// `status: "completed"` having silently ignored what the caller actually
+/// asked for. (Verified empirically against a real WAL-G backup: PostgreSQL
+/// 18's log shows `starting point-in-time recovery to <target>` /
+/// `consistent recovery state reached` / `recovery stopping before commit
+/// of transaction N` — no FATAL, no error — for a target years before the
+/// backup existed.)
+///
+/// A target in the FUTURE (past all archived WAL) is already handled safely
+/// without this check: PostgreSQL itself FATALs with "recovery ended before
+/// configured recovery target was reached" once it exhausts available WAL,
+/// which — combined with `restart_policy=always` — crash-loops the
+/// container until `wait_for_container_health`'s 90s timeout surfaces it as
+/// a failed restore run. That path is a real, if slow (up to 90s) and
+/// generically-worded, failure — not silent corruption — so it's
+/// intentionally left alone here.
+///
+/// `backup_started_at` is `None` for orphan restores (backup discovered by
+/// S3 scan, produced by another Temps instance) — there's no DB row and
+/// thus no known start time to validate against, so we can't range-check
+/// what we don't know; those still fall back on Postgres's own FATAL/crash
+/// loop for a too-early target too (untested here, but the same "PG stops
+/// at the earliest reachable point without erroring" behavior applies).
+fn validate_pitr_recovery_target(
+    target: &RecoveryTarget,
+    backup_started_at: Option<chrono::DateTime<Utc>>,
+) -> Result<(), RestoreError> {
+    if let RecoveryTarget::Time { time } = target {
+        if let Some(started_at) = backup_started_at {
+            if *time < started_at {
+                return Err(RestoreError::Validation {
+                    message: format!(
+                        "PITR recovery target {} is before this backup started ({}) — no WAL \
+                         this backup covers can satisfy it. Choose a time at or after the \
+                         backup start, or select an earlier backup.",
+                        time.to_rfc3339(),
+                        started_at.to_rfc3339(),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a PITR request whose backup format cannot anchor a forward-roll.
+///
+/// The test is ENGINE-specific because the two PITR-capable engines record
+/// their base backups differently:
+///
+///   Postgres — WAL-G bases are stored as `s3://…` URLs.
+///   MariaDB  — physical (`mariadb-backup`) bases are stored either as a WAL-G
+///              repository ending in `/walg` (what `MariadbPhysicalEngine`
+///              writes today) or, in older buckets, as a bare S3 key ending in
+///              `base.mbstream.gz`.
+///
+/// Applying the Postgres shape to MariaDB rejected every MariaDB PITR before
+/// it could start — with a "requires WAL-G" message that made no sense for the
+/// engine — even though `MariaDbService::restore_capabilities` advertises
+/// `pitr: true`. MariaDB is classified with the engine's own predicate so this
+/// guard, the plan preview, and the engine all agree on what a physical base is.
+/// That predicate must be the layout-agnostic one: testing only the legacy
+/// `base.mbstream.gz` object reintroduces the same class of bug, because a
+/// MariaDB WAL-G repository is a physical base the engine can and does replay.
+fn validate_pitr_backup_location(
+    target_service_type: &str,
+    backup_location: &str,
+) -> Result<(), RestoreError> {
+    if target_service_type.eq_ignore_ascii_case("mariadb") {
+        if !temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+            backup_location,
+        ) {
+            return Err(RestoreError::Validation {
+                message: format!(
+                    "PITR requires a physical (mariadb-backup) base backup; location was '{}'",
+                    backup_location
+                ),
+            });
+        }
+    } else if !backup_location.starts_with("s3://") {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "PITR requires a WAL-G backup (s3:// prefix); location was '{}'",
+                backup_location
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Which credential-reconciliation steps a restore needs, as
+/// `(preserves_source_credentials, wants_pre_restore_merge)`.
+///
+/// `preserves_source_credentials` means the restored data carries the ORIGIN
+/// service's auth catalog, so the target's stored password must be patched to
+/// the origin's afterwards. `wants_pre_restore_merge` additionally hands the
+/// origin's credentials to the engine up front, which is only safe for OFFLINE
+/// restores (the data swap doesn't authenticate, and the steps after it must
+/// use the credentials the restored data expects).
+///
+///   Postgres — both. The base backup contains `pg_authid`; the restore is
+///              offline.
+///   MongoDB  — patch only. `mongorestore` streams into a LIVE mongod that
+///              still wants the TARGET's password until the restore lands.
+///   MariaDB  — depends on the backup FORMAT, which the location encodes:
+///              a physical base — WAL-G repository or legacy mbstream object
+///              alike — replaces the whole datadir including the `mysql`
+///              system schema (so both, like Postgres), while a
+///              logical `mariadb_dump` explicitly EXCLUDES the `mysql` schema
+///              (see engines/mariadb_dump.rs) and therefore carries no
+///              credentials at all — merging there would authenticate the dump
+///              load with the wrong password and then overwrite the target's
+///              stored password with a credential the target never had,
+///              locking the operator out via UI/CLI.
+///   Redis / S3 / RustFS — neither; their data layer has no auth.
+///
+/// A MariaDB backup row with an empty `s3_location` (legacy rows, backfilled
+/// from S3 later in the worker) classifies as non-physical and therefore skips
+/// both steps: a cross-service PITR forward-roll that fails auth loudly is
+/// strictly better than silently rewriting the target's stored credentials.
+fn credential_propagation_gates(target_service_type: &str, backup_location: &str) -> (bool, bool) {
+    match target_service_type.to_ascii_lowercase().as_str() {
+        "postgres" => (true, true),
+        "mongodb" => (true, false),
+        "mariadb" => {
+            let physical =
+                temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+                    backup_location,
+                );
+            (physical, physical)
+        }
+        _ => (false, false),
+    }
 }
 
 /// Worker: marks the run through phases, dispatches to the trait, and
@@ -1149,37 +1498,73 @@ async fn run_restore_inner(
     //   into the config passed to the engine (that breaks the fetch auth)
     //   — we only need to capture it for the post-restore config patch.
     //
+    // MariaDB: YES for a physical base, and it needs the SAME pre-restore
+    //   merge Postgres gets. `mariadb-backup --copy-back` replaces the entire
+    //   datadir including the `mysql` system schema, so `mysql.user` — the
+    //   password-hash table — becomes the source's the moment the swap lands.
+    //   The swap itself is offline (stop container → helper rewrites the
+    //   volume → start), so the merged credentials cannot break it. But the
+    //   step AFTER it does depend on them: `restore_pitr` reuses the same
+    //   `MariaDbConfig` (built from this very `source_config`) to authenticate
+    //   `mariadb-binlog`'s replay against the freshly-restored server, which
+    //   by then only accepts the ORIGIN's password. Without the merge, a
+    //   cross-service MariaDB PITR restores the base and then fails auth on
+    //   the forward-roll — data restored, recovery point silently lost.
+    //
+    //   NO for a logical `mariadb_dump` base. That dump explicitly excludes
+    //   the `mysql` schema (`SCHEMA_NAME NOT IN (…, 'mysql', …)` in
+    //   engines/mariadb_dump.rs), so restoring it leaves the target's own
+    //   `mysql.user` — and therefore its password — completely untouched.
+    //   Merging origin credentials there is actively harmful: the engine
+    //   would authenticate the dump load with the WRONG password, and the
+    //   post-restore `patch_service_password` would overwrite the target's
+    //   stored password with the origin's even though nothing on the target
+    //   changed, locking the operator out of the real credentials via the
+    //   UI/CLI. So MariaDB is gated on the backup FORMAT, matching the
+    //   plan preview (which excludes `mariadb_dump_restore` from the same
+    //   classification) — the location string tells us the format without
+    //   an extra S3 round-trip.
+    //
     // S3/RustFS: NO. No auth in the data layer.
     //
     // Two separate gates. `engine_preserves_source_credentials` drives the
-    // post-restore patch (same for Postgres and Mongo). The pre-restore
-    // merge is Postgres-only because Postgres's restore is offline
-    // (wal-g writes PGDATA, PG replays WAL) so the engine's view of the
-    // "current password" during the fetch doesn't matter. Mongo's is
-    // online so merging too early breaks everything.
-    let engine_preserves_source_credentials = matches!(
-        target_service.service_type.to_ascii_lowercase().as_str(),
-        "postgres" | "mongodb"
-    );
-    let engine_wants_pre_restore_credential_merge =
-        target_service.service_type.eq_ignore_ascii_case("postgres");
+    // post-restore patch (Postgres, Mongo, physical MariaDB). The pre-restore
+    // merge covers the OFFLINE restores (Postgres, physical MariaDB): the
+    // engine's view of the "current password" during the data swap doesn't
+    // matter, and the merged creds are what the restored data will actually
+    // expect. Mongo's restore is online so merging too early breaks the
+    // mongorestore auth.
+    //
+    // See `credential_propagation_gates` for the per-engine (and, for MariaDB,
+    // per-FORMAT) reasoning; it is a free function so the matrix is unit-tested.
+    let (engine_preserves_source_credentials, engine_wants_pre_restore_credential_merge) =
+        credential_propagation_gates(&target_service.service_type, &backup_model.s3_location);
 
     let mut origin_password_for_post_restore_patch: Option<String> = None;
+    let mut origin_root_password_for_post_restore_patch: Option<String> = None;
     if engine_preserves_source_credentials {
         if let Some(origin_id) = origin_service_id {
             if origin_id != target_service.id {
                 match mgr.get_service_config(origin_id).await {
                     Ok(origin_cfg) => {
                         if engine_wants_pre_restore_credential_merge {
-                            // Postgres only: merge origin credentials into
-                            // the config we pass to the engine. Restore is
-                            // offline — the merged creds will match the
-                            // restored pg_authid.
+                            // Offline engines (Postgres, MariaDB): merge origin
+                            // credentials into the config we pass to the engine.
+                            // The restore replaces the auth catalog wholesale
+                            // (pg_authid / mysql.user), so the merged creds are
+                            // exactly what the restored server will expect.
                             if let (Some(target_params), Some(origin_params)) = (
                                 source_config.parameters.as_object_mut(),
                                 origin_cfg.parameters.as_object(),
                             ) {
-                                for key in ["password", "username", "database"] {
+                                // `root_password` is MariaDB's admin credential
+                                // — the one `mariadb-binlog` replay and every
+                                // post-restore admin exec authenticate with —
+                                // and it lives in the restored `mysql.user`
+                                // table just like `password` does. Postgres
+                                // configs have no such key, so the lookup is a
+                                // no-op there rather than a behavior change.
+                                for key in ["password", "root_password", "username", "database"] {
                                     if let Some(v) = origin_params.get(key).cloned() {
                                         target_params.insert(key.to_string(), v);
                                     }
@@ -1221,6 +1606,18 @@ async fn run_restore_inner(
                             .get("password")
                             .and_then(|v| v.as_str())
                             .map(String::from);
+                        // MariaDB keeps a SECOND credential in its config, the
+                        // `root_password` used for every admin operation
+                        // (backup, binlog replay, SQL exec). It lives in the
+                        // restored `mysql.user` table too, so leaving the
+                        // stored copy stale would break the next backup — the
+                        // failure would surface hours later, far from this
+                        // restore. Absent for every other engine.
+                        origin_root_password_for_post_restore_patch = origin_cfg
+                            .parameters
+                            .get("root_password")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                     }
                     Err(e) => {
                         warn!(
@@ -1233,8 +1630,8 @@ async fn run_restore_inner(
         }
     } else {
         info!(
-            "Engine '{}' does not propagate source credentials; skipping origin-password merge for target service {}",
-            target_service.service_type, target_service.id
+            "Backup '{}' for engine '{}' does not propagate source credentials; skipping origin-password merge for target service {}",
+            backup_model.s3_location, target_service.service_type, target_service.id
         );
     }
 
@@ -1252,9 +1649,19 @@ async fn run_restore_inner(
                 reason: format!("Failed to decrypt secret key: {}", e),
             })?;
 
+    // `None` for every long-lived operator-configured credential, so nothing
+    // about those restores changes.
+    let decrypted_session_token =
+        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source).map_err(
+            |e| RestoreError::Encryption {
+                reason: format!("Failed to decrypt session token: {}", e),
+            },
+        )?;
+
     let s3_credentials = S3Credentials {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token.clone(),
         region: s3_source.region.clone(),
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
@@ -1267,10 +1674,13 @@ async fn run_restore_inner(
     // for mc-alias setup (s3/rustfs/blob) needs plaintext or it will pass
     // ciphertext to mc and get "not signed up" back. `backup_to_s3` already
     // decrypts before passing; the restore dispatch path did not — that was
-    // the source of the in-place-restore auth failure.
+    // the source of the in-place-restore auth failure. `session_token` is on
+    // the same footing: leaving it encrypted here would sign a ciphertext
+    // token and get a 403 back from the provider.
     let s3_source_plain = temps_entities::s3_sources::Model {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token,
         ..s3_source.clone()
     };
 
@@ -1293,8 +1703,14 @@ async fn run_restore_inner(
         let engine = target_service.service_type.clone();
 
         if let Some(origin) = origin_service_name {
-            let resolved =
-                resolve_backup_location_from_s3(&s3_client, &s3_source, &engine, &origin).await;
+            let resolved = resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                &engine,
+                &origin,
+                &backup_model.backup_id,
+            )
+            .await;
             match resolved {
                 Ok(Some(loc)) => {
                     info!(
@@ -1427,7 +1843,14 @@ async fn run_restore_inner(
         // with the origin's plaintext value so the UI/env vars/CLI reflect
         // the credentials that actually work post-restore.
         if let Some(new_password) = origin_password_for_post_restore_patch.as_ref() {
-            if let Err(e) = patch_service_password(&db, &enc, target_service.id, new_password).await
+            if let Err(e) = patch_service_password(
+                &db,
+                &enc,
+                target_service.id,
+                new_password,
+                origin_root_password_for_post_restore_patch.as_deref(),
+            )
+            .await
             {
                 // Don't fail the restore over a config patch — data is
                 // restored, user can reset password manually. Log loudly.
@@ -1448,17 +1871,24 @@ async fn run_restore_inner(
     Ok(target_service_id)
 }
 
-/// Rewrite the target service's encrypted `config.password` field.
+/// Rewrite the target service's encrypted `config.password` (and, when the
+/// engine has one, `config.root_password`) field.
 ///
 /// Called after an in-place restore so the credentials stored in the Temps
 /// DB match what's actually in the restored cluster (which carries the
 /// origin service's password hashes). Everything else about the config
 /// — image, port, volume, container name — stays the target's.
+///
+/// `new_root_password` is `Some` only for engines that keep a separate admin
+/// credential inside the restored auth catalog (MariaDB's `mysql.user` root
+/// row). Postgres and MongoDB pass `None`, leaving their configs untouched
+/// apart from `password`.
 async fn patch_service_password(
     db: &DatabaseConnection,
     enc: &Arc<temps_core::EncryptionService>,
     service_id: i32,
     new_password: &str,
+    new_root_password: Option<&str>,
 ) -> Result<(), RestoreError> {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
@@ -1492,6 +1922,17 @@ async fn patch_service_password(
         "password".to_string(),
         serde_json::Value::String(new_password.to_string()),
     );
+    // Only overwrite `root_password` when the caller actually resolved one and
+    // the target config already has the key — never introduce a credential
+    // field an engine doesn't understand.
+    if let Some(root_password) = new_root_password {
+        if params.contains_key("root_password") {
+            params.insert(
+                "root_password".to_string(),
+                serde_json::Value::String(root_password.to_string()),
+            );
+        }
+    }
 
     let re_serialized = serde_json::to_string(&params).map_err(|e| RestoreError::Internal {
         reason: format!("Failed to re-serialize patched config: {}", e),
@@ -1537,7 +1978,9 @@ fn build_s3_client(creds: &S3Credentials) -> S3Client {
     let aws_creds = aws_sdk_s3::config::Credentials::new(
         creds.access_key_id.clone(),
         creds.secret_key.clone(),
-        None,
+        // `None` for the long-lived credentials operators configure; `Some`
+        // only for a temporary one, which SigV4 rejects without its token.
+        creds.session_token.clone(),
         None,
         "restore-service",
     );
@@ -1631,6 +2074,9 @@ fn engine_container_name(engine_lower: &str, service_name: &str) -> String {
         "postgres" => format!("postgres-{}", service_name),
         "redis" => format!("redis-{}", service_name),
         "mongodb" => format!("mongodb-{}", service_name),
+        // Matches MariaDbService::get_container_name() and the dispatch-side
+        // PITR-tools probe in engines/dispatch.rs, both `mariadb-{name}`.
+        "mariadb" => format!("mariadb-{}", service_name),
         "s3" => format!("rustfs-{}", service_name),
         "rustfs" => format!("rustfs-{}", service_name),
         "blob" | "kv" | "minio" => format!("{}-{}", engine_lower, service_name),
@@ -1754,6 +2200,202 @@ fn build_postgres_steps(
     }
 }
 
+/// MariaDB restore plan.
+///
+/// Structurally the closest analog to Postgres: the PITR path is OFFLINE
+/// (stop container → replace the datadir → start → forward-roll), not an
+/// online stream like Mongo's. The two formats:
+///
+/// - `mariadb_physical_restore` — a gzipped `mariadb-backup --stream=mbstream`
+///   base (`base.mbstream.gz`). Restore is the documented prepare/copy-back
+///   dance run inside an ephemeral helper container that shares the service's
+///   data volume (`volumes_from`), because the datadir must be replaced while
+///   the server is down. PITR then replays archived binary logs on top.
+/// - `mariadb_dump_restore` — a gzipped `mariadb-dump` of the user databases
+///   (`dump.sql.gz`), applied by feeding it to the `mariadb` client inside the
+///   running container. No binlog anchor, so no PITR.
+///
+/// **Credential side-effect (physical only):** `--copy-back` replaces the whole
+/// datadir including the `mysql` system schema, so `mysql.user` — the
+/// password-hash table — becomes the source's. The logical dump deliberately
+/// skips the `mysql` schema and therefore leaves the target's credentials
+/// alone.
+fn build_mariadb_steps(
+    strategy: &str,
+    mode: &RestoreRequestMode,
+    container_name: &str,
+    resolved_location: &str,
+    steps: &mut Vec<String>,
+    destructive: &mut bool,
+    errors: &mut Vec<String>,
+) {
+    // The physical restore sequence, shared by in-place, new-service, and the
+    // base half of PITR. Kept in one place so the three previews can't drift
+    // from each other (they all run `physical_restore_into_container`).
+    let physical_sequence = |target: &str, steps: &mut Vec<String>| {
+        steps.push(format!(
+            "Download {} from S3 and gunzip it to a raw mbstream on the host",
+            resolved_location
+        ));
+        steps.push(format!(
+            "Disable {}'s restart policy and stop it so the datadir volume is free",
+            target
+        ));
+        steps.push(format!(
+            "Create an ephemeral helper container sharing {}'s volumes, upload the mbstream onto it, and start it",
+            target
+        ));
+        steps.push(
+            "Helper: `mbstream -x` into a staging dir, `mariadb-backup --prepare` (apply redo logs), wipe /var/lib/mysql, `mariadb-backup --copy-back`, chown to mysql"
+                .into(),
+        );
+        steps.push("Remove the helper and re-enable the restart policy".into());
+        steps.push(format!(
+            "Start {} on the restored datadir and wait for it to report healthy",
+            target
+        ));
+    };
+
+    match strategy {
+        "mariadb_physical_restore" => match mode {
+            RestoreRequestMode::InPlace => {
+                *destructive = true;
+                physical_sequence(container_name, steps);
+                steps.push(format!(
+                    "The restored datadir carries the SOURCE's `mysql` system schema, so {} now authenticates with the source's root/user passwords",
+                    container_name
+                ));
+                steps.push(
+                    "Orchestrator patches the target service's stored config with the source's password so UI/env/CLI still work"
+                        .into(),
+                );
+            }
+            RestoreRequestMode::NewService { name, .. } => {
+                steps.push(format!(
+                    "Allocate a new MariaDB container 'mariadb-{}' on a fresh volume and port (image + credentials cloned from the target)",
+                    name
+                ));
+                physical_sequence(&format!("mariadb-{}", name), steps);
+                steps.push(
+                    "Because the copy-back replays the source's `mysql` schema, the new service's accounts are the SOURCE's, not the freshly-generated ones"
+                        .into(),
+                );
+                steps.push("Persist the new service in the database".into());
+            }
+            RestoreRequestMode::Pitr {
+                to_new_service,
+                new_service_name,
+                target,
+            } => {
+                *destructive = !*to_new_service;
+                let target_container = if *to_new_service {
+                    let name = new_service_name.as_deref().unwrap_or("<unnamed>");
+                    steps.push(format!(
+                        "Provision new service 'mariadb-{}' just like the new_service flow",
+                        name
+                    ));
+                    format!("mariadb-{}", name)
+                } else {
+                    container_name.to_string()
+                };
+                steps.push(
+                    "Read the base's metadata.json companion for its binlog coordinates (binlog_file / binlog_position); reject the restore if the base was taken without binary logging"
+                        .into(),
+                );
+                physical_sequence(&target_container, steps);
+                steps.push(
+                    "Read the binlog manifest.json under the SOURCE service's binlog/ prefix and download + gunzip every archived segment at or after the base's binlog_file"
+                        .into(),
+                );
+                match target {
+                    RecoveryTarget::Time { .. } => {
+                        steps.push(
+                            "Set the recovery target (type: timestamp) as `mariadb-binlog --stop-datetime`"
+                                .into(),
+                        );
+                    }
+                    RecoveryTarget::Lsn { .. } => {
+                        steps.push(
+                            "Set the recovery target (type: lsn, given as `binlog_file:position`) as `mariadb-binlog --stop-position`. The named file must be the LAST segment replayed, otherwise the position is ambiguous across segments and the restore is rejected."
+                                .into(),
+                        );
+                    }
+                    // `recovery_target_to_stop_flag` rejects both of these
+                    // before touching any data, so the plan must surface them
+                    // as errors rather than describing a step that can't run.
+                    RecoveryTarget::Xid { .. } => {
+                        errors.push(
+                            "MariaDB PITR does not support an xid/GTID recovery target yet — use a timestamp, or an lsn given as `binlog_file:position`."
+                                .into(),
+                        );
+                    }
+                    RecoveryTarget::Name { .. } => {
+                        errors.push(
+                            "MariaDB has no named-restore-point equivalent — use a timestamp recovery target, or an lsn given as `binlog_file:position`."
+                                .into(),
+                        );
+                    }
+                }
+                steps.push(format!(
+                    "Upload the segments into {} and replay them in ONE `mariadb-binlog --disable-log-bin --start-position=<base position>` pass piped into the mariadb client, stopping at the target",
+                    target_container
+                ));
+                steps.push(format!(
+                    "Clean up the uploaded segments; {} is left running at the recovered point",
+                    target_container
+                ));
+            }
+        },
+        "mariadb_dump_restore" => match mode {
+            RestoreRequestMode::InPlace => {
+                *destructive = true;
+                steps.push(format!(
+                    "Download {} from S3 and gunzip it to a .sql file on the host",
+                    resolved_location
+                ));
+                steps.push(format!(
+                    "Upload the .sql into the RUNNING {} at /tmp (the container is not stopped)",
+                    container_name
+                ));
+                steps.push(
+                    "Feed it to the `mariadb` client as root (`mariadb -uroot < /tmp/...`); the dump's `DROP TABLE`/`CREATE` statements replace the dumped databases".into(),
+                );
+                steps.push(
+                    "The dump excludes the `mysql` system schema, so the target keeps its own accounts and passwords".into(),
+                );
+                steps.push("Remove the uploaded .sql from the container".into());
+            }
+            RestoreRequestMode::NewService { name, .. } => {
+                steps.push(format!(
+                    "Allocate a new MariaDB container 'mariadb-{}' on a fresh volume and port",
+                    name
+                ));
+                steps.push(
+                    "Download + gunzip the dump and apply it via the new container's mariadb client"
+                        .into(),
+                );
+                steps.push(
+                    "The new service keeps its freshly-generated credentials (the dump carries no `mysql` schema)"
+                        .into(),
+                );
+                steps.push("Persist the new service in the database".into());
+            }
+            RestoreRequestMode::Pitr { .. } => {
+                errors.push(
+                    "PITR is not possible with a mariadb_dump backup — a logical dump records no binlog anchor to replay from. Choose a physical (mariadb-backup) base backup."
+                        .into(),
+                );
+            }
+        },
+        _ => {
+            errors.push(
+                "Backup format could not be classified as either a physical mariadb-backup base (base.mbstream.gz) or a logical mariadb-dump (.sql.gz). Restore is not supported."
+                    .into(),
+            );
+        }
+    }
+}
+
 /// Redis restore plan. RDB dumps via WAL-G stream, or legacy tar. Redis
 /// auth (`requirepass`) is NOT inside the data, so the container's
 /// existing password is preserved across the restore — no credential
@@ -1808,22 +2450,51 @@ fn build_redis_steps(
                 );
             }
         },
+        "redis_rdb_restore" => match mode {
+            RestoreRequestMode::InPlace => {
+                *destructive = true;
+                steps.push(format!(
+                    "Download and decompress {} into a Redis RDB snapshot",
+                    resolved_location
+                ));
+                steps.push(format!(
+                    "Stop {} and install the RDB into its data volume",
+                    container_name
+                ));
+                steps.push(
+                    "Rebuild the Redis 7+ appendonlydir manifest from the restored RDB".into(),
+                );
+                steps.push(format!(
+                    "Restart {} and wait for it to report healthy",
+                    container_name
+                ));
+            }
+            RestoreRequestMode::NewService { name, .. } => {
+                steps.push(format!(
+                    "Allocate a new Redis container 'redis-{}' on a fresh volume",
+                    name
+                ));
+                steps.push(format!(
+                    "Download and decompress {} into the new service's data volume",
+                    resolved_location
+                ));
+                steps
+                    .push("Rebuild the Redis 7+ appendonlydir manifest and start the clone".into());
+                steps
+                    .push("Persist the restored Redis service after its healthcheck passes".into());
+            }
+            RestoreRequestMode::Pitr { .. } => {
+                errors.push(
+                    "Redis does not support point-in-time recovery — RDB snapshots are discrete; pick a specific backup instead."
+                        .into(),
+                );
+            }
+        },
         _ => {
-            steps.push(format!(
-                "Download {} from S3 to a temp file",
+            errors.push(format!(
+                "Redis backup location '{}' is neither a WAL-G prefix nor a current .rdb.gz object.",
                 resolved_location
             ));
-            steps.push(format!(
-                "Extract dump.rdb / appendonly.aof and copy into {}'s volume",
-                container_name
-            ));
-            steps.push(format!(
-                "Restart {} to load the restored data",
-                container_name
-            ));
-            if matches!(mode, RestoreRequestMode::InPlace) {
-                *destructive = true;
-            }
         }
     }
 }
@@ -1956,6 +2627,7 @@ async fn resolve_backup_location_from_s3(
     s3_source: &temps_entities::s3_sources::Model,
     engine: &str,
     origin_service_name: &str,
+    backup_uuid: &str,
 ) -> Result<Option<String>, anyhow::Error> {
     let bucket = &s3_source.bucket_name;
     // Mirror the path convention backup_external_service writes to:
@@ -1995,8 +2667,18 @@ async fn resolve_backup_location_from_s3(
         )));
     }
 
-    // 2) pg_dump / rdb / mongodump — pick the newest matching object under
-    //    the service prefix.
+    // 2) pg_dump / rdb / mongodump / mariadb — every non-WAL-G engine writes
+    //    its artifact under `<service_prefix>.../<backup_uuid>/<filename>`
+    //    (see `v2_common::build_external_service_s3_key`, where `backup_uuid`
+    //    is `backups.backup_id`). Scanning the whole service prefix and
+    //    picking the newest matching extension is NOT safe here: a service
+    //    can carry backups from more than one engine/format (e.g. a MariaDB
+    //    physical base and a later logical dump), and "newest of any format"
+    //    can silently return a different backup than the one the caller
+    //    selected. Require the object's key to contain this exact backup's
+    //    own uuid path segment, so the resolver can only ever return the
+    //    artifact that this specific backup wrote.
+    let uuid_segment = format!("/{}/", backup_uuid);
     let mut best: Option<(String, aws_sdk_s3::primitives::DateTime)> = None;
     let mut continuation: Option<String> = None;
     loop {
@@ -2016,11 +2698,15 @@ async fn resolve_backup_location_from_s3(
             if key.contains("/walg/") {
                 continue;
             }
+            if !key.contains(&uuid_segment) {
+                continue;
+            }
             if !(key.ends_with(".sql.gz")
                 || key.ends_with(".pgdump.gz")
                 || key.ends_with(".rdb.gz")
                 || key.ends_with(".bson.gz")
-                || key.ends_with(".archive"))
+                || key.ends_with(".archive")
+                || key.ends_with(".mbstream.gz"))
             {
                 continue;
             }
@@ -2049,6 +2735,56 @@ async fn resolve_backup_location_from_s3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_rdb_clone_plan_uses_current_volume_installer() {
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+
+        build_redis_steps(
+            "redis_rdb_restore",
+            &RestoreRequestMode::NewService {
+                name: "cache-clone".to_string(),
+                parameter_overrides: serde_json::json!({}),
+            },
+            "redis-source",
+            "external_services/redis/source/test-backup.rdb.gz",
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        );
+
+        assert!(errors.is_empty());
+        assert!(!destructive);
+        assert!(steps.iter().any(|step| step.contains("redis-cache-clone")));
+        assert!(steps.iter().any(|step| step.contains("appendonlydir")));
+        assert!(!steps.iter().any(|step| step.contains("legacy tar")));
+    }
+
+    #[test]
+    fn redis_unknown_backup_plan_is_rejected() {
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+
+        build_redis_steps(
+            "unsupported",
+            &RestoreRequestMode::NewService {
+                name: "cache-clone".to_string(),
+                parameter_overrides: serde_json::json!({}),
+            },
+            "redis-source",
+            "legacy-backup.tar",
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        );
+
+        assert!(steps.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("neither a WAL-G prefix nor a current .rdb.gz"));
+    }
     use bollard::Docker;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
@@ -2070,6 +2806,370 @@ mod tests {
         assert_eq!(slugify("My Restored DB!!"), "my-restored-db");
         assert_eq!(slugify("   leading   "), "leading");
         assert_eq!(slugify("UPPER_case"), "upper-case");
+    }
+
+    // ---- MariaDB restore plan -------------------------------------------
+
+    #[test]
+    fn engine_container_name_matches_mariadb_provider_convention() {
+        // Must equal MariaDbService::get_container_name() and the container
+        // dispatch.rs probes; a mismatch silently produces a plan naming a
+        // container that doesn't exist.
+        assert_eq!(engine_container_name("mariadb", "orders"), "mariadb-orders");
+    }
+
+    fn mariadb_steps(
+        strategy: &str,
+        mode: &RestoreRequestMode,
+        location: &str,
+    ) -> (Vec<String>, bool, Vec<String>) {
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+        build_mariadb_steps(
+            strategy,
+            mode,
+            "mariadb-orders",
+            location,
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        );
+        (steps, destructive, errors)
+    }
+
+    #[test]
+    fn mariadb_physical_in_place_is_destructive_and_describes_the_copy_back() {
+        let (steps, destructive, errors) = mariadb_steps(
+            "mariadb_physical_restore",
+            &RestoreRequestMode::InPlace,
+            "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz",
+        );
+        assert!(destructive, "replacing the datadir in place is destructive");
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        let joined = steps.join("\n");
+        assert!(joined.contains("mbstream"));
+        assert!(joined.contains("--prepare"));
+        assert!(joined.contains("--copy-back"));
+        assert!(
+            joined.contains("mysql` system schema"),
+            "the plan must warn that the source's credentials come with the datadir"
+        );
+    }
+
+    #[test]
+    fn mariadb_physical_new_service_is_not_destructive() {
+        let (steps, destructive, errors) = mariadb_steps(
+            "mariadb_physical_restore",
+            &RestoreRequestMode::NewService {
+                name: "orders-copy".into(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz",
+        );
+        assert!(!destructive);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(steps.iter().any(|s| s.contains("mariadb-orders-copy")));
+    }
+
+    #[test]
+    fn mariadb_pitr_in_place_is_destructive_but_to_new_service_is_not() {
+        let target = RecoveryTarget::Time { time: Utc::now() };
+        let location = "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz";
+
+        let (steps, destructive, errors) = mariadb_steps(
+            "mariadb_physical_restore",
+            &RestoreRequestMode::Pitr {
+                to_new_service: false,
+                new_service_name: None,
+                target: target.clone(),
+            },
+            location,
+        );
+        assert!(destructive);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(steps.iter().any(|s| s.contains("--stop-datetime")));
+        assert!(steps.iter().any(|s| s.contains("manifest.json")));
+
+        let (steps, destructive, errors) = mariadb_steps(
+            "mariadb_physical_restore",
+            &RestoreRequestMode::Pitr {
+                to_new_service: true,
+                new_service_name: Some("orders-pitr".into()),
+                target,
+            },
+            location,
+        );
+        assert!(!destructive, "provisioning a sibling touches no live data");
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(steps.iter().any(|s| s.contains("mariadb-orders-pitr")));
+    }
+
+    #[test]
+    fn mariadb_pitr_rejects_targets_the_engine_cannot_honor() {
+        // `recovery_target_to_stop_flag` fails fast on Xid and Name, so the
+        // preview must surface them as errors, not as steps.
+        for target in [
+            RecoveryTarget::Xid { xid: "42".into() },
+            RecoveryTarget::Name {
+                name: "before-migration".into(),
+            },
+        ] {
+            let (_steps, _destructive, errors) = mariadb_steps(
+                "mariadb_physical_restore",
+                &RestoreRequestMode::Pitr {
+                    to_new_service: false,
+                    new_service_name: None,
+                    target,
+                },
+                "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz",
+            );
+            assert_eq!(errors.len(), 1, "expected exactly one error: {:?}", errors);
+        }
+    }
+
+    #[test]
+    fn pitr_location_guard_is_engine_aware() {
+        let physical = "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz";
+        let dump = "external_services/mariadb/orders/2026/05/01/uuid/dump.sql.gz";
+        let walg = "s3://bucket/walg/basebackups_005/base_0000";
+
+        // The regression: a MariaDB physical base is a BARE key, so the
+        // Postgres-shaped `s3://` test rejected every MariaDB PITR at the door.
+        validate_pitr_backup_location("mariadb", physical)
+            .expect("physical MariaDB base must be accepted for PITR");
+        validate_pitr_backup_location("MariaDB", physical)
+            .expect("engine match is case-insensitive");
+
+        let err = validate_pitr_backup_location("mariadb", dump)
+            .expect_err("a logical dump cannot anchor a forward-roll");
+        assert!(
+            matches!(&err, RestoreError::Validation { message } if message.contains("physical (mariadb-backup)")),
+            "MariaDB must get a MariaDB-shaped error, not a WAL-G one: {:?}",
+            err
+        );
+
+        validate_pitr_backup_location("postgres", walg).expect("WAL-G base still accepted");
+        let err = validate_pitr_backup_location("postgres", dump)
+            .expect_err("pg_dump cannot anchor a forward-roll");
+        assert!(
+            matches!(&err, RestoreError::Validation { message } if message.contains("WAL-G")),
+            "got {:?}",
+            err
+        );
+    }
+
+    /// Regression: `MariadbPhysicalEngine` writes a WAL-G repository, not a
+    /// `base.mbstream.gz` object. Testing only the legacy layout rejected
+    /// every PITR restore of every backup the current engine produces, with
+    /// HTTP 400 at `startRestore` — before the engine (which handles the
+    /// repository layout fine) was ever reached.
+    #[test]
+    fn pitr_location_guard_accepts_a_walg_repository_base() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+
+        validate_pitr_backup_location("mariadb", repository)
+            .expect("a MariaDB WAL-G repository base must be accepted for PITR");
+        validate_pitr_backup_location("MariaDB", &format!("{repository}/"))
+            .expect("a trailing slash must not change the classification");
+    }
+
+    /// A WAL-G repository restore streams the whole datadir back — including
+    /// the `mysql` system schema — exactly like the legacy mbstream base, so
+    /// it must take the same credential-propagation path. Leaving it on the
+    /// logical-dump path would skip patching the target's stored password
+    /// after a cross-service restore and lock the operator out via UI/CLI.
+    #[test]
+    fn credential_gates_treat_a_walg_repository_as_physical() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+        assert_eq!(
+            credential_propagation_gates("mariadb", repository),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("mariadb", &format!("{repository}/")),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn credential_gates_split_mariadb_by_backup_format() {
+        let physical = "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz";
+        let dump = "external_services/mariadb/orders/2026/05/01/uuid/dump.sql.gz";
+
+        // Physical: datadir swap replaces `mysql.user`, so both the pre-restore
+        // merge and the post-restore password patch are required.
+        assert_eq!(
+            credential_propagation_gates("mariadb", physical),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("MariaDB", physical),
+            (true, true)
+        );
+
+        // Logical dump: `mysql` schema is excluded from the dump, so the
+        // target's credentials never change — merging would make the engine
+        // authenticate with the origin's password and would then overwrite the
+        // target's stored password with a credential it never had.
+        assert_eq!(
+            credential_propagation_gates("mariadb", dump),
+            (false, false)
+        );
+        // Unknown/legacy empty location is treated as non-physical.
+        assert_eq!(credential_propagation_gates("mariadb", ""), (false, false));
+
+        // Other engines are unchanged by the MariaDB format split.
+        assert_eq!(
+            credential_propagation_gates("postgres", "s3://bucket/walg/base"),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("postgres", "backups/x.sql.gz"),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("mongodb", "backups/x.archive.gz"),
+            (true, false)
+        );
+        assert_eq!(
+            credential_propagation_gates("redis", "backups/dump.rdb"),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn mariadb_dump_restore_has_no_pitr_and_preserves_target_credentials() {
+        let location = "external_services/mariadb/orders/2026/05/01/uuid/dump.sql.gz";
+
+        let (steps, destructive, errors) = mariadb_steps(
+            "mariadb_dump_restore",
+            &RestoreRequestMode::InPlace,
+            location,
+        );
+        assert!(destructive);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(
+            steps.iter().any(|s| s.contains("excludes the `mysql`")),
+            "the plan must state that a logical dump does NOT carry credentials"
+        );
+
+        let (_steps, _destructive, errors) = mariadb_steps(
+            "mariadb_dump_restore",
+            &RestoreRequestMode::Pitr {
+                to_new_service: false,
+                new_service_name: None,
+                target: RecoveryTarget::Time { time: Utc::now() },
+            },
+            location,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("no binlog anchor"), "{:?}", errors);
+    }
+
+    #[test]
+    fn mariadb_unclassifiable_location_errors_rather_than_guessing() {
+        let (_steps, _destructive, errors) = mariadb_steps(
+            "unsupported",
+            &RestoreRequestMode::InPlace,
+            "external_services/mariadb/orders/some/random/key",
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("base.mbstream.gz"), "{:?}", errors);
+    }
+
+    // ---- PITR out-of-range recovery target validation -------------------
+    //
+    // Regression coverage for the gap a live PITR restore against a real
+    // WAL-G backup exposed: before this validation existed, a
+    // `recovery_target_time` before the backup's own `started_at` was
+    // silently accepted by the API (202), silently accepted by PostgreSQL
+    // itself (no FATAL — recovery just stops at the earliest reachable
+    // point), and the restore run came back `status: "completed"` having
+    // silently discarded the caller's actual requested target. These tests
+    // pin the fix: `validate_pitr_recovery_target` must reject that case
+    // before the run is ever persisted or a container touched.
+
+    #[test]
+    fn pitr_target_before_backup_start_is_rejected() {
+        let backup_started_at = chrono::DateTime::parse_from_rfc3339("2026-08-09T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let target_before_backup = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let target = RecoveryTarget::Time {
+            time: target_before_backup,
+        };
+
+        let err = validate_pitr_recovery_target(&target, Some(backup_started_at))
+            .expect_err("a target years before the backup started must be rejected");
+        match err {
+            RestoreError::Validation { message } => {
+                assert!(
+                    message.contains("before this backup started"),
+                    "got: {}",
+                    message
+                );
+            }
+            other => panic!("expected Validation error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pitr_target_at_or_after_backup_start_is_accepted() {
+        let backup_started_at = chrono::DateTime::parse_from_rfc3339("2026-08-09T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Exactly at the backup start — the boundary case must NOT be
+        // rejected (nothing before it is out of range, this is in range).
+        let at_start = RecoveryTarget::Time {
+            time: backup_started_at,
+        };
+        assert!(validate_pitr_recovery_target(&at_start, Some(backup_started_at)).is_ok());
+
+        // A minute after the backup started — the ordinary in-range case.
+        let after_start = RecoveryTarget::Time {
+            time: backup_started_at + chrono::Duration::minutes(1),
+        };
+        assert!(validate_pitr_recovery_target(&after_start, Some(backup_started_at)).is_ok());
+    }
+
+    #[test]
+    fn pitr_target_validation_skipped_when_backup_start_unknown() {
+        // Orphan restores (backup discovered by S3 scan, no DB row) have no
+        // known `started_at` to range-check against — must not fail closed
+        // on missing metadata, just skip the check.
+        let target = RecoveryTarget::Time {
+            time: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert!(validate_pitr_recovery_target(&target, None).is_ok());
+    }
+
+    #[test]
+    fn pitr_target_validation_only_applies_to_time_targets() {
+        // Xid/Lsn/Name targets have no comparable ordering against
+        // `started_at` — the check must be a no-op for them, not panic or
+        // spuriously reject.
+        let backup_started_at = Utc::now();
+        for target in [
+            RecoveryTarget::Xid {
+                xid: "12345".into(),
+            },
+            RecoveryTarget::Lsn {
+                lsn: "0/3000000".into(),
+            },
+            RecoveryTarget::Name {
+                name: "before-migration".into(),
+            },
+        ] {
+            assert!(validate_pitr_recovery_target(&target, Some(backup_started_at)).is_ok());
+        }
     }
 
     #[test]
@@ -2169,6 +3269,92 @@ mod tests {
             dns_registry,
         ));
         RestoreService::new(db, mgr, enc)
+    }
+
+    fn make_producer_row(
+        id: i32,
+        backup_id: i32,
+        service_id: i32,
+    ) -> temps_entities::external_service_backups::Model {
+        temps_entities::external_service_backups::Model {
+            id,
+            service_id,
+            backup_id,
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: Some(1024),
+            s3_location: format!("s3://bucket/{backup_id}/{service_id}"),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            service_name_snapshot: Some(format!("service-{service_id}")),
+            service_type_snapshot: Some("postgres".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backup_source_services_for_backups_dedupes_and_preserves_ownerless() {
+        // Arrange: backup 10 has two producer services (one duplicate), while
+        // backup 20 is raw/control-plane and therefore ownerless.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    make_producer_row(1, 10, 8),
+                    make_producer_row(2, 10, 3),
+                    make_producer_row(3, 10, 8),
+                ]])
+                .into_connection(),
+        );
+        let service = build_restore_service(db);
+
+        // Act.
+        let mappings = service
+            .backup_source_services_for_backups(&[20, 10, 20])
+            .await
+            .expect("producer mappings should resolve");
+
+        // Assert.
+        assert_eq!(
+            mappings,
+            vec![
+                BackupProducerServices {
+                    backup_id: 10,
+                    service_ids: vec![3, 8],
+                },
+                BackupProducerServices {
+                    backup_id: 20,
+                    service_ids: vec![],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_source_services_for_backups_database_error_is_typed() {
+        // Arrange.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "restore producer lookup failed".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = build_restore_service(db);
+
+        // Act.
+        let error = service
+            .backup_source_services_for_backups(&[10])
+            .await
+            .expect_err("producer query error must remain typed");
+
+        // Assert.
+        assert!(matches!(error, RestoreError::Database(_)));
+        assert!(error.to_string().contains("restore producer lookup failed"));
     }
 
     #[tokio::test]
@@ -2288,6 +3474,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "eu-central-1".into(),
             endpoint: Some("http://localhost:9000".into()),
             bucket_name: "b".into(),
@@ -2304,6 +3491,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: Some("minio.example.com:9000".into()),
             bucket_name: "b".into(),
@@ -2315,5 +3503,376 @@ mod tests {
         // in a stable way across minor versions, so we check behavior via
         // construction success.
         let _client = build_s3_client(&creds);
+    }
+
+    // ---- Backup-location repair against a REAL MinIO (docker-tests) ------
+    //
+    // `resolve_backup_location_from_s3` is the repair path for `backups` rows
+    // whose `s3_location` was never populated. It is private, so it can only be
+    // exercised from in-crate tests — and it is pure S3 listing, so mocking the
+    // S3 client would only test the mock. These tests boot a real MinIO,
+    // seed real objects at the real key shapes the engines write, and call the
+    // real function.
+
+    #[cfg(feature = "docker-tests")]
+    const LOCATION_TEST_MINIO_ACCESS_KEY: &str = "minioadmin";
+    #[cfg(feature = "docker-tests")]
+    const LOCATION_TEST_MINIO_SECRET_KEY: &str = "minioadmin";
+
+    /// RAII reaper for the MinIO container booted by the location-resolution
+    /// tests. Mirrors `tests/mariadb_pitr_e2e.rs::ContainerGuard`; requires a
+    /// multi-thread test runtime because it drives Docker from `Drop`.
+    #[cfg(feature = "docker-tests")]
+    struct MinioGuard {
+        docker: Docker,
+        id: String,
+    }
+
+    #[cfg(feature = "docker-tests")]
+    impl Drop for MinioGuard {
+        fn drop(&mut self) {
+            let docker = self.docker.clone();
+            let id = self.id.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            let _ = docker
+                                .remove_container(
+                                    &id,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        v: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await;
+                            eprintln!("Reaped MinIO container {id}");
+                        });
+                    });
+                }
+            }));
+        }
+    }
+
+    /// Boot a MinIO container for the location-resolution tests, returning
+    /// `(host_port, guard)`. Returns `None` (graceful skip) whenever Docker is
+    /// unreachable or the image cannot be pulled — never panics on missing
+    /// infrastructure.
+    #[cfg(feature = "docker-tests")]
+    async fn boot_location_test_minio() -> Option<(u16, MinioGuard)> {
+        use futures::StreamExt;
+        use std::collections::HashMap;
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Docker unavailable (connect failed), skipping: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            eprintln!("Docker socket unreachable (ping failed), skipping: {e}");
+            return None;
+        }
+
+        let mut stream = docker.create_image(
+            Some(bollard::query_parameters::CreateImageOptions {
+                from_image: Some("minio/minio".to_string()),
+                tag: Some("latest".to_string()),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                eprintln!("Could not pull MinIO image, skipping: {e}");
+                return None;
+            }
+        }
+
+        let port = {
+            use std::net::TcpListener;
+            (9400..9600).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())?
+        };
+        let name = format!("temps-test-restore-loc-minio-{}", uuid::Uuid::new_v4());
+
+        let config = bollard::models::ContainerCreateBody {
+            image: Some("minio/minio:latest".to_string()),
+            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+            env: Some(vec![
+                format!("MINIO_ROOT_USER={LOCATION_TEST_MINIO_ACCESS_KEY}"),
+                format!("MINIO_ROOT_PASSWORD={LOCATION_TEST_MINIO_SECRET_KEY}"),
+            ]),
+            host_config: Some(bollard::models::HostConfig {
+                port_bindings: Some(HashMap::from([(
+                    "9000/tcp".to_string(),
+                    Some(vec![bollard::models::PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: Some(port.to_string()),
+                    }]),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let created = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&name)
+                        .build(),
+                ),
+                config,
+            )
+            .await
+            .ok()?;
+        let guard = MinioGuard {
+            docker: docker.clone(),
+            id: created.id.clone(),
+        };
+        docker
+            .start_container(
+                &created.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .ok()?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Some((port, guard))
+    }
+
+    /// An `s3_sources::Model` pointing at the local MinIO with an empty
+    /// `bucket_path`, matching the row shape `run_pitr_flow` inserts.
+    #[cfg(feature = "docker-tests")]
+    fn location_test_s3_source(port: u16, bucket: &str) -> temps_entities::s3_sources::Model {
+        temps_entities::s3_sources::Model {
+            id: 1,
+            name: "loc-test-s3".to_string(),
+            backing_service_id: None,
+            bucket_name: bucket.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{port}")),
+            bucket_path: String::new(),
+            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: true,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// REGRESSION (Greptile findings on PR #878, two rounds):
+    ///
+    /// 1. A legacy MariaDB *physical* backup row with an empty `s3_location`
+    ///    was undiscoverable, because the extension allowlist in
+    ///    `resolve_backup_location_from_s3` did not include `.mbstream.gz`.
+    ///    That made the backup permanently unrestorable through the repair
+    ///    path — a data-safety bug, not a cosmetic one.
+    /// 2. After (1) was fixed, the resolver still picked the *newest matching
+    ///    object of any format* under the service prefix — so a service with
+    ///    both a physical base and a later logical dump would silently
+    ///    substitute the dump for a physical backup row, restoring the wrong
+    ///    snapshot and format. The fix scopes every non-WAL-G lookup to the
+    ///    calling backup's own `<backup_uuid>/` path segment (`backups.backup_id`,
+    ///    the same uuid every engine already writes its artifact under —
+    ///    see `v2_common::build_external_service_s3_key`), so the resolver can
+    ///    only ever return that specific backup's own object.
+    ///
+    /// This seeds the exact key shape a physical base occupies in a real
+    /// bucket and asserts the resolver now finds it; seeds a logical
+    /// `dump.sql.gz` under a *different* service prefix and asserts that one
+    /// still resolves (the extension fix is additive, not a swap); and seeds
+    /// a physical base and a NEWER logical dump under the SAME service
+    /// prefix with different backup uuids, asserting each backup's own uuid
+    /// resolves to its own artifact rather than the newer one winning.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
+        // ---- Arrange: real MinIO + real objects at real key shapes --------
+        let Some((port, _minio_guard)) = boot_location_test_minio().await else {
+            return;
+        };
+        let bucket = "restore-location-test";
+        let s3_source = location_test_s3_source(port, bucket);
+        let s3_client = build_s3_client(&S3Credentials {
+            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: bucket.to_string(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        });
+        if let Err(e) = s3_client.create_bucket().bucket(bucket).send().await {
+            eprintln!("Could not create MinIO bucket, skipping: {e}");
+            return;
+        }
+
+        let physical_service = "orders-physical";
+        let logical_service = "orders-logical";
+        let physical_uuid = uuid::Uuid::new_v4().to_string();
+        let logical_uuid = uuid::Uuid::new_v4().to_string();
+        let physical_key = format!(
+            "external_services/mariadb/{physical_service}/2026/01/01/{physical_uuid}/base.mbstream.gz"
+        );
+        let logical_key = format!(
+            "external_services/mariadb/{logical_service}/2026/01/01/{logical_uuid}/dump.sql.gz"
+        );
+        // Engines always write a `metadata.json` companion next to the
+        // artifact; seeding it proves the resolver picks the artifact and not
+        // its sidecar.
+        for key in [
+            physical_key.clone(),
+            logical_key.clone(),
+            physical_key.replace("base.mbstream.gz", "metadata.json"),
+            logical_key.replace("dump.sql.gz", "metadata.json"),
+        ] {
+            if let Err(e) = s3_client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+                .send()
+                .await
+            {
+                eprintln!("Could not seed object {key}, skipping: {e}");
+                return;
+            }
+        }
+
+        // ---- Act + Assert: physical base is now discoverable --------------
+        let physical = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            physical_service,
+            &physical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error");
+        eprintln!("resolved physical location = {physical:?}");
+        let physical = physical.expect(
+            "a .mbstream.gz physical base must be discoverable; before the \
+             extension-allowlist fix this returned None and the backup was unrestorable",
+        );
+        assert!(
+            physical.ends_with("base.mbstream.gz"),
+            "resolver must return the physical base artifact, got {physical}"
+        );
+        assert_eq!(physical, physical_key, "resolver must return the exact key");
+
+        // ---- Assert: the logical-dump path did not regress ----------------
+        let logical = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            logical_service,
+            &logical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error");
+        eprintln!("resolved logical location = {logical:?}");
+        let logical = logical.expect("a .sql.gz logical dump must stay discoverable");
+        assert_eq!(
+            logical, logical_key,
+            "resolver must return the logical dump artifact unchanged"
+        );
+
+        // ---- Assert: an unknown service still resolves to None ------------
+        let missing = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            "no-such-service",
+            &physical_uuid,
+        )
+        .await
+        .expect("listing an empty prefix must not error");
+        assert!(
+            missing.is_none(),
+            "an empty service prefix must resolve to None, got {missing:?}"
+        );
+
+        // ---- REGRESSION (round 2): same service, two backups of different
+        //      formats and different ages — the resolver must not let the
+        //      newer one win when a specific backup's own uuid is given. ---
+        let shared_service = "orders-mixed-formats";
+        let older_physical_uuid = uuid::Uuid::new_v4().to_string();
+        let newer_logical_uuid = uuid::Uuid::new_v4().to_string();
+        let older_physical_key = format!(
+            "external_services/mariadb/{shared_service}/2026/01/01/{older_physical_uuid}/base.mbstream.gz"
+        );
+        let newer_logical_key = format!(
+            "external_services/mariadb/{shared_service}/2026/01/02/{newer_logical_uuid}/dump.sql.gz"
+        );
+        // Seed the OLDER physical object first, then the NEWER logical
+        // object second, so a naive "pick whatever S3 reports as most
+        // recently modified" implementation would pick the logical one.
+        if let Err(e) = s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(&older_physical_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+            .send()
+            .await
+        {
+            eprintln!("Could not seed object {older_physical_key}, skipping: {e}");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Err(e) = s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(&newer_logical_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+            .send()
+            .await
+        {
+            eprintln!("Could not seed object {newer_logical_key}, skipping: {e}");
+            return;
+        }
+
+        let resolved_for_older = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            shared_service,
+            &older_physical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error")
+        .expect("the older physical backup's own artifact must still be discoverable by its uuid");
+        eprintln!("resolved (older physical uuid) = {resolved_for_older}");
+        assert_eq!(
+            resolved_for_older, older_physical_key,
+            "SECURITY/DATA-SAFETY: resolving the OLDER physical backup's own uuid must return \
+             its own artifact, not the newer logical dump under the same service prefix — \
+             substituting artifacts here means restoring the wrong snapshot in the wrong format"
+        );
+
+        let resolved_for_newer = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            shared_service,
+            &newer_logical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error")
+        .expect("the newer logical backup's own artifact must be discoverable by its uuid");
+        assert_eq!(
+            resolved_for_newer, newer_logical_key,
+            "resolving the newer logical backup's own uuid must return its own artifact"
+        );
     }
 }

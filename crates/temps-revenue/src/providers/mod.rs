@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Provider-agnostic webhook verification and event normalization.
 //!
 //! Adding a new provider = implement [`RevenueProvider`] and register it

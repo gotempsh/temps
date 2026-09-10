@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-projects = { path = "../temps-projects" }
+temps-deployments = { path = "../temps-deployments" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+temps-entities = { path = "../temps-entities" }
+async-trait = { workspace = true }
+sea-orm = { workspace = true }
+chrono = { workspace = true }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::handlers::{configure_public_routes, configure_routes, AppState};
 use crate::services::service::PerformanceService;
 use std::future::Future;
@@ -43,11 +46,17 @@ impl TempsPlugin for PerformancePlugin {
         let performance_service = context.require_service::<PerformanceService>();
         let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let routes = configure_routes().with_state(Arc::new(AppState {
             performance_service,
             route_table,
             ip_address_service,
+            project_access_checker,
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         }));
 
         Some(PluginRoutes::new(routes))
@@ -58,10 +67,19 @@ impl TempsPlugin for PerformancePlugin {
         let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
 
+        // Public ingest routes resolve project/environment/deployment from the
+        // route table (by Host header) or from an ADR-040 ingest key, never
+        // from a caller-supplied project_id, so there is no project scope to
+        // check here.
         let routes = configure_public_routes().with_state(Arc::new(AppState {
             performance_service,
             route_table,
             ip_address_service,
+            project_access_checker: None,
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         }));
 
         Some(PluginRoutes::new(routes))

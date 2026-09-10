@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getSessionDetailsOptions,
   getVisitorDetailsOptions,
@@ -32,6 +35,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { DateRangePicker } from '@/components/ui/date-range-picker'
+import { httpStatusClass } from '@/lib/http-status-class'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -48,7 +52,7 @@ import {
   ChevronRight,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { DateRange } from 'react-day-picker'
@@ -191,11 +195,19 @@ export function SessionDetail({
   }
 
   const getStatusColor = (statusCode: number) => {
-    if (statusCode >= 200 && statusCode < 300) return 'text-green-600'
-    if (statusCode >= 300 && statusCode < 400) return 'text-blue-600'
-    if (statusCode >= 400 && statusCode < 500) return 'text-yellow-600'
-    if (statusCode >= 500) return 'text-red-600'
-    return 'text-gray-600'
+    switch (httpStatusClass(statusCode)) {
+      case '1xx':
+      case '3xx':
+        return 'text-blue-600'
+      case '2xx':
+        return 'text-green-600'
+      case '4xx':
+        return 'text-yellow-600'
+      case '5xx':
+        return 'text-red-600'
+      default:
+        return 'text-gray-600'
+    }
   }
 
   const isLoading = isLoadingSession || isLoadingVisitor

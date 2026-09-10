@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -17,18 +20,34 @@ interface DeploymentActionOptions {
   force?: boolean
 }
 
+/**
+ * Parses the `--project-id`/`--deployment-id` CLI flags into numeric IDs.
+ * Returns null on anything non-numeric so callers can bail out with a clear
+ * warning instead of sending `NaN` into an API path segment.
+ */
+export function parseDeploymentTarget(
+  options: { projectId: string; deploymentId: string }
+): { projectId: number; deploymentId: number } | null {
+  const projectId = parseInt(options.projectId, 10)
+  const deploymentId = parseInt(options.deploymentId, 10)
+  if (isNaN(projectId) || isNaN(deploymentId)) {
+    return null
+  }
+  return { projectId, deploymentId }
+}
+
 export async function cancelDeploymentAction(
   options: DeploymentActionOptions
 ): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projId = parseInt(options.projectId, 10)
-  const deplId = parseInt(options.deploymentId, 10)
-  if (isNaN(projId) || isNaN(deplId)) {
+  const target = parseDeploymentTarget(options)
+  if (!target) {
     warning('Invalid project or deployment ID')
     return
   }
+  const { projectId: projId, deploymentId: deplId } = target
 
   if (!options.force) {
     const confirmed = await promptConfirm({
@@ -60,12 +79,12 @@ export async function pauseDeploymentAction(
   await requireAuth()
   await setupClient()
 
-  const projId = parseInt(options.projectId, 10)
-  const deplId = parseInt(options.deploymentId, 10)
-  if (isNaN(projId) || isNaN(deplId)) {
+  const target = parseDeploymentTarget(options)
+  if (!target) {
     warning('Invalid project or deployment ID')
     return
   }
+  const { projectId: projId, deploymentId: deplId } = target
 
   await withSpinner('Pausing deployment...', async () => {
     const { error } = await pauseDeployment({
@@ -87,12 +106,12 @@ export async function resumeDeploymentAction(
   await requireAuth()
   await setupClient()
 
-  const projId = parseInt(options.projectId, 10)
-  const deplId = parseInt(options.deploymentId, 10)
-  if (isNaN(projId) || isNaN(deplId)) {
+  const target = parseDeploymentTarget(options)
+  if (!target) {
     warning('Invalid project or deployment ID')
     return
   }
+  const { projectId: projId, deploymentId: deplId } = target
 
   await withSpinner('Resuming deployment...', async () => {
     const { error } = await resumeDeployment({
@@ -113,12 +132,12 @@ export async function teardownDeploymentAction(
   await requireAuth()
   await setupClient()
 
-  const projId = parseInt(options.projectId, 10)
-  const deplId = parseInt(options.deploymentId, 10)
-  if (isNaN(projId) || isNaN(deplId)) {
+  const target = parseDeploymentTarget(options)
+  if (!target) {
     warning('Invalid project or deployment ID')
     return
   }
+  const { projectId: projId, deploymentId: deplId } = target
 
   // Get deployment info first
   const deployment = await withSpinner('Fetching deployment...', async () => {

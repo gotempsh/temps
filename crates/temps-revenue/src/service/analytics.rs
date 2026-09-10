@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Analytics service: read-only projections for the dashboard.
 //!
 //! Everything here is project-scoped — `project_id` is always the first

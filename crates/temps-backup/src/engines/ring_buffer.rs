@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bounded ring buffer for capturing the tail of a byte stream.
 //!
 //! Used by backup engines to retain at most N bytes of stdout/stderr from a

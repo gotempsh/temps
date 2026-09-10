@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -174,8 +177,8 @@ impl DnsProviderService for CloudflareDnsProvider {
             .join(".");
 
         info!(
-            "Setting TXT record for zone: {} base_domain: {} name: {} value: {}",
-            zone_id, base_domain, name, value
+            "Setting TXT record for zone: {} base_domain: {} name: {} value: [REDACTED]",
+            zone_id, base_domain, name
         );
 
         // Get all existing TXT records with this name (try both full name and relative name)
@@ -524,9 +527,7 @@ impl CloudflareDnsProvider {
         );
 
         for record in &txt_records {
-            if let dns::DnsContent::TXT { content } = &record.content {
-                info!("  - TXT record id={} value={}", record.id, content);
-            }
+            info!("  - TXT record id={} value=[REDACTED]", record.id);
         }
 
         Ok(txt_records)

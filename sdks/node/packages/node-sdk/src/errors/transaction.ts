@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Transaction, Span, SpanContext, TransactionContext, Event, Measurements } from './types.js';
 
 export class TransactionImpl implements Transaction {

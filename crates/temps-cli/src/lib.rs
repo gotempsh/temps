@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps CLI — library entrypoint.
 //!
 //! Exposes the same dispatch as the OSS `temps` binary so an out-of-tree
@@ -10,9 +13,9 @@ pub mod commands;
 use clap::{Parser, Subcommand};
 use commands::{
     AgentCommand, ApiKeyCommand, BackfillCommand, BackupCommand, BuildCommand, DeployCommand,
-    DoctorCommand, DomainCommand, EdgeCommand, JoinCommand, MigrateCommand, NetworkCommand,
-    NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand,
-    SetupCommand, UpgradeCommand,
+    DoctorCommand, DomainCommand, EdgeCommand, FirecrackerCommand, JoinCommand, MigrateCommand,
+    NetworkCommand, NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand,
+    ServicesCommand, SetupCommand, UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -59,7 +62,7 @@ pub enum Commands {
     ApiKey(ApiKeyCommand),
     /// Backup management commands
     Backup(BackupCommand),
-    /// One-shot data migration utilities (e.g. TimescaleDB → ClickHouse)
+    /// One-shot data migration utilities (TimescaleDB → ClickHouse, spans → Temps Cloud)
     Backfill(BackfillCommand),
     /// Manage platform services (KV, Blob)
     Services(ServicesCommand),
@@ -86,6 +89,8 @@ pub enum Commands {
     Edge(EdgeCommand),
     /// Manage standalone sandboxes via the Vercel-compatible `/v1/sandbox/*` API
     Sandbox(SandboxCommand),
+    /// Provision and manage the Firecracker microVM sandbox backend
+    Firecracker(FirecrackerCommand),
 }
 
 /// Install the global tracing subscriber. Safe to call once per process.
@@ -124,6 +129,9 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_providers={level},\
              temps_audit={level},\
              temps_backup={level},\
+             temps_cloud={level},\
+             temps_cloud_client={level},\
+             temps_cloud_protocol={level},\
              temps_config={level},\
              temps_analytics={level},\
              temps_notifications={level},\
@@ -172,6 +180,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_ai_chat={level},\
              temps_ai_api_tools={level},\
              temps_agents={level},\
+             temps_sandbox={level},\
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\
@@ -200,9 +209,35 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
             .boxed(),
     };
 
-    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(ErrorMetricsLayer);
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
+}
+
+/// Tracing layer that counts ERROR-level events for the anonymous
+/// `error_summary` telemetry event (see `temps_core::error_metrics`).
+///
+/// Records ONLY the event's target — the module path, a compile-time
+/// identifier of our own code. The message and all fields are ignored, so no
+/// user data (IDs, paths, resource names embedded in error messages) can
+/// reach telemetry. Counting is in-memory and bounded; nothing leaves the
+/// process unless the serve command's telemetry flusher is running and the
+/// operator hasn't opted out.
+struct ErrorMetricsLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorMetricsLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() == tracing::Level::ERROR {
+            temps_core::error_metrics::record_log_error(event.metadata().target());
+        }
+    }
 }
 
 // Re-exported so embedding binaries build their UI bundle with the exact
@@ -233,10 +268,26 @@ pub fn dispatch(
     cli: Cli,
     extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
 ) -> anyhow::Result<()> {
+    dispatch_with_ip_gate(cli, extra_plugins, None)
+}
+
+/// `dispatch`, plus an optional project IP gate for the `proxy` subcommand.
+///
+/// A standalone `temps proxy` has no plugin lifecycle, so the extension point
+/// the console uses to install a gate does not exist there. This is the
+/// equivalent seam for that process: an embedding binary that knows how to
+/// build a gate passes one, and split-topology proxy nodes then enforce
+/// project IP rules exactly as the single-binary mode does. `dispatch`
+/// passes `None`, leaving the open gate in place.
+pub fn dispatch_with_ip_gate(
+    cli: Cli,
+    extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+    ip_gate_builder: Option<commands::proxy::ProjectIpGateBuilder>,
+) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
         Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
-        Commands::Proxy(proxy_cmd) => proxy_cmd.execute(),
+        Commands::Proxy(proxy_cmd) => proxy_cmd.execute_with_ip_gate(ip_gate_builder),
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::Migrate(migrate_cmd) => migrate_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
@@ -255,6 +306,7 @@ pub fn dispatch(
         Commands::Network(network_cmd) => network_cmd.execute(),
         Commands::Edge(edge_cmd) => edge_cmd.execute(),
         Commands::Sandbox(sandbox_cmd) => sandbox_cmd.execute(),
+        Commands::Firecracker(firecracker_cmd) => firecracker_cmd.execute(),
     }
 }
 
@@ -403,4 +455,171 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
     dispatch(cli, extra_plugins)
+}
+
+#[cfg(test)]
+mod error_metrics_layer_tests {
+    use super::*;
+    use temps_core::error_metrics::{self, CATEGORY_LOG_ERROR};
+
+    /// The layer must count ERROR events by target and ignore every other
+    /// level. Targets are unique to this test so parallel tests can't
+    /// interfere via the global counter store.
+    #[test]
+    fn counts_only_error_level_events_by_target() {
+        let subscriber = tracing_subscriber::registry().with(ErrorMetricsLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: "layer_test_error_target",
+                "message with user data {} that must never be recorded",
+                "/home/alice/secret"
+            );
+            tracing::error!(target: "layer_test_error_target", "second error");
+            tracing::warn!(target: "layer_test_warn_target", "not counted");
+            tracing::info!(target: "layer_test_info_target", "not counted");
+        });
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_error_target"),
+            2
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_warn_target"),
+            0
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_info_target"),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod command_tree_tests {
+    use std::collections::BTreeSet;
+
+    use clap::{error::ErrorKind, Command, CommandFactory};
+
+    use super::Cli;
+
+    fn leaf_paths(command: &Command, prefix: &[String], paths: &mut BTreeSet<String>) {
+        let visible_subcommands: Vec<&Command> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .collect();
+
+        if visible_subcommands.is_empty() {
+            if !prefix.is_empty() {
+                paths.insert(prefix.join(" "));
+            }
+            return;
+        }
+
+        for subcommand in visible_subcommands {
+            let mut next = prefix.to_vec();
+            next.push(subcommand.get_name().to_string());
+            leaf_paths(subcommand, &next, paths);
+        }
+    }
+
+    fn expected_leaf_paths() -> BTreeSet<String> {
+        [
+            "agent",
+            "api-key",
+            "backfill clickhouse",
+            "backfill cloud-telemetry",
+            "backup list",
+            "backup restore",
+            "backup restore-service",
+            "build",
+            "deploy git",
+            "deploy image",
+            "deploy static",
+            "doctor",
+            "domain add",
+            "domain cert-status",
+            "domain delete",
+            "domain import",
+            "domain list",
+            "domain order cancel",
+            "domain order create",
+            "domain order finalize",
+            "domain order list",
+            "domain order show",
+            "domain provision",
+            "domain show",
+            "edge",
+            "firecracker setup",
+            "join",
+            "migrate",
+            "network diag",
+            "network peers",
+            "network setup-multi-node",
+            "network status",
+            "node drain",
+            "node list",
+            "node remove",
+            "node show",
+            "node undrain",
+            "proxy",
+            "reset-admin-password",
+            "sandbox create",
+            "sandbox exec",
+            "sandbox list",
+            "sandbox show",
+            "sandbox stop",
+            "serve",
+            "services blob disable",
+            "services blob enable",
+            "services blob status",
+            "services kv disable",
+            "services kv enable",
+            "services kv status",
+            "setup",
+            "upgrade",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_is_in_the_audited_inventory() {
+        Cli::command().debug_assert();
+        let command = Cli::command();
+
+        let mut actual = BTreeSet::new();
+        leaf_paths(&command, &[], &mut actual);
+
+        let expected = expected_leaf_paths();
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "CLI command inventory drifted; missing={missing:?}, unexpected={unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_renders_help_without_running_side_effects() {
+        let command = Cli::command();
+        let mut paths = BTreeSet::new();
+        leaf_paths(&command, &[], &mut paths);
+
+        for path in paths {
+            let mut argv = vec!["temps".to_string()];
+            argv.extend(path.split_whitespace().map(str::to_string));
+            argv.push("--help".to_string());
+
+            let error = Cli::command()
+                .try_get_matches_from(argv)
+                .expect_err("--help must short-circuit command execution");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelp,
+                "`temps {path} --help` did not render help: {error}"
+            );
+        }
+    }
 }

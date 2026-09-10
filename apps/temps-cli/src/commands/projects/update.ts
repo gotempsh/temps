@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -11,7 +14,8 @@ import {
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, warning, error, keyValue } from '../../ui/output.js'
+import { fetchGitConnections, findRepositoryByName } from '../../lib/git-connection.js'
 
 export async function updateProjectAction(
   options: { project?: string; name?: string; json?: boolean; yes?: boolean }
@@ -96,13 +100,41 @@ export async function updateProjectAction(
 export async function updateSettingsAction(
   options: {
     project?: string
+    name?: string
     slug?: string
     attackMode?: boolean
     previewEnvs?: boolean
+    vulnerabilityScanning?: boolean
+    imageRetentionHours?: string
+    resetImageRetention?: boolean
     json?: boolean
     yes?: boolean
   }
 ): Promise<void> {
+  // Validate arguments before authenticating or hitting the network, so a
+  // typo'd flag fails immediately instead of after a project lookup.
+  //
+  // Tri-state, matching the PATCH contract: `undefined` leaves the value
+  // unchanged, `null` clears the override back to the system default, and a
+  // number sets an explicit per-project window.
+  let imageRetentionHours: number | null | undefined
+  if (options.resetImageRetention && options.imageRetentionHours !== undefined) {
+    throw new Error(
+      'Pass either --image-retention-hours or --reset-image-retention, not both'
+    )
+  }
+  if (options.resetImageRetention) {
+    imageRetentionHours = null
+  } else if (options.imageRetentionHours !== undefined) {
+    const parsed = Number(options.imageRetentionHours)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 8760) {
+      throw new Error(
+        `--image-retention-hours must be a whole number between 1 and 8760 (got "${options.imageRetentionHours}")`
+      )
+    }
+    imageRetentionHours = parsed
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -141,16 +173,31 @@ export async function updateSettingsAction(
   })
 
   // Collect settings interactively if not provided via options
+  let name = options.name
   let slug = options.slug
   let attackMode = options.attackMode
   let previewEnvs = options.previewEnvs
+  let vulnerabilityScanning = options.vulnerabilityScanning
 
   // Only prompt if no flags provided AND not in automation mode
-  if (slug === undefined && attackMode === undefined && previewEnvs === undefined && !options.yes) {
+  if (
+    name === undefined &&
+    slug === undefined &&
+    attackMode === undefined &&
+    previewEnvs === undefined &&
+    vulnerabilityScanning === undefined &&
+    imageRetentionHours === undefined &&
+    !options.yes
+  ) {
     newline()
     header('Update Project Settings')
     info(`Current settings for "${project.name}"`)
     newline()
+
+    name = await promptText({
+      message: 'Project name (display name)',
+      default: project.name,
+    })
 
     slug = await promptText({
       message: 'Project slug (URL-friendly identifier)',
@@ -166,6 +213,12 @@ export async function updateSettingsAction(
       message: 'Enable preview environments for branches?',
       default: project.enable_preview_environments ?? false,
     })
+
+    vulnerabilityScanning = await promptConfirm({
+      message:
+        'Enable vulnerability scanning (Trivy scans of deployed Docker images, post-deploy + daily)?',
+      default: project.vulnerability_scanning_enabled ?? false,
+    })
   }
 
   const updated = await withSpinner('Updating project settings...', async () => {
@@ -173,9 +226,17 @@ export async function updateSettingsAction(
       client,
       path: { project_id: project.id },
       body: {
+        name: name ?? undefined,
         slug: slug ?? undefined,
         attack_mode: attackMode ?? undefined,
         enable_preview_environments: previewEnvs ?? undefined,
+        vulnerability_scanning_enabled: vulnerabilityScanning ?? undefined,
+        // Only include the key when the user actually asked to change it —
+        // sending `null` unconditionally would silently reset every project
+        // to the system default.
+        ...(imageRetentionHours !== undefined
+          ? { image_retention_hours: imageRetentionHours }
+          : {}),
       },
     })
     if (error) {
@@ -190,9 +251,38 @@ export async function updateSettingsAction(
   }
 
   success('Project settings updated successfully')
-  keyValue('Slug', slug ?? project.slug)
+  // Report what the server persisted, not what was submitted: it trims the name
+  // and slugifies the slug, so echoing the request can show a value that was
+  // never stored.
+  keyValue('Name', updated?.name ?? name ?? project.name)
+  keyValue('Slug', updated?.slug ?? slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))
+  keyValue(
+    'Vulnerability Scanning',
+    (updated?.vulnerability_scanning_enabled ??
+      vulnerabilityScanning ??
+      project.vulnerability_scanning_enabled)
+      ? colors.success('Enabled')
+      : colors.muted('Disabled')
+  )
+
+  const effectiveRetention =
+    imageRetentionHours !== undefined
+      ? imageRetentionHours
+      : (updated?.image_retention_hours ?? null)
+  keyValue(
+    'Image Retention',
+    effectiveRetention === null
+      ? colors.muted('System default')
+      : `${effectiveRetention}h`
+  )
+  if (effectiveRetention !== null && effectiveRetention < 48) {
+    warning(
+      `Rollback is only possible while a deployment's image still exists. ` +
+        `At ${effectiveRetention}h, deployments older than that can no longer be rolled back to.`
+    )
+  }
 }
 
 export async function updateGitAction(
@@ -203,6 +293,7 @@ export async function updateGitAction(
     branch?: string
     directory?: string
     preset?: string
+    connection?: string
     json?: boolean
     yes?: boolean
   }
@@ -307,8 +398,39 @@ export async function updateGitAction(
     preset = preset ?? project.preset ?? 'auto'
   }
 
+  // Resolve the git provider connection — same shape as `projects create`.
+  // Without this, repo_owner/repo_name alone give the project text fields
+  // pointing at a repo it has no actual clone access to; `deploy` then
+  // reports "no git provider connected" even though `projects git`
+  // reported success. --connection <id> makes this settable
+  // non-interactively; omitting it keeps the project's existing
+  // connection untouched (explicit opt-in, never silently cleared).
+  let connectionId: number | undefined
+  if (options.connection) {
+    const connId = parseInt(options.connection, 10)
+    if (isNaN(connId)) {
+      error(`Invalid connection ID: ${options.connection}`)
+      return
+    }
+    const connections = await fetchGitConnections()
+    const connection = connections.find((c) => c.id === connId)
+    if (!connection) {
+      error(`Git connection with ID ${options.connection} not found.`)
+      return
+    }
+    if (repoOwner && repoName) {
+      const repo = await findRepositoryByName(connection.id, repoOwner, repoName)
+      if (!repo) {
+        error(`Repository "${repoOwner}/${repoName}" not found in connection "${connection.account_name}".`)
+        return
+      }
+    }
+    info(`Using git connection: ${connection.account_name}`)
+    connectionId = connection.id
+  }
+
   const updated = await withSpinner('Updating git settings...', async () => {
-    const { data, error } = await updateGitSettings({
+    const { data, error: apiError } = await updateGitSettings({
       client,
       path: { project_id: project.id },
       body: {
@@ -317,10 +439,11 @@ export async function updateGitAction(
         main_branch: mainBranch!,
         directory: directory || '',
         preset: preset || null,
+        ...(connectionId !== undefined ? { git_provider_connection_id: connectionId } : {}),
       },
     })
-    if (error) {
-      throw new Error(getErrorMessage(error))
+    if (apiError) {
+      throw new Error(getErrorMessage(apiError))
     }
     return data
   })
@@ -344,6 +467,9 @@ export async function updateConfigAction(
     cpuLimit?: string
     memoryLimit?: string
     autoDeploy?: boolean
+    requestTimeout?: string
+    sseIdleTimeout?: string
+    websocketIdleTimeout?: string
     json?: boolean
     yes?: boolean
   }
@@ -390,9 +516,23 @@ export async function updateConfigAction(
   let cpuLimit = options.cpuLimit ? parseFloat(options.cpuLimit) : undefined
   let memoryLimit = options.memoryLimit ? parseInt(options.memoryLimit, 10) : undefined
   let autoDeploy = options.autoDeploy
+  const requestTimeoutSeconds = options.requestTimeout ? parseInt(options.requestTimeout, 10) : undefined
+  const sseIdleTimeoutSeconds = options.sseIdleTimeout ? parseInt(options.sseIdleTimeout, 10) : undefined
+  const websocketIdleTimeoutSeconds = options.websocketIdleTimeout
+    ? parseInt(options.websocketIdleTimeout, 10)
+    : undefined
 
   // Only prompt if no flags provided AND not in automation mode
-  if (replicas === undefined && cpuLimit === undefined && memoryLimit === undefined && autoDeploy === undefined && !options.yes) {
+  if (
+    replicas === undefined &&
+    cpuLimit === undefined &&
+    memoryLimit === undefined &&
+    autoDeploy === undefined &&
+    requestTimeoutSeconds === undefined &&
+    sseIdleTimeoutSeconds === undefined &&
+    websocketIdleTimeoutSeconds === undefined &&
+    !options.yes
+  ) {
     newline()
     header('Update Deployment Configuration')
     info(`Deployment config for "${project.name}"`)
@@ -431,6 +571,9 @@ export async function updateConfigAction(
         cpuLimit: cpuLimit ?? undefined,
         memoryLimit: memoryLimit ?? undefined,
         automaticDeploy: autoDeploy ?? undefined,
+        requestTimeoutSeconds: requestTimeoutSeconds ?? undefined,
+        sseIdleTimeoutSeconds: sseIdleTimeoutSeconds ?? undefined,
+        websocketIdleTimeoutSeconds: websocketIdleTimeoutSeconds ?? undefined,
       },
     })
     if (error) {
@@ -449,4 +592,7 @@ export async function updateConfigAction(
   if (cpuLimit !== undefined) keyValue('CPU Limit', `${cpuLimit} cores`)
   if (memoryLimit !== undefined) keyValue('Memory Limit', `${memoryLimit} MB`)
   if (autoDeploy !== undefined) keyValue('Auto Deploy', autoDeploy ? colors.success('Enabled') : colors.muted('Disabled'))
+  if (requestTimeoutSeconds !== undefined) keyValue('Request Timeout', `${requestTimeoutSeconds}s`)
+  if (sseIdleTimeoutSeconds !== undefined) keyValue('SSE Idle Timeout', `${sseIdleTimeoutSeconds}s`)
+  if (websocketIdleTimeoutSeconds !== undefined) keyValue('WebSocket Idle Timeout', `${websocketIdleTimeoutSeconds}s`)
 }

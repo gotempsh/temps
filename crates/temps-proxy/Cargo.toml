@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-proxy"
 version.workspace = true
@@ -28,7 +31,6 @@ bytes = { workspace = true }
 cookie = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
-flate2 = { workspace = true }
 tracing = { workspace = true }
 memchr = "2.7"
 htmd = "0.5"
@@ -61,6 +63,7 @@ arc-swap = "1"
 moka = { version = "0.12", features = ["future"] }
 ipnetwork = "0.21"
 regex = { workspace = true }
+reqwest = { workspace = true }
 once_cell = { workspace = true }
 woothee = "0.13"
 rustls = "0.23"
@@ -75,12 +78,12 @@ integration = []
 
 [dev-dependencies]
 tokio-test = "0.4"
-testcontainers = { workspace = true }
+testcontainers = { workspace = true, features = ["http_wait_plain"] }
 temp-dir = "0.2"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = { workspace = true }
-tower = "0.4"
+tower = "0.5"
 anyhow = "1.0"
 lazy_static = "1.4"
 temps-presets = { path = "../temps-presets" }

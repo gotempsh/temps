@@ -1,10 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Blob Service configuration types
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
-/// Default RustFS Docker image
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+/// Default RustFS Docker image. Re-export the provider default so managed S3
+/// and the blob subsystem cannot silently provision different releases.
+pub use temps_providers::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
 /// Default container name
 pub const DEFAULT_CONTAINER_NAME: &str = "temps-blob-rustfs";
 /// Default volume name
@@ -15,7 +19,7 @@ pub const DEFAULT_BUCKET_NAME: &str = "temps-blobs";
 /// User-provided configuration for Blob service (with defaults)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlobInputConfig {
-    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.98")
+    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-rc.5")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
 
@@ -130,19 +134,19 @@ impl BlobConfig {
 
 /// Generate a random access key (16 alphanumeric characters)
 fn generate_access_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     (0..16)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate a random secret key (32 alphanumeric characters)
 fn generate_secret_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     (0..32)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 

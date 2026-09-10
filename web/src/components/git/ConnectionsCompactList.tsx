@@ -1,10 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState } from 'react'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
 import {
   deleteConnectionMutation,
   runConnectionHealthCheckMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { isGitHubApp } from '@/lib/provider'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -48,6 +50,7 @@ import {
 } from 'lucide-react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 type Variant = 'single-line' | 'two-line' | 'avatar'
 
@@ -69,6 +72,8 @@ export function ConnectionsCompactList({
   variant,
 }: ConnectionsCompactListProps) {
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [updateTokenDialog, setUpdateTokenDialog] = useState<{
     open: boolean
     connectionId: number
@@ -88,7 +93,22 @@ export function ConnectionsCompactList({
       setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
       onConnectionDeleted?.()
     },
-    onError: () => toast.error('Failed to delete connection'),
+    // The server refuses when projects still deploy from this connection and
+    // says which ones in the Problem Details `detail`. Swallowing that left the
+    // user with a bare "Failed to delete connection" and nothing to act on.
+    onError: (error: any, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          deleteConnectionMut.mutate(variables)
+        )
+      ) {
+        setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
+        return
+      }
+      toast.error('Failed to delete connection', {
+        description: error?.detail || error?.title || error?.message,
+      })
+    },
   })
 
   const [healthCheckInFlight, setHealthCheckInFlight] = useState<number | null>(
@@ -176,25 +196,26 @@ export function ConnectionsCompactList({
             Update token
           </DropdownMenuItem>
         )}
-        {provider && isGitHubApp(provider) && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              className="text-destructive"
-              onSelect={(e) => {
-                e.preventDefault()
-                setDeleteDialog({
-                  open: true,
-                  connectionId: c.id,
-                  connectionName: c.account_name,
-                })
-              }}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Delete connection
-            </DropdownMenuItem>
-          </>
-        )}
+        {/* Every provider type, not just GitHub Apps: DELETE /git-connections/
+            {id} is generic, and hiding it left PAT/OAuth connections with no
+            way to be removed — including the ones that block deleting their
+            provider. The server still refuses when a project depends on the
+            connection, and now says which. */}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive"
+          onSelect={(e) => {
+            e.preventDefault()
+            setDeleteDialog({
+              open: true,
+              connectionId: c.id,
+              connectionName: c.account_name,
+            })
+          }}
+        >
+          <Trash2 className="mr-2 h-4 w-4" />
+          Delete connection
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -463,6 +484,8 @@ export function ConnectionsCompactList({
           setUpdateTokenDialog({ ...updateTokenDialog, open })
         }
       />
+
+      {verificationDialog}
 
       <AlertDialog
         open={deleteDialog.open}
