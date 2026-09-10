@@ -342,10 +342,16 @@ impl BackupEngine for S3MirrorEngine {
                 );
             }
 
+            // Trailing slash makes this a directory-boundary prefix, not a
+            // plain string prefix: without it, an enumerated bucket named
+            // "data" would also match objects mirrored under a sibling
+            // "database" bucket's prefix, inflating this bucket's size with
+            // another bucket's bytes.
+            let bucket_size_prefix = format!("{}/", bucket_dest_prefix);
             let bucket_size_bytes = list_total_s3_size(
                 &s3_dest_client,
                 &s3_dest.bucket_name,
-                &bucket_dest_prefix,
+                &bucket_size_prefix,
             )
             .await
             .unwrap_or_else(|e| {
@@ -438,22 +444,32 @@ async fn list_source_buckets(
         .build();
     let client = S3Client::from_conf(s3_config);
 
-    let resp = client
-        .list_buckets()
-        .send()
-        .await
-        .map_err(|e| BackupError::Failed {
+    let mut bucket_names = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut req = client.list_buckets();
+        if let Some(tok) = continuation {
+            req = req.continuation_token(tok);
+        }
+        let resp = req.send().await.map_err(|e| BackupError::Failed {
             reason: format!(
                 "could not enumerate source buckets at {} (account-level ListBuckets): {}",
                 endpoint, e
             ),
         })?;
+        bucket_names.extend(
+            resp.buckets()
+                .iter()
+                .filter_map(|b| b.name())
+                .map(String::from),
+        );
+        continuation = resp.continuation_token().map(|s| s.to_string());
+        if continuation.is_none() {
+            break;
+        }
+    }
 
-    Ok(resp
-        .buckets()
-        .iter()
-        .filter_map(|b| b.name().map(|n| n.to_string()))
-        .collect())
+    Ok(bucket_names)
 }
 
 async fn list_total_s3_size(
