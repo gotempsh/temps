@@ -224,7 +224,9 @@ fn recovered_container_matches_egress_policy(
         .as_ref()
         .and_then(|settings| settings.networks.as_ref());
     if network_mode == Some("none") {
-        return networks.is_none_or(HashMap::is_empty);
+        // Docker may explicitly report its built-in null network. It has no
+        // external connectivity; any additional network remains forbidden.
+        return networks.is_none_or(|networks| networks.keys().all(|name| name == "none"));
     }
 
     let expected_network = sandbox_network_name(container_name);
@@ -1320,6 +1322,25 @@ fn exec_runs_as_root(user: Option<&str>) -> bool {
         user.map(|u| u.split(':').next().unwrap_or(u).trim()),
         Some("0") | Some("root")
     )
+}
+
+// Docker frames are arbitrary byte chunks, not lines or UTF-8 boundaries.
+// Keep partial JSONL tool events intact until a newline (or final EOF).
+fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(end) = bytes[*emitted..].iter().position(|byte| *byte == b'\n') {
+        let end = *emitted + end;
+        let line = bytes[*emitted..end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&bytes[*emitted..end]);
+        lines.push(String::from_utf8_lossy(line).into_owned());
+        *emitted = end + 1;
+    }
+    if eof && *emitted < bytes.len() {
+        lines.push(String::from_utf8_lossy(&bytes[*emitted..]).into_owned());
+        *emitted = bytes.len();
+    }
+    lines
 }
 
 impl DockerSandboxProvider {
@@ -2594,6 +2615,10 @@ impl DockerSandboxProvider {
     fn container_tmpfs() -> HashMap<String, String> {
         let mut tmpfs = HashMap::new();
         tmpfs.insert(
+            "/run/temps-runtime".to_string(),
+            format!("size=8m,mode=0700,uid={SANDBOX_UID},gid={SANDBOX_GID}"),
+        );
+        tmpfs.insert(
             "/run/secrets".to_string(),
             format!("size=1m,mode=0710,gid={SANDBOX_GID}"),
         );
@@ -2813,7 +2838,26 @@ impl DockerSandboxProvider {
         on_event: Option<OnStreamEventCallback>,
         user: Option<String>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.inspect_handle_policy(handle).await?;
+        let info = self.inspect_handle_policy(handle).await?;
+        let uses_daemon = info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|labels| labels.get("sh.temps.runtime.protocol"))
+            .map(String::as_str)
+            == Some("1");
+        let cmd = if uses_daemon && !exec_runs_as_root(user.as_deref()) {
+            [
+                vec![
+                    "/usr/local/bin/temps-sandbox-runtime".to_string(),
+                    "exec".to_string(),
+                ],
+                cmd,
+            ]
+            .concat()
+        } else {
+            cmd
+        };
         // Pin PATH for every root exec, not just the one in `run_root_exec`.
         //
         // The image's own PATH puts sandbox-user-writable directories
@@ -2877,8 +2921,10 @@ impl DockerSandboxProvider {
                 reason: format!("Failed to start exec: {}", e),
             })?;
 
-        let mut stdout_output = String::new();
-        let mut stderr_output = String::new();
+        let mut stdout_output = Vec::new();
+        let mut stderr_output = Vec::new();
+        let mut stdout_emitted = 0;
+        let mut stderr_emitted = 0;
 
         match output {
             StartExecResults::Attached { mut output, .. } => {
@@ -2889,22 +2935,22 @@ impl DockerSandboxProvider {
                 loop {
                     match tokio::time::timeout(IDLE_POLL, output.next()).await {
                         Ok(Some(Ok(LogOutput::StdOut { message }))) => {
-                            let text = String::from_utf8_lossy(&message);
-                            for line in text.lines() {
-                                stdout_output.push_str(line);
-                                stdout_output.push('\n');
+                            stdout_output.extend_from_slice(&message);
+                            for line in
+                                completed_exec_lines(&stdout_output, &mut stdout_emitted, false)
+                            {
                                 if let Some(ref cb) = on_event {
-                                    cb(ExecStream::Stdout, line.to_string()).await;
+                                    cb(ExecStream::Stdout, line).await;
                                 }
                             }
                         }
                         Ok(Some(Ok(LogOutput::StdErr { message }))) => {
-                            let text = String::from_utf8_lossy(&message);
-                            for line in text.lines() {
-                                stderr_output.push_str(line);
-                                stderr_output.push('\n');
+                            stderr_output.extend_from_slice(&message);
+                            for line in
+                                completed_exec_lines(&stderr_output, &mut stderr_emitted, false)
+                            {
                                 if let Some(ref cb) = on_event {
-                                    cb(ExecStream::Stderr, line.to_string()).await;
+                                    cb(ExecStream::Stderr, line).await;
                                 }
                             }
                         }
@@ -2957,6 +3003,16 @@ impl DockerSandboxProvider {
             }
         }
 
+        for (stream, bytes, emitted) in [
+            (ExecStream::Stdout, &stdout_output, &mut stdout_emitted),
+            (ExecStream::Stderr, &stderr_output, &mut stderr_emitted),
+        ] {
+            for line in completed_exec_lines(bytes, emitted, true) {
+                if let Some(ref cb) = on_event {
+                    cb(stream, line).await;
+                }
+            }
+        }
         let exit_code = self
             .docker
             .inspect_exec(&exec.id)
@@ -2967,8 +3023,8 @@ impl DockerSandboxProvider {
 
         Ok(SandboxExecResult {
             exit_code,
-            stdout: stdout_output,
-            stderr: stderr_output,
+            stdout: String::from_utf8_lossy(&stdout_output).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_output).into_owned(),
         })
     }
 }
@@ -3034,6 +3090,28 @@ impl SandboxProvider for DockerSandboxProvider {
                 }
             }
         }
+
+        let image_info = self.docker.inspect_image(image).await.map_err(|error| {
+            AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".into(),
+                reason: format!("inspect runtime image {image}: {error}"),
+            }
+        })?;
+        let runtime_protocol = image_info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|labels| labels.get("sh.temps.runtime.protocol"))
+            .cloned();
+        if runtime_protocol
+            .as_deref()
+            .is_some_and(|version| version != "1")
+        {
+            return Err(AgentError::SandboxCreationFailed { run_id: config.run_id, provider: "docker".into(),
+                reason: format!("image {image} requires unsupported runtime protocol {runtime_protocol:?}; expected 1") });
+        }
+        let uses_daemon = runtime_protocol.is_some();
 
         if let Err(error) = self
             .ensure_network(
@@ -3151,6 +3229,9 @@ impl SandboxProvider for DockerSandboxProvider {
         };
 
         let mut labels = HashMap::new();
+        if uses_daemon {
+            labels.insert("sh.temps.runtime.protocol".into(), "1".into());
+        }
         labels.insert("sh.temps.sandbox".to_string(), "true".to_string());
         labels.insert(
             "sh.temps.sandbox.run_id".to_string(),
@@ -3160,7 +3241,11 @@ impl SandboxProvider for DockerSandboxProvider {
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(image.to_string()),
             // Keep the container alive — exec calls run commands inside it
-            cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+            cmd: Some(if uses_daemon {
+                vec!["serve".to_string()]
+            } else {
+                vec!["sleep".to_string(), "infinity".to_string()]
+            }),
             env: if env_vars.is_empty() {
                 None
             } else {
@@ -3270,7 +3355,7 @@ impl SandboxProvider for DockerSandboxProvider {
         //
         // We restore both ~/.local (claude + opencode) and ~/.bun (codex)
         // because bun installs codex into its own global tree, not ~/.local.
-        {
+        if !uses_daemon {
             let restore_script = format!(
                 "need_restore=0; \
                  [ -x {home}/.local/bin/claude ] || need_restore=1; \
@@ -3317,6 +3402,38 @@ impl SandboxProvider for DockerSandboxProvider {
             }
         }
 
+        if uses_daemon {
+            let mut ready = false;
+            for _ in 0..20 {
+                if matches!(
+                    self.run_root_exec(
+                        &container.id,
+                        config.run_id,
+                        "runtime-health",
+                        vec![
+                            "/usr/local/bin/temps-sandbox-runtime".into(),
+                            "request".into(),
+                        ],
+                    )
+                    .await,
+                    Ok(0)
+                ) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !ready {
+                let error = AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".into(),
+                    reason: format!(
+                        "runtime daemon in {container_name} did not become healthy (protocol 1)"
+                    ),
+                };
+                return Err(self.rollback_failed_create(&container_name, error).await);
+            }
+        }
         tracing::info!(
             "Sandbox container {} ({}) created for run {}",
             container_name,
@@ -5436,6 +5553,57 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exec_frames_preserve_split_utf8_and_json_lines() {
+        let mut bytes = b"{\"text\":\"".to_vec();
+        let mut emitted = 0;
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, false).is_empty());
+        bytes.extend_from_slice(&[0xc3]);
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, false).is_empty());
+        bytes.extend_from_slice(b"\xa9\"}\nlast");
+        assert_eq!(
+            super::completed_exec_lines(&bytes, &mut emitted, false),
+            vec!["{\"text\":\"é\"}"]
+        );
+        assert_eq!(
+            super::completed_exec_lines(&bytes, &mut emitted, true),
+            vec!["last"]
+        );
+        assert!(super::completed_exec_lines(&bytes, &mut emitted, true).is_empty());
+    }
+
+    #[test]
+    fn null_network_inspection_allows_only_docker_none_network() {
+        let mut container = bollard::models::ContainerInspectResponse {
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some("none".into()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(std::collections::HashMap::from([(
+                    "none".into(),
+                    Default::default(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(super::recovered_container_matches_egress_policy(
+            &container, "test"
+        ));
+        container
+            .network_settings
+            .as_mut()
+            .unwrap()
+            .networks
+            .as_mut()
+            .unwrap()
+            .insert("bridge".into(), Default::default());
+        assert!(!super::recovered_container_matches_egress_policy(
+            &container, "test"
+        ));
+    }
+
     use super::*;
     use std::sync::OnceLock;
     use std::time::Duration;
