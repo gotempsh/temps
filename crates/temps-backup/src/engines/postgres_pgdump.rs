@@ -158,6 +158,7 @@ impl BackupEngine for PostgresPgDumpEngine {
             // `postgres-{service_name}` resolves.
             network_mode: Some(temps_core::NETWORK_NAME.to_string()),
             user: Some("root".to_string()),
+            stderr_watch: None,
         };
 
         let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {

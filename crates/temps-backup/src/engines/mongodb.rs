@@ -221,6 +221,7 @@ impl BackupEngine for MongodbEngine {
             binds: vec![format!("{}:/backup:rw", backup_dir.display())],
             network_mode: Some(temps_core::NETWORK_NAME.to_string()),
             user: Some("root".to_string()),
+            stderr_watch: None,
         };
 
         let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {

@@ -93,6 +93,145 @@ enum StageError {
     Retry(String),
 }
 
+/// How many individual object failures one upload pass keeps verbatim. The
+/// count is always reported; only the first few reasons are, so a pass that
+/// loses thousands of objects to the same outage does not write thousands of
+/// near-identical lines into the mirror state's `reason` column.
+const MAX_REPORTED_OBJECT_FAILURES: usize = 3;
+/// Consecutive object failures after which a pass stops walking the manifest.
+///
+/// Tolerating individual failures is what makes progress monotonic, but a
+/// *run* of them is not individual bad luck — it is the source bucket, its
+/// credential, or Cloud being down for everything. Each failed object has
+/// already spent up to three attempts against `S3_CONTROL_REQUEST_TIMEOUT`
+/// and `S3_STREAM_IDLE_TIMEOUT`, so continuing through a 100,000-object
+/// manifest during an outage would hold the sweep (which serves every other
+/// backup on this instance in series) for hours. Ten in a row is far more
+/// than a transient stall produces and far less than an outage costs.
+const MAX_CONSECUTIVE_OBJECT_FAILURES: usize = 10;
+
+/// Bookkeeping for one pass over a declared manifest.
+///
+/// A pass used to be all-or-nothing: the first object that failed after its
+/// bounded retries aborted the whole snapshot, and the next sweep started
+/// again from the first object — re-requesting a target and re-verifying
+/// every object Cloud already held. For an S3-mirror snapshot, whose manifest
+/// has as many objects as the source buckets, that meant one transient S3
+/// stall anywhere in a multi-thousand-object walk reset all the progress
+/// behind it, and a snapshot could stay "Uploading" on Cloud indefinitely.
+///
+/// A pass now records per-object failures and keeps going, so every object
+/// that *can* upload does, and Cloud's `completed_relative_keys` lets the
+/// next pass skip them. Progress is therefore monotonic across sweeps.
+#[derive(Debug, Default)]
+struct UploadPass {
+    /// Objects in the declared manifest.
+    declared: usize,
+    /// Objects Cloud reported as already complete before this pass began.
+    already_complete: usize,
+    /// Objects this pass uploaded and had Cloud verify.
+    uploaded: usize,
+    /// Objects that failed after their own bounded retries.
+    failed: usize,
+    /// `(relative_key, reason)` for the first `MAX_REPORTED_OBJECT_FAILURES`.
+    reported_failures: Vec<(String, String)>,
+    /// Failures since the last successful upload; drives the circuit breaker.
+    consecutive_failures: usize,
+    /// Set when the breaker tripped and the manifest walk stopped early, so
+    /// the recorded reason says so rather than implying every object was tried.
+    stopped_early: bool,
+}
+
+impl UploadPass {
+    fn record_success(&mut self) {
+        self.uploaded += 1;
+        self.consecutive_failures = 0;
+    }
+
+    /// Record one failed object. Returns `true` when the pass should stop
+    /// walking the manifest because failures are no longer isolated.
+    fn record_failure(&mut self, relative_key: &str, reason: &str) -> bool {
+        self.failed += 1;
+        self.consecutive_failures += 1;
+        if self.reported_failures.len() < MAX_REPORTED_OBJECT_FAILURES {
+            self.reported_failures
+                .push((relative_key.to_owned(), reason.to_owned()));
+        }
+        if self.consecutive_failures >= MAX_CONSECUTIVE_OBJECT_FAILURES {
+            self.stopped_early = true;
+        }
+        self.stopped_early
+    }
+
+    /// `Ok(())` when every declared object is now complete on Cloud, otherwise
+    /// a `Retry` describing what this pass did and did not manage, so the
+    /// mirror state an operator sees says "resumed 400 of 2,000, 3 failed"
+    /// rather than only the first object's error.
+    fn into_result(self) -> Result<(), StageError> {
+        if self.failed == 0 {
+            return Ok(());
+        }
+        let mut reason = format!(
+            "{} of {} objects did not upload this pass ({} were already complete on Cloud, \
+             {} uploaded now); the next pass resumes from Cloud's completed set",
+            self.failed, self.declared, self.already_complete, self.uploaded
+        );
+        if self.stopped_early {
+            reason.push_str(&format!(
+                "; stopped after {} consecutive failures, which points at the source, \
+                 its credential, or Cloud being unavailable rather than at these objects",
+                self.consecutive_failures
+            ));
+        }
+        for (relative_key, failure) in &self.reported_failures {
+            reason.push_str(&format!("; {relative_key}: {failure}"));
+        }
+        if self.failed > self.reported_failures.len() {
+            reason.push_str(&format!(
+                "; {} more not listed",
+                self.failed - self.reported_failures.len()
+            ));
+        }
+        Err(StageError::Retry(reason))
+    }
+}
+
+/// Split a declared manifest into the objects still to upload and the count
+/// Cloud already verified. `completed` is Cloud's own answer for this exact
+/// `backup_id`, so a key in it can be skipped without re-checking anything:
+/// Cloud verified the bytes and checksum against the manifest it bound the
+/// snapshot to, and that manifest is the one we just re-declared unchanged.
+///
+/// The set is still sanity-bounded by what *we* declared: Cloud can only have
+/// completed objects from that manifest, so a longer list is a protocol
+/// anomaly. It is ignored wholesale (every object uploads, as before this
+/// field existed) rather than trusted for whatever prefix happens to match.
+fn pending_objects<T>(
+    declarations: Vec<T>,
+    completed: &[String],
+    relative_key: impl Fn(&T) -> &str,
+) -> (Vec<T>, usize) {
+    if completed.is_empty() {
+        return (declarations, 0);
+    }
+    if completed.len() > declarations.len() {
+        warn!(
+            completed = completed.len(),
+            declared = declarations.len(),
+            "Cloud reported more completed objects than this snapshot declares; ignoring the set"
+        );
+        return (declarations, 0);
+    }
+    let completed: HashSet<&str> = completed.iter().map(String::as_str).collect();
+    let before = declarations.len();
+    let pending: Vec<T> = declarations
+        .into_iter()
+        .filter(|declaration| !completed.contains(relative_key(declaration)))
+        .collect();
+    let skipped = before - pending.len();
+    (pending, skipped)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepOutcome {
     NotLinked,
@@ -1095,8 +1234,28 @@ async fn declare_and_complete_native_snapshot(
         .await
         .map_err(|error| StageError::Retry(error.to_string()))?;
     if snapshot.upload_required {
-        for declaration in declarations {
-            upload_native_object(
+        let mut pass = UploadPass {
+            declared: declarations.len(),
+            ..UploadPass::default()
+        };
+        let (pending, already_complete) = pending_objects(
+            declarations,
+            &snapshot.completed_relative_keys,
+            |declaration| declaration.relative_key.as_str(),
+        );
+        pass.already_complete = already_complete;
+        if already_complete > 0 {
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                already_complete,
+                pending = pending.len(),
+                "Cloud backup mirror resuming native snapshot from Cloud's completed set"
+            );
+        }
+        for declaration in pending {
+            let relative_key = declaration.relative_key.clone();
+            match upload_native_object(
                 link,
                 client,
                 &source_config.bucket_name,
@@ -1105,8 +1264,31 @@ async fn declare_and_complete_native_snapshot(
                 cloud_backup_id,
                 declaration,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => pass.record_success(),
+                Err(StageError::Retry(reason)) => {
+                    warn!(
+                        local_backup_id = %backup.backup_id,
+                        %relative_key,
+                        error = %reason,
+                        "Cloud backup mirror could not upload one object; continuing with the rest"
+                    );
+                    if pass.record_failure(&relative_key, &reason) {
+                        warn!(
+                            local_backup_id = %backup.backup_id,
+                            consecutive_failures = MAX_CONSECUTIVE_OBJECT_FAILURES,
+                            "Cloud backup mirror stopping this pass early; failures are no longer isolated"
+                        );
+                        break;
+                    }
+                }
+                // Structural: the same object will be rejected the same way
+                // on every pass, so finishing the walk cannot help.
+                Err(error @ StageError::Unsupported(_)) => return Err(error),
+            }
         }
+        pass.into_result()?;
     }
     link.complete_native_snapshot(&WalGSnapshotCompleted {
         backup_id: cloud_backup_id,
@@ -1371,8 +1553,28 @@ async fn mirror_walg_backup(
         .await
         .map_err(|error| StageError::Retry(error.to_string()))?;
     if snapshot.upload_required {
-        for declaration in declarations {
-            upload_repository_object(
+        let mut pass = UploadPass {
+            declared: declarations.len(),
+            ..UploadPass::default()
+        };
+        let (pending, already_complete) = pending_objects(
+            declarations,
+            &snapshot.completed_relative_keys,
+            |declaration| declaration.relative_key.as_str(),
+        );
+        pass.already_complete = already_complete;
+        if already_complete > 0 {
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                already_complete,
+                pending = pending.len(),
+                "Cloud backup mirror resuming WAL-G snapshot from Cloud's completed set"
+            );
+        }
+        for declaration in pending {
+            let relative_key = declaration.relative_key.clone();
+            match upload_repository_object(
                 link,
                 &client,
                 &source_config.bucket_name,
@@ -1381,8 +1583,29 @@ async fn mirror_walg_backup(
                 cloud_backup_id,
                 declaration,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => pass.record_success(),
+                Err(StageError::Retry(reason)) => {
+                    warn!(
+                        local_backup_id = %backup.backup_id,
+                        %relative_key,
+                        error = %reason,
+                        "Cloud backup mirror could not upload one object; continuing with the rest"
+                    );
+                    if pass.record_failure(&relative_key, &reason) {
+                        warn!(
+                            local_backup_id = %backup.backup_id,
+                            consecutive_failures = MAX_CONSECUTIVE_OBJECT_FAILURES,
+                            "Cloud backup mirror stopping this pass early; failures are no longer isolated"
+                        );
+                        break;
+                    }
+                }
+                Err(error @ StageError::Unsupported(_)) => return Err(error),
+            }
         }
+        pass.into_result()?;
     }
     link.complete_walg_snapshot(&WalGSnapshotCompleted {
         backup_id: cloud_backup_id,
@@ -2309,10 +2532,11 @@ mod tests {
     use super::{
         append_source_object, backup_engine_key, contains_backup_identity, deferred_legacy_state,
         ensure_json_object_size, image_tag_version, manifest_digest, merge_mirror_state,
-        mirror_backup, next_sweep_interval, parse_postgres_major, run, s3_key, select_due_backups,
-        sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
+        mirror_backup, next_sweep_interval, parse_postgres_major, pending_objects, run, s3_key,
+        select_due_backups, sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
         upload_native_object, wal_segment_name, wal_segment_of, walg_root_key, SourceObject,
-        StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL,
+        StageError, SweepOutcome, UploadPass, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
+        DUE_BACKUPS_SQL, MAX_CONSECUTIVE_OBJECT_FAILURES, MAX_REPORTED_OBJECT_FAILURES,
         MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
     use std::{
@@ -2344,6 +2568,142 @@ mod tests {
         WalGObjectTargetRequest,
     };
     use uuid::Uuid;
+
+    fn native_declaration(relative_key: &str) -> NativeSnapshotObjectDeclaration {
+        NativeSnapshotObjectDeclaration {
+            relative_key: relative_key.to_owned(),
+            kind: NativeSnapshotObjectKind::Object,
+            bytes: 1,
+            checksum_sha256: "ab".repeat(32),
+        }
+    }
+
+    /// Cloud's completed set is authoritative for the exact manifest just
+    /// re-declared: those objects are skipped, everything else stays in
+    /// manifest order, and a key Cloud names that we never declared is
+    /// ignored rather than trusted.
+    #[test]
+    fn pending_objects_skips_only_what_cloud_reports_complete() {
+        let declarations = vec![
+            native_declaration("bucket-a/one"),
+            native_declaration("bucket-a/two"),
+            native_declaration("bucket-b/three"),
+        ];
+        let completed = vec!["bucket-a/two".to_owned(), "never-declared".to_owned()];
+
+        let (pending, skipped) =
+            pending_objects(declarations, &completed, |d| d.relative_key.as_str());
+
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|d| d.relative_key.as_str())
+                .collect::<Vec<_>>(),
+            ["bucket-a/one", "bucket-b/three"]
+        );
+    }
+
+    /// A Cloud that predates `completed_relative_keys` (or a fresh
+    /// declaration) reports nothing complete; the pass must then be exactly
+    /// the pre-resume behaviour, with no object skipped.
+    #[test]
+    fn pending_objects_without_completed_set_uploads_everything() {
+        let declarations = vec![native_declaration("one"), native_declaration("two")];
+        let (pending, skipped) = pending_objects(declarations, &[], |d| d.relative_key.as_str());
+        assert_eq!(skipped, 0);
+        assert_eq!(pending.len(), 2);
+    }
+
+    /// One failed object no longer aborts the pass, but it must still stop
+    /// the snapshot from being reported complete: the result is a `Retry`
+    /// whose reason accounts for every object, names the failures an
+    /// operator can act on, and stays bounded when many fail the same way.
+    #[test]
+    fn upload_pass_reports_partial_progress_as_retry() {
+        let mut pass = UploadPass {
+            declared: 2_000,
+            already_complete: 1_500,
+            uploaded: 495,
+            ..UploadPass::default()
+        };
+        for index in 0..5 {
+            pass.record_failure(
+                &format!("bucket-a/object-{index}"),
+                "source object made no progress for 60 seconds",
+            );
+        }
+        assert_eq!(pass.failed, 5);
+        assert_eq!(pass.reported_failures.len(), MAX_REPORTED_OBJECT_FAILURES);
+
+        let error = pass
+            .into_result()
+            .expect_err("a pass with failures must not complete the snapshot");
+        let StageError::Retry(reason) = error else {
+            panic!("partial progress is transient, not unsupported");
+        };
+        assert!(reason.starts_with("5 of 2000 objects did not upload this pass"));
+        assert!(reason.contains("1500 were already complete on Cloud"));
+        assert!(reason.contains("495 uploaded now"));
+        assert!(reason.contains("bucket-a/object-0: source object made no progress"));
+        assert!(reason.contains("bucket-a/object-2"));
+        assert!(!reason.contains("bucket-a/object-3"));
+        assert!(reason.ends_with("; 2 more not listed"));
+    }
+
+    /// A run of failures is an outage, not bad luck per object. The breaker
+    /// stops the walk so one wedged snapshot cannot hold the serial sweep for
+    /// hours, a success in between resets it, and the recorded reason says
+    /// the pass stopped early instead of implying every object was tried.
+    #[test]
+    fn upload_pass_breaker_trips_only_on_consecutive_failures() {
+        let mut pass = UploadPass {
+            declared: 100,
+            ..UploadPass::default()
+        };
+        for _ in 0..MAX_CONSECUTIVE_OBJECT_FAILURES - 1 {
+            assert!(!pass.record_failure("k", "stall"));
+        }
+        pass.record_success();
+        for _ in 0..MAX_CONSECUTIVE_OBJECT_FAILURES - 1 {
+            assert!(
+                !pass.record_failure("k", "stall"),
+                "a success in between must reset the run"
+            );
+        }
+        assert!(pass.record_failure("k", "stall"), "tenth in a row trips");
+        assert!(pass.stopped_early);
+
+        let StageError::Retry(reason) = pass.into_result().expect_err("failed pass retries") else {
+            panic!("an outage is transient");
+        };
+        assert!(reason.contains(&format!(
+            "stopped after {MAX_CONSECUTIVE_OBJECT_FAILURES} consecutive failures"
+        )));
+    }
+
+    /// Cloud can only have completed objects we declared. A longer list is a
+    /// protocol anomaly and must not be trusted even for the keys that match.
+    #[test]
+    fn pending_objects_ignores_a_completed_set_larger_than_the_manifest() {
+        let declarations = vec![native_declaration("one")];
+        let completed = vec!["one".to_owned(), "two".to_owned()];
+        let (pending, skipped) =
+            pending_objects(declarations, &completed, |d| d.relative_key.as_str());
+        assert_eq!(skipped, 0);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn upload_pass_without_failures_completes() {
+        let pass = UploadPass {
+            declared: 3,
+            already_complete: 2,
+            uploaded: 1,
+            ..UploadPass::default()
+        };
+        assert!(pass.into_result().is_ok());
+    }
 
     #[test]
     fn repository_discovery_rejects_excess_object_count() {

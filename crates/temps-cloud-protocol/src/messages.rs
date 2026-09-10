@@ -353,6 +353,15 @@ pub struct NativeSnapshotRequest {
 pub struct NativeSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// `relative_key`s from the declared manifest that Cloud has already
+    /// verified as complete for this `backup_id`. A re-declaration of an
+    /// unchanged manifest returns every object a previous, interrupted pass
+    /// managed to finish, so the instance can resume from where it stopped
+    /// instead of re-requesting a target and re-verifying every object.
+    /// Empty when nothing has completed yet, when the manifest was replaced,
+    /// or when talking to a Cloud that predates this field.
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +408,9 @@ pub struct WalGSnapshotRequest {
 pub struct WalGSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// Same contract as [`NativeSnapshot::completed_relative_keys`].
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +732,29 @@ mod tests {
         let env = Envelope::new("heartbeat", &hb).unwrap();
         let back: Heartbeat = env.decode("heartbeat").unwrap();
         assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    /// A Cloud built before `completed_relative_keys` existed answers a
+    /// declaration without it. The instance must decode that as "nothing
+    /// complete yet" and fall back to uploading every object, not fail the
+    /// whole mirror pass on a missing field.
+    #[test]
+    fn snapshot_completed_keys_are_additive() {
+        let native: NativeSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true
+        }))
+        .unwrap();
+        assert!(native.upload_required);
+        assert!(native.completed_relative_keys.is_empty());
+
+        let walg: WalGSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true,
+            "completed_relative_keys": ["basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"]
+        }))
+        .unwrap();
+        assert_eq!(walg.completed_relative_keys.len(), 1);
     }
 
     #[test]
