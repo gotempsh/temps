@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { MonitorPathForm } from './MonitorPathForm'
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
@@ -659,6 +660,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
               <p className="text-sm font-mono break-all">
                 {monitor.monitor_url}
               </p>
+              <MonitorPathForm key={monitor.id} monitor={monitor} />
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">

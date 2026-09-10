@@ -18,11 +18,21 @@ use tracing::{debug, error, warn};
 
 use super::types::{
     validate_check_path, CreateMonitorRequest, MonitorResponse, MonitorStatus, StatusCheckResponse,
-    StatusPageError, UptimeDataPoint, UptimeHistoryResponse,
+    StatusPageError, UpdateMonitorRequest, UptimeDataPoint, UptimeHistoryResponse,
 };
 
 const USER_CREATED_MONITOR_BOOTSTRAP_MESSAGE: &str =
     "Monitor created - awaiting first health check";
+
+fn monitor_url(public_url: &str, monitor_type: &str, check_path: Option<&str>) -> String {
+    let base = public_url.trim_end_matches('/');
+    match check_path {
+        Some("/") => base.to_string(),
+        Some(path) if !path.is_empty() => format!("{base}{path}"),
+        _ if monitor_type == "health" => format!("{base}/health"),
+        _ => public_url.to_string(),
+    }
+}
 
 fn is_managed_monitor_unique_violation(error: &DbErr) -> bool {
     let rendered = error.to_string();
@@ -100,22 +110,11 @@ impl MonitorService {
                     .await
                 {
                     // Use custom check_path if set, otherwise fall back to monitor_type logic
-                    let base = base_url.trim_end_matches('/');
-                    let url = match &response.check_path {
-                        Some(path) if !path.is_empty() && path != "/" => {
-                            let path = if path.starts_with('/') {
-                                path.to_string()
-                            } else {
-                                format!("/{}", path)
-                            };
-                            format!("{}{}", base, path)
-                        }
-                        _ if response.monitor_type == "health" => {
-                            format!("{}/health", base)
-                        }
-                        _ => base_url,
-                    };
-                    response.monitor_url = url;
+                    response.monitor_url = monitor_url(
+                        &base_url,
+                        &response.monitor_type,
+                        response.check_path.as_deref(),
+                    );
                 }
             }
         }
@@ -458,6 +457,35 @@ impl MonitorService {
 
         let response: MonitorResponse = monitor.into();
         Ok(self.populate_monitor_url(response).await)
+    }
+
+    /// Update a monitor's probe path without replacing the monitor row.
+    /// Keeping the same row preserves its managed ownership and status-check history.
+    pub async fn update_monitor(
+        &self,
+        monitor_id: i32,
+        request: UpdateMonitorRequest,
+    ) -> Result<MonitorResponse, StatusPageError> {
+        validate_check_path(&request.check_path)?;
+
+        let result = status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckPath,
+                Expr::value(Some(request.check_path)),
+            )
+            .col_expr(
+                status_monitors::Column::CheckPathRevision,
+                Expr::col(status_monitors::Column::CheckPathRevision).add(1_i64),
+            )
+            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(status_monitors::Column::Id.eq(monitor_id))
+            .exec(self.db.as_ref())
+            .await?;
+        if result.rows_affected == 0 {
+            return Err(StatusPageError::NotFound);
+        }
+
+        self.get_monitor(monitor_id).await
     }
 
     /// Resolve the project a monitor belongs to, for project-access checks
@@ -1281,6 +1309,146 @@ mod tests {
         )
         .expect("Failed to create test config");
         Arc::new(ConfigService::new(Arc::new(config), db.clone()))
+    }
+
+    fn mock_monitor(id: i32, check_path: Option<&str>) -> status_monitors::Model {
+        let now = Utc::now();
+        status_monitors::Model {
+            id,
+            project_id: 7,
+            environment_id: None,
+            name: "Production monitor".to_string(),
+            monitor_type: "health".to_string(),
+            check_path: check_path.map(str::to_string),
+            check_path_revision: 4,
+            check_interval_seconds: 60,
+            is_active: true,
+            is_managed: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn explicit_root_path_displays_deployment_root_for_health_monitor() {
+        assert_eq!(
+            monitor_url("https://app.example.test/", "health", Some("/")),
+            "https://app.example.test"
+        );
+        assert_eq!(
+            monitor_url("https://app.example.test/", "health", None),
+            "https://app.example.test/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_monitor_changes_only_path_and_revision() {
+        let mut after = mock_monitor(11, Some("/old"));
+        after.check_path = Some("/ready".to_string());
+        after.check_path_revision = 5;
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![after]])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let updated = service
+            .update_monitor(
+                11,
+                UpdateMonitorRequest {
+                    check_path: "/ready".to_string(),
+                },
+            )
+            .await
+            .expect("valid monitor path should update");
+
+        assert_eq!(updated.id, 11);
+        assert_eq!(updated.check_path.as_deref(), Some("/ready"));
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        let transaction_log = db.into_transaction_log();
+        let rendered = transaction_log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| format!("{statement:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("check_path"));
+        assert!(rendered.contains("/ready"));
+        assert!(rendered.contains("check_path_revision"));
+        assert!(rendered.contains("+"));
+    }
+
+    #[tokio::test]
+    async fn update_monitor_returns_not_found_for_missing_id() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service
+            .update_monitor(
+                404,
+                UpdateMonitorRequest {
+                    check_path: "/ready".to_string(),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(StatusPageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn update_monitor_validates_before_database_access() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service
+            .update_monitor(
+                11,
+                UpdateMonitorRequest {
+                    check_path: "https://example.test/ready".to_string(),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(StatusPageError::Validation(_))));
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_monitor_propagates_database_failure() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_errors([DbErr::Custom("monitor update unavailable".to_string())])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service
+            .update_monitor(
+                11,
+                UpdateMonitorRequest {
+                    check_path: "/ready".to_string(),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(StatusPageError::Database(_))));
     }
 
     #[tokio::test]

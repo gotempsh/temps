@@ -88,7 +88,6 @@ impl StatusPagePlugin {
                             // the first post-deploy result reflects the service's real
                             // health endpoint rather than a stale `/` probe.
                             tracing::info!(
-                                health_path = ?job.health_check_path,
                                 environment_id = job.environment_id,
                                 project_id = job.project_id,
                                 "Synchronizing managed monitor path with successful deployment"
