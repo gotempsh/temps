@@ -22,6 +22,8 @@ pub struct TraceReadScope {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
     pub cloud: bool,
+    /// The cutover that narrowed this project's requested window, if any.
+    pub window_clamped_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +620,7 @@ mod tests {
                 from,
                 to,
                 cloud: false,
+                window_clamped_at: None,
             })
             .collect();
         let sql = build(&q, Dialect::ClickHouse, &BTreeMap::new()).unwrap();

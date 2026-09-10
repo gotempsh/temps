@@ -922,14 +922,18 @@ pub struct DockerComposeConfig {
     /// the settings-page exclusion checklist render without a live git fetch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compose_services: Vec<ComposeServiceSnapshot>,
-    /// Compose service names granted the minimal Linux capabilities
-    /// (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) their entrypoint needs
-    /// to fix ownership on a data directory and drop from root to a service
-    /// user at container start — a pattern common to many official images,
-    /// not just databases (postgres/mysql/mariadb/mongo, but also e.g.
-    /// Gitea). Off by default: Temps drops all capabilities from every
-    /// compose service for defense in depth, and only grants this back for
-    /// a service the user has explicitly opted in.
+    /// Legacy per-service opt-in for the minimal Linux capabilities (CHOWN,
+    /// DAC_OVERRIDE, FOWNER, SETUID, SETGID) an entrypoint needs to fix
+    /// ownership on a data directory and drop from root to a service user
+    /// at container start. Every sandboxed Compose service now gets this
+    /// set by default — the pattern is common to nearly all official
+    /// images (databases like postgres/mysql/mariadb/mongo, but also web
+    /// servers like nginx, and others such as Gitea), not a rare exception
+    /// worth an opt-in. This field is kept only so older stored configs
+    /// that listed services here keep deserializing; it no longer changes
+    /// what gets granted (see `ComposeExecutor::RELAXED_CAPABILITIES`). An
+    /// image that needs capabilities beyond that default set should use
+    /// `unsandboxed_services` instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relaxed_capability_services: Vec<String>,
     /// Compose services for which Temps must not inject its default runtime

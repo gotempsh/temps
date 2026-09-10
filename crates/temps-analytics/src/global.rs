@@ -215,7 +215,7 @@ fn build_query(
     };
     let event_filter=match facet {
         AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL",
-        AnalyticsFacet::Speed=>"(e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)",
+        AnalyticsFacet::Speed=>"COALESCE(g.is_hosting_provider, false) = false AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)",
         AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''",
         _=>"e.event_type='page_view'",
     };
@@ -284,11 +284,16 @@ fn build_query(
     } else {
         "e.time_on_page"
     };
-    let geo_join = if facet == AnalyticsFacet::Breakdown
+    // Match project performance views: normal browser UAs from hosting-provider
+    // IPs are excluded before counts and percentiles, while unknown IPs remain.
+    let geo_join = if facet == AnalyticsFacet::Speed {
+        "LEFT JOIN ip_geolocations g ON g.id=e.ip_address_id"
+    } else if facet == AnalyticsFacet::Breakdown
         && matches!(
             q.dimension.as_deref().unwrap_or("country"),
             "country" | "region" | "city"
-        ) {
+        )
+    {
         "LEFT JOIN ip_geolocations g ON g.id=e.ip_geolocation_id"
     } else {
         ""
@@ -353,6 +358,64 @@ mod tests {
         assert!(!sql.contains("OR true"));
         assert_eq!(values.len(), 9);
     }
+    #[tokio::test]
+    async fn global_speed_excludes_hosting_providers_before_counts_and_percentiles() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("Skipping PostgreSQL integration: TEST_DATABASE_URL is not configured");
+            return;
+        };
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared(r#"
+            CREATE TEMP TABLE projects(id int, name text, is_deleted bool DEFAULT false);
+            CREATE TEMP TABLE ip_geolocations(id int, is_hosting_provider bool);
+            CREATE TEMP TABLE performance_metrics(project_id int, environment_id int, recorded_at timestamptz,
+                is_crawler bool, ip_address_id int, session_id int, visitor_id int, device_type text,
+                lcp real, inp real, cls real, ttfb real, fcp real);
+            INSERT INTO projects VALUES(1,'First app',false),(2,'Second app',false);
+            INSERT INTO ip_geolocations VALUES(1,true),(2,false),(3,NULL);
+            INSERT INTO performance_metrics
+                SELECT 1,10,'2026-01-01T01:00:00Z',false,ip,ip,ip,'desktop',v,v,v,v,v
+                FROM (VALUES (2,100),(3,200),(NULL::int,300)) AS sample(ip,v);
+            INSERT INTO performance_metrics
+                SELECT 1,10,'2026-01-01T01:00:00Z',false,1,n,n,'desktop',9999,9999,9999,9999,9999
+                FROM generate_series(10,109) n;
+            INSERT INTO performance_metrics VALUES
+                (1,10,'2026-01-01T01:00:00Z',true,2,200,200,'desktop',9999,9999,9999,9999,9999),
+                (2,20,'2026-01-01T01:00:00Z',false,2,1,1,'desktop',500,500,500,500,500);
+        "#).await.unwrap();
+        let service = GlobalAnalyticsService::new(Arc::new(db));
+        let mut q = query();
+        q.facet = Some(AnalyticsFacet::Speed);
+        let result = service.query(&q, &[2]).await.unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.total_views, 3);
+        let row = &result.rows[0];
+        assert_eq!(
+            row.views, 3,
+            "hosting-provider and crawler samples must not affect counts"
+        );
+        for percentile in [
+            row.lcp_p75,
+            row.inp_p75,
+            row.cls_p75,
+            row.ttfb_p75,
+            row.fcp_p75,
+        ] {
+            assert_eq!(
+                percentile,
+                Some(250.0),
+                "unknown/missing geolocation must remain included"
+            );
+        }
+        q.project_id = Some(1);
+        q.environment_id = Some(10);
+        assert_eq!(service.query(&q, &[]).await.unwrap().total_views, 3);
+        q.environment_id = Some(20);
+        assert_eq!(service.query(&q, &[]).await.unwrap().total, 0);
+    }
+
     // A dedicated single-connection pool owns only TEMP tables. No shared
     // database objects or operator data are modified, even on a developer DB.
     #[tokio::test]
@@ -365,7 +428,7 @@ mod tests {
         options.max_connections(1).min_connections(1);
         let db = Database::connect(options).await.unwrap();
         db.execute_unprepared("CREATE TEMP TABLE projects(id int,name text,is_deleted bool DEFAULT false);
-          CREATE TEMP TABLE ip_geolocations(id int,country text,region text,city text);
+          CREATE TEMP TABLE ip_geolocations(id int,country text,region text,city text,is_hosting_provider bool);
           CREATE TEMP TABLE events(id bigserial,project_id int, environment_id int, timestamp timestamptz, is_crawler bool DEFAULT false,
           event_type text DEFAULT 'page_view',event_name text,page_path text,session_id text,visitor_id int,time_on_page int,is_bounce bool DEFAULT false,
           device_type text,ip_geolocation_id int,lcp real,inp real,cls real,ttfb real,fcp real);
@@ -376,7 +439,7 @@ mod tests {
           SELECT 2,20,'2026-01-01T01:00:00Z','/popular','session-'||n,n,40,300,'desktop' FROM generate_series(1,5) n;
           INSERT INTO events(project_id,environment_id,timestamp,page_path,session_id,visitor_id)
           SELECT 3,30,'2026-01-01T01:00:00Z','/hidden','hidden-'||n,n FROM generate_series(1,100) n;
-          CREATE TEMP TABLE performance_metrics AS SELECT project_id,environment_id,timestamp AS recorded_at,is_crawler,session_id,visitor_id,lcp,inp,cls,ttfb,fcp,device_type FROM events;
+          CREATE TEMP TABLE performance_metrics AS SELECT ip_geolocation_id AS ip_address_id,project_id,environment_id,timestamp AS recorded_at,is_crawler,session_id,visitor_id,lcp,inp,cls,ttfb,fcp,device_type FROM events;
           INSERT INTO events(project_id,environment_id,timestamp,page_path,session_id,is_crawler) VALUES (1,11,'2026-01-01T01:00:00Z','/preview','preview',false),(2,20,'2026-01-01T01:00:00Z','/bot','bot',true);").await.unwrap();
         let service = GlobalAnalyticsService::new(Arc::new(db));
         let mut q = query();

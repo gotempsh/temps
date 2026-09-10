@@ -5137,6 +5137,10 @@
           "commit_sha": {
             "type": "string"
           },
+          "is_default": {
+            "description": "Whether this is the repository's default branch, as reported by the\ngit provider (e.g. `main` or `master`). Clients should use this\ninstead of guessing from the branch name.",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -5147,7 +5151,8 @@
         "required": [
           "name",
           "commit_sha",
-          "protected"
+          "protected",
+          "is_default"
         ],
         "type": "object"
       },
@@ -22151,12 +22156,20 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "windows": {
+            "description": "Effective per-project windows; totals and rows describe these windows.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceWindow"
+            },
+            "type": "array"
           }
         },
         "required": [
           "data",
           "total",
-          "projects"
+          "projects",
+          "windows"
         ],
         "type": "object"
       },
@@ -22187,6 +22200,40 @@
           }
         ]
       },
+      "GlobalTraceWindow": {
+        "description": "A global query can use different stores and effective windows per project.\nA non-null clamp explicitly tells clients the pre-cutover range is excluded;\nrequest an earlier window to read the older source (ADR-040/041).",
+        "properties": {
+          "effective_end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "effective_start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CloudTelemetryWriteMode"
+          },
+          "window_clamped_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "source",
+          "effective_start_time",
+          "effective_end_time"
+        ],
+        "type": "object"
+      },
       "GlobalTracesResponse": {
         "properties": {
           "data": {
@@ -22199,11 +22246,19 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "windows": {
+            "description": "Effective per-project windows; totals and rows describe these windows.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceWindow"
+            },
+            "type": "array"
           }
         },
         "required": [
           "data",
-          "total"
+          "total",
+          "windows"
         ],
         "type": "object"
       },

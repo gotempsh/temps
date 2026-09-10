@@ -401,6 +401,7 @@ impl TelemetryWriteModeService {
                 from: resolution.from,
                 to: resolution.to,
                 cloud: resolution.source == CloudTelemetryWriteMode::Cloud,
+                window_clamped_at: resolution.window_clamped_at,
             });
             names.insert(p.id, (p.name, p.slug));
         }
@@ -1520,7 +1521,9 @@ mod tests {
             .unwrap();
         assert_eq!(scopes.len(), 105);
         assert_eq!(names.len(), 105);
-        assert!(scopes.iter().all(|s| !s.cloud));
+        assert!(scopes
+            .iter()
+            .all(|s| !s.cloud && s.window_clamped_at.is_none()));
         drop(service);
         let log = Arc::try_unwrap(db)
             .expect("sole test database owner")
@@ -1529,6 +1532,54 @@ mod tests {
         let sql = format!("{log:?}");
         assert!(sql.contains("NOT IN"));
         assert!(sql.contains("is_deleted"));
+    }
+
+    #[tokio::test]
+    async fn global_trace_scopes_preserve_both_cutover_directions() {
+        use sea_orm::MockDatabase;
+        let to = Utc::now();
+        let from = to - ChronoDuration::hours(2);
+        let cutover = to - ChronoDuration::minutes(30);
+        for (old, new) in [
+            (
+                CloudTelemetryWriteMode::Local,
+                CloudTelemetryWriteMode::Cloud,
+            ),
+            (
+                CloudTelemetryWriteMode::Cloud,
+                CloudTelemetryWriteMode::Local,
+            ),
+        ] {
+            let rows = vec![std::collections::BTreeMap::<String, sea_orm::Value>::from(
+                [
+                    ("id".into(), 7.into()),
+                    ("name".into(), "Project".into()),
+                    ("slug".into(), "project".into()),
+                ],
+            )];
+            let mut before = interval(1, old, 240, Some(30));
+            before.effective_to = Some(cutover);
+            let mut after = interval(2, new, 30, None);
+            after.effective_from = cutover;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([rows])
+                    .append_query_results([vec![before, after]])
+                    .into_connection(),
+            );
+            let service = TelemetryWriteModeService::new(db.clone());
+            let (scopes, _) = service
+                .global_trace_scopes(Some(7), &[], from, to)
+                .await
+                .unwrap();
+            assert_eq!(scopes.len(), 1);
+            assert_eq!(scopes[0].from, cutover);
+            assert_eq!(scopes[0].to, to);
+            assert_eq!(scopes[0].window_clamped_at, Some(cutover));
+            assert_eq!(scopes[0].cloud, new == CloudTelemetryWriteMode::Cloud);
+            drop(service);
+            assert_eq!(Arc::try_unwrap(db).unwrap().into_transaction_log().len(), 2);
+        }
     }
 
     fn interval(

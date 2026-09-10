@@ -309,6 +309,7 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
                 from: query.start_time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
                 to: query.end_time.unwrap_or_else(Utc::now),
                 cloud: true,
+                window_clamped_at: None,
             };
             let q = super::global_traces::GlobalTraceQuery {
                 source_offset: query.offset.unwrap_or(0),

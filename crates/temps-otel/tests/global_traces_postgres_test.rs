@@ -60,6 +60,7 @@ async fn global_postgres_pagination_and_raw_spans_use_the_same_authorized_scope(
                 from: now - Duration::hours(1),
                 to: now,
                 cloud: false,
+                window_clamped_at: None,
             })
             .collect(),
         summaries: true,
