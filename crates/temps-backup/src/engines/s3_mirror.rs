@@ -323,12 +323,14 @@ impl BackupEngine for S3MirrorEngine {
                 return Err(BackupError::Failed {
                     reason: format!(
                         "mc mirror could not list one side of the mirror for comparison \
-                         (access denied) for bucket {}. mc still exited 0 and copied what \
-                         it could reach via direct PUT/GET, but the result may be an \
-                         incomplete, non-diffed copy -- check that both the source and \
-                         destination S3 credentials have list permission on their bucket. \
-                         stderr: {}",
+                         (access denied) for bucket {} (backup {}, service {}). mc still \
+                         exited 0 and copied what it could reach via direct PUT/GET, but \
+                         the result may be an incomplete, non-diffed copy -- check that \
+                         both the source and destination S3 credentials have list \
+                         permission on their bucket. stderr: {}",
                         bucket,
+                        backup_id,
+                        service_id,
                         sensitive_values.redact(result.stderr_tail.trim()),
                     ),
                 });
