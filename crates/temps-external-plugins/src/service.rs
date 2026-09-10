@@ -42,6 +42,10 @@ pub struct ExternalPluginsService {
     proxy_router: Arc<RwLock<Router>>,
     /// Serializes discovery, reload, and install/promotion lifecycles.
     lifecycle: tokio::sync::Mutex<()>,
+    /// Serializes every read/compare/write mutation of the persisted registry
+    /// trust state. Catalogue requests can overlap on the network, but they
+    /// must be committed in a single monotonic order with installations.
+    registry_state: tokio::sync::Mutex<()>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     closing: AtomicBool,
@@ -130,6 +134,7 @@ impl ExternalPluginsService {
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
             lifecycle: tokio::sync::Mutex::new(()),
+            registry_state: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
         }
     }
@@ -217,6 +222,7 @@ impl ExternalPluginsService {
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
             lifecycle: tokio::sync::Mutex::new(()),
+            registry_state: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
         }
     }
@@ -303,8 +309,16 @@ impl ExternalPluginsService {
 
     /// Fetch and authenticate the complete remote catalogue.
     pub async fn catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
-        let client = RegistryClient::new(self.manager.config().registry.clone())?;
-        Ok(client.fetch().await?)
+        let registry_config = self.manager.config().registry.clone();
+        let client = RegistryClient::new(registry_config.clone())?;
+        let registry = client.fetch().await?;
+        // Catalogue access is the explicit network refresh boundary. Record
+        // both the keyset generation and catalogue revision on first view and
+        // every later view so discovery and reload remain fully local without
+        // sacrificing rollback protection.
+        self.accept_catalog_state(registry_config, &registry)
+            .await?;
+        Ok(registry)
     }
 
     /// Resolve the exact signed release identity without downloading or
@@ -376,9 +390,12 @@ impl ExternalPluginsService {
         }
 
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        installer
-            .accept_registry_revision(&self.manager.config().plugins_dir, &selected.registry)
-            .await?;
+        {
+            let _registry_state = self.registry_state.lock().await;
+            installer
+                .accept_registry_revision(&self.manager.config().plugins_dir, &selected.registry)
+                .await?;
+        }
         let candidate = installer
             .prepare(
                 &self.manager.config().plugins_dir,
@@ -456,6 +473,33 @@ impl ExternalPluginsService {
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
+
+    async fn accept_catalog_state(
+        &self,
+        registry_config: crate::catalog::RegistryConfig,
+        registry: &VerifiedRegistry,
+    ) -> Result<(), ExternalPluginsError> {
+        // Match installation's lock order. This prevents a newly learned
+        // revocation from committing halfway through launch of a binary that
+        // was selected under the preceding keyset.
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        self.accept_registry_state(registry_config, registry).await
+    }
+
+    async fn accept_registry_state(
+        &self,
+        registry_config: crate::catalog::RegistryConfig,
+        registry: &VerifiedRegistry,
+    ) -> Result<(), ExternalPluginsError> {
+        let _registry_state = self.registry_state.lock().await;
+        PluginInstaller::new(registry_config)?
+            .accept_registry_revision(&self.manager.config().plugins_dir, registry)
+            .await?;
+        Ok(())
+    }
 
     /// Build a proxy router from a set of manifests.
     async fn build_proxy_router_from(
@@ -563,6 +607,31 @@ mod tests {
             stream.write_all(&body).await.expect("write artifact body");
         });
         format!("http://{address}/plugin")
+    }
+
+    async fn serve_json_once(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalogue fixture");
+        let address = listener.local_addr().expect("catalogue fixture address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept catalogue request");
+            let mut request = [0u8; 2048];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read catalogue request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write catalogue headers");
+            stream.write_all(&body).await.expect("write catalogue body");
+        });
+        format!("http://{address}/plugins")
     }
 
     #[cfg(unix)]
@@ -700,6 +769,31 @@ except Exception:
             },
         }
     }
+
+    fn registry_revision(
+        revision: u64,
+        keyset_generation: u64,
+        signing: &SigningKey,
+    ) -> VerifiedRegistry {
+        let mut selected = selected_plugin(
+            "http://127.0.0.1/plugin".to_string(),
+            b"fixture",
+            "fixture-plugin",
+            "1.0.0",
+            revision,
+            signing,
+        );
+        selected.registry.keyset = crate::trust::VerifiedKeyset::test_fixture_with_keys(
+            vec![(
+                "fixture-key".to_string(),
+                signing.verifying_key().to_bytes(),
+                crate::trust::CatalogKeyStatus::Active,
+            )],
+            keyset_generation,
+        )
+        .1;
+        selected.registry
+    }
     fn service() -> ExternalPluginsService {
         let database = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
@@ -743,6 +837,182 @@ except Exception:
             Err(error) => error,
         };
         assert!(matches!(error, ExternalPluginsError::ShuttingDown));
+    }
+
+    #[tokio::test]
+    async fn catalog_view_persists_first_trust_state_and_rejects_rollbacks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[63; 32]);
+        let registry = registry_revision(7, 2, &signing);
+        let url = serve_json_once(
+            serde_json::to_vec(&registry.envelope).expect("serialize catalogue envelope"),
+        )
+        .await;
+        let registry_config = crate::catalog::RegistryConfig::local_with_generation(
+            url,
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+            2,
+        );
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        )
+        .with_registry(registry_config.clone());
+        let service = ExternalPluginsService::new_empty(
+            config.clone(),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+
+        service
+            .catalog()
+            .await
+            .expect("first catalogue view must persist authenticated trust state");
+        assert!(config.plugins_dir.join("registry-state.json").is_file());
+
+        let revision_error = service
+            .accept_registry_state(registry_config.clone(), &registry_revision(6, 2, &signing))
+            .await
+            .expect_err("an older catalogue revision must be rejected after viewing");
+        assert!(matches!(
+            revision_error,
+            ExternalPluginsError::Install(InstallError::RegistryRollback {
+                received: 6,
+                highest: 7
+            })
+        ));
+
+        let keyset_error = service
+            .accept_registry_state(registry_config, &registry_revision(8, 1, &signing))
+            .await
+            .expect_err("an older keyset generation must be rejected after viewing");
+        assert!(matches!(
+            keyset_error,
+            ExternalPluginsError::Install(InstallError::KeysetRollback {
+                received: 1,
+                highest: 2
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_out_of_order_registry_updates_cannot_roll_back_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[64; 32]);
+        let registry_config = crate::catalog::RegistryConfig::local(
+            "http://127.0.0.1/plugins".to_string(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        )
+        .with_registry(registry_config.clone());
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        ));
+        service
+            .accept_registry_state(registry_config.clone(), &registry_revision(1, 1, &signing))
+            .await
+            .expect("seed registry state");
+
+        // Queue generation 3 first and generation 2 second while holding the
+        // state lock. Tokio's mutex is FIFO, so this deterministically models
+        // the dangerous response order where the stale response finishes last.
+        let gate = service.registry_state.lock().await;
+        let newest_service = service.clone();
+        let newest_config = registry_config.clone();
+        let newest_registry = registry_revision(3, 3, &signing);
+        let newest = tokio::spawn(async move {
+            newest_service
+                .accept_registry_state(newest_config, &newest_registry)
+                .await
+        });
+        tokio::task::yield_now().await;
+        let stale_service = service.clone();
+        let stale_registry = registry_revision(2, 2, &signing);
+        let stale = tokio::spawn(async move {
+            stale_service
+                .accept_registry_state(registry_config, &stale_registry)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(gate);
+
+        newest
+            .await
+            .expect("newest update task")
+            .expect("newest update must be accepted");
+        let error = stale
+            .await
+            .expect("stale update task")
+            .expect_err("stale response must not overwrite the newer state");
+        assert!(matches!(
+            error,
+            ExternalPluginsError::Install(InstallError::KeysetRollback {
+                received: 2,
+                highest: 3
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_trust_commit_waits_for_in_progress_install_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[65; 32]);
+        let registry_config = crate::catalog::RegistryConfig::local(
+            "http://127.0.0.1/plugins".to_string(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        )
+        .with_registry(registry_config.clone());
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        ));
+        service
+            .accept_registry_state(registry_config.clone(), &registry_revision(1, 1, &signing))
+            .await
+            .expect("seed registry state");
+
+        // install_selected owns this guard from trust acceptance through
+        // candidate activation and promotion. A catalogue response learned in
+        // parallel must not commit until that complete lifecycle ends.
+        let install_lifecycle = service.lifecycle.lock().await;
+        let catalogue_service = service.clone();
+        let newer_registry = registry_revision(2, 2, &signing);
+        let mut catalogue_commit = tokio::spawn(async move {
+            catalogue_service
+                .accept_catalog_state(registry_config, &newer_registry)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut catalogue_commit)
+                .await
+                .is_err(),
+            "catalogue trust update must wait for the active install lifecycle"
+        );
+
+        drop(install_lifecycle);
+        catalogue_commit
+            .await
+            .expect("catalogue update task")
+            .expect("catalogue update must commit after installation finishes");
     }
 
     #[tokio::test]

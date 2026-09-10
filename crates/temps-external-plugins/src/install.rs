@@ -353,9 +353,9 @@ impl PluginInstaller {
         sync_directory("registry", plugins_dir).await
     }
 
-    /// Persist a newer root-authorized keyset without requiring the catalogue
-    /// to be online. Startup uses this to learn rotations and revocations while
-    /// retaining the last accepted catalogue revision for rollback protection.
+    /// Persist a newer root-authorized keyset while retaining the last accepted
+    /// catalogue revision for rollback protection. Callers must serialize this
+    /// read/compare/write operation with catalogue revision acceptance.
     pub async fn refresh_keyset(
         &self,
         plugins_dir: &Path,
@@ -517,12 +517,6 @@ impl PluginInstaller {
         }
         Ok(())
     }
-}
-
-pub(crate) async fn has_registry_state(plugins_dir: &Path) -> bool {
-    tokio::fs::symlink_metadata(plugins_dir.join(REGISTRY_STATE_FILE))
-        .await
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 async fn read_registry_state(state_path: &Path) -> Result<Option<RegistryState>, InstallError> {

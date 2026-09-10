@@ -4,6 +4,10 @@
 //! Authenticated external-plugin registry documents.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -37,6 +41,8 @@ pub struct RegistryConfig {
     pub(crate) allow_http: bool,
     #[cfg(test)]
     test_keyset: Option<VerifiedKeyset>,
+    #[cfg(test)]
+    test_keyset_fetches: Option<Arc<AtomicUsize>>,
 }
 
 impl Default for RegistryConfig {
@@ -49,6 +55,8 @@ impl Default for RegistryConfig {
             allow_http: false,
             #[cfg(test)]
             test_keyset: None,
+            #[cfg(test)]
+            test_keyset_fetches: None,
         }
     }
 }
@@ -61,11 +69,28 @@ impl RegistryConfig {
 
     #[cfg(test)]
     pub(crate) fn local(url: String, key_id: &str, key: [u8; 32]) -> Self {
+        Self::local_with_generation(url, key_id, key, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_with_generation(
+        url: String,
+        key_id: &str,
+        key: [u8; 32],
+        generation: u64,
+    ) -> Self {
         let host = Url::parse(&url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        let (root_trust, test_keyset) = VerifiedKeyset::test_fixture(key_id, key);
+        let (root_trust, test_keyset) = VerifiedKeyset::test_fixture_with_keys(
+            vec![(
+                key_id.to_string(),
+                key,
+                crate::trust::CatalogKeyStatus::Active,
+            )],
+            generation,
+        );
         Self {
             keys_url: format!("{url}/keys"),
             url,
@@ -73,7 +98,20 @@ impl RegistryConfig {
             allowed_artifact_hosts: BTreeSet::from([host]),
             allow_http: true,
             test_keyset: Some(test_keyset),
+            test_keyset_fetches: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_counted(
+        url: String,
+        key_id: &str,
+        key: [u8; 32],
+        fetches: Arc<AtomicUsize>,
+    ) -> Self {
+        let mut config = Self::local(url, key_id, key);
+        config.test_keyset_fetches = Some(fetches);
+        config
     }
 }
 
@@ -193,6 +231,10 @@ impl RegistryClient {
     }
 
     pub async fn fetch_keyset(&self) -> Result<VerifiedKeyset, CatalogError> {
+        #[cfg(test)]
+        if let Some(fetches) = &self.config.test_keyset_fetches {
+            fetches.fetch_add(1, Ordering::SeqCst);
+        }
         #[cfg(test)]
         if let Some(keyset) = &self.config.test_keyset {
             return Ok(keyset.clone());
