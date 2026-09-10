@@ -27,6 +27,9 @@
       ],
       "@temps-sdk/console-kit": [
         "./packages/console-kit/src/index.ts"
+      ],
+      "@temps-sdk/ds": [
+        "./packages/ds/src/index.ts"
       ]
     }
   },

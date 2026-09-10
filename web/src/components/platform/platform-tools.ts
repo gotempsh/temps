@@ -9,6 +9,7 @@ import {
   Database,
   DatabaseBackup,
   Folder,
+  Cpu,
   Gauge,
   GitBranch,
   Globe,
@@ -126,6 +127,22 @@ export const platformToolGroups: PlatformToolGroup[] = [
     description: 'Understand platform health, traffic, and operator activity.',
     icon: Radar,
     items: [
+      {
+        title: 'Server',
+        description:
+          'CPU, memory, disk, Docker disk usage and I/O of the control-plane host.',
+        url: '/monitoring/server',
+        icon: Cpu,
+        keywords: [
+          'cpu',
+          'memory',
+          'disk',
+          'docker',
+          'network',
+          'host',
+          'resources',
+        ],
+      },
       {
         title: 'Monitoring',
         description:
