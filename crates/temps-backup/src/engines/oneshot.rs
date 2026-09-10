@@ -55,7 +55,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::ring_buffer::RingBuffer;
+use super::ring_buffer::{RingBuffer, SubstringWatcher};
 
 /// Spec for a one-shot backup container. Engines build this and pass it
 /// to [`run_one_shot`]. Everything the helper needs to declare and run
@@ -96,6 +96,15 @@ pub struct OneShotSpec {
     /// Run-as-user. `Some("root")` is typical for sidecars that write
     /// to a host-owned bind mount.
     pub user: Option<String>,
+    /// Optional substring to watch for anywhere in the full stderr stream,
+    /// case-insensitively. Set this when a command can report a real
+    /// failure via stderr while still exiting `0` (e.g. `mc mirror`
+    /// swallowing a failed comparison listing and falling back to a
+    /// plain copy) -- `stderr_tail` alone is not reliable for that, since
+    /// it only keeps the last 4 KiB and enough later output can evict the
+    /// diagnostic before the caller ever inspects it. `None` skips the
+    /// check entirely (no extra cost).
+    pub stderr_watch: Option<&'static str>,
 }
 
 /// Outcome of [`run_one_shot`].
@@ -112,6 +121,10 @@ pub struct OneShotResult {
     /// --archive=-`) write to stdout — those engines should set
     /// `binds=[]` and use this field instead.
     pub stdout_tail: String,
+    /// `true` if `OneShotSpec::stderr_watch` was set and matched anywhere
+    /// in stderr, including bytes since evicted from `stderr_tail`.
+    /// Always `false` when `stderr_watch` was `None`.
+    pub stderr_watch_matched: bool,
 }
 
 /// Failure mode that prevented the container from reaching an exit
@@ -268,6 +281,8 @@ pub async fn run_one_shot(
 
     let mut stdout_tail = RingBuffer::with_capacity(4 * 1024);
     let mut stderr_tail = RingBuffer::with_capacity(4 * 1024);
+    let mut stderr_watch_matched = false;
+    let stderr_watch = spec.stderr_watch;
 
     // ── Log collector (background task) ──────────────────────────────────
     //
@@ -281,10 +296,16 @@ pub async fn run_one_shot(
                 let mut stream = stream;
                 let mut stdout = RingBuffer::with_capacity(4 * 1024);
                 let mut stderr = RingBuffer::with_capacity(4 * 1024);
+                let mut watcher = stderr_watch.map(SubstringWatcher::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(LogOutput::StdOut { message }) => stdout.append(&message),
-                        Ok(LogOutput::StdErr { message }) => stderr.append(&message),
+                        Ok(LogOutput::StdErr { message }) => {
+                            if let Some(watcher) = watcher.as_mut() {
+                                watcher.feed(&message);
+                            }
+                            stderr.append(&message)
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             debug!(error = %e, "one_shot: log stream error (non-fatal)");
@@ -292,7 +313,8 @@ pub async fn run_one_shot(
                         }
                     }
                 }
-                (stdout, stderr)
+                let matched = watcher.is_some_and(|w| w.matched());
+                (stdout, stderr, matched)
             }))
         }
         Err(e) => {
@@ -350,9 +372,10 @@ pub async fn run_one_shot(
     // the pipe before we hand back to the caller.
     if let Some(handle) = log_handle {
         match tokio::time::timeout(Duration::from_secs(2), handle).await {
-            Ok(Ok((s_out, s_err))) => {
+            Ok(Ok((s_out, s_err, matched))) => {
                 stdout_tail = s_out;
                 stderr_tail = s_err;
+                stderr_watch_matched = matched;
             }
             Ok(Err(_)) => {
                 // Join error (task panicked or was aborted). Captured
@@ -377,6 +400,7 @@ pub async fn run_one_shot(
         exit_code,
         stdout_tail: stdout_tail.into_string_lossy(),
         stderr_tail: stderr_tail.into_string_lossy(),
+        stderr_watch_matched,
     })
 }
 
