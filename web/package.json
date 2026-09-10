@@ -62,7 +62,7 @@
     "@tailwindcss/postcss": "^4.3.3",
     "@tanstack/react-query": "^5.102.8",
     "@tanstack/react-virtual": "^3.14.10",
-    "@temps-sdk/console-kit": "file:./packages/console-kit",
+    "@temps-sdk/console-kit": "workspace:*",
     "@temps-sdk/react-analytics": "^0.0.4",
     "@types/three": "^0.185.4",
     "ansi-to-html": "^0.7.2",

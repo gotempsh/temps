@@ -119,6 +119,13 @@ export const platformToolGroups: PlatformToolGroup[] = [
         icon: Cloud,
         keywords: ['cloudflare', 'dns'],
       },
+      {
+        title: 'Delivery profiles',
+        description: 'Choose Direct or Cloudflare delivery for project domains.',
+        url: '/delivery-profiles',
+        icon: Cloud,
+        keywords: ['delivery', 'cdn', 'cloudflare', 'domains'],
+      },
     ],
   },
   {

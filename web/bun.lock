@@ -548,9 +548,8 @@
 
     "@temps-sdk/analytics-core": ["@temps-sdk/analytics-core@0.0.2", "", { "dependencies": { "@rrweb/packer": "^2.0.0-alpha.17", "rrweb": "^2.0.0-alpha.17", "web-vitals": "^4.2.4" } }, "sha512-7lpfpNLVzmHDJtKVuaX11e3BJoKkjeFabssg7kJuK3iOfZxp+tpLCxY4V7z3H5DN5VHGLi9dAFj4FxSlv5azbw=="],
 
-    "@temps-sdk/console-kit": ["@temps-sdk/console-kit@file:packages/console-kit", { "devDependencies": { "@types/react": "^19.1.12", "react": "^19.1.1", "typescript": "^5.9.2" }, "peerDependencies": { "react": "^19.0.0" } }],
-
     "@temps-sdk/console-kit": ["@temps-sdk/console-kit@workspace:packages/console-kit"],
+
 
     "@temps-sdk/ds": ["@temps-sdk/ds@workspace:packages/ds"],
 

@@ -12,6 +12,8 @@
 //! [`dns_sync::DnsSyncAppState`].
 
 pub mod dns_sync;
+pub mod domain_delivery;
+pub mod managed_records;
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -24,9 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::{
-    AuditContext, AuditOperation, ForceRouteReloadJob, Job, PublicHostnameStrategy, RequestMetadata,
-};
+use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
@@ -106,11 +106,14 @@ impl From<HostnameModeResult> for HostnamePreviewResponse {
 pub struct DnsAppState {
     pub provider_service: Arc<DnsProviderService>,
     pub record_service: Arc<DnsRecordService>,
+    pub managed_record_service: Arc<crate::services::ManagedDnsRecordService>,
+    pub domain_delivery_service: Arc<crate::services::domain_delivery::DomainDeliveryService>,
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// Queue used to trigger a route reload after a hostname-mode change so
     /// derived (Standard/Flat) hostnames take effect.
     pub queue: Arc<dyn temps_core::JobQueue>,
     /// Audit logger for write operations.
-    pub audit: Arc<dyn temps_core::AuditLogger>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 // ========================================
@@ -292,6 +295,8 @@ pub struct AddManagedDomainApiRequest {
     pub domain: String,
     #[serde(default = "default_true")]
     pub auto_manage: bool,
+    #[serde(default)]
+    pub proxied_by_default: bool,
     /// Generated hostname layout: `"standard"` (default) or `"flat"`.
     #[serde(default)]
     pub generated_hostname_mode: Option<String>,
@@ -318,6 +323,8 @@ pub struct UpdateManagedDomainApiRequest {
     pub sync_generated_records: Option<bool>,
     /// Toggle automatic DNS management for this domain.
     pub auto_manage: Option<bool>,
+    /// Default proxy mode for newly managed records; `false` is an explicit override.
+    pub proxied_by_default: Option<bool>,
 }
 
 /// Request to apply a hostname mode (recompute + optional DNS sync).
@@ -338,6 +345,7 @@ pub struct ManagedDomainResponse {
     pub domain: String,
     pub zone_id: Option<String>,
     pub auto_manage: bool,
+    pub proxied_by_default: bool,
     pub verified: bool,
     pub verified_at: Option<String>,
     pub verification_error: Option<String>,
@@ -361,6 +369,7 @@ impl From<temps_entities::dns_managed_domains::Model> for ManagedDomainResponse 
             domain: d.domain,
             zone_id: d.zone_id,
             auto_manage: d.auto_manage,
+            proxied_by_default: d.proxied_by_default,
             verified: d.verified,
             verified_at: d.verified_at.map(|t| t.to_rfc3339()),
             verification_error: d.verification_error,
@@ -907,6 +916,7 @@ async fn add_managed_domain(
             AddManagedDomainRequest {
                 domain: request.domain,
                 auto_manage: request.auto_manage,
+                proxied_by_default: request.proxied_by_default,
                 generated_hostname_mode: request.generated_hostname_mode,
                 sync_generated_records: request.sync_generated_records,
             },
@@ -920,10 +930,7 @@ async fn add_managed_domain(
         id,
         &managed.domain,
         "DNS_MANAGED_DOMAIN_ADDED",
-        serde_json::json!({
-            "auto_manage": managed.auto_manage,
-            "verified": managed.verified,
-        }),
+        serde_json::json!({"auto_manage": managed.auto_manage, "verified": managed.verified}),
     )
     .await;
 
@@ -1077,17 +1084,21 @@ async fn update_managed_domain(
         .provider_service
         .get_managed_domain(provider_id, &domain)
         .await?;
-    let resulting_auto_manage = request.auto_manage.unwrap_or(existing.auto_manage);
-    let resulting_sync_generated_records = request
-        .sync_generated_records
-        .unwrap_or(existing.sync_generated_records);
-    if managed_domain_automation_enabled(resulting_auto_manage, resulting_sync_generated_records) {
+    if managed_domain_automation_enabled(
+        request.auto_manage.unwrap_or(existing.auto_manage),
+        request
+            .sync_generated_records
+            .unwrap_or(existing.sync_generated_records),
+    ) || request.proxied_by_default.is_some()
+    {
         permission_check!(auth, Permission::DnsAutomationWrite);
     }
+
     let changes = serde_json::json!({
         "generated_hostname_mode": request.generated_hostname_mode,
         "sync_generated_records": request.sync_generated_records,
         "auto_manage": request.auto_manage,
+        "proxied_by_default": request.proxied_by_default,
     });
 
     let updated = state
@@ -1099,6 +1110,7 @@ async fn update_managed_domain(
                 generated_hostname_mode: request.generated_hostname_mode,
                 sync_generated_records: request.sync_generated_records,
                 auto_manage: request.auto_manage,
+                proxied_by_default: request.proxied_by_default,
             },
         )
         .await?;
@@ -1152,7 +1164,7 @@ async fn preview_hostname_mode(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersRead);
 
-    let target = PublicHostnameStrategy::from_db_str(&query.mode);
+    let target = DnsProviderService::parse_requested_hostname_mode(&query.mode)?;
     let result = state
         .provider_service
         .preview_hostname_mode(provider_id, &domain, target, query.sync)
@@ -1188,14 +1200,21 @@ async fn apply_hostname_mode(
         permission_check!(auth, Permission::DnsAutomationWrite);
     }
 
-    let target = PublicHostnameStrategy::from_db_str(&request.mode);
+    let target = DnsProviderService::parse_requested_hostname_mode(&request.mode)?;
     let result = state
         .provider_service
-        .apply_hostname_mode(provider_id, &domain, target, request.sync_dns)
+        .apply_hostname_mode(
+            provider_id,
+            &domain,
+            target,
+            request.sync_dns,
+            auth.user_id(),
+        )
         .await?;
 
     // Trigger a full route reload so derived (Standard/Flat) hostnames take
-    // effect. Failure to enqueue is logged but does not fail the request.
+    // effect. Never report a fully successful apply when the route plane was
+    // not notified; the durable reconciliation run preserves what DNS changed.
     if let Err(e) = state
         .queue
         .send(Job::ForceRouteReload(ForceRouteReloadJob {
@@ -1208,6 +1227,11 @@ async fn apply_hostname_mode(
             "Failed to enqueue route reload after hostname mode change: {}",
             e
         );
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Route Reload Failed")
+            .with_detail(format!(
+                "DNS and hostname settings were applied, but the route reload could not be queued: {e}"
+            )));
     }
 
     log_dns_governance_audit(
@@ -1217,17 +1241,13 @@ async fn apply_hostname_mode(
         provider_id,
         &domain,
         "DNS_HOSTNAME_MODE_APPLIED",
-        serde_json::json!({
-            "mode": request.mode,
-            "sync_dns": request.sync_dns,
-        }),
+        serde_json::json!({"mode": request.mode, "sync_dns": request.sync_dns}),
     )
     .await;
 
     Ok(Json(HostnamePreviewResponse::from(result)))
 }
 
-/// Emit an audit log for a managed-domain write; failure is logged, not fatal.
 async fn log_dns_governance_audit(
     state: &Arc<DnsAppState>,
     auth: &temps_auth::AuthContext,
@@ -1248,7 +1268,7 @@ async fn log_dns_governance_audit(
         action: action.to_string(),
         details,
     };
-    if let Err(e) = state.audit.create_audit_log(&audit).await {
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         tracing::error!("Failed to create audit log: {}", e);
     }
 }
@@ -1294,6 +1314,54 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
             "/dns-providers/{provider_id}/domains/{domain}/apply-hostname-mode",
             post(apply_hostname_mode),
         )
+        // Ownership-guarded managed records (ADR-031)
+        .route(
+            "/dns-records",
+            post(managed_records::set_managed_record)
+                .delete(managed_records::remove_managed_record),
+        )
+        .route(
+            "/dns-records/ownership",
+            get(managed_records::get_record_ownership),
+        )
+        .route(
+            "/dns-records/import",
+            post(managed_records::import_managed_record),
+        )
+        .route(
+            "/delivery-capabilities",
+            get(domain_delivery::get_delivery_capabilities),
+        )
+        .route(
+            "/delivery-profiles",
+            get(domain_delivery::list_delivery_profiles)
+                .post(domain_delivery::create_delivery_profile),
+        )
+        .route(
+            "/delivery-profiles/{profile_id}",
+            delete(domain_delivery::delete_delivery_profile),
+        )
+        .route(
+            "/projects/{project_id}/delivery-settings",
+            get(domain_delivery::get_project_delivery_settings)
+                .put(domain_delivery::update_project_delivery_settings),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings",
+            get(domain_delivery::list_domain_delivery_bindings),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/preview",
+            post(domain_delivery::preview_domain_delivery_binding),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/apply",
+            post(domain_delivery::apply_domain_delivery_binding),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/{binding_id}",
+            delete(domain_delivery::delete_domain_delivery_binding),
+        )
 }
 
 /// Configure internal DNS sync routes (ADR-011).
@@ -1334,6 +1402,20 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         verify_managed_domain,
         preview_hostname_mode,
         apply_hostname_mode,
+        managed_records::get_record_ownership,
+        managed_records::set_managed_record,
+        managed_records::remove_managed_record,
+        managed_records::import_managed_record,
+        domain_delivery::get_delivery_capabilities,
+        domain_delivery::list_delivery_profiles,
+        domain_delivery::create_delivery_profile,
+        domain_delivery::delete_delivery_profile,
+        domain_delivery::get_project_delivery_settings,
+        domain_delivery::update_project_delivery_settings,
+        domain_delivery::list_domain_delivery_bindings,
+        domain_delivery::preview_domain_delivery_binding,
+        domain_delivery::apply_domain_delivery_binding,
+        domain_delivery::delete_domain_delivery_binding,
         dns_sync::get_dns_changes,
         dns_sync::post_dns_ack,
     ),
@@ -1350,6 +1432,27 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             HostnameChange,
             DnsRecordChange,
             HostnamePreviewResponse,
+            managed_records::SetManagedRecordRequest,
+            managed_records::ImportManagedRecordRequest,
+            managed_records::RecordOwnershipResponse,
+            managed_records::ImportManagedRecordResponse,
+            domain_delivery::CreateDeliveryProfileRequest,
+            domain_delivery::UpdateProjectDeliverySettingsRequest,
+            domain_delivery::ApplyDomainDeliveryBindingRequest,
+            crate::services::domain_delivery::DeliveryProviderKind,
+            crate::services::domain_delivery::DeliveryCapabilityResponse,
+            crate::services::domain_delivery::DeliveryProfileResponse,
+            crate::services::domain_delivery::EnvironmentDeliveryOverride,
+            crate::services::domain_delivery::ProjectDeliverySettingsResponse,
+            crate::services::domain_delivery::PreviewDomainDeliveryBindingRequest,
+            crate::services::domain_delivery::AdoptDeliveryRecord,
+            crate::services::domain_delivery::DeliveryRecordPlan,
+            crate::services::domain_delivery::DeliveryRecordRequirement,
+            crate::services::domain_delivery::DeliveryRequirements,
+            crate::services::domain_delivery::OriginTlsPolicy,
+            crate::services::domain_delivery::DeliveryRoutingPlan,
+            crate::services::domain_delivery::DomainDeliveryPreviewResponse,
+            crate::services::domain_delivery::DomainDeliveryBindingResponse,
             ConnectionTestResult,
             ZoneListResponse,
             RecordListResponse,
@@ -1364,6 +1467,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
     ),
     tags(
         (name = "DNS Providers", description = "DNS provider management endpoints"),
+        (name = "DNS Records", description = "Ownership-guarded managed DNS records (ADR-031)"),
         (name = "Internal DNS", description = "Per-node DNS resolver sync (ADR-011)"),
     )
 )]

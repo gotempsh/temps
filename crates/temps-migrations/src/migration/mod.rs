@@ -154,6 +154,8 @@ mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260713_000002_add_dns_ownership;
+mod m20260714_000001_create_domain_delivery;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
 mod m20260714_000001_secure_sns_email_events;
 mod m20260716_000001_observability_compression_24h;
@@ -568,6 +570,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260903_000004_repair_application_primary_projects::Migration),
             Box::new(m20260908_000001_reconcile_legacy_status_monitors::Migration),
             Box::new(m20260909_000001_index_global_log_chunks::Migration),
+            Box::new(m20260713_000002_add_dns_ownership::Migration),
+            Box::new(m20260714_000001_create_domain_delivery::Migration),
         ]
     }
 }
