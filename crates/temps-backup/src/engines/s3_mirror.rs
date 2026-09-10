@@ -245,6 +245,30 @@ impl BackupEngine for S3MirrorEngine {
             });
         }
         if !result.stderr_tail.trim().is_empty() {
+            // `mc mirror` exits 0 even when it could not list one side of the
+            // mirror for comparison -- it logs the failure and falls back to
+            // copying everything it *can* reach via plain PUT/GET, rather
+            // than treating a failed diff as fatal. That fallback silently
+            // turns a real access/listing problem into a "completed" backup
+            // that never actually diffed against what's already there, with
+            // no visible signal to the operator beyond an info-level log line
+            // buried in server output. Escalate to a real failure instead so
+            // the underlying access problem (permanent misconfiguration or a
+            // persistent provider-side listing issue) is surfaced immediately
+            // through the normal backup-error path rather than staying
+            // invisible behind a green "completed" status.
+            if stderr_indicates_access_denied(&result.stderr_tail) {
+                return Err(BackupError::Failed {
+                    reason: format!(
+                        "mc mirror could not list one side of the mirror for comparison \
+                         (access denied). mc still exited 0 and copied what it could reach \
+                         via direct PUT/GET, but the result may be an incomplete, non-diffed \
+                         copy -- check that both the source and destination S3 credentials \
+                         have list permission on their bucket. stderr: {}",
+                        sensitive_values.redact(result.stderr_tail.trim()),
+                    ),
+                });
+            }
             info!(
                 backup_id,
                 "mc mirror stderr (warnings): {}",
@@ -338,6 +362,16 @@ async fn list_total_s3_size(
     Ok(total)
 }
 
+/// Whether `mc`'s stderr reports that it could not list one side of the
+/// mirror for comparison. `mc mirror` treats this as non-fatal -- it logs the
+/// failure and falls back to copying whatever it can still reach -- so the
+/// container's own exit code is not sufficient evidence that the mirror
+/// actually diffed correctly against what's already there.
+fn stderr_indicates_access_denied(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("unable to list") && lower.contains("access denied")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +382,23 @@ mod tests {
         assert!(MC_IMAGE
             .contains("sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"));
         assert!(MC_IMAGE.contains("@sha256:"));
+    }
+
+    #[test]
+    fn detects_access_denied_during_mc_mirror_comparison_listing() {
+        assert!(stderr_indicates_access_denied(
+            "mc: <ERROR> Unable to list comparison retrying.. Access Denied."
+        ));
+        assert!(stderr_indicates_access_denied(
+            "mc: <ERROR> Unable to list comparison retrying.. ACCESS DENIED"
+        ));
+    }
+
+    #[test]
+    fn does_not_flag_unrelated_mc_warnings() {
+        assert!(!stderr_indicates_access_denied(
+            "mc: <WARNING> `source/foo.txt`: object is a delete marker, skipping"
+        ));
+        assert!(!stderr_indicates_access_denied(""));
     }
 }
