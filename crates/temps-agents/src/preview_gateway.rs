@@ -197,6 +197,10 @@ pub async fn load_settings(db: &DatabaseConnection) -> PreviewGatewaySettings {
         .unwrap_or_default()
 }
 
+fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
+    settings.enabled
+}
+
 /// Reconcile the gateway to match `spec`. Idempotent.
 pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<()> {
     info!(
@@ -599,6 +603,12 @@ pub fn spawn_reconcile(
     data_dir: std::path::PathBuf,
 ) {
     rt.spawn(async move {
+        let settings = load_settings(&db).await;
+        if !should_reconcile(&settings) {
+            info!("preview gateway reconciliation disabled by settings");
+            return;
+        }
+
         // DB-backed secret so the value is stable across restarts, cwd
         // changes, and `TEMPS_DATA_DIR` overrides. Falls back to the legacy
         // file path for migration.
@@ -609,7 +619,6 @@ pub fn spawn_reconcile(
             );
         }
 
-        let settings = load_settings(&db).await;
         let mut spec = PreviewGatewaySpec::from_settings(&settings);
         spec.shared_secret = shared_secret;
 
@@ -854,6 +863,16 @@ pub async fn tail_logs(docker: &Docker, tail: usize) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn disabled_settings_skip_reconciliation_operations() {
+        let settings = PreviewGatewaySettings {
+            enabled: false,
+            ..PreviewGatewaySettings::default()
+        };
+
+        assert!(!should_reconcile(&settings));
+    }
 
     #[test]
     fn ensure_shared_secret_creates_file_on_first_call() {

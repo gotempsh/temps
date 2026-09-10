@@ -553,6 +553,10 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
+    /// Master switch for the shared preview gateway supervisor. Defaults to
+    /// enabled so existing installations retain their current behaviour.
+    #[schema(example = true)]
+    pub enabled: bool,
     /// Docker image reference for the gateway. Pinned per Temps release.
     /// Operators can override this to test a custom build.
     #[schema(example = "ghcr.io/gotempsh/temps-preview-gateway:latest")]
@@ -581,6 +585,7 @@ pub struct PreviewGatewaySettings {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             image: "ghcr.io/gotempsh/temps-preview-gateway:latest".to_string(),
             host_port: 8090,
             auto_upgrade: true,
@@ -1010,6 +1015,23 @@ mod tests {
         assert!(!parsed.on_demand_tls.enabled);
         assert_eq!(parsed.on_demand_tls.max_concurrent, 3);
         assert_eq!(parsed.on_demand_tls.hourly_cap, 10);
+    }
+
+    #[test]
+    fn legacy_preview_gateway_settings_default_to_enabled() {
+        let legacy = serde_json::json!({
+            "image": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "host_port": 8090,
+            "auto_upgrade": true
+        });
+
+        let parsed: PreviewGatewaySettings =
+            serde_json::from_value(legacy).expect("legacy preview gateway settings should parse");
+
+        assert!(
+            parsed.enabled,
+            "legacy settings must keep preview gateway reconciliation enabled"
+        );
     }
 
     #[test]

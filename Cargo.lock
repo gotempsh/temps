@@ -11517,6 +11517,7 @@ dependencies = [
  "temps-dns-resolver",
  "temps-entities",
  "temps-migrations",
+ "temps-projects",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",

@@ -14,6 +14,7 @@
 
 pub mod deployment_publisher;
 pub mod dns_registry;
+pub mod domain_delivery;
 pub mod hostname_sync;
 pub mod managed_records;
 pub mod provider_service;

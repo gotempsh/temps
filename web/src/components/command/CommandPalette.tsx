@@ -226,6 +226,12 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Delivery Profiles',
+    url: '/delivery-profiles',
+    icon: Cloud,
+    keywords: ['delivery', 'cdn', 'cloudflare', 'direct', 'domains'],
+  },
+  {
     title: 'Add DNS Provider',
     url: '/dns-providers/add',
     icon: Cloud,
@@ -613,14 +619,20 @@ export function CommandPalette() {
     enabled: open,
     staleTime: 60_000,
   })
-  const globalSkills = globalSkillsData?.items ?? []
+  const globalSkills = useMemo(
+    () => globalSkillsData?.items ?? [],
+    [globalSkillsData]
+  )
 
   const { data: globalMcpServersData, refetch: refetchMcp } = useQuery({
     ...listGlobalMcpsOptions(),
     enabled: open,
     staleTime: 60_000,
   })
-  const globalMcpServers = globalMcpServersData?.items ?? []
+  const globalMcpServers = useMemo(
+    () => globalMcpServersData?.items ?? [],
+    [globalMcpServersData]
+  )
 
   // Detect if user is on a project page and extract slug
   const currentProjectSlug = useMemo(() => {

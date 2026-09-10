@@ -63,6 +63,7 @@ pub struct UpgradeRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PreviewGatewaySettingsResponse {
+    pub enabled: bool,
     pub image: String,
     pub host_port: u16,
     pub auto_upgrade: bool,
@@ -76,6 +77,7 @@ pub struct PreviewGatewaySettingsResponse {
 impl From<PreviewGatewaySettings> for PreviewGatewaySettingsResponse {
     fn from(s: PreviewGatewaySettings) -> Self {
         Self {
+            enabled: s.enabled,
             image: s.image,
             host_port: s.host_port,
             auto_upgrade: s.auto_upgrade,
@@ -87,6 +89,7 @@ impl From<PreviewGatewaySettings> for PreviewGatewaySettingsResponse {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PatchSettingsRequest {
+    pub enabled: Option<bool>,
     pub image: Option<String>,
     pub host_port: Option<u16>,
     pub auto_upgrade: Option<bool>,
@@ -237,6 +240,9 @@ pub async fn patch_preview_gateway_settings(
     state
         .platform_config_service
         .update_setting_field(|s| {
+            if let Some(enabled) = patch.enabled {
+                s.preview_gateway.enabled = enabled;
+            }
             if let Some(image) = patch.image.clone() {
                 s.preview_gateway.image = image;
             }

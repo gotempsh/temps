@@ -159,6 +159,12 @@ export function DnsProviders() {
           <div className="flex items-center gap-2 self-start sm:self-auto">
             <Button
               variant="outline"
+              onClick={() => navigate('/delivery-profiles')}
+            >
+              Delivery profiles
+            </Button>
+            <Button
+              variant="outline"
               size="icon"
               onClick={() => refetch()}
               aria-label="Refresh"

@@ -1,7 +1,7 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_core::url_validation;
-use temps_entities::project_custom_domains;
+use temps_entities::{domain_delivery_bindings, project_custom_domains};
 use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
@@ -20,6 +20,8 @@ pub enum CustomDomainError {
     Internal(String),
     #[error("Circular redirect: {0}")]
     CircularRedirect(String),
+    #[error("Custom domain {domain_id} has delivery binding {binding_id}; remove the delivery binding before deleting the route")]
+    DeliveryBindingExists { domain_id: i32, binding_id: i32 },
     #[error("Invalid redirect URL: {0}")]
     InvalidRedirectUrl(String),
 }
@@ -461,6 +463,17 @@ impl CustomDomainService {
     /// Delete custom domain
     pub async fn delete_custom_domain(&self, id: i32) -> Result<(), CustomDomainError> {
         info!("Deleting custom domain ID: {}", id);
+
+        if let Some(binding) = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::CustomDomainId.eq(id))
+            .one(self.db.as_ref())
+            .await?
+        {
+            return Err(CustomDomainError::DeliveryBindingExists {
+                domain_id: id,
+                binding_id: binding.id,
+            });
+        }
 
         let result = project_custom_domains::Entity::delete_by_id(id)
             .exec(self.db.as_ref())

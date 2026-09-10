@@ -9,6 +9,7 @@
 //! [`dns_sync::DnsSyncAppState`].
 
 pub mod dns_sync;
+pub mod domain_delivery;
 pub mod managed_records;
 
 use axum::{
@@ -102,6 +103,8 @@ pub struct DnsAppState {
     pub provider_service: Arc<DnsProviderService>,
     pub record_service: Arc<DnsRecordService>,
     pub managed_record_service: Arc<crate::services::ManagedDnsRecordService>,
+    pub domain_delivery_service: Arc<crate::services::domain_delivery::DomainDeliveryService>,
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// Queue used to trigger a route reload after a hostname-mode change so
     /// derived (Standard/Flat) hostnames take effect.
     pub queue: Arc<dyn temps_core::JobQueue>,
@@ -1178,6 +1181,40 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
             "/dns-records/import",
             post(managed_records::import_managed_record),
         )
+        .route(
+            "/delivery-capabilities",
+            get(domain_delivery::get_delivery_capabilities),
+        )
+        .route(
+            "/delivery-profiles",
+            get(domain_delivery::list_delivery_profiles)
+                .post(domain_delivery::create_delivery_profile),
+        )
+        .route(
+            "/delivery-profiles/{profile_id}",
+            delete(domain_delivery::delete_delivery_profile),
+        )
+        .route(
+            "/projects/{project_id}/delivery-settings",
+            get(domain_delivery::get_project_delivery_settings)
+                .put(domain_delivery::update_project_delivery_settings),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings",
+            get(domain_delivery::list_domain_delivery_bindings),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/preview",
+            post(domain_delivery::preview_domain_delivery_binding),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/apply",
+            post(domain_delivery::apply_domain_delivery_binding),
+        )
+        .route(
+            "/projects/{project_id}/domain-delivery-bindings/{binding_id}",
+            delete(domain_delivery::delete_domain_delivery_binding),
+        )
 }
 
 /// Configure internal DNS sync routes (ADR-011).
@@ -1222,6 +1259,16 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         managed_records::set_managed_record,
         managed_records::remove_managed_record,
         managed_records::import_managed_record,
+        domain_delivery::get_delivery_capabilities,
+        domain_delivery::list_delivery_profiles,
+        domain_delivery::create_delivery_profile,
+        domain_delivery::delete_delivery_profile,
+        domain_delivery::get_project_delivery_settings,
+        domain_delivery::update_project_delivery_settings,
+        domain_delivery::list_domain_delivery_bindings,
+        domain_delivery::preview_domain_delivery_binding,
+        domain_delivery::apply_domain_delivery_binding,
+        domain_delivery::delete_domain_delivery_binding,
         dns_sync::get_dns_changes,
         dns_sync::post_dns_ack,
     ),
@@ -1242,6 +1289,23 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             managed_records::ImportManagedRecordRequest,
             managed_records::RecordOwnershipResponse,
             managed_records::ImportManagedRecordResponse,
+            domain_delivery::CreateDeliveryProfileRequest,
+            domain_delivery::UpdateProjectDeliverySettingsRequest,
+            domain_delivery::ApplyDomainDeliveryBindingRequest,
+            crate::services::domain_delivery::DeliveryProviderKind,
+            crate::services::domain_delivery::DeliveryCapabilityResponse,
+            crate::services::domain_delivery::DeliveryProfileResponse,
+            crate::services::domain_delivery::EnvironmentDeliveryOverride,
+            crate::services::domain_delivery::ProjectDeliverySettingsResponse,
+            crate::services::domain_delivery::PreviewDomainDeliveryBindingRequest,
+            crate::services::domain_delivery::AdoptDeliveryRecord,
+            crate::services::domain_delivery::DeliveryRecordPlan,
+            crate::services::domain_delivery::DeliveryRecordRequirement,
+            crate::services::domain_delivery::DeliveryRequirements,
+            crate::services::domain_delivery::OriginTlsPolicy,
+            crate::services::domain_delivery::DeliveryRoutingPlan,
+            crate::services::domain_delivery::DomainDeliveryPreviewResponse,
+            crate::services::domain_delivery::DomainDeliveryBindingResponse,
             ConnectionTestResult,
             ZoneListResponse,
             RecordListResponse,

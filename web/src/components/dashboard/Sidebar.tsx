@@ -76,7 +76,7 @@ import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, Eye, type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -138,6 +138,7 @@ const navWorkflow: PlatformNavItem[] = [
     subItems: [
       { title: 'Git Providers', url: '/git-providers', icon: GitBranch },
       { title: 'DNS Providers', url: '/dns-providers', icon: Cloud },
+      { title: 'Delivery Profiles', url: '/delivery-profiles', icon: Globe },
     ],
   },
 ]
@@ -180,7 +181,11 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Infrastructure',
     items: [
       { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
-      { title: 'Docker Registry', url: '/settings/docker-registry', icon: Boxes },
+      {
+        title: 'Docker Registry',
+        url: '/settings/docker-registry',
+        icon: Boxes,
+      },
       { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
@@ -191,8 +196,16 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Security Headers', url: '/settings/security', icon: Shield },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
-      { title: 'Disk Monitoring', url: '/settings/disk-monitoring', icon: HardDrive },
-      { title: 'Metrics Monitoring', url: '/settings/metrics-monitoring', icon: BarChart3 },
+      {
+        title: 'Disk Monitoring',
+        url: '/settings/disk-monitoring',
+        icon: HardDrive,
+      },
+      {
+        title: 'Metrics Monitoring',
+        url: '/settings/metrics-monitoring',
+        icon: BarChart3,
+      },
     ],
   },
 ]
@@ -320,11 +333,10 @@ export default function AppSidebar() {
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   const settingsMode = location.pathname.startsWith('/settings')
-  const projectMatch = location.pathname.match(
-    /^\/projects\/([^/]+)(?:\/.*)?$/
-  )
+  const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =
-    projectMatch && !['new', 'import-wizard', 'import'].includes(projectMatch[1])
+    projectMatch &&
+    !['new', 'import-wizard', 'import'].includes(projectMatch[1])
       ? projectMatch[1]
       : null
 
@@ -332,10 +344,13 @@ export default function AppSidebar() {
   // even though we're still on /settings or /projects/:slug. Cleared on
   // any pathname change (so re-clicking Settings or any sub-link
   // re-triggers the swap).
-  const [forceDefault, setForceDefault] = useState(false)
-  useEffect(() => {
-    setForceDefault(false)
-  }, [location.pathname])
+  const [defaultNavPath, setDefaultNavPath] = useState<string | null>(null)
+  const forceDefault = defaultNavPath === location.pathname
+  const setForceDefault = (value: boolean) =>
+    setDefaultNavPath(value ? location.pathname : null)
+  if (defaultNavPath !== null && defaultNavPath !== location.pathname) {
+    setDefaultNavPath(null)
+  }
 
   const compact = isMinimal && !isMobile
 
@@ -384,18 +399,13 @@ export default function AppSidebar() {
         {showDefault ? (
           <DefaultNav
             pluginItems={pluginItems}
-            pinnedProjectSlug={
-              forceDefault && projectSlug ? projectSlug : null
-            }
+            pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
             onReturnToProject={() => setForceDefault(false)}
           />
         ) : settingsMode ? (
           <SettingsNav onBack={() => setForceDefault(true)} />
         ) : projectSlug ? (
-          <ProjectNav
-            slug={projectSlug}
-            onBack={() => setForceDefault(true)}
-          />
+          <ProjectNav slug={projectSlug} onBack={() => setForceDefault(true)} />
         ) : null}
       </SidebarContent>
       <SidebarFooter>
@@ -436,8 +446,7 @@ function NavSection({
       allUrls
         .filter(
           (url) =>
-            location.pathname === url ||
-            location.pathname.startsWith(url + '/')
+            location.pathname === url || location.pathname.startsWith(url + '/')
         )
         .reduce<string | null>(
           (best, url) =>
@@ -448,9 +457,7 @@ function NavSection({
   )
   return (
     <SidebarGroup
-      className={
-        compact ? '' : 'group-data-[collapsible=icon]:hidden'
-      }
+      className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
       <SidebarGroupLabel className={compact ? 'hidden' : ''}>
         {label}
@@ -816,7 +823,11 @@ const projectBaseNav: ProjectNavItem[] = [
     ],
   },
   { title: 'Databases', url: 'storage', icon: Database },
-  { title: 'Environment Variables', url: 'environment-variables', icon: KeyRound },
+  {
+    title: 'Environment Variables',
+    url: 'environment-variables',
+    icon: KeyRound,
+  },
   { title: 'Domains', url: 'domains', icon: Globe },
   { title: 'Git', url: 'git', icon: GitFork },
   { title: 'Logs', url: 'runtime', icon: ScrollText },
@@ -863,13 +874,7 @@ const projectBaseNav: ProjectNavItem[] = [
   },
 ]
 
-function ProjectNav({
-  slug,
-  onBack,
-}: {
-  slug: string
-  onBack: () => void
-}) {
+function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery({
     ...getProjectBySlugOptions({ path: { slug } }),
   })
@@ -915,26 +920,14 @@ function ProjectNav({
       it.subItems?.some((s) => matchesSubRoute(s.url, route))
     )?.title ?? null
 
-  const [drilledTo, setDrilledTo] = useState<string | null>(() =>
-    activeRoute ? findDrillParent(activeRoute) : null
+  // Initialize once the project route is known. Explicit null preserves Back
+  // navigation; undefined means the initial route has not loaded yet.
+  const [drilledTo, setDrilledTo] = useState<string | null | undefined>(() =>
+    activeRoute ? findDrillParent(activeRoute) : undefined
   )
-
-  // On a hard refresh the `useState` initializer above runs before `project`
-  // has loaded, so `activeRoute` is empty and `drilledTo` stays null — leaving
-  // the sidebar on the root nav even though the URL is a deep sub-route. Re-sync
-  // exactly once, the first time `activeRoute` becomes available, so a refreshed
-  // deep link (e.g. /analytics/ai-agents) expands the right section. We gate on
-  // a ref so this never fires again on later route changes — that would fight
-  // the Back arrow, which intentionally collapses to root while staying on the
-  // sub-route URL.
-  const didSyncDrillRef = useRef(false)
-  useEffect(() => {
-    if (didSyncDrillRef.current || !activeRoute) return
-    didSyncDrillRef.current = true
-    const parent = findDrillParent(activeRoute)
-    if (parent) setDrilledTo(parent)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRoute])
+  if (drilledTo === undefined && activeRoute) {
+    setDrilledTo(findDrillParent(activeRoute))
+  }
 
   // The single most-specific nav URL that the current route falls under. Among
   // all candidate URLs whose path the route matches (exactly or as a prefix),
@@ -968,8 +961,10 @@ function ProjectNav({
 
   const isActive = (url: string) => {
     const pathOnly = url.split('?')[0]
-    if (pathOnly === 'project') return activeRoute === '' || activeRoute === 'project'
-    if (pathOnly === 'environments') return activeRoute.startsWith('environments')
+    if (pathOnly === 'project')
+      return activeRoute === '' || activeRoute === 'project'
+    if (pathOnly === 'environments')
+      return activeRoute.startsWith('environments')
     return pathOnly === bestMatchUrl
   }
   const isParentActive = (item: ProjectNavItem) =>
@@ -995,7 +990,7 @@ function ProjectNav({
                       className={cn(
                         compact ? 'justify-center' : 'justify-start',
                         active &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                          'bg-sidebar-accent text-sidebar-accent-foreground'
                       )}
                     >
                       <Link to={`/projects/${project.slug}/${sub.url}`}>
@@ -1033,7 +1028,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <Link to={`/projects/${project.slug}/${item.url}`}>
@@ -1053,7 +1048,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <item.icon />
@@ -1071,7 +1066,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <Link to={`/projects/${project.slug}/${item.url}`}>
@@ -1141,13 +1136,7 @@ function CurrentProjectPin({
 
 // Shared back-arrow header used by Settings, Project, and drill-down
 // sub-views. `onBack` is a state callback — it never navigates.
-function SwapHeader({
-  title,
-  onBack,
-}: {
-  title: string
-  onBack: () => void
-}) {
+function SwapHeader({ title, onBack }: { title: string; onBack: () => void }) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
   if (compact) return null

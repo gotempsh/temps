@@ -262,6 +262,11 @@ export type AdminGateResponse = {
  */
 export type AdminGateSource = 'default' | 'db' | 'env';
 
+export type AdoptDeliveryRecord = {
+    name: string;
+    record_type: DnsRecordType;
+};
+
 /**
  * Response DTO for a single agent — masks the encrypted API key.
  */
@@ -1112,6 +1117,11 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+};
+
+export type ApplyDomainDeliveryBindingRequest = {
+    adopt_records?: Array<AdoptDeliveryRecord>;
+    preview_id: string;
 };
 
 /**
@@ -2932,6 +2942,11 @@ export type CreateDashboardRequest = {
     project_id: number;
 };
 
+export type CreateDeliveryProfileRequest = {
+    name: string;
+    provider_kind: DeliveryProviderKind;
+};
+
 export type CreateDeploymentTokenRequest = {
     /**
      * Optional deployment ID - if set, token is scoped to a specific deployment
@@ -3972,6 +3987,55 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeliveryCapabilityResponse = {
+    configured: boolean;
+    name: string;
+    provider_kind: DeliveryProviderKind;
+    requirements: Array<string>;
+    setup_path?: string | null;
+    supported: boolean;
+};
+
+export type DeliveryProfileResponse = {
+    created_at: string;
+    id: number;
+    name: string;
+    provider_kind: DeliveryProviderKind;
+    updated_at: string;
+};
+
+export type DeliveryProviderKind = 'direct' | 'cloudflare';
+
+export type DeliveryRecordPlan = {
+    expected_existing_record?: unknown;
+    name: string;
+    ownership_status: string;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    requires_adoption: boolean;
+    value: string;
+};
+
+export type DeliveryRecordRequirement = {
+    content: DnsRecordContent;
+    name: string;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    ttl?: number | null;
+    value: string;
+};
+
+export type DeliveryRequirements = {
+    origin_tls: OriginTlsPolicy;
+    record: DeliveryRecordRequirement;
+    warnings: Array<string>;
+};
+
+export type DeliveryRoutingPlan = {
+    custom_domain_id?: number | null;
+    will_create_custom_domain: boolean;
 };
 
 export type DeployFromImageRequest = {
@@ -5144,6 +5208,38 @@ export type DomainChallengeResponse = {
     txt_records: Array<TxtRecord>;
 };
 
+export type DomainDeliveryBindingResponse = {
+    applied_at: string;
+    custom_domain_id: number;
+    delivery_profile_id: number;
+    delivery_profile_name: string;
+    dns_provider_id: number;
+    environment_id: number;
+    hostname: string;
+    id: number;
+    last_error?: string | null;
+    origin_target: string;
+    profile_source: string;
+    project_id: number;
+    provider_kind: DeliveryProviderKind;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    status: string;
+    zone: string;
+};
+
+export type DomainDeliveryPreviewResponse = {
+    expires_at: string;
+    origin_tls: OriginTlsPolicy;
+    preview_id: string;
+    profile_id: number;
+    profile_source: string;
+    provider_kind: DeliveryProviderKind;
+    record: DeliveryRecordPlan;
+    routing: DeliveryRoutingPlan;
+    warnings: Array<string>;
+};
+
 export type DomainEnvironmentResponse = {
     id: number;
     name: string;
@@ -5694,6 +5790,11 @@ export type EnvironmentConfiguration = {
      * Proposed subdomain
      */
     subdomain: string;
+};
+
+export type EnvironmentDeliveryOverride = {
+    environment_id: number;
+    profile_id?: number | null;
 };
 
 export type EnvironmentDomainResponse = {
@@ -9895,6 +9996,8 @@ export type OperationResultsResponse = {
     operations: Array<OperationResultResponse>;
 };
 
+export type OriginTlsPolicy = 'existing_certificate';
+
 export type OtelDashboardResponse = {
     created_at: string;
     id: number;
@@ -10613,6 +10716,7 @@ export type PasswordProtectionConfig = {
 
 export type PatchSettingsRequest = {
     auto_upgrade?: boolean | null;
+    enabled?: boolean | null;
     host_port?: number | null;
     image?: string | null;
 };
@@ -11075,6 +11179,15 @@ export type PresetResponse = {
     slug: string;
 };
 
+export type PreviewDomainDeliveryBindingRequest = {
+    delivery_profile_id?: number | null;
+    dns_provider_id: number;
+    environment_id: number;
+    hostname: string;
+    origin_target: string;
+    zone: string;
+};
+
 /**
  * Workspace preview gateway settings.
  *
@@ -11092,6 +11205,11 @@ export type PreviewGatewaySettings = {
      * from the settings UI.
      */
     auto_upgrade?: boolean;
+    /**
+     * Master switch for the shared preview gateway supervisor. Defaults to
+     * enabled so existing installations retain their current behaviour.
+     */
+    enabled?: boolean;
     /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
@@ -11134,6 +11252,7 @@ export type PreviewGatewaySettingsResponse = {
      * "Reset to default" link without round-tripping.
      */
     default_image: string;
+    enabled: boolean;
     host_port: number;
     image: string;
 };
@@ -11228,6 +11347,13 @@ export type ProjectDashboardAnalytics = {
      * Unique visitor count in the current time range
      */
     unique_visitors: number;
+};
+
+export type ProjectDeliverySettingsResponse = {
+    default_profile_id?: number | null;
+    effective_default_profile?: null | DeliveryProfileResponse;
+    environment_overrides: Array<EnvironmentDeliveryOverride>;
+    project_id: number;
 };
 
 /**
@@ -16285,6 +16411,11 @@ export type UpdateOidcProviderRequest = {
 
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
+};
+
+export type UpdateProjectDeliverySettingsRequest = {
+    default_profile_id?: number | null;
+    environment_overrides?: Array<EnvironmentDeliveryOverride>;
 };
 
 /**
@@ -22707,6 +22838,60 @@ export type GetDashboardProjectsAnalyticsResponses = {
 };
 
 export type GetDashboardProjectsAnalyticsResponse = GetDashboardProjectsAnalyticsResponses[keyof GetDashboardProjectsAnalyticsResponses];
+
+export type GetDeliveryCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/delivery-capabilities';
+};
+
+export type GetDeliveryCapabilitiesResponses = {
+    200: Array<DeliveryCapabilityResponse>;
+};
+
+export type GetDeliveryCapabilitiesResponse = GetDeliveryCapabilitiesResponses[keyof GetDeliveryCapabilitiesResponses];
+
+export type ListDeliveryProfilesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/delivery-profiles';
+};
+
+export type ListDeliveryProfilesResponses = {
+    200: Array<DeliveryProfileResponse>;
+};
+
+export type ListDeliveryProfilesResponse = ListDeliveryProfilesResponses[keyof ListDeliveryProfilesResponses];
+
+export type CreateDeliveryProfileData = {
+    body: CreateDeliveryProfileRequest;
+    path?: never;
+    query?: never;
+    url: '/delivery-profiles';
+};
+
+export type CreateDeliveryProfileResponses = {
+    201: DeliveryProfileResponse;
+};
+
+export type CreateDeliveryProfileResponse = CreateDeliveryProfileResponses[keyof CreateDeliveryProfileResponses];
+
+export type DeleteDeliveryProfileData = {
+    body?: never;
+    path: {
+        profile_id: number;
+    };
+    query?: never;
+    url: '/delivery-profiles/{profile_id}';
+};
+
+export type DeleteDeliveryProfileResponses = {
+    204: void;
+};
+
+export type DeleteDeliveryProfileResponse = DeleteDeliveryProfileResponses[keyof DeleteDeliveryProfileResponses];
 
 export type GetActivityGraphData = {
     body?: never;
@@ -35707,6 +35892,36 @@ export type LinkCustomDomainToCertificateResponses = {
 
 export type LinkCustomDomainToCertificateResponse = LinkCustomDomainToCertificateResponses[keyof LinkCustomDomainToCertificateResponses];
 
+export type GetProjectDeliverySettingsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/delivery-settings';
+};
+
+export type GetProjectDeliverySettingsResponses = {
+    200: ProjectDeliverySettingsResponse;
+};
+
+export type GetProjectDeliverySettingsResponse = GetProjectDeliverySettingsResponses[keyof GetProjectDeliverySettingsResponses];
+
+export type UpdateProjectDeliverySettingsData = {
+    body: UpdateProjectDeliverySettingsRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/delivery-settings';
+};
+
+export type UpdateProjectDeliverySettingsResponses = {
+    200: ProjectDeliverySettingsResponse;
+};
+
+export type UpdateProjectDeliverySettingsResponse = UpdateProjectDeliverySettingsResponses[keyof UpdateProjectDeliverySettingsResponses];
+
 export type UpdateProjectDeploymentConfigData = {
     body: UpdateDeploymentConfigRequest;
     path: {
@@ -36585,6 +36800,67 @@ export type TeardownDeploymentResponses = {
 };
 
 export type TeardownDeploymentResponse = TeardownDeploymentResponses[keyof TeardownDeploymentResponses];
+
+export type ListDomainDeliveryBindingsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings';
+};
+
+export type ListDomainDeliveryBindingsResponses = {
+    200: Array<DomainDeliveryBindingResponse>;
+};
+
+export type ListDomainDeliveryBindingsResponse = ListDomainDeliveryBindingsResponses[keyof ListDomainDeliveryBindingsResponses];
+
+export type ApplyDomainDeliveryBindingData = {
+    body: ApplyDomainDeliveryBindingRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/apply';
+};
+
+export type ApplyDomainDeliveryBindingResponses = {
+    200: DomainDeliveryBindingResponse;
+};
+
+export type ApplyDomainDeliveryBindingResponse = ApplyDomainDeliveryBindingResponses[keyof ApplyDomainDeliveryBindingResponses];
+
+export type PreviewDomainDeliveryBindingData = {
+    body: PreviewDomainDeliveryBindingRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/preview';
+};
+
+export type PreviewDomainDeliveryBindingResponses = {
+    200: DomainDeliveryPreviewResponse;
+};
+
+export type PreviewDomainDeliveryBindingResponse = PreviewDomainDeliveryBindingResponses[keyof PreviewDomainDeliveryBindingResponses];
+
+export type DeleteDomainDeliveryBindingData = {
+    body?: never;
+    path: {
+        project_id: number;
+        binding_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/{binding_id}';
+};
+
+export type DeleteDomainDeliveryBindingResponses = {
+    204: void;
+};
+
+export type DeleteDomainDeliveryBindingResponse = DeleteDomainDeliveryBindingResponses[keyof DeleteDomainDeliveryBindingResponses];
 
 export type ListDsnsData = {
     body?: never;

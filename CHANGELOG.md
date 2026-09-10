@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Project domain delivery setup:** Add reusable Direct and Cloudflare delivery profiles, project defaults with environment overrides, and project-domain DNS preview and explicit adoption through the shared ownership service. Existing DNS and origin certificates are preserved until a setup is applied.
 - **Managed DNS and proxied origins:** Add signed, ownership-guarded A/AAAA/CNAME automation, per-domain Cloudflare proxy defaults, flat generated-hostname sync, conflict/import states, and self-signed origin TLS that avoids per-hostname ACME issuance.
 - **Daily returning-visitor metric**: The analytics overview now reports visitors active in the selected period who were previously seen in the same project and environment, making daily audience retention visible across TimescaleDB and ClickHouse backends.
 
 ### Fixed
 
+- **Local preview-gateway isolation:** Allow an installation to disable preview-gateway reconciliation in persisted settings before starting a second local instance, preventing that instance from managing the shared gateway container.
 - **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
 
 ## [0.1.0-beta.46] - 2026-07-12
