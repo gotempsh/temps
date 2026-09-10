@@ -161,6 +161,22 @@ pub enum OneShotError {
 
     #[error("Container '{name}' produced no exit code")]
     NoExitCode { name: String },
+
+    /// The caller asked for a stderr watch, the container exited without the
+    /// watched text having been seen, and the log stream had still not
+    /// closed after `drain_secs`. Whatever stderr was still in flight was
+    /// never inspected, so "no match" cannot be claimed. Callers treat this
+    /// as a failed run: for a watch that guards data completeness, an
+    /// uninspected diagnostic is not a clean result.
+    #[error(
+        "Container '{name}' exited but its stderr could not be fully inspected for \
+         '{watch}' within {drain_secs}s; refusing to report the run as clean"
+    )]
+    StderrWatchIncomplete {
+        name: String,
+        watch: &'static str,
+        drain_secs: u64,
+    },
 }
 
 /// Run a one-shot container start-to-finish. Returns when the container
@@ -382,15 +398,25 @@ pub async fn run_one_shot(
                 // collector published before it died.
             }
             Err(_) => {
-                if stderr_watch.is_some() {
-                    warn!(
-                        backup_id = spec.backup_id,
-                        engine = spec.engine,
-                        container = %spec.name,
-                        drain_secs = drain_deadline.as_secs(),
-                        "one_shot: log drain timed out with a stderr watch set; \
-                         a match seen so far is kept, later output was not inspected",
-                    );
+                // A match already published survives regardless. With a
+                // watch set and no match yet, the uninspected remainder of
+                // the stream makes a "clean" verdict unprovable: fail closed.
+                if let Some(watch) = stderr_watch {
+                    if !stderr_watch_flag.load(Ordering::Acquire) {
+                        warn!(
+                            backup_id = spec.backup_id,
+                            engine = spec.engine,
+                            container = %spec.name,
+                            drain_secs = drain_deadline.as_secs(),
+                            "one_shot: log drain timed out with a stderr watch set and no match \
+                             seen; later output was not inspected, refusing to report clean",
+                        );
+                        return Err(OneShotError::StderrWatchIncomplete {
+                            name: spec.name.clone(),
+                            watch,
+                            drain_secs: drain_deadline.as_secs(),
+                        });
+                    }
                 } else {
                     debug!("one_shot: log drain timed out after 2s");
                 }
