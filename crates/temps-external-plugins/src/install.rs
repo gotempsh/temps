@@ -33,8 +33,12 @@ pub enum InstallError {
     UnsafePluginName { name: String },
     #[error("Plugin '{plugin}' has unsafe release version '{version}'")]
     UnsafeVersion { plugin: String, version: String },
-    #[error("Unsupported platform: {os} {arch}")]
-    UnsupportedPlatform { os: String, arch: String },
+    #[error("Unsupported platform: {os} {arch} ({target_env})")]
+    UnsupportedPlatform {
+        os: String,
+        arch: String,
+        target_env: String,
+    },
     #[error("Plugin '{plugin}' v{version} has no binary for platform '{platform}'")]
     NoRelease {
         plugin: String,
@@ -934,16 +938,19 @@ fn open_executable_beneath(
     open_regular_file(plugin, path)
 }
 
-pub fn platform_target_for(os: &str, arch: &str) -> Result<String, InstallError> {
-    let target = match (os, arch) {
-        ("macos", "x86_64") => "darwin-amd64",
-        ("macos", "aarch64") => "darwin-arm64",
-        ("linux", "x86_64") => "linux-amd64",
-        ("linux", "aarch64") => "linux-arm64",
+pub fn platform_target_for(os: &str, arch: &str, target_env: &str) -> Result<String, InstallError> {
+    let target = match (os, arch, target_env) {
+        ("macos", "x86_64", _) => "darwin-amd64",
+        ("macos", "aarch64", _) => "darwin-arm64",
+        ("linux", "x86_64", "gnu") => "linux-amd64-gnu",
+        ("linux", "x86_64", "musl") => "linux-amd64-musl",
+        ("linux", "aarch64", "gnu") => "linux-arm64-gnu",
+        ("linux", "aarch64", "musl") => "linux-arm64-musl",
         _ => {
             return Err(InstallError::UnsupportedPlatform {
                 os: os.to_string(),
                 arch: arch.to_string(),
+                target_env: target_env.to_string(),
             })
         }
     };
@@ -951,7 +958,14 @@ pub fn platform_target_for(os: &str, arch: &str) -> Result<String, InstallError>
 }
 
 pub fn platform_target() -> Result<String, InstallError> {
-    platform_target_for(std::env::consts::OS, std::env::consts::ARCH)
+    let target_env = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "unknown"
+    };
+    platform_target_for(std::env::consts::OS, std::env::consts::ARCH, target_env)
 }
 
 pub fn validate_plugin_name(name: &str) -> Result<(), InstallError> {
@@ -1363,15 +1377,23 @@ mod tests {
     #[test]
     fn platform_selection_is_explicit() {
         assert_eq!(
-            platform_target_for("linux", "x86_64").expect("linux"),
-            "linux-amd64"
+            platform_target_for("linux", "x86_64", "gnu").expect("linux gnu"),
+            "linux-amd64-gnu"
         );
         assert_eq!(
-            platform_target_for("macos", "aarch64").expect("mac"),
+            platform_target_for("linux", "aarch64", "musl").expect("linux musl"),
+            "linux-arm64-musl"
+        );
+        assert_eq!(
+            platform_target_for("macos", "aarch64", "unknown").expect("mac"),
             "darwin-arm64"
         );
         assert!(matches!(
-            platform_target_for("windows", "x86_64"),
+            platform_target_for("windows", "x86_64", "gnu"),
+            Err(InstallError::UnsupportedPlatform { .. })
+        ));
+        assert!(matches!(
+            platform_target_for("linux", "x86_64", "unknown"),
             Err(InstallError::UnsupportedPlatform { .. })
         ));
     }
