@@ -163,19 +163,20 @@ pub enum OneShotError {
     NoExitCode { name: String },
 
     /// The caller asked for a stderr watch, the container exited without the
-    /// watched text having been seen, and the log stream had still not
-    /// closed after `drain_secs`. Whatever stderr was still in flight was
-    /// never inspected, so "no match" cannot be claimed. Callers treat this
-    /// as a failed run: for a watch that guards data completeness, an
-    /// uninspected diagnostic is not a clean result.
+    /// watched text having been seen, and some part of stderr was never
+    /// inspected: the attach failed, the log stream broke or did not close
+    /// in time, or the collector died. "No match" cannot be claimed over
+    /// bytes nobody read, so callers treat this as a failed run: for a watch
+    /// that guards data completeness, an uninspected diagnostic is not a
+    /// clean result.
     #[error(
         "Container '{name}' exited but its stderr could not be fully inspected for \
-         '{watch}' within {drain_secs}s; refusing to report the run as clean"
+         '{watch}' ({reason}); refusing to report the run as clean"
     )]
     StderrWatchIncomplete {
         name: String,
         watch: &'static str,
-        drain_secs: u64,
+        reason: String,
     },
 }
 
@@ -307,6 +308,9 @@ pub async fn run_one_shot(
     // on a drain timeout, and an exit-0 container whose stderr had already
     // shown the watched diagnostic was then reported as a clean success.
     let stderr_watch_flag = Arc::new(AtomicBool::new(false));
+    // Why some part of stderr went uninspected, if any part did. Only
+    // consulted when a watch is set and nothing matched; see the gate below.
+    let mut inspection_gap: Option<String> = None;
 
     // ── Log collector (background task) ──────────────────────────────────
     //
@@ -325,6 +329,7 @@ pub async fn run_one_shot(
         }
         Err(e) => {
             warn!(error = %e, "one_shot: attach failed; will run without log capture");
+            inspection_gap = Some(format!("could not attach to the container's output: {e}"));
             None
         }
     };
@@ -388,42 +393,51 @@ pub async fn run_one_shot(
     };
     if let Some(handle) = log_handle {
         match tokio::time::timeout(drain_deadline, handle).await {
-            Ok(Ok((s_out, s_err))) => {
-                stdout_tail = s_out;
-                stderr_tail = s_err;
+            Ok(Ok(capture)) => {
+                stdout_tail = capture.stdout;
+                stderr_tail = capture.stderr;
+                if !capture.stream_closed_cleanly {
+                    inspection_gap =
+                        Some("the log stream broke before the container's output ended".into());
+                }
             }
-            Ok(Err(_)) => {
-                // Join error (task panicked or was aborted). Captured
-                // tails stay empty; the watch flag keeps whatever the
-                // collector published before it died.
+            Ok(Err(e)) => {
+                // Task panicked or was aborted. Captured tails stay empty;
+                // the watch flag keeps whatever was published before.
+                inspection_gap = Some(format!("the log collector stopped early: {e}"));
             }
             Err(_) => {
-                // A match already published survives regardless. With a
-                // watch set and no match yet, the uninspected remainder of
-                // the stream makes a "clean" verdict unprovable: fail closed.
-                if let Some(watch) = stderr_watch {
-                    if !stderr_watch_flag.load(Ordering::Acquire) {
-                        warn!(
-                            backup_id = spec.backup_id,
-                            engine = spec.engine,
-                            container = %spec.name,
-                            drain_secs = drain_deadline.as_secs(),
-                            "one_shot: log drain timed out with a stderr watch set and no match \
-                             seen; later output was not inspected, refusing to report clean",
-                        );
-                        return Err(OneShotError::StderrWatchIncomplete {
-                            name: spec.name.clone(),
-                            watch,
-                            drain_secs: drain_deadline.as_secs(),
-                        });
-                    }
-                } else {
-                    debug!("one_shot: log drain timed out after 2s");
-                }
+                debug!(
+                    drain_secs = drain_deadline.as_secs(),
+                    "one_shot: log drain timed out"
+                );
+                inspection_gap = Some(format!(
+                    "the log stream had not closed {}s after the container exited",
+                    drain_deadline.as_secs()
+                ));
             }
         }
     }
     let stderr_watch_matched = stderr_watch_flag.load(Ordering::Acquire);
+    // A match already published survives every gap above. With a watch set
+    // and no match, any gap means part of stderr was never read, and a
+    // "clean" verdict over unread bytes is not a verdict: fail closed.
+    if let (Some(watch), false, Some(reason)) = (stderr_watch, stderr_watch_matched, inspection_gap)
+    {
+        warn!(
+            backup_id = spec.backup_id,
+            engine = spec.engine,
+            container = %spec.name,
+            watch,
+            %reason,
+            "one_shot: stderr watch set but stderr was not fully inspected; refusing to report clean",
+        );
+        return Err(OneShotError::StderrWatchIncomplete {
+            name: spec.name.clone(),
+            watch,
+            reason,
+        });
+    }
 
     info!(
         backup_id = spec.backup_id,
@@ -448,16 +462,26 @@ pub async fn run_one_shot(
 /// it and a match is published to `watch_flag` immediately, not at stream
 /// end: the caller may stop waiting for this task before the stream closes,
 /// and the verdict has to be visible by then.
+/// What the log collector captured, and whether it saw all of it.
+struct LogCapture {
+    stdout: RingBuffer,
+    stderr: RingBuffer,
+    /// `false` when the stream ended with an error instead of closing, so
+    /// output after that point was never read.
+    stream_closed_cleanly: bool,
+}
+
 async fn collect_logs<S>(
     mut stream: S,
     mut watcher: Option<SubstringWatcher>,
     watch_flag: Arc<AtomicBool>,
-) -> (RingBuffer, RingBuffer)
+) -> LogCapture
 where
     S: futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
 {
     let mut stdout = RingBuffer::with_capacity(4 * 1024);
     let mut stderr = RingBuffer::with_capacity(4 * 1024);
+    let mut stream_closed_cleanly = true;
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(LogOutput::StdOut { message }) => stdout.append(&message),
@@ -473,11 +497,16 @@ where
             Ok(_) => {}
             Err(e) => {
                 debug!(error = %e, "one_shot: log stream error (non-fatal)");
+                stream_closed_cleanly = false;
                 break;
             }
         }
     }
-    (stdout, stderr)
+    LogCapture {
+        stdout,
+        stderr,
+        stream_closed_cleanly,
+    }
 }
 
 /// Suppress unused-import warning when the helper is compiled but only
@@ -543,7 +572,7 @@ mod collector_tests {
             }),
         ]);
 
-        let (stdout, stderr) = collect_logs(
+        let capture = collect_logs(
             stream,
             Some(SubstringWatcher::new("access denied")),
             Arc::clone(&flag),
@@ -551,7 +580,43 @@ mod collector_tests {
         .await;
 
         assert!(!flag.load(Ordering::Acquire));
-        assert!(stdout.into_string_lossy().contains("only on stdout"));
-        assert!(stderr.into_string_lossy().contains("transferred"));
+        assert!(capture.stream_closed_cleanly);
+        assert!(capture
+            .stdout
+            .into_string_lossy()
+            .contains("only on stdout"));
+        assert!(capture.stderr.into_string_lossy().contains("transferred"));
+    }
+
+    /// A stream that errors out mid-way leaves later output unread. The
+    /// capture must say so, because with a watch set and no match that is
+    /// the difference between a clean run and one that cannot be vouched for.
+    #[tokio::test]
+    async fn a_broken_stream_is_reported_as_not_fully_read() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream = futures::stream::iter([
+            Ok(LogOutput::StdErr {
+                message: Bytes::from_static(b"still fine\n"),
+            }),
+            Err(bollard::errors::Error::IOError {
+                err: std::io::Error::other("connection reset"),
+            }),
+            Ok(LogOutput::StdErr {
+                message: Bytes::from_static(b"Access Denied\n"),
+            }),
+        ]);
+
+        let capture = collect_logs(
+            stream,
+            Some(SubstringWatcher::new("access denied")),
+            Arc::clone(&flag),
+        )
+        .await;
+
+        assert!(!capture.stream_closed_cleanly);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the diagnostic after the break was never read, so it cannot have matched"
+        );
     }
 }
