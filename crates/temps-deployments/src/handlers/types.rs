@@ -41,6 +41,9 @@ pub struct AppState {
     pub config_service: Arc<temps_config::ConfigService>,
     /// Docker client for container exec/terminal
     pub docker: Arc<bollard::Docker>,
+    /// On-demand `docker system df` for the control-plane host (server
+    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
+    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys

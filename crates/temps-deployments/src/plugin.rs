@@ -608,6 +608,7 @@ impl TempsPlugin for DeploymentsPlugin {
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
+            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::from_env()),
             deployment_gate,
             project_access_checker,
             hostname_resolver,
