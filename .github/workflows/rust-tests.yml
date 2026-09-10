@@ -205,7 +205,7 @@ jobs:
       - name: Verify committed WASM package matches a reproducible rebuild
         run: |
           if [ -n "$(git status --porcelain -- crates/temps-captcha-wasm/pkg/)" ]; then
-            echo "::error::crates/temps-captcha-wasm/pkg/ does not match a fresh rebuild with the pinned toolchain from the Dockerfile. Run 'cd crates/temps-captcha-wasm && wasm-pack build --target web --release' locally and commit the regenerated pkg/ files."
+            echo "::error::crates/temps-captcha-wasm/pkg/ does not match a fresh rebuild with the pinned toolchain from the Dockerfile. Rebuild with the Dockerfile toolchain on linux/amd64 at /build using 'cd crates/temps-captcha-wasm && npm run build', then commit the regenerated pkg/ files. Native macOS or ARM builds can embed different dependency hashes."
             git status --short -- crates/temps-captcha-wasm/pkg/
             git diff --stat -- crates/temps-captcha-wasm/pkg/
             exit 1
