@@ -14,7 +14,8 @@
 //! junction table for multi-environment membership, transactional writes).
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +37,9 @@ pub enum SecretError {
     #[error("Secret {secret_id} not found in project {project_id}")]
     NotFound { secret_id: i32, project_id: i32 },
 
-    #[error("Secret with key '{key}' already exists in project {project_id}")]
+    #[error(
+        "Secret with key '{key}' already applies to one or more requested environments in project {project_id}"
+    )]
     KeyAlreadyExists { project_id: i32, key: String },
 
     #[error("Secret value for key '{key}' is {size} bytes, exceeds limit of {limit} bytes")]
@@ -49,8 +52,11 @@ pub enum SecretError {
     #[error("Invalid secret key '{key}': {reason}")]
     InvalidKey { key: String, reason: String },
 
-    #[error("Environment {environment_id} not found")]
-    EnvironmentNotFound { environment_id: i32 },
+    #[error("Environment {environment_id} was not found in project {project_id}")]
+    EnvironmentNotFound {
+        environment_id: i32,
+        project_id: i32,
+    },
 
     #[error("Failed to encrypt secret '{key}': {reason}")]
     EncryptionFailed { key: String, reason: String },
@@ -98,7 +104,12 @@ fn validate_secret_key(key: &str) -> Result<(), SecretError> {
         });
     }
     let mut chars = key.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return Err(SecretError::InvalidKey {
+            key: key.to_string(),
+            reason: "key cannot be empty".to_string(),
+        });
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(SecretError::InvalidKey {
             key: key.to_string(),
@@ -171,6 +182,19 @@ fn normalize_compose_services(services: Vec<String>) -> Result<Vec<String>, Secr
     Ok(out)
 }
 
+fn secret_scope_overlaps(
+    requested_environment_ids: &[i32],
+    existing_environment_ids: &[i32],
+) -> bool {
+    let requested_is_global = requested_environment_ids.is_empty();
+    let existing_is_global = existing_environment_ids.is_empty();
+    requested_is_global
+        || existing_is_global
+        || existing_environment_ids
+            .iter()
+            .any(|id| requested_environment_ids.contains(id))
+}
+
 #[derive(Clone)]
 pub struct SecretService {
     db: Arc<temps_database::DbConnection>,
@@ -210,6 +234,88 @@ impl SecretService {
                 key: key.to_string(),
                 reason: e.to_string(),
             })
+    }
+
+    /// Resolve requested environments inside the project that owns the secret.
+    /// IDs are de-duplicated so repeated input cannot trip the junction
+    /// table's unique constraint.
+    async fn environments_in_project(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        environment_ids: &[i32],
+    ) -> Result<Vec<environments::Model>, SecretError> {
+        let unique_ids = environment_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let models = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(unique_ids.iter().copied()))
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .all(txn)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|environment| (environment.id, environment))
+            .collect::<HashMap<_, _>>();
+
+        unique_ids
+            .into_iter()
+            .map(|environment_id| {
+                by_id
+                    .remove(&environment_id)
+                    .ok_or(SecretError::EnvironmentNotFound {
+                        environment_id,
+                        project_id,
+                    })
+            })
+            .collect()
+    }
+
+    /// Serialize and validate one key's scope. Empty bindings mean project-wide,
+    /// so they overlap every scoped secret with the same key.
+    async fn claim_key_scope(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        key: &str,
+        environment_ids: &[i32],
+        excluded_secret_id: Option<i32>,
+    ) -> Result<(), SecretError> {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            [project_id.into(), key.to_string().into()],
+        ))
+        .await?;
+
+        let mut query = secrets::Entity::find()
+            .filter(secrets::Column::ProjectId.eq(project_id))
+            .filter(secrets::Column::Key.eq(key));
+        if let Some(secret_id) = excluded_secret_id {
+            query = query.filter(secrets::Column::Id.ne(secret_id));
+        }
+        let existing = query
+            .find_with_related(secret_environments::Entity)
+            .all(txn)
+            .await?;
+        let overlaps = existing.iter().any(|(_, bindings)| {
+            let existing_environment_ids = bindings
+                .iter()
+                .map(|binding| binding.environment_id)
+                .collect::<Vec<_>>();
+            secret_scope_overlaps(environment_ids, &existing_environment_ids)
+        });
+        if overlaps {
+            return Err(SecretError::KeyAlreadyExists {
+                project_id,
+                key: key.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Lists secrets visible to a project, optionally filtered to a specific
@@ -324,18 +430,6 @@ impl SecretService {
             });
         }
 
-        let duplicate = secrets::Entity::find()
-            .filter(secrets::Column::ProjectId.eq(project_id))
-            .filter(secrets::Column::Key.eq(&key))
-            .one(self.db.as_ref())
-            .await?;
-        if duplicate.is_some() {
-            return Err(SecretError::KeyAlreadyExists {
-                project_id,
-                key: key.clone(),
-            });
-        }
-
         let encrypted = self.encrypt_value(&key, &value)?;
 
         let result = self
@@ -346,6 +440,14 @@ impl SecretService {
                 let environment_ids = environment_ids.clone();
                 let compose_services = compose_services.clone();
                 Box::pin(async move {
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    let environment_ids = scoped_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    Self::claim_key_scope(txn, project_id, &key, &environment_ids, None).await?;
+
                     let new_row = secrets::ActiveModel {
                         project_id: Set(project_id),
                         environment_id: Set(None),
@@ -359,14 +461,7 @@ impl SecretService {
                     let row = new_row.insert(txn).await?;
 
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
-                        let env = environments::Entity::find_by_id(*env_id)
-                            .one(txn)
-                            .await?
-                            .ok_or(SecretError::EnvironmentNotFound {
-                                environment_id: *env_id,
-                            })?;
-
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let junction = secret_environments::ActiveModel {
                             secret_id: Set(row.id),
                             environment_id: Set(*env_id),
@@ -467,12 +562,27 @@ impl SecretService {
                 Box::pin(async move {
                     let row = secrets::Entity::find_by_id(secret_id)
                         .filter(secrets::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
                         .one(txn)
                         .await?
                         .ok_or(SecretError::NotFound {
                             secret_id,
                             project_id,
                         })?;
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    let environment_ids = scoped_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    Self::claim_key_scope(
+                        txn,
+                        project_id,
+                        &row.key,
+                        &environment_ids,
+                        Some(secret_id),
+                    )
+                    .await?;
 
                     let mut active: secrets::ActiveModel = row.into();
                     if let Some(v) = encrypted_new {
@@ -488,14 +598,7 @@ impl SecretService {
                         .await?;
 
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
-                        let env = environments::Entity::find_by_id(*env_id)
-                            .one(txn)
-                            .await?
-                            .ok_or(SecretError::EnvironmentNotFound {
-                                environment_id: *env_id,
-                            })?;
-
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let junction = secret_environments::ActiveModel {
                             secret_id: Set(row.id),
                             environment_id: Set(*env_id),
@@ -547,32 +650,30 @@ impl SecretService {
     }
 
     pub async fn delete(&self, project_id: i32, secret_id: i32) -> Result<(), SecretError> {
-        let affected = self
-            .db
-            .transaction::<_, u64, SecretError>(|txn| {
+        self.db
+            .transaction::<_, (), SecretError>(|txn| {
                 Box::pin(async move {
+                    let secret = secrets::Entity::find_by_id(secret_id)
+                        .filter(secrets::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or(SecretError::NotFound {
+                            secret_id,
+                            project_id,
+                        })?;
+
                     secret_environments::Entity::delete_many()
                         .filter(secret_environments::Column::SecretId.eq(secret_id))
                         .exec(txn)
                         .await?;
 
-                    let res = secrets::Entity::delete_many()
-                        .filter(secrets::Column::Id.eq(secret_id))
-                        .filter(secrets::Column::ProjectId.eq(project_id))
-                        .exec(txn)
-                        .await?;
-
-                    Ok(res.rows_affected)
+                    let active: secrets::ActiveModel = secret.into();
+                    active.delete(txn).await?;
+                    Ok(())
                 })
             })
             .await?;
-
-        if affected == 0 {
-            return Err(SecretError::NotFound {
-                secret_id,
-                project_id,
-            });
-        }
         Ok(())
     }
 
@@ -613,7 +714,6 @@ impl SecretService {
                 .or_default()
                 .push(j.environment_id);
         }
-
         let mut out = HashMap::new();
         for row in rows {
             let applies = match (environment_id, bindings.get(&row.id)) {
@@ -699,6 +799,22 @@ mod tests {
     }
 
     #[test]
+    fn test_secret_scope_allows_same_key_in_disjoint_environments() {
+        assert!(!secret_scope_overlaps(&[2], &[1]));
+    }
+
+    #[test]
+    fn test_secret_scope_rejects_shared_environment() {
+        assert!(secret_scope_overlaps(&[1, 2], &[2, 3]));
+    }
+
+    #[test]
+    fn test_secret_scope_rejects_global_overlap_in_both_directions() {
+        assert!(secret_scope_overlaps(&[], &[1]));
+        assert!(secret_scope_overlaps(&[1], &[]));
+    }
+
+    #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let svc = make_encryption_service();
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
@@ -772,7 +888,14 @@ mod tests {
         let existing = make_secret_model(1, 10, "API_KEY", "cipher");
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![existing]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![(
+                    existing,
+                    Option::<secret_environments::Model>::None,
+                )]])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
@@ -789,6 +912,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretError::KeyAlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_propagates_key_scope_lock_database_error() {
+        let svc = make_encryption_service();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(
+                    "advisory lock unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = SecretService::new(db, svc);
+
+        let err = service
+            .create(
+                10,
+                vec![],
+                "API_KEY".to_string(),
+                "value".to_string(),
+                false,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SecretError::Database(_)));
     }
 
     #[tokio::test]
@@ -926,16 +1076,7 @@ mod tests {
         let svc = make_encryption_service();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // First delete (junction): 0 rows is fine
-                .append_exec_results(vec![MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
-                // Second delete (secrets): 0 rows -> triggers NotFound
-                .append_exec_results(vec![MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
+                .append_query_results(vec![Vec::<secrets::Model>::new()])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
