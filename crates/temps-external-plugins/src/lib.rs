@@ -22,6 +22,7 @@ pub mod manager;
 pub mod plugin;
 pub mod proxy;
 pub mod service;
+pub mod trust;
 
 pub use channel::PluginChannel;
 pub use event_listener::PluginEventListener;

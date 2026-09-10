@@ -377,10 +377,7 @@ impl ExternalPluginsService {
 
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         installer
-            .accept_registry_revision(
-                &self.manager.config().plugins_dir,
-                selected.registry.document.revision,
-            )
+            .accept_registry_revision(&self.manager.config().plugins_dir, &selected.registry)
             .await?;
         let candidate = installer
             .prepare(
@@ -672,11 +669,26 @@ except Exception:
         let envelope = crate::catalog::RegistryEnvelope {
             key_id: "fixture-key".to_string(),
             payload: base64::engine::general_purpose::STANDARD.encode(&payload),
-            signature: base64::engine::general_purpose::STANDARD
-                .encode(signing.sign(&payload).to_bytes()),
+            signature: base64::engine::general_purpose::STANDARD.encode(
+                signing
+                    .sign(&crate::trust::signature_message(
+                        crate::trust::CATALOG_SIGNATURE_DOMAIN,
+                        &payload,
+                    ))
+                    .to_bytes(),
+            ),
         };
+        let keyset = crate::trust::VerifiedKeyset::test_fixture(
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        )
+        .1;
         SelectedPlugin {
-            registry: VerifiedRegistry { envelope, document },
+            registry: VerifiedRegistry {
+                keyset,
+                envelope,
+                document,
+            },
             plugin,
             identity: ReleaseIdentity {
                 name: name.to_string(),
@@ -702,16 +714,12 @@ except Exception:
         )
     }
 
-    #[tokio::test]
-    async fn catalog_fails_closed_without_production_trust_anchor() {
-        let error = service()
-            .catalog()
-            .await
-            .expect_err("unsigned registry access must be unavailable");
-        assert!(matches!(
-            error,
-            ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. })
-        ));
+    #[test]
+    fn production_registry_has_embedded_offline_root_threshold() {
+        let service = service();
+        let registry = &service.manager().config().registry;
+        assert_eq!(registry.root_trust.threshold, 2);
+        assert_eq!(registry.root_trust.keys.len(), 3);
     }
 
     #[tokio::test]
@@ -908,6 +916,11 @@ except Exception:
         };
         let selected = SelectedPlugin {
             registry: VerifiedRegistry {
+                keyset: crate::trust::VerifiedKeyset::test_fixture(
+                    "test-key",
+                    SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes(),
+                )
+                .1,
                 envelope: crate::catalog::RegistryEnvelope {
                     key_id: "test-key".to_string(),
                     payload: String::new(),

@@ -8,46 +8,52 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use futures::StreamExt as _;
+use reqwest::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, PRAGMA};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 use utoipa::ToSchema;
 
+use crate::trust::{
+    signature_message, KeysetEnvelope, KeysetUse, RootTrust, TrustError, VerifiedKeyset,
+    CATALOG_SIGNATURE_DOMAIN,
+};
+
 pub const REGISTRY_URL: &str = "https://registry.temps.sh/api/plugins";
+pub const REGISTRY_KEYS_URL: &str = "https://registry.temps.sh/api/plugins/keys";
 pub const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+pub const MAX_REGISTRY_KEYS_BYTES: u64 = 64 * 1024;
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REGISTRY_VALIDITY: ChronoDuration = ChronoDuration::days(30);
 
 #[derive(Debug, Clone)]
 pub struct RegistryConfig {
     pub url: String,
-    pub trust_anchors: BTreeMap<String, [u8; 32]>,
+    pub(crate) keys_url: String,
+    pub(crate) root_trust: RootTrust,
     pub allowed_artifact_hosts: BTreeSet<String>,
-    pub allow_http: bool,
+    pub(crate) allow_http: bool,
+    #[cfg(test)]
+    test_keyset: Option<VerifiedKeyset>,
 }
 
 impl Default for RegistryConfig {
     fn default() -> Self {
         Self {
             url: REGISTRY_URL.to_string(),
-            // Deliberately empty until the registry owner publishes the
-            // production Ed25519 public key. An absent key is an error, never
-            // an invitation to accept an unsigned document.
-            trust_anchors: BTreeMap::new(),
+            keys_url: REGISTRY_KEYS_URL.to_string(),
+            root_trust: RootTrust::default(),
             allowed_artifact_hosts: BTreeSet::from(["registry.temps.sh".to_string()]),
             allow_http: false,
+            #[cfg(test)]
+            test_keyset: None,
         }
     }
 }
 
 impl RegistryConfig {
-    pub fn with_trust_anchor(mut self, key_id: impl Into<String>, key: [u8; 32]) -> Self {
-        self.trust_anchors.insert(key_id.into(), key);
-        self
-    }
-
     pub fn with_artifact_host(mut self, host: impl Into<String>) -> Self {
         self.allowed_artifact_hosts.insert(host.into());
         self
@@ -59,76 +65,16 @@ impl RegistryConfig {
             .ok()
             .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "127.0.0.1".to_string());
+        let (root_trust, test_keyset) = VerifiedKeyset::test_fixture(key_id, key);
         Self {
+            keys_url: format!("{url}/keys"),
             url,
-            trust_anchors: BTreeMap::from([(key_id.to_string(), key)]),
+            root_trust,
             allowed_artifact_hosts: BTreeSet::from([host]),
             allow_http: true,
+            test_keyset: Some(test_keyset),
         }
     }
-}
-
-#[derive(Debug, Error)]
-pub enum RegistryTrustConfigError {
-    #[error("External-plugin registry trust configuration is incomplete: {provided} is set but {missing} is missing")]
-    Incomplete {
-        provided: &'static str,
-        missing: &'static str,
-    },
-    #[error("External-plugin registry key ID must not be empty and may contain only ASCII letters, digits, '.', '_', or '-'")]
-    InvalidKeyId,
-    #[error("External-plugin registry public key for key ID '{key_id}' is not valid hexadecimal: {reason}")]
-    InvalidPublicKeyHex { key_id: String, reason: String },
-    #[error("External-plugin registry public key for key ID '{key_id}' decoded to {actual} bytes; Ed25519 public keys must be exactly 32 bytes")]
-    InvalidPublicKeyLength { key_id: String, actual: usize },
-}
-
-/// Build the production registry configuration from the paired bootstrap
-/// values accepted by `temps serve`. Neither value alone grants any trust;
-/// absent values keep the catalogue visible but fail closed on fetch/startup.
-pub fn registry_config_from_anchor(
-    key_id: Option<&str>,
-    public_key_hex: Option<&str>,
-) -> Result<RegistryConfig, RegistryTrustConfigError> {
-    let (key_id, public_key_hex) = match (key_id, public_key_hex) {
-        (None, None) => return Ok(RegistryConfig::default()),
-        (Some(_), None) => {
-            return Err(RegistryTrustConfigError::Incomplete {
-                provided: "registry key ID",
-                missing: "registry public key",
-            });
-        }
-        (None, Some(_)) => {
-            return Err(RegistryTrustConfigError::Incomplete {
-                provided: "registry public key",
-                missing: "registry key ID",
-            });
-        }
-        (Some(key_id), Some(public_key_hex)) => (key_id.trim(), public_key_hex.trim()),
-    };
-    if key_id.is_empty()
-        || key_id.len() > 128
-        || !key_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err(RegistryTrustConfigError::InvalidKeyId);
-    }
-    let decoded = hex::decode(public_key_hex).map_err(|error| {
-        RegistryTrustConfigError::InvalidPublicKeyHex {
-            key_id: key_id.to_string(),
-            reason: error.to_string(),
-        }
-    })?;
-    let actual = decoded.len();
-    let key: [u8; 32] =
-        decoded
-            .try_into()
-            .map_err(|_| RegistryTrustConfigError::InvalidPublicKeyLength {
-                key_id: key_id.to_string(),
-                actual,
-            })?;
-    Ok(RegistryConfig::default().with_trust_anchor(key_id, key))
 }
 
 /// The outer envelope signs the decoded bytes in `payload`. Encoding the
@@ -182,16 +128,15 @@ pub struct PlatformRelease {
 
 #[derive(Debug, Clone)]
 pub struct VerifiedRegistry {
+    pub keyset: VerifiedKeyset,
     pub envelope: RegistryEnvelope,
     pub document: RegistryDocument,
 }
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
-    #[error(
-        "Plugin registry trust is not configured: no Ed25519 public keys are trusted for {url}"
-    )]
-    TrustNotConfigured { url: String },
+    #[error(transparent)]
+    Trust(#[from] TrustError),
     #[error("Plugin registry document from {url} uses untrusted key id '{key_id}'")]
     UntrustedKey { url: String, key_id: String },
     #[error("Plugin registry document from {url} contains invalid base64 in {field}: {reason}")]
@@ -229,9 +174,12 @@ pub struct RegistryClient {
 impl RegistryClient {
     pub fn new(config: RegistryConfig) -> Result<Self, CatalogError> {
         validate_url(&config.url, &config, true)?;
+        validate_url(&config.keys_url, &config, true)?;
         let client = reqwest::Client::builder()
+            .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REGISTRY_TIMEOUT)
+            .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .build()
             .map_err(|error| CatalogError::Client {
                 url: config.url.clone(),
@@ -244,41 +192,64 @@ impl RegistryClient {
         &self.config
     }
 
-    pub async fn fetch(&self) -> Result<VerifiedRegistry, CatalogError> {
-        if self.config.trust_anchors.is_empty() {
-            return Err(CatalogError::TrustNotConfigured {
-                url: self.config.url.clone(),
-            });
+    pub async fn fetch_keyset(&self) -> Result<VerifiedKeyset, CatalogError> {
+        #[cfg(test)]
+        if let Some(keyset) = &self.config.test_keyset {
+            return Ok(keyset.clone());
         }
+        let response = self
+            .client
+            .get(&self.config.keys_url)
+            .header("User-Agent", "temps-plugin-installer")
+            .header(ACCEPT, "application/json")
+            .header(CACHE_CONTROL, "no-cache, no-store, max-age=0")
+            .header(PRAGMA, "no-cache")
+            .send()
+            .await
+            .map_err(|error| CatalogError::Fetch {
+                url: self.config.keys_url.clone(),
+                reason: error.to_string(),
+            })?;
+        require_json_success(&response, &self.config.keys_url)?;
+        let body =
+            read_body_capped(response, &self.config.keys_url, MAX_REGISTRY_KEYS_BYTES).await?;
+        let envelope: KeysetEnvelope =
+            serde_json::from_slice(&body).map_err(|error| CatalogError::Parse {
+                url: self.config.keys_url.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(VerifiedKeyset::verify(
+            envelope,
+            &self.config.root_trust,
+            Utc::now(),
+            KeysetUse::FreshCatalog,
+        )?)
+    }
+
+    pub async fn fetch(&self) -> Result<VerifiedRegistry, CatalogError> {
+        let keyset = self.fetch_keyset().await?;
         let response = self
             .client
             .get(&self.config.url)
             .header("User-Agent", "temps-plugin-installer")
+            .header(ACCEPT, "application/json")
+            .header(CACHE_CONTROL, "no-cache, no-store, max-age=0")
+            .header(PRAGMA, "no-cache")
             .send()
             .await
             .map_err(|error| CatalogError::Fetch {
                 url: self.config.url.clone(),
                 reason: error.to_string(),
             })?;
-        if response.status().is_redirection() {
-            return Err(CatalogError::Status {
-                url: self.config.url.clone(),
-                status: response.status().as_u16(),
-            });
-        }
-        if !response.status().is_success() {
-            return Err(CatalogError::Status {
-                url: self.config.url.clone(),
-                status: response.status().as_u16(),
-            });
-        }
+        require_json_success(&response, &self.config.url)?;
         let body = read_body_capped(response, &self.config.url, MAX_REGISTRY_BYTES).await?;
         let envelope: RegistryEnvelope =
             serde_json::from_slice(&body).map_err(|error| CatalogError::Parse {
                 url: self.config.url.clone(),
                 reason: error.to_string(),
             })?;
-        let verified = verify_envelope(envelope, &self.config.trust_anchors, &self.config.url)?;
+        let verified =
+            verify_envelope(envelope, keyset, &self.config.url, KeysetUse::FreshCatalog)?;
         validate_freshness(&verified.document, &self.config.url, Utc::now())?;
         Ok(verified)
     }
@@ -286,20 +257,10 @@ impl RegistryClient {
 
 pub fn verify_envelope(
     envelope: RegistryEnvelope,
-    anchors: &BTreeMap<String, [u8; 32]>,
+    keyset: VerifiedKeyset,
     source: &str,
+    use_case: KeysetUse,
 ) -> Result<VerifiedRegistry, CatalogError> {
-    if anchors.is_empty() {
-        return Err(CatalogError::TrustNotConfigured {
-            url: source.to_string(),
-        });
-    }
-    let key_bytes = anchors
-        .get(&envelope.key_id)
-        .ok_or_else(|| CatalogError::UntrustedKey {
-            url: source.to_string(),
-            key_id: envelope.key_id.clone(),
-        })?;
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&envelope.payload)
         .map_err(|error| CatalogError::InvalidEncoding {
@@ -307,6 +268,12 @@ pub fn verify_envelope(
             field: "payload",
             reason: error.to_string(),
         })?;
+    let document: RegistryDocument =
+        serde_json::from_slice(&payload).map_err(|error| CatalogError::Parse {
+            url: source.to_string(),
+            reason: error.to_string(),
+        })?;
+    let key_bytes = keyset.catalog_key(&envelope.key_id, document.issued_at, use_case)?;
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(&envelope.signature)
         .map_err(|error| CatalogError::InvalidEncoding {
@@ -320,19 +287,15 @@ pub fn verify_envelope(
             field: "signature",
             reason: error.to_string(),
         })?;
-    let key = VerifyingKey::from_bytes(key_bytes).map_err(|error| CatalogError::Parse {
+    let key = VerifyingKey::from_bytes(&key_bytes).map_err(|error| CatalogError::Parse {
         url: source.to_string(),
-        reason: format!("invalid trust anchor '{}': {error}", envelope.key_id),
+        reason: format!("invalid catalogue key '{}': {error}", envelope.key_id),
     })?;
-    key.verify(&payload, &signature)
+    let message = signature_message(CATALOG_SIGNATURE_DOMAIN, &payload);
+    key.verify_strict(&message, &signature)
         .map_err(|_| CatalogError::InvalidSignature {
             url: source.to_string(),
             key_id: envelope.key_id.clone(),
-        })?;
-    let document: RegistryDocument =
-        serde_json::from_slice(&payload).map_err(|error| CatalogError::Parse {
-            url: source.to_string(),
-            reason: error.to_string(),
         })?;
     if document.schema_version != 1 {
         return Err(CatalogError::UnsupportedSchema {
@@ -358,7 +321,36 @@ pub fn verify_envelope(
             reason: "catalogue validity may not exceed 30 days".to_string(),
         });
     }
-    Ok(VerifiedRegistry { envelope, document })
+    Ok(VerifiedRegistry {
+        keyset,
+        envelope,
+        document,
+    })
+}
+
+fn require_json_success(response: &reqwest::Response, url: &str) -> Result<(), CatalogError> {
+    if response.status().is_redirection() || !response.status().is_success() {
+        return Err(CatalogError::Status {
+            url: url.to_string(),
+            status: response.status().as_u16(),
+        });
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(CatalogError::Parse {
+            url: url.to_string(),
+            reason: "response Content-Type must be application/json".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_freshness(
@@ -447,95 +439,18 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
-    fn test_registry_config_from_anchor_without_values_returns_unconfigured_defaults() {
-        // Arrange / Act
-        let config = registry_config_from_anchor(None, None).expect("empty configuration is valid");
+    fn production_config_uses_embedded_offline_root_quorum() {
+        let config = RegistryConfig::default();
 
-        // Assert
         assert_eq!(config.url, REGISTRY_URL);
-        assert!(config.trust_anchors.is_empty());
+        assert_eq!(config.keys_url, REGISTRY_KEYS_URL);
+        assert_eq!(config.root_trust.threshold, 2);
+        assert_eq!(config.root_trust.keys.len(), 3);
         assert!(!config.allow_http);
         assert_eq!(
             config.allowed_artifact_hosts,
             BTreeSet::from(["registry.temps.sh".to_string()])
         );
-    }
-
-    #[test]
-    fn test_registry_config_from_anchor_with_pair_configures_trimmed_anchor() {
-        // Arrange
-        let expected_key = [0xabu8; 32];
-        let encoded_key = hex::encode(expected_key);
-
-        // Act
-        let config = registry_config_from_anchor(
-            Some("  production-key_1  "),
-            Some(&format!("  {encoded_key}  ")),
-        )
-        .expect("a complete valid trust anchor must be accepted");
-
-        // Assert
-        assert_eq!(
-            config.trust_anchors.get("production-key_1"),
-            Some(&expected_key)
-        );
-        assert_eq!(config.trust_anchors.len(), 1);
-        assert_eq!(config.url, REGISTRY_URL);
-        assert!(!config.allow_http);
-    }
-
-    #[test]
-    fn test_registry_config_from_anchor_with_half_pair_returns_incomplete_error() {
-        // Arrange / Act / Assert
-        assert!(matches!(
-            registry_config_from_anchor(Some("key-1"), None),
-            Err(RegistryTrustConfigError::Incomplete {
-                provided: "registry key ID",
-                missing: "registry public key"
-            })
-        ));
-        assert!(matches!(
-            registry_config_from_anchor(None, Some(&hex::encode([7u8; 32]))),
-            Err(RegistryTrustConfigError::Incomplete {
-                provided: "registry public key",
-                missing: "registry key ID"
-            })
-        ));
-    }
-
-    #[test]
-    fn test_registry_config_from_anchor_with_malformed_key_returns_precise_error() {
-        // Arrange / Act / Assert
-        assert!(matches!(
-            registry_config_from_anchor(Some("key-1"), Some("not-hex")),
-            Err(RegistryTrustConfigError::InvalidPublicKeyHex { ref key_id, .. })
-                if key_id == "key-1"
-        ));
-        assert!(matches!(
-            registry_config_from_anchor(Some("key-1"), Some("abcd")),
-            Err(RegistryTrustConfigError::InvalidPublicKeyLength {
-                ref key_id,
-                actual: 2
-            }) if key_id == "key-1"
-        ));
-    }
-
-    #[test]
-    fn test_registry_config_from_anchor_with_invalid_key_id_is_rejected() {
-        // Arrange
-        let key = hex::encode([7u8; 32]);
-        let too_long = "a".repeat(129);
-
-        // Act / Assert
-        for key_id in ["", "contains space", "path/key", "keyé", &too_long] {
-            assert!(
-                matches!(
-                    registry_config_from_anchor(Some(key_id), Some(&key)),
-                    Err(RegistryTrustConfigError::InvalidKeyId)
-                ),
-                "invalid key ID was accepted: {key_id:?}"
-            );
-        }
     }
 
     async fn oversized_registry_url() -> String {
@@ -548,7 +463,7 @@ mod tests {
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request).await.expect("read request");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 MAX_REGISTRY_BYTES + 1
             );
             stream
@@ -571,54 +486,63 @@ mod tests {
         RegistryEnvelope {
             key_id: key_id.to_string(),
             payload: base64::engine::general_purpose::STANDARD.encode(&payload),
-            signature: base64::engine::general_purpose::STANDARD
-                .encode(signing_key.sign(&payload).to_bytes()),
+            signature: base64::engine::general_purpose::STANDARD.encode(
+                signing_key
+                    .sign(&signature_message(CATALOG_SIGNATURE_DOMAIN, &payload))
+                    .to_bytes(),
+            ),
         }
+    }
+
+    fn test_keyset(key_id: &str, key: [u8; 32]) -> VerifiedKeyset {
+        VerifiedKeyset::test_fixture(key_id, key).1
     }
 
     #[test]
     fn accepts_valid_signature() {
         let signing = SigningKey::from_bytes(&[7; 32]);
-        let anchors =
-            BTreeMap::from([("test-key".to_string(), signing.verifying_key().to_bytes())]);
-        let verified = verify_envelope(signed_envelope("test-key", &signing), &anchors, "test")
-            .expect("signature should verify");
-        assert_eq!(verified.document.schema_version, 1);
-    }
-
-    #[test]
-    fn node_crypto_cross_ecosystem_test_vector_verifies() {
-        // Generated from a 32-byte test seed containing 0x07 using Node's
-        // built-in crypto Ed25519 implementation. This literal vector keeps
-        // the registry signer and Rust verifier aligned on standard base64
-        // and on signing the decoded JSON payload bytes.
-        let public_key: [u8; 32] =
-            hex::decode("ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c")
-                .expect("test public key hex")
-                .try_into()
-                .expect("32-byte test public key");
-        let envelope = RegistryEnvelope {
-            key_id: "node-test".to_string(),
-            payload: "eyJzY2hlbWFfdmVyc2lvbiI6MSwicmV2aXNpb24iOjEsImlzc3VlZF9hdCI6IjIwMjYtMDktMDFUMDA6MDA6MDBaIiwiZXhwaXJlc19hdCI6IjIwMjYtMDktMzBUMDA6MDA6MDBaIiwicGx1Z2lucyI6W119".to_string(),
-            signature: "wS4olkCwC6M9ytN05byXhfWi1MHKtEqryxOufhHTykeei5XpWfwiRCNc222xnkSXjNj7Db9qmdWMlvL3AD5hCQ==".to_string(),
-        };
         let verified = verify_envelope(
-            envelope,
-            &BTreeMap::from([("node-test".to_string(), public_key)]),
-            "node-test-vector",
+            signed_envelope("test-key", &signing),
+            test_keyset("test-key", signing.verifying_key().to_bytes()),
+            "test",
+            KeysetUse::FreshCatalog,
         )
-        .expect("Node signature must verify in Rust");
+        .expect("signature should verify");
         assert_eq!(verified.document.schema_version, 1);
-        assert!(verified.document.plugins.is_empty());
     }
 
     #[test]
     fn rejects_invalid_signature() {
         let signing = SigningKey::from_bytes(&[7; 32]);
         let other = SigningKey::from_bytes(&[8; 32]);
-        let anchors = BTreeMap::from([("test-key".to_string(), other.verifying_key().to_bytes())]);
         assert!(matches!(
-            verify_envelope(signed_envelope("test-key", &signing), &anchors, "test"),
+            verify_envelope(
+                signed_envelope("test-key", &signing),
+                test_keyset("test-key", other.verifying_key().to_bytes()),
+                "test",
+                KeysetUse::FreshCatalog,
+            ),
+            Err(CatalogError::InvalidSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_signature_without_catalogue_domain_separator() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let mut envelope = signed_envelope("test-key", &signing);
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&envelope.payload)
+            .expect("fixture payload");
+        envelope.signature =
+            base64::engine::general_purpose::STANDARD.encode(signing.sign(&payload).to_bytes());
+
+        assert!(matches!(
+            verify_envelope(
+                envelope,
+                test_keyset("test-key", signing.verifying_key().to_bytes()),
+                "test",
+                KeysetUse::FreshCatalog,
+            ),
             Err(CatalogError::InvalidSignature { .. })
         ));
     }
@@ -626,10 +550,14 @@ mod tests {
     #[test]
     fn rejects_untrusted_key() {
         let signing = SigningKey::from_bytes(&[7; 32]);
-        let anchors = BTreeMap::from([("other".to_string(), signing.verifying_key().to_bytes())]);
         assert!(matches!(
-            verify_envelope(signed_envelope("test-key", &signing), &anchors, "test"),
-            Err(CatalogError::UntrustedKey { .. })
+            verify_envelope(
+                signed_envelope("test-key", &signing),
+                test_keyset("other", signing.verifying_key().to_bytes()),
+                "test",
+                KeysetUse::FreshCatalog,
+            ),
+            Err(CatalogError::Trust(TrustError::CatalogKeyNotTrusted { .. }))
         ));
     }
 

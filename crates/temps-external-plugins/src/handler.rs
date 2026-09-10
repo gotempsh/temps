@@ -318,9 +318,9 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
         | ExternalPluginsError::DuplicateRegistryEntry { .. } => {
             (StatusCode::BAD_REQUEST, "Plugin Cannot Be Installed")
         }
-        ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. }) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Plugin Registry Trust Is Not Configured",
+        ExternalPluginsError::Catalog(CatalogError::Trust(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Registry Key Verification Failed",
         ),
         ExternalPluginsError::Catalog(CatalogError::UntrustedKey { .. }) => (
             StatusCode::BAD_GATEWAY,
@@ -340,9 +340,12 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::BAD_GATEWAY,
             "Plugin Artifact Verification Failed",
         ),
-        ExternalPluginsError::Install(InstallError::RegistryRollback { .. }) => {
-            (StatusCode::CONFLICT, "Plugin Registry Rollback Refused")
-        }
+        ExternalPluginsError::Install(
+            InstallError::RegistryRollback { .. }
+            | InstallError::RegistryRevisionConflict { .. }
+            | InstallError::KeysetRollback { .. }
+            | InstallError::KeysetGenerationConflict { .. },
+        ) => (StatusCode::CONFLICT, "Plugin Registry Rollback Refused"),
         ExternalPluginsError::Install(InstallError::Io { .. })
         | ExternalPluginsError::Install(InstallError::MissingActiveRecord { .. })
         | ExternalPluginsError::Install(InstallError::InvalidReceipt { .. }) => (
@@ -377,14 +380,16 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
             | InstallError::UnsupportedPlatform { .. }
             | InstallError::NoRelease { .. }
             | InstallError::InvalidDigest { .. }
-            | InstallError::RegistryRollback { .. }),
+            | InstallError::RegistryRollback { .. }
+            | InstallError::RegistryRevisionConflict { .. }
+            | InstallError::KeysetRollback { .. }
+            | InstallError::KeysetGenerationConflict { .. }),
         ) => error.to_string(),
         ExternalPluginsError::NotInRegistry { .. }
         | ExternalPluginsError::DuplicateRegistryEntry { .. }
         | ExternalPluginsError::ShuttingDown => error.to_string(),
-        ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. }) => {
-            "Configure a trusted plugin-registry key ID and Ed25519 public key before using the registry"
-                .to_string()
+        ExternalPluginsError::Catalog(CatalogError::Trust(_)) => {
+            "The registry catalogue-key document did not pass offline-root verification".to_string()
         }
         ExternalPluginsError::Catalog(CatalogError::UntrustedKey { key_id, .. }) => {
             format!("The plugin registry used untrusted signing key ID '{key_id}'")
@@ -398,8 +403,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
             "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
         ),
         ExternalPluginsError::Install(
-            InstallError::UnsafeArtifactUrl { plugin, .. }
-            | InstallError::Download { plugin, .. },
+            InstallError::UnsafeArtifactUrl { plugin, .. } | InstallError::Download { plugin, .. },
         ) => format!("Plugin '{plugin}' could not be downloaded securely"),
         ExternalPluginsError::Install(
             InstallError::Client { .. }
@@ -865,11 +869,13 @@ mod tests {
             }],
         };
         let payload = serde_json::to_vec(&document).expect("serialize registry fixture");
+        let signed_payload =
+            crate::trust::signature_message(crate::trust::CATALOG_SIGNATURE_DOMAIN, &payload);
         let envelope = crate::catalog::RegistryEnvelope {
             key_id: key_id.to_string(),
             payload: base64::engine::general_purpose::STANDARD.encode(&payload),
             signature: base64::engine::general_purpose::STANDARD
-                .encode(signing_key.sign(&payload).to_bytes()),
+                .encode(signing_key.sign(&signed_payload).to_bytes()),
         };
         let registry_body = serde_json::to_vec(&envelope).expect("serialize registry envelope");
         let requests = Arc::new(AtomicUsize::new(0));
@@ -891,7 +897,7 @@ mod tests {
                     b"artifact-must-not-be-requested"
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 stream

@@ -500,6 +500,7 @@ impl ExternalPluginManager {
     ) {
         let mut binaries = Vec::new();
         let mut failures = Vec::new();
+        self.refresh_registry_keyset().await;
         for result in
             crate::install::discover_active(&self.config.plugins_dir, &self.config.registry).await
         {
@@ -516,6 +517,44 @@ impl ExternalPluginManager {
         }
         binaries.sort_by(|left, right| left.name.cmp(&right.name));
         (binaries, failures)
+    }
+
+    /// Opportunistically refresh the root-signed catalogue keyset before
+    /// loading installed plugins. A network outage cannot prevent an offline
+    /// restart: discovery will still authenticate receipts with the last
+    /// accepted keyset. A successfully verified newer keyset is persisted
+    /// first, so key revocations take effect before any plugin is executed.
+    async fn refresh_registry_keyset(&self) {
+        if !crate::install::has_registry_state(&self.config.plugins_dir).await {
+            return;
+        }
+        let registry = match crate::catalog::RegistryClient::new(self.config.registry.clone()) {
+            Ok(registry) => registry,
+            Err(error) => {
+                warn!(error = %error, "Could not prepare plugin keyset refresh; using cached trust state");
+                return;
+            }
+        };
+        let keyset = match registry.fetch_keyset().await {
+            Ok(keyset) => keyset,
+            Err(error) => {
+                warn!(error = %error, "Could not refresh plugin keyset; using cached trust state");
+                return;
+            }
+        };
+        let installer = match crate::install::PluginInstaller::new(self.config.registry.clone()) {
+            Ok(installer) => installer,
+            Err(error) => {
+                warn!(error = %error, "Could not prepare plugin trust-state update; using cached trust state");
+                return;
+            }
+        };
+        if let Err(error) = installer
+            .refresh_keyset(&self.config.plugins_dir, &keyset)
+            .await
+        {
+            warn!(error = %error, "Refused plugin keyset refresh; using cached trust state");
+        }
     }
 
     /// Remove stale plugin bookkeeping left over from a previous run.

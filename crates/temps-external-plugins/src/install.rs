@@ -7,6 +7,7 @@ use std::io::{Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -17,6 +18,7 @@ use crate::catalog::{
     validate_url, PlatformRelease, RegistryConfig, RegistryEnvelope, RegistryPlugin,
     VerifiedRegistry,
 };
+use crate::trust::{KeysetEnvelope, KeysetUse, VerifiedKeyset};
 
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const BINARY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -82,6 +84,12 @@ pub enum InstallError {
     },
     #[error("Refusing signed plugin registry revision {received}; this instance has already accepted revision {highest}")]
     RegistryRollback { received: u64, highest: u64 },
+    #[error("Refusing plugin registry revision {revision}: it differs from the already accepted catalogue with that revision")]
+    RegistryRevisionConflict { revision: u64 },
+    #[error("Refusing signed plugin keyset generation {received}; this instance has already accepted generation {highest}")]
+    KeysetRollback { received: u64, highest: u64 },
+    #[error("Refusing plugin keyset generation {generation}: it differs from the already accepted document with that generation")]
+    KeysetGenerationConflict { generation: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +156,8 @@ impl VerifiedExecutable {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct InstallReceipt {
+    keyset: KeysetEnvelope,
+    keyset_generation: u64,
     envelope: RegistryEnvelope,
     plugin_name: String,
     version: String,
@@ -164,6 +174,10 @@ struct ActiveRecord {
 #[derive(Debug, Deserialize, Serialize)]
 struct RegistryState {
     highest_revision: u64,
+    #[serde(default)]
+    catalog_payload_sha256: String,
+    highest_keyset_generation: u64,
+    keyset: KeysetEnvelope,
 }
 
 #[derive(Clone)]
@@ -225,6 +239,8 @@ impl PluginInstaller {
             self.download_binary(plugin, release, &sha256, &staged_binary)
                 .await?;
             let receipt = InstallReceipt {
+                keyset: registry.keyset.envelope.clone(),
+                keyset_generation: registry.keyset.document.generation,
                 envelope: registry.envelope.clone(),
                 plugin_name: plugin.name.clone(),
                 version: plugin.version.clone(),
@@ -283,45 +299,94 @@ impl PluginInstaller {
     pub async fn accept_registry_revision(
         &self,
         plugins_dir: &Path,
-        revision: u64,
+        registry: &VerifiedRegistry,
     ) -> Result<(), InstallError> {
         ensure_directory("registry", plugins_dir).await?;
         let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
-        let highest = match tokio::fs::symlink_metadata(&state_path).await {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(InstallError::Io {
-                    plugin: "registry".to_string(),
-                    path: state_path.display().to_string(),
-                    reason: "registry state must be a regular file".to_string(),
+        // A newer root-authorized keyset is security state in its own right.
+        // Persist it even when the accompanying catalogue is later refused as
+        // a revision rollback, so an emergency revocation cannot be discarded
+        // by pairing it with a stale catalogue response.
+        self.refresh_keyset(plugins_dir, &registry.keyset).await?;
+        let previous = read_registry_state(&state_path).await?;
+        let catalog_payload = base64::engine::general_purpose::STANDARD
+            .decode(&registry.envelope.payload)
+            .map_err(|error| {
+                invalid_receipt(
+                    "registry",
+                    &state_path,
+                    format!("verified catalogue payload is not valid base64: {error}"),
+                )
+            })?;
+        let catalog_payload_sha256 = hex::encode(Sha256::digest(&catalog_payload));
+        if let Some(previous) = &previous {
+            if registry.document.revision < previous.highest_revision {
+                return Err(InstallError::RegistryRollback {
+                    received: registry.document.revision,
+                    highest: previous.highest_revision,
                 });
             }
-            Ok(_) => {
-                let bytes = read_regular_file_capped("registry", &state_path, 16 * 1024).await?;
-                serde_json::from_slice::<RegistryState>(&bytes)
-                    .map_err(|error| InstallError::Io {
-                        plugin: "registry".to_string(),
-                        path: state_path.display().to_string(),
-                        reason: format!("invalid registry state: {error}"),
-                    })?
-                    .highest_revision
+            if registry.document.revision == previous.highest_revision
+                && !previous.catalog_payload_sha256.is_empty()
+            {
+                if catalog_payload_sha256 != previous.catalog_payload_sha256 {
+                    return Err(InstallError::RegistryRevisionConflict {
+                        revision: registry.document.revision,
+                    });
+                }
+                return Ok(());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(io_error("registry", &state_path, error)),
+            // An equal revision with an empty digest continues once to migrate
+            // the pre-binding state format using this authenticated payload.
+        }
+        write_json_atomically(
+            "registry",
+            &state_path,
+            &RegistryState {
+                highest_revision: registry.document.revision,
+                catalog_payload_sha256,
+                highest_keyset_generation: registry.keyset.document.generation,
+                keyset: registry.keyset.envelope.clone(),
+            },
+        )
+        .await?;
+        sync_directory("registry", plugins_dir).await
+    }
+
+    /// Persist a newer root-authorized keyset without requiring the catalogue
+    /// to be online. Startup uses this to learn rotations and revocations while
+    /// retaining the last accepted catalogue revision for rollback protection.
+    pub async fn refresh_keyset(
+        &self,
+        plugins_dir: &Path,
+        keyset: &VerifiedKeyset,
+    ) -> Result<(), InstallError> {
+        let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
+        let Some(previous) = read_registry_state(&state_path).await? else {
+            return Ok(());
         };
-        if revision < highest {
-            return Err(InstallError::RegistryRollback {
-                received: revision,
-                highest,
+        if keyset.document.generation < previous.highest_keyset_generation {
+            return Err(InstallError::KeysetRollback {
+                received: keyset.document.generation,
+                highest: previous.highest_keyset_generation,
             });
         }
-        if revision == highest {
+        if keyset.document.generation == previous.highest_keyset_generation {
+            if keyset.envelope.payload != previous.keyset.payload {
+                return Err(InstallError::KeysetGenerationConflict {
+                    generation: keyset.document.generation,
+                });
+            }
             return Ok(());
         }
         write_json_atomically(
             "registry",
             &state_path,
             &RegistryState {
-                highest_revision: revision,
+                highest_revision: previous.highest_revision,
+                catalog_payload_sha256: previous.catalog_payload_sha256,
+                highest_keyset_generation: keyset.document.generation,
+                keyset: keyset.envelope.clone(),
             },
         )
         .await?;
@@ -454,11 +519,89 @@ impl PluginInstaller {
     }
 }
 
+pub(crate) async fn has_registry_state(plugins_dir: &Path) -> bool {
+    tokio::fs::symlink_metadata(plugins_dir.join(REGISTRY_STATE_FILE))
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+async fn read_registry_state(state_path: &Path) -> Result<Option<RegistryState>, InstallError> {
+    match tokio::fs::symlink_metadata(state_path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(InstallError::Io {
+                plugin: "registry".to_string(),
+                path: state_path.display().to_string(),
+                reason: "registry state must be a regular file".to_string(),
+            })
+        }
+        Ok(_) => {
+            let bytes = read_regular_file_capped("registry", state_path, 128 * 1024).await?;
+            serde_json::from_slice::<RegistryState>(&bytes)
+                .map(Some)
+                .map_err(|error| InstallError::Io {
+                    plugin: "registry".to_string(),
+                    path: state_path.display().to_string(),
+                    reason: format!("invalid registry state: {error}"),
+                })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("registry", state_path, error)),
+    }
+}
+
 pub async fn discover_active(
     plugins_dir: &Path,
     registry: &RegistryConfig,
 ) -> Vec<Result<ActiveInstallation, InstallError>> {
     let mut results = Vec::new();
+    let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
+    let state_bytes = match read_regular_file_capped("registry", &state_path, 128 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if has_plugin_directories(plugins_dir).await {
+                results.push(Err(error));
+            }
+            return results;
+        }
+    };
+    let state: RegistryState = match serde_json::from_slice(&state_bytes) {
+        Ok(state) => state,
+        Err(error) => {
+            results.push(Err(invalid_receipt(
+                "registry",
+                &state_path,
+                format!("invalid registry state: {error}"),
+            )));
+            return results;
+        }
+    };
+    let accepted_keyset = match VerifiedKeyset::verify(
+        state.keyset,
+        &registry.root_trust,
+        chrono::Utc::now(),
+        KeysetUse::HistoricalReceipt,
+    ) {
+        Ok(keyset) if keyset.document.generation == state.highest_keyset_generation => keyset,
+        Ok(keyset) => {
+            results.push(Err(invalid_receipt(
+                "registry",
+                &state_path,
+                format!(
+                    "keyset generation {} does not match persisted generation {}",
+                    keyset.document.generation, state.highest_keyset_generation
+                ),
+            )));
+            return results;
+        }
+        Err(error) => {
+            results.push(Err(invalid_receipt(
+                "registry",
+                &state_path,
+                error.to_string(),
+            )));
+            return results;
+        }
+    };
     let mut entries = match tokio::fs::read_dir(plugins_dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return results,
@@ -483,15 +626,37 @@ pub async fn discover_active(
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        results.push(verify_active(&name, &path, registry).await);
+        results.push(verify_active(&name, &path, registry, &accepted_keyset).await);
     }
     results
+}
+
+async fn has_plugin_directories(plugins_dir: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(plugins_dir).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if tokio::fs::symlink_metadata(entry.path())
+            .await
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn verify_active(
     name: &str,
     plugin_root: &Path,
     registry: &RegistryConfig,
+    accepted_keyset: &VerifiedKeyset,
 ) -> Result<ActiveInstallation, InstallError> {
     validate_plugin_name(name)?;
     let active_path = plugin_root.join(ACTIVE_FILE);
@@ -516,6 +681,27 @@ async fn verify_active(
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
     let receipt: InstallReceipt = serde_json::from_slice(&receipt_bytes)
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    let receipt_keyset = VerifiedKeyset::verify(
+        receipt.keyset,
+        &registry.root_trust,
+        chrono::Utc::now(),
+        KeysetUse::HistoricalReceipt,
+    )
+    .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    if receipt_keyset.document.generation != receipt.keyset_generation {
+        return Err(invalid_receipt(
+            name,
+            &receipt_path,
+            "receipt keyset generation does not match its signed payload",
+        ));
+    }
+    if receipt.keyset_generation > accepted_keyset.document.generation {
+        return Err(invalid_receipt(
+            name,
+            &receipt_path,
+            "receipt keyset is newer than the accepted registry state",
+        ));
+    }
     let current_platform = platform_target()?;
     if receipt.platform != current_platform {
         return Err(invalid_receipt(
@@ -527,9 +713,13 @@ async fn verify_active(
             ),
         ));
     }
-    let verified =
-        crate::catalog::verify_envelope(receipt.envelope, &registry.trust_anchors, &registry.url)
-            .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    let verified = crate::catalog::verify_envelope(
+        receipt.envelope,
+        accepted_keyset.clone(),
+        &registry.url,
+        KeysetUse::HistoricalReceipt,
+    )
+    .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
     let plugin = verified
         .document
         .plugins
@@ -1039,7 +1229,6 @@ fn invalid_receipt(plugin: &str, path: &Path, reason: impl Into<String>) -> Inst
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
 
@@ -1075,10 +1264,17 @@ mod tests {
     }
 
     fn signed_registry(plugin: RegistryPlugin) -> (VerifiedRegistry, SigningKey) {
+        signed_registry_revision(plugin, 1)
+    }
+
+    fn signed_registry_revision(
+        plugin: RegistryPlugin,
+        revision: u64,
+    ) -> (VerifiedRegistry, SigningKey) {
         let signing = SigningKey::from_bytes(&[42; 32]);
         let document = crate::catalog::RegistryDocument {
             schema_version: 1,
-            revision: 1,
+            revision,
             issued_at: chrono::Utc::now() - chrono::Duration::minutes(1),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             plugins: vec![plugin],
@@ -1087,10 +1283,28 @@ mod tests {
         let envelope = RegistryEnvelope {
             key_id: "test-key".to_string(),
             payload: base64::engine::general_purpose::STANDARD.encode(&payload),
-            signature: base64::engine::general_purpose::STANDARD
-                .encode(signing.sign(&payload).to_bytes()),
+            signature: base64::engine::general_purpose::STANDARD.encode(
+                signing
+                    .sign(&crate::trust::signature_message(
+                        crate::trust::CATALOG_SIGNATURE_DOMAIN,
+                        &payload,
+                    ))
+                    .to_bytes(),
+            ),
         };
-        (VerifiedRegistry { envelope, document }, signing)
+        let keyset = crate::trust::VerifiedKeyset::test_fixture(
+            "test-key",
+            signing.verifying_key().to_bytes(),
+        )
+        .1;
+        (
+            VerifiedRegistry {
+                keyset,
+                envelope,
+                document,
+            },
+            signing,
+        )
     }
 
     fn plugin(url: String, bytes: &[u8], version: &str) -> RegistryPlugin {
@@ -1126,6 +1340,30 @@ mod tests {
             PluginInstaller::new(config.clone()).expect("test installer"),
             config,
         )
+    }
+
+    fn rotated_keyset(
+        old_key: &SigningKey,
+        old_status: crate::trust::CatalogKeyStatus,
+        new_key: &SigningKey,
+        generation: u64,
+    ) -> VerifiedKeyset {
+        crate::trust::VerifiedKeyset::test_fixture_with_keys(
+            vec![
+                (
+                    "test-key".to_string(),
+                    old_key.verifying_key().to_bytes(),
+                    old_status,
+                ),
+                (
+                    "next-key".to_string(),
+                    new_key.verifying_key().to_bytes(),
+                    crate::trust::CatalogKeyStatus::Active,
+                ),
+            ],
+            generation,
+        )
+        .1
     }
 
     #[test]
@@ -1167,20 +1405,187 @@ mod tests {
         let signing = SigningKey::from_bytes(&[42; 32]);
         let (installer, _) = installer("http://127.0.0.1/plugin", &signing);
         let temp = tempfile::tempdir().expect("tempdir");
+        let release = plugin("http://127.0.0.1/plugin".to_string(), b"fixture", "1.0.0");
+        let registry_7 = signed_registry_revision(release.clone(), 7).0;
+        let registry_6 = signed_registry_revision(release, 6).0;
         installer
-            .accept_registry_revision(temp.path(), 7)
+            .accept_registry_revision(temp.path(), &registry_7)
             .await
             .expect("accept revision");
         installer
-            .accept_registry_revision(temp.path(), 7)
+            .accept_registry_revision(temp.path(), &registry_7)
             .await
             .expect("equal revision remains valid");
         assert!(matches!(
-            installer.accept_registry_revision(temp.path(), 6).await,
+            installer
+                .accept_registry_revision(temp.path(), &registry_6)
+                .await,
             Err(InstallError::RegistryRollback {
                 received: 6,
                 highest: 7
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn equal_registry_revision_with_different_payload_is_rejected() {
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        let (installer, _) = installer("http://127.0.0.1/plugin", &signing);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = signed_registry_revision(
+            plugin("http://127.0.0.1/plugin".to_string(), b"one", "1.0.0"),
+            7,
+        )
+        .0;
+        let conflicting = signed_registry_revision(
+            plugin("http://127.0.0.1/plugin".to_string(), b"two", "2.0.0"),
+            7,
+        )
+        .0;
+        installer
+            .accept_registry_revision(temp.path(), &first)
+            .await
+            .expect("accept first revision payload");
+
+        assert!(matches!(
+            installer
+                .accept_registry_revision(temp.path(), &conflicting)
+                .await,
+            Err(InstallError::RegistryRevisionConflict { revision: 7 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyset_refresh_rejects_rollback_and_same_generation_conflict() {
+        let old_key = SigningKey::from_bytes(&[42; 32]);
+        let new_key = SigningKey::from_bytes(&[43; 32]);
+        let (installer, _) = installer("http://127.0.0.1/plugin", &old_key);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let release = plugin("http://127.0.0.1/plugin".to_string(), b"fixture", "1.0.0");
+        let registry = signed_registry_revision(release, 7).0;
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept initial keyset");
+        let generation_2 = rotated_keyset(
+            &old_key,
+            crate::trust::CatalogKeyStatus::VerifyOnly,
+            &new_key,
+            2,
+        );
+        installer
+            .refresh_keyset(temp.path(), &generation_2)
+            .await
+            .expect("accept planned rotation");
+
+        assert!(matches!(
+            installer
+                .refresh_keyset(temp.path(), &registry.keyset)
+                .await,
+            Err(InstallError::KeysetRollback {
+                received: 1,
+                highest: 2
+            })
+        ));
+
+        let conflicting_generation_2 = rotated_keyset(
+            &old_key,
+            crate::trust::CatalogKeyStatus::Revoked,
+            &new_key,
+            2,
+        );
+        assert!(matches!(
+            installer
+                .refresh_keyset(temp.path(), &conflicting_generation_2)
+                .await,
+            Err(InstallError::KeysetGenerationConflict { generation: 2 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn newer_keyset_is_kept_when_catalogue_revision_rolls_back() {
+        let old_key = SigningKey::from_bytes(&[42; 32]);
+        let new_key = SigningKey::from_bytes(&[43; 32]);
+        let (installer, _) = installer("http://127.0.0.1/plugin", &old_key);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let release = plugin("http://127.0.0.1/plugin".to_string(), b"fixture", "1.0.0");
+        let registry_7 = signed_registry_revision(release.clone(), 7).0;
+        installer
+            .accept_registry_revision(temp.path(), &registry_7)
+            .await
+            .expect("accept initial registry");
+        let mut registry_6 = signed_registry_revision(release, 6).0;
+        registry_6.keyset = rotated_keyset(
+            &old_key,
+            crate::trust::CatalogKeyStatus::Revoked,
+            &new_key,
+            2,
+        );
+
+        assert!(matches!(
+            installer
+                .accept_registry_revision(temp.path(), &registry_6)
+                .await,
+            Err(InstallError::RegistryRollback {
+                received: 6,
+                highest: 7
+            })
+        ));
+        let state = read_registry_state(&temp.path().join(REGISTRY_STATE_FILE))
+            .await
+            .expect("read registry state")
+            .expect("registry state exists");
+        assert_eq!(state.highest_revision, 7);
+        assert_eq!(state.highest_keyset_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_preserves_receipt_but_revocation_blocks_it() {
+        let bytes = b"standalone executable bytes";
+        let url = serve_once("200 OK", &[], bytes.to_vec()).await;
+        let (registry, old_key) = signed_registry(plugin(url.clone(), bytes, "1.2.3"));
+        let new_key = SigningKey::from_bytes(&[43; 32]);
+        let (installer, config) = installer(&url, &old_key);
+        let temp = tempfile::tempdir().expect("tempdir");
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept initial registry state");
+        let candidate = installer
+            .prepare(temp.path(), &registry, &registry.document.plugins[0])
+            .await
+            .expect("prepare binary");
+        installer.activate(&candidate).await.expect("activate");
+
+        let verify_only = rotated_keyset(
+            &old_key,
+            crate::trust::CatalogKeyStatus::VerifyOnly,
+            &new_key,
+            2,
+        );
+        installer
+            .refresh_keyset(temp.path(), &verify_only)
+            .await
+            .expect("accept verify-only rotation");
+        assert!(matches!(
+            &discover_active(temp.path(), &config).await[..],
+            [Ok(found)] if found.version == "1.2.3"
+        ));
+
+        let revoked = rotated_keyset(
+            &old_key,
+            crate::trust::CatalogKeyStatus::Revoked,
+            &new_key,
+            3,
+        );
+        installer
+            .refresh_keyset(temp.path(), &revoked)
+            .await
+            .expect("accept emergency revocation");
+        assert!(matches!(
+            &discover_active(temp.path(), &config).await[..],
+            [Err(InstallError::InvalidReceipt { reason, .. })]
+                if reason.contains("key status is Revoked")
         ));
     }
 
@@ -1192,6 +1597,10 @@ mod tests {
         let (installer, config) = installer(&url, &signing);
         let temp = tempfile::tempdir().expect("tempdir");
         let plugins_dir = temp.path().join("plugins");
+        installer
+            .accept_registry_revision(&plugins_dir, &registry)
+            .await
+            .expect("accept registry state");
         let candidate = installer
             .prepare(&plugins_dir, &registry, &registry.document.plugins[0])
             .await
@@ -1279,6 +1688,10 @@ mod tests {
         let (registry, signing) = signed_registry(plugin(url.clone(), bytes, "1.2.3"));
         let (installer, config) = installer(&url, &signing);
         let temp = tempfile::tempdir().expect("tempdir");
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept registry state");
         let candidate = installer
             .prepare(temp.path(), &registry, &registry.document.plugins[0])
             .await
@@ -1320,6 +1733,10 @@ mod tests {
         let (registry, signing) = signed_registry(plugin(url.clone(), bytes, "1.2.3"));
         let (installer, config) = installer(&url, &signing);
         let temp = tempfile::tempdir().expect("tempdir");
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept registry state");
         let candidate = installer
             .prepare(temp.path(), &registry, &registry.document.plugins[0])
             .await
@@ -1403,6 +1820,10 @@ mod tests {
         let (registry, signing) = signed_registry(plugin(url.clone(), v1, "1.0.0"));
         let (installer, config) = installer(&url, &signing);
         let temp = tempfile::tempdir().expect("tempdir");
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept registry state");
         let candidate = installer
             .prepare(temp.path(), &registry, &registry.document.plugins[0])
             .await
