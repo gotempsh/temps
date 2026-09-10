@@ -42,6 +42,8 @@
 //! after the container exits).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::container::LogOutput;
@@ -281,8 +283,14 @@ pub async fn run_one_shot(
 
     let mut stdout_tail = RingBuffer::with_capacity(4 * 1024);
     let mut stderr_tail = RingBuffer::with_capacity(4 * 1024);
-    let mut stderr_watch_matched = false;
     let stderr_watch = spec.stderr_watch;
+    // The watch verdict lives outside the collector task. The collector
+    // publishes a match the moment it sees one, so the verdict survives even
+    // if the caller stops waiting for the collector to drain (below): a
+    // verdict that only travelled through the task's return value was lost
+    // on a drain timeout, and an exit-0 container whose stderr had already
+    // shown the watched diagnostic was then reported as a clean success.
+    let stderr_watch_flag = Arc::new(AtomicBool::new(false));
 
     // ── Log collector (background task) ──────────────────────────────────
     //
@@ -292,30 +300,12 @@ pub async fn run_one_shot(
     let log_handle = match attach {
         Ok(attach_results) => {
             let stream = attach_results.output;
-            Some(tokio::spawn(async move {
-                let mut stream = stream;
-                let mut stdout = RingBuffer::with_capacity(4 * 1024);
-                let mut stderr = RingBuffer::with_capacity(4 * 1024);
-                let mut watcher = stderr_watch.map(SubstringWatcher::new);
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(LogOutput::StdOut { message }) => stdout.append(&message),
-                        Ok(LogOutput::StdErr { message }) => {
-                            if let Some(watcher) = watcher.as_mut() {
-                                watcher.feed(&message);
-                            }
-                            stderr.append(&message)
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            debug!(error = %e, "one_shot: log stream error (non-fatal)");
-                            break;
-                        }
-                    }
-                }
-                let matched = watcher.is_some_and(|w| w.matched());
-                (stdout, stderr, matched)
-            }))
+            let watch_flag = Arc::clone(&stderr_watch_flag);
+            Some(tokio::spawn(collect_logs(
+                stream,
+                stderr_watch.map(SubstringWatcher::new),
+                watch_flag,
+            )))
         }
         Err(e) => {
             warn!(error = %e, "one_shot: attach failed; will run without log capture");
@@ -368,25 +358,46 @@ pub async fn run_one_shot(
         }
     };
 
-    // Give the log collector up to 2 seconds to drain anything still in
-    // the pipe before we hand back to the caller.
+    // Give the log collector time to drain anything still in the pipe
+    // before we hand back to the caller. The tails are diagnostics, so two
+    // seconds is plenty for them. A stderr watch is a correctness signal
+    // (the caller fails the backup on it), so when one is set the drain
+    // waits longer: the container has already exited, so the stream ends
+    // as soon as the daemon flushes, and a slow flush must not turn an
+    // observed failure into a reported success.
+    let drain_deadline = if stderr_watch.is_some() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(2)
+    };
     if let Some(handle) = log_handle {
-        match tokio::time::timeout(Duration::from_secs(2), handle).await {
-            Ok(Ok((s_out, s_err, matched))) => {
+        match tokio::time::timeout(drain_deadline, handle).await {
+            Ok(Ok((s_out, s_err))) => {
                 stdout_tail = s_out;
                 stderr_tail = s_err;
-                stderr_watch_matched = matched;
             }
             Ok(Err(_)) => {
                 // Join error (task panicked or was aborted). Captured
-                // tails stay empty.
+                // tails stay empty; the watch flag keeps whatever the
+                // collector published before it died.
             }
             Err(_) => {
-                // Timeout draining; not worth blocking the caller.
-                debug!("one_shot: log drain timed out after 2s");
+                if stderr_watch.is_some() {
+                    warn!(
+                        backup_id = spec.backup_id,
+                        engine = spec.engine,
+                        container = %spec.name,
+                        drain_secs = drain_deadline.as_secs(),
+                        "one_shot: log drain timed out with a stderr watch set; \
+                         a match seen so far is kept, later output was not inspected",
+                    );
+                } else {
+                    debug!("one_shot: log drain timed out after 2s");
+                }
             }
         }
     }
+    let stderr_watch_matched = stderr_watch_flag.load(Ordering::Acquire);
 
     info!(
         backup_id = spec.backup_id,
@@ -404,6 +415,45 @@ pub async fn run_one_shot(
     })
 }
 
+/// Drain a container's attached log stream into bounded tails.
+///
+/// Runs concurrently with `wait_container` so the container never blocks on
+/// a full pipe. When a `watcher` is given, every stderr chunk is fed through
+/// it and a match is published to `watch_flag` immediately, not at stream
+/// end: the caller may stop waiting for this task before the stream closes,
+/// and the verdict has to be visible by then.
+async fn collect_logs<S>(
+    mut stream: S,
+    mut watcher: Option<SubstringWatcher>,
+    watch_flag: Arc<AtomicBool>,
+) -> (RingBuffer, RingBuffer)
+where
+    S: futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+{
+    let mut stdout = RingBuffer::with_capacity(4 * 1024);
+    let mut stderr = RingBuffer::with_capacity(4 * 1024);
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(LogOutput::StdOut { message }) => stdout.append(&message),
+            Ok(LogOutput::StdErr { message }) => {
+                if let Some(watcher) = watcher.as_mut() {
+                    watcher.feed(&message);
+                    if watcher.matched() {
+                        watch_flag.store(true, Ordering::Release);
+                    }
+                }
+                stderr.append(&message)
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!(error = %e, "one_shot: log stream error (non-fatal)");
+                break;
+            }
+        }
+    }
+    (stdout, stderr)
+}
+
 /// Suppress unused-import warning when the helper is compiled but only
 /// the `StartExecResults` re-export is needed elsewhere. Tests in the
 /// engines crate consume `attach_container` directly which forces the
@@ -411,4 +461,71 @@ pub async fn run_one_shot(
 #[allow(dead_code)]
 fn _force_link_referenced_types() {
     let _ = std::mem::size_of::<StartExecResults>();
+}
+
+#[cfg(test)]
+mod collector_tests {
+    use super::*;
+    use tokio_util::bytes::Bytes;
+
+    /// Regression: the watch verdict must not depend on the collector
+    /// finishing. A stream that shows the watched diagnostic and then never
+    /// closes (a slow daemon flush after exit) still has to publish the
+    /// match, because `run_one_shot` stops waiting for the collector after
+    /// its drain deadline and reads the flag, not the task's return value.
+    #[tokio::test]
+    async fn watch_match_is_published_before_the_stream_ends() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream = futures::stream::iter([
+            Ok(LogOutput::StdErr {
+                message: Bytes::from_static(b"mc: <ERROR> Unable to list comparison. "),
+            }),
+            Ok(LogOutput::StdErr {
+                message: Bytes::from_static(b"Access Denied.\n"),
+            }),
+        ])
+        .chain(futures::stream::pending());
+
+        let collector = tokio::spawn(collect_logs(
+            stream,
+            Some(SubstringWatcher::new("access denied")),
+            Arc::clone(&flag),
+        ));
+
+        let drained = tokio::time::timeout(Duration::from_millis(200), collector).await;
+        assert!(
+            drained.is_err(),
+            "the stream never closes, so the collector must still be running"
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the match crossed a chunk boundary and must already be visible"
+        );
+    }
+
+    /// Without a match the flag stays false, and stdout never feeds the
+    /// watcher: the diagnostic `mc` prints on success must not trip it.
+    #[tokio::test]
+    async fn unmatched_streams_leave_the_flag_clear() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream = futures::stream::iter([
+            Ok(LogOutput::StdOut {
+                message: Bytes::from_static(b"access denied appears only on stdout\n"),
+            }),
+            Ok(LogOutput::StdErr {
+                message: Bytes::from_static(b"Total: 3 objects, 1.2 MiB, transferred\n"),
+            }),
+        ]);
+
+        let (stdout, stderr) = collect_logs(
+            stream,
+            Some(SubstringWatcher::new("access denied")),
+            Arc::clone(&flag),
+        )
+        .await;
+
+        assert!(!flag.load(Ordering::Acquire));
+        assert!(stdout.into_string_lossy().contains("only on stdout"));
+        assert!(stderr.into_string_lossy().contains("transferred"));
+    }
 }
