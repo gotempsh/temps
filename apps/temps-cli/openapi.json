@@ -48051,6 +48051,17 @@
         },
         "type": "object"
       },
+      "UpdateMonitorRequest": {
+        "properties": {
+          "check_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_path"
+        ],
+        "type": "object"
+      },
       "UpdateNotificationEmailProviderRequest": {
         "properties": {
           "config": {
@@ -77807,6 +77818,67 @@
           }
         ],
         "summary": "Get a monitor by ID",
+        "tags": [
+          "Status Page"
+        ]
+      },
+      "patch": {
+        "operationId": "update_monitor",
+        "parameters": [
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor updated successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Monitor not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a monitor's check path",
         "tags": [
           "Status Page"
         ]
