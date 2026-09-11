@@ -61145,3 +61145,52 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+
+export type UpdateMonitorRequest = {
+    check_path: string;
+};
+
+export type UpdateMonitorData = {
+    body: UpdateMonitorRequest;
+    path: {
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/monitors/{monitor_id}';
+};
+
+export type UpdateMonitorErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMonitorResponses = {
+    /**
+     * Monitor updated successfully
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];

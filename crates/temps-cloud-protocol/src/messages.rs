@@ -347,12 +347,32 @@ pub struct NativeSnapshotRequest {
     /// unvalidated.
     #[serde(default)]
     pub source_image: Option<String>,
+    /// Key prefix in the Cloud-managed bucket under which the backup engine
+    /// already wrote every object in `objects` (their keys are
+    /// `<in_place_root>/<relative_key>`). Set only for sources the cloud
+    /// manages (`s3_sources.managed_by_cloud`), whose bucket *is* the
+    /// tenant's cloud backup bucket: it tells Cloud to catalog the objects
+    /// where they sit rather than asking the instance to upload a second
+    /// copy into Cloud's own layout in the same bucket. A Cloud that predates
+    /// the field ignores it and answers `upload_required: true`, so the
+    /// instance falls back to the copy path unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// `relative_key`s from the declared manifest that Cloud has already
+    /// verified as complete for this `backup_id`. A re-declaration of an
+    /// unchanged manifest returns every object a previous, interrupted pass
+    /// managed to finish, so the instance can resume from where it stopped
+    /// instead of re-requesting a target and re-verifying every object.
+    /// Empty when nothing has completed yet, when the manifest was replaced,
+    /// or when talking to a Cloud that predates this field.
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +419,9 @@ pub struct WalGSnapshotRequest {
 pub struct WalGSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// Same contract as [`NativeSnapshot::completed_relative_keys`].
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +743,29 @@ mod tests {
         let env = Envelope::new("heartbeat", &hb).unwrap();
         let back: Heartbeat = env.decode("heartbeat").unwrap();
         assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    /// A Cloud built before `completed_relative_keys` existed answers a
+    /// declaration without it. The instance must decode that as "nothing
+    /// complete yet" and fall back to uploading every object, not fail the
+    /// whole mirror pass on a missing field.
+    #[test]
+    fn snapshot_completed_keys_are_additive() {
+        let native: NativeSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true
+        }))
+        .unwrap();
+        assert!(native.upload_required);
+        assert!(native.completed_relative_keys.is_empty());
+
+        let walg: WalGSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true,
+            "completed_relative_keys": ["basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"]
+        }))
+        .unwrap();
+        assert_eq!(walg.completed_relative_keys.len(), 1);
     }
 
     #[test]
@@ -1061,6 +1107,7 @@ mod tests {
                 checksum_sha256: "ab".repeat(32),
             }],
             source_image: None,
+            in_place_root: None,
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -1068,6 +1115,40 @@ mod tests {
         assert_eq!(value["format"], "mongo_dump_archive");
         assert_eq!(value["identity"]["kind"], "mongo_db_stream");
         assert_eq!(value["objects"][0]["kind"], "data");
+        // Absent by default so an older Cloud sees the exact request it
+        // always did; present verbatim when the sweep sets it.
+        assert!(value.get("in_place_root").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_in_place_root_round_trips_and_defaults() {
+        let mut request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "s3/object-store".into(),
+            engine: BackupEngine::RustFs,
+            format: BackupFormat::ObjectSet,
+            compression: BackupCompression::None,
+            identity: NativeSnapshotIdentity::ObjectSet {
+                snapshot_name: "backup-7".into(),
+            },
+            objects: vec![],
+            source_image: None,
+            in_place_root: Some("external_services/s3/object-store/2026-09-11/backup-7".into()),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["in_place_root"],
+            "external_services/s3/object-store/2026-09-11/backup-7"
+        );
+        let decoded: NativeSnapshotRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, request);
+
+        request.in_place_root = None;
+        let mut without = serde_json::to_value(&request).unwrap();
+        without.as_object_mut().unwrap().remove("in_place_root");
+        let decoded: NativeSnapshotRequest = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded.in_place_root, None);
     }
 
     #[test]

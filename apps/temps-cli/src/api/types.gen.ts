@@ -22453,6 +22453,10 @@ export type UpdateMetricAlertRequest = {
     window_secs?: number | null;
 };
 
+export type UpdateMonitorRequest = {
+    check_path: string;
+};
+
 export type UpdateNotificationEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -40252,6 +40256,50 @@ export type GetMonitorResponses = {
 };
 
 export type GetMonitorResponse = GetMonitorResponses[keyof GetMonitorResponses];
+
+export type UpdateMonitorData = {
+    body: UpdateMonitorRequest;
+    path: {
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/monitors/{monitor_id}';
+};
+
+export type UpdateMonitorErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMonitorResponses = {
+    /**
+     * Monitor updated successfully
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];
 
 export type GetBucketedStatusData = {
     body?: never;
