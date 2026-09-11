@@ -29,6 +29,7 @@ import {
   Database,
   DatabaseBackup,
   Folder,
+  Cpu,
   Gauge,
   GitBranch,
   GitFork,
@@ -120,10 +121,18 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
       { title: 'Logs', url: '/logs', icon: ScrollText },
       { title: 'Errors', url: '/errors', icon: ShieldAlert },
       {
+        title: 'Server',
+        url: '/monitoring/server',
+        icon: Cpu,
+        activeWhen: (pathname) => pathname.startsWith('/monitoring/server'),
+      },
+      {
         title: 'Monitoring',
         url: '/monitoring/alerts',
         icon: Gauge,
-        activeWhen: (pathname) => pathname.startsWith('/monitoring'),
+        activeWhen: (pathname) =>
+          pathname.startsWith('/monitoring') &&
+          !pathname.startsWith('/monitoring/server'),
         featureKey: 'alerts-metric-alerts',
       },
       { title: 'Proxy', url: '/proxy', icon: Activity },

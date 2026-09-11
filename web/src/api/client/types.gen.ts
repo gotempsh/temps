@@ -7216,6 +7216,54 @@ export type DockerComposePresetConfig = {
     relaxedCapabilityServices?: Array<string>;
 };
 
+/**
+ * Result of `docker system df` for the control-plane host.
+ */
+export type DockerDiskUsage = {
+    /**
+     * Docker API version the daemon answered with, when it reported one
+     * (`Api-Version` header). Useful when a category shows `null`
+     * reclaimable bytes.
+     */
+    api_version?: string | null;
+    build_cache: DockerDiskUsageCategory;
+    /**
+     * When this snapshot was taken (ISO 8601, UTC).
+     */
+    collected_at: string;
+    containers: DockerDiskUsageCategory;
+    images: DockerDiskUsageCategory;
+    /**
+     * Sum of the four category sizes.
+     */
+    total_bytes: number;
+    volumes: DockerDiskUsageCategory;
+};
+
+/**
+ * One slice of the Docker disk-usage donut.
+ */
+export type DockerDiskUsageCategory = {
+    /**
+     * Objects currently in use (images referenced by a container, running
+     * containers, mounted volumes, in-use cache records).
+     */
+    active_count: number;
+    /**
+     * Bytes `docker system prune` could free from this category. `null`
+     * when the daemon is older than API 1.52 and does not report it.
+     */
+    reclaimable_bytes?: number | null;
+    /**
+     * Bytes on disk attributed to this category.
+     */
+    size_bytes: number;
+    /**
+     * Number of objects in this category (all images, all containers, …).
+     */
+    total_count: number;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -22451,6 +22499,10 @@ export type UpdateMetricAlertRequest = {
     name?: string | null;
     severity?: string | null;
     window_secs?: number | null;
+};
+
+export type UpdateMonitorRequest = {
+    check_path: string;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -40253,6 +40305,50 @@ export type GetMonitorResponses = {
 
 export type GetMonitorResponse = GetMonitorResponses[keyof GetMonitorResponses];
 
+export type UpdateMonitorData = {
+    body: UpdateMonitorRequest;
+    path: {
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/monitors/{monitor_id}';
+};
+
+export type UpdateMonitorErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMonitorResponses = {
+    /**
+     * Monitor updated successfully
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];
+
 export type GetBucketedStatusData = {
     body?: never;
     path: {
@@ -40566,6 +40662,96 @@ export type NodeMetricsUpdateAlertRuleResponses = {
 };
 
 export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
+export type NodeMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/latest';
+};
+
+export type NodeMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetLatestResponse = NodeMetricsGetLatestResponses[keyof NodeMetricsGetLatestResponses];
+
+export type NodeDockerDiskUsageGetData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/nodes/{node_id}/docker-disk-usage';
+};
+
+export type NodeDockerDiskUsageGetErrors = {
+    /**
+     * Node is not the control plane
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Docker daemon answered with an unexpected response
+     */
+    502: unknown;
+    /**
+     * Docker daemon unreachable
+     */
+    503: unknown;
+    /**
+     * Docker daemon timed out
+     */
+    504: unknown;
+};
+
+export type NodeDockerDiskUsageGetResponses = {
+    /**
+     * Docker disk usage by category
+     */
+    200: DockerDiskUsage;
+};
+
+export type NodeDockerDiskUsageGetResponse = NodeDockerDiskUsageGetResponses[keyof NodeDockerDiskUsageGetResponses];
 
 export type DeletePreferencesData = {
     body?: never;
@@ -61145,52 +61331,3 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
-
-
-export type UpdateMonitorRequest = {
-    check_path: string;
-};
-
-export type UpdateMonitorData = {
-    body: UpdateMonitorRequest;
-    path: {
-        /**
-         * Monitor ID
-         */
-        monitor_id: number;
-    };
-    query?: never;
-    url: '/monitors/{monitor_id}';
-};
-
-export type UpdateMonitorErrors = {
-    /**
-     * Invalid request
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Monitor not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type UpdateMonitorResponses = {
-    /**
-     * Monitor updated successfully
-     */
-    200: MonitorResponse;
-};
-
-export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];
