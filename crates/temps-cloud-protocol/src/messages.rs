@@ -347,6 +347,17 @@ pub struct NativeSnapshotRequest {
     /// unvalidated.
     #[serde(default)]
     pub source_image: Option<String>,
+    /// Key prefix in the Cloud-managed bucket under which the backup engine
+    /// already wrote every object in `objects` (their keys are
+    /// `<in_place_root>/<relative_key>`). Set only for sources the cloud
+    /// manages (`s3_sources.managed_by_cloud`), whose bucket *is* the
+    /// tenant's cloud backup bucket: it tells Cloud to catalog the objects
+    /// where they sit rather than asking the instance to upload a second
+    /// copy into Cloud's own layout in the same bucket. A Cloud that predates
+    /// the field ignores it and answers `upload_required: true`, so the
+    /// instance falls back to the copy path unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1096,6 +1107,7 @@ mod tests {
                 checksum_sha256: "ab".repeat(32),
             }],
             source_image: None,
+            in_place_root: None,
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -1103,6 +1115,40 @@ mod tests {
         assert_eq!(value["format"], "mongo_dump_archive");
         assert_eq!(value["identity"]["kind"], "mongo_db_stream");
         assert_eq!(value["objects"][0]["kind"], "data");
+        // Absent by default so an older Cloud sees the exact request it
+        // always did; present verbatim when the sweep sets it.
+        assert!(value.get("in_place_root").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_in_place_root_round_trips_and_defaults() {
+        let mut request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "s3/object-store".into(),
+            engine: BackupEngine::RustFs,
+            format: BackupFormat::ObjectSet,
+            compression: BackupCompression::None,
+            identity: NativeSnapshotIdentity::ObjectSet {
+                snapshot_name: "backup-7".into(),
+            },
+            objects: vec![],
+            source_image: None,
+            in_place_root: Some("external_services/s3/object-store/2026-09-11/backup-7".into()),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["in_place_root"],
+            "external_services/s3/object-store/2026-09-11/backup-7"
+        );
+        let decoded: NativeSnapshotRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, request);
+
+        request.in_place_root = None;
+        let mut without = serde_json::to_value(&request).unwrap();
+        without.as_object_mut().unwrap().remove("in_place_root");
+        let decoded: NativeSnapshotRequest = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded.in_place_root, None);
     }
 
     #[test]

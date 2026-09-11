@@ -14,7 +14,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use sha2::{Digest, Sha256};
-use temps_cloud_client::CloudLink;
+use temps_cloud_client::{CloudError, CloudLink};
 use temps_cloud_protocol::{
     BackupCompression, BackupEngine, BackupFormat, NativeSnapshotIdentity,
     NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest,
@@ -1155,6 +1155,31 @@ async fn mirror_native_backup(
     .await
 }
 
+/// The root Cloud may catalog in place for this snapshot, if any.
+///
+/// A managed source's bucket is the tenant's cloud backup bucket, so the
+/// objects the engine wrote under `root` already are the offsite copy. Telling
+/// Cloud where they are lets it catalog them in place rather than have the
+/// sweep read every object back and upload it a second time into Cloud's own
+/// layout in the same bucket. A Cloud that predates the field answers
+/// `upload_required: true` and the copy path runs unchanged.
+///
+/// Only snapshot-exclusive layouts qualify: an object set or a logical dump
+/// lives under a root that belongs to this backup alone. A WAL-G stream
+/// snapshot (Redis/MongoDB `/walg`, MariaDB physical) selects its objects out
+/// of a repository shared by every backup of that service, and WAL-G's own
+/// retention later deletes from it, so cataloging those objects in place would
+/// leave Cloud pointing at files that disappear. They keep the copy path.
+fn in_place_root_for(
+    managed_by_cloud: bool,
+    compression: BackupCompression,
+    root: &str,
+) -> Option<String> {
+    (managed_by_cloud && compression != BackupCompression::WalGNative)
+        .then(|| root.trim_matches('/').to_string())
+        .filter(|root| !root.is_empty())
+}
+
 /// Declare, upload (if required), and complete a native snapshot against
 /// Cloud. Factored out of `mirror_native_backup` so [`mirror_control_plane_backup`]
 /// can reuse the same declare/upload/complete sequence without duplicating
@@ -1218,7 +1243,8 @@ async fn declare_and_complete_native_snapshot(
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let request = NativeSnapshotRequest {
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, compression, root);
+    let mut request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
         source,
@@ -1228,11 +1254,37 @@ async fn declare_and_complete_native_snapshot(
         identity,
         objects: declarations.clone(),
         source_image,
+        in_place_root,
     };
-    let snapshot = link
-        .declare_native_snapshot(&request)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let snapshot = match link.declare_native_snapshot(&request).await {
+        Ok(snapshot) => snapshot,
+        // Cloud understood the in-place request and refused it (a root it
+        // will not accept, a bucket that disagrees with the manifest). That
+        // is a verdict on this layout, not a transient fault: retrying the
+        // same declaration would loop forever. Fall back to the copy path,
+        // which is what Cloud always accepted, and say why.
+        Err(CloudError::Rejected { detail }) if request.in_place_root.is_some() => {
+            warn!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                %detail,
+                "Cloud declined to catalog the snapshot in place; mirroring a copy instead"
+            );
+            request.in_place_root = None;
+            link.declare_native_snapshot(&request)
+                .await
+                .map_err(|error| StageError::Retry(error.to_string()))?
+        }
+        Err(error) => return Err(StageError::Retry(error.to_string())),
+    };
+    if !snapshot.upload_required && request.in_place_root.is_some() {
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            objects = declarations.len(),
+            "Cloud cataloged the snapshot in place; no second copy uploaded"
+        );
+    }
     if snapshot.upload_required {
         let mut pass = UploadPass {
             declared: declarations.len(),
@@ -2564,7 +2616,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
     use temps_cloud_protocol::{
-        NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, WalGObjectCompleted,
+        BackupCompression, NativeSnapshot, NativeSnapshotObjectDeclaration,
+        NativeSnapshotObjectKind, NativeSnapshotRequest, WalGObjectCompleted,
         WalGObjectTargetRequest,
     };
     use uuid::Uuid;
@@ -4396,6 +4449,314 @@ mod tests {
             "expected exactly the dump object and metadata.json to be read and checksummed, \
              proving the decoy object was excluded and both real objects were reached"
         );
+    }
+
+    #[test]
+    fn only_snapshot_exclusive_layouts_on_managed_sources_catalog_in_place() {
+        let root = "/t/managed-backups/external_services/s3/store/2026-09-11/backup-7/";
+        assert_eq!(
+            super::in_place_root_for(true, BackupCompression::None, root).as_deref(),
+            Some("t/managed-backups/external_services/s3/store/2026-09-11/backup-7")
+        );
+        assert!(super::in_place_root_for(true, BackupCompression::Gzip, root).is_some());
+        // Shared WAL-G repositories are rotated by WAL-G retention: copy.
+        assert!(super::in_place_root_for(true, BackupCompression::WalGNative, root).is_none());
+        // Operator-owned sources are not the cloud bucket: copy.
+        assert!(super::in_place_root_for(false, BackupCompression::None, root).is_none());
+        assert!(super::in_place_root_for(true, BackupCompression::None, "/").is_none());
+    }
+
+    struct InPlaceCloudStub {
+        /// Every declaration received, in order.
+        declared: Mutex<Vec<NativeSnapshotRequest>>,
+        /// Refuse declarations that carry `in_place_root` with a 400, the
+        /// way Cloud does for a root it will not catalog.
+        reject_in_place: bool,
+        target_calls: AtomicUsize,
+        completions: AtomicUsize,
+    }
+
+    /// Cloud's problem body for a refused request.
+    #[derive(serde::Serialize)]
+    struct StubRejection {
+        detail: &'static str,
+    }
+
+    /// Cloud's acknowledgement of a completed snapshot.
+    #[derive(serde::Serialize)]
+    struct StubCompletion {
+        state: &'static str,
+    }
+
+    async fn in_place_declare_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+        Json(request): Json<NativeSnapshotRequest>,
+    ) -> Result<(StatusCode, Json<NativeSnapshot>), (StatusCode, Json<StubRejection>)> {
+        let in_place = request.in_place_root.is_some();
+        let response = NativeSnapshot {
+            backup_id: request.backup_id,
+            upload_required: !in_place,
+            completed_relative_keys: Vec::new(),
+        };
+        state.declared.lock().expect("declared lock").push(request);
+        if in_place && state.reject_in_place {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(StubRejection {
+                    detail: "in_place_root must lie under this tenant's managed backup path",
+                }),
+            ));
+        }
+        Ok((StatusCode::CREATED, Json(response)))
+    }
+
+    async fn in_place_target_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+    ) -> (StatusCode, Json<StubRejection>) {
+        state.target_calls.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(StubRejection {
+                detail: "in-place snapshots never request targets",
+            }),
+        )
+    }
+
+    async fn in_place_complete_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+    ) -> (StatusCode, Json<StubCompletion>) {
+        state.completions.fetch_add(1, Ordering::SeqCst);
+        (StatusCode::OK, Json(StubCompletion { state: "complete" }))
+    }
+
+    /// A managed source's bucket is the tenant's cloud bucket, so the sweep
+    /// declares the engine's own root and Cloud catalogs the objects where
+    /// they already are. Against a stub Cloud that answers
+    /// `upload_required: false`, the whole native flow must complete with
+    /// zero object targets and zero re-uploads.
+    #[tokio::test]
+    async fn managed_native_snapshots_are_declared_in_place_and_never_re_uploaded() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping in-place catalog test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: false,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        let expected_root = dump_key
+            .rsplit_once('/')
+            .expect("dump key has a parent")
+            .0
+            .to_string();
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        expect_stage_ok(
+            mirror_backup(&link, &mut resources, &backup, instance_id).await,
+            "in-place native mirror completes",
+        );
+
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(declared.len(), 1, "one declaration, accepted first time");
+        assert_eq!(
+            declared[0].in_place_root.as_deref(),
+            Some(expected_root.as_str())
+        );
+        assert_eq!(declared[0].objects.len(), 2);
+        assert_eq!(
+            cloud.target_calls.load(Ordering::SeqCst),
+            0,
+            "an in-place snapshot must never ask for an upload target"
+        );
+        assert_eq!(cloud.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Cloud answering 400 to an in-place declaration is a verdict on the
+    /// layout, not a transient fault. The sweep must not retry it forever:
+    /// it re-declares without the root and takes the copy path, which is
+    /// what Cloud always accepted. The stub's target endpoint returns 500,
+    /// so reaching it is the proof that the fallback happened, and the
+    /// resulting error is `Retry`, exactly as for any copy-path hiccup.
+    #[tokio::test]
+    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping in-place fallback test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: true,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("the copy path hits the stub's failing target endpoint");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => {
+                panic!("a copy-path target failure is transient, not Unsupported: {reason}")
+            }
+        }
+
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(
+            declared.len(),
+            2,
+            "in-place attempt, then the copy-path re-declaration"
+        );
+        assert!(declared[0].in_place_root.is_some());
+        assert!(
+            declared[1].in_place_root.is_none(),
+            "the fallback must not carry the rejected root"
+        );
+        assert!(
+            cloud.target_calls.load(Ordering::SeqCst) > 0,
+            "the copy path asked for an upload target"
+        );
+        assert_eq!(cloud.completions.load(Ordering::SeqCst), 0);
     }
 
     /// The `mirror_native_backup` fallback branch treats a dump with no
