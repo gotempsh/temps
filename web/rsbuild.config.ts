@@ -34,7 +34,6 @@ const consoleKitEntry = path.resolve(
   __dirname,
   'packages/console-kit/src/index.ts'
 )
-const dsDir = path.resolve(__dirname, 'packages/ds/src')
 
 export default defineConfig({
   plugins: [pluginReact()],
@@ -43,10 +42,6 @@ export default defineConfig({
       // Local workspace package — pin explicitly so rsbuild resolves it even
       // when node_modules/@temps-sdk/console-kit is missing or stale.
       '@temps-sdk/console-kit': consoleKitEntry,
-      // The operator design system, resolved to source the same way: the
-      // package publishes `dist/`, which a fresh checkout never builds.
-      '@temps-sdk/ds/op.css': path.join(dsDir, 'op.css'),
-      '@temps-sdk/ds$': path.join(dsDir, 'index.ts'),
     },
   },
   source: {

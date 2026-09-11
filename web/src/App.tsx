@@ -46,7 +46,6 @@ import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
 import { PlatformAccessProvider } from './contexts/PlatformAccessContext'
 import './globals.css'
 import { MonitoringSettings } from './components/monitoring/MonitoringSettings'
-import { ServerPage } from './pages/v1/ServerPage'
 import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
 import { NotificationRouteForm } from './pages/NotificationRouteForm'
@@ -613,7 +612,6 @@ const FullAppRoutes = () => {
                         path="providers/edit/:id"
                         element={<EditNotificationProvider />}
                       />
-                      <Route path="server" element={<ServerPage />} />
                       <Route path=":section" element={<MonitoringSettings />} />
                     </Route>
                     <Route
