@@ -4,7 +4,7 @@
 'use client'
 
 import * as React from 'react'
-import { CheckIcon, CopyIcon, XIcon } from 'lucide-react'
+import { type LucideIcon, CheckIcon, CopyIcon, XIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   Tooltip,
@@ -19,6 +19,7 @@ import { writeToClipboard } from '@/lib/clipboard'
 
 interface CopyButtonProps extends ButtonProps {
   value: string
+  icon?: LucideIcon
   children?: React.ReactNode
   minimal?: boolean
   /** Overrides the tooltip text and the accessible label. */
@@ -37,6 +38,7 @@ interface CopyButtonProps extends ButtonProps {
  */
 export function CopyButton({
   value,
+  icon: IdleIcon = CopyIcon,
   className,
   children,
   minimal = false,
@@ -69,7 +71,7 @@ export function CopyButton({
   }
 
   const Icon =
-    state === 'copied' ? CheckIcon : state === 'failed' ? XIcon : CopyIcon
+    state === 'copied' ? CheckIcon : state === 'failed' ? XIcon : IdleIcon
 
   const buttonContent = (
     <button

@@ -5889,6 +5889,12 @@ export type DatabaseMetricsRow = {
 };
 
 /**
+ * Controls which logical database a deployment receives through a
+ * project-to-service link.
+ */
+export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
+
+/**
  * Request to delete keys
  */
 export type DelRequest = {
@@ -11511,6 +11517,14 @@ export type LinkApplicationProjectRequest = {
 };
 
 export type LinkServiceRequest = {
+    /**
+     * Exact database name used when `database_provisioning_mode` is `custom`.
+     */
+    custom_database_name?: string | null;
+    /**
+     * How deployments linked through this service select a logical database.
+     */
+    database_provisioning_mode?: DatabaseProvisioningMode;
     project_id: number;
 };
 
@@ -15366,6 +15380,8 @@ export type ProjectSecretResponse = {
 };
 
 export type ProjectServiceInfo = {
+    custom_database_name?: string | null;
+    database_provisioning_mode: DatabaseProvisioningMode;
     id: number;
     project: ProjectInfo;
     service: ExternalServiceInfo;
@@ -35299,6 +35315,10 @@ export type LinkServiceToProjectData = {
 };
 
 export type LinkServiceToProjectErrors = {
+    /**
+     * Invalid database provisioning configuration
+     */
+    400: unknown;
     /**
      * Authentication required
      */

@@ -3,15 +3,9 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { SettingsSection } from '@/components/ui/settings-section'
 import {
   Select,
   SelectContent,
@@ -36,6 +30,7 @@ import {
   HardDrive,
   Loader2,
   Save,
+  Timer,
 } from 'lucide-react'
 import { forwardRef, useEffect, type ComponentProps } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -208,20 +203,12 @@ export function MonitoringSettingsPage() {
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
       {/* Overview — metrics collection is always on, controlled per-service */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <BarChart2 className="h-5 w-5" />
-            Metrics Collection
-          </CardTitle>
-          <CardDescription>
-            Collect resource and performance metrics from databases, containers,
-            and nodes for alerting and dashboards. Enable monitoring per service
-            from its detail page — these settings tune how the collected data is
-            sampled and retained.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
+      <SettingsSection
+        title="Metrics Collection"
+        icon={BarChart2}
+        description="Collect resource and performance metrics from databases, containers, and nodes for alerting and dashboards. Enable monitoring per service from its detail page — these settings tune how the collected data is sampled and retained."
+      >
+        <div className="space-y-3">
           <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <Database className="h-4 w-4 text-muted-foreground" />
@@ -281,33 +268,23 @@ export function MonitoringSettingsPage() {
               </AlertDescription>
             </Alert>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Immutable proxy logs and spans share one operational pattern: write
           once, then compress closed Timescale chunks. ClickHouse compresses
           parts automatically and therefore has no age-based policy. */}
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="space-y-1.5">
-              <CardTitle className="flex items-center gap-2">
-                <Archive className="h-5 w-5" />
-                Telemetry Compression
-              </CardTitle>
-              <CardDescription>
-                Reduce storage used by immutable proxy request logs and
-                OpenTelemetry spans after their active ingest window closes.
-              </CardDescription>
-            </div>
-            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
-              {effectiveObservabilityStore === 'click_house'
-                ? 'ClickHouse · automatic'
-                : 'TimescaleDB · scheduled'}
-            </span>
-          </div>
-        </CardHeader>
-        <CardContent>
+      <SettingsSection
+        title="Telemetry Compression"
+        icon={Archive}
+        description="Reduce storage used by immutable proxy request logs and OpenTelemetry spans after their active ingest window closes."
+      >
+        <div className="space-y-4">
+          <span className="inline-flex rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+            {effectiveObservabilityStore === 'click_house'
+              ? 'ClickHouse · automatic'
+              : 'TimescaleDB · scheduled'}
+          </span>
           {effectiveObservabilityStore === 'click_house' ? (
             <div className="rounded-lg border border-border bg-muted/30 px-4 py-4">
               <div className="flex items-start gap-3">
@@ -403,67 +380,52 @@ export function MonitoringSettingsPage() {
               </p>
             </div>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Scrape interval */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Scrape Interval</CardTitle>
-          <CardDescription>
-            How often the MetricsScraper collects data from all sources. Lower
-            values give higher resolution but increase storage usage.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="w-full sm:w-48">
-            <Label htmlFor="scrape-interval">Interval</Label>
-            <Select
-              value={String(monitoring?.scrape_interval_secs ?? 30)}
-              onValueChange={(v) =>
-                setValue('monitoring.scrape_interval_secs', Number(v), {
-                  shouldDirty: true,
-                })
-              }
-            >
-              <SelectTrigger id="scrape-interval" className="mt-1">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="15">15 seconds</SelectItem>
-                <SelectItem value="30">30 seconds (default)</SelectItem>
-                <SelectItem value="60">60 seconds</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              Controls how often Temps samples CPU, memory, database, container,
-              and node metrics. Shorter intervals show finer detail but create
-              more raw metric rows.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+      <SettingsSection
+        title="Scrape Interval"
+        icon={Timer}
+        description="How often the MetricsScraper collects data from all sources. Lower values give higher resolution but increase storage usage."
+      >
+        <div className="w-full sm:w-48">
+          <Label htmlFor="scrape-interval">Interval</Label>
+          <Select
+            value={String(monitoring?.scrape_interval_secs ?? 30)}
+            onValueChange={(v) =>
+              setValue('monitoring.scrape_interval_secs', Number(v), {
+                shouldDirty: true,
+              })
+            }
+          >
+            <SelectTrigger id="scrape-interval" className="mt-1">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="15">15 seconds</SelectItem>
+              <SelectItem value="30">30 seconds (default)</SelectItem>
+              <SelectItem value="60">60 seconds</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            Controls how often Temps samples CPU, memory, database, container,
+            and node metrics. Shorter intervals show finer detail but create
+            more raw metric rows.
+          </p>
+        </div>
+      </SettingsSection>
 
       {/* Retention spans every observability signal, not only resource metrics. */}
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="space-y-1.5">
-              <CardTitle className="flex items-center gap-2">
-                <HardDrive className="h-5 w-5" />
-                Data Retention
-              </CardTitle>
-              <CardDescription>
-                Control how long resource metrics, proxy request logs, traces,
-                OpenTelemetry logs, and OpenTelemetry metrics remain available.
-              </CardDescription>
-            </div>
-            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
-              All telemetry
-            </span>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-8">
+      <SettingsSection
+        title="Data Retention"
+        icon={HardDrive}
+        description="Control how long resource metrics, proxy request logs, traces, OpenTelemetry logs, and OpenTelemetry metrics remain available."
+      >
+        <div className="space-y-8">
+          <span className="inline-flex rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+            All telemetry
+          </span>
           <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertTitle>Retention permanently deletes old data</AlertTitle>
@@ -825,8 +787,8 @@ export function MonitoringSettingsPage() {
               )}
             </div>
           </section>
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {isDirty && (
         <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">

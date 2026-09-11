@@ -5,11 +5,13 @@ import {
   getEnvironmentsOptions,
   createEnvironmentMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Route, Routes, useSearchParams } from 'react-router'
-import { EnvironmentDashboard } from './EnvironmentDashboard'
+import {
+  EnvironmentDashboard,
+  EnvironmentDashboardSkeleton,
+} from './EnvironmentDashboard'
 import { ContainerDetailPage } from './ContainerDetailPage'
 import { ProjectResponse } from '@/api/client'
 import { CreateEnvironmentDialog } from '@/components/project/settings/environments/CreateEnvironmentDialog'
@@ -60,17 +62,7 @@ export function EnvironmentsTabsView({
   )
 
   if (isEnvironmentsLoading) {
-    return (
-      <div className="flex flex-col h-full">
-        <div className="p-6 border-b bg-background">
-          <Skeleton className="h-8 w-48 mb-2" />
-          <Skeleton className="h-4 w-64" />
-        </div>
-        <div className="flex-1 p-6">
-          <Skeleton className="h-96 w-full" />
-        </div>
-      </div>
-    )
+    return <EnvironmentDashboardSkeleton />
   }
 
   if (!environments || environments.length === 0) {

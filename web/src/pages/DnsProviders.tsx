@@ -169,11 +169,13 @@ export function DnsProviders() {
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
-            <CreateActionButton
-              size="sm"
-              onClick={() => navigate('/dns-providers/add')}
-              label="Add DNS Provider"
-            />
+            {!isLoading && Boolean(dnsProviders?.length) && (
+              <CreateActionButton
+                size="sm"
+                onClick={() => navigate('/dns-providers/add')}
+                label="Add DNS Provider"
+              />
+            )}
           </div>
         </div>
 

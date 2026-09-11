@@ -2697,7 +2697,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<super::LogicalResource> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
 
         // Create the database
         self.create_database(&db_name).await?;
@@ -2725,7 +2725,7 @@ impl ExternalService for MongodbService {
     }
 
     async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
         self.drop_database(&db_name).await
     }
 
@@ -2777,7 +2777,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
 
         // Create the database if it doesn't exist
         self.create_database(&db_name).await?;
@@ -2790,7 +2790,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
         // Preview: skip create_database so the UI doesn't provision DBs.
         self.build_runtime_env_vars(&db_name).await
     }

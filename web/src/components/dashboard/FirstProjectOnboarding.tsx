@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Link, useNavigate } from 'react-router'
 import {
@@ -459,18 +460,6 @@ function Step({ index, label }: { index: number; label: string }) {
 }
 
 function CliCommand({ command }: { command: string }) {
-  const tokens = command.split(' ')
-  const packageIndex = tokens.findIndex((t) => t.startsWith('@'))
-
-  const colorFor = (token: string, i: number): string => {
-    if (/^https?:\/\//.test(token)) return 'text-amber-600 dark:text-amber-400'
-    if (i === 0) return 'text-emerald-600 dark:text-emerald-400'
-    if (i === packageIndex) return 'text-foreground font-medium'
-    if (packageIndex !== -1 && i === packageIndex + 1)
-      return 'text-sky-600 dark:text-sky-400'
-    return 'text-muted-foreground'
-  }
-
   return (
     <div
       className={cn(
@@ -479,14 +468,11 @@ function CliCommand({ command }: { command: string }) {
       )}
     >
       <span className="shrink-0 select-none text-muted-foreground">$</span>
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {tokens.map((token, i) => (
-          <span key={i}>
-            {i > 0 && ' '}
-            <span className={colorFor(token, i)}>{token}</span>
-          </span>
-        ))}
-      </code>
+      <HighlightedCode
+        code={command}
+        language="bash"
+        className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap"
+      />
       <CopyButton
         value={command}
         minimal

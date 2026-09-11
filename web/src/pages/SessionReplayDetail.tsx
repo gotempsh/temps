@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse, SessionEventDto } from '@/api/client'
 import {
@@ -540,7 +541,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                           {isSelected && firstEventData && (
                             <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
                               <pre className="text-xs overflow-x-auto">
-                                {formatEventData(firstEventData)}
+                                <HighlightedCode
+                                  code={formatEventData(firstEventData)}
+                                  language="json"
+                                />
                               </pre>
                             </div>
                           )}

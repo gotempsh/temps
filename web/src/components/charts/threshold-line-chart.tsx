@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ReactNode, useCallback, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useMemo, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
@@ -13,7 +13,7 @@ import {
   YAxis,
 } from 'recharts'
 import {
-  ChartConfig,
+  type ChartConfig,
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
@@ -101,6 +101,7 @@ interface ThresholdLineChartProps {
   /** Height of the chart in px. Defaults to 300. */
   height?: number
   /** Format the Y-axis ticks (e.g. "2.5s"). */
+  allowDecimals?: boolean
   yTickFormatter?: (value: number) => string
   /** Format categorical X-axis ticks without changing their unique values. */
   xTickFormatter?: (value: string | number) => string
@@ -201,6 +202,7 @@ export function ThresholdLineChart({
   markers = [],
   bandSeries,
   height = 300,
+  allowDecimals = true,
   yTickFormatter,
   xTickFormatter,
   tooltipValueFormatter,
@@ -486,6 +488,7 @@ export function ThresholdLineChart({
           className="text-xs"
         />
         <YAxis
+          allowDecimals={allowDecimals}
           tickLine={false}
           axisLine={false}
           tickMargin={8}

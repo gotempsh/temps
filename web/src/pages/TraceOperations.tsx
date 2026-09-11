@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import { EnvironmentResponse, ProjectResponse, SpanStats } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -43,7 +45,6 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ChevronLeft,
   ChevronRight,
-  Clock,
   Gauge,
   RefreshCw,
   Search,
@@ -73,8 +74,16 @@ const SORT_OPTIONS: { value: string; label: string; hint: string }[] = [
     hint: 'Where the wall-clock actually goes — cost x volume',
   },
   { value: 'p95', label: 'Slowest (p95)', hint: 'What most users feel' },
-  { value: 'p99', label: 'Slowest (p99)', hint: 'What your worst-off users feel' },
-  { value: 'max', label: 'Worst single call', hint: 'The slowest this ever got' },
+  {
+    value: 'p99',
+    label: 'Slowest (p99)',
+    hint: 'What your worst-off users feel',
+  },
+  {
+    value: 'max',
+    label: 'Worst single call',
+    hint: 'The slowest this ever got',
+  },
   {
     value: 'variability',
     label: 'Most inconsistent',
@@ -86,7 +95,11 @@ const SORT_OPTIONS: { value: string; label: string; hint: string }[] = [
     hint: 'How much worse the bad case is than the typical one',
   },
   { value: 'count', label: 'Most called', hint: 'Highest call volume' },
-  { value: 'error_rate', label: 'Highest error rate', hint: 'Most failure-prone' },
+  {
+    value: 'error_rate',
+    label: 'Highest error rate',
+    hint: 'Most failure-prone',
+  },
 ]
 
 /**
@@ -146,7 +159,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
     (searchParams.get('range') as TracesTimeRange) || '24h'
   )
   const [sortBy, setSortBy] = useState(searchParams.get('sort') || 'total_time')
-  const [minCount, setMinCount] = useState(searchParams.get('min_count') || '10')
+  const [minCount, setMinCount] = useState(
+    searchParams.get('min_count') || '10'
+  )
   const [environmentId, setEnvironmentId] = useState(
     searchParams.get('environment') || 'all'
   )
@@ -297,19 +312,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
               </SelectContent>
             </Select>
 
-            <Select value={timeRange} onValueChange={handleRangeChange}>
-              <SelectTrigger className="w-full sm:w-[150px]">
-                <Clock className="mr-2 h-3.5 w-3.5" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1h">Last 1 hour</SelectItem>
-                <SelectItem value="6h">Last 6 hours</SelectItem>
-                <SelectItem value="24h">Last 24 hours</SelectItem>
-                <SelectItem value="7d">Last 7 days</SelectItem>
-                <SelectItem value="30d">Last 30 days</SelectItem>
-              </SelectContent>
-            </Select>
+            <TimeRangeFilter value={timeRange} onChange={handleRangeChange} />
 
             <Select value={minCount} onValueChange={handleMinCountChange}>
               <SelectTrigger className="w-full sm:w-[160px]">
@@ -437,9 +440,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                           p99/p50
                         </TooltipTrigger>
                         <TooltipContent>
-                          How much worse the bad case is than the typical one.
-                          A high ratio means this operation is unpredictable,
-                          even if its average looks fine.
+                          How much worse the bad case is than the typical one. A
+                          high ratio means this operation is unpredictable, even
+                          if its average looks fine.
                         </TooltipContent>
                       </Tooltip>
                     </TableHead>
@@ -457,7 +460,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                         navigate(
                           `/projects/${project.slug}/traces?name=${encodeURIComponent(
                             row.span_name
-                          )}&service=${encodeURIComponent(row.service_name)}&sort=duration&range=${timeRange}`
+                          )}&service=${encodeURIComponent(row.service_name)}&sort=duration&range=${encodeURIComponent(timeRange)}`
                         )
                       }
                     >

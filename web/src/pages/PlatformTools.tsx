@@ -114,11 +114,11 @@ export function PlatformTools() {
       )}
 
       {filteredGroups.length > 0 ? (
-        <div className="grid items-start gap-4 lg:grid-cols-2">
+        <div className="grid items-start gap-5 lg:grid-cols-2">
           {filteredGroups.map((group) => (
             <section
               key={group.label}
-              className="rounded-xl border bg-card p-4"
+              className="rounded-xl border bg-card p-5"
             >
               <div className="mb-3 flex items-start gap-3 px-1">
                 <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/40 text-muted-foreground">
@@ -131,12 +131,12 @@ export function PlatformTools() {
                   </p>
                 </div>
               </div>
-              <div className="grid gap-1 sm:grid-cols-2">
+              <div className="grid gap-2">
                 {group.items.map((item) => (
                   <Link
                     key={item.url}
                     to={item.url}
-                    className="group flex min-w-0 items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 transition-colors hover:border-border hover:bg-accent/60"
+                    className="group flex min-w-0 items-start gap-3 rounded-lg border border-transparent px-3 py-3 transition-colors hover:border-border hover:bg-accent/60"
                   >
                     <span className="grid size-8 shrink-0 place-items-center rounded-lg border bg-background text-muted-foreground">
                       <item.icon className="size-4" />
@@ -151,7 +151,7 @@ export function PlatformTools() {
                           />
                         </span>
                       </span>
-                      <span className="block truncate text-xs text-muted-foreground">
+                      <span className="mt-0.5 block text-xs leading-relaxed text-muted-foreground">
                         {item.description}
                       </span>
                     </span>

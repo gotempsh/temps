@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { ACTIVATION_SECTION_ANCHOR } from '@/components/observe/CloudTelemetryActivationSection'
 import { CloudTelemetryWriteStatusCard } from '@/components/observe/CloudTelemetryWriteStatusCard'
 import { JOB_STATUS_LABELS } from '@/lib/cloud-telemetry-activation'
@@ -19,13 +22,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -72,19 +69,6 @@ import { Link } from 'react-router'
 // ---------------------------------------------------------------------------
 // Trend chart
 // ---------------------------------------------------------------------------
-
-/** Presets accepted by `GET /otel/pipeline-history` (`range_to_step` server-side). */
-const RANGE_PRESETS = [
-  { value: '1h', label: 'Last hour' },
-  { value: '6h', label: 'Last 6 hours' },
-  { value: '24h', label: 'Last 24 hours' },
-  { value: '7d', label: 'Last 7 days' },
-] as const
-
-type RangePreset = (typeof RANGE_PRESETS)[number]['value']
-
-/** Multi-day ranges get a date on the x-axis; same-time points would collide. */
-const RANGES_SHOWING_DATE: RangePreset[] = ['7d']
 
 type TrendSeriesDef = {
   /** Metric name as published by the sampler (`OTEL_PIPELINE_METRIC_NAMES`). */
@@ -603,7 +587,7 @@ export function OtelPipelineStatusPage() {
 
   usePageTitle('OTel Pipeline Status')
 
-  const [range, setRange] = useState<RangePreset>('24h')
+  const [range, setRange] = useState<string>('24h')
   const [errorsOpen, setErrorsOpen] = useState(false)
 
   const { data, isLoading, error } = useQuery({
@@ -621,7 +605,14 @@ export function OtelPipelineStatusPage() {
     isLoading: historyLoading,
     error: historyError,
   } = useQuery({
-    ...getPipelineHistoryOptions({ query: { range } }),
+    ...getPipelineHistoryOptions({
+      query: range.startsWith('custom:')
+        ? {
+            start_time: resolveTimeRange(range).from,
+            end_time: resolveTimeRange(range).to,
+          }
+        : { range },
+    }),
     refetchInterval: 60_000,
   })
 
@@ -645,7 +636,7 @@ export function OtelPipelineStatusPage() {
 
   const stats = data?.stats
   const errorEntries = ingestErrors?.errors ?? []
-  const showDate = RANGES_SHOWING_DATE.includes(range)
+  const showDate = range.startsWith('custom:') || range === '7d'
   const sampleIntervalSeconds = history?.sample_interval_seconds ?? 60
 
   const rateLimited = stats?.rate_limited_requests ?? 0
@@ -701,24 +692,11 @@ export function OtelPipelineStatusPage() {
                 ~10 per {sampleIntervalSeconds}&nbsp;s — not 10 in total.
               </CardDescription>
             </div>
-            <Select
+            <TimeRangeFilter
               value={range}
-              onValueChange={(v) => setRange(v as RangePreset)}
-            >
-              <SelectTrigger
-                className="w-full sm:w-[160px]"
-                aria-label="Time window"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {RANGE_PRESETS.map((preset) => (
-                  <SelectItem key={preset.value} value={preset.value}>
-                    {preset.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              onChange={setRange}
+              maxRangeDays={7}
+            />
           </div>
         </CardHeader>
         <CardContent>

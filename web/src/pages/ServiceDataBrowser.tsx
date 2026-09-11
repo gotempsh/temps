@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   checkExplorerSupportOptions,
@@ -4253,7 +4254,7 @@ function EntityDataView({
                                 </span>
                               ) : isStructured ? (
                                 <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
-                                  {text}
+                                  <HighlightedCode code={text} language="json" />
                                 </pre>
                               ) : (
                                 <span className="font-mono text-xs break-all">

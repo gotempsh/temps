@@ -280,7 +280,7 @@ function ClusterMemberConfig({
 }
 
 export function CreateService() {
-  usePageTitle('Create Service')
+  usePageTitle('Create database')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
@@ -362,7 +362,7 @@ export function CreateService() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
-      { label: 'Create Service', href: '/storage/create' },
+      { label: 'Create database', href: '/storage/create' },
     ])
   }, [setBreadcrumbs])
 
@@ -473,7 +473,7 @@ export function CreateService() {
                 Back to Databases
               </Button>
             </Link>
-            <h1 className="text-2xl font-semibold">Create Service</h1>
+            <h1 className="text-2xl font-semibold">Create database</h1>
             <p className="text-muted-foreground">
               Choose a service type to get started.
             </p>
@@ -754,7 +754,7 @@ export function CreateService() {
           submitText={
             serviceName.trim()
               ? `Create ${serviceName.trim()}`
-              : 'Create Service'
+              : 'Create database'
           }
           submitDisabled={!serviceName.trim()}
           isSubmitting={createServiceMut.isPending}

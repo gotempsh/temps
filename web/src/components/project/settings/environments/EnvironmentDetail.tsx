@@ -8,13 +8,7 @@ import {
   updateEnvironmentSubdomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,12 +20,13 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Globe, Loader2, RefreshCw, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { Globe, HardDrive, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
@@ -107,10 +102,6 @@ function SubdomainCard({
 
   const [value, setValue] = useState(currentLabel)
 
-  useEffect(() => {
-    setValue(currentLabel)
-  }, [currentLabel])
-
   const trimmed = value.trim().toLowerCase()
   const isUnchanged = trimmed === currentLabel
   const isValid = SUBDOMAIN_PATTERN.test(trimmed) && trimmed.length <= 63
@@ -119,7 +110,9 @@ function SubdomainCard({
     ...updateEnvironmentSubdomainMutation(),
     meta: { errorTitle: 'Failed to rename subdomain' },
     onSuccess: () => {
-      toast.success('Subdomain updated. The previous hostname will stop resolving shortly.')
+      toast.success(
+        'Subdomain updated. The previous hostname will stop resolving shortly.'
+      )
       onUpdate()
     },
   })
@@ -137,67 +130,58 @@ function SubdomainCard({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Globe className="h-5 w-5" />
-          Subdomain
-        </CardTitle>
-        <CardDescription>
-          Rename the auto-managed hostname for this environment. The previous
-          subdomain stops resolving as soon as the change is applied. Custom
-          domains attached to this environment are unaffected.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <Label htmlFor="subdomain-input">Subdomain</Label>
-            <div className="mt-2 flex flex-col sm:flex-row sm:items-stretch gap-2">
-              <div className="flex flex-1 items-stretch rounded-md border border-input bg-background focus-within:ring-2 focus-within:ring-ring overflow-hidden">
-                <Input
-                  id="subdomain-input"
-                  value={value}
-                  onChange={(e) => setValue(e.target.value)}
-                  placeholder="e.g., myapp"
-                  className="border-0 focus-visible:ring-0 focus-visible:ring-offset-0 rounded-none"
-                  maxLength={63}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                {previewDomain && (
-                  <span className="flex items-center px-3 text-sm text-muted-foreground bg-muted/40 border-l whitespace-nowrap">
-                    .{previewDomain}
-                  </span>
-                )}
-              </div>
-              <Button
-                type="submit"
-                disabled={!isValid || isUnchanged || mutation.isPending}
-                className="sm:w-auto"
-              >
-                {mutation.isPending && (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                )}
-                Save
-              </Button>
+    <SettingsSection
+      title="Subdomain"
+      icon={Globe}
+      description="Rename the auto-managed hostname for this environment. The previous subdomain stops resolving as soon as the change is applied. Custom domains attached to this environment are unaffected."
+    >
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <Label htmlFor="subdomain-input">Subdomain</Label>
+          <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch">
+            <div className="flex flex-1 items-stretch overflow-hidden rounded-md border border-input bg-background focus-within:ring-2 focus-within:ring-ring">
+              <Input
+                id="subdomain-input"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder="e.g., myapp"
+                className="rounded-none border-0 focus-visible:ring-0 focus-visible:ring-offset-0"
+                maxLength={63}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {previewDomain && (
+                <span className="flex items-center whitespace-nowrap border-l bg-muted/40 px-3 text-sm text-muted-foreground">
+                  .{previewDomain}
+                </span>
+              )}
             </div>
-            {!isValid && trimmed.length > 0 && (
-              <p className="text-xs text-destructive mt-2">
-                Use 1–63 lowercase letters, digits, or hyphens. Cannot start or
-                end with a hyphen.
-              </p>
-            )}
-            {isValid && (
-              <p className="text-xs text-muted-foreground mt-2">
-                DNS-safe slug: lowercase letters, digits, and hyphens (max 63
-                chars). Casing is normalized server-side.
-              </p>
-            )}
+            <Button
+              type="submit"
+              disabled={!isValid || isUnchanged || mutation.isPending}
+              className="sm:w-auto"
+            >
+              {mutation.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Save
+            </Button>
           </div>
-        </form>
-      </CardContent>
-    </Card>
+          {!isValid && trimmed.length > 0 && (
+            <p className="mt-2 text-xs text-destructive">
+              Use 1–63 lowercase letters, digits, or hyphens. Cannot start or
+              end with a hyphen.
+            </p>
+          )}
+          {isValid && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              DNS-safe slug: lowercase letters, digits, and hyphens (max 63
+              chars). Casing is normalized server-side.
+            </p>
+          )}
+        </div>
+      </form>
+    </SettingsSection>
   )
 }
 
@@ -230,42 +214,34 @@ function PurgeAssetCacheCard({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-sm font-medium">Asset Cache</CardTitle>
-        <CardDescription>
-          Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback.
-          Purge if you need to force-clear cached assets for this environment.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <AlertDialog open={showConfirm} onOpenChange={setShowConfirm}>
-          <AlertDialogTrigger asChild>
-            <Button variant="outline" size="sm">
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Purge Asset Cache
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogTitle>Purge Asset Cache</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will delete all cached static assets for this environment.
-              In-flight users with old HTML may see broken pages until they refresh.
-              Orphaned blobs are cleaned up automatically overnight.
-            </AlertDialogDescription>
-            <div className="flex justify-end gap-3 mt-4">
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={handlePurge}
-                disabled={isPurging}
-              >
-                {isPurging ? 'Purging...' : 'Purge Cache'}
-              </AlertDialogAction>
-            </div>
-          </AlertDialogContent>
-        </AlertDialog>
-      </CardContent>
-    </Card>
+    <SettingsSection
+      title="Asset Cache"
+      icon={HardDrive}
+      description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
+    >
+      <AlertDialog open={showConfirm} onOpenChange={setShowConfirm}>
+        <AlertDialogTrigger asChild>
+          <Button variant="outline" size="sm">
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Purge Asset Cache
+          </Button>
+        </AlertDialogTrigger>
+        <AlertDialogContent>
+          <AlertDialogTitle>Purge Asset Cache</AlertDialogTitle>
+          <AlertDialogDescription>
+            This will delete all cached static assets for this environment.
+            In-flight users with old HTML may see broken pages until they
+            refresh. Orphaned blobs are cleaned up automatically overnight.
+          </AlertDialogDescription>
+          <div className="flex justify-end gap-3 mt-4">
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handlePurge} disabled={isPurging}>
+              {isPurging ? 'Purging...' : 'Purge Cache'}
+            </AlertDialogAction>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+    </SettingsSection>
   )
 }
 
@@ -364,6 +340,10 @@ export function EnvironmentDetail({
       />
 
       <SubdomainCard
+        key={`${environment.id}:${
+          (environment as EnvironmentResponse & { subdomain?: string })
+            .subdomain ?? environment.main_url
+        }`}
         project={project}
         environment={environment}
         onUpdate={() => {
@@ -372,68 +352,72 @@ export function EnvironmentDetail({
         }}
       />
 
-      <PurgeAssetCacheCard projectId={project.id} environmentId={environmentId} />
+      <PurgeAssetCacheCard
+        projectId={project.id}
+        environmentId={environmentId}
+      />
 
-      <Card className="border-destructive/50 bg-destructive/5">
-        <CardHeader>
-          <CardTitle className="text-destructive">Danger Zone</CardTitle>
-          <CardDescription>
-            Irreversible and destructive actions
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            <p className="text-sm text-muted-foreground">
-              Deleting this environment will remove all configurations,
-              deployments, and data associated with it. This action cannot be
-              undone.
+      <SettingsSection
+        title="Danger Zone"
+        icon={Trash2}
+        description="Irreversible and destructive actions"
+        className="border-destructive/50 bg-destructive/5"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Deleting this environment will remove all configurations,
+            deployments, and data associated with it. This action cannot be
+            undone.
+          </p>
+          {isProduction && (
+            <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
+              ℹ️ The production environment cannot be deleted to prevent
+              accidental data loss.
             </p>
-            {isProduction && (
-              <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
-                ℹ️ The production environment cannot be deleted to prevent
-                accidental data loss.
-              </p>
-            )}
-            <AlertDialog
-              open={showDeleteConfirm}
-              onOpenChange={setShowDeleteConfirm}
-            >
-              <AlertDialogTrigger asChild>
-                <Button variant="destructive" disabled={isProduction} className="w-full sm:w-auto">
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  Delete Environment
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogTitle>Delete Environment</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Are you sure you want to delete the &quot;{environment.name}
-                  &quot; environment? This action cannot be undone.
-                </AlertDialogDescription>
-                <div className="flex justify-end gap-3 mt-6">
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={async () => {
-                      await removeEnvironmentMutation.mutateAsync({
-                        path: {
-                          project_id: project.id || 0,
-                          env_id: Number(environmentId),
-                        },
-                      })
-                    }}
-                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                    disabled={removeEnvironmentMutation.isPending}
-                  >
-                    {removeEnvironmentMutation.isPending
-                      ? 'Deleting...'
-                      : 'Delete Environment'}
-                  </AlertDialogAction>
-                </div>
-              </AlertDialogContent>
-            </AlertDialog>
-          </div>
-        </CardContent>
-      </Card>
+          )}
+          <AlertDialog
+            open={showDeleteConfirm}
+            onOpenChange={setShowDeleteConfirm}
+          >
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="destructive"
+                disabled={isProduction}
+                className="w-full sm:w-auto"
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Delete Environment
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogTitle>Delete Environment</AlertDialogTitle>
+              <AlertDialogDescription>
+                Are you sure you want to delete the &quot;{environment.name}
+                &quot; environment? This action cannot be undone.
+              </AlertDialogDescription>
+              <div className="flex justify-end gap-3 mt-6">
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={async () => {
+                    await removeEnvironmentMutation.mutateAsync({
+                      path: {
+                        project_id: project.id || 0,
+                        env_id: Number(environmentId),
+                      },
+                    })
+                  }}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  disabled={removeEnvironmentMutation.isPending}
+                >
+                  {removeEnvironmentMutation.isPending
+                    ? 'Deleting...'
+                    : 'Delete Environment'}
+                </AlertDialogAction>
+              </div>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </SettingsSection>
     </div>
   )
 }

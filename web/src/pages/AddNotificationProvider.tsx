@@ -8,6 +8,7 @@ import {
   createWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import {
   Card,
   CardContent,
@@ -391,8 +392,10 @@ export function AddNotificationProvider() {
                         <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-muted">
                           {provider.icon}
                         </div>
-                        {provider.available && (
+                        {provider.available ? (
                           <ArrowRight className="h-5 w-5 text-muted-foreground" />
+                        ) : (
+                          <Badge variant="secondary">Coming soon</Badge>
                         )}
                       </div>
                     </CardHeader>

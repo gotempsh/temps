@@ -71,7 +71,7 @@ export function CreateBackupSchedule() {
     max_runtime_hours: '',
   })
   const [selectedPreset, setSelectedPreset] = useState<string>(
-    scheduleOptions[1].value,
+    scheduleOptions[1].value
   )
   const [customCron, setCustomCron] = useState('')
   // 'all' (default) means the schedule backs up every database — including
@@ -144,7 +144,7 @@ export function CreateBackupSchedule() {
 
     if (backupMode === 'specific' && selectedServiceIds.length === 0) {
       toast.error(
-        'Select at least one database, or switch back to "All databases."',
+        'Select at least one database, or switch back to "All databases."'
       )
       return
     }
@@ -161,14 +161,13 @@ export function CreateBackupSchedule() {
         max_runtime_secs,
         target_all_services: backupMode === 'all',
         include_control_plane: includeControlPlane,
-        service_ids:
-          backupMode === 'specific' ? selectedServiceIds : [],
+        service_ids: backupMode === 'specific' ? selectedServiceIds : [],
       },
     })
   }
 
   return (
-    <div className="space-y-6 max-w-3xl mx-auto p-4 md:p-6">
+    <div className="mx-auto max-w-4xl space-y-6 p-4 md:p-6">
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="sm" asChild>
           <Link to={`/backups/s3-sources/${id}`}>
@@ -181,33 +180,50 @@ export function CreateBackupSchedule() {
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">New backup schedule</h1>
         <p className="text-sm text-muted-foreground sm:text-base">
-          Run this S3 source's backup on a recurring cron schedule.
+          Run this S3 source&apos;s backup on a recurring cron schedule.
         </p>
       </div>
 
       <div className="space-y-6">
-        <div className="grid gap-2">
-          <Label htmlFor="name">Schedule Name</Label>
-            <Input
-              id="name"
-              placeholder="Daily Backup"
-              value={form.name ?? ''}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
+        <section className="space-y-5 rounded-lg border p-5 sm:p-6">
+          <div>
+            <h2 className="font-semibold">Schedule details</h2>
+            <p className="text-sm text-muted-foreground">
+              Give this recurring backup a recognizable name.
+            </p>
           </div>
+          <div className="grid gap-5 md:grid-cols-2">
+            <div className="grid gap-2">
+              <Label htmlFor="name">Schedule Name</Label>
+              <Input
+                id="name"
+                placeholder="Daily Backup"
+                value={form.name ?? ''}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="description">Description (Optional)</Label>
-            <Input
-              id="description"
-              placeholder="Daily backup at midnight"
-              value={form.description ?? ''}
-              onChange={(e) =>
-                setForm({ ...form, description: e.target.value })
-              }
-            />
+            <div className="grid gap-2">
+              <Label htmlFor="description">Description (Optional)</Label>
+              <Input
+                id="description"
+                placeholder="Daily backup at midnight"
+                value={form.description ?? ''}
+                onChange={(e) =>
+                  setForm({ ...form, description: e.target.value })
+                }
+              />
+            </div>
           </div>
+        </section>
 
+        <section className="space-y-5 rounded-lg border p-5 sm:p-6">
+          <div>
+            <h2 className="font-semibold">Timing and retention</h2>
+            <p className="text-sm text-muted-foreground">
+              Choose when backups run and how long they are kept.
+            </p>
+          </div>
           <div className="grid gap-2">
             <Label htmlFor="backup-type">Backup Type</Label>
             <Select
@@ -265,8 +281,8 @@ export function CreateBackupSchedule() {
                     className="mt-1"
                   />
                   <p className="text-xs text-muted-foreground mt-1">
-                    Format: second minute hour day month weekday. Use names
-                    such as SUN for weekdays.
+                    Format: second minute hour day month weekday. Use names such
+                    as SUN for weekdays.
                   </p>
                 </div>
               )}
@@ -288,7 +304,15 @@ export function CreateBackupSchedule() {
               }
             />
           </div>
+        </section>
 
+        <section className="space-y-5 rounded-lg border p-5 sm:p-6">
+          <div>
+            <h2 className="font-semibold">Backup coverage</h2>
+            <p className="text-sm text-muted-foreground">
+              Select the databases included in every run.
+            </p>
+          </div>
           <div className="grid gap-2">
             <Label>Backup targets</Label>
             <RadioGroup
@@ -306,8 +330,8 @@ export function CreateBackupSchedule() {
                     All databases (recommended)
                   </Label>
                   <p className="text-sm text-muted-foreground">
-                    Back up every database currently on the host — and any
-                    new database you create later, automatically.
+                    Back up every database currently on the host — and any new
+                    database you create later, automatically.
                   </p>
                 </div>
               </div>
@@ -345,10 +369,9 @@ export function CreateBackupSchedule() {
                   Also back up the Temps control plane
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  Includes Temps's own database (users, projects, service
-                  configs, audit logs, error groups). Recommended unless you
-                  use Temps purely as a backup orchestrator for external
-                  databases.
+                  Includes Temps&apos;s own database (users, projects, service
+                  configs, audit logs, error groups). Recommended unless you use
+                  Temps purely as a backup orchestrator for external databases.
                 </p>
               </div>
               <Switch
@@ -378,21 +401,19 @@ export function CreateBackupSchedule() {
               }}
             />
             <p className="text-xs text-muted-foreground">
-              Wall-clock ceiling for one backup attempt. Leave empty to use
-              the engine default (24h for Postgres, 4h for Redis/MongoDB, 12h
-              for S3 mirror).
+              Wall-clock ceiling for one backup attempt. Leave empty to use the
+              engine default (24h for Postgres, 4h for Redis/MongoDB, 12h for S3
+              mirror).
             </p>
           </div>
+        </section>
       </div>
 
       <div className="flex justify-end gap-2">
         <Button variant="outline" asChild>
           <Link to={`/backups/s3-sources/${id}`}>Cancel</Link>
         </Button>
-        <Button
-          onClick={handleSubmit}
-          disabled={createMutation.isPending}
-        >
+        <Button onClick={handleSubmit} disabled={createMutation.isPending}>
           {createMutation.isPending ? 'Creating…' : 'Create schedule'}
         </Button>
       </div>

@@ -30,6 +30,7 @@ import {
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
+import { ContainerEmptyState } from './ContainerEmptyState'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -65,18 +66,7 @@ export function ContainerList({
   }
 
   if (containers.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center h-72 rounded-lg border border-neutral-950/10 bg-neutral-50 p-6 dark:border-white/10 dark:bg-white/5">
-        <div className="text-center space-y-1">
-          <p className="text-sm font-semibold text-neutral-900 dark:text-white">
-            No containers yet
-          </p>
-          <p className="text-sm text-neutral-600 dark:text-neutral-400">
-            This environment doesn&apos;t have any running containers
-          </p>
-        </div>
-      </div>
-    )
+    return <ContainerEmptyState projectSlug={project.slug} />
   }
 
   return (
