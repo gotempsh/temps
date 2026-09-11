@@ -5,7 +5,11 @@ export const PROJECT_PRIMARY_ROUTES = [
   'project',
   'deployments',
   'environments',
-  'observe',
+  'logs',
+  'errors',
+  'traces',
+  'analytics',
+  'monitoring',
   'storage',
   'security',
   'settings',
@@ -19,38 +23,46 @@ export interface ProjectSectionLink {
 export const PROJECT_SECTION_LINKS: Partial<
   Record<ProjectSection, ProjectSectionLink[]>
 > = {
-  observe: [
-    { title: 'Logs', url: 'runtime' },
-    { title: 'Errors', url: 'errors' },
+  project: [
+    { title: 'Overview', url: 'project' },
+    { title: 'Activity', url: 'observe' },
+  ],
+  logs: [
+    { title: 'Application logs', url: 'runtime' },
+    { title: 'Request logs', url: 'request-logs', aliases: ['logs'] },
+    { title: 'Telemetry logs', url: 'telemetry-logs' },
+  ],
+  errors: [{ title: 'Issues', url: 'errors' }],
+  traces: [
     { title: 'Traces', url: 'traces' },
+    { title: 'AI traces', url: 'ai-gateway?tab=activity' },
+  ],
+  monitoring: [
     { title: 'Metrics', url: 'metrics', aliases: ['dashboards'] },
     { title: 'Uptime', url: 'monitors' },
-    { title: 'Analytics', url: 'analytics' },
+    { title: 'Alert rules', url: 'errors/alert-rules' },
+  ],
+  analytics: [
+    { title: 'Overview', url: 'analytics' },
     { title: 'Visitors', url: 'analytics/visitors' },
     { title: 'Pages', url: 'analytics/pages' },
     { title: 'Sessions', url: 'analytics/replays' },
     { title: 'Funnels', url: 'analytics/funnels' },
     { title: 'Web performance', url: 'speed' },
-    { title: 'Request logs', url: 'request-logs', aliases: ['logs'] },
-    { title: 'Telemetry logs', url: 'telemetry-logs' },
-    { title: 'Activity', url: 'observe' },
-    { title: 'AI traces', url: 'ai-gateway?tab=activity' },
     { title: 'AI visitors', url: 'analytics/ai-agents' },
     { title: 'API traffic', url: 'analytics/api-traffic' },
     { title: 'AI crawlers', url: 'ai-crawlers' },
     { title: 'Revenue', url: 'revenue' },
-    { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   storage: [
-    { title: 'Databases & services', url: 'storage', aliases: ['databases'] },
+    { title: 'Databases', url: 'storage', aliases: ['databases'] },
     { title: 'Key-value store', url: 'services/kv' },
     { title: 'Blob storage', url: 'services/blob' },
-    { title: 'Storage overview', url: 'services' },
   ],
   security: [
-    { title: 'Scans & vulnerabilities', url: 'security' },
     { title: 'Protection', url: 'settings/security' },
     { title: 'Access', url: 'settings/access' },
+    { title: 'Scans', url: 'security' },
   ],
   settings: [
     {
@@ -72,7 +84,7 @@ export const PROJECT_SECTION_LINKS: Partial<
     },
     { title: 'Domains', url: 'domains', aliases: ['settings/domains'] },
     {
-      title: 'Variables & secrets',
+      title: 'Variables',
       url: 'settings/variables',
       aliases: [
         'environment-variables',
@@ -103,7 +115,16 @@ export function resolveProjectPrimaryRoute(
   if (!route || route === 'project') return 'project'
   if (matches(route, 'deployments') || route === 'drop') return 'deployments'
   if (matches(route, 'environments')) return 'environments'
-  for (const section of ['security', 'observe', 'storage'] as const) {
+  for (const section of [
+    'security',
+    'monitoring',
+    'logs',
+    'errors',
+    'traces',
+    'analytics',
+    'project',
+    'storage',
+  ] as const) {
     if (
       PROJECT_SECTION_LINKS[section]?.some((link) =>
         [link.url.split('?')[0], ...(link.aliases ?? [])].some((prefix) =>

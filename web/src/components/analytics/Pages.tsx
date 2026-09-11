@@ -18,8 +18,9 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { FileText, RefreshCw } from 'lucide-react'
-import React, { useMemo } from 'react'
+import { FileText } from 'lucide-react'
+import { useMemo } from 'react'
+import { Link } from 'react-router'
 import {
   InsightsPanel,
   InsightsToggleButton,
@@ -42,7 +43,6 @@ export function Pages({
   endDate,
   environment,
 }: PagesProps) {
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   // Fetch page paths
@@ -94,12 +94,6 @@ export function Pages({
     return map
   }, [sparklines])
 
-  const handleRefresh = React.useCallback(async () => {
-    setIsRefreshing(true)
-    await refetch()
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [refetch])
-
   const insights = useMemo(
     () => derivePagesInsights(pagePaths ?? []),
     [pagePaths]
@@ -130,11 +124,7 @@ export function Pages({
             <p className="text-sm text-muted-foreground mb-2">
               Failed to load page paths
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => window.location.reload()}
-            >
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
               Try again
             </Button>
           </div>
@@ -174,18 +164,6 @@ export function Pages({
                 open={insightsOpen}
                 onToggle={setInsightsOpen}
               />
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleRefresh}
-                disabled={isLoading || isRefreshing}
-                className="gap-2"
-              >
-                <RefreshCw
-                  className={`h-4 w-4 ${isLoading || isRefreshing ? 'animate-spin' : ''}`}
-                />
-                Refresh
-              </Button>
             </div>
           </div>
         </CardHeader>
@@ -225,6 +203,11 @@ export function Pages({
                 <p className="text-sm text-muted-foreground mt-1">
                   Page data will appear once users visit your application
                 </p>
+                <Button asChild variant="outline" size="sm" className="mt-4">
+                  <Link to={`/projects/${project.slug}/analytics/setup`}>
+                    Check analytics setup
+                  </Link>
+                </Button>
               </div>
             </div>
           ) : (
@@ -236,6 +219,8 @@ export function Pages({
                   sessions={pageData.session_count || 0}
                   avgTime={pageData.avg_time_seconds || 0}
                   project={project}
+                  startDate={startDate}
+                  endDate={endDate}
                   sparkline={sparklinesByPath.get(pageData.page_path)}
                 />
               ))}

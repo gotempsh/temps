@@ -125,16 +125,43 @@ export function AnalyticsMetrics({
     )
 
   return (
-    <MetricSummary
+    <AnalyticsSummary
       loading={isLoading}
+      visitors={uniqueVisitors}
+      sessions={sessionsQuery.data?.count ?? 0}
+      pages={pathsQuery.data?.count ?? 0}
+      returningPercentage={returningPercentage}
+    />
+  )
+}
+
+export function AnalyticsSummary({
+  loading,
+  visitors,
+  sessions,
+  pages,
+  returningPercentage,
+}: {
+  loading?: boolean
+  visitors: number
+  sessions: number
+  pages: number
+  returningPercentage?: number
+}) {
+  return (
+    <MetricSummary
+      loading={loading}
       metrics={[
         {
           label: 'Visitors',
-          value: uniqueVisitors,
-          hint: `${returningPercentage}% returning`,
+          value: visitors,
+          hint:
+            returningPercentage == null
+              ? undefined
+              : `${returningPercentage}% returning`,
         },
-        { label: 'Sessions', value: sessionsQuery.data?.count ?? 0 },
-        { label: 'Pages', value: pathsQuery.data?.count ?? 0 },
+        { label: 'Sessions', value: sessions },
+        { label: 'Pages', value: pages },
       ]}
     />
   )

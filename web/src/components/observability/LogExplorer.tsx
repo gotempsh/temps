@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { GlobalLogLine } from '@/api/client/types.gen'
@@ -453,7 +454,10 @@ export function LogExplorer({
             <>
               <h3 className="mb-2 text-xs font-semibold">Structured fields</h3>
               <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs">
-                {JSON.stringify(line.fields, null, 2)}
+                <HighlightedCode
+                  code={JSON.stringify(line.fields, null, 2)}
+                  language={'json'}
+                />
               </pre>
             </>
           )}

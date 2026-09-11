@@ -75,9 +75,10 @@ export function PagesChart({
 
   const sortedPages = React.useMemo(() => {
     if (!data) return []
-    const total = data.items.reduce((sum, item) => sum + item.count, 0)
+    const total = data.total
     return [...data.items]
       .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
       .map((item) => ({
         page: item.value || '/',
         visitors: item.count,
@@ -161,7 +162,7 @@ export function PagesChart({
               ),
               facts: [
                 { label: 'Visitors', value: page.visitors.toLocaleString() },
-                { label: 'Share of top pages', value: `${page.percentage}%` },
+                { label: 'Share', value: `${page.percentage}%` },
               ],
             }))}
           />

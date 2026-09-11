@@ -538,7 +538,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-cpu_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      cpuData.filter((point) =>
+                        Number.isFinite(point[`cpu_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />
@@ -614,7 +620,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-mem_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      memData.filter((point) =>
+                        Number.isFinite(point[`mem_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />
@@ -690,7 +702,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-rx_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      netData.filter((point) =>
+                        Number.isFinite(point[`rx_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />,
@@ -702,7 +720,13 @@ export function EnvironmentMetricsCharts({
                     stroke={`var(--color-tx_${series.key})`}
                     strokeWidth={2}
                     strokeDasharray="4 3"
-                    dot={false}
+                    dot={
+                      netData.filter((point) =>
+                        Number.isFinite(point[`tx_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />,

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+
 import {
   listAuditLogsOptions,
   listUsersOptions,
@@ -397,15 +399,11 @@ export function AuditLogs() {
   }
 
   return (
-    <div className="space-y-4">
-      {/* Page header */}
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Audit Logs</h1>
-        <p className="text-sm text-muted-foreground">
-          Activity across the platform — authentication, project changes,
-          skills, MCP servers, and more.
-        </p>
-      </div>
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Audit Logs"
+        description="Activity across the platform — authentication, project changes, skills, MCP servers, and more."
+      />
 
       {/* Filter bar */}
       <Card>
@@ -549,6 +547,6 @@ export function AuditLogs() {
           </div>
         </div>
       )}
-    </div>
+    </PageContainer>
   )
 }

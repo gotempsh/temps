@@ -20,7 +20,7 @@ export function CreateServiceButton({
   open,
   onOpenChange,
   projectId = null,
-  label = 'Create Service',
+  label = 'Create database',
 }: {
   projectId?: number | null
   label?: string

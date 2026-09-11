@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
+import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
+import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
@@ -1397,21 +1400,11 @@ export function UsageAnalytics() {
           {/* Filter row — hidden until the user opens it, or while a filter is active */}
           {(recentFiltersOpen || recentHasFilters) && (
             <div className="flex flex-col gap-2 rounded-lg border bg-muted/30 p-3 sm:flex-row sm:flex-wrap sm:items-center">
-              <Select value={recentProvider} onValueChange={setRecentProvider}>
-                <SelectTrigger className="w-full sm:w-[160px]">
-                  <SelectValue placeholder="Provider" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All providers</SelectItem>
-                  {/* Source the full supported-provider set, not the time-windowed
-                      analytics query — the recent list isn't bound to that window. */}
-                  {AI_PROVIDERS.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <AiProviderSelect
+                value={recentProvider}
+                onValueChange={setRecentProvider}
+                providers={AI_PROVIDERS}
+              />
               <Select value={recentStatus} onValueChange={setRecentStatus}>
                 <SelectTrigger className="w-full sm:w-[150px]">
                   <SelectValue placeholder="Status" />
@@ -2173,7 +2166,10 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
                   <span className="text-amber-500">{tc.function?.name}</span>
                   {tc.function?.arguments && (
                     <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
-                      {tc.function.arguments}
+                      <HighlightedCode
+                        code={tc.function.arguments}
+                        language="json"
+                      />
                     </pre>
                   )}
                 </div>
@@ -2192,9 +2188,14 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
               )}
               {block.input && (
                 <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
-                  {typeof block.input === 'string'
-                    ? block.input
-                    : JSON.stringify(block.input, null, 2)}
+                  <HighlightedCode
+                    code={
+                      typeof block.input === 'string'
+                        ? block.input
+                        : JSON.stringify(block.input, null, 2)
+                    }
+                    language="json"
+                  />
                 </pre>
               )}
             </div>
@@ -2298,13 +2299,16 @@ function FullConversationView({
                 </div>
                 {block?.text && (
                   <pre className="whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground mt-1">
-                    {(() => {
-                      try {
-                        return JSON.stringify(JSON.parse(block.text), null, 2)
-                      } catch {
-                        return block.text
-                      }
-                    })()}
+                    <HighlightedCode
+                      code={(() => {
+                        try {
+                          return JSON.stringify(JSON.parse(block.text), null, 2)
+                        } catch {
+                          return block.text
+                        }
+                      })()}
+                      language="json"
+                    />
                   </pre>
                 )}
               </div>
@@ -2336,7 +2340,7 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
       </CollapsibleTrigger>
       <CollapsibleContent>
         <pre className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto">
-          {formatted}
+          <HighlightedCode code={formatted} language="json" />
         </pre>
       </CollapsibleContent>
     </Collapsible>
@@ -3408,24 +3412,12 @@ export function AgentActivity() {
               </SelectContent>
             </Select>
           )}
-          <Select
+          <AiProviderSelect
             value={systemFilter || 'all'}
-            onValueChange={(v) => setSystemFilter(v === 'all' ? '' : v)}
-          >
-            <SelectTrigger className="w-full sm:w-[150px]">
-              <SelectValue placeholder="All providers" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All providers</SelectItem>
-              <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="anthropic">Anthropic</SelectItem>
-              <SelectItem value="xai">xAI</SelectItem>
-              <SelectItem value="gemini">Google Gemini</SelectItem>
-              <SelectItem value="openrouter">OpenRouter</SelectItem>
-              <SelectItem value="mistral">Mistral</SelectItem>
-              <SelectItem value="deepseek">DeepSeek</SelectItem>
-            </SelectContent>
-          </Select>
+            onValueChange={(value) =>
+              setSystemFilter(value === 'all' ? '' : value)
+            }
+          />
           <div className="flex gap-1">
             <AiTimeRange
               range={timeRange}
@@ -3450,11 +3442,7 @@ export function AgentActivity() {
           <Skeleton className="h-16 w-full" />
         </div>
       ) : traces.length === 0 ? (
-        <EmptyState
-          icon={Bot}
-          title="No AI traces found"
-          description="Client applications need to emit OTel spans with gen_ai.* semantic conventions. Point your OTEL_EXPORTER_OTLP_ENDPOINT to this instance."
-        />
+        <AiActivityEmptyState setupHref="/ai-gateway/setup" />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -3697,24 +3685,12 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">AI Activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Select
+          <AiProviderSelect
             value={systemFilter || 'all'}
-            onValueChange={(v) => setSystemFilter(v === 'all' ? '' : v)}
-          >
-            <SelectTrigger className="w-full sm:w-[150px]">
-              <SelectValue placeholder="All providers" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All providers</SelectItem>
-              <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="anthropic">Anthropic</SelectItem>
-              <SelectItem value="xai">xAI</SelectItem>
-              <SelectItem value="gemini">Google Gemini</SelectItem>
-              <SelectItem value="openrouter">OpenRouter</SelectItem>
-              <SelectItem value="mistral">Mistral</SelectItem>
-              <SelectItem value="deepseek">DeepSeek</SelectItem>
-            </SelectContent>
-          </Select>
+            onValueChange={(value) =>
+              setSystemFilter(value === 'all' ? '' : value)
+            }
+          />
           <div className="flex gap-1">
             <AiTimeRange
               range={timeRange}
@@ -3732,11 +3708,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
           <Skeleton className="h-16 w-full" />
         </div>
       ) : traces.length === 0 ? (
-        <EmptyState
-          icon={Bot}
-          title="No AI traces found"
-          description="Applications need to emit OTel spans with gen_ai.* semantic conventions. Point your OTEL_EXPORTER_OTLP_ENDPOINT to this instance."
-        />
+        <AiActivityEmptyState setupHref="../traces#traces-setup" />
       ) : (
         <Card>
           <CardContent className="p-0">

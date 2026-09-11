@@ -185,7 +185,7 @@ function ProjectAlerts({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save project alerts
           </Button>
         </div>
       </form>
@@ -299,7 +299,7 @@ function DomainAlerts({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save domain alerts
           </Button>
         </div>
       </form>
@@ -404,7 +404,7 @@ function BackupAlerts({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save backup alerts
           </Button>
         </div>
       </form>
@@ -471,7 +471,7 @@ function RouteAlerts({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save route alerts
           </Button>
         </div>
       </form>
@@ -617,7 +617,7 @@ function NotificationSettings({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save preferences
           </Button>
         </div>
       </form>
@@ -842,7 +842,7 @@ function WeeklyDigest({
 
         <div className="flex justify-end">
           <Button disabled={!form.formState.isDirty} type="submit">
-            Save Changes
+            Save digest
           </Button>
         </div>
       </form>

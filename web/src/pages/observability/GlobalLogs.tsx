@@ -8,7 +8,7 @@ import { useQuery } from '@tanstack/react-query'
 import { searchGlobalLogs } from '@/api/client/sdk.gen'
 import type { GlobalLogSource, LogLevel } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
-import { PageContainer } from '@/components/layout/PageContainer'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
@@ -98,14 +98,11 @@ export default function GlobalLogs() {
       </QueryContent>
     ) : undefined
   return (
-    <PageContainer className="py-4 lg:px-6" innerClassName="space-y-4">
-      <div className="flex flex-wrap items-baseline gap-3">
-        <h1 className="text-xl font-semibold tracking-tight">Logs</h1>
-        <span className="text-xs text-muted-foreground">
-          {view.projectId ? 'Selected project' : 'All projects'} · application
-          and database logs
-        </span>
-      </div>
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Logs"
+        description={`${view.projectId ? 'Selected project' : 'All projects'} · application and database logs`}
+      />
       <LogExplorer
         lines={lines}
         onFilter={filter}

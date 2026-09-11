@@ -13,12 +13,16 @@ import {
 } from '@/components/project/project-tools'
 
 describe('flat project navigation', () => {
-  test('has exactly seven sections and gives security its own home', () => {
+  test('has direct observability sections and gives security its own home', () => {
     expect(PROJECT_PRIMARY_ROUTES).toEqual([
       'project',
       'deployments',
       'environments',
-      'observe',
+      'logs',
+      'errors',
+      'traces',
+      'analytics',
+      'monitoring',
       'storage',
       'security',
       'settings',
@@ -33,18 +37,20 @@ describe('flat project navigation', () => {
       expect(resolveProjectPrimaryRoute(path)).toBe('security')
   })
   test('keeps deep links in their owning section', () => {
-    for (const path of [
-      'analytics/pages',
-      'analytics/visitors/42',
-      'errors/12',
-      'errors/alert-rules/new',
-      'traces/abc',
-      'runtime',
-      'request-logs/42',
-      'telemetry-logs',
-      'dashboards/custom',
-    ])
-      expect(resolveProjectPrimaryRoute(path)).toBe('observe')
+    for (const [path, section] of Object.entries({
+      'analytics/pages': 'analytics',
+      'analytics/visitors/42': 'analytics',
+      'errors/12': 'errors',
+      'errors/alert-rules/new': 'monitoring',
+      'traces/abc': 'traces',
+      'ai-gateway?tab=activity': 'traces',
+      runtime: 'logs',
+      'request-logs/42': 'logs',
+      'telemetry-logs': 'logs',
+      'dashboards/custom': 'monitoring',
+      observe: 'project',
+    } as const))
+      expect(resolveProjectPrimaryRoute(path)).toBe(section)
     expect(resolveProjectPrimaryRoute('deployments/99')).toBe('deployments')
     expect(resolveProjectPrimaryRoute('environments/1')).toBe('environments')
     expect(resolveProjectPrimaryRoute('services/blob')).toBe('storage')
@@ -53,10 +59,10 @@ describe('flat project navigation', () => {
   })
   test('selects the most specific sibling and respects legacy build query links', () => {
     expect(
-      resolveProjectSectionLink('observe', 'errors/alert-rules/new', '')
+      resolveProjectSectionLink('monitoring', 'errors/alert-rules/new', '')
     ).toBe('errors/alert-rules')
     expect(
-      resolveProjectSectionLink('observe', 'analytics/visitors/42', '')
+      resolveProjectSectionLink('analytics', 'analytics/visitors/42', '')
     ).toBe('analytics/visitors')
     for (const route of ['build', 'settings/build']) {
       for (const tab of ['source', 'build', 'deploy', 'previews'])

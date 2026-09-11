@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Input } from '@/components/ui/input'
 import { DateTimeRange } from '@/components/ui/date-time-range'
@@ -67,63 +66,15 @@ export function ProjectScope({
   view: GlobalView
   disabled?: boolean
 }) {
-  const [catalogPage, setCatalogPage] = useState(1)
-  const projects = useQuery(
-    getProjectsOptions({ query: { page: catalogPage, per_page: 100 } })
-  )
-  const options: [string, string][] = [
-    ['all', 'All projects'],
-    ...(projects.data?.projects ?? []).map(
-      (project) => [String(project.id), project.name] as [string, string]
-    ),
-  ]
-  if (view.projectId && !options.some(([id]) => id === String(view.projectId)))
-    options.push([String(view.projectId), `Project #${view.projectId}`])
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <FilterSelect
-        label="Project scope"
-        disabled={disabled}
-        value={disabled ? 'all' : String(view.projectId ?? 'all')}
-        onChange={(value) =>
-          view.patch({ project_id: value === 'all' ? undefined : value })
-        }
-        options={options}
-      />
-      {(projects.data?.total ?? 0) > 100 && (
-        <div className="flex items-center gap-2 text-xs">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={catalogPage === 1 || projects.isFetching}
-            onClick={() => setCatalogPage((page) => page - 1)}
-          >
-            Previous projects
-          </Button>
-          <span>Project choices {catalogPage}</span>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={
-              catalogPage * 100 >= (projects.data?.total ?? 0) ||
-              projects.isFetching
-            }
-            onClick={() => setCatalogPage((page) => page + 1)}
-          >
-            More projects
-          </Button>
-        </div>
-      )}
-      {projects.isError && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void projects.refetch()}
-        >
-          Retry project choices
-        </Button>
-      )}
-    </div>
+    <ProjectSelect
+      value={disabled ? null : (view.projectId ?? null)}
+      onValueChange={(id) =>
+        view.patch({ project_id: id == null ? undefined : String(id) })
+      }
+      disabled={disabled}
+      className="h-9 sm:w-52"
+    />
   )
 }
 

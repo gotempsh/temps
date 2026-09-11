@@ -1,7 +1,29 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type ReactNode } from 'react'
+import { SettingsSection } from '@/components/ui/settings-section'
+import {
+  Blocks,
+  Bot,
+  Boxes,
+  Braces,
+  CalendarClock,
+  CodeXml,
+  Container,
+  Flag,
+  GitBranch,
+  KeyRound,
+  ListChecks,
+  LockKeyhole,
+  PlugZap,
+  Puzzle,
+  Rocket,
+  Settings2,
+  Sparkles,
+  Webhook,
+} from 'lucide-react'
+import type { ReactNode } from 'react'
+import type { LucideIcon } from 'lucide-react'
 import type { ProjectResponse } from '@/api/client'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { GeneralSettings } from './GeneralSettings'
@@ -43,21 +65,27 @@ export function CombinedProjectSettings({
   refetch: () => void
 }) {
   usePageTitle(`${titles[page]} · ${project.name}`)
-  let sections: { title: string; content: ReactNode }[]
+  let sections: { title: string; icon: LucideIcon; content: ReactNode }[]
   switch (page) {
     case 'general':
       sections = [
         {
           title: 'Project settings',
+          icon: Settings2,
           content: <GeneralSettings project={project} refetch={refetch} />,
         },
-        { title: 'Project setup', content: <ProjectSetup project={project} /> },
+        {
+          title: 'Project setup',
+          icon: ListChecks,
+          content: <ProjectSetup project={project} />,
+        },
       ]
       break
     case 'delivery':
       sections = [
         {
           title: 'Source',
+          icon: CodeXml,
           content: (
             <BuildDeploySettings
               project={project}
@@ -68,10 +96,12 @@ export function CombinedProjectSettings({
         },
         {
           title: 'Repository',
+          icon: GitBranch,
           content: <GitSettings project={project} refetch={refetch} />,
         },
         {
           title: 'Build',
+          icon: Container,
           content: (
             <BuildDeploySettings
               project={project}
@@ -82,6 +112,7 @@ export function CombinedProjectSettings({
         },
         {
           title: 'Deployment',
+          icon: Rocket,
           content: (
             <BuildDeploySettings
               project={project}
@@ -92,6 +123,7 @@ export function CombinedProjectSettings({
         },
         {
           title: 'Previews',
+          icon: Blocks,
           content: (
             <BuildDeploySettings
               project={project}
@@ -102,6 +134,7 @@ export function CombinedProjectSettings({
         },
         {
           title: 'Feature flags',
+          icon: Flag,
           content: <ProjectFeatureFlags project={project} />,
         },
       ]
@@ -110,11 +143,17 @@ export function CombinedProjectSettings({
       sections = [
         {
           title: 'Environment variables',
+          icon: Braces,
           content: <EnvironmentVariablesSettings project={project} />,
         },
-        { title: 'Secrets', content: <SecretsSettings project={project} /> },
+        {
+          title: 'Secrets',
+          icon: LockKeyhole,
+          content: <SecretsSettings project={project} />,
+        },
         {
           title: 'Deployment tokens',
+          icon: KeyRound,
           content: <DeploymentTokensSettings project={project} />,
         },
       ]
@@ -123,22 +162,41 @@ export function CombinedProjectSettings({
       sections = [
         {
           title: 'Agents & runs',
+          icon: Bot,
           content: <AutopilotPage project={project} />,
         },
-        { title: 'Cron jobs', content: <CronJobsSettings project={project} /> },
-        { title: 'Autofixer', content: <AutofixerPage project={project} /> },
+        {
+          title: 'Cron jobs',
+          icon: CalendarClock,
+          content: <CronJobsSettings project={project} />,
+        },
+        {
+          title: 'Autofixer',
+          icon: Sparkles,
+          content: <AutofixerPage project={project} />,
+        },
       ]
       break
     case 'integrations':
       sections = [
-        { title: 'Webhooks', content: <WebhooksSettings project={project} /> },
-        { title: 'Skills', content: <SkillsSettings project={project} /> },
+        {
+          title: 'Webhooks',
+          icon: Webhook,
+          content: <WebhooksSettings project={project} />,
+        },
+        {
+          title: 'Skills',
+          icon: Puzzle,
+          content: <SkillsSettings project={project} />,
+        },
         {
           title: 'MCP servers',
+          icon: PlugZap,
           content: <McpServersSettings project={project} />,
         },
         {
           title: 'Extensions',
+          icon: Boxes,
           content: <ProjectExtensionLinks project={project} />,
         },
       ]
@@ -147,42 +205,16 @@ export function CombinedProjectSettings({
   return (
     <div className="min-w-0 space-y-4">
       <h1 className="text-xl font-semibold tracking-tight">{titles[page]}</h1>
-      {sections.map((section, index) => (
+      {sections.map((section) => (
         <SettingsSection
           key={`${page}-${section.title}`}
           title={section.title}
-          initiallyOpen={index === 0}
+          icon={section.icon}
         >
           {section.content}
         </SettingsSection>
       ))}
     </div>
-  )
-}
-
-function SettingsSection({
-  title,
-  initiallyOpen,
-  children,
-}: {
-  title: string
-  initiallyOpen: boolean
-  children: ReactNode
-}) {
-  const [visited, setVisited] = useState(initiallyOpen)
-  return (
-    <details
-      open={initiallyOpen}
-      onToggle={(event) => {
-        if (event.currentTarget.open) setVisited(true)
-      }}
-      className="rounded-lg border bg-background"
-    >
-      <summary className="cursor-pointer rounded-lg px-4 py-3 text-sm font-medium hover:bg-muted/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring">
-        {title}
-      </summary>
-      {visited && <div className="min-w-0 border-t p-4">{children}</div>}
-    </details>
   )
 }
 

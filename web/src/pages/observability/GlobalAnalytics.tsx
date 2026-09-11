@@ -1,292 +1,311 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { DataSection } from '@/components/data-display/DataSection'
-import { MetricSummary } from '@/components/data-display/MetricSummary'
-import { RankedList } from '@/components/data-display/RankedList'
-import {
-  Tabs,
-  ScrollableTabsList,
-  TabsTrigger,
-  TabsContent,
-} from '@/components/ui/tabs'
-
-import { number } from '@/lib/global-observability'
-import { useGlobalView } from '@/hooks/useGlobalView'
-import { useQuery } from '@tanstack/react-query'
+import { useState, type ReactNode } from 'react'
+import { Button } from '@/components/ui/button'
+import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getGlobalAnalyticsOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
+  AnalyticsTrafficChart,
+  type AnalyticsMetric,
+} from '@/components/analytics/overview/AnalyticsTrafficChart'
+import { AnalyticsSummary } from '@/components/analytics/overview/AnalyticsMetrics'
+import {
+  AnalyticsDimensionIcon,
+  dimensionLabel,
+} from '@/components/analytics/overview/AnalyticsDimensionIdentity'
+import { AnalyticsBreakdownRow } from '@/components/analytics/overview/AnalyticsBreakdownRow'
+import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+import { DataSection } from '@/components/data-display/DataSection'
+import {
   GlobalPage,
-  GlobalPagination,
   QueryContent,
-  FilterSelect,
+  GlobalPagination,
 } from '@/components/observability/GlobalPage'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
-import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts'
+import { useGlobalView } from '@/hooks/useGlobalView'
+import type { GlobalView } from '@/hooks/useGlobalView'
+import type { AnalyticsFacet } from '@/api/client/types.gen'
+import { EmptyState } from '@/components/ui/empty-state'
+import { BarChart3 } from 'lucide-react'
+import { Link } from 'react-router'
 
+function Breakdown({
+  title,
+  view,
+  facet = 'breakdown',
+  dimension,
+  totalVisitors,
+  expanded = false,
+}: {
+  title: string
+  view: GlobalView
+  facet?: AnalyticsFacet
+  dimension?: string
+  totalVisitors: number
+  expanded?: boolean
+}) {
+  const query = useQuery(
+    getGlobalAnalyticsOptions({
+      query: {
+        project_id: view.projectId,
+        start_date: view.from,
+        end_date: view.to,
+        facet,
+        dimension,
+        sort_by: 'visitors',
+        sort_order: 'desc',
+        per_page: expanded ? OBSERVABILITY_PAGE_SIZE : 10,
+        search: view.search || undefined,
+        page: expanded ? view.page : 1,
+      },
+    })
+  )
+  return (
+    <DataSection
+      title={title}
+      actions={
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() =>
+            view.patch({
+              breakdown: expanded ? undefined : (dimension ?? facet),
+              page: undefined,
+            })
+          }
+        >
+          {expanded ? 'Back to overview' : 'View all'}
+        </Button>
+      }
+    >
+      <QueryContent
+        title={title}
+        loading={query.isPending}
+        error={query.error}
+        empty={!query.data?.rows.length}
+        retry={() => void query.refetch()}
+      >
+        <div className="space-y-1" aria-label={`${title} by visitors`}>
+          {(query.data?.rows ?? []).map((row) => (
+            <AnalyticsBreakdownRow
+              key={`${row.project_id}:${row.key}`}
+              label={dimensionLabel(dimension, row.key)}
+              icon={
+                <AnalyticsDimensionIcon
+                  dimension={facet === 'events' ? 'event' : dimension}
+                  value={row.key}
+                />
+              }
+              count={row.visitors}
+              percentage={
+                totalVisitors > 0 ? (row.visitors / totalVisitors) * 100 : 0
+              }
+              subtitle={
+                view.projectId ? undefined : row.project_name || undefined
+              }
+            />
+          ))}
+        </div>
+        <p className="mt-4 text-xs text-muted-foreground">
+          Share of all visitors in the selected scope
+        </p>
+        {expanded && (
+          <GlobalPagination view={view} total={query.data?.total ?? 0} />
+        )}
+      </QueryContent>
+    </DataSection>
+  )
+}
 export default function GlobalAnalytics() {
   const view = useGlobalView()
-  const sort = ['views', 'visitors', 'sessions'].includes(
-    view.params.get('sort') ?? ''
-  )
-    ? view.params.get('sort')!
-    : 'views'
+  const queryClient = useQueryClient()
+  const [metric, setMetric] = useState<AnalyticsMetric>('visitors')
   const common = {
     project_id: view.projectId,
     start_date: view.from,
     end_date: view.to,
   }
-  const query = useQuery({
-    ...getGlobalAnalyticsOptions({
-      query: {
-        ...common,
-        facet: 'pages',
-        search: view.search || undefined,
-        sort_by: sort,
-        sort_order: 'desc',
-        page: view.page,
-        per_page: OBSERVABILITY_PAGE_SIZE,
-      },
-    }),
-    retry: false,
-  })
-  const traffic = useQuery({
-    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } }),
-    retry: false,
-  })
-  const summary = useQuery({
-    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } }),
-    retry: false,
-  })
+  const summary = useQuery(
+    getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } })
+  )
+  const traffic = useQuery(
+    getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } })
+  )
+  const pages = useQuery(
+    getGlobalAnalyticsOptions({
+      query: { ...common, facet: 'pages', per_page: 1 },
+    })
+  )
   const totals = summary.data?.rows[0]
-  const tableView = view.params.get('chart') === 'table'
+  const grid = (children: ReactNode) => (
+    <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+      {children}
+    </div>
+  )
+  const breakdown = (title: string, dimension: string) => (
+    <Breakdown
+      title={title}
+      dimension={dimension}
+      view={view}
+      totalVisitors={totals?.visitors ?? 0}
+    />
+  )
+  const selectedBreakdown = view.params.get('breakdown')
+  const breakdowns: Record<string, string> = {
+    pages: 'Pages',
+    referrer_hostname: 'Referrers',
+    channel: 'Channels',
+    utm_campaign: 'UTM Campaigns',
+    country: 'Locations',
+    language: 'Languages',
+    browser: 'Browsers',
+    operating_system: 'Operating Systems',
+    device_type: 'Devices',
+    events: 'Events',
+  }
+  const expandedTitle = selectedBreakdown
+    ? breakdowns[selectedBreakdown]
+    : undefined
+  const hasNoAnalytics =
+    !summary.isPending &&
+    !traffic.isPending &&
+    !pages.isPending &&
+    (totals?.visitors ?? 0) === 0 &&
+    (totals?.sessions ?? 0) === 0 &&
+    (pages.data?.total ?? 0) === 0 &&
+    (traffic.data?.rows.length ?? 0) === 0
   return (
     <GlobalPage
       title="Analytics"
-      description="Compare website traffic across your projects."
+      description="Traffic, audience, and engagement across your projects."
       view={view}
-      fetching={query.isFetching || traffic.isFetching || summary.isFetching}
+      fetching={summary.isFetching || traffic.isFetching || pages.isFetching}
       refresh={() => {
-        void query.refetch()
-        void traffic.refetch()
-        void summary.refetch()
+        void queryClient.invalidateQueries({
+          predicate: (query) =>
+            (query.queryKey[0] as { _id?: string })?._id ===
+            'getGlobalAnalytics',
+        })
       }}
-      searchLabel="Search pages or projects"
-      filters={
-        <FilterSelect
-          label="Sort analytics"
-          value={sort}
-          onChange={(sort) => view.patch({ sort })}
-          options={[
-            ['views', 'Most views'],
-            ['visitors', 'Most visitors'],
-            ['sessions', 'Most sessions'],
-          ]}
-        />
-      }
+      searchLabel="Search analytics breakdowns"
     >
-      <QueryContent
-        title="Traffic summary"
-        loading={summary.isPending}
-        error={summary.error}
-        empty={false}
-        retry={() => void summary.refetch()}
-      >
-        <MetricSummary
-          metrics={[
-            { label: 'Page views', value: totals?.views ?? 0 },
-            { label: 'Visitors', value: totals?.visitors ?? 0 },
-            { label: 'Sessions', value: totals?.sessions ?? 0 },
-          ]}
-        />
-      </QueryContent>
-      <Tabs
-        value={tableView ? 'table' : 'chart'}
-        onValueChange={(value) =>
-          view.patch({ chart: value === 'table' ? 'table' : undefined })
-        }
-      >
-        <DataSection
-          title="Page views over time"
-          description="Traffic for the selected scope and time range."
-          actions={
-            <ScrollableTabsList aria-label="Traffic presentation">
-              <TabsTrigger value="chart">Chart</TabsTrigger>
-              <TabsTrigger value="table">Data table</TabsTrigger>
-            </ScrollableTabsList>
+      {expandedTitle && selectedBreakdown ? (
+        <Breakdown
+          key={selectedBreakdown}
+          title={expandedTitle}
+          view={view}
+          facet={
+            selectedBreakdown === 'pages' || selectedBreakdown === 'events'
+              ? selectedBreakdown
+              : 'breakdown'
           }
-        >
+          dimension={
+            selectedBreakdown === 'pages' || selectedBreakdown === 'events'
+              ? undefined
+              : selectedBreakdown
+          }
+          totalVisitors={totals?.visitors ?? 0}
+          expanded
+        />
+      ) : (
+        <>
           <QueryContent
-            title="Traffic"
-            loading={traffic.isPending}
-            error={traffic.error}
-            empty={!traffic.data?.rows.length}
-            retry={() => void traffic.refetch()}
+            title="Analytics metrics"
+            loading={summary.isPending || pages.isPending}
+            error={summary.error || pages.error}
+            empty={false}
+            retry={() => {
+              void summary.refetch()
+              void pages.refetch()
+            }}
           >
-            <TabsContent value={tableView ? 'table' : 'chart'} className="mt-0">
-              {tableView ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Hour (UTC)</TableHead>
-                      <TableHead className="text-right">Views</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {traffic.data?.rows.map((row) => (
-                      <TableRow key={row.key}>
-                        <TableCell>{row.key}</TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {number(row.views)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              ) : (
-                <div
-                  className="h-48 w-full min-w-0 sm:h-72"
-                  aria-label="Page views by hour"
-                >
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={traffic.data?.rows ?? []}>
-                      <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                      <XAxis
-                        dataKey="key"
-                        tickFormatter={(value) =>
-                          new Date(value).toLocaleDateString(undefined, {
-                            month: 'short',
-                            day: 'numeric',
-                            hour: 'numeric',
-                          })
-                        }
-                        minTickGap={60}
-                      />
-                      <YAxis
-                        width={42}
-                        allowDecimals={false}
-                        tickFormatter={(value) =>
-                          new Intl.NumberFormat(undefined, {
-                            notation: 'compact',
-                          }).format(value)
-                        }
-                      />
-                      <Tooltip
-                        labelFormatter={(value) =>
-                          new Date(String(value)).toLocaleString()
-                        }
-                      />
-                      <Area
-                        type="monotone"
-                        dataKey="views"
-                        name="Page views"
-                        stroke="var(--chart-1)"
-                        fill="var(--chart-1)"
-                        fillOpacity={0.12}
-                        isAnimationActive={false}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-            </TabsContent>
-          </QueryContent>
-        </DataSection>
-      </Tabs>
-      <section aria-labelledby="analytics-projects">
-        <h2 id="analytics-projects" className="mb-3 text-base font-semibold">
-          Top pages across projects
-        </h2>
-        <QueryContent
-          title="Analytics"
-          loading={query.isPending}
-          error={query.error}
-          empty={!query.data?.rows.length}
-          retry={() => void query.refetch()}
-        >
-          <div className="md:hidden">
-            <RankedList
-              label="Top pages"
-              items={(query.data?.rows ?? []).map((row) => ({
-                id: `${row.project_id}:${row.key}`,
-                title: row.key,
-                subtitle: row.project_name,
-                facts: [
-                  { label: 'Views', value: number(row.views) },
-                  { label: 'Visitors', value: number(row.visitors) },
-                  { label: 'Sessions', value: number(row.sessions) },
-                  {
-                    label: 'Avg. time',
-                    value:
-                      row.avg_time_seconds == null
-                        ? '—'
-                        : `${number(row.avg_time_seconds)} s`,
-                  },
-                ],
-              }))}
+            <AnalyticsSummary
+              visitors={totals?.visitors ?? 0}
+              sessions={totals?.sessions ?? 0}
+              pages={pages.data?.total ?? 0}
             />
-          </div>
-          <div className="hidden rounded-lg border md:block">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Page</TableHead>
-                  <TableHead>Project</TableHead>
-                  <TableHead className="text-right">Views</TableHead>
-                  <TableHead className="text-right">Visitors</TableHead>
-                  <TableHead className="text-right">Sessions</TableHead>
-                  <TableHead className="text-right hidden md:table-cell">
-                    Average time
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {query.data?.rows.map((row) => (
-                  <TableRow key={`${row.project_id}:${row.key}`}>
-                    <TableCell className="font-medium break-all">
-                      {row.key}
-                    </TableCell>
-                    <TableCell>{row.project_name}</TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {number(row.views)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {number(row.visitors)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {number(row.sessions)}
-                    </TableCell>
-                    <TableCell className="text-right hidden md:table-cell tabular-nums">
-                      {row.avg_time_seconds == null
-                        ? '—'
-                        : `${number(row.avg_time_seconds)} s`}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-          <div className="mt-4">
-            <GlobalPagination view={view} total={query.data?.total ?? 0} />
-          </div>
-        </QueryContent>
-      </section>
+          </QueryContent>
+          {hasNoAnalytics ? (
+            <DataSection title="Traffic">
+              <EmptyState
+                size="compact"
+                icon={BarChart3}
+                title="No analytics data yet"
+                description="Open a project to finish analytics setup and start collecting page views, sessions, and visitors."
+                action={
+                  <Button asChild size="sm">
+                    <Link to="/projects">Open projects</Link>
+                  </Button>
+                }
+              />
+            </DataSection>
+          ) : (
+            <AnalyticsTrafficChart
+              data={traffic.data?.rows.map((row) => ({
+                date: row.key,
+                count:
+                  metric === 'events'
+                    ? row.views
+                    : metric === 'sessions'
+                      ? row.sessions
+                      : row.visitors,
+              }))}
+              startDate={new Date(view.from)}
+              endDate={new Date(view.to)}
+              isLoading={traffic.isPending}
+              error={traffic.error}
+              aggregationLevel={metric}
+              onAggregationChange={setMetric}
+              onZoom={(from, to) =>
+                view.setTimeRange({
+                  from: from.toISOString(),
+                  to: to.toISOString(),
+                  preset: 'custom',
+                })
+              }
+            />
+          )}
+          {!hasNoAnalytics && (
+            <AnalyticsBreakdowns
+              traffic={grid(
+                <>
+                  <Breakdown
+                    title="Top Pages"
+                    facet="pages"
+                    view={view}
+                    totalVisitors={totals?.visitors ?? 0}
+                  />
+                  {breakdown('Referrers', 'referrer_hostname')}
+                  {breakdown('Channels', 'channel')}
+                  {breakdown('UTM Campaigns', 'utm_campaign')}
+                </>
+              )}
+              audience={grid(
+                <>
+                  {breakdown('Locations', 'country')}
+                  {breakdown('Languages', 'language')}
+                </>
+              )}
+              technology={grid(
+                <>
+                  {breakdown('Browsers', 'browser')}
+                  {breakdown('Operating Systems', 'operating_system')}
+                  {breakdown('Devices', 'device_type')}
+                </>
+              )}
+              events={grid(
+                <Breakdown
+                  title="Events"
+                  facet="events"
+                  view={view}
+                  totalVisitors={totals?.visitors ?? 0}
+                />
+              )}
+            />
+          )}
+        </>
+      )}
     </GlobalPage>
   )
 }

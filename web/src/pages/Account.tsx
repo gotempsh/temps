@@ -42,9 +42,9 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Loader2, X } from 'lucide-react'
+import { Check, Circle, Loader2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
@@ -180,7 +180,11 @@ export function Account() {
       revoke_other_sessions: false,
     },
   })
-  const newPassword = passwordForm.watch('new_password')
+  const newPassword = useWatch({
+    control: passwordForm.control,
+    name: 'new_password',
+  })
+  const passwordStarted = newPassword.length > 0
   const requirementResults = passwordRequirementResults(newPassword)
 
   const { mutate: changePassword, isPending: isChangingPassword } = useMutation(
@@ -381,8 +385,8 @@ export function Account() {
         <CardHeader>
           <CardTitle>Change Password</CardTitle>
           <CardDescription>
-            Update your account password. You'll need your current password to
-            confirm the change.
+            Update your account password. You&apos;ll need your current password
+            to confirm the change.
             {user?.mfa_enabled
               ? ' Because you have MFA enabled, a TOTP code (or recovery code) is also required.'
               : ''}
@@ -432,8 +436,7 @@ export function Account() {
                       className="grid gap-1.5 pt-2 sm:grid-cols-2"
                     >
                       {PASSWORD_REQUIREMENTS.map((requirement, index) => {
-                        const met =
-                          requirementResults[index]?.met ?? false
+                        const met = requirementResults[index]?.met ?? false
                         return (
                           <li
                             key={requirement.id}
@@ -441,13 +444,17 @@ export function Account() {
                               'flex items-center gap-1.5 text-xs transition-colors',
                               met
                                 ? 'text-emerald-600 dark:text-emerald-400 font-medium'
-                                : 'text-rose-500 font-medium'
+                                : passwordStarted
+                                  ? 'text-rose-500 font-medium'
+                                  : 'text-muted-foreground'
                             )}
                           >
                             {met ? (
                               <Check className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
-                            ) : (
+                            ) : passwordStarted ? (
                               <X className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
+                            ) : (
+                              <Circle className="h-3.5 w-3.5 shrink-0 stroke-[2]" />
                             )}
                             <span>{requirement.label}</span>
                           </li>
@@ -514,7 +521,7 @@ export function Account() {
                       </FormLabel>
                       <p className="text-xs text-muted-foreground">
                         Revokes every session except this one. Recommended if
-                        you're rotating because of a leak or shared device.
+                        you&apos;re rotating because of a leak or shared device.
                       </p>
                     </div>
                   </FormItem>

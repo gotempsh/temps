@@ -16,6 +16,22 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet'
 import {
+  Activity,
+  BarChart3,
+  ScrollText,
+  GitFork,
+  Gauge,
+  Users,
+  FileText,
+  Play,
+  Filter,
+  Bell,
+  Database,
+  ShieldAlert,
+  Home,
+  History,
+  HardDrive,
+  DollarSign,
   Menu,
   Settings2,
   Rocket,
@@ -27,7 +43,34 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 
-const settingsIcons: Record<string, LucideIcon> = {
+const sectionIcons: Record<string, LucideIcon> = {
+  project: Home,
+  observe: History,
+  runtime: ScrollText,
+  'request-logs': FileText,
+  'telemetry-logs': Radio,
+  errors: ShieldAlert,
+  traces: GitFork,
+  'ai-gateway?tab=activity': Bot,
+  metrics: Gauge,
+  monitors: Activity,
+  'errors/alert-rules': Bell,
+  analytics: BarChart3,
+  'analytics/visitors': Users,
+  'analytics/pages': FileText,
+  'analytics/replays': Play,
+  'analytics/funnels': Filter,
+  speed: Gauge,
+  'analytics/ai-agents': Bot,
+  'analytics/api-traffic': Activity,
+  'ai-crawlers': Bot,
+  revenue: DollarSign,
+  storage: Database,
+  'services/kv': KeyRound,
+  'services/blob': HardDrive,
+  security: ShieldAlert,
+  'settings/security': ShieldAlert,
+  'settings/access': Users,
   'settings/general': Settings2,
   'settings/delivery': Rocket,
   domains: Globe,
@@ -65,11 +108,13 @@ export function ProjectSectionLayout({
     setSearch('')
   }
   const base = PROJECT_SECTION_LINKS[section]
-  if (!base) return <>{children}</>
+  if (!base || base.length < 2) return <>{children}</>
   const title =
-    section === 'storage'
-      ? 'Databases'
-      : section[0].toUpperCase() + section.slice(1)
+    section === 'project'
+      ? 'Overview'
+      : section === 'storage'
+        ? 'Databases'
+        : section[0].toUpperCase() + section.slice(1)
   const links = base.map((link) => ({
     ...link,
     href: `/projects/${project.slug}/${link.url}`,
@@ -123,12 +168,13 @@ export function ProjectSectionLayout({
                 active === link.url && 'bg-muted font-medium text-foreground'
               )}
             >
-              {section === 'settings' &&
-                (() => {
-                  const Icon = settingsIcons[link.url] ?? Plug
-                  return <Icon aria-hidden="true" className="size-4 shrink-0" />
-                })()}
-              <span>{link.title}</span>
+              {(() => {
+                const Icon = sectionIcons[link.url] ?? Plug
+                return <Icon aria-hidden="true" className="size-4 shrink-0" />
+              })()}
+              <span className="min-w-0 truncate" title={link.title}>
+                {link.title}
+              </span>
             </Link>
           ))}
         {!links.some((link) =>

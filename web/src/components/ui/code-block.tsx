@@ -39,7 +39,7 @@ export type CodeLanguage =
 
 interface CodeBlockProps {
   code: string
-  language?: CodeLanguage
+  language: CodeLanguage
   className?: string
   showCopy?: boolean
   title?: string
@@ -289,7 +289,7 @@ export function HighlightedCode({
   showLineNumbers = false,
 }: {
   code: string
-  language?: CodeLanguage
+  language: CodeLanguage
   className?: string
   showLineNumbers?: boolean
 }) {

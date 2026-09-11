@@ -21,7 +21,6 @@ import { PlatformServices } from '@/components/storage/PlatformServices'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -50,11 +49,16 @@ export function Storage() {
     useState<ExternalServiceInfo | null>(null)
   const [isCreateDropdownOpen, setIsCreateDropdownOpen] = useState(false)
 
-  // Get active tab from URL or default to 'external'
-  const activeTab = searchParams.get('tab') || 'external'
+  // Preserve existing section links; databases and storage is the default.
+  const activeTab =
+    searchParams.get('tab') === 'platform' ? 'platform' : 'external'
 
   const handleTabChange = (value: string) => {
-    setSearchParams({ tab: value })
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous)
+      next.set('tab', value)
+      return next
+    })
   }
 
   const {
@@ -87,6 +91,7 @@ export function Storage() {
   useKeyboardShortcut({
     key: 'n',
     callback: () => setIsCreateDropdownOpen(true),
+    enabled: activeTab === 'external' && Boolean(services?.length),
   })
 
   usePageTitle('Databases')
@@ -137,17 +142,6 @@ export function Storage() {
 
     return (
       <>
-        <div className="flex items-center justify-end mb-4">
-          <div className="flex items-center gap-2">
-            <ImportServiceButton onSuccess={() => refetch()} />
-            <CreateServiceButton
-              onSuccess={() => refetch()}
-              open={isCreateDropdownOpen}
-              onOpenChange={setIsCreateDropdownOpen}
-            />
-          </div>
-        </div>
-
         <ServicesCardGrid
           services={services}
           healthMap={healthMap}
@@ -165,35 +159,67 @@ export function Storage() {
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
-        <PageHeader
-          title="Databases"
-          description="Manage platform and external data services"
-        />
-
-        <Tabs
-          value={activeTab}
-          onValueChange={handleTabChange}
-          className="space-y-6"
-        >
-          <TabsList>
-            <TabsTrigger value="platform" className="gap-2">
-              <Database className="h-4 w-4" />
-              Platform Services
-            </TabsTrigger>
-            <TabsTrigger value="external" className="gap-2">
-              <HardDrive className="h-4 w-4" />
-              External Services
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="platform" className="space-y-6">
-            <PlatformServices />
-          </TabsContent>
-
-          <TabsContent value="external" className="space-y-6">
-            {renderExternalServicesContent()}
-          </TabsContent>
-        </Tabs>
+        <div className="grid min-w-0 gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
+          <aside
+            className="self-start border-b pb-4 lg:border-b-0 lg:border-r lg:pr-4 lg:pb-0"
+            aria-label="Databases navigation"
+          >
+            <p className="mb-3 text-sm font-semibold">Databases</p>
+            <nav aria-label="Database pages" className="flex gap-1 lg:flex-col">
+              {[
+                {
+                  value: 'external',
+                  label: 'Databases',
+                  icon: HardDrive,
+                },
+                {
+                  value: 'platform',
+                  label: 'Platform services',
+                  icon: Database,
+                },
+              ].map(({ value, label, icon: Icon }) => (
+                <Button
+                  key={value}
+                  variant="ghost"
+                  onClick={() => handleTabChange(value)}
+                  aria-current={activeTab === value ? 'page' : undefined}
+                  className={cn(
+                    'h-auto justify-start gap-2 text-left whitespace-normal px-2.5 py-2 text-sm font-normal text-muted-foreground',
+                    activeTab === value &&
+                      'bg-muted font-medium text-foreground'
+                  )}
+                >
+                  <Icon className="size-4 shrink-0" aria-hidden="true" />
+                  {label}
+                </Button>
+              ))}
+            </nav>
+          </aside>
+          <div className="min-w-0 space-y-6">
+            <PageHeader
+              title={
+                activeTab === 'platform' ? 'Platform services' : 'Databases'
+              }
+              actions={
+                activeTab === 'external' && services?.length ? (
+                  <>
+                    <ImportServiceButton onSuccess={() => refetch()} />
+                    <CreateServiceButton
+                      onSuccess={() => refetch()}
+                      open={isCreateDropdownOpen}
+                      onOpenChange={setIsCreateDropdownOpen}
+                    />
+                  </>
+                ) : undefined
+              }
+            />
+            {activeTab === 'platform' ? (
+              <PlatformServices />
+            ) : (
+              renderExternalServicesContent()
+            )}
+          </div>
+        </div>
 
         {selectedService && (
           <EditServiceDialog

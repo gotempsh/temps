@@ -929,7 +929,21 @@ const projectPrimaryItems = [
     icon: Layers,
     section: 'environments',
   },
-  { title: 'Observe', url: 'runtime', icon: Activity, section: 'observe' },
+  { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
+  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
+  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
+  {
+    title: 'Analytics',
+    url: 'analytics',
+    icon: BarChart3,
+    section: 'analytics',
+  },
+  {
+    title: 'Monitoring',
+    url: 'metrics',
+    icon: Activity,
+    section: 'monitoring',
+  },
   { title: 'Databases', url: 'storage', icon: Database, section: 'storage' },
   {
     title: 'Security',

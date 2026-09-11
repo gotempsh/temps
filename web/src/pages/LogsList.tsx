@@ -36,6 +36,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { LogsEmptyState } from '@/components/observability/LogsEmptyState'
 
 interface LogsListProps {
   project: ProjectResponse
@@ -108,6 +109,9 @@ export default function LogsList({ project }: LogsListProps) {
 
   // Reset to first page when any filter changes.
   useEffect(() => {
+    // Query pagination is local UI state and must reset when the debounced
+    // filter values become active.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPage(1)
     setExpanded(new Set())
   }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
@@ -290,15 +294,15 @@ export default function LogsList({ project }: LogsListProps) {
           ))}
         </div>
       ) : logs.length === 0 ? (
-        <EmptyState
-          icon={ScrollText}
-          title="No logs found"
-          description={
-            hasFilters || traceId
-              ? 'Try adjusting your filters or time range.'
-              : 'Logs will appear here once your application sends them via OpenTelemetry (OTLP).'
-          }
-        />
+        hasFilters || traceId ? (
+          <EmptyState
+            icon={ScrollText}
+            title="No logs found"
+            description="Try adjusting your filters or time range."
+          />
+        ) : (
+          <LogsEmptyState projectSlug={project.slug} />
+        )
       ) : (
         <>
           <div className="overflow-hidden rounded-md border font-mono text-xs">

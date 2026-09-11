@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { DataSection } from '@/components/data-display/DataSection'
+import { PageHeader } from '@/components/layout/PageContainer'
+
+import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
+import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -55,7 +58,6 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { ChartRangeSelectionBar } from '@/components/charts/chart-range-selection-bar'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -188,155 +190,18 @@ export function VisitorChart({
     enabled: !!startDate && !!endDate,
   })
 
-  const chartData = React.useMemo(() => {
-    if (!data || !startDate || !endDate) return []
-
-    // Calculate the range in days
-    const rangeInDays = Math.ceil(
-      (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)
-    )
-
-    // Check if start and end are on the same day
-    const sameDay = startDate.toDateString() === endDate.toDateString()
-
-    return data.map((item) => {
-      // Parse the date string (format: "2025-10-05 19:00")
-      const date = new Date(item.date.replace(' ', 'T'))
-
-      let formattedDate: string
-
-      if (sameDay || rangeInDays <= 1) {
-        // Same day or Last 24 hours: show only hour
-        formattedDate = date.toLocaleString('en-US', {
-          hour: 'numeric',
-          hour12: true,
-        })
-      } else if (rangeInDays <= 7) {
-        // Last 7 days (multiple days): show month, day and hour
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          hour: 'numeric',
-          hour12: true,
-        })
-      } else if (rangeInDays <= 30) {
-        // Last 30 days: show month and day
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-        })
-      } else {
-        // More than 30 days: show month, day and year
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: '2-digit',
-        })
-      }
-
-      return {
-        date: formattedDate,
-        timestamp: date.getTime(),
-        count: item.count,
-      }
-    })
-  }, [data, startDate, endDate])
-
-  const getAggregationLabel = () => {
-    switch (aggregationLevel) {
-      case 'events':
-        return 'Page Views'
-      case 'sessions':
-        return 'Sessions'
-      case 'visitors':
-        return 'Visitors'
-    }
-  }
-
-  const getChartTitle = () => {
-    if (!startDate || !endDate) return getAggregationLabel()
-
-    const rangeInDays = Math.ceil(
-      (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)
-    )
-    const sameDay = startDate.toDateString() === endDate.toDateString()
-
-    if (sameDay || rangeInDays <= 1) {
-      return `Hourly ${getAggregationLabel()}`
-    } else {
-      return getAggregationLabel()
-    }
-  }
-
   return (
-    <DataSection
-      title={getChartTitle()}
-      description={
-        onZoom ? 'Drag across the chart to inspect a time window.' : undefined
-      }
-      actions={
-        <div
-          role="group"
-          aria-label="Traffic metric"
-          className="flex items-center gap-1 rounded-md bg-muted p-1"
-        >
-          {(['events', 'sessions', 'visitors'] as const).map((metric) => (
-            <Button
-              key={metric}
-              type="button"
-              variant={aggregationLevel === metric ? 'secondary' : 'ghost'}
-              size="sm"
-              aria-pressed={aggregationLevel === metric}
-              onClick={() => setAggregationLevel(metric)}
-            >
-              {metric === 'events'
-                ? 'Page views'
-                : metric === 'sessions'
-                  ? 'Sessions'
-                  : 'Visitors'}
-            </Button>
-          ))}
-        </div>
-      }
-    >
-      {isLoading ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-muted-foreground">
-            Loading chart data...
-          </div>
-        </div>
-      ) : error ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-red-500">Failed to load chart data</div>
-        </div>
-      ) : !chartData.length ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-muted-foreground">
-            No data available for the selected period
-          </div>
-        </div>
-      ) : (
-        <ThresholdLineChart
-          data={chartData}
-          xKey="timestamp"
-          series={{
-            dataKey: 'count',
-            label: getAggregationLabel(),
-            tone: 'neutral',
-          }}
-          height={250}
-          xTickFormatter={(value) =>
-            chartData.find((point) => point.timestamp === Number(value))
-              ?.date ?? ''
-          }
-          yTickFormatter={(value) => value.toLocaleString()}
-          tooltipValueFormatter={(value) => value.toLocaleString()}
-          selectionKey="timestamp"
-          selectedRange={selectedRange}
-          onRangeSelect={onZoom}
-        />
-      )}
-    </DataSection>
+    <AnalyticsTrafficChart
+      data={data}
+      startDate={startDate}
+      endDate={endDate}
+      isLoading={isLoading}
+      error={error}
+      aggregationLevel={aggregationLevel}
+      onAggregationChange={setAggregationLevel}
+      onZoom={onZoom}
+      selectedRange={selectedRange}
+    />
   )
 }
 
@@ -495,20 +360,25 @@ function PagesTab({ project }: PagesTabProps) {
     [dateFilter]
   )
 
-  const handleRefresh = React.useCallback(() => {
+  const handleRefresh = React.useCallback(async () => {
     setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          key.includes('getPagePaths')
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
+    try {
+      await queryClient.invalidateQueries({
+        predicate: (query) => {
+          const key = query.queryKey[0] as {
+            _id?: string
+            query?: { project_id?: number }
+          }
+          return (
+            !!key?._id?.startsWith('getPage') &&
+            key.query?.project_id === project.id
+          )
+        },
+      })
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [queryClient, project.id])
 
   // Sync date filter to URL search params (preserves path param)
   const updateDateFilter = React.useCallback(
@@ -1487,23 +1357,21 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   return (
     <>
       <div className="space-y-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Analytics</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Traffic, audience, and engagement for {project.name}.
-            </p>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              navigate(`/projects/${project.slug}/analytics/globe`)
-            }
-          >
-            <Globe className="mr-2 size-4" /> Visitor globe
-          </Button>
-        </div>
+        <PageHeader
+          title="Analytics"
+          description={`Traffic, audience, and engagement for ${project.name}.`}
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                navigate(`/projects/${project.slug}/analytics/globe`)
+              }
+            >
+              <Globe className="mr-2 size-4" /> Visitor globe
+            </Button>
+          }
+        />
 
         {hasNoData && (
           <Card className="border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950/50">
@@ -1610,14 +1478,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               />
             )}
           </div>
-          <Tabs defaultValue="traffic" className="min-w-0">
-            <ScrollableTabsList aria-label="Analytics breakdowns">
-              <TabsTrigger value="traffic">Traffic</TabsTrigger>
-              <TabsTrigger value="audience">Audience</TabsTrigger>
-              <TabsTrigger value="technology">Technology</TabsTrigger>
-              <TabsTrigger value="events">Events</TabsTrigger>
-            </ScrollableTabsList>
-            <TabsContent value="traffic" className="mt-3">
+          <AnalyticsBreakdowns
+            traffic={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <PagesChart
                   project={project}
@@ -1644,8 +1506,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   environment={selectedEnvironment}
                 />
               </div>
-            </TabsContent>
-            <TabsContent value="audience" className="mt-3">
+            }
+            audience={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <LocationsChart
                   project={project}
@@ -1666,8 +1528,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   environment={selectedEnvironment}
                 />
               </div>
-            </TabsContent>
-            <TabsContent value="technology" className="mt-3">
+            }
+            technology={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <BrowsersChart
                   project={project}
@@ -1688,8 +1550,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   environment={selectedEnvironment}
                 />
               </div>
-            </TabsContent>
-            <TabsContent value="events" className="mt-3">
+            }
+            events={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <EventsChart
                   project={project}
@@ -1698,8 +1560,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   environment={selectedEnvironment}
                 />
               </div>
-            </TabsContent>
-          </Tabs>
+            }
+          />
         </div>
       </div>
     </>

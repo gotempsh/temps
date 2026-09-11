@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   getBackupOptions,
   getS3SourceOptions,
@@ -216,9 +218,9 @@ function Detail({
   mono?: boolean
 }) {
   return (
-    <div className="grid grid-cols-1 gap-1 py-3 sm:grid-cols-3 sm:gap-4">
+    <div className="grid grid-cols-1 gap-1 py-3">
       <dt className="text-sm font-medium text-foreground">{label}</dt>
-      <dd className="flex min-w-0 items-center gap-2 sm:col-span-2">
+      <dd className="flex min-w-0 items-center gap-2">
         <div
           className={cn(
             'min-w-0 flex-1 break-all text-sm text-muted-foreground',
@@ -240,7 +242,12 @@ export function BackupDetail() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const { data: backup, isLoading, error, refetch } = useQuery({
+  const {
+    data: backup,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
     ...getBackupOptions({
       path: { id: backupId! },
     }),
@@ -435,418 +442,432 @@ export function BackupDetail() {
         </Button>
       </div>
 
-      <div className="grid gap-6">
-        {/* Overview */}
-        <Card>
-          <CardHeader>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div className="space-y-1.5 min-w-0">
-                <CardTitle className="flex items-center gap-2 min-w-0">
-                  <FileArchive className="h-5 w-5 shrink-0" />
-                  <span className="truncate">
-                    Backup{' '}
-                    <span className="font-mono text-base text-muted-foreground">
-                      #{backup.backup_id.slice(0, 8)}
+      <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="min-w-0 space-y-4">
+          {/* Overview */}
+          <Card className="overflow-hidden shadow-none">
+            <CardHeader className="border-b px-5 py-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="space-y-1.5 min-w-0">
+                  <PageHeader
+                    title={
+                      <span className="flex items-center gap-2">
+                        <FileArchive className="h-5 w-5 shrink-0" />
+                        <span className="truncate">
+                          Backup{' '}
+                          <span className="font-mono text-base text-muted-foreground">
+                            #{backup.backup_id.slice(0, 8)}
+                          </span>
+                        </span>
+                      </span>
+                    }
+                  />
+                  <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Clock className="h-3.5 w-3.5" />
+                      <TimeAgo date={backup.started_at} />
                     </span>
-                  </span>
-                </CardTitle>
-                <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="inline-flex items-center gap-1.5">
-                    <Clock className="h-3.5 w-3.5" />
-                    <TimeAgo date={backup.started_at} />
-                  </span>
-                  <span aria-hidden>·</span>
-                  <span className="hidden sm:inline">
-                    {format(startedAt, 'PPp')}
-                  </span>
-                  <span className="sm:hidden">
-                    {format(startedAt, 'MMM d, p')}
-                  </span>
-                  {source ? (
-                    <>
-                      <span aria-hidden>·</span>
-                      <Link
-                        to={`/backups/s3-sources/${id}`}
-                        className="text-foreground hover:underline truncate"
-                      >
-                        {source.name}
-                      </Link>
-                    </>
-                  ) : null}
-                </CardDescription>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
-                <StatusBadge state={state} />
-                <CopyButton value={backup.s3_location} className="gap-2">
-                  Copy S3 path
-                </CopyButton>
-                {/* Cancel — only live backups can be cancelled. Soft cancel:
+                    <span aria-hidden>·</span>
+                    <span className="hidden sm:inline">
+                      {format(startedAt, 'PPp')}
+                    </span>
+                    <span className="sm:hidden">
+                      {format(startedAt, 'MMM d, p')}
+                    </span>
+                    {source ? (
+                      <>
+                        <span aria-hidden>·</span>
+                        <Link
+                          to={`/backups/s3-sources/${id}`}
+                          className="text-foreground hover:underline truncate"
+                        >
+                          {source.name}
+                        </Link>
+                      </>
+                    ) : null}
+                  </CardDescription>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
+                  <StatusBadge state={state} />
+                  <CopyButton value={backup.s3_location} className="gap-2">
+                    Copy S3 path
+                  </CopyButton>
+                  {/* Cancel — only live backups can be cancelled. Soft cancel:
                     the DB row flips immediately + the engine sees the
                     cancellation token on its next heartbeat tick. */}
-                {(state === 'pending' || state === 'running') && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setShowCancelDialog(true)}
-                    disabled={cancelMutation.isPending}
-                    className="gap-2"
-                  >
-                    {cancelMutation.isPending ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Ban className="h-4 w-4" />
-                    )}
-                    Cancel
-                  </Button>
-                )}
-                {state !== 'pending' && state !== 'running' && (
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    onClick={() => setShowDeleteDialog(true)}
-                    disabled={deleteMutation.isPending}
-                    className="gap-2"
-                  >
-                    {deleteMutation.isPending ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-4 w-4" />
-                    )}
-                    Delete
-                  </Button>
-                )}
+                  {(state === 'pending' || state === 'running') && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowCancelDialog(true)}
+                      disabled={cancelMutation.isPending}
+                      className="gap-2"
+                    >
+                      {cancelMutation.isPending ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Ban className="h-4 w-4" />
+                      )}
+                      Cancel
+                    </Button>
+                  )}
+                  {state !== 'pending' && state !== 'running' && (
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => setShowDeleteDialog(true)}
+                      disabled={deleteMutation.isPending}
+                      className="gap-2"
+                    >
+                      {deleteMutation.isPending ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-4 w-4" />
+                      )}
+                      Delete
+                    </Button>
+                  )}
+                </div>
               </div>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div
-              role="list"
-              className="grid grid-cols-2 divide-x divide-y divide-border overflow-hidden rounded-md border border-border sm:grid-cols-4 sm:divide-y-0"
-            >
-              <Stat
-                icon={CheckCircle2}
-                label="Status"
-                value={
-                  <span className="inline-flex items-center gap-2 text-xl">
-                    <StatusIcon state={state} />
-                    <span className="capitalize">{state}</span>
-                  </span>
-                }
-                sub={
-                  completedAt ? (
-                    <>Finished {format(completedAt, 'p')}</>
-                  ) : state === 'running' ? (
-                    <>In progress</>
-                  ) : (
-                    <>—</>
-                  )
-                }
-              />
-              <Stat
-                icon={Clock}
-                label="Duration"
-                value={durationMs !== null ? formatDuration(durationMs) : '—'}
-                sub={
-                  completedAt
-                    ? // Collapse `5:22 PM → 5:22 PM` to a single time when the
-                      // start and end land in the same minute (the common case
-                      // for sub-60s backups). Saves visual noise on narrow
-                      // screens.
-                      format(startedAt, 'p') === format(completedAt, 'p')
-                      ? format(startedAt, 'p')
-                      : `${format(startedAt, 'p')} → ${format(completedAt, 'p')}`
-                    : 'Not finished'
-                }
-              />
-              <Stat
-                icon={HardDrive}
-                label="Size"
-                value={
-                  displaySize ? (
-                    <span className="inline-flex items-baseline gap-2">
-                      <span>{formatBytes(displaySize)}</span>
-                      {isLiveSize ? (
-                        <span className="text-xs font-normal text-muted-foreground">
-                          so far
-                        </span>
-                      ) : null}
+            </CardHeader>
+            <CardContent className="p-5">
+              <div
+                role="list"
+                className="grid grid-cols-2 divide-x divide-y divide-border overflow-hidden rounded-md border border-border sm:grid-cols-4 sm:divide-y-0"
+              >
+                <Stat
+                  icon={CheckCircle2}
+                  label="Status"
+                  value={
+                    <span className="inline-flex items-center gap-2 text-xl">
+                      <StatusIcon state={state} />
+                      <span className="capitalize">{state}</span>
                     </span>
-                  ) : (
-                    '—'
-                  )
-                }
-                sub={
-                  backup.compression_type && backup.compression_type !== 'none'
-                    ? `${backup.compression_type} compression`
-                    : 'Uncompressed'
-                }
-              />
-              <Stat
-                icon={FileArchive}
-                label="Type"
-                value={<span className="capitalize">{backup.backup_type}</span>}
-                sub={
-                  backup.file_count
-                    ? `${backup.file_count.toLocaleString()} files`
-                    : undefined
-                }
-              />
-            </div>
-          </CardContent>
-        </Card>
+                  }
+                  sub={
+                    completedAt ? (
+                      <>Finished {format(completedAt, 'p')}</>
+                    ) : state === 'running' ? (
+                      <>In progress</>
+                    ) : (
+                      <>—</>
+                    )
+                  }
+                />
+                <Stat
+                  icon={Clock}
+                  label="Duration"
+                  value={durationMs !== null ? formatDuration(durationMs) : '—'}
+                  sub={
+                    completedAt
+                      ? // Collapse `5:22 PM → 5:22 PM` to a single time when the
+                        // start and end land in the same minute (the common case
+                        // for sub-60s backups). Saves visual noise on narrow
+                        // screens.
+                        format(startedAt, 'p') === format(completedAt, 'p')
+                        ? format(startedAt, 'p')
+                        : `${format(startedAt, 'p')} → ${format(completedAt, 'p')}`
+                      : 'Not finished'
+                  }
+                />
+                <Stat
+                  icon={HardDrive}
+                  label="Size"
+                  value={
+                    displaySize ? (
+                      <span className="inline-flex items-baseline gap-2">
+                        <span>{formatBytes(displaySize)}</span>
+                        {isLiveSize ? (
+                          <span className="text-xs font-normal text-muted-foreground">
+                            so far
+                          </span>
+                        ) : null}
+                      </span>
+                    ) : (
+                      '—'
+                    )
+                  }
+                  sub={
+                    backup.compression_type &&
+                    backup.compression_type !== 'none'
+                      ? `${backup.compression_type} compression`
+                      : 'Uncompressed'
+                  }
+                />
+                <Stat
+                  icon={FileArchive}
+                  label="Type"
+                  value={
+                    <span className="capitalize">{backup.backup_type}</span>
+                  }
+                  sub={
+                    backup.file_count
+                      ? `${backup.file_count.toLocaleString()} files`
+                      : undefined
+                  }
+                />
+              </div>
+            </CardContent>
+          </Card>
 
-        {/* Error — only when present */}
-        {backup.error_message ? (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Backup failed</AlertTitle>
-            <AlertDescription className="font-mono text-xs break-all">
-              {backup.error_message}
-            </AlertDescription>
-          </Alert>
-        ) : null}
+          {/* Error — only when present */}
+          {backup.error_message ? (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertTitle>Backup failed</AlertTitle>
+              <AlertDescription className="font-mono text-xs break-all">
+                {backup.error_message}
+              </AlertDescription>
+            </Alert>
+          ) : null}
 
-        {/* Details */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Details</CardTitle>
-            <CardDescription>
-              Storage, provenance, and integrity metadata for this backup.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <dl className="divide-y divide-border">
-              <Detail label="Backup ID" mono copy={backup.backup_id}>
-                {backup.backup_id}
-              </Detail>
-              <Detail label="Location" mono copy={backup.s3_location}>
-                {backup.s3_location}
-              </Detail>
-              {source ? (
-                <Detail label="S3 source">
-                  <Link
-                    to={`/backups/s3-sources/${id}`}
-                    className="text-foreground hover:underline"
-                  >
-                    {source.name}
-                  </Link>{' '}
-                  <span className="text-muted-foreground">
-                    ({source.bucket_name})
-                  </span>
-                </Detail>
-              ) : null}
-              {backup.external_service ? (
-                <Detail label="Service">
-                  <Link
-                    to={`/storage/${backup.external_service.id}`}
-                    className="text-foreground hover:underline"
-                  >
-                    {backup.external_service.name}
-                  </Link>{' '}
-                  <span className="text-muted-foreground capitalize">
-                    ({backup.external_service.service_type})
-                  </span>
-                </Detail>
-              ) : null}
-              <Detail label="Created by">
-                {createdByUser ? (
-                  <Link
-                    to={`/settings/users/${createdByUser.id}`}
-                    className="text-foreground hover:underline"
-                  >
-                    {createdByLabel}
-                  </Link>
-                ) : (
-                  createdByLabel
-                )}
-              </Detail>
-              <Detail label="Started at">{format(startedAt, 'PPpp')}</Detail>
-              {completedAt ? (
-                <Detail label="Finished at">
-                  {format(completedAt, 'PPpp')}
-                </Detail>
-              ) : null}
-              {state === 'running' ? (
-                <Detail label="Step">
-                  <span className="inline-flex items-center gap-2">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600 shrink-0" />
-                    <span className="font-mono text-xs">
-                      {backup.current_step ?? 'starting…'}
-                    </span>
-                  </span>
-                </Detail>
-              ) : null}
-              {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
-                <Detail label="Attempt">
-                  {backup.attempts} of {backup.max_attempts ?? '?'}
-                </Detail>
-              ) : null}
-              {typeof backup.max_runtime_secs === 'number' ? (
-                <Detail label="Timeout">
-                  {formatTimeoutSecs(backup.max_runtime_secs)}
-                </Detail>
-              ) : null}
-              {backup.expires_at ? (
-                <Detail label="Expires">
-                  {format(new Date(backup.expires_at), 'PPp')}{' '}
-                  <span className="text-muted-foreground">
-                    (<TimeAgo date={backup.expires_at} />)
-                  </span>
-                </Detail>
-              ) : null}
-              {backup.schedule_id ? (
-                <Detail label="Schedule">
-                  <Link
-                    to={`/backups/s3-sources/${id}`}
-                    className="text-foreground hover:underline"
-                  >
-                    Schedule #{backup.schedule_id}
-                  </Link>
-                </Detail>
-              ) : null}
-              {backup.checksum ? (
-                <Detail label="Checksum" mono copy={backup.checksum}>
-                  {backup.checksum}
-                </Detail>
-              ) : null}
-            </dl>
-          </CardContent>
-        </Card>
-
-        {/* Services in this backup — only shown when children exist */}
-        {children.length > 0 ? (
-          <Card>
-            <CardHeader>
-              <CardTitle>Services in this backup</CardTitle>
+          {/* Services in this backup — only shown when children exist */}
+          {children.length > 0 ? (
+            <Card className="overflow-hidden shadow-none">
+              <CardHeader className="border-b px-5 py-4">
+                <CardTitle className="text-base font-semibold">
+                  Services in this backup
+                </CardTitle>
+                <CardDescription>
+                  External services whose data was captured in this backup run.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="p-0">
+                <div className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Service</TableHead>
+                        <TableHead>Type</TableHead>
+                        <TableHead>State</TableHead>
+                        <TableHead className="hidden sm:table-cell">
+                          Size
+                        </TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Duration
+                        </TableHead>
+                        <TableHead className="hidden lg:table-cell">
+                          Error
+                        </TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {children.map((child) => {
+                        const childStarted = new Date(child.started_at)
+                        const childFinished = child.finished_at
+                          ? new Date(child.finished_at)
+                          : null
+                        const childDurationMs = childFinished
+                          ? childFinished.getTime() - childStarted.getTime()
+                          : null
+                        // When the parent backup has finalized but the child is
+                        // still pending/running, the engine bailed before
+                        // updating the child row (typical: pre-flight S3 check
+                        // failed, parent was marked failed but children were
+                        // never visited). Surface the parent's state + error
+                        // instead of showing a stale "Pending" forever.
+                        const parentFinalized =
+                          state === 'failed' || state === 'cancelled'
+                        const childStale =
+                          child.state === 'pending' || child.state === 'running'
+                        const effectiveState =
+                          parentFinalized && childStale ? state : child.state
+                        const effectiveError =
+                          child.error_message ??
+                          (parentFinalized && childStale
+                            ? (backup.error_message ?? null)
+                            : null)
+                        return (
+                          <TableRow key={child.id}>
+                            <TableCell>
+                              <Link
+                                to={`/storage/${child.service_id}`}
+                                className="flex items-center gap-2 hover:underline"
+                              >
+                                <Database className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                <span className="font-medium">
+                                  {child.service_name}
+                                </span>
+                              </Link>
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className="capitalize">
+                                {child.service_type}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <StatusBadge state={effectiveState} />
+                            </TableCell>
+                            <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
+                              {child.size_bytes !== null
+                                ? formatBytes(child.size_bytes)
+                                : '—'}
+                            </TableCell>
+                            <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
+                              {childDurationMs !== null
+                                ? formatDuration(childDurationMs)
+                                : '—'}
+                            </TableCell>
+                            <TableCell className="hidden lg:table-cell max-w-[200px]">
+                              {effectiveError ? (
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="block truncate text-xs text-destructive cursor-help">
+                                        {effectiveError}
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent
+                                      side="top"
+                                      className="max-w-sm whitespace-pre-wrap break-words"
+                                    >
+                                      {effectiveError}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
+                              ) : (
+                                <span className="text-muted-foreground">—</span>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+        </div>
+        <aside className="min-w-0 space-y-4">
+          {' '}
+          {/* Details */}
+          <Card className="overflow-hidden shadow-none">
+            <CardHeader className="border-b px-5 py-4">
+              <CardTitle className="text-base font-semibold">Details</CardTitle>
               <CardDescription>
-                External services whose data was captured in this backup run.
+                Storage, provenance, and integrity metadata for this backup.
               </CardDescription>
             </CardHeader>
-            <CardContent className="p-0">
-              <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Service</TableHead>
-                      <TableHead>Type</TableHead>
-                      <TableHead>State</TableHead>
-                      <TableHead className="hidden sm:table-cell">
-                        Size
-                      </TableHead>
-                      <TableHead className="hidden md:table-cell">
-                        Duration
-                      </TableHead>
-                      <TableHead className="hidden lg:table-cell">
-                        Error
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {children.map((child) => {
-                      const childStarted = new Date(child.started_at)
-                      const childFinished = child.finished_at
-                        ? new Date(child.finished_at)
-                        : null
-                      const childDurationMs = childFinished
-                        ? childFinished.getTime() - childStarted.getTime()
-                        : null
-                      // When the parent backup has finalized but the child is
-                      // still pending/running, the engine bailed before
-                      // updating the child row (typical: pre-flight S3 check
-                      // failed, parent was marked failed but children were
-                      // never visited). Surface the parent's state + error
-                      // instead of showing a stale "Pending" forever.
-                      const parentFinalized =
-                        state === 'failed' || state === 'cancelled'
-                      const childStale =
-                        child.state === 'pending' || child.state === 'running'
-                      const effectiveState =
-                        parentFinalized && childStale ? state : child.state
-                      const effectiveError =
-                        child.error_message ??
-                        (parentFinalized && childStale
-                          ? (backup.error_message ?? null)
-                          : null)
-                      return (
-                        <TableRow key={child.id}>
-                          <TableCell>
-                            <Link
-                              to={`/storage/${child.service_id}`}
-                              className="flex items-center gap-2 hover:underline"
-                            >
-                              <Database className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              <span className="font-medium">
-                                {child.service_name}
-                              </span>
-                            </Link>
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="outline" className="capitalize">
-                              {child.service_type}
-                            </Badge>
-                          </TableCell>
-                          <TableCell>
-                            <StatusBadge state={effectiveState} />
-                          </TableCell>
-                          <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
-                            {child.size_bytes !== null
-                              ? formatBytes(child.size_bytes)
-                              : '—'}
-                          </TableCell>
-                          <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                            {childDurationMs !== null
-                              ? formatDuration(childDurationMs)
-                              : '—'}
-                          </TableCell>
-                          <TableCell className="hidden lg:table-cell max-w-[200px]">
-                            {effectiveError ? (
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <span className="block truncate text-xs text-destructive cursor-help">
-                                      {effectiveError}
-                                    </span>
-                                  </TooltipTrigger>
-                                  <TooltipContent
-                                    side="top"
-                                    className="max-w-sm whitespace-pre-wrap break-words"
-                                  >
-                                    {effectiveError}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                            ) : (
-                              <span className="text-muted-foreground">—</span>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-              </div>
+            <CardContent className="p-5">
+              <dl className="divide-y divide-border">
+                <Detail label="Backup ID" mono copy={backup.backup_id}>
+                  {backup.backup_id}
+                </Detail>
+                <Detail label="Location" mono copy={backup.s3_location}>
+                  {backup.s3_location}
+                </Detail>
+                {source ? (
+                  <Detail label="S3 source">
+                    <Link
+                      to={`/backups/s3-sources/${id}`}
+                      className="text-foreground hover:underline"
+                    >
+                      {source.name}
+                    </Link>{' '}
+                    <span className="text-muted-foreground">
+                      ({source.bucket_name})
+                    </span>
+                  </Detail>
+                ) : null}
+                {backup.external_service ? (
+                  <Detail label="Service">
+                    <Link
+                      to={`/storage/${backup.external_service.id}`}
+                      className="text-foreground hover:underline"
+                    >
+                      {backup.external_service.name}
+                    </Link>{' '}
+                    <span className="text-muted-foreground capitalize">
+                      ({backup.external_service.service_type})
+                    </span>
+                  </Detail>
+                ) : null}
+                <Detail label="Created by">
+                  {createdByUser ? (
+                    <Link
+                      to={`/settings/users/${createdByUser.id}`}
+                      className="text-foreground hover:underline"
+                    >
+                      {createdByLabel}
+                    </Link>
+                  ) : (
+                    createdByLabel
+                  )}
+                </Detail>
+                <Detail label="Started at">{format(startedAt, 'PPpp')}</Detail>
+                {completedAt ? (
+                  <Detail label="Finished at">
+                    {format(completedAt, 'PPpp')}
+                  </Detail>
+                ) : null}
+                {state === 'running' ? (
+                  <Detail label="Step">
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600 shrink-0" />
+                      <span className="font-mono text-xs">
+                        {backup.current_step ?? 'starting…'}
+                      </span>
+                    </span>
+                  </Detail>
+                ) : null}
+                {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
+                  <Detail label="Attempt">
+                    {backup.attempts} of {backup.max_attempts ?? '?'}
+                  </Detail>
+                ) : null}
+                {typeof backup.max_runtime_secs === 'number' ? (
+                  <Detail label="Timeout">
+                    {formatTimeoutSecs(backup.max_runtime_secs)}
+                  </Detail>
+                ) : null}
+                {backup.expires_at ? (
+                  <Detail label="Expires">
+                    {format(new Date(backup.expires_at), 'PPp')}{' '}
+                    <span className="text-muted-foreground">
+                      (<TimeAgo date={backup.expires_at} />)
+                    </span>
+                  </Detail>
+                ) : null}
+                {backup.schedule_id ? (
+                  <Detail label="Schedule">
+                    <Link
+                      to={`/backups/s3-sources/${id}`}
+                      className="text-foreground hover:underline"
+                    >
+                      Schedule #{backup.schedule_id}
+                    </Link>
+                  </Detail>
+                ) : null}
+                {backup.checksum ? (
+                  <Detail label="Checksum" mono copy={backup.checksum}>
+                    {backup.checksum}
+                  </Detail>
+                ) : null}
+              </dl>
             </CardContent>
-          </Card>
-        ) : null}
-
-        {/* Tags */}
-        {backup.tags.length > 0 ? (
-          <Card>
-            <CardHeader>
-              <CardTitle>Tags</CardTitle>
-              <CardDescription>Labels attached to this backup.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex flex-wrap gap-2">
-                {backup.tags.map((tag) => (
-                  <Badge key={tag} variant="secondary">
-                    {tag}
-                  </Badge>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        ) : null}
+          </Card>{' '}
+          {/* Tags */}
+          {backup.tags.length > 0 ? (
+            <Card className="overflow-hidden shadow-none">
+              <CardHeader className="border-b px-5 py-4">
+                <CardTitle className="text-base font-semibold">Tags</CardTitle>
+                <CardDescription>
+                  Labels attached to this backup.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="p-5">
+                <div className="flex flex-wrap gap-2">
+                  {backup.tags.map((tag) => (
+                    <Badge key={tag} variant="secondary">
+                      {tag}
+                    </Badge>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+        </aside>
       </div>
 
       <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

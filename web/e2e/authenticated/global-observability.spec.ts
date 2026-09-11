@@ -524,3 +524,27 @@ test('log autocomplete remains usable on a narrow screen', async ({ page }) => {
   await expect(page.getByRole('button', {name:'Edit level filter'})).toHaveText('level:warn')
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
 })
+
+for (const theme of ['light', 'dark']) {
+  test(`logs use the shared chart tooltip in ${theme}`, async ({ page }) => {
+    await page.addInitScript((theme) => localStorage.setItem('theme', theme), theme)
+    await mock(page, 'logs')
+    await page.route('**/api/logs/global/search**', route => route.fulfill({ json: {
+      ...fixtures.logs,
+      lines: [0, 1, 2].map(i => ({ ...fixtures.logs.lines[0], timestamp: new Date(Date.parse(stamp) + i * 60000).toISOString(), line_offset: i }))
+    }}))
+    await page.goto('/logs')
+    const chart = page.getByRole('region', { name: 'Log volume' })
+    await expect(chart.locator('.recharts-line-curve').first()).toHaveAttribute('stroke-width', '2')
+    await chart.locator('.recharts-surface').hover()
+    const tooltip = chart.locator('.recharts-tooltip-wrapper')
+    await expect(tooltip).toBeVisible()
+    await expect(tooltip.locator('.rounded-lg')).toBeVisible()
+    await expect(tooltip).toContainText('UTC')
+    await expect(tooltip).not.toContainText('Invalid Date')
+    await expect(page.locator('html')).toHaveClass(new RegExp(theme))
+    await chart.screenshot({ path: `/tmp/temps-logs-chart-${theme}.png` })
+    await chart.getByRole('button', { name: 'Show volume table' }).click()
+    await expect(chart.getByRole('table')).toBeVisible()
+  })
+}

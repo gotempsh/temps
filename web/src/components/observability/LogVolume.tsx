@@ -8,10 +8,14 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
   ReferenceArea,
 } from 'recharts'
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from '@/components/ui/chart'
+import { SERIES_STROKE } from '@/components/charts/chart-colors'
 import type { GlobalLogLine } from '@/api/client/types.gen'
 import { LOG_LEVELS, logVolume } from '@/lib/log-explorer'
 import { Button } from '@/components/ui/button'
@@ -25,11 +29,11 @@ import {
 } from '@/components/ui/table'
 
 const COLORS = {
-  ERROR: 'var(--destructive)',
-  WARN: '#b7791f',
-  INFO: 'var(--foreground)',
+  ERROR: SERIES_STROKE.poor,
+  WARN: SERIES_STROKE.warn,
+  INFO: SERIES_STROKE.neutral,
   DEBUG: 'var(--muted-foreground)',
-  TRACE: 'var(--chart-2)',
+  TRACE: SERIES_STROKE.good,
 }
 export function LogVolume({
   lines,
@@ -105,7 +109,15 @@ export function LogVolume({
         </div>
       ) : (
         <div className="h-40 w-full min-w-0 select-none">
-          <ResponsiveContainer width="100%" height="100%">
+          <ChartContainer
+            className="h-full w-full aspect-auto"
+            config={Object.fromEntries(
+              LOG_LEVELS.map((level) => [
+                level,
+                { label: level.toLowerCase(), color: COLORS[level] },
+              ])
+            )}
+          >
             <LineChart
               data={buckets}
               margin={{ top: 10, right: 12, left: -12, bottom: 0 }}
@@ -132,7 +144,8 @@ export function LogVolume({
             >
               <CartesianGrid
                 vertical={false}
-                strokeDasharray="2 4"
+                strokeDasharray="3 3"
+                strokeOpacity={0.6}
                 stroke="var(--border)"
               />
               <XAxis
@@ -147,35 +160,35 @@ export function LogVolume({
                   })
                 }
                 minTickGap={60}
-                tick={{ fontSize: 10 }}
+                tick={{ fontSize: 12 }}
                 axisLine={false}
                 tickLine={false}
               />
               <YAxis
                 allowDecimals={false}
-                tick={{ fontSize: 10 }}
+                tick={{ fontSize: 12 }}
                 axisLine={false}
                 tickLine={false}
               />
-              <Tooltip
-                labelFormatter={(value) =>
-                  `${new Date(Number(value)).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
+              <ChartTooltip
+                cursor={{ stroke: 'var(--border)', strokeDasharray: '3 3' }}
+                content={
+                  <ChartTooltipContent
+                    indicator="line"
+                    labelFormatter={(_value, payload) =>
+                      `${new Date(Number(payload[0]?.payload.time)).toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
+                    }
+                  />
                 }
-                contentStyle={{
-                  background: 'var(--background)',
-                  borderColor: 'var(--border)',
-                  fontSize: 12,
-                }}
               />
               {LOG_LEVELS.map((level) => (
                 <Line
                   key={level}
                   dataKey={level}
                   stroke={COLORS[level]}
-                  strokeWidth={level === 'ERROR' ? 2 : 1}
-                  strokeDasharray={
-                    level === 'WARN' || level === 'TRACE' ? '3 3' : undefined
-                  }
+                  type="monotone"
+                  strokeWidth={2}
+                  activeDot={{ r: 4, strokeWidth: 0 }}
                   dot={buckets.length === 1}
                   isAnimationActive={false}
                 />
@@ -189,7 +202,7 @@ export function LogVolume({
                 />
               )}
             </LineChart>
-          </ResponsiveContainer>
+          </ChartContainer>
         </div>
       )}
       <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
