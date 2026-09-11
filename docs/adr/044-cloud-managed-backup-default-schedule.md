@@ -33,12 +33,14 @@ backup → cloud protocol, not the reverse).
 ## Decision
 
 1. **A trait in `temps-core` carries the request across the seam.**
-   `ManagedBackupScheduleProvisioner` has two methods: the schedule that
-   targets an S3 source, and "ensure one exists, creating the default when
-   none does". The backup plugin registers `BackupService` as the
-   implementation; the Cloud plugin resolves it in `initialize_plugin_services`,
-   after every plugin has registered. Same shape as
-   `CloudTelemetryActivationTrigger` (ADR-042).
+   `ManagedBackupScheduleProvisioner` has three methods: the schedule that
+   targets an S3 source, "ensure one exists, creating the default when none
+   does", and "release every schedule targeting the source". The backup
+   plugin registers `ManagedScheduleProvisioner` (a small struct over the
+   database connection and `BackupService`) as the implementation; the Cloud
+   plugin looks it up optionally in `initialize_plugin_services`, after every
+   plugin has registered. Same shape as `CloudTelemetryActivationTrigger`
+   (ADR-042).
 
 2. **The default schedule is an ordinary schedule.** Name "Temps Cloud
    nightly", six-field cron `0 0 2 * * *`, full backup of every service plus
@@ -48,11 +50,15 @@ backup → cloud protocol, not the reverse).
    never recreated behind the operator's back: "ensure" returns the oldest
    schedule targeting the source when one exists, whatever its state.
 
-3. **Retention comes from the backend.** `ManagedBackupCapability` gains an
-   optional `retention_days`. Cloud fills it from the plan; an older backend
-   that omits it gets the Starter figure, seven days, which is the smallest
-   promise the offer makes. The instance remembers the last value it saw and
-   uses it whenever it creates the default.
+3. **Retention comes from the backend, and is never guessed.**
+   `ManagedBackupCapability` gains an optional `retention_days`. Cloud fills
+   it from the plan; an older backend that answers without it gets the
+   Starter figure, seven days, which is the smallest promise the offer makes.
+   The instance keeps the last capability it read this process. If none has
+   been read yet (after a restart, say) the ensure path fetches the
+   capability first and refuses to create a schedule when Cloud does not
+   answer: a 30-day plan must not end up with a 7-day schedule because the
+   value was not loaded.
 
 4. **Enrollment creates the schedule; the page offers it again.** The first
    time the managed source is inserted (`UpsertOutcome::Created`), the Cloud
@@ -65,6 +71,20 @@ backup → cloud protocol, not the reverse).
    `POST /api/cloud/backups/schedule/ensure`. The CLI mirrors it with
    `temps cloud backup-schedule ensure`, and `temps cloud status` prints the
    schedule line.
+
+5. **Disconnect releases the schedules first.** Before the credential is
+   revoked, every schedule targeting the managed destination is released:
+   the one enrollment created (still tagged `temps-cloud`) is deleted, any
+   other is disabled so the operator's configuration survives but nothing
+   fires against a dead credential. A release failure aborts the disconnect
+   with the reason, leaving the link intact. The existing rule that the
+   destination row is kept while backup records reference it is unchanged.
+
+6. **Look-up-then-insert is serialised.** `backup_schedules.s3_source_id` is
+   not unique, and enrollment, the settings page and the CLI can all ask at
+   once, so the provisioner runs ensure and release behind one mutex. The
+   provisioner is its own struct in `temps-backup`, built from the database
+   connection and `BackupService`, so the service's internals stay private.
 
 ## Consequences
 
@@ -81,4 +101,8 @@ backup → cloud protocol, not the reverse).
   clicks the button again.
 - A schedule created before this change that already targets the managed
   destination is recognised as "the" schedule, so upgrading does not create a
-  second one.
+  second one. On disconnect it is disabled, not deleted, because it does not
+  carry the `temps-cloud` tag.
+- The backup plugin stays optional. Without it the Cloud plugin logs that
+  schedules are unavailable, status carries no schedule, and the ensure
+  endpoint answers with that reason.

@@ -161,6 +161,10 @@ fn problem(error: CloudServiceError) -> Problem {
         CloudServiceError::Client(temps_cloud_client::CloudError::FeatureDisabled { .. }) => {
             StatusCode::CONFLICT
         }
+        // The reason is the operator's to act on ("Cloud did not answer the
+        // plan's retention", "backup plugin not enabled"), so it is returned
+        // rather than hidden behind a 500.
+        CloudServiceError::ManagedBackupSchedule(_) => StatusCode::CONFLICT,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
@@ -171,7 +175,6 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::State(_)
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
-        | CloudServiceError::ManagedBackupSchedule(_)
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },

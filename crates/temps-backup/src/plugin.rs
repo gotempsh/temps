@@ -26,6 +26,7 @@ use crate::{
         s3_mirror::{S3MirrorDeps, S3MirrorEngine},
     },
     handlers::{self, create_backup_app_state, BackupAppState},
+    managed_schedule::ManagedScheduleProvisioner,
     services::{
         sweep_backup_alerts, BackupNotificationAdapter, BackupService, RestoreService,
         S3LifecycleService,
@@ -79,11 +80,13 @@ impl TempsPlugin for BackupPlugin {
                 encryption_service.clone(),
             ));
             context.register_service(backup_service.clone());
-            // The Cloud plugin creates the managed destination's nightly
-            // schedule through this seam (ADR-044).
-            context.register_service(
-                backup_service.clone() as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>
-            );
+            // The Cloud plugin creates and releases the managed destination's
+            // nightly schedule through this seam (ADR-044).
+            context.register_service(Arc::new(ManagedScheduleProvisioner::new(
+                db.clone(),
+                backup_service.clone(),
+            ))
+                as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>);
 
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.

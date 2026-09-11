@@ -181,8 +181,11 @@ pub struct CloudService {
     /// exists, so the two crates stay independent.
     schedule_provisioner: OnceLock<Arc<dyn ManagedBackupScheduleProvisioner>>,
     /// The plan's retention, from the last managed backup capability Cloud
-    /// answered; the default schedule is created with it.
-    managed_backup_retention_days: RwLock<Option<u16>>,
+    /// answered. Outer `None`: no capability read yet this process, so the
+    /// value must be fetched before a schedule is created. Inner `None`:
+    /// Cloud answered without a figure (older backend), so the default
+    /// applies.
+    managed_backup_retention_days: RwLock<Option<Option<u16>>>,
 }
 
 impl CloudService {
@@ -224,14 +227,59 @@ impl CloudService {
         *self
             .managed_backup_retention_days
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = days;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(days);
     }
 
-    fn managed_backup_retention_days(&self) -> u16 {
+    /// The retention to create a schedule with, once a capability has been
+    /// read this process. `None` means nothing has been read yet.
+    fn loaded_retention_days(&self) -> Option<u16> {
         self.managed_backup_retention_days
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS)
+            .map(|days| days.unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS))
+    }
+
+    /// The plan's retention, fetching the capability first when this process
+    /// has not read one yet (a restart, say). A schedule is never created
+    /// from a guessed figure: a 30-day plan must not end up with a 7-day
+    /// schedule because the capability was not loaded.
+    async fn plan_retention_days(&self, s3_source_id: i32) -> Result<u16, CloudServiceError> {
+        if let Some(days) = self.loaded_retention_days() {
+            return Ok(days);
+        }
+        let outcome = self.provision_managed_backup_source().await;
+        self.loaded_retention_days().ok_or_else(|| {
+            temps_core::ManagedBackupScheduleError::Create {
+                s3_source_id,
+                reason: format!(
+                    "Temps Cloud did not answer the plan's retention ({}); retry once the link is healthy",
+                    managed_backup_setup_from_outcome(&outcome).message
+                ),
+            }
+            .into()
+        })
+    }
+
+    /// Stop the schedules that write to the managed destination before its
+    /// credential is revoked. Nothing to do without a destination or a
+    /// scheduler.
+    async fn release_managed_backup_schedules(&self) -> Result<(), CloudServiceError> {
+        let Some(source_id) = self.managed_backup_source_id().await? else {
+            return Ok(());
+        };
+        let Some(provisioner) = self.schedule_provisioner.get() else {
+            return Ok(());
+        };
+        let released = provisioner.release_schedules_for_source(source_id).await?;
+        if !released.deleted.is_empty() || !released.disabled.is_empty() {
+            tracing::info!(
+                s3_source_id = source_id,
+                deleted = ?released.deleted,
+                disabled = ?released.disabled,
+                "released the backup schedules targeting the Temps Cloud destination"
+            );
+        }
+        Ok(())
     }
 
     async fn managed_backup_source_id(&self) -> Result<Option<i32>, CloudServiceError> {
@@ -288,11 +336,12 @@ impl CloudService {
         let provisioner = self.schedule_provisioner.get().ok_or_else(|| {
             temps_core::ManagedBackupScheduleError::Create {
                 s3_source_id: source_id,
-                reason: "the backup scheduler is not registered on this instance".to_string(),
+                reason: "the backup plugin is not enabled on this instance".to_string(),
             }
         })?;
+        let retention_days = self.plan_retention_days(source_id).await?;
         let schedule = provisioner
-            .ensure_schedule_for_source(source_id, self.managed_backup_retention_days())
+            .ensure_schedule_for_source(source_id, retention_days)
             .await?;
         tracing::info!(
             schedule_id = schedule.id,
@@ -784,11 +833,13 @@ impl CloudService {
                 // if this does not happen.
                 if let Some(provisioner) = self.schedule_provisioner.get() {
                     if let Ok(Some(source_id)) = self.managed_backup_source_id().await {
+                        // The capability was read just above, so the plan's
+                        // retention is loaded.
+                        let retention_days = self
+                            .loaded_retention_days()
+                            .unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS);
                         match provisioner
-                            .ensure_schedule_for_source(
-                                source_id,
-                                self.managed_backup_retention_days(),
-                            )
+                            .ensure_schedule_for_source(source_id, retention_days)
                             .await
                         {
                             Ok(schedule) => tracing::info!(
@@ -880,6 +931,16 @@ impl CloudService {
     /// Returns whether a managed source was found and removed, so the caller
     /// can decide whether to audit a credential revocation.
     pub async fn disconnect(&self) -> Result<(CloudStatus, bool), CloudServiceError> {
+        if !self.link.is_linked() {
+            // Nothing to revoke, so nothing to release either: the answer
+            // `revoke` would give, before any schedule is touched.
+            return Err(CloudServiceError::Client(CloudError::NotEnrolled));
+        }
+        // Before the credential is revoked: a schedule that keeps firing
+        // against a dead destination fails every night, and the source
+        // cleanup below refuses to remove a destination a schedule still
+        // points at. A failure here leaves the link intact and is reported.
+        self.release_managed_backup_schedules().await?;
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),

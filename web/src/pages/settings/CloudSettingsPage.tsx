@@ -11,6 +11,7 @@ import {
   updateCloudFeaturesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
+  CloudStatus,
   ManagedBackupSchedule,
   ManagedBackupSetup,
 } from '@/api/client/types.gen'
@@ -44,7 +45,7 @@ import {
 import { useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useForm } from 'react-hook-form'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -130,12 +131,7 @@ export function CloudSettingsPage() {
   const createBackupSchedule = async () => {
     try {
       const managedBackupSetup = await ensureBackupSchedule.mutateAsync({})
-      if (status.data) {
-        queryClient.setQueryData(getCloudStatusOptions().queryKey, {
-          ...status.data,
-          managed_backup_setup: managedBackupSetup,
-        })
-      }
+      mergeManagedBackupSetup(managedBackupSetup)
       if (managedBackupSetup.schedule) {
         toast.success(
           `Schedule "${managedBackupSetup.schedule.name}" targets Temps Cloud`
@@ -174,15 +170,19 @@ export function CloudSettingsPage() {
     }
   }
 
+  // Merge into whatever the 5s poll has fetched since the request started,
+  // not into the snapshot captured before it.
+  const mergeManagedBackupSetup = (managedBackupSetup: ManagedBackupSetup) =>
+    queryClient.setQueryData(
+      getCloudStatusOptions().queryKey,
+      (current: CloudStatus | undefined) =>
+        current ? { ...current, managed_backup_setup: managedBackupSetup } : current
+    )
+
   const retryBackupSource = async () => {
     try {
       const managedBackupSetup = await reconcileBackupSource.mutateAsync({})
-      if (status.data) {
-        queryClient.setQueryData(getCloudStatusOptions().queryKey, {
-          ...status.data,
-          managed_backup_setup: managedBackupSetup,
-        })
-      }
+      mergeManagedBackupSetup(managedBackupSetup)
 
       if (managedBackupSetup.ready) {
         toast.success('Managed backup source is ready')

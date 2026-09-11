@@ -46,16 +46,30 @@ pub struct ManagedBackupSchedule {
     pub next_run: Option<DateTime<Utc>>,
 }
 
+/// What releasing a destination's schedules did (see
+/// [`ManagedBackupScheduleProvisioner::release_schedules_for_source`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReleasedManagedBackupSchedules {
+    /// Schedules enrollment created, now deleted.
+    pub deleted: Vec<i32>,
+    /// Schedules the operator created or claimed, now disabled.
+    pub disabled: Vec<i32>,
+}
+
 #[derive(Debug, Error)]
 pub enum ManagedBackupScheduleError {
     #[error("Could not read the backup schedules targeting S3 source {s3_source_id}: {reason}")]
     Lookup { s3_source_id: i32, reason: String },
     #[error("Could not create the default backup schedule for S3 source {s3_source_id}: {reason}")]
     Create { s3_source_id: i32, reason: String },
+    #[error("Could not release the backup schedules targeting S3 source {s3_source_id}: {reason}")]
+    Release { s3_source_id: i32, reason: String },
 }
 
 /// Registered by the backup plugin as `Arc<dyn ManagedBackupScheduleProvisioner>`
-/// and resolved by the Cloud plugin once every service is registered.
+/// and resolved by the Cloud plugin once every service is registered. The
+/// backup plugin is optional: the Cloud plugin degrades to "no schedule
+/// information" when nothing registered an implementation.
 #[async_trait]
 pub trait ManagedBackupScheduleProvisioner: Send + Sync {
     /// The schedule that targets `s3_source_id`, when one exists. Several
@@ -75,4 +89,14 @@ pub trait ManagedBackupScheduleProvisioner: Send + Sync {
         s3_source_id: i32,
         retention_days: u16,
     ) -> Result<ManagedBackupSchedule, ManagedBackupScheduleError>;
+
+    /// Stop every schedule targeting `s3_source_id`, for the moment the
+    /// destination's credential is about to be revoked. The schedule
+    /// enrollment created (still tagged `temps-cloud`) is deleted; any other
+    /// is disabled, so the operator's configuration survives but nothing
+    /// keeps running against a dead credential.
+    async fn release_schedules_for_source(
+        &self,
+        s3_source_id: i32,
+    ) -> Result<ReleasedManagedBackupSchedules, ManagedBackupScheduleError>;
 }

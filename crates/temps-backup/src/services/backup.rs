@@ -1230,7 +1230,7 @@ pub enum RecoverySetPublication {
 
 #[derive(Clone)]
 pub struct BackupService {
-    pub(crate) db: Arc<DatabaseConnection>,
+    db: Arc<DatabaseConnection>,
     external_service_manager: Arc<ExternalServiceManager>,
     alarm_service: Arc<AlarmService>,
     config_service: Arc<temps_config::ConfigService>,

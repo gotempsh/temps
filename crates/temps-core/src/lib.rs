@@ -94,8 +94,8 @@ pub use error_builder::*;
 pub use jobs::*;
 pub use managed_backup_schedule::{
     ManagedBackupSchedule, ManagedBackupScheduleError, ManagedBackupScheduleProvisioner,
-    DEFAULT_MANAGED_BACKUP_RETENTION_DAYS, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
-    MANAGED_BACKUP_SCHEDULE_NAME,
+    ReleasedManagedBackupSchedules, DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
+    MANAGED_BACKUP_SCHEDULE_EXPRESSION, MANAGED_BACKUP_SCHEDULE_NAME,
 };
 pub use on_demand::*;
 pub use project_access::{

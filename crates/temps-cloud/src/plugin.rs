@@ -86,9 +86,14 @@ impl TempsPlugin for CloudPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let service = context.require_service::<CloudService>();
-            service.set_schedule_provisioner(
-                context.require_service::<dyn temps_core::ManagedBackupScheduleProvisioner>(),
-            );
+            // The backup plugin is optional; without it the Cloud settings
+            // page simply has no schedule to show (ADR-044).
+            match context.get_service::<dyn temps_core::ManagedBackupScheduleProvisioner>() {
+                Some(provisioner) => service.set_schedule_provisioner(provisioner),
+                None => tracing::info!(
+                    "backup plugin not registered; Temps Cloud managed backup schedules unavailable"
+                ),
+            }
             if cloud_initialization_succeeded(service.initialize().await) {
                 service.start_backup_mirror(
                     context.require_service::<sea_orm::DatabaseConnection>(),
