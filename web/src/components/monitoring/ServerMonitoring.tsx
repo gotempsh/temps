@@ -69,25 +69,34 @@ import {
 } from '@/lib/proxy-metrics-window'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, RefreshCw, Settings } from 'lucide-react'
+import { AlertTriangle, Pause, Play, RefreshCw, Settings } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 
 const METRICS_SETTINGS_PATH = '/settings/metrics-monitoring'
 const REFRESH_MS = 30_000
+/** All panels share one tooltip cursor: hover or arrow through one and the others follow. */
+const CHART_SYNC_ID = 'server-monitoring'
+
+const isRangePreset = (v: string | null): v is ProxyRangePreset =>
+  PROXY_RANGE_PRESETS.some((p) => p.value === v)
 
 // ---------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------
 
-function useNodeSeries(metric: string, range: ProxyRangePreset) {
+function useNodeSeries(
+  metric: string,
+  range: ProxyRangePreset,
+  refetchInterval: number | false
+) {
   return useQuery({
     ...nodeMetricsGetRangeOptions({
       path: { id: CONTROL_PLANE_NODE_ID },
       query: { metric, range },
     }),
     staleTime: 15_000,
-    refetchInterval: REFRESH_MS,
+    refetchInterval,
     retry: false,
   })
 }
@@ -234,6 +243,7 @@ function ChartPanel({
             series={series}
             thresholds={thresholds}
             height={220}
+            syncId={CHART_SYNC_ID}
             yTickFormatter={tickFormatter ?? valueFormatter}
             tooltipValueFormatter={valueFormatter}
           />
@@ -418,7 +428,24 @@ const memoryBands = bandsOf(MEMORY_THRESHOLDS)
 const diskBands = bandsOf(DISK_THRESHOLDS)
 
 export function ServerMonitoring() {
-  const [range, setRange] = useState<ProxyRangePreset>('1h')
+  // The window lives in the URL (`?range=6h`) so a link opens on the same
+  // view and the browser's back button walks the ranges.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const rangeParam = searchParams.get('range')
+  const range: ProxyRangePreset = isRangePreset(rangeParam) ? rangeParam : '1h'
+  const setRange = (next: ProxyRangePreset) =>
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev)
+        if (next === '1h') p.delete('range')
+        else p.set('range', next)
+        return p
+      },
+      { replace: true }
+    )
+  // Pause stops the 30 s polling so a sample under investigation stays put.
+  const [paused, setPaused] = useState(false)
+  const refetchInterval = paused ? false : REFRESH_MS
   const step = STEP_SECONDS[range]
   const showDate = range === '7d'
   const label = (iso: string) => formatProxyTimeLabel(iso, showDate)
@@ -430,16 +457,32 @@ export function ServerMonitoring() {
   const latest = useQuery({
     ...nodeMetricsGetLatestOptions({ path: { id: CONTROL_PLANE_NODE_ID } }),
     staleTime: 15_000,
-    refetchInterval: REFRESH_MS,
+    refetchInterval,
     retry: false,
   })
-  const cpu = useNodeSeries('node.cpu_percent', range)
-  const memory = useNodeSeries('node.memory_percent', range)
-  const disk = useNodeSeries('node.disk_used_bytes', range)
-  const rx = useNodeSeries('node.network_rx_bytes_total', range)
-  const tx = useNodeSeries('node.network_tx_bytes_total', range)
-  const read = useNodeSeries('node.disk_read_bytes_total', range)
-  const write = useNodeSeries('node.disk_write_bytes_total', range)
+  const cpu = useNodeSeries('node.cpu_percent', range, refetchInterval)
+  const memory = useNodeSeries('node.memory_percent', range, refetchInterval)
+  const disk = useNodeSeries('node.disk_used_bytes', range, refetchInterval)
+  const rx = useNodeSeries(
+    'node.network_rx_bytes_total',
+    range,
+    refetchInterval
+  )
+  const tx = useNodeSeries(
+    'node.network_tx_bytes_total',
+    range,
+    refetchInterval
+  )
+  const read = useNodeSeries(
+    'node.disk_read_bytes_total',
+    range,
+    refetchInterval
+  )
+  const write = useNodeSeries(
+    'node.disk_write_bytes_total',
+    range,
+    refetchInterval
+  )
 
   const snapshot = (latest.data ?? {}) as Record<string, number>
   const g = (k: string): number | null =>
@@ -521,6 +564,8 @@ export function ServerMonitoring() {
           onRange={setRange}
           scrapeInterval={scrapeInterval}
           ageSeconds={null}
+          paused={paused}
+          onTogglePause={() => setPaused((p) => !p)}
         />
         <Card>
           <CardHeader>
@@ -556,6 +601,8 @@ export function ServerMonitoring() {
         onRange={setRange}
         scrapeInterval={scrapeInterval}
         ageSeconds={ageSeconds}
+        paused={paused}
+        onTogglePause={() => setPaused((p) => !p)}
       />
 
       {firstError && (
@@ -725,15 +772,19 @@ function SectionIntro({
   onRange,
   scrapeInterval,
   ageSeconds,
+  paused,
+  onTogglePause,
 }: {
   range: ProxyRangePreset
   onRange: (r: ProxyRangePreset) => void
   scrapeInterval: number
   ageSeconds: number | null
+  paused: boolean
+  onTogglePause: () => void
 }) {
   return (
-    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-      <div>
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0">
         <h3 className="text-lg font-semibold tracking-tight">Server</h3>
         <p className="text-sm text-muted-foreground">
           Resource usage of the machine running this control plane, sampled
@@ -741,10 +792,25 @@ function SectionIntro({
           {ageSeconds != null
             ? ` · last sample ${formatAge(ageSeconds)} ago`
             : ''}
-          .
+          {paused ? ' · updates paused' : ' · refreshes every 30 s'}. Hover or
+          focus a chart and use ← → to read every panel at one instant.
         </p>
       </div>
-      <div className="flex items-center gap-1">
+      <div className="flex shrink-0 flex-wrap items-center gap-1">
+        <Button
+          variant="outline"
+          size="sm"
+          aria-pressed={paused}
+          onClick={onTogglePause}
+          className="mr-2"
+        >
+          {paused ? (
+            <Play className="mr-1.5 h-3.5 w-3.5" />
+          ) : (
+            <Pause className="mr-1.5 h-3.5 w-3.5" />
+          )}
+          {paused ? 'Resume' : 'Pause'}
+        </Button>
         {PROXY_RANGE_PRESETS.map((opt) => (
           <Button
             key={opt.value}

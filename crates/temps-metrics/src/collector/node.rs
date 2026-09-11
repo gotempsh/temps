@@ -564,13 +564,44 @@ fn is_virtual_block_device(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Whether `name` is a partition of one of `devices`, following the kernel's
+/// naming grammar rather than a bare prefix test: a partition is its parent's
+/// name plus a partition number (`sda` → `sda1`), with a `p` separator when
+/// the parent already ends in a digit (`nvme0n1` → `nvme0n1p1`, `mmcblk0` →
+/// `mmcblk0p2`). A prefix test would call `sdaa` (the 27th disk) a partition
+/// of `sda` and drop it from the totals.
+fn is_partition_of(name: &str, devices: &[&str]) -> bool {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.len() == name.len() || stem.is_empty() {
+        // No partition number at all: a whole disk.
+        return false;
+    }
+    let candidates: [&str; 2] = if let Some(base) = stem.strip_suffix('p') {
+        [stem, base]
+    } else {
+        [stem, stem]
+    };
+    for parent in candidates {
+        let parent_ends_in_digit = parent.ends_with(|c: char| c.is_ascii_digit());
+        // `sda1`'s parent is `sda` (no `p`); `nvme0n1p1`'s parent is `nvme0n1`
+        // (the `p` is required because the parent ends in a digit).
+        let valid_form = if parent == stem {
+            !parent_ends_in_digit
+        } else {
+            parent_ends_in_digit
+        };
+        if valid_form && devices.iter().any(|d| *d == parent && *d != name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse `/proc/diskstats` and sum sectors read/written over whole physical
 /// devices only.
 ///
 /// Partitions are excluded because their I/O is already included in the
-/// parent device's counters: a device is treated as a partition when another
-/// listed device name is a strict prefix of it (`sda` → `sda1`,
-/// `nvme0n1` → `nvme0n1p1`, `mmcblk0` → `mmcblk0p2`).
+/// parent device's counters; see [`is_partition_of`] for what counts as one.
 fn parse_diskstats(content: &str) -> Option<DiskIoTotals> {
     // (name, sectors_read, sectors_written)
     let mut devices: Vec<(&str, u64, u64)> = Vec::new();
@@ -594,12 +625,10 @@ fn parse_diskstats(content: &str) -> Option<DiskIoTotals> {
         return None;
     }
 
+    let names: Vec<&str> = devices.iter().map(|(n, _, _)| *n).collect();
     let mut totals = DiskIoTotals::default();
     for (name, sectors_read, sectors_written) in &devices {
-        let is_partition = devices
-            .iter()
-            .any(|(other, _, _)| other.len() < name.len() && name.starts_with(other));
-        if is_partition {
+        if is_partition_of(name, &names) {
             continue;
         }
         totals.read_bytes = totals
@@ -667,21 +696,60 @@ struct NetworkIoTotals {
     tx_bytes: u64,
 }
 
-/// Whether an interface is the loopback or a container-side virtual link.
-/// Traffic on `veth*` / `docker*` / `br-*` is either purely local
-/// (container ↔ container) or already counted on the physical uplink, so
-/// summing it would double-count what the operator thinks of as "the
-/// server's network I/O".
+/// Name-based fallback for [`is_physical_interface`]: the loopback, container
+/// links, bridges and the tunnels/overlays Temps and common orchestrators
+/// create. Traffic on these is either purely local or is the same bytes that
+/// already crossed the physical uplink underneath (a VXLAN or WireGuard packet
+/// is counted once on `vxlan-temps0` / `wg0` and again on `eth0`), so summing
+/// them would double-count what the operator thinks of as "the server's
+/// network I/O". Used only where `/sys/class/net` cannot be consulted.
 fn is_virtual_interface(name: &str) -> bool {
-    name == "lo"
-        || name.starts_with("veth")
-        || name.starts_with("docker")
-        || name.starts_with("br-")
-        || name.starts_with("virbr")
+    const PREFIXES: [&str; 16] = [
+        "veth",
+        "docker",
+        "br-",
+        "virbr",
+        "vxlan",
+        "wg",
+        "temps-wg",
+        "tun",
+        "tap",
+        "tailscale",
+        "flannel",
+        "cni",
+        "kube",
+        "weave",
+        "nerdctl",
+        "podman",
+    ];
+    name == "lo" || name.starts_with("temps") || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Parse `/proc/net/dev` and sum rx/tx bytes over physical interfaces.
+/// Whether an interface is backed by hardware: on Linux, a physical NIC has a
+/// `/sys/class/net/<name>/device` link to its PCI/USB device and a virtual
+/// one (bridge, veth, VXLAN, WireGuard, VLAN, bond, tun) does not. This is
+/// the kernel's own classification, so new overlay types need no allow-list.
+/// Falls back to [`is_virtual_interface`] when sysfs is not available.
+fn is_physical_interface(name: &str) -> bool {
+    let sys = std::path::Path::new("/sys/class/net");
+    if sys.is_dir() {
+        return sys.join(name).join("device").exists();
+    }
+    !is_virtual_interface(name)
+}
+
+/// Parse `/proc/net/dev` and sum rx/tx bytes over physical interfaces, using
+/// the name-based filter alone (what production falls back to without sysfs).
+#[cfg(test)]
 fn parse_net_dev(content: &str) -> Option<NetworkIoTotals> {
+    parse_net_dev_with(content, |name| !is_virtual_interface(name))
+}
+
+/// [`parse_net_dev`] with a caller-supplied physical-interface test.
+fn parse_net_dev_with(
+    content: &str,
+    is_physical: impl Fn(&str) -> bool,
+) -> Option<NetworkIoTotals> {
     let mut totals = NetworkIoTotals::default();
     let mut seen_any = false;
     // First two lines are headers. Data lines: `  eth0: <rx_bytes> <rx_packets>
@@ -693,7 +761,7 @@ fn parse_net_dev(content: &str) -> Option<NetworkIoTotals> {
             None => continue,
         };
         let name = name.trim();
-        if is_virtual_interface(name) {
+        if !is_physical(name) {
             continue;
         }
         let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -718,7 +786,7 @@ async fn collect_network_io(
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let totals = match parse_net_dev(&content) {
+    let totals = match parse_net_dev_with(&content, is_physical_interface) {
         Some(t) => t,
         None => {
             debug!(
@@ -1218,6 +1286,76 @@ mod tests {
         let totals = parse_diskstats(content).expect("should parse");
         assert_eq!(totals.read_bytes, (1000 + 10) * 512);
         assert_eq!(totals.write_bytes, (2000 + 20) * 512);
+    }
+
+    #[test]
+    fn test_is_partition_of_follows_kernel_naming() {
+        let devs = [
+            "sda",
+            "sda1",
+            "sdaa",
+            "sdaa1",
+            "nvme0n1",
+            "nvme0n1p1",
+            "mmcblk0",
+            "mmcblk0p2",
+            "vdb",
+        ];
+        assert!(is_partition_of("sda1", &devs));
+        assert!(is_partition_of("sdaa1", &devs));
+        assert!(is_partition_of("nvme0n1p1", &devs));
+        assert!(is_partition_of("mmcblk0p2", &devs));
+        // The 27th disk is not a partition of the first.
+        assert!(!is_partition_of("sdaa", &devs));
+        assert!(!is_partition_of("sda", &devs));
+        assert!(!is_partition_of("vdb", &devs));
+        // A whole NVMe namespace ends in a digit but has no listed parent.
+        assert!(!is_partition_of("nvme0n1", &devs));
+        assert!(!is_partition_of("mmcblk0", &devs));
+        // `sda1` is only a partition when `sda` is actually listed.
+        assert!(!is_partition_of("sdb1", &devs));
+    }
+
+    #[test]
+    fn test_parse_diskstats_counts_sdaa_as_a_whole_disk() {
+        let content = "\
+   8       0 sda 100 0 2048 0 50 0 1024 0 0 0 0
+   8       1 sda1 100 0 2048 0 50 0 1024 0 0 0 0
+  65     160 sdaa 10 0 4096 0 5 0 512 0 0 0 0
+  65     161 sdaa1 10 0 4096 0 5 0 512 0 0 0 0
+";
+        let t = parse_diskstats(content).expect("totals");
+        assert_eq!(t.read_bytes, (2048 + 4096) * 512);
+        assert_eq!(t.write_bytes, (1024 + 512) * 512);
+    }
+
+    #[test]
+    fn test_parse_net_dev_skips_overlay_and_tunnel_interfaces() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0
+vxlan-temps0: 500 1 0 0 0 0 0 0 600 1 0 0 0 0 0 0
+   wg0: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0
+ temps0: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0
+ tailscale0: 7 1 0 0 0 0 0 0 8 1 0 0 0 0 0 0
+";
+        let t = parse_net_dev(content).expect("totals");
+        assert_eq!(t.rx_bytes, 1000);
+        assert_eq!(t.tx_bytes, 2000);
+    }
+
+    #[test]
+    fn test_parse_net_dev_with_custom_physical_test() {
+        let content = "\
+h1
+h2
+  eth0: 1 0 0 0 0 0 0 0 10 0 0 0 0 0 0 0
+  eth1: 2 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0
+";
+        let t = parse_net_dev_with(content, |n| n == "eth1").expect("totals");
+        assert_eq!((t.rx_bytes, t.tx_bytes), (2, 20));
+        assert!(parse_net_dev_with(content, |_| false).is_none());
     }
 
     #[test]
