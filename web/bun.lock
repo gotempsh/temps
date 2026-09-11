@@ -32,7 +32,7 @@
         "@tailwindcss/postcss": "^4.3.3",
         "@tanstack/react-query": "^5.102.8",
         "@tanstack/react-virtual": "^3.14.10",
-        "@temps-sdk/console-kit": "file:./packages/console-kit",
+        "@temps-sdk/console-kit": "workspace:*",
         "@temps-sdk/react-analytics": "^0.0.4",
         "@types/three": "^0.185.4",
         "ansi-to-html": "^0.7.2",
@@ -548,7 +548,6 @@
 
     "@temps-sdk/analytics-core": ["@temps-sdk/analytics-core@0.0.2", "", { "dependencies": { "@rrweb/packer": "^2.0.0-alpha.17", "rrweb": "^2.0.0-alpha.17", "web-vitals": "^4.2.4" } }, "sha512-7lpfpNLVzmHDJtKVuaX11e3BJoKkjeFabssg7kJuK3iOfZxp+tpLCxY4V7z3H5DN5VHGLi9dAFj4FxSlv5azbw=="],
 
-    "@temps-sdk/console-kit": ["@temps-sdk/console-kit@file:packages/console-kit", { "devDependencies": { "@types/react": "^19.1.12", "react": "^19.1.1", "typescript": "^5.9.2" }, "peerDependencies": { "react": "^19.0.0" } }],
 
     "@temps-sdk/console-kit": ["@temps-sdk/console-kit@workspace:packages/console-kit"],
 
@@ -1686,7 +1685,6 @@
 
     "@tailwindcss/oxide-wasm32-wasi/tslib": ["tslib@2.8.1", "", { "bundled": true }, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
 
-    "@temps-sdk/console-kit/react": ["react@19.1.1", "", {}, "sha512-w8nqGImo45dmMIfljjMwOGtbmC/mk4CMYhWIicdSflH91J9TyCyczcPFXJzrZ/ZXcgGRFeP6BU0BEJTw6tZdfQ=="],
 
     "@types/d3-interpolate/@types/d3-color": ["@types/d3-color@2.0.6", "", {}, "sha512-tbaFGDmJWHqnenvk3QGSvD3RVwr631BjKRD7Sc7VLRgrdX5mk5hTyoeBL6rXZaeoXzmZwIl1D2HPogEdt1rHBg=="],
 
