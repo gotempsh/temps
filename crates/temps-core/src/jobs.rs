@@ -382,6 +382,21 @@ pub struct BackupFailedJob {
     pub error_message: String,
 }
 
+/// Published by the backup service once a backup's remote objects and its
+/// row are gone (a manual delete or schedule retention). Lets anything that
+/// catalogs the instance's backups elsewhere (the Cloud mirror) stop
+/// offering it, instead of discovering the loss at the next failed restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupDeletedJob {
+    /// The local `backups.id`; already gone from the table when this fires.
+    pub backup_id: i32,
+    /// The backup's stable `backups.backup_id` UUID string, the identity
+    /// remote catalogs key on.
+    pub backup_uuid: String,
+    pub engine: String,
+    pub s3_location: String,
+}
+
 /// Ask the deployment job processor to re-run its [`DeploymentGate`] check for
 /// a deployment that a previous check left sitting in `Pending`.
 ///
@@ -459,6 +474,7 @@ pub enum Job {
     BackupStarted(BackupStartedJob),
     BackupCompleted(BackupCompletedJob),
     BackupFailed(BackupFailedJob),
+    BackupDeleted(BackupDeletedJob),
     BackupCancelRequested(BackupCancelRequestedJob),
     /// Scheduled hourly to prune raw service_metrics rows older than the
     /// configured `retention_raw_days` window. Continuous aggregates
@@ -518,6 +534,7 @@ impl fmt::Display for Job {
             Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
+            Job::BackupDeleted(job) => write!(f, "BackupDeleted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),
             Job::PruneMetrics => write!(f, "PruneMetrics"),
             Job::DeploymentGateRecheck(job) => {
