@@ -1284,7 +1284,7 @@ async fn declare_and_complete_native_snapshot(
         source_image,
         in_place_root,
     };
-    let snapshot = match link.declare_native_snapshot(&request).await {
+    let mut snapshot = match link.declare_native_snapshot(&request).await {
         Ok(snapshot) => snapshot,
         // Cloud understood the in-place request and refused it (a root it
         // will not accept, a bucket that disagrees with the manifest). That
@@ -1319,6 +1319,34 @@ async fn declare_and_complete_native_snapshot(
         }
         Err(error) => return Err(StageError::Retry(error.to_string())),
     };
+    if snapshot.upload_required && request.in_place_root.is_some() {
+        // Cloud took the declaration but wants a copy anyway: a Cloud that
+        // does not know `in_place_root` ignores it and answers as it always
+        // did. Its uploads bind checksums the in-place declaration did not
+        // carry, so hash now and re-declare the copy manifest; Cloud
+        // replaces the never-completed draft.
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            "Cloud did not catalog the snapshot in place; mirroring a copy instead"
+        );
+        declarations = native_declarations(
+            resources,
+            backup,
+            source_config,
+            root,
+            selected,
+            engine,
+            true,
+        )
+        .await?;
+        request.in_place_root = None;
+        request.objects = declarations.clone();
+        snapshot = link
+            .declare_native_snapshot(&request)
+            .await
+            .map_err(|error| StageError::Retry(error.to_string()))?;
+    }
     if !snapshot.upload_required && request.in_place_root.is_some() {
         info!(
             local_backup_id = %backup.backup_id,
@@ -1625,7 +1653,7 @@ async fn mirror_walg_backup(
         manifest_digest = %manifest_digest(&declarations),
         "Cloud backup mirror declaring WAL-G snapshot"
     );
-    let snapshot = match link.declare_walg_snapshot(&request).await {
+    let mut snapshot = match link.declare_walg_snapshot(&request).await {
         Ok(snapshot) => snapshot,
         // Same reasoning as the native path: a 400 to an in-place
         // declaration is a verdict on the layout, not a transient fault.
@@ -1656,6 +1684,32 @@ async fn mirror_walg_backup(
         }
         Err(error) => return Err(StageError::Retry(error.to_string())),
     };
+    if snapshot.upload_required && request.in_place_root.is_some() {
+        // See the native path: a Cloud that ignores `in_place_root` still
+        // wants a copy, and the copy needs hashes.
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            "Cloud did not catalog the WAL-G repository in place; mirroring a copy instead"
+        );
+        declarations = walg_declarations(
+            resources,
+            backup,
+            &source_config,
+            &root,
+            &selected,
+            &sentinel_key,
+            &base_prefix,
+            true,
+        )
+        .await?;
+        request.in_place_root = None;
+        request.objects = declarations.clone();
+        snapshot = link
+            .declare_walg_snapshot(&request)
+            .await
+            .map_err(|error| StageError::Retry(error.to_string()))?;
+    }
     if !snapshot.upload_required && request.in_place_root.is_some() {
         info!(
             local_backup_id = %backup.backup_id,
@@ -4606,6 +4660,9 @@ mod tests {
         /// Refuse declarations that carry `in_place_root` with a 400, the
         /// way Cloud does for a root it will not catalog.
         reject_in_place: bool,
+        /// Accept declarations but answer `upload_required: true` whatever
+        /// they carry, the way a Cloud that predates `in_place_root` does.
+        ignore_in_place: bool,
         target_calls: AtomicUsize,
         completions: AtomicUsize,
     }
@@ -4629,7 +4686,7 @@ mod tests {
         let in_place = request.in_place_root.is_some();
         let response = NativeSnapshot {
             backup_id: request.backup_id,
-            upload_required: !in_place,
+            upload_required: !in_place || state.ignore_in_place,
             completed_relative_keys: Vec::new(),
         };
         state.declared.lock().expect("declared lock").push(request);
@@ -4688,6 +4745,7 @@ mod tests {
         let cloud = Arc::new(InPlaceCloudStub {
             declared: Mutex::new(Vec::new()),
             reject_in_place: false,
+            ignore_in_place: false,
             target_calls: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
         });
@@ -4801,8 +4859,7 @@ mod tests {
     /// what Cloud always accepted. The stub's target endpoint returns 500,
     /// so reaching it is the proof that the fallback happened, and the
     /// resulting error is `Retry`, exactly as for any copy-path hiccup.
-    #[tokio::test]
-    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+    async fn copy_path_fallback_case(reject_in_place: bool, ignore_in_place: bool) {
         let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
             return;
         };
@@ -4820,7 +4877,8 @@ mod tests {
         );
         let cloud = Arc::new(InPlaceCloudStub {
             declared: Mutex::new(Vec::new()),
-            reject_in_place: true,
+            reject_in_place,
+            ignore_in_place,
             target_calls: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
         });
@@ -4921,6 +4979,21 @@ mod tests {
             "the copy path asked for an upload target"
         );
         assert_eq!(cloud.completions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+        copy_path_fallback_case(true, false).await;
+    }
+
+    /// A Cloud that predates `in_place_root` accepts the declaration and
+    /// answers `upload_required: true` as it always did. The in-place
+    /// declaration carried no checksums and uploads need them, so the sweep
+    /// must re-declare a hashed copy manifest before its first upload
+    /// rather than fail every object.
+    #[tokio::test]
+    async fn an_ignored_in_place_root_re_declares_with_checksums_before_uploading() {
+        copy_path_fallback_case(false, true).await;
     }
 
     /// The `mirror_native_backup` fallback branch treats a dump with no

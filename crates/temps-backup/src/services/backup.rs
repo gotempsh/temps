@@ -10812,6 +10812,24 @@ mod tests {
 
     struct NoopJobQueue;
 
+    /// Records every job sent, so a test can assert what the service
+    /// published without a live consumer.
+    struct RecordingJobQueue {
+        sent: std::sync::Mutex<Vec<temps_core::Job>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for RecordingJobQueue {
+        async fn send(&self, job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            self.sent.lock().unwrap().push(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("RecordingJobQueue does not support subscribing in tests")
+        }
+    }
+
     #[async_trait::async_trait]
     impl temps_core::JobQueue for NoopJobQueue {
         async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
@@ -11295,6 +11313,10 @@ mod tests {
             config_service,
             encryption_service,
         );
+        let published = Arc::new(RecordingJobQueue {
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        backup_service.set_queue(published.clone());
 
         // Create a test user for backup operations
         use sea_orm::{ActiveModelTrait, Set};
@@ -11473,6 +11495,22 @@ mod tests {
             .await
             .expect("backup deletion should complete");
         assert_eq!(deleted_objects, 2, "dump and metadata must be deleted");
+        // Anything cataloging this backup elsewhere (the Cloud mirror) hears
+        // about the deletion, keyed on the stable backup uuid.
+        let deleted_jobs: Vec<temps_core::BackupDeletedJob> = published
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|job| match job {
+                temps_core::Job::BackupDeleted(job) => Some(job.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted_jobs.len(), 1, "one BackupDeleted per deletion");
+        assert_eq!(deleted_jobs[0].backup_uuid, backup_result.backup_id);
+        assert_eq!(deleted_jobs[0].backup_id, backup_result.id);
+        assert_eq!(deleted_jobs[0].s3_location, backup_result.s3_location);
         let remaining = s3_client
             .list_objects_v2()
             .bucket(bucket_name)
