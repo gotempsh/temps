@@ -4746,6 +4746,24 @@ SELECT cp.id
         }
 
         info!(backup_id = %backup.backup_id, "Backup deleted successfully");
+        // Tell anyone cataloging this instance's backups elsewhere. Best
+        // effort: the deletion is done either way, and the Cloud mirror has
+        // its own presence check for events that never arrive.
+        if let Some(queue) = self.queue.get() {
+            if let Err(error) = queue
+                .send(temps_core::Job::BackupDeleted(
+                    temps_core::BackupDeletedJob {
+                        backup_id: backup.id,
+                        backup_uuid: backup.backup_id.clone(),
+                        engine: engine.to_string(),
+                        s3_location: backup.s3_location.clone(),
+                    },
+                ))
+                .await
+            {
+                warn!(backup_id = %backup.backup_id, error = %error, "could not publish BackupDeleted");
+            }
+        }
         Ok((backup, deleted_objects))
     }
 

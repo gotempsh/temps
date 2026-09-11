@@ -1164,20 +1164,72 @@ async fn mirror_native_backup(
 /// layout in the same bucket. A Cloud that predates the field answers
 /// `upload_required: true` and the copy path runs unchanged.
 ///
-/// Only snapshot-exclusive layouts qualify: an object set or a logical dump
-/// lives under a root that belongs to this backup alone. A WAL-G stream
-/// snapshot (Redis/MongoDB `/walg`, MariaDB physical) selects its objects out
-/// of a repository shared by every backup of that service, and WAL-G's own
-/// retention later deletes from it, so cataloging those objects in place would
-/// leave Cloud pointing at files that disappear. They keep the copy path.
-fn in_place_root_for(
-    managed_by_cloud: bool,
-    compression: BackupCompression,
-    root: &str,
-) -> Option<String> {
-    (managed_by_cloud && compression != BackupCompression::WalGNative)
+/// Every managed source qualifies, including WAL-G repositories shared by
+/// every backup of a service: Cloud confirms only the declared keys of a
+/// shared repository and hears about deletions through the `deleted`
+/// lifecycle event (and its own presence check), so WAL-G's retention no
+/// longer leaves it pointing at files that disappeared.
+fn in_place_root_for(managed_by_cloud: bool, root: &str) -> Option<String> {
+    managed_by_cloud
         .then(|| root.trim_matches('/').to_string())
         .filter(|root| !root.is_empty())
+}
+
+/// Build a native snapshot's object declarations from the listing. With
+/// `hash`, every object is streamed once for its SHA-256 (the copy path
+/// needs it: Cloud binds it into the presigned upload). Without, the listed
+/// size is the declaration and nothing is read: an in-place declaration is
+/// confirmed by Cloud against the bucket, and reading every object back
+/// only to hash it was the whole cost of a sweep.
+async fn native_declarations(
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    source_config: &s3_sources::Model,
+    root: &str,
+    selected: &[SourceObject],
+    engine: BackupEngine,
+    hash: bool,
+) -> Result<Vec<NativeSnapshotObjectDeclaration>, StageError> {
+    let mut declarations = Vec::with_capacity(selected.len());
+    for object in selected {
+        let (bytes, checksum_sha256) = if hash {
+            let (bytes, checksum) = resources
+                .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+                .await?;
+            if bytes != object.bytes {
+                return Err(StageError::Retry(format!(
+                    "native snapshot object {} changed while its manifest was built",
+                    object.key
+                )));
+            }
+            (bytes, Some(checksum))
+        } else {
+            (object.bytes, None)
+        };
+        let relative_key = object
+            .key
+            .strip_prefix(&format!("{root}/"))
+            .unwrap_or_else(|| object.key.rsplit('/').next().unwrap_or(&object.key))
+            .to_string();
+        let kind = if object.key.ends_with("_backup_stop_sentinel.json")
+            || object.key.ends_with("metadata.json")
+        {
+            NativeSnapshotObjectKind::Metadata
+        } else if engine == BackupEngine::MariaDb {
+            NativeSnapshotObjectKind::BaseBackup
+        } else if engine == BackupEngine::RustFs {
+            NativeSnapshotObjectKind::Object
+        } else {
+            NativeSnapshotObjectKind::Data
+        };
+        declarations.push(NativeSnapshotObjectDeclaration {
+            relative_key,
+            kind,
+            bytes,
+            checksum_sha256,
+        });
+    }
+    Ok(declarations)
 }
 
 /// Declare, upload (if required), and complete a native snapshot against
@@ -1203,47 +1255,23 @@ async fn declare_and_complete_native_snapshot(
     selected: &[SourceObject],
     source_image: Option<String>,
 ) -> Result<(), StageError> {
-    let mut declarations = Vec::with_capacity(selected.len());
-    for object in selected {
-        let (bytes, checksum_sha256) = resources
-            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
-            .await?;
-        if bytes != object.bytes {
-            return Err(StageError::Retry(format!(
-                "native snapshot object {} changed while its manifest was built",
-                object.key
-            )));
-        }
-        let relative_key = object
-            .key
-            .strip_prefix(&format!("{root}/"))
-            .unwrap_or_else(|| object.key.rsplit('/').next().unwrap_or(&object.key))
-            .to_string();
-        let kind = if object.key.ends_with("_backup_stop_sentinel.json")
-            || object.key.ends_with("metadata.json")
-        {
-            NativeSnapshotObjectKind::Metadata
-        } else if engine == BackupEngine::MariaDb {
-            NativeSnapshotObjectKind::BaseBackup
-        } else if engine == BackupEngine::RustFs {
-            NativeSnapshotObjectKind::Object
-        } else {
-            NativeSnapshotObjectKind::Data
-        };
-        declarations.push(NativeSnapshotObjectDeclaration {
-            relative_key,
-            kind,
-            bytes,
-            checksum_sha256,
-        });
-    }
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, root);
+    let mut declarations = native_declarations(
+        resources,
+        backup,
+        source_config,
+        root,
+        selected,
+        engine,
+        in_place_root.is_none(),
+    )
+    .await?;
     let cloud_backup_id = Uuid::new_v5(
         &link
             .tenant_id()
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let in_place_root = in_place_root_for(source_config.managed_by_cloud, compression, root);
     let mut request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
@@ -1270,7 +1298,21 @@ async fn declare_and_complete_native_snapshot(
                 %detail,
                 "Cloud declined to catalog the snapshot in place; mirroring a copy instead"
             );
+            // The copy path binds a checksum into every upload, so the
+            // objects are read now, once, for exactly the snapshots Cloud
+            // would not take in place.
+            declarations = native_declarations(
+                resources,
+                backup,
+                source_config,
+                root,
+                selected,
+                engine,
+                true,
+            )
+            .await?;
             request.in_place_root = None;
+            request.objects = declarations.clone();
             link.declare_native_snapshot(&request)
                 .await
                 .map_err(|error| StageError::Retry(error.to_string()))?
@@ -1528,43 +1570,25 @@ async fn mirror_walg_backup(
         }
     }
 
-    let mut declarations = Vec::with_capacity(selected.len());
-    for object in &selected {
-        let (bytes, checksum_sha256) = resources
-            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
-            .await?;
-        if bytes != object.bytes {
-            return Err(StageError::Retry(format!(
-                "WAL-G object {} changed while its manifest was being built",
-                object.key
-            )));
-        }
-        declarations.push(WalGObjectDeclaration {
-            relative_key: object
-                .key
-                .strip_prefix(&format!("{root}/"))
-                .ok_or_else(|| {
-                    StageError::Retry(format!("object {} escaped repository", object.key))
-                })?
-                .to_string(),
-            kind: if object.key == sentinel_key {
-                WalGObjectKind::Sentinel
-            } else if object.key.starts_with(&base_prefix) {
-                WalGObjectKind::BaseBackup
-            } else {
-                WalGObjectKind::Wal
-            },
-            bytes,
-            checksum_sha256,
-        });
-    }
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, &root);
+    let mut declarations = walg_declarations(
+        resources,
+        backup,
+        &source_config,
+        &root,
+        &selected,
+        &sentinel_key,
+        &base_prefix,
+        in_place_root.is_none(),
+    )
+    .await?;
     let cloud_backup_id = Uuid::new_v5(
         &link
             .tenant_id()
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let request = WalGSnapshotRequest {
+    let mut request = WalGSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
         source,
@@ -1584,6 +1608,7 @@ async fn mirror_walg_backup(
         start_lsn,
         finish_lsn,
         objects: declarations.clone(),
+        in_place_root,
     };
     // The declared manifest is what Cloud binds the snapshot to, and a retry
     // that computes a different one is rejected. Log the identity and the shape
@@ -1600,10 +1625,45 @@ async fn mirror_walg_backup(
         manifest_digest = %manifest_digest(&declarations),
         "Cloud backup mirror declaring WAL-G snapshot"
     );
-    let snapshot = link
-        .declare_walg_snapshot(&request)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let snapshot = match link.declare_walg_snapshot(&request).await {
+        Ok(snapshot) => snapshot,
+        // Same reasoning as the native path: a 400 to an in-place
+        // declaration is a verdict on the layout, not a transient fault.
+        // Hash the objects now (the copy path needs it) and re-declare.
+        Err(CloudError::Rejected { detail }) if request.in_place_root.is_some() => {
+            warn!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                %detail,
+                "Cloud declined to catalog the WAL-G repository in place; mirroring a copy instead"
+            );
+            declarations = walg_declarations(
+                resources,
+                backup,
+                &source_config,
+                &root,
+                &selected,
+                &sentinel_key,
+                &base_prefix,
+                true,
+            )
+            .await?;
+            request.in_place_root = None;
+            request.objects = declarations.clone();
+            link.declare_walg_snapshot(&request)
+                .await
+                .map_err(|error| StageError::Retry(error.to_string()))?
+        }
+        Err(error) => return Err(StageError::Retry(error.to_string())),
+    };
+    if !snapshot.upload_required && request.in_place_root.is_some() {
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            objects = declarations.len(),
+            "Cloud cataloged the WAL-G repository in place; no second copy uploaded"
+        );
+    }
     if snapshot.upload_required {
         let mut pass = UploadPass {
             declared: declarations.len(),
@@ -1664,6 +1724,58 @@ async fn mirror_walg_backup(
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
+}
+
+/// WAL-G counterpart of [`native_declarations`]: listed sizes without a
+/// read for an in-place declaration, one hashing read per object for the
+/// copy path.
+#[allow(clippy::too_many_arguments)]
+async fn walg_declarations(
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    source_config: &s3_sources::Model,
+    root: &str,
+    selected: &[SourceObject],
+    sentinel_key: &str,
+    base_prefix: &str,
+    hash: bool,
+) -> Result<Vec<WalGObjectDeclaration>, StageError> {
+    let mut declarations = Vec::with_capacity(selected.len());
+    for object in selected {
+        let (bytes, checksum_sha256) = if hash {
+            let (bytes, checksum) = resources
+                .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+                .await?;
+            if bytes != object.bytes {
+                return Err(StageError::Retry(format!(
+                    "WAL-G object {} changed while its manifest was being built",
+                    object.key
+                )));
+            }
+            (bytes, Some(checksum))
+        } else {
+            (object.bytes, None)
+        };
+        declarations.push(WalGObjectDeclaration {
+            relative_key: object
+                .key
+                .strip_prefix(&format!("{root}/"))
+                .ok_or_else(|| {
+                    StageError::Retry(format!("object {} escaped repository", object.key))
+                })?
+                .to_string(),
+            kind: if object.key == sentinel_key {
+                WalGObjectKind::Sentinel
+            } else if object.key.starts_with(base_prefix) {
+                WalGObjectKind::BaseBackup
+            } else {
+                WalGObjectKind::Wal
+            },
+            bytes,
+            checksum_sha256,
+        });
+    }
+    Ok(declarations)
 }
 
 #[derive(Clone, Debug)]
@@ -1858,7 +1970,7 @@ fn manifest_digest(declarations: &[WalGObjectDeclaration]) -> String {
         hasher.update(object.relative_key.as_bytes());
         hasher.update([0]);
         hasher.update(object.bytes.to_le_bytes());
-        hasher.update(object.checksum_sha256.as_bytes());
+        hasher.update(object.checksum_sha256.as_deref().unwrap_or("").as_bytes());
         hasher.update([0]);
     }
     hasher
@@ -1942,6 +2054,18 @@ async fn inspect_source_object(
     Ok((bytes, checksum))
 }
 
+/// The copy path uploads against a checksum Cloud bound into the target, so
+/// an object declared without one (an in-place declaration) can never be
+/// uploaded. The sweep re-declares with hashes before it ever gets here;
+/// reaching this is a programming error, not a transient condition.
+fn declared_checksum(relative_key: &str, checksum: &Option<String>) -> Result<String, StageError> {
+    checksum.clone().ok_or_else(|| {
+        StageError::Unsupported(format!(
+            "{relative_key} was declared without a checksum and cannot be uploaded"
+        ))
+    })
+}
+
 async fn upload_repository_object(
     link: &CloudLink,
     source_client: &S3Client,
@@ -1951,6 +2075,8 @@ async fn upload_repository_object(
     backup_id: Uuid,
     declaration: WalGObjectDeclaration,
 ) -> Result<(), StageError> {
+    let checksum_sha256 =
+        declared_checksum(&declaration.relative_key, &declaration.checksum_sha256)?;
     let target = link
         .walg_object_target(&WalGObjectTargetRequest {
             backup_id,
@@ -2049,7 +2175,7 @@ async fn upload_repository_object(
         backup_id,
         relative_key: declaration.relative_key,
         bytes: declaration.bytes,
-        checksum_sha256: declaration.checksum_sha256,
+        checksum_sha256,
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
@@ -2064,6 +2190,8 @@ async fn upload_native_object(
     backup_id: Uuid,
     declaration: NativeSnapshotObjectDeclaration,
 ) -> Result<(), StageError> {
+    let checksum_sha256 =
+        declared_checksum(&declaration.relative_key, &declaration.checksum_sha256)?;
     let target = link
         .native_object_target(&WalGObjectTargetRequest {
             backup_id,
@@ -2159,7 +2287,7 @@ async fn upload_native_object(
         backup_id,
         relative_key: declaration.relative_key,
         bytes: declaration.bytes,
-        checksum_sha256: declaration.checksum_sha256,
+        checksum_sha256,
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
@@ -2616,9 +2744,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
     use temps_cloud_protocol::{
-        BackupCompression, NativeSnapshot, NativeSnapshotObjectDeclaration,
-        NativeSnapshotObjectKind, NativeSnapshotRequest, WalGObjectCompleted,
-        WalGObjectTargetRequest,
+        NativeSnapshot, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
+        NativeSnapshotRequest, WalGObjectCompleted, WalGObjectTargetRequest,
     };
     use uuid::Uuid;
 
@@ -2627,7 +2754,7 @@ mod tests {
             relative_key: relative_key.to_owned(),
             kind: NativeSnapshotObjectKind::Object,
             bytes: 1,
-            checksum_sha256: "ab".repeat(32),
+            checksum_sha256: Some("ab".repeat(32)),
         }
     }
 
@@ -4443,27 +4570,34 @@ mod tests {
                 "a real repository with a complete dump + metadata.json must not be Unsupported: {reason}"
             ),
         }
-        assert_eq!(
-            resources.object_inspections.len(),
-            2,
-            "expected exactly the dump object and metadata.json to be read and checksummed, \
-             proving the decoy object was excluded and both real objects were reached"
+        assert!(
+            resources.object_inspections.is_empty(),
+            "a managed source is declared in place from the listing: nothing is read back \
+             to be hashed (`managed_native_snapshots_are_declared_in_place_and_never_re_uploaded` \
+             proves the selection against the same decoy)"
         );
     }
 
     #[test]
-    fn only_snapshot_exclusive_layouts_on_managed_sources_catalog_in_place() {
+    fn every_managed_source_catalogs_in_place() {
         let root = "/t/managed-backups/external_services/s3/store/2026-09-11/backup-7/";
         assert_eq!(
-            super::in_place_root_for(true, BackupCompression::None, root).as_deref(),
+            super::in_place_root_for(true, root).as_deref(),
             Some("t/managed-backups/external_services/s3/store/2026-09-11/backup-7")
         );
-        assert!(super::in_place_root_for(true, BackupCompression::Gzip, root).is_some());
-        // Shared WAL-G repositories are rotated by WAL-G retention: copy.
-        assert!(super::in_place_root_for(true, BackupCompression::WalGNative, root).is_none());
+        // Shared WAL-G repositories too: Cloud confirms only the declared
+        // keys and learns of deletions through the lifecycle event.
+        assert_eq!(
+            super::in_place_root_for(
+                true,
+                "/t/managed-backups/external_services/postgres/main/walg"
+            )
+            .as_deref(),
+            Some("t/managed-backups/external_services/postgres/main/walg")
+        );
         // Operator-owned sources are not the cloud bucket: copy.
-        assert!(super::in_place_root_for(false, BackupCompression::None, root).is_none());
-        assert!(super::in_place_root_for(true, BackupCompression::None, "/").is_none());
+        assert!(super::in_place_root_for(false, root).is_none());
+        assert!(super::in_place_root_for(true, "/").is_none());
     }
 
     struct InPlaceCloudStub {
@@ -4588,6 +4722,10 @@ mod tests {
             let mut objects = state.objects.lock().expect("repository stub objects lock");
             objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
             objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+            objects.insert(
+                format!("{expected_root}/unrelated-object.tmp"),
+                b"not part of this backup".to_vec(),
+            );
         }
 
         let temp = tempfile::tempdir().expect("cloud-link state dir");
@@ -4633,7 +4771,22 @@ mod tests {
             declared[0].in_place_root.as_deref(),
             Some(expected_root.as_str())
         );
-        assert_eq!(declared[0].objects.len(), 2);
+        assert_eq!(
+            declared[0].objects.len(),
+            2,
+            "the dump and its metadata.json, not the decoy"
+        );
+        assert!(
+            declared[0]
+                .objects
+                .iter()
+                .all(|object| object.checksum_sha256.is_none()),
+            "an in-place declaration carries sizes, not hashes"
+        );
+        assert!(
+            resources.object_inspections.is_empty(),
+            "nothing is read back from the bucket to declare in place"
+        );
         assert_eq!(
             cloud.target_calls.load(Ordering::SeqCst),
             0,
@@ -4748,9 +4901,20 @@ mod tests {
             "in-place attempt, then the copy-path re-declaration"
         );
         assert!(declared[0].in_place_root.is_some());
+        assert!(declared[0]
+            .objects
+            .iter()
+            .all(|object| object.checksum_sha256.is_none()));
         assert!(
             declared[1].in_place_root.is_none(),
             "the fallback must not carry the rejected root"
+        );
+        assert!(
+            declared[1]
+                .objects
+                .iter()
+                .all(|object| object.checksum_sha256.is_some()),
+            "the copy path re-declares with the hashes its uploads bind"
         );
         assert!(
             cloud.target_calls.load(Ordering::SeqCst) > 0,
@@ -4992,7 +5156,7 @@ mod tests {
             relative_key: key.to_owned(),
             kind: WalGObjectKind::Wal,
             bytes,
-            checksum_sha256: checksum.to_owned(),
+            checksum_sha256: Some(checksum.to_owned()),
         };
         let checksum = "a".repeat(64);
         let manifest = vec![
@@ -5018,7 +5182,7 @@ mod tests {
         assert_ne!(manifest_digest(&rekeyed), digest);
 
         let mut rechecksummed = manifest;
-        rechecksummed[1].checksum_sha256 = "b".repeat(64);
+        rechecksummed[1].checksum_sha256 = Some("b".repeat(64));
         assert_ne!(manifest_digest(&rechecksummed), digest);
     }
 
@@ -5402,7 +5566,7 @@ mod tests {
             relative_key: "object-0001.bin".into(),
             kind: NativeSnapshotObjectKind::Object,
             bytes,
-            checksum_sha256,
+            checksum_sha256: Some(checksum_sha256),
         };
 
         expect_stage_ok(
@@ -5531,7 +5695,7 @@ mod tests {
                     relative_key: "object-0001.bin".into(),
                     kind: NativeSnapshotObjectKind::Object,
                     bytes: source_body.len() as u64,
-                    checksum_sha256: expected_checksum,
+                    checksum_sha256: Some(expected_checksum),
                 },
             )
             .await,

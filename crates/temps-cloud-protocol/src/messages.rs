@@ -314,7 +314,12 @@ pub struct NativeSnapshotObjectDeclaration {
     pub relative_key: String,
     pub kind: NativeSnapshotObjectKind,
     pub bytes: u64,
-    pub checksum_sha256: String,
+    /// Hex SHA-256 of the object. Optional: an object Cloud catalogs in
+    /// place (`in_place_root`) is declared by size alone, so the instance
+    /// never reads it back to hash it. The copy path always carries one,
+    /// because Cloud binds it into the presigned upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
 }
 
 /// Engine-neutral registration envelope for physical/native backups.
@@ -394,8 +399,11 @@ pub struct WalGObjectDeclaration {
     pub bytes: u64,
     /// Hex SHA-256 computed by streaming the source object once. Cloud binds
     /// it into the presigned PUT; the subsequent upload is a second bounded-
-    /// memory stream and never requires a local staging file.
-    pub checksum_sha256: String,
+    /// memory stream and never requires a local staging file. Optional for
+    /// the same reason as on `NativeSnapshotObjectDeclaration`: a
+    /// repository cataloged in place is declared by size alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
 }
 
 /// Register a physical PostgreSQL snapshot before mirroring its objects.
@@ -413,6 +421,16 @@ pub struct WalGSnapshotRequest {
     pub start_lsn: String,
     pub finish_lsn: String,
     pub objects: Vec<WalGObjectDeclaration>,
+    /// The WAL-G repository root in the Cloud-managed bucket under which
+    /// every object in `objects` already sits (`<in_place_root>/<relative_key>`).
+    /// Same contract as `NativeSnapshotRequest::in_place_root`: set only for
+    /// sources the cloud manages, so Cloud catalogs the repository where it
+    /// is instead of asking for a second copy. The repository is shared by
+    /// every snapshot of the service; Cloud confirms only the declared keys.
+    /// A Cloud that predates the field ignores it and answers
+    /// `upload_required: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +682,9 @@ pub enum BackupLifecycleStage {
     Started,
     Completed,
     Failed,
+    /// The instance deleted the backup (schedule retention or by hand), so
+    /// Cloud's catalog entry for it must stop being offered as restorable.
+    Deleted,
 }
 
 /// A backup lifecycle transition reported by an instance. `instance_id`
@@ -684,6 +705,12 @@ pub struct BackupLifecycleEventRequest {
     pub size_bytes: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// The instance's own `backups.backup_id` (its stable UUID string), the
+    /// value the mirror sweep hashes with `instance_id` into the catalog
+    /// `backup_id`. Sent with `Deleted` so Cloud can find the catalog entry
+    /// without a lookup table; older instances never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,13 +1105,57 @@ mod tests {
                     "basebackups_005/base_00000001000000000000000A_backup_stop_sentinel.json".into(),
                 kind: WalGObjectKind::Sentinel,
                 bytes: 512,
-                checksum_sha256: "00".repeat(32),
+                checksum_sha256: Some("00".repeat(32)),
             }],
+            in_place_root: None,
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["engine"], "postgres");
         assert_eq!(value["objects"][0]["kind"], "sentinel");
         assert_eq!(value["timeline"], 1);
+    }
+
+    /// An in-place declaration carries no checksum and the WAL-G root; the
+    /// keys are absent from the wire, not null, so a Cloud built before them
+    /// sees the request it always did.
+    #[test]
+    fn in_place_declarations_omit_absent_checksums_and_carry_the_root() {
+        let object = WalGObjectDeclaration {
+            relative_key: "wal_005/000000010000000000000005.lz4".into(),
+            kind: WalGObjectKind::Wal,
+            bytes: 16_777_216,
+            checksum_sha256: None,
+        };
+        let value = serde_json::to_value(&object).unwrap();
+        assert!(value.get("checksum_sha256").is_none());
+        let parsed: WalGObjectDeclaration = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, object);
+        let with_hash: WalGObjectDeclaration = serde_json::from_value(serde_json::json!({
+            "relative_key": "a",
+            "kind": "wal",
+            "bytes": 1,
+            "checksum_sha256": "ab".repeat(32),
+        }))
+        .unwrap();
+        assert_eq!(
+            with_hash.checksum_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+
+        let event = BackupLifecycleEventRequest {
+            instance_id: Uuid::new_v4(),
+            backup_id: 3,
+            engine: "postgres_walg".into(),
+            stage: BackupLifecycleStage::Deleted,
+            occurred_at: chrono::Utc::now(),
+            s3_location: None,
+            size_bytes: None,
+            error_message: None,
+            backup_uuid: Some("backup-uuid".into()),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["stage"], "deleted");
+        assert_eq!(value["backup_uuid"], "backup-uuid");
     }
 
     #[test]
@@ -1104,7 +1175,7 @@ mod tests {
                 relative_key: "streams/mongodb.archive.lz4".into(),
                 kind: NativeSnapshotObjectKind::Data,
                 bytes: 1_024,
-                checksum_sha256: "ab".repeat(32),
+                checksum_sha256: Some("ab".repeat(32)),
             }],
             source_image: None,
             in_place_root: None,
