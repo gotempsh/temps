@@ -10813,14 +10813,43 @@ mod tests {
     struct NoopJobQueue;
 
     /// Records every job sent, so a test can assert what the service
-    /// published without a live consumer.
+    /// published without a live consumer. Flip `refuse` to make every send
+    /// fail, the way a queue does when its backing channel is gone.
     struct RecordingJobQueue {
         sent: std::sync::Mutex<Vec<temps_core::Job>>,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingJobQueue {
+        fn new() -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                refuse: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// The `BackupDeleted` jobs published so far, in order.
+        fn deleted_jobs(&self) -> Vec<temps_core::BackupDeletedJob> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|job| match job {
+                    temps_core::Job::BackupDeleted(job) => Some(job.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
     impl temps_core::JobQueue for RecordingJobQueue {
         async fn send(&self, job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(temps_core::QueueError::SendError(
+                    "queue refused the job for the test".to_string(),
+                ));
+            }
             self.sent.lock().unwrap().push(job);
             Ok(())
         }
@@ -11313,9 +11342,7 @@ mod tests {
             config_service,
             encryption_service,
         );
-        let published = Arc::new(RecordingJobQueue {
-            sent: std::sync::Mutex::new(Vec::new()),
-        });
+        let published = Arc::new(RecordingJobQueue::new());
         backup_service.set_queue(published.clone());
 
         // Create a test user for backup operations
@@ -11496,21 +11523,18 @@ mod tests {
             .expect("backup deletion should complete");
         assert_eq!(deleted_objects, 2, "dump and metadata must be deleted");
         // Anything cataloging this backup elsewhere (the Cloud mirror) hears
-        // about the deletion, keyed on the stable backup uuid.
-        let deleted_jobs: Vec<temps_core::BackupDeletedJob> = published
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|job| match job {
-                temps_core::Job::BackupDeleted(job) => Some(job.clone()),
-                _ => None,
-            })
-            .collect();
+        // about the deletion, keyed on the stable backup uuid, and only once
+        // the row is gone: the job is the last thing the deletion does.
+        let deleted_jobs = published.deleted_jobs();
         assert_eq!(deleted_jobs.len(), 1, "one BackupDeleted per deletion");
         assert_eq!(deleted_jobs[0].backup_uuid, backup_result.backup_id);
         assert_eq!(deleted_jobs[0].backup_id, backup_result.id);
         assert_eq!(deleted_jobs[0].s3_location, backup_result.s3_location);
+        assert!(backup_service
+            .get_backup(&backup_result.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
         let remaining = s3_client
             .list_objects_v2()
             .bucket(bucket_name)
@@ -11548,6 +11572,85 @@ mod tests {
             .expect("backup index must contain an array")
             .iter()
             .all(|entry| entry["backup_id"] != backup_result.backup_id));
+
+        // Retention deletion goes through the same path and publishes the
+        // same job. Age a second backup past the schedule's retention period
+        // and let the scheduler's sweep delete it.
+        let retained = backup_service
+            .create_backup(Some(schedule.id), s3_source.id, "full", 1)
+            .await
+            .expect("Failed to create the backup that retention will expire");
+        temps_entities::backups::Entity::update_many()
+            .col_expr(
+                temps_entities::backups::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::days(8)),
+            )
+            .filter(temps_entities::backups::Column::Id.eq(retained.id))
+            .exec(test_db.db.as_ref())
+            .await
+            .expect("aging the backup should succeed");
+        let report = backup_service
+            .enforce_retention(Some(schedule.id), None)
+            .await
+            .expect("retention enforcement should complete");
+        assert_eq!(report.deleted, 1, "the aged backup is the only candidate");
+        assert_eq!(report.failed, 0, "{:?}", report.failures);
+        let deleted_jobs = published.deleted_jobs();
+        assert_eq!(
+            deleted_jobs.len(),
+            2,
+            "retention publishes BackupDeleted too"
+        );
+        assert_eq!(deleted_jobs[1].backup_uuid, retained.backup_id);
+        assert_eq!(deleted_jobs[1].backup_id, retained.id);
+        assert!(backup_service
+            .get_backup(&retained.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
+
+        // Publishing is best effort: a queue that refuses the job must not
+        // turn a finished deletion into an error, and must not leave the row
+        // or the objects behind.
+        let unannounced = backup_service
+            .create_backup(Some(schedule.id), s3_source.id, "full", 1)
+            .await
+            .expect("Failed to create the backup deleted without a queue");
+        published
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, deleted_objects) = backup_service
+            .delete_backup(&unannounced.backup_id)
+            .await
+            .expect("a refused publication must not fail the deletion");
+        assert_eq!(
+            deleted_objects, 2,
+            "dump and metadata must still be deleted"
+        );
+        assert_eq!(
+            published.deleted_jobs().len(),
+            2,
+            "the refused job is not recorded"
+        );
+        assert!(backup_service
+            .get_backup(&unannounced.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
+        let unannounced_prefix =
+            validated_snapshot_prefix(&unannounced.s3_location, &s3_source, &unannounced.backup_id)
+                .expect("backup must have an attributable snapshot prefix");
+        let remaining = s3_client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(format!("{unannounced_prefix}/"))
+            .send()
+            .await
+            .expect("snapshot prefix should remain listable");
+        assert!(
+            remaining.contents().is_empty(),
+            "snapshot prefix must be empty"
+        );
 
         println!("\n✓ Integration test passed:");
         println!("  - Database container started (timescale/timescaledb-ha)");
