@@ -559,7 +559,13 @@ async fn reconcile_cloud_backup_source(
     post,
     path = "/cloud/backups/schedule/ensure",
     tag = "Cloud",
-    responses((status = 200, body = ManagedBackupSetup)),
+    responses(
+        (status = 200, description = "The managed destination's setup with the schedule that targets it, created when none did", body = ManagedBackupSetup),
+        (status = 401, description = "Authentication required", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 409, description = "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)", body = temps_core::ProblemDetails),
+        (status = 500, description = "Database or link state failure", body = temps_core::ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 async fn ensure_cloud_backup_schedule(

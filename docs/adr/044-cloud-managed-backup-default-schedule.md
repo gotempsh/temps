@@ -76,9 +76,12 @@ backup → cloud protocol, not the reverse).
    revoked, every schedule targeting the managed destination is released:
    the one enrollment created (still tagged `temps-cloud`) is deleted, any
    other is disabled so the operator's configuration survives but nothing
-   fires against a dead credential. A release failure aborts the disconnect
-   with the reason, leaving the link intact. The existing rule that the
-   destination row is kept while backup records reference it is unchanged.
+   fires against a dead credential. One statement disables every schedule
+   targeting the source before any delete, so a failure part-way leaves only
+   "disabled, not yet deleted", which the next attempt completes. A release
+   failure aborts the disconnect with the reason, leaving the link intact.
+   The existing rule that the destination row is kept while backup records
+   reference it is unchanged.
 
 6. **Look-up-then-insert is serialised.** `backup_schedules.s3_source_id` is
    not unique, and enrollment, the settings page and the CLI can all ask at

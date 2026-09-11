@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    sea_query::Expr, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+};
 use temps_core::{
     ManagedBackupSchedule, ManagedBackupScheduleError, ManagedBackupScheduleProvisioner,
     ReleasedManagedBackupSchedules, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
@@ -147,26 +149,45 @@ impl ManagedBackupScheduleProvisioner for ManagedScheduleProvisioner {
         s3_source_id: i32,
     ) -> Result<ReleasedManagedBackupSchedules, ManagedBackupScheduleError> {
         let _serialised = self.ensure.lock().await;
-        let mut released = ReleasedManagedBackupSchedules::default();
-        for schedule in self.schedules_for_source(s3_source_id).await? {
-            let release =
-                |error: crate::services::BackupError| ManagedBackupScheduleError::Release {
+        let schedules = self.schedules_for_source(s3_source_id).await?;
+        let mut released = ReleasedManagedBackupSchedules {
+            deleted: Vec::new(),
+            disabled: schedules
+                .iter()
+                .filter(|schedule| schedule.enabled && !is_managed_schedule(&schedule.tags))
+                .map(|schedule| schedule.id)
+                .collect(),
+        };
+
+        // One statement stops everything first. Whatever fails after this
+        // point, nothing targeting the destination fires again: the only
+        // partial state a caller can observe is "disabled, not yet deleted",
+        // which a retry completes.
+        backup_schedules::Entity::update_many()
+            .col_expr(backup_schedules::Column::Enabled, Expr::value(false))
+            .filter(backup_schedules::Column::S3SourceId.eq(s3_source_id))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| ManagedBackupScheduleError::Release {
+                s3_source_id,
+                reason: format!("disabling the schedules: {error}"),
+            })?;
+
+        for schedule in schedules
+            .iter()
+            .filter(|schedule| is_managed_schedule(&schedule.tags))
+        {
+            self.backups
+                .delete_backup_schedule(schedule.id)
+                .await
+                .map_err(|error| ManagedBackupScheduleError::Release {
                     s3_source_id,
-                    reason: format!("schedule {} ({}): {error}", schedule.id, schedule.name),
-                };
-            if is_managed_schedule(&schedule.tags) {
-                self.backups
-                    .delete_backup_schedule(schedule.id)
-                    .await
-                    .map_err(release)?;
-                released.deleted.push(schedule.id);
-            } else if schedule.enabled {
-                self.backups
-                    .disable_backup_schedule(schedule.id)
-                    .await
-                    .map_err(release)?;
-                released.disabled.push(schedule.id);
-            }
+                    reason: format!(
+                        "deleting schedule {} ({}): {error}",
+                        schedule.id, schedule.name
+                    ),
+                })?;
+            released.deleted.push(schedule.id);
         }
         Ok(released)
     }

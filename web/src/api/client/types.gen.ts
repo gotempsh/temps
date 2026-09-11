@@ -31024,7 +31024,31 @@ export type EnsureCloudBackupScheduleData = {
     url: '/cloud/backups/schedule/ensure';
 };
 
+export type EnsureCloudBackupScheduleErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)
+     */
+    409: ProblemDetails;
+    /**
+     * Database or link state failure
+     */
+    500: ProblemDetails;
+};
+
+export type EnsureCloudBackupScheduleError = EnsureCloudBackupScheduleErrors[keyof EnsureCloudBackupScheduleErrors];
+
 export type EnsureCloudBackupScheduleResponses = {
+    /**
+     * The managed destination's setup with the schedule that targets it, created when none did
+     */
     200: ManagedBackupSetup;
 };
 
