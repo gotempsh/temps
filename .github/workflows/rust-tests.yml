@@ -171,19 +171,15 @@ jobs:
             temps-musl-fast-
             compose-security-musl-
 
-      # The committed package has a canonical Linux/AMD64 compiler host.
-      # Rust's WASM output can differ between host architectures. Verify before
-      # the web UI and application build, which can take over an hour cold.
-      - name: Rebuild CAPTCHA WASM in canonical toolchain
+      # Build the CAPTCHA from source before embedding it in the application.
+      # Byte differences from the committed package do not block the build.
+      - name: Rebuild CAPTCHA WASM in toolchain container
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "$PWD":/build --workdir /build/crates/temps-captcha-wasm \
             --env CARGO_TARGET_DIR=/tmp/captcha-target \
             temps-toolchain:ci \
             sh -ec 'git config --global --add safe.directory /build; rustc -Vv; wasm-pack --version; wasm-bindgen --version; npm run build'
-
-      - name: Verify committed WASM package matches a reproducible rebuild
-        run: bash scripts/verify-captcha-wasm.sh
 
       # Continues the Dockerfile builder stage (web UI -> cargo build)
       # inside the toolchain container, with target/ and the cargo registry

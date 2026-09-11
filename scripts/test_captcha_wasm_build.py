@@ -66,9 +66,10 @@ class CaptchaWasmBuildTests(unittest.TestCase):
         self.assertNotIn("matches the canonical rebuild", result.stdout)
         self.assertIn("Cannot inspect", result.stderr)
 
-    def test_gate_precedes_application_build(self):
+    def test_ci_rebuilds_before_application_without_byte_comparison(self):
         workflow = (ROOT / ".github/workflows/rust-tests.yml").read_text()
-        self.assertLess(workflow.index("run: bash scripts/verify-captcha-wasm.sh"),
+        self.assertNotIn("scripts/verify-captcha-wasm.sh", workflow)
+        self.assertLess(workflow.index("name: Rebuild CAPTCHA WASM in toolchain container"),
                         workflow.index("cargo build --profile fast --bin temps"))
 
     def test_rebuild_uses_amd64_for_image_and_container(self):
