@@ -86,6 +86,9 @@ impl TempsPlugin for CloudPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let service = context.require_service::<CloudService>();
+            service.set_schedule_provisioner(
+                context.require_service::<dyn temps_core::ManagedBackupScheduleProvisioner>(),
+            );
             if cloud_initialization_succeeded(service.initialize().await) {
                 service.start_backup_mirror(
                     context.require_service::<sea_orm::DatabaseConnection>(),

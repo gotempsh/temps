@@ -8,12 +8,16 @@ use std::{
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;
+use std::sync::OnceLock;
 use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind};
 use temps_cloud_protocol::{
     ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
 };
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
+use temps_core::{
+    ManagedBackupSchedule, ManagedBackupScheduleProvisioner, DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
+};
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use utoipa::ToSchema;
@@ -39,6 +43,8 @@ pub enum CloudServiceError {
     Database(#[from] sea_orm::DbErr),
     #[error("Could not persist the managed Cloud backup credential: {0}")]
     ManagedBackupCredential(#[from] temps_entities::s3_sources::S3SourceCredentialError),
+    #[error("Could not set up the backup schedule for the managed destination: {0}")]
+    ManagedBackupSchedule(#[from] temps_core::ManagedBackupScheduleError),
 }
 
 /// Outcome of attempting to provision a Cloud-managed backup source as part
@@ -78,6 +84,9 @@ pub enum ManagedBackupOutcome {
 /// routine credential rotation from one that landed on a different bucket
 /// than what was already on record (see [`ManagedBackupOutcome::ProvisionedBucketChanged`]).
 enum UpsertOutcome {
+    /// The managed source did not exist yet and was inserted: the moment
+    /// the destination gets its default schedule (ADR-044).
+    Created,
     SameBucket,
     BucketChanged {
         previous_bucket_name: String,
@@ -124,6 +133,10 @@ pub struct ManagedBackupSetup {
     pub ready: bool,
     pub message: String,
     pub action: ManagedBackupSetupAction,
+    /// The schedule that writes to the managed destination, when one does.
+    /// `None` on a ready destination means nothing backs up to Cloud yet:
+    /// the console offers to create the nightly schedule (ADR-044).
+    pub schedule: Option<ManagedBackupSchedule>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -163,6 +176,13 @@ pub struct CloudService {
     configuration_issue: RwLock<Option<String>>,
     managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
     managed_backup_reconcile_lock: AsyncMutex<()>,
+    /// Creates the nightly schedule for the managed destination (ADR-044).
+    /// Registered by the backup plugin and handed over once every service
+    /// exists, so the two crates stay independent.
+    schedule_provisioner: OnceLock<Arc<dyn ManagedBackupScheduleProvisioner>>,
+    /// The plan's retention, from the last managed backup capability Cloud
+    /// answered; the default schedule is created with it.
+    managed_backup_retention_days: RwLock<Option<u16>>,
 }
 
 impl CloudService {
@@ -190,7 +210,99 @@ impl CloudService {
             configuration_issue: RwLock::new(None),
             managed_backup_setup: RwLock::new(None),
             managed_backup_reconcile_lock: AsyncMutex::new(()),
+            schedule_provisioner: OnceLock::new(),
+            managed_backup_retention_days: RwLock::new(None),
         }
+    }
+
+    /// Wire the backup scheduler in once it is registered. Idempotent.
+    pub fn set_schedule_provisioner(&self, provisioner: Arc<dyn ManagedBackupScheduleProvisioner>) {
+        let _ = self.schedule_provisioner.set(provisioner);
+    }
+
+    fn set_managed_backup_retention_days(&self, days: Option<u16>) {
+        *self
+            .managed_backup_retention_days
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = days;
+    }
+
+    fn managed_backup_retention_days(&self) -> u16 {
+        self.managed_backup_retention_days
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS)
+    }
+
+    async fn managed_backup_source_id(&self) -> Result<Option<i32>, CloudServiceError> {
+        Ok(temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .one(self.db.as_ref())
+            .await?
+            .map(|source| source.id))
+    }
+
+    /// Attach the schedule that targets the managed destination to a setup
+    /// that is otherwise ready. A lookup failure is logged and leaves the
+    /// field empty: status must keep answering when the scheduler cannot.
+    async fn with_schedule(&self, setup: ManagedBackupSetup) -> ManagedBackupSetup {
+        if !setup.ready {
+            return setup;
+        }
+        let Some(provisioner) = self.schedule_provisioner.get() else {
+            return setup;
+        };
+        let source_id = match self.managed_backup_source_id().await {
+            Ok(Some(id)) => id,
+            Ok(None) => return setup,
+            Err(error) => {
+                tracing::warn!(%error, "could not look up the managed backup source for its schedule");
+                return setup;
+            }
+        };
+        match provisioner.schedule_for_source(source_id).await {
+            Ok(schedule) => ManagedBackupSetup { schedule, ..setup },
+            Err(error) => {
+                tracing::warn!(%error, "could not read the managed destination's backup schedule");
+                setup
+            }
+        }
+    }
+
+    /// Create the nightly schedule for the managed destination unless one
+    /// already targets it, and answer the setup with the schedule attached.
+    /// The operator-facing entry point behind "Create nightly schedule";
+    /// enrollment calls the same path when it first creates the destination.
+    pub async fn ensure_managed_backup_schedule(
+        &self,
+    ) -> Result<ManagedBackupSetup, CloudServiceError> {
+        let _guard = self.managed_backup_reconcile_lock.lock().await;
+        let setup = match self.managed_backup_setup() {
+            Some(setup) => setup,
+            None if self.has_managed_backup_source().await? => ready_managed_backup_setup(),
+            None => default_managed_backup_setup(self.link.feature_switches().backups),
+        };
+        let Some(source_id) = self.managed_backup_source_id().await? else {
+            return Ok(setup);
+        };
+        let provisioner = self.schedule_provisioner.get().ok_or_else(|| {
+            temps_core::ManagedBackupScheduleError::Create {
+                s3_source_id: source_id,
+                reason: "the backup scheduler is not registered on this instance".to_string(),
+            }
+        })?;
+        let schedule = provisioner
+            .ensure_schedule_for_source(source_id, self.managed_backup_retention_days())
+            .await?;
+        tracing::info!(
+            schedule_id = schedule.id,
+            retention_days = schedule.retention_period,
+            "backup schedule targets the Temps Cloud managed destination"
+        );
+        Ok(ManagedBackupSetup {
+            schedule: Some(schedule),
+            ..setup
+        })
     }
 
     fn set_configuration_issue(&self, issue: Option<String>) {
@@ -523,6 +635,7 @@ impl CloudService {
         } else {
             default_managed_backup_setup(switches.backups)
         };
+        let managed_backup_setup = self.with_schedule(managed_backup_setup).await;
         Ok(CloudStatus {
             status,
             status_message,
@@ -645,6 +758,7 @@ impl CloudService {
             );
             return ManagedBackupOutcome::NotConfigured { reason };
         }
+        self.set_managed_backup_retention_days(capability.retention_days);
         let credentials = match managed_backup_credentials_from_capability(capability) {
             Ok(credentials) => credentials,
             Err(reason) => {
@@ -663,6 +777,34 @@ impl CloudService {
         }
         match upserted {
             Ok(UpsertOutcome::SameBucket) => ManagedBackupOutcome::Provisioned,
+            Ok(UpsertOutcome::Created) => {
+                // The destination exists for the first time: give it the
+                // nightly schedule the offer promises (ADR-044). Best effort
+                // here; the console shows the gap and offers the same action
+                // if this does not happen.
+                if let Some(provisioner) = self.schedule_provisioner.get() {
+                    if let Ok(Some(source_id)) = self.managed_backup_source_id().await {
+                        match provisioner
+                            .ensure_schedule_for_source(
+                                source_id,
+                                self.managed_backup_retention_days(),
+                            )
+                            .await
+                        {
+                            Ok(schedule) => tracing::info!(
+                                schedule_id = schedule.id,
+                                retention_days = schedule.retention_period,
+                                "created the nightly backup schedule for the Temps Cloud destination"
+                            ),
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "could not create the nightly backup schedule for the Temps Cloud destination; the Cloud settings page offers to retry"
+                            ),
+                        }
+                    }
+                }
+                ManagedBackupOutcome::Provisioned
+            }
             Ok(UpsertOutcome::BucketChanged {
                 previous_bucket_name,
                 new_bucket_name,
@@ -729,7 +871,7 @@ impl CloudService {
                     None,
                 )
                 .await?;
-                Ok(UpsertOutcome::SameBucket)
+                Ok(UpsertOutcome::Created)
             }
         }
     }
@@ -770,7 +912,7 @@ impl CloudService {
         let outcome = self.provision_managed_backup_source().await;
         let setup = managed_backup_setup_from_outcome(&outcome);
         self.set_managed_backup_setup(setup.clone());
-        Ok(setup)
+        Ok(self.with_schedule(setup).await)
     }
 
     /// Remove the Cloud-managed `s3_sources` row created by
@@ -953,6 +1095,7 @@ fn parse_backend(value: &str, allow_loopback_development: bool) -> Result<Backen
 
 fn ready_managed_backup_setup() -> ManagedBackupSetup {
     ManagedBackupSetup {
+        schedule: None,
         status: ManagedBackupSetupStatus::Ready,
         ready: true,
         message: "Managed backup destination is ready.".to_string(),
@@ -963,6 +1106,7 @@ fn ready_managed_backup_setup() -> ManagedBackupSetup {
 fn default_managed_backup_setup(backups_enabled: bool) -> ManagedBackupSetup {
     if backups_enabled {
         ManagedBackupSetup {
+            schedule: None,
             status: ManagedBackupSetupStatus::NeedsSetup,
             ready: false,
             message: "Temps Cloud has not created the managed backup destination yet.".to_string(),
@@ -970,6 +1114,7 @@ fn default_managed_backup_setup(backups_enabled: bool) -> ManagedBackupSetup {
         }
     } else {
         ManagedBackupSetup {
+            schedule: None,
             status: ManagedBackupSetupStatus::Disabled,
             ready: false,
             message: "Enable Cloud backup export to provision the managed destination.".to_string(),
@@ -994,6 +1139,7 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
         // configured, no entitlement, instance too old, ...) rather than a
         // single message covering every case identically.
         ManagedBackupOutcome::NotConfigured { reason } => ManagedBackupSetup {
+            schedule: None,
             status: ManagedBackupSetupStatus::NeedsSetup,
             ready: false,
             message: reason.clone().unwrap_or_else(|| {
@@ -1009,6 +1155,7 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
         // raw transport internals, so it's safe and useful to show directly
         // rather than flattening every failure into one generic sentence.
         ManagedBackupOutcome::Unavailable(reason) => ManagedBackupSetup {
+            schedule: None,
             status: ManagedBackupSetupStatus::Unavailable,
             ready: false,
             message: format!(
@@ -1021,6 +1168,7 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
 
 fn subscription_required_managed_backup_setup() -> ManagedBackupSetup {
     ManagedBackupSetup {
+        schedule: None,
         status: ManagedBackupSetupStatus::SubscriptionRequired,
         ready: false,
         message: "Your Temps Cloud subscription is inactive. Renew it before managed backups can be provisioned."
@@ -1161,6 +1309,7 @@ mod tests {
             secret_key: Some("vended-secret".to_string()),
             session_token: session_token.map(str::to_string),
             expires_at,
+            retention_days: None,
             reason: None,
         }
     }
@@ -1334,7 +1483,9 @@ mod tests {
                 assert_eq!(previous_bucket_name, "temps-cloud-tenant-abc");
                 assert_eq!(new_bucket_name, "temps-cloud-tenant-XYZ-different");
             }
-            UpsertOutcome::SameBucket => panic!("expected a bucket-changed outcome"),
+            UpsertOutcome::Created | UpsertOutcome::SameBucket => {
+                panic!("expected a bucket-changed outcome")
+            }
         }
     }
 }

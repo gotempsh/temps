@@ -171,6 +171,7 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::State(_)
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
+        | CloudServiceError::ManagedBackupSchedule(_)
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -548,6 +549,40 @@ async fn reconcile_cloud_backup_source(
     Ok(Json(result))
 }
 
+/// Create the nightly schedule for the Temps Cloud destination unless one
+/// already targets it (ADR-044). Answers the same shape as the reconcile so
+/// the console can swap it into the status it already holds.
+#[utoipa::path(
+    post,
+    path = "/cloud/backups/schedule/ensure",
+    tag = "Cloud",
+    responses((status = 200, body = ManagedBackupSetup)),
+    security(("bearer_auth" = []))
+)]
+async fn ensure_cloud_backup_schedule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<CloudState>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Json<ManagedBackupSetup>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, BackupsWrite);
+    let result = state
+        .service
+        .ensure_managed_backup_schedule()
+        .await
+        .map_err(problem)?;
+    audit(
+        &state,
+        &auth,
+        &metadata,
+        "CLOUD_BACKUP_SCHEDULE_ENSURED",
+        None,
+        None,
+    )
+    .await;
+    Ok(Json(result))
+}
+
 #[utoipa::path(delete, path = "/cloud", tag = "Cloud", responses((status = 200, body = CloudStatus)), security(("bearer_auth" = [])))]
 async fn disconnect_cloud(
     RequireAuth(auth): RequireAuth,
@@ -624,6 +659,10 @@ pub fn cloud_routes(
             "/cloud/backups/source/reconcile",
             post(reconcile_cloud_backup_source),
         )
+        .route(
+            "/cloud/backups/schedule/ensure",
+            post(ensure_cloud_backup_schedule),
+        )
         .route("/cloud/enroll", post(enroll_cloud))
         .route("/cloud", delete(disconnect_cloud))
         .with_state(CloudState {
@@ -641,6 +680,7 @@ pub fn cloud_routes(
         get_cloud_ai_capability,
         update_cloud_features,
         reconcile_cloud_backup_source,
+        ensure_cloud_backup_schedule,
         enroll_cloud,
         disconnect_cloud
     ),
@@ -649,6 +689,7 @@ pub fn cloud_routes(
         CloudCapability,
         CloudStatus,
         ManagedBackupSetup,
+        temps_core::ManagedBackupSchedule,
         ManagedBackupSetupAction,
         ManagedBackupSetupStatus,
         CloudFeatureSwitchesRequest,

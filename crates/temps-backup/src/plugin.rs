@@ -79,6 +79,11 @@ impl TempsPlugin for BackupPlugin {
                 encryption_service.clone(),
             ));
             context.register_service(backup_service.clone());
+            // The Cloud plugin creates the managed destination's nightly
+            // schedule through this seam (ADR-044).
+            context.register_service(
+                backup_service.clone() as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>
+            );
 
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.

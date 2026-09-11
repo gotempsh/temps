@@ -12026,10 +12026,27 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+/**
+ * What the Cloud settings page shows about the schedule that targets the
+ * managed destination.
+ */
+export type ManagedBackupSchedule = {
+    enabled: boolean;
+    id: number;
+    name: string;
+    next_run?: string | null;
+    /**
+     * Days each backup is kept before the schedule's retention deletes it.
+     */
+    retention_period: number;
+    schedule_expression: string;
+};
+
 export type ManagedBackupSetup = {
     action: ManagedBackupSetupAction;
     message: string;
     ready: boolean;
+    schedule?: null | ManagedBackupSchedule;
     status: ManagedBackupSetupStatus;
 };
 
@@ -30999,6 +31016,19 @@ export type GetCloudAiCapabilityResponses = {
 };
 
 export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
+
+export type EnsureCloudBackupScheduleData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/backups/schedule/ensure';
+};
+
+export type EnsureCloudBackupScheduleResponses = {
+    200: ManagedBackupSetup;
+};
+
+export type EnsureCloudBackupScheduleResponse = EnsureCloudBackupScheduleResponses[keyof EnsureCloudBackupScheduleResponses];
 
 export type ReconcileCloudBackupSourceData = {
     body?: never;
