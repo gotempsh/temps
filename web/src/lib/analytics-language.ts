@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Map common language codes to human-readable names
 const LANGUAGE_NAMES: Record<string, string> = {
   en: 'English',

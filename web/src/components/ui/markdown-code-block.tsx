@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { isValidElement, type ReactNode } from 'react'
 import { CodeBlock } from '@/components/ui/code-block'
 import { codeLanguage } from '@/lib/code-language'

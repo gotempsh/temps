@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { expect, test } from 'bun:test'
 import { formatTraceDuration } from './trace-presentation'
 test('formats trace durations without noisy millisecond decimals', () => {

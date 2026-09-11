@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /** Compact display only: sorting continues to use the original millisecond value. */
 export function formatTraceDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '—'
