@@ -62,7 +62,7 @@ pub struct S3InputConfig {
     #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
-    /// Docker image to use for MinIO (e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)
+    /// Docker image to use for MinIO (e.g., quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z)
     #[serde(default = "default_image")]
     #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
@@ -185,11 +185,11 @@ fn example_region() -> &'static str {
 }
 
 fn default_image() -> String {
-    "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
 }
 
 fn example_image() -> &'static str {
-    "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 }
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
@@ -208,7 +208,7 @@ impl S3Service {
     /// MinIO Client (mc) utility image - used for temporary operations like migration and copy.
     /// Pinned to an immutable release tag — never use `:latest` here to prevent
     /// supply-chain / MITM attacks on floating tags.
-    const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
+    const MC_IMAGE: &'static str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
 
     /// Shell script executed inside a disposable mc container by `restore_in_place`.
     ///
@@ -2646,7 +2646,7 @@ impl ExternalService for S3Service {
         // Return (image_name, version)
         // Default MinIO image and release version
         (
-            "minio/minio".to_string(),
+            "quay.io/minio/minio".to_string(),
             "RELEASE.2025-09-07T16-13-09Z".to_string(),
         )
     }
@@ -2978,8 +2978,8 @@ mod tests {
         let service = S3Service::new("test-image".to_string(), docker, encryption_service);
         let (image_name, version) = service.get_default_docker_image();
         assert_eq!(
-            image_name, "minio/minio",
-            "Default image should be minio/minio"
+            image_name, "quay.io/minio/minio",
+            "Default image should be quay.io/minio/minio"
         );
         assert!(
             version.starts_with("RELEASE."),

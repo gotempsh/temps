@@ -213,7 +213,10 @@ fn find_available_port(start: u16) -> Option<u16> {
 /// Boot a MinIO container, returning (host_port, container_name, guard).
 /// Skips (None) on failure so the test can bail gracefully.
 async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
-    if pull_image(docker, "minio/minio:latest").await.is_err() {
+    if pull_image(docker, "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
+        .await
+        .is_err()
+    {
         eprintln!("Could not pull MinIO image, skipping");
         return None;
     }
@@ -221,7 +224,7 @@ async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
     let name = format!("temps-test-pitr-minio-{}", uuid::Uuid::new_v4());
 
     let config = bollard::models::ContainerCreateBody {
-        image: Some("minio/minio:latest".to_string()),
+        image: Some("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
         cmd: Some(vec!["server".to_string(), "/data".to_string()]),
         env: Some(vec![
             format!("MINIO_ROOT_USER={MINIO_ACCESS_KEY}"),
