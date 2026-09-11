@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageContainer } from '@/components/layout/PageContainer'
+
 import { useQuery } from '@tanstack/react-query'
 import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
@@ -50,7 +52,7 @@ export function Domains() {
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
   return (
-    <div className="flex-1 overflow-auto">
+    <PageContainer innerClassName="space-y-6">
       <div className="space-y-6">
         <DomainsManagement
           domains={domainsData?.domains || []}
@@ -66,6 +68,6 @@ export function Domains() {
           isSearching={searchQuery !== debouncedSearch}
         />
       </div>
-    </div>
+    </PageContainer>
   )
 }

@@ -3,12 +3,13 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, Loader2, Save } from 'lucide-react'
+import { AlertCircle, LockKeyhole, Loader2, Save } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -124,7 +125,13 @@ export function SecurityPage() {
 
   return (
     <div className="space-y-6">
-      <AdminGateCard />
+      <SettingsSection
+        title="Admin access gate"
+        description="Require additional verification for sensitive administrative actions"
+        icon={LockKeyhole}
+      >
+        <AdminGateCard />
+      </SettingsSection>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
         <SecuritySettings
           control={control}

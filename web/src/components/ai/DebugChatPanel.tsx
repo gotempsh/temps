@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 
 import {
   confirmPendingAction,
@@ -91,7 +92,6 @@ import {
 import { toast } from 'sonner'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import rehypeHighlight from 'rehype-highlight'
 import { useAiAssistant } from './AiAssistantContext'
 import {
   chatDraftStorageKey,
@@ -136,9 +136,6 @@ import {
   createPendingAttachment,
   revokeAttachmentPreviews,
 } from './attachment-previews'
-// highlight.js token theme for fenced code blocks. github-dark reads well on the
-// dark code surface used in both light and dark app themes.
-import 'highlight.js/styles/github-dark.css'
 
 /** A minimal mdast node (only the fields this file touches). */
 interface MdNode {
@@ -808,7 +805,7 @@ const toolBlockClasses =
 
 /**
  * Render a tool's arguments/result. JSON is syntax-highlighted via the same
- * `rehype-highlight` pipeline the assistant's code blocks use (so it matches the
+ * shared CodeBlock renderer the assistant's code blocks use (so it matches the
  * rest of the chat); non-JSON text (CLI `--help` output, errors) falls back to a
  * plain preformatted block. Height-capped with its own scroll.
  */
@@ -826,12 +823,7 @@ function ToolBlock({ value }: { value: string }) {
         'scrollbar-thin max-h-48 overflow-auto [&_pre]:my-0 [&_pre]:text-[11px]'
       )}
     >
-      <ReactMarkdown
-        rehypePlugins={[
-          [rehypeHighlight, { detect: true, ignoreMissing: true }],
-        ]}
-        components={markdownComponents}
-      >
+      <ReactMarkdown components={markdownComponents}>
         {`\`\`\`json\n${json}\n\`\`\``}
       </ReactMarkdown>
     </div>
@@ -2038,9 +2030,7 @@ function TurnActivity({
 const markdownComponents: Components = {
   // Give horizontally-scrolling code blocks a thin, subtle scrollbar instead of
   // the chunky default OS bar over the dark code surface.
-  pre({ node: _node, className, ...props }) {
-    return <pre {...props} className={cn('scrollbar-thin', className)} />
-  },
+  pre: MarkdownCodeBlock,
   // SECURITY: cross-origin images from model output never auto-load. Shared
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
@@ -2055,9 +2045,6 @@ function MarkdownText({ text }: { text: string }) {
         remarkPlugins={[remarkGfm, remarkSoftBreaks]}
         // `detect` so unlabeled ``` fences (common in LLM output) still get
         // highlighted; `ignoreMissing` avoids throwing on an unknown language hint.
-        rehypePlugins={[
-          [rehypeHighlight, { detect: true, ignoreMissing: true }],
-        ]}
         components={markdownComponents}
       >
         {text}

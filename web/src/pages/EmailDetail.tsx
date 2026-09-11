@@ -1,7 +1,9 @@
+'use client'
+
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
-'use client'
 
 import { getEmailOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
@@ -31,9 +33,17 @@ import {
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
 
-function HeadersDisplay({ headers }: { headers: Record<string, string> | null | undefined }) {
+function HeadersDisplay({
+  headers,
+}: {
+  headers: Record<string, string> | null | undefined
+}) {
   if (!headers || Object.keys(headers).length === 0) {
-    return <p className="text-sm text-muted-foreground">No custom headers were set for this email.</p>
+    return (
+      <p className="text-sm text-muted-foreground">
+        No custom headers were set for this email.
+      </p>
+    )
   }
 
   const entries = Object.entries(headers)
@@ -42,7 +52,9 @@ function HeadersDisplay({ headers }: { headers: Record<string, string> | null | 
     <div className="space-y-2">
       {entries.map(([key, value]) => (
         <div key={key} className="flex items-start gap-2 text-sm">
-          <span className="font-medium min-w-[140px] text-muted-foreground">{key}:</span>
+          <span className="font-medium min-w-[140px] text-muted-foreground">
+            {key}:
+          </span>
           <span className="font-mono text-xs break-all">{value}</span>
         </div>
       ))}
@@ -96,7 +108,10 @@ function HtmlPreview({ html }: { html: string }) {
         // Adjust iframe height based on content
         const resizeObserver = new ResizeObserver(() => {
           if (doc.body) {
-            const newHeight = Math.max(300, Math.min(doc.body.scrollHeight + 40, 800))
+            const newHeight = Math.max(
+              300,
+              Math.min(doc.body.scrollHeight + 40, 800)
+            )
             setIframeHeight(newHeight)
           }
         })
@@ -126,12 +141,20 @@ function HtmlPreview({ html }: { html: string }) {
 function TextPreview({ text }: { text: string }) {
   return (
     <div className="border rounded-lg bg-muted/30 p-4">
-      <pre className="text-sm whitespace-pre-wrap font-mono break-all">{text}</pre>
+      <pre className="text-sm whitespace-pre-wrap font-mono break-all">
+        {text}
+      </pre>
     </div>
   )
 }
 
-function SourceView({ content, type }: { content: string; type: 'html' | 'text' }) {
+function SourceView({
+  content,
+  type,
+}: {
+  content: string
+  type: 'html' | 'text'
+}) {
   return (
     <div className="relative">
       <div className="absolute top-2 right-2 z-10">
@@ -142,7 +165,10 @@ function SourceView({ content, type }: { content: string; type: 'html' | 'text' 
       </div>
       <div className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
         <pre className="text-xs font-mono whitespace-pre-wrap break-all">
-          {type === 'html' ? content : content}
+          <HighlightedCode
+            code={type === 'html' ? content : content}
+            language={type === 'html' ? 'html' : 'text'}
+          />
         </pre>
       </div>
     </div>
@@ -182,17 +208,27 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="space-y-4">
               <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">From</h4>
+                <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                  From
+                </h4>
                 <p className="text-sm font-medium">
-                  {email.from_name ? `${email.from_name} <${email.from_address}>` : email.from_address}
+                  {email.from_name
+                    ? `${email.from_name} <${email.from_address}>`
+                    : email.from_address}
                 </p>
               </div>
 
               <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">To</h4>
+                <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                  To
+                </h4>
                 <div className="flex flex-wrap gap-1">
                   {email.to_addresses.map((addr) => (
-                    <Badge key={addr} variant="secondary" className="font-mono text-xs">
+                    <Badge
+                      key={addr}
+                      variant="secondary"
+                      className="font-mono text-xs"
+                    >
                       {addr}
                     </Badge>
                   ))}
@@ -201,10 +237,16 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
 
               {email.cc_addresses && email.cc_addresses.length > 0 && (
                 <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">CC</h4>
+                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                    CC
+                  </h4>
                   <div className="flex flex-wrap gap-1">
                     {email.cc_addresses.map((addr) => (
-                      <Badge key={addr} variant="outline" className="font-mono text-xs">
+                      <Badge
+                        key={addr}
+                        variant="outline"
+                        className="font-mono text-xs"
+                      >
                         {addr}
                       </Badge>
                     ))}
@@ -214,10 +256,16 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
 
               {email.bcc_addresses && email.bcc_addresses.length > 0 && (
                 <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">BCC</h4>
+                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                    BCC
+                  </h4>
                   <div className="flex flex-wrap gap-1">
                     {email.bcc_addresses.map((addr) => (
-                      <Badge key={addr} variant="outline" className="font-mono text-xs">
+                      <Badge
+                        key={addr}
+                        variant="outline"
+                        className="font-mono text-xs"
+                      >
                         {addr}
                       </Badge>
                     ))}
@@ -227,7 +275,9 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
 
               {email.reply_to && (
                 <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">Reply-To</h4>
+                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                    Reply-To
+                  </h4>
                   <p className="text-sm font-mono">{email.reply_to}</p>
                 </div>
               )}
@@ -235,7 +285,9 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
 
             <div className="space-y-4">
               <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">Status</h4>
+                <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                  Status
+                </h4>
                 <StatusBadge status={email.status} />
               </div>
 
@@ -374,8 +426,12 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                       >
                         {link.original_url}
                       </a>
-                      <Badge variant={link.click_count > 0 ? 'default' : 'secondary'} className="shrink-0">
-                        {link.click_count} {link.click_count === 1 ? 'click' : 'clicks'}
+                      <Badge
+                        variant={link.click_count > 0 ? 'default' : 'secondary'}
+                        className="shrink-0"
+                      >
+                        {link.click_count}{' '}
+                        {link.click_count === 1 ? 'click' : 'clicks'}
                       </Badge>
                     </div>
                   ))}
@@ -585,7 +641,10 @@ export function EmailDetail() {
           <CardContent className="pt-6">
             <div className="flex items-center gap-2 text-destructive">
               <AlertCircle className="h-5 w-5" />
-              <p>Failed to load email details. The email may not exist or you may not have permission to view it.</p>
+              <p>
+                Failed to load email details. The email may not exist or you may
+                not have permission to view it.
+              </p>
             </div>
           </CardContent>
         </Card>

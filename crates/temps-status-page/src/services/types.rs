@@ -167,6 +167,11 @@ pub struct CreateMonitorRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateMonitorRequest {
+    pub check_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct MonitorResponse {
     pub id: i32,
     pub project_id: i32,

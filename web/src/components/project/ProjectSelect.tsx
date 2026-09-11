@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import * as React from 'react'
-import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { getProjects } from '@/api/client/sdk.gen'
+import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
+import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -55,8 +57,24 @@ export function ProjectSelect({
   const queryClient = useQueryClient()
 
   const projectsQuery = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
-    staleTime: 60_000,
+    queryKey: ['project-selector-catalog'],
+    queryFn: async ({ signal }) => {
+      const projects = []
+      let page = 1
+      while (true) {
+        const { data } = await getProjects({
+          query: { page, per_page: 100 },
+          signal,
+          throwOnError: true,
+        })
+        projects.push(...data.projects)
+        if (projects.length >= data.total || data.projects.length === 0) break
+        page += 1
+      }
+      return { projects }
+    },
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
   })
 
   const projects = React.useMemo(() => {
@@ -74,12 +92,26 @@ export function ProjectSelect({
     [projects, value]
   )
 
+  const media = useLatestDeploymentMedia(
+    (projectsQuery.data?.projects ?? []).map((p) => p.id).sort((a, b) => a - b)
+  )
+  const projectImage = (project: NonNullable<typeof selected>) => (
+    <ProjectCardMedia
+      name={project.name}
+      className="mr-2 size-5 [&_img]:p-0.5"
+      templateImageUrl={project.service_template_image_url}
+      deploymentUrl={media.data?.projects?.[String(project.id)]?.url}
+      screenshotLocation={
+        media.data?.projects?.[String(project.id)]?.screenshot_location
+      }
+    />
+  )
   const handleRefresh = (e: React.MouseEvent) => {
     e.stopPropagation()
-    queryClient.invalidateQueries({
-      queryKey: getProjectsOptions({ query: { page: 1, per_page: 100 } })
-        .queryKey,
+    void queryClient.invalidateQueries({
+      queryKey: ['project-selector-catalog'],
     })
+    void media.refetch()
   }
 
   const triggerLabel =
@@ -104,7 +136,10 @@ export function ProjectSelect({
             className
           )}
         >
-          <span className="truncate">{triggerLabel}</span>
+          <span className="flex min-w-0 items-center">
+            {selected && projectImage(selected)}
+            <span className="truncate">{triggerLabel}</span>
+          </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
@@ -194,6 +229,7 @@ export function ProjectSelect({
                           value === p.id ? 'opacity-100' : 'opacity-0'
                         )}
                       />
+                      {projectImage(p)}
                       <span className="min-w-0 flex-1 truncate">{p.name}</span>
                       <span className="shrink-0 truncate text-xs text-muted-foreground">
                         {p.slug}

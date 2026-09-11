@@ -82,7 +82,10 @@ export function AiWorkflowsOverview() {
                   <Bot className="size-4 text-muted-foreground" />
                   {project.name}
                 </span>
-                <ArrowRight className="size-4 text-muted-foreground" />
+                <span className="flex items-center gap-1.5 text-sm font-medium text-primary">
+                  Open workflows
+                  <ArrowRight className="size-4" />
+                </span>
               </Link>
             ))}
           </CardContent>

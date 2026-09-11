@@ -153,8 +153,8 @@ function CreateTeamDialog({ open, onOpenChange }: CreateTeamDialogProps) {
               placeholder="platform-engineering"
             />
             <p className="text-xs text-muted-foreground">
-              Lowercase letters, numbers and hyphens. Auto-derived from the
-              name until edited.
+              Lowercase letters, numbers and hyphens. Auto-derived from the name
+              until edited.
             </p>
           </div>
           <div className="space-y-2">
@@ -196,7 +196,7 @@ function TeamsTableSkeleton() {
           <TableHead>Slug</TableHead>
           <TableHead className="hidden md:table-cell">Description</TableHead>
           <TableHead className="text-right">Members</TableHead>
-          <TableHead className="w-10" />
+          <TableHead className="w-24 text-right">Actions</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -215,7 +215,7 @@ function TeamsTableSkeleton() {
               <Skeleton className="ml-auto h-4 w-8" />
             </TableCell>
             <TableCell>
-              <Skeleton className="h-8 w-8" />
+              <Skeleton className="ml-auto h-8 w-20" />
             </TableCell>
           </TableRow>
         ))}
@@ -280,13 +280,13 @@ export function Teams() {
   const teams = data?.teams ?? []
 
   return (
-    <div className="container mx-auto space-y-6 px-4 py-6 sm:px-6">
+    <div className="container mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold sm:text-3xl">Teams</h1>
           <p className="mt-2 text-muted-foreground">
-            Group users, then grant each team access to the projects it
-            should reach. Projects with no grants stay open to everyone.
+            Group users, then grant each team access to the projects it should
+            reach. Projects with no grants stay open to everyone.
           </p>
         </div>
         <CreateActionButton
@@ -333,7 +333,7 @@ export function Teams() {
                       Description
                     </TableHead>
                     <TableHead className="text-right">Members</TableHead>
-                    <TableHead className="w-10" />
+                    <TableHead className="w-24 text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -355,10 +355,10 @@ export function Teams() {
                       <TableCell className="text-right">
                         <MemberCount teamId={team.id} />
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="text-right">
                         <Button
                           variant="ghost"
-                          size="icon"
+                          size="sm"
                           aria-label={`Delete team ${team.name}`}
                           onClick={(e) => {
                             // Don't trigger the row's navigate.
@@ -366,7 +366,8 @@ export function Teams() {
                             setTeamToDelete(team)
                           }}
                         >
-                          <Trash2 className="h-4 w-4 text-destructive" />
+                          <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                          Delete
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -395,8 +396,8 @@ export function Teams() {
               This permanently deletes the team
               {teamToDelete ? ` "${teamToDelete.name}"` : ''} along with its
               memberships and project-access grants. Members lose access to
-              every project they could only reach through this team. This
-              cannot be undone.
+              every project they could only reach through this team. This cannot
+              be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

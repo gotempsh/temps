@@ -9687,6 +9687,8 @@ mod tests {
             id,
             project_id,
             service_id,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

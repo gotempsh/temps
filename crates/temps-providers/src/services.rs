@@ -37,6 +37,7 @@ use temps_entities::{
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
+use utoipa::ToSchema;
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
 // Add these constants at the top of the file proper key management
@@ -47,6 +48,145 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Controls which logical database a deployment receives through a
+/// project-to-service link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseProvisioningMode {
+    /// All environments in the project share one database.
+    Project,
+    /// Each project/environment pair receives its own database.
+    #[default]
+    ProjectEnvironment,
+    /// Every deployment reuses the explicitly configured database name.
+    Custom,
+}
+
+impl DatabaseProvisioningMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::ProjectEnvironment => "project_environment",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn from_persisted(
+        value: &str,
+        service_id: i32,
+        project_id: i32,
+    ) -> Result<Self, ExternalServiceError> {
+        match value {
+            "project" => Ok(Self::Project),
+            "project_environment" => Ok(Self::ProjectEnvironment),
+            "custom" => Ok(Self::Custom),
+            _ => Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: format!("unknown persisted mode '{value}'"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseProvisioningConfig {
+    pub mode: DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
+}
+
+impl DatabaseProvisioningConfig {
+    fn validate(
+        &self,
+        service_id: i32,
+        project_id: i32,
+        service_type: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let is_named_database = matches!(service_type, "postgres" | "mariadb" | "mongodb");
+        if !is_named_database && self != &Self::default() {
+            return Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: format!("service type '{service_type}' does not provision named databases"),
+            });
+        }
+
+        match (self.mode, self.custom_database_name.as_deref()) {
+            (DatabaseProvisioningMode::Custom, Some(name))
+                if is_valid_custom_database_name(name) =>
+            {
+                Ok(())
+            }
+            (DatabaseProvisioningMode::Custom, Some(name)) => {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: format!(
+                        "custom database name '{name}' must match [a-z_][a-z0-9_]{{0,62}}"
+                    ),
+                })
+            }
+            (DatabaseProvisioningMode::Custom, None) => {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: "custom mode requires custom_database_name".to_string(),
+                })
+            }
+            (_, Some(_)) => Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: "custom_database_name is only valid in custom mode".to_string(),
+            }),
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn runtime_scope(
+        &self,
+        project_slug: &str,
+        environment_slug: &str,
+        service_id: i32,
+        project_id: i32,
+    ) -> Result<(String, String), ExternalServiceError> {
+        match self.mode {
+            DatabaseProvisioningMode::Project => Ok((project_slug.to_string(), String::new())),
+            DatabaseProvisioningMode::ProjectEnvironment => {
+                Ok((project_slug.to_string(), environment_slug.to_string()))
+            }
+            DatabaseProvisioningMode::Custom => self
+                .custom_database_name
+                .clone()
+                .map(|name| (name, String::new()))
+                .ok_or_else(|| ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: "custom mode has no persisted custom database name".to_string(),
+                }),
+        }
+    }
+
+    fn from_link(link: &project_services::Model) -> Result<Self, ExternalServiceError> {
+        Ok(Self {
+            mode: DatabaseProvisioningMode::from_persisted(
+                &link.database_provisioning_mode,
+                link.service_id,
+                link.project_id,
+            )?,
+            custom_database_name: link.custom_database_name.clone(),
+        })
+    }
+}
+
+fn is_valid_custom_database_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && matches!(bytes[0], b'a'..=b'z' | b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
 
 /// Whether a live pg_auto_failover state identifies a node that accepts writes.
 ///
@@ -197,6 +337,15 @@ pub enum ExternalServiceError {
 
     #[error("Service {service_id} is no longer available to claim")]
     ServiceClaimDenied { service_id: i32 },
+
+    #[error(
+        "Invalid database provisioning for service {service_id} in project {project_id}: {reason}"
+    )]
+    InvalidDatabaseProvisioning {
+        service_id: i32,
+        project_id: i32,
+        reason: String,
+    },
 
     #[error("Project {id} not found")]
     ProjectNotFound { id: i32 },
@@ -926,6 +1075,8 @@ pub struct ProjectServiceInfo {
     pub id: i32,
     pub project: ProjectInfo,
     pub service: ExternalServiceInfo,
+    pub database_provisioning_mode: DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
 }
 
 /// Persisted health snapshot returned by `get_health_snapshot`.
@@ -8901,11 +9052,33 @@ echo "[restore] Pre-seed complete"
         project_id_val: i32,
         claim_user_id: Option<i32>,
     ) -> Result<ProjectServiceInfo, ExternalServiceError> {
+        self.link_service_to_project_with_provisioning(
+            service_id_val,
+            project_id_val,
+            claim_user_id,
+            DatabaseProvisioningConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn link_service_to_project_with_provisioning(
+        &self,
+        service_id_val: i32,
+        project_id_val: i32,
+        claim_user_id: Option<i32>,
+        provisioning: DatabaseProvisioningConfig,
+    ) -> Result<ProjectServiceInfo, ExternalServiceError> {
         let claims = claim_user_id
             .map(|user_id| BTreeMap::from([(service_id_val, user_id)]))
             .unwrap_or_default();
+        let provisioning_by_service = BTreeMap::from([(service_id_val, provisioning)]);
         let mut links = self
-            .link_services_to_project_transactionally(&[service_id_val], project_id_val, &claims)
+            .link_services_to_project_transactionally(
+                &[service_id_val],
+                project_id_val,
+                &claims,
+                &provisioning_by_service,
+            )
             .await?;
         let link = links
             .pop()
@@ -8933,6 +9106,12 @@ echo "[restore] Pre-seed complete"
                 created_at: project.created_at.to_rfc3339(),
             },
             service: service_info,
+            database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                &link.database_provisioning_mode,
+                link.service_id,
+                link.project_id,
+            )?,
+            custom_database_name: link.custom_database_name,
         })
     }
 
@@ -8947,8 +9126,13 @@ echo "[restore] Pre-seed complete"
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
     ) -> Result<(), ExternalServiceError> {
-        self.link_services_to_project_transactionally(service_ids, project_id, claims)
-            .await?;
+        self.link_services_to_project_transactionally(
+            service_ids,
+            project_id,
+            claims,
+            &BTreeMap::new(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -8957,6 +9141,7 @@ echo "[restore] Pre-seed complete"
         service_ids: &[i32],
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
+        provisioning_by_service: &BTreeMap<i32, DatabaseProvisioningConfig>,
     ) -> Result<Vec<project_services::Model>, ExternalServiceError> {
         let mut ordered_service_ids = service_ids.to_vec();
         ordered_service_ids.sort_unstable();
@@ -8966,6 +9151,7 @@ echo "[restore] Pre-seed complete"
         }
 
         let claims = claims.clone();
+        let provisioning_by_service = provisioning_by_service.clone();
         self.db
             .transaction::<_, Vec<project_services::Model>, ExternalServiceError>(|txn| {
                 Box::pin(async move {
@@ -9041,14 +9227,25 @@ echo "[restore] Pre-seed complete"
                                 service_type: service.service_type.clone(),
                             });
                         }
+                        provisioning_by_service
+                            .get(&service.id)
+                            .cloned()
+                            .unwrap_or_default()
+                            .validate(service.id, project_id, &service.service_type)?;
                     }
 
                     let now = Utc::now();
                     let mut links = Vec::with_capacity(services.len());
                     for service in services {
+                        let provisioning = provisioning_by_service
+                            .get(&service.id)
+                            .cloned()
+                            .unwrap_or_default();
                         let link = project_services::ActiveModel {
                             project_id: Set(project_id),
                             service_id: Set(service.id),
+                            database_provisioning_mode: Set(provisioning.mode.as_str().to_string()),
+                            custom_database_name: Set(provisioning.custom_database_name),
                             created_at: Set(now),
                             updated_at: Set(now),
                             ..Default::default()
@@ -9158,7 +9355,7 @@ echo "[restore] Pre-seed complete"
         })?;
 
         // Verify service is linked to project
-        let link_exists = project_services::Entity::find()
+        let link = project_services::Entity::find()
             .filter(
                 project_services::Column::ServiceId
                     .eq(service_id_val)
@@ -9167,12 +9364,11 @@ echo "[restore] Pre-seed complete"
             .one(self.db.as_ref())
             .await?;
 
-        if link_exists.is_none() {
-            return Err(ExternalServiceError::ServiceNotLinkedToProject {
-                service_id: service_id_val,
-                project_id,
-            });
-        }
+        let link = link.ok_or(ExternalServiceError::ServiceNotLinkedToProject {
+            service_id: service_id_val,
+            project_id,
+        })?;
+        let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
 
         // Resolve the environment inside the authorized project before
         // decrypting service configuration or provisioning any tenant
@@ -9190,16 +9386,18 @@ echo "[restore] Pre-seed complete"
 
         let parameters = self.get_service_parameters(service_id_val).await?;
 
-        // Compute the per-tenant database name once — both paths use
-        // the same `<project_slug>_<env_slug>` convention so an app
-        // gets the same DB whether the upstream service is standalone
-        // or clustered.
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+        let (project_scope, environment_scope) = provisioning.runtime_scope(
+            &project.slug,
+            &environment.slug,
+            service_id_val,
+            project_id,
+        )?;
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
-            &format!("{}_{}", project.slug, environment.slug),
+            &crate::externalsvc::scoped_resource_name(&project_scope, &environment_scope),
         );
 
         // Cluster services: build multi-host env vars from
@@ -9240,8 +9438,8 @@ echo "[restore] Pre-seed complete"
             return client
                 .get_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
                     service_config,
-                    project_slug: project.slug,
-                    environment_slug: environment.slug,
+                    project_slug: project_scope,
+                    environment_slug: environment_scope,
                 })
                 .await
                 .map(|response| response.environment)
@@ -9272,7 +9470,7 @@ echo "[restore] Pre-seed complete"
         // Get runtime environment variables (this provisions resources like databases/buckets)
         // `project` and `environment` were fetched up top — reuse the slugs.
         service_instance
-            .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
+            .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get runtime environment variables: {}", e),
@@ -9743,6 +9941,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info.clone(),
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9789,6 +9993,12 @@ echo "[restore] Pre-seed complete"
                         created_at: project.created_at.to_rfc3339(),
                     },
                     service: service_info.clone(),
+                    database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                        &link.database_provisioning_mode,
+                        link.service_id,
+                        link.project_id,
+                    )?,
+                    custom_database_name: link.custom_database_name,
                 })
             })
             .collect()
@@ -9822,6 +10032,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info,
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9860,6 +10076,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info,
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9980,7 +10202,7 @@ echo "[restore] Pre-seed complete"
     /// from every service linked to `project_id`. Side-effect-free: skips
     /// `CREATE DATABASE` / bucket creation that the real runtime path
     /// performs. Used by the resolved env vars UI so users can switch
-    /// between environments and see the actual `<project>_<env>` values.
+    /// between environments and see the actual database selected by the link.
     pub async fn preview_project_service_environment_variables(
         &self,
         project_id_val: i32,
@@ -10010,6 +10232,7 @@ echo "[restore] Pre-seed complete"
             match self
                 .preview_service_environment_variables(
                     linked.service_id,
+                    &linked,
                     &project.slug,
                     &environment.slug,
                 )
@@ -10040,6 +10263,7 @@ echo "[restore] Pre-seed complete"
     async fn preview_service_environment_variables(
         &self,
         service_id_val: i32,
+        link: &project_services::Model,
         project_slug: &str,
         environment_slug: &str,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
@@ -10051,9 +10275,16 @@ echo "[restore] Pre-seed complete"
             }
         })?;
         let parameters = self.get_service_parameters(service_id_val).await?;
+        let provisioning = DatabaseProvisioningConfig::from_link(link)?;
+        let (project_scope, environment_scope) = provisioning.runtime_scope(
+            project_slug,
+            environment_slug,
+            service_id_val,
+            link.project_id,
+        )?;
 
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
-            &format!("{}_{}", project_slug, environment_slug),
+            &crate::externalsvc::scoped_resource_name(&project_scope, &environment_scope),
         );
 
         if service.topology == "cluster" && service.service_type == "postgres" {
@@ -10092,7 +10323,7 @@ echo "[restore] Pre-seed complete"
             })?;
 
         service_instance
-            .preview_runtime_env_vars(service_config, project_slug, environment_slug)
+            .preview_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to preview runtime environment variables: {}", e),
@@ -10191,7 +10422,7 @@ echo "[restore] Pre-seed complete"
         if !is_cluster && options.include_docker {
             if let (Some(proj_id), Some(_env_id)) = (project_id, environment_id) {
                 // Verify service is linked to project
-                let link_exists = project_services::Entity::find()
+                let link = project_services::Entity::find()
                     .filter(
                         project_services::Column::ServiceId
                             .eq(service_id)
@@ -10200,7 +10431,7 @@ echo "[restore] Pre-seed complete"
                     .one(self.db.as_ref())
                     .await?;
 
-                if link_exists.is_none() {
+                if link.is_none() {
                     return Err(ExternalServiceError::ServiceNotLinkedToProject {
                         service_id,
                         project_id: proj_id,
@@ -10220,7 +10451,7 @@ echo "[restore] Pre-seed complete"
         if !is_cluster && options.include_runtime {
             if let (Some(proj_id), Some(env_id)) = (project_id, environment_id) {
                 // Verify service is linked to project
-                let link_exists = project_services::Entity::find()
+                let link = project_services::Entity::find()
                     .filter(
                         project_services::Column::ServiceId
                             .eq(service_id)
@@ -10229,12 +10460,10 @@ echo "[restore] Pre-seed complete"
                     .one(self.db.as_ref())
                     .await?;
 
-                if link_exists.is_none() {
-                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
-                        service_id,
-                        project_id: proj_id,
-                    });
-                }
+                let link = link.ok_or(ExternalServiceError::ServiceNotLinkedToProject {
+                    service_id,
+                    project_id: proj_id,
+                })?;
 
                 let service_config = ServiceConfig {
                     name: service.name.clone(),
@@ -10262,14 +10491,24 @@ echo "[restore] Pre-seed complete"
                     .ok_or(ExternalServiceError::ProjectNotFound { id: proj_id })?;
 
                 let environment = temps_entities::environments::Entity::find_by_id(env_id)
+                    .filter(temps_entities::environments::Column::ProjectId.eq(proj_id))
+                    .filter(temps_entities::environments::Column::DeletedAt.is_null())
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or_else(|| ExternalServiceError::InternalError {
-                        reason: format!("Environment {} not found", env_id),
+                    .ok_or(ExternalServiceError::EnvironmentNotFound {
+                        environment_id: env_id,
+                        project_id: proj_id,
                     })?;
+                let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
+                let (project_scope, environment_scope) = provisioning.runtime_scope(
+                    &project.slug,
+                    &environment.slug,
+                    service_id,
+                    proj_id,
+                )?;
 
                 let runtime_vars = service_instance
-                    .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
+                    .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
                     .await
                     .map_err(|e| ExternalServiceError::InternalError {
                         reason: format!("Failed to get runtime environment variables: {}", e),
@@ -11854,6 +12093,174 @@ mod tests {
             "gotempsh/redis-walg:8-bookworm"
         );
         assert!(defaults["parameters"].get("password").is_none());
+    }
+
+    #[tokio::test]
+    async fn database_provisioning_link_persists_selected_mode_and_name() {
+        for (mode, name) in [
+            (DatabaseProvisioningMode::Project, None),
+            (
+                DatabaseProvisioningMode::Custom,
+                Some("shared_catalog".to_string()),
+            ),
+        ] {
+            let mut service = encrypted_service_model(71, serde_json::json!({}));
+            service.created_by_user_id = None;
+            let project = environment_preview_project(10);
+            let link = project_services::Model {
+                id: 9,
+                project_id: 10,
+                service_id: 71,
+                database_provisioning_mode: mode.as_str().to_string(),
+                custom_database_name: name.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![service.clone()]])
+                    .append_query_results([vec![project.clone()]])
+                    .append_query_results([Vec::<project_services::Model>::new(), Vec::new()])
+                    .append_query_results([vec![link]])
+                    .append_query_results([vec![service]])
+                    .append_query_results([vec![project]])
+                    .into_connection(),
+            );
+            let manager = mock_service_manager_with_db(Arc::clone(&db));
+            let result = manager
+                .link_service_to_project_with_provisioning(
+                    71,
+                    10,
+                    None,
+                    DatabaseProvisioningConfig {
+                        mode,
+                        custom_database_name: name.clone(),
+                    },
+                )
+                .await
+                .expect("link with selected database provisioning");
+            assert_eq!(result.database_provisioning_mode, mode);
+            assert_eq!(result.custom_database_name, name);
+            drop(manager);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+            let log = db.into_transaction_log();
+            let insert = log
+                .iter()
+                .flat_map(|transaction| transaction.statements())
+                .find(|statement| {
+                    statement
+                        .sql
+                        .starts_with("INSERT INTO \"project_services\"")
+                })
+                .expect("link insert executed")
+                .to_string();
+            assert!(insert.contains("database_provisioning_mode"));
+            assert!(insert.contains(mode.as_str()));
+            assert!(insert.contains("custom_database_name"));
+            if let Some(name) = name {
+                assert!(insert.contains(&name));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn database_provisioning_invalid_link_does_not_consume_creator_claim() {
+        let mut service = encrypted_service_model(71, serde_json::json!({}));
+        service.created_by_user_id = Some(42);
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .append_query_results([vec![environment_preview_project(10)]])
+                .append_query_results([Vec::<project_services::Model>::new(), Vec::new()])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(Arc::clone(&db));
+        let error = manager
+            .link_service_to_project_with_provisioning(
+                71,
+                10,
+                Some(42),
+                DatabaseProvisioningConfig {
+                    mode: DatabaseProvisioningMode::Custom,
+                    custom_database_name: Some("bad-name".to_string()),
+                },
+            )
+            .await
+            .expect_err("invalid custom database must reject link");
+        assert!(matches!(
+            error,
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 71,
+                project_id: 10,
+                ..
+            }
+        ));
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+        let log = db.into_transaction_log();
+        assert!(
+            log.iter()
+                .flat_map(|transaction| transaction.statements())
+                .all(|statement| !statement.sql.starts_with("INSERT")
+                    && !statement.sql.starts_with("UPDATE")),
+            "validation must happen before link creation or claim consumption"
+        );
+    }
+
+    #[test]
+    fn database_provisioning_modes_resolve_expected_runtime_scopes() {
+        let per_environment = DatabaseProvisioningConfig::default()
+            .runtime_scope("storefront", "preview", 7, 11)
+            .expect("default scope");
+        assert_eq!(per_environment, ("storefront".into(), "preview".into()));
+
+        let per_project = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Project,
+            custom_database_name: None,
+        }
+        .runtime_scope("storefront", "preview", 7, 11)
+        .expect("project scope");
+        assert_eq!(per_project, ("storefront".into(), String::new()));
+
+        let custom = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_catalog".to_string()),
+        }
+        .runtime_scope("storefront", "preview", 7, 11)
+        .expect("custom scope");
+        assert_eq!(custom, ("shared_catalog".into(), String::new()));
+    }
+
+    #[test]
+    fn custom_database_provisioning_requires_a_safe_exact_name() {
+        let valid = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_catalog_2".to_string()),
+        };
+        assert!(valid.validate(7, 11, "postgres").is_ok());
+
+        for name in ["", "SharedCatalog", "2catalog", "shared-catalog"] {
+            let invalid = DatabaseProvisioningConfig {
+                mode: DatabaseProvisioningMode::Custom,
+                custom_database_name: Some(name.to_string()),
+            };
+            assert!(matches!(
+                invalid.validate(7, 11, "postgres"),
+                Err(ExternalServiceError::InvalidDatabaseProvisioning { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn non_database_services_reject_non_default_database_provisioning() {
+        let custom = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_cache".to_string()),
+        };
+        assert!(matches!(
+            custom.validate(7, 11, "redis"),
+            Err(ExternalServiceError::InvalidDatabaseProvisioning { .. })
+        ));
     }
 
     // ── Cluster write availability ──────────────────────────────────────
@@ -14065,6 +14472,8 @@ mod tests {
                 id: 1,
                 project_id: 9,
                 service_id: 17,
+                database_provisioning_mode: "project_environment".to_string(),
+                custom_database_name: None,
                 created_at: now,
                 updated_at: now,
             },
@@ -14072,6 +14481,8 @@ mod tests {
                 id: 2,
                 project_id: 4,
                 service_id: 17,
+                database_provisioning_mode: "project_environment".to_string(),
+                custom_database_name: None,
                 created_at: now,
                 updated_at: now,
             },
@@ -14329,6 +14740,8 @@ mod tests {
             id: 9,
             project_id: 10,
             service_id: 71,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

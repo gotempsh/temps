@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -666,7 +667,10 @@ export function SentryEventDetail({
               <CardContent>
                 <ScrollArea className="h-[400px]">
                   <pre className="text-xs">
-                    {JSON.stringify(event, null, 2)}
+                    <HighlightedCode
+                      code={JSON.stringify(event, null, 2)}
+                      language="json"
+                    />
                   </pre>
                 </ScrollArea>
               </CardContent>
@@ -1259,23 +1263,26 @@ export function SentryEventDetail({
                 <CardContent>
                   <ScrollArea className="h-[200px]">
                     <pre className="text-xs">
-                      {JSON.stringify(
-                        Object.fromEntries(
-                          Object.entries(contexts).filter(
-                            ([key]) =>
-                              ![
-                                'os',
-                                'device',
-                                'runtime',
-                                'app',
-                                'trace',
-                                'culture',
-                              ].includes(key)
-                          )
-                        ),
-                        null,
-                        2
-                      )}
+                      <HighlightedCode
+                        code={JSON.stringify(
+                          Object.fromEntries(
+                            Object.entries(contexts).filter(
+                              ([key]) =>
+                                ![
+                                  'os',
+                                  'device',
+                                  'runtime',
+                                  'app',
+                                  'trace',
+                                  'culture',
+                                ].includes(key)
+                            )
+                          ),
+                          null,
+                          2
+                        )}
+                        language="json"
+                      />
                     </pre>
                   </ScrollArea>
                 </CardContent>

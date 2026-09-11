@@ -33,6 +33,26 @@ use super::types::{validate_check_path, StatusPageError};
 /// first runs on the regular interval.
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
 
+fn probe_url(
+    public_url: &str,
+    monitor_type: &str,
+    check_path: Option<&str>,
+) -> Result<String, StatusPageError> {
+    let base = public_url.trim_end_matches('/');
+    match check_path {
+        Some(path) => {
+            validate_check_path(path)?;
+            if path == "/" {
+                Ok(base.to_string())
+            } else {
+                Ok(format!("{base}{path}"))
+            }
+        }
+        None if monitor_type == "health" => Ok(format!("{base}/health")),
+        None => Ok(public_url.to_string()),
+    }
+}
+
 #[derive(Clone)]
 struct MonitorProbeSnapshot {
     monitor_id: i32,
@@ -243,25 +263,20 @@ impl HealthCheckService {
                 // Defense-in-depth: re-validate the stored path at use time so that any
                 // rows written before write-time validation was added (or written by a
                 // future migration/import path) cannot inject a manipulated URL.
-                let base = public_url.trim_end_matches('/');
-                match &monitor.check_path {
-                    Some(path) if !path.is_empty() && path != "/" => {
-                        if let Err(e) = validate_check_path(path) {
-                            warn!(
-                                monitor_id = monitor.id,
-                                error = %e,
-                                "Stored check_path failed validation; falling back to default URL"
-                            );
-                            public_url
-                        } else {
-                            // Path is guaranteed to start with '/' by validate_check_path.
-                            format!("{}{}", base, path)
-                        }
+                match probe_url(
+                    &public_url,
+                    &monitor.monitor_type,
+                    monitor.check_path.as_deref(),
+                ) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        warn!(
+                            monitor_id = monitor.id,
+                            error = %e,
+                            "Stored check_path failed validation; falling back to default URL"
+                        );
+                        public_url
                     }
-                    _ if monitor.monitor_type == "health" => {
-                        format!("{}/health", base)
-                    }
-                    _ => public_url,
                 }
             }
             Err(e) => {
@@ -830,11 +845,9 @@ impl HealthCheckService {
             .one(self.db.as_ref())
             .await?;
 
-        if deployment.is_none() {
+        let Some(deployment) = deployment else {
             return Ok(("no_deployment".to_string(), None));
-        }
-
-        let deployment = deployment.unwrap();
+        };
 
         // Get the deployment container
         let container = deployment_containers::Entity::find()
@@ -842,11 +855,9 @@ impl HealthCheckService {
             .one(self.db.as_ref())
             .await?;
 
-        if container.is_none() {
+        let Some(container) = container else {
             return Ok(("no_container".to_string(), None));
-        }
-
-        let container = container.unwrap();
+        };
 
         // Construct the check URL
         let check_url = format!(
@@ -885,6 +896,20 @@ impl HealthCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_root_path_probes_deployment_root_for_health_monitor() {
+        assert_eq!(
+            probe_url("https://app.example.test/", "health", Some("/"))
+                .expect("root is a valid check path"),
+            "https://app.example.test"
+        );
+        assert_eq!(
+            probe_url("https://app.example.test/", "health", None)
+                .expect("default health path should resolve"),
+            "https://app.example.test/health"
+        );
+    }
     use temps_entities::deployment_config::DeploymentConfig;
     use temps_entities::upstream_config::UpstreamList;
 

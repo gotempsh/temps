@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   AlertDialog,
@@ -193,7 +194,9 @@ export function UpdateNowDialog({
                   expectRestart={capability?.restart_mode !== 'manual'}
                   migrationsApplied={capability?.migrations_applied ?? null}
                   migrationsTotal={capability?.migrations_total ?? null}
-                  currentMigrationName={capability?.current_migration_name ?? null}
+                  currentMigrationName={
+                    capability?.current_migration_name ?? null
+                  }
                 />
               ) : (
                 <ConfirmBody
@@ -315,9 +318,11 @@ function ConfirmBody({
             </p>
             <div className="flex items-center gap-2">
               <Terminal className="h-3.5 w-3.5 shrink-0" />
-              <code className="min-w-0 flex-1 truncate font-mono text-xs">
-                {manualCommand}
-              </code>
+              <HighlightedCode
+                className="min-w-0 flex-1 truncate font-mono text-xs"
+                code={manualCommand}
+                language="bash"
+              />
               <CopyButton value={manualCommand} minimal />
             </div>
           </div>

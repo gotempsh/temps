@@ -35,18 +35,15 @@ import {
   GitFork,
   Globe,
   Home,
-  KeyRound,
   Layers,
   LogOut,
   Monitor,
   Moon,
-  Network,
   Search,
   ScrollText,
   MessageSquare,
   Server,
   Settings,
-  Settings2,
   ShieldAlert,
   Sun,
   Sparkles,
@@ -54,25 +51,14 @@ import {
   Wand2,
 } from 'lucide-react'
 
-import { ProjectResponse } from '@/api/client'
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
-import { useProjectSetup } from '@/hooks/useProjectSetup'
-import { usePinnedProjectTools } from '@/hooks/usePinnedProjectTools'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { isPlatformToolsRoute } from '@/lib/platform-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import {
-  isProjectToolsRoute,
-  resolveProjectPrimaryRoute,
-} from '@/lib/project-navigation'
+import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
 import { cn } from '@/lib/utils'
-import {
-  flattenProjectTools,
-  projectToolGroups,
-  type ProjectToolItem,
-} from '@/components/project/project-tools'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -130,6 +116,10 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Observe',
     items: [
+      { title: 'Analytics', url: '/analytics', icon: BarChart3 },
+      { title: 'Traces', url: '/traces', icon: GitFork },
+      { title: 'Logs', url: '/logs', icon: ScrollText },
+      { title: 'Errors', url: '/errors', icon: ShieldAlert },
       {
         title: 'Server',
         url: '/monitoring/server',
@@ -934,352 +924,94 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-type ProjectNavItem = ProjectToolItem
-
-interface ProjectNavGroup {
-  label: string
-  items: ProjectNavItem[]
-}
-
-// The permanent sidebar is intentionally short and task-first. These are the
-// destinations operators reach for every day, and each one opens the data in a
-// single click. Everything else remains visible in the grouped tools menu
-// below, without replacing the sidebar or hiding behind route-driven state.
-const projectPrimaryGroups: ProjectNavGroup[] = [
+const projectPrimaryItems = [
+  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
   {
-    label: 'Project',
-    items: [
-      { title: 'Overview', url: 'project', icon: Home },
-      { title: 'Deployments', url: 'deployments', icon: GitBranch },
-    ],
+    title: 'Deployments',
+    url: 'deployments',
+    icon: GitBranch,
+    section: 'deployments',
   },
   {
-    label: 'Data',
-    items: [
-      {
-        title: 'Analytics',
-        url: 'analytics',
-        icon: BarChart3,
-        featureKey: 'web-analytics',
-      },
-      {
-        title: 'Errors',
-        url: 'errors',
-        icon: ShieldAlert,
-        featureKey: 'error-tracking',
-      },
-      {
-        title: 'Traces',
-        url: 'traces',
-        icon: Network,
-        featureKey: 'otel-traces-metrics',
-      },
-      { title: 'Logs', url: 'runtime', icon: ScrollText },
-      { title: 'Databases', url: 'storage', icon: Database },
-    ],
+    title: 'Environments',
+    url: 'environments',
+    icon: Layers,
+    section: 'environments',
+  },
+  { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
+  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
+  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
+  {
+    title: 'Analytics',
+    url: 'analytics',
+    icon: BarChart3,
+    section: 'analytics',
   },
   {
-    label: 'Configure',
-    items: [
-      { title: 'Environments', url: 'environments', icon: Layers },
-      {
-        title: 'Environment Variables',
-        url: 'environment-variables',
-        icon: KeyRound,
-      },
-      { title: 'Domains', url: 'domains', icon: Globe },
-      { title: 'Git', url: 'git', icon: GitFork },
-      { title: 'Build & Deploy', url: 'build', icon: Settings2 },
-      { title: 'Project settings', url: 'settings', icon: Settings },
-    ],
+    title: 'Monitoring',
+    url: 'metrics',
+    icon: Activity,
+    section: 'monitoring',
   },
-]
-
-function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
-  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const setup = useProjectSetup(project)
-  const remainingSteps = setup.steps.filter((step) => !step.done)
-
-  if (setup.isLoading || remainingSteps.length === 0) return null
-
-  if (compact) {
-    return (
-      <SidebarGroup className="py-0 pb-2">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              asChild
-              tooltip={`Project setup — ${setup.completedCount}/${setup.totalCount}`}
-              className="justify-center"
-            >
-              <Link
-                to={`/projects/${project.slug}/setup`}
-                onClick={() => isMobile && setOpenMobile(false)}
-              >
-                <BadgeCheck />
-              </Link>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarGroup>
-    )
-  }
-
-  return (
-    <SidebarGroup className="py-0 pb-1">
-      <Link
-        to={`/projects/${project.slug}/setup`}
-        onClick={() => isMobile && setOpenMobile(false)}
-        className="group rounded-md px-2 py-2 transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
-      >
-        <div className="flex items-center gap-2">
-          <BadgeCheck className="size-4 shrink-0 text-primary" />
-          <span className="flex-1 text-sm font-medium">Project setup</span>
-          <span className="text-xs tabular-nums text-muted-foreground">
-            {setup.completedCount}/{setup.totalCount}
-          </span>
-        </div>
-        <div
-          className="mt-1.5 h-0.5 w-full overflow-hidden rounded-full bg-sidebar-border"
-          role="progressbar"
-          aria-label={`${project.name} setup progress`}
-          aria-valuemin={0}
-          aria-valuemax={setup.totalCount}
-          aria-valuenow={setup.completedCount}
-        >
-          <div
-            className="h-full rounded-full bg-primary transition-all duration-500"
-            style={{ width: `${setup.percent}%` }}
-          />
-        </div>
-      </Link>
-    </SidebarGroup>
-  )
-}
+  { title: 'Databases', url: 'storage', icon: Database, section: 'storage' },
+  {
+    title: 'Security',
+    url: 'security',
+    icon: ShieldAlert,
+    section: 'security',
+  },
+  {
+    title: 'Settings',
+    url: 'settings/general',
+    icon: Settings,
+    section: 'settings',
+  },
+] as const
 
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
-  const { data: project } = useQuery({
-    ...getProjectBySlugOptions({ path: { slug } }),
-  })
-  const { projectNavEntries } = usePluginsContext()
-  const { projectToolLinks } = useConsoleExtensions()
+  const { data: project } = useQuery(
+    getProjectBySlugOptions({ path: { slug } })
+  )
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const pluginItems = useMemo<ProjectNavItem[]>(
-    () =>
-      projectNavEntries.map((entry) => ({
-        title: entry.label,
-        url: entry.path,
-        icon: resolvePluginIcon(entry.icon),
-      })),
-    [projectNavEntries]
+  const active = resolveProjectPrimaryRoute(
+    location.pathname.slice(`/projects/${slug}/`.length)
   )
-  const availableTools = useMemo(
-    () => [...flattenProjectTools(projectToolGroups), ...pluginItems],
-    [pluginItems]
-  )
-  const { pinnedUrls } = usePinnedProjectTools(
-    slug,
-    availableTools.map((tool) => tool.url)
-  )
-  const toolByUrl = useMemo(
-    () => new Map(availableTools.map((tool) => [tool.url, tool])),
-    [availableTools]
-  )
-  const pinnedItems = pinnedUrls
-    .map((url) => toolByUrl.get(url))
-    .filter((tool): tool is ProjectToolItem => tool !== undefined)
-
-  const activeRoute = useMemo(() => {
-    if (!project) return ''
-    const parts = location.pathname.split('/')
-    const slugIdx = parts.indexOf(project.slug)
-    if (slugIdx === -1) return ''
-    return parts.slice(slugIdx + 1).join('/')
-  }, [location.pathname, project])
-
-  const pinnedActiveUrl = pinnedItems.find((item) => {
-    const route = item.url.split('?')[0]
-    return activeRoute === route || activeRoute.startsWith(`${route}/`)
-  })?.url
-  const primaryActiveUrl = pinnedActiveUrl
-    ? null
-    : resolveProjectPrimaryRoute(activeRoute)
-
-  if (!project) {
-    return (
-      <>
-        <SwapHeader title="Loading…" onBack={onBack} backLabel="Back to menu" />
-      </>
-    )
-  }
-
-  const toolsActive = isProjectToolsRoute(activeRoute) && !pinnedActiveUrl
-
   return (
     <>
       <SwapHeader
-        title={project.name}
+        title={project?.name ?? 'Loading…'}
         onBack={onBack}
         backLabel="Back to menu"
       />
-      <ProjectSetupNavItem project={project} />
-      {projectPrimaryGroups.map((group) => (
-        <SidebarGroup key={group.label} className="py-1">
-          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-            {group.label}
-          </SidebarGroupLabel>
-          <SidebarMenu>
-            {group.items.map((item) => {
-              const active = primaryActiveUrl === item.url.split('?')[0]
-              return (
-                <SidebarMenuItem
-                  key={item.url}
-                  data-tour={item.url.split('?')[0]}
+      <SidebarGroup className="py-2">
+        <SidebarMenu aria-label="Project navigation">
+          {projectPrimaryItems.map((item) => (
+            <SidebarMenuItem key={item.section} data-tour={item.section}>
+              <SidebarMenuButton
+                asChild
+                tooltip={compact ? item.title : undefined}
+                className={cn(
+                  compact ? 'justify-center' : 'justify-start',
+                  active === item.section &&
+                    'bg-sidebar-accent text-sidebar-accent-foreground'
+                )}
+              >
+                <Link
+                  to={`/projects/${slug}/${item.url}`}
+                  aria-current={active === item.section ? 'page' : undefined}
+                  onClick={() => isMobile && setOpenMobile(false)}
                 >
-                  <SidebarMenuButton
-                    asChild
-                    tooltip={compact ? item.title : undefined}
-                    className={cn(
-                      compact ? 'justify-center' : 'justify-start',
-                      active &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
-                    )}
-                  >
-                    <Link
-                      to={`/projects/${project.slug}/${item.url}`}
-                      onClick={() => isMobile && setOpenMobile(false)}
-                    >
-                      <item.icon />
-                      {!compact && <span>{item.title}</span>}
-                      {!compact && (
-                        <FeatureMaturityBadge
-                          featureKey={item.featureKey}
-                          compact
-                        />
-                      )}
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )
-            })}
-          </SidebarMenu>
-        </SidebarGroup>
-      ))}
-      {pinnedItems.length > 0 && (
-        <SidebarGroup className="py-1">
-          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-            Pinned
-          </SidebarGroupLabel>
-          <SidebarMenu>
-            {pinnedItems.map((item) => (
-              <SidebarMenuItem key={item.url}>
-                <SidebarMenuButton
-                  asChild
-                  tooltip={compact ? item.title : undefined}
-                  className={cn(
-                    compact ? 'justify-center' : 'justify-start',
-                    pinnedActiveUrl === item.url &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
-                  )}
-                >
-                  <Link
-                    to={
-                      item.url.startsWith('/')
-                        ? item.url
-                        : `/projects/${project.slug}/${item.url}`
-                    }
-                    onClick={() => isMobile && setOpenMobile(false)}
-                  >
-                    <item.icon />
-                    {!compact && <span>{item.title}</span>}
-                    {!compact && (
-                      <FeatureMaturityBadge
-                        featureKey={item.featureKey}
-                        compact
-                      />
-                    )}
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            ))}
-          </SidebarMenu>
-        </SidebarGroup>
-      )}
-      {projectToolLinks && projectToolLinks.length > 0 && (
-        <SidebarGroup className="py-1">
-          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-            Enterprise
-          </SidebarGroupLabel>
-          <SidebarMenu>
-            {projectToolLinks.map((link) => (
-              <SidebarMenuItem key={link.id}>
-                <SidebarMenuButton
-                  asChild
-                  tooltip={compact ? link.title : undefined}
-                  className={cn(compact ? 'justify-center' : 'justify-start')}
-                >
-                  <Link
-                    to={link.href(project)}
-                    onClick={() => isMobile && setOpenMobile(false)}
-                  >
-                    {link.icon}
-                    {!compact && <span>{link.title}</span>}
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            ))}
-          </SidebarMenu>
-        </SidebarGroup>
-      )}
-      <SidebarGroup className="py-1">
-        <SidebarMenu>
-          <SidebarMenuItem data-tour="all-tools">
-            <ProjectToolsMenu
-              slug={project.slug}
-              active={toolsActive}
-              compact={compact}
-              onNavigate={() => setOpenMobile(false)}
-            />
-          </SidebarMenuItem>
+                  <item.icon />
+                  {!compact && <span>{item.title}</span>}
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
         </SidebarMenu>
       </SidebarGroup>
     </>
-  )
-}
-
-function ProjectToolsMenu({
-  slug,
-  active,
-  compact,
-  onNavigate,
-}: {
-  slug: string
-  active: boolean
-  compact: boolean
-  onNavigate: () => void
-}) {
-  return (
-    <SidebarMenuButton
-      asChild
-      tooltip={compact ? 'All project tools' : undefined}
-      className={cn(
-        compact ? 'justify-center' : 'justify-start',
-        active && 'bg-sidebar-accent text-sidebar-accent-foreground'
-      )}
-    >
-      <Link to={`/projects/${slug}/tools`} onClick={onNavigate}>
-        <Boxes />
-        {!compact && (
-          <>
-            <span className="flex-1 text-left">All project tools</span>
-            <ChevronRight className="size-4 text-muted-foreground" />
-          </>
-        )}
-      </Link>
-    </SidebarMenuButton>
   )
 }
 

@@ -1,7 +1,9 @@
+'use client'
+
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
-'use client'
 
 import {
   getEmailTrackingStatus,
@@ -302,7 +304,7 @@ export function EmailTrackingSetup({ providerId }: { providerId: number }) {
               <CopyButton value={SETUP_IAM_POLICY} className="h-6 w-6" />
             </div>
             <pre className="max-h-48 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug">
-              {SETUP_IAM_POLICY}
+              <HighlightedCode code={SETUP_IAM_POLICY} language="json" />
             </pre>
             <p className="text-muted-foreground">
               Runtime needs no extra permissions — SNS pushes events to the

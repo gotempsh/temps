@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { resolveTimeRange } from '@/lib/time-range-filter'
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import { LogRecord, LogSeverity, ProjectResponse } from '@/api/client'
 import { queryLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -25,7 +28,6 @@ import { format } from 'date-fns'
 import {
   ChevronLeft,
   ChevronRight,
-  Clock,
   Network,
   RefreshCw,
   ScrollText,
@@ -34,12 +36,13 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { LogsEmptyState } from '@/components/observability/LogsEmptyState'
 
 interface LogsListProps {
   project: ProjectResponse
 }
 
-type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
+type TimeRange = string
 
 const PAGE_SIZE = 50
 const ALL = '__all__'
@@ -79,12 +82,14 @@ export default function LogsList({ project }: LogsListProps) {
   usePageTitle(`Logs - ${project.name}`)
 
   const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h',
+    () => (searchParams.get('range') as TimeRange) || '24h'
   )
   const [severity, setSeverity] = useState<string>(
-    () => searchParams.get('severity') || ALL,
+    () => searchParams.get('severity') || ALL
   )
-  const [service, setService] = useState(() => searchParams.get('service') || '')
+  const [service, setService] = useState(
+    () => searchParams.get('service') || ''
+  )
   const [search, setSearch] = useState(() => searchParams.get('q') || '')
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = searchParams.get('trace') || ''
@@ -104,6 +109,9 @@ export default function LogsList({ project }: LogsListProps) {
 
   // Reset to first page when any filter changes.
   useEffect(() => {
+    // Query pagination is local UI state and must reset when the debounced
+    // filter values become active.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPage(1)
     setExpanded(new Set())
   }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
@@ -117,29 +125,18 @@ export default function LogsList({ project }: LogsListProps) {
     if (debouncedSearch) params.set('q', debouncedSearch)
     if (traceId) params.set('trace', traceId)
     setSearchParams(params, { replace: true })
-  }, [timeRange, severity, debouncedService, debouncedSearch, traceId, setSearchParams])
+  }, [
+    timeRange,
+    severity,
+    debouncedService,
+    debouncedSearch,
+    traceId,
+    setSearchParams,
+  ])
 
   const { startTime, endTime } = useMemo(() => {
-    const now = new Date()
-    const start = new Date()
-    switch (timeRange) {
-      case '1h':
-        start.setHours(start.getHours() - 1)
-        break
-      case '6h':
-        start.setHours(start.getHours() - 6)
-        break
-      case '24h':
-        start.setDate(start.getDate() - 1)
-        break
-      case '7d':
-        start.setDate(start.getDate() - 7)
-        break
-      case '30d':
-        start.setDate(start.getDate() - 30)
-        break
-    }
-    return { startTime: start.toISOString(), endTime: now.toISOString() }
+    const range = resolveTimeRange(timeRange)
+    return { startTime: range.from, endTime: range.to }
   }, [timeRange])
 
   const { data, isLoading, isFetching, refetch } = useQuery({
@@ -212,7 +209,9 @@ export default function LogsList({ project }: LogsListProps) {
           onClick={() => refetch()}
           disabled={isFetching}
         >
-          <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+          <RefreshCw
+            className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+          />
         </Button>
       </div>
 
@@ -232,7 +231,12 @@ export default function LogsList({ project }: LogsListProps) {
           >
             View trace
           </Button>
-          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={clearTrace}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={clearTrace}
+          >
             <X className="h-3.5 w-3.5" />
           </Button>
         </div>
@@ -242,23 +246,11 @@ export default function LogsList({ project }: LogsListProps) {
       <Card>
         <CardContent className="p-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
-            <Select
+            <TimeRangeFilter
               value={timeRange}
-              onValueChange={(v) => setTimeRange(v as TimeRange)}
+              onChange={setTimeRange}
               disabled={!!traceId}
-            >
-              <SelectTrigger className="w-full sm:w-[140px]">
-                <Clock className="mr-2 h-3.5 w-3.5" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1h">Last 1 hour</SelectItem>
-                <SelectItem value="6h">Last 6 hours</SelectItem>
-                <SelectItem value="24h">Last 24 hours</SelectItem>
-                <SelectItem value="7d">Last 7 days</SelectItem>
-                <SelectItem value="30d">Last 30 days</SelectItem>
-              </SelectContent>
-            </Select>
+            />
 
             <Select value={severity} onValueChange={setSeverity}>
               <SelectTrigger className="w-full sm:w-[150px]">
@@ -302,15 +294,15 @@ export default function LogsList({ project }: LogsListProps) {
           ))}
         </div>
       ) : logs.length === 0 ? (
-        <EmptyState
-          icon={ScrollText}
-          title="No logs found"
-          description={
-            hasFilters || traceId
-              ? 'Try adjusting your filters or time range.'
-              : 'Logs will appear here once your application sends them via OpenTelemetry (OTLP).'
-          }
-        />
+        hasFilters || traceId ? (
+          <EmptyState
+            icon={ScrollText}
+            title="No logs found"
+            description="Try adjusting your filters or time range."
+          />
+        ) : (
+          <LogsEmptyState projectSlug={project.slug} />
+        )
       ) : (
         <>
           <div className="overflow-hidden rounded-md border font-mono text-xs">
@@ -346,18 +338,26 @@ export default function LogsList({ project }: LogsListProps) {
                         {log.body}
                       </pre>
                       <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
-                        <span>service: {log.resource?.service_name || '—'}</span>
+                        <span>
+                          service: {log.resource?.service_name || '—'}
+                        </span>
                         {log.resource?.deployment_environment && (
-                          <span>env: {log.resource.deployment_environment}</span>
+                          <span>
+                            env: {log.resource.deployment_environment}
+                          </span>
                         )}
                         {log.resource?.service_version && (
                           <span>version: {log.resource.service_version}</span>
                         )}
-                        <span>severity: {log.severity_text || log.severity}</span>
+                        <span>
+                          severity: {log.severity_text || log.severity}
+                        </span>
                         {log.trace_id && (
                           <button
                             type="button"
-                            onClick={() => navigate(`../traces/${log.trace_id}`)}
+                            onClick={() =>
+                              navigate(`../traces/${log.trace_id}`)
+                            }
                             className="text-primary hover:underline"
                           >
                             view trace ↗
@@ -389,7 +389,8 @@ export default function LogsList({ project }: LogsListProps) {
           <div className="flex items-center justify-between">
             <span className="text-sm text-muted-foreground">
               Page {page}
-              {logs.length > 0 && ` · ${logs.length} line${logs.length === 1 ? '' : 's'}`}
+              {logs.length > 0 &&
+                ` · ${logs.length} line${logs.length === 1 ? '' : 's'}`}
             </span>
             <div className="flex gap-1">
               <Button

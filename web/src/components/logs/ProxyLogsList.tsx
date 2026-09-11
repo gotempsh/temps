@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -29,7 +32,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useQuery } from '@tanstack/react-query'
-import { format, subDays, subHours } from 'date-fns'
+import { format } from 'date-fns'
 import {
   ChevronLeft,
   ChevronRight,
@@ -139,33 +142,8 @@ export default function ProxyLogsList({
 
   // Calculate date range based on selected time range
   const dateRange = useMemo(() => {
-    const now = new Date()
-    let from: Date
-
-    switch (timeRange) {
-      case '1h':
-        from = subHours(now, 1)
-        break
-      case '6h':
-        from = subHours(now, 6)
-        break
-      case '24h':
-        from = subHours(now, 24)
-        break
-      case '7d':
-        from = subDays(now, 7)
-        break
-      case '30d':
-        from = subDays(now, 30)
-        break
-      case '90d':
-        from = subDays(now, 90)
-        break
-      default:
-        from = subHours(now, 24)
-    }
-
-    return { from, to: now }
+    const window = resolveTimeRange(timeRange)
+    return { from: new Date(window.from), to: new Date(window.to) }
   }, [timeRange])
 
   const { data: environmentsData } = useQuery(
@@ -408,19 +386,10 @@ export default function ProxyLogsList({
               >
                 Time range
               </label>
-              <Select value={timeRange} onValueChange={handleTimeRangeChange}>
-                <SelectTrigger id="filter-time-range" className="w-full sm:w-[160px]">
-                  <SelectValue placeholder="Time range" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1h">Last 1 hour</SelectItem>
-                  <SelectItem value="6h">Last 6 hours</SelectItem>
-                  <SelectItem value="24h">Last 24 hours</SelectItem>
-                  <SelectItem value="7d">Last 7 days</SelectItem>
-                  <SelectItem value="30d">Last 30 days</SelectItem>
-                  <SelectItem value="90d">Last 90 days</SelectItem>
-                </SelectContent>
-              </Select>
+              <TimeRangeFilter
+                value={timeRange}
+                onChange={handleTimeRangeChange}
+              />
             </div>
 
             <div className="flex flex-col gap-1">
@@ -431,7 +400,10 @@ export default function ProxyLogsList({
                 Method
               </label>
               <Select value={method} onValueChange={handleMethodChange}>
-                <SelectTrigger id="filter-method" className="w-full sm:w-[140px]">
+                <SelectTrigger
+                  id="filter-method"
+                  className="w-full sm:w-[140px]"
+                >
                   <SelectValue placeholder="HTTP method" />
                 </SelectTrigger>
                 <SelectContent>
@@ -453,7 +425,10 @@ export default function ProxyLogsList({
                 Status
               </label>
               <Select value={statusCode} onValueChange={handleStatusCodeChange}>
-                <SelectTrigger id="filter-status" className="w-full sm:w-[180px]">
+                <SelectTrigger
+                  id="filter-status"
+                  className="w-full sm:w-[180px]"
+                >
                   <SelectValue placeholder="Status code" />
                 </SelectTrigger>
                 <SelectContent>
@@ -481,12 +456,16 @@ export default function ProxyLogsList({
                     <SelectItem value="404">404 Not Found</SelectItem>
                     <SelectItem value="405">405 Method Not Allowed</SelectItem>
                     <SelectItem value="409">409 Conflict</SelectItem>
-                    <SelectItem value="422">422 Unprocessable Entity</SelectItem>
+                    <SelectItem value="422">
+                      422 Unprocessable Entity
+                    </SelectItem>
                     <SelectItem value="429">429 Too Many Requests</SelectItem>
                   </SelectGroup>
                   <SelectGroup>
                     <SelectLabel>Server Error (5xx)</SelectLabel>
-                    <SelectItem value="500">500 Internal Server Error</SelectItem>
+                    <SelectItem value="500">
+                      500 Internal Server Error
+                    </SelectItem>
                     <SelectItem value="502">502 Bad Gateway</SelectItem>
                     <SelectItem value="503">503 Service Unavailable</SelectItem>
                     <SelectItem value="504">504 Gateway Timeout</SelectItem>
@@ -630,196 +609,192 @@ export default function ProxyLogsList({
       )}
 
       <div className="space-y-4">
-          {!isLoading && logs?.logs.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-center">
-              <FileSearch className="h-16 w-16 text-muted-foreground mb-4" />
-              <h3 className="text-lg font-semibold mb-2">
-                No request logs found
-              </h3>
-              <p className="text-sm text-muted-foreground max-w-md">
-                {statusCode !== 'all' ||
-                method !== 'all' ||
-                environment !== 'all'
-                  ? 'Try adjusting your filters to see more results.'
-                  : 'Start making requests to see logs appear here.'}
-              </p>
-            </div>
-          ) : (
-            <div className="-mx-4 overflow-x-auto whitespace-nowrap sm:mx-0">
-              <div className="inline-block min-w-full px-4 align-middle sm:px-0">
-                <Table className="w-full">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="whitespace-nowrap">
-                        Timestamp
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap">Method</TableHead>
-                      <TableHead className="whitespace-nowrap">URL</TableHead>
-                      <TableHead className="whitespace-nowrap">Status</TableHead>
-                      <TableHead className="whitespace-nowrap">
-                        Duration
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap">
-                        User agent
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {isLoading
-                      ? [...Array(5)].map((_, i) => (
-                          <TableRow key={i}>
-                            <TableCell>
-                              <Skeleton className="h-6 w-32" />
-                            </TableCell>
-                            <TableCell>
-                              <Skeleton className="h-6 w-16" />
-                            </TableCell>
-                            <TableCell>
-                              <Skeleton className="h-6 w-96" />
-                            </TableCell>
-                            <TableCell>
-                              <Skeleton className="h-6 w-16" />
-                            </TableCell>
-                            <TableCell>
-                              <Skeleton className="h-6 w-20" />
-                            </TableCell>
-                            <TableCell>
-                              <Skeleton className="h-6 w-40" />
-                            </TableCell>
-                          </TableRow>
-                        ))
-                      : logs?.logs.map((log) => (
-                          <TableRow
-                            key={log.request_id}
-                            className={
-                              onRowClick
-                                ? 'cursor-pointer hover:bg-muted/50'
-                                : ''
-                            }
-                            onClick={() =>
-                              onRowClick &&
-                              log.project_id &&
-                              handleRowClick(
-                                log.request_id,
-                                log.project_id,
-                                log.timestamp
-                              )
-                            }
-                          >
-                            <TableCell className="tabular-nums text-muted-foreground">
-                              {format(
-                                new Date(log.timestamp),
-                                'yyyy-MM-dd HH:mm:ss'
-                              )}
-                            </TableCell>
-                            <TableCell>
+        {!isLoading && logs?.logs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 text-center">
+            <FileSearch className="h-16 w-16 text-muted-foreground mb-4" />
+            <h3 className="text-lg font-semibold mb-2">
+              No request logs found
+            </h3>
+            <p className="text-sm text-muted-foreground max-w-md">
+              {statusCode !== 'all' || method !== 'all' || environment !== 'all'
+                ? 'Try adjusting your filters to see more results.'
+                : 'Start making requests to see logs appear here.'}
+            </p>
+          </div>
+        ) : (
+          <div className="-mx-4 overflow-x-auto whitespace-nowrap sm:mx-0">
+            <div className="inline-block min-w-full px-4 align-middle sm:px-0">
+              <Table className="w-full">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="whitespace-nowrap">
+                      Timestamp
+                    </TableHead>
+                    <TableHead className="whitespace-nowrap">Method</TableHead>
+                    <TableHead className="whitespace-nowrap">URL</TableHead>
+                    <TableHead className="whitespace-nowrap">Status</TableHead>
+                    <TableHead className="whitespace-nowrap">
+                      Duration
+                    </TableHead>
+                    <TableHead className="whitespace-nowrap">
+                      User agent
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {isLoading
+                    ? [...Array(5)].map((_, i) => (
+                        <TableRow key={i}>
+                          <TableCell>
+                            <Skeleton className="h-6 w-32" />
+                          </TableCell>
+                          <TableCell>
+                            <Skeleton className="h-6 w-16" />
+                          </TableCell>
+                          <TableCell>
+                            <Skeleton className="h-6 w-96" />
+                          </TableCell>
+                          <TableCell>
+                            <Skeleton className="h-6 w-16" />
+                          </TableCell>
+                          <TableCell>
+                            <Skeleton className="h-6 w-20" />
+                          </TableCell>
+                          <TableCell>
+                            <Skeleton className="h-6 w-40" />
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    : logs?.logs.map((log) => (
+                        <TableRow
+                          key={log.request_id}
+                          className={
+                            onRowClick ? 'cursor-pointer hover:bg-muted/50' : ''
+                          }
+                          onClick={() =>
+                            onRowClick &&
+                            log.project_id &&
+                            handleRowClick(
+                              log.request_id,
+                              log.project_id,
+                              log.timestamp
+                            )
+                          }
+                        >
+                          <TableCell className="tabular-nums text-muted-foreground">
+                            {format(
+                              new Date(log.timestamp),
+                              'yyyy-MM-dd HH:mm:ss'
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <span
+                              className={`rounded-full px-2 py-1 text-xs font-medium ${
+                                log.method === 'GET'
+                                  ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+                                  : log.method === 'POST'
+                                    ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
+                                    : log.method === 'DELETE'
+                                      ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                                      : log.method === 'PUT'
+                                        ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
+                                        : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200'
+                              }`}
+                            >
+                              {log.method}
+                            </span>
+                          </TableCell>
+                          <TableCell className="max-w-[320px] truncate font-mono text-sm">
+                            <span title={`https://${log.host}${log.path}`}>
+                              https://{log.host}
+                              {log.path}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <span
+                              className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_BADGE_CLASSES[httpStatusClass(log.status_code)]}`}
+                            >
+                              {log.status_code}
+                            </span>
+                          </TableCell>
+                          <TableCell className="tabular-nums text-muted-foreground">
+                            {log.response_time_ms
+                              ? `${log.response_time_ms}ms`
+                              : '-'}
+                          </TableCell>
+                          <TableCell className="max-w-[280px]">
+                            {log.bot_name ? (
+                              <span className="inline-flex items-center gap-1.5 truncate text-xs font-medium">
+                                <AiAgentLogo agent={log.bot_name} size={14} />
+                                {log.bot_name}
+                              </span>
+                            ) : (
                               <span
-                                className={`rounded-full px-2 py-1 text-xs font-medium ${
-                                  log.method === 'GET'
-                                    ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
-                                    : log.method === 'POST'
-                                      ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                                      : log.method === 'DELETE'
-                                        ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
-                                        : log.method === 'PUT'
-                                          ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
-                                          : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200'
-                                }`}
+                                className="block truncate font-mono text-xs text-muted-foreground"
+                                title={log.user_agent || ''}
                               >
-                                {log.method}
+                                {log.user_agent || '-'}
                               </span>
-                            </TableCell>
-                            <TableCell className="max-w-[320px] truncate font-mono text-sm">
-                              <span title={`https://${log.host}${log.path}`}>
-                                https://{log.host}
-                                {log.path}
-                              </span>
-                            </TableCell>
-                            <TableCell>
-                              <span
-                                className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_BADGE_CLASSES[httpStatusClass(log.status_code)]}`}
-                              >
-                                {log.status_code}
-                              </span>
-                            </TableCell>
-                            <TableCell className="tabular-nums text-muted-foreground">
-                              {log.response_time_ms
-                                ? `${log.response_time_ms}ms`
-                                : '-'}
-                            </TableCell>
-                            <TableCell className="max-w-[280px]">
-                              {log.bot_name ? (
-                                <span className="inline-flex items-center gap-1.5 truncate text-xs font-medium">
-                                  <AiAgentLogo agent={log.bot_name} size={14} />
-                                  {log.bot_name}
-                                </span>
-                              ) : (
-                                <span
-                                  className="block truncate font-mono text-xs text-muted-foreground"
-                                  title={log.user_agent || ''}
-                                >
-                                  {log.user_agent || '-'}
-                                </span>
-                              )}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                  </TableBody>
-                </Table>
-              </div>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                </TableBody>
+              </Table>
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Pagination */}
-          {totalPages > 1 && (
-            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6">
-              <div className="text-xs sm:text-sm text-muted-foreground text-center sm:text-left">
-                Showing {(page - 1) * limit + 1} to{' '}
-                {Math.min(page * limit, logs?.total || 0)} of {logs?.total || 0}{' '}
-                logs
-              </div>
-              <div className="flex items-center gap-1 sm:gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  disabled={page === 1}
-                  className="h-8 px-2 sm:h-9 sm:px-3"
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline ml-1">Previous</span>
-                </Button>
-                {/* Desktop only: Show numbered page buttons */}
-                <div className="hidden sm:flex items-center gap-1">
-                  {getPaginationPages(page, totalPages).map((pageNum) => (
-                    <Button
-                      key={pageNum}
-                      variant={pageNum === page ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => setPage(pageNum)}
-                      className="w-10"
-                    >
-                      {pageNum}
-                    </Button>
-                  ))}
-                </div>
-                {/* Mobile only: Show current page info */}
-                <span className="sm:hidden text-xs text-muted-foreground px-2">
-                  {page} / {totalPages}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                  disabled={page === totalPages}
-                  className="h-8 px-2 sm:h-9 sm:px-3"
-                >
-                  <span className="hidden sm:inline mr-1">Next</span>
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6">
+            <div className="text-xs sm:text-sm text-muted-foreground text-center sm:text-left">
+              Showing {(page - 1) * limit + 1} to{' '}
+              {Math.min(page * limit, logs?.total || 0)} of {logs?.total || 0}{' '}
+              logs
             </div>
-          )}
+            <div className="flex items-center gap-1 sm:gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page === 1}
+                className="h-8 px-2 sm:h-9 sm:px-3"
+              >
+                <ChevronLeft className="h-4 w-4" />
+                <span className="hidden sm:inline ml-1">Previous</span>
+              </Button>
+              {/* Desktop only: Show numbered page buttons */}
+              <div className="hidden sm:flex items-center gap-1">
+                {getPaginationPages(page, totalPages).map((pageNum) => (
+                  <Button
+                    key={pageNum}
+                    variant={pageNum === page ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setPage(pageNum)}
+                    className="w-10"
+                  >
+                    {pageNum}
+                  </Button>
+                ))}
+              </div>
+              {/* Mobile only: Show current page info */}
+              <span className="sm:hidden text-xs text-muted-foreground px-2">
+                {page} / {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page === totalPages}
+                className="h-8 px-2 sm:h-9 sm:px-3"
+              >
+                <span className="hidden sm:inline mr-1">Next</span>
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

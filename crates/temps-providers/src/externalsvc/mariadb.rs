@@ -4053,7 +4053,7 @@ impl ExternalService for MariaDbService {
         environment: &str,
     ) -> Result<LogicalResource> {
         let resource_name =
-            Self::normalize_database_name(&format!("{}_{}", project_id, environment));
+            Self::normalize_database_name(&super::scoped_resource_name(project_id, environment));
         self.create_database(service_config.clone(), &resource_name)
             .await?;
 
@@ -4067,7 +4067,7 @@ impl ExternalService for MariaDbService {
 
     async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
         let resource_name =
-            Self::normalize_database_name(&format!("{}_{}", project_id, environment));
+            Self::normalize_database_name(&super::scoped_resource_name(project_id, environment));
         let Some(config) = self.config.read().await.as_ref().cloned() else {
             return Ok(());
         };
@@ -4116,7 +4116,7 @@ impl ExternalService for MariaDbService {
         environment: &str,
     ) -> Result<HashMap<String, String>> {
         let resource_name =
-            Self::normalize_database_name(&format!("{}_{}", project_id, environment));
+            Self::normalize_database_name(&super::scoped_resource_name(project_id, environment));
         self.create_database(service_config.clone(), &resource_name)
             .await?;
         self.build_runtime_env_vars(service_config, &resource_name)
@@ -4129,7 +4129,7 @@ impl ExternalService for MariaDbService {
         environment: &str,
     ) -> Result<HashMap<String, String>> {
         let resource_name =
-            Self::normalize_database_name(&format!("{}_{}", project_id, environment));
+            Self::normalize_database_name(&super::scoped_resource_name(project_id, environment));
         self.build_runtime_env_vars(service_config, &resource_name)
     }
 

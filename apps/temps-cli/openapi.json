@@ -12286,6 +12286,15 @@
         ],
         "type": "object"
       },
+      "DatabaseProvisioningMode": {
+        "description": "Controls which logical database a deployment receives through a\nproject-to-service link.",
+        "enum": [
+          "project",
+          "project_environment",
+          "custom"
+        ],
+        "type": "string"
+      },
       "DelRequest": {
         "description": "Request to delete keys",
         "properties": {
@@ -24834,6 +24843,17 @@
       },
       "LinkServiceRequest": {
         "properties": {
+          "custom_database_name": {
+            "description": "Exact database name used when `database_provisioning_mode` is `custom`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode",
+            "description": "How deployments linked through this service select a logical database."
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -33367,6 +33387,15 @@
       },
       "ProjectServiceInfo": {
         "properties": {
+          "custom_database_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -33381,7 +33410,8 @@
         "required": [
           "id",
           "project",
-          "service"
+          "service",
+          "database_provisioning_mode"
         ],
         "type": "object"
       },
@@ -48707,6 +48737,17 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateMonitorRequest": {
+        "properties": {
+          "check_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_path"
+        ],
         "type": "object"
       },
       "UpdateNotificationEmailProviderRequest": {
@@ -71643,6 +71684,9 @@
             },
             "description": "Service linked to project successfully"
           },
+          "400": {
+            "description": "Invalid database provisioning configuration"
+          },
           "401": {
             "description": "Authentication required"
           },
@@ -78868,6 +78912,67 @@
           }
         ],
         "summary": "Get a monitor by ID",
+        "tags": [
+          "Status Page"
+        ]
+      },
+      "patch": {
+        "operationId": "update_monitor",
+        "parameters": [
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor updated successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Monitor not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a monitor's check path",
         "tags": [
           "Status Page"
         ]

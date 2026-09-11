@@ -958,7 +958,7 @@ const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Observe',
+    title: 'Activity',
     url: 'observe',
     icon: Activity,
     keywords: [

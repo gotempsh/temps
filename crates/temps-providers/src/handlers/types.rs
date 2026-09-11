@@ -636,6 +636,12 @@ pub struct UpgradeExternalServiceRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct LinkServiceRequest {
     pub project_id: i32,
+    /// How deployments linked through this service select a logical database.
+    #[serde(default)]
+    pub database_provisioning_mode: crate::services::DatabaseProvisioningMode,
+    /// Exact database name used when `database_provisioning_mode` is `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_database_name: Option<String>,
 }
 
 /// Available Docker container that can be imported as a service
@@ -693,6 +699,9 @@ pub struct ProjectServiceInfo {
     pub id: i32,
     pub project: ProjectInfo,
     pub service: ExternalServiceInfo,
+    pub database_provisioning_mode: crate::services::DatabaseProvisioningMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_database_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

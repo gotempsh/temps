@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -107,7 +108,10 @@ function TlsStatusCell({
     const importCommand = `bunx @temps-sdk/cli traefik-discovery tls import acme.json --hosts ${host}`
     return (
       <span className="flex max-w-[280px] flex-col gap-1">
-        <Badge variant="outline" className="w-fit border-amber-500 text-xs text-amber-600 dark:text-amber-400">
+        <Badge
+          variant="outline"
+          className="w-fit border-amber-500 text-xs text-amber-600 dark:text-amber-400"
+        >
           TLS
         </Badge>
         <span className="text-xs text-amber-600 dark:text-amber-400">
@@ -157,7 +161,10 @@ function TlsStatusCell({
   }
   if (cert.cert_authorized) {
     return (
-      <Badge variant="outline" className="w-fit border-green-500 text-xs text-green-600 dark:text-green-400">
+      <Badge
+        variant="outline"
+        className="w-fit border-green-500 text-xs text-green-600 dark:text-green-400"
+      >
         Authorized
       </Badge>
     )
@@ -272,7 +279,7 @@ function SetupInstructions({
         </p>
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
           <pre className="overflow-x-auto text-xs leading-relaxed">
-            <code>{EXAMPLE_LABELS}</code>
+            <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
           </pre>
           <CopyButton
             value={EXAMPLE_LABELS}
@@ -328,7 +335,7 @@ function SetupInstructions({
 
         <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
           <pre className="overflow-x-auto text-xs leading-relaxed">
-            <code>{status.setup.example}</code>
+            <HighlightedCode code={status.setup.example} language="bash" />
           </pre>
           <CopyButton
             value={status.setup.example}
@@ -510,7 +517,11 @@ function RouteRow({
           )}
       </TableCell>
       <TableCell className="hidden md:table-cell">
-        <TlsStatusCell host={route.host} tls={route.tls} cert={route.tls_certificate} />
+        <TlsStatusCell
+          host={route.host}
+          tls={route.tls}
+          cert={route.tls_certificate}
+        />
       </TableCell>
       <TableCell>
         {route.active ? (
@@ -752,7 +763,7 @@ export function TraefikDiscoveryPage() {
                 </p>
                 <div className="mt-3 flex items-start justify-between gap-2 rounded-md bg-muted p-3">
                   <pre className="overflow-x-auto text-xs leading-relaxed">
-                    <code>{EXAMPLE_LABELS}</code>
+                    <HighlightedCode code={EXAMPLE_LABELS} language="bash" />
                   </pre>
                   <CopyButton
                     value={EXAMPLE_LABELS}
@@ -770,10 +781,11 @@ export function TraefikDiscoveryPage() {
                     <AlertTitle>Certificate drift detected</AlertTitle>
                     <AlertDescription>
                       <p className="mb-1">
-                        The following {driftRoutes.length === 1 ? 'host is' : 'hosts are'}{' '}
-                        now served by a different container than the one that was
-                        authorized for TLS. HTTPS will fail until the certificate
-                        is re-authorized.
+                        The following{' '}
+                        {driftRoutes.length === 1 ? 'host is' : 'hosts are'} now
+                        served by a different container than the one that was
+                        authorized for TLS. HTTPS will fail until the
+                        certificate is re-authorized.
                       </p>
                       <ul className="list-disc pl-4 text-sm">
                         {driftRoutes.map((r) => (
@@ -781,7 +793,8 @@ export function TraefikDiscoveryPage() {
                             <span className="font-mono">{r.host}</span>
                             {r.tls_certificate?.current_container_name && (
                               <span className="text-muted-foreground">
-                                {' '}— now served by{' '}
+                                {' '}
+                                — now served by{' '}
                                 <span className="font-mono">
                                   {r.tls_certificate.current_container_name}
                                 </span>

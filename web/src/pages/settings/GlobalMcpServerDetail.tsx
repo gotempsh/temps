@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   AlertDialog,
@@ -358,7 +359,10 @@ export function GlobalMcpServerDetail() {
                   </div>
                   <div className="rounded-md border bg-muted/50 p-3">
                     <pre className="text-xs whitespace-pre-wrap font-mono overflow-x-auto">
-                      {JSON.stringify(mcp.config, null, 2)}
+                      <HighlightedCode
+                        code={JSON.stringify(mcp.config, null, 2)}
+                        language="json"
+                      />
                     </pre>
                   </div>
                 </div>
