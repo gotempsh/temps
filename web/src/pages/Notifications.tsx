@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+
 import { NotificationRoutesManagement } from '@/components/monitoring/NotificationRoutesManagement'
 import { ProvidersManagement } from '@/components/monitoring/ProvidersManagement'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -23,7 +25,11 @@ export function Notifications() {
   usePageTitle('Notifications')
 
   return (
-    <div className="w-full px-4 sm:px-6 lg:px-8 py-8">
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Notifications"
+        description="Manage delivery providers and notification routes."
+      />
       <div className="w-full">
         <Tabs
           value={activeTab}
@@ -49,6 +55,6 @@ export function Notifications() {
           </TabsContent>
         </Tabs>
       </div>
-    </div>
+    </PageContainer>
   )
 }

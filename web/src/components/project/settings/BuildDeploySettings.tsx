@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSearchParams } from 'react-router'
 import { BuildSettings } from './GitSettings'
 import { DeployDefaultsCard } from './DeployDefaultsCard'
@@ -29,67 +28,69 @@ function isTab(value: string | null): value is TabValue {
  * that can rewrite them. Observability toggles deliberately stay on General —
  * they describe what a deployment reports, not how it ships.
  *
- * The active tab lives in the query string so a tab is linkable and survives a
- * reload, rather than silently resetting to the first one.
+ * The flat Settings sidebar selects the page. Existing tab query parameters
+ * remain supported so saved links keep opening the same configuration.
  */
 export function BuildDeploySettings({
   project,
   refetch,
+  section,
 }: {
   project: ProjectResponse
   refetch: () => void
+  section?: TabValue
 }) {
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams] = useSearchParams()
   const requested = searchParams.get('tab')
-  const active: TabValue = isTab(requested) ? requested : 'source'
-
-  const selectTab = (value: string) => {
-    const next = new URLSearchParams(searchParams)
-    next.set('tab', value)
-    setSearchParams(next, { replace: true })
-  }
+  const active: TabValue = section ?? (isTab(requested) ? requested : 'source')
 
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <h2 className="text-xl font-semibold text-balance">
-          Build and deployment
+          {
+            {
+              source: 'Source',
+              build: 'Build',
+              deploy: 'Deployment',
+              previews: 'Preview environments',
+            }[active]
+          }
         </h2>
         <p className="max-w-[72ch] text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
           Configure how Temps turns your source into a running application.
         </p>
       </div>
 
-      <Tabs value={active} onValueChange={selectTab} className="space-y-6">
-        <TabsList>
-          <TabsTrigger value="source">Source</TabsTrigger>
-          <TabsTrigger value="build">Build</TabsTrigger>
-          <TabsTrigger value="deploy">Deploy</TabsTrigger>
-          <TabsTrigger value="previews">Previews</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="source" className="space-y-6">
+      {active === 'source' && (
+        <div className="space-y-6">
           <DeploymentSourceCard project={project} refetch={refetch} />
-        </TabsContent>
+        </div>
+      )}
 
-        <TabsContent value="build" className="space-y-6">
+      {active === 'build' && (
+        <div className="space-y-6">
           {project.project_type === 'service' ? (
             <ServiceTemplateRuntimeCard project={project} refetch={refetch} />
           ) : (
             <BuildSettings project={project} refetch={refetch} embedded />
           )}
-        </TabsContent>
+        </div>
+      )}
 
-        <TabsContent value="deploy" className="space-y-6">
+      {active === 'deploy' && (
+        <div className="space-y-6">
           <DeployDefaultsCard project={project} refetch={refetch} />
           <EnvironmentPortOverrideCard project={project} />
           <ImageRetentionCard project={project} refetch={refetch} />
-        </TabsContent>
+        </div>
+      )}
 
-        <TabsContent value="previews" className="space-y-6">
+      {active === 'previews' && (
+        <div className="space-y-6">
           <PreviewEnvironmentsCard project={project} refetch={refetch} />
-        </TabsContent>
-      </Tabs>
+        </div>
+      )}
     </div>
   )
 }

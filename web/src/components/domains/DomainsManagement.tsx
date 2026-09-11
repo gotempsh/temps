@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   deleteDomainMutation,
   renewDomainMutation,
@@ -99,11 +101,8 @@ export function DomainsManagement({
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
-  const {
-    canManageCertificates,
-    canCreateDomains,
-    isUsingCloudflare,
-  } = usePlatformCapabilities()
+  const { canManageCertificates, canCreateDomains, isUsingCloudflare } =
+    usePlatformCapabilities()
 
   const deleteDomain = useMutation({
     ...deleteDomainMutation(),
@@ -117,9 +116,7 @@ export function DomainsManagement({
     },
     onError: (error, variables) => {
       if (
-        handleSensitiveActionError(error, () =>
-          deleteDomain.mutate(variables)
-        )
+        handleSensitiveActionError(error, () => deleteDomain.mutate(variables))
       ) {
         setDomainToDelete(null)
         return
@@ -191,7 +188,28 @@ export function DomainsManagement({
     ).length || 0
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <PageHeader
+        title="Domains"
+        description="Manage your custom domains and TLS certificates"
+        actions={
+          <>
+            {' '}
+            {canCreateDomains ? (
+              <CreateActionButton
+                to="/domains/add"
+                label="Add Domain"
+                icon={<Globe className="h-4 w-4" />}
+              />
+            ) : (
+              <Button disabled>
+                <Globe className="mr-2 h-4 w-4" />
+                Managed by Cloudflare
+              </Button>
+            )}{' '}
+          </>
+        }
+      />
       <DNSConfigurationHelper />
 
       {isUsingCloudflare() && (
@@ -220,27 +238,6 @@ export function DomainsManagement({
           </AlertDescription>
         </Alert>
       )}
-
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">Domains</h2>
-          <p className="text-sm text-muted-foreground">
-            Manage your custom domains and TLS certificates
-          </p>
-        </div>
-        {canCreateDomains ? (
-          <CreateActionButton
-            to="/domains/add"
-            label="Add Domain"
-            icon={<Globe className="h-4 w-4" />}
-          />
-        ) : (
-          <Button disabled>
-            <Globe className="mr-2 h-4 w-4" />
-            Managed by Cloudflare
-          </Button>
-        )}
-      </div>
 
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -289,7 +286,10 @@ export function DomainsManagement({
       {isLoading ? (
         <div className="divide-y rounded-lg border">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="flex items-center gap-4 px-4 py-3 animate-pulse">
+            <div
+              key={i}
+              className="flex items-center gap-4 px-4 py-3 animate-pulse"
+            >
               <div className="size-9 shrink-0 rounded-md bg-muted" />
               <div className="flex-1 min-w-0 space-y-1.5">
                 <div className="h-4 w-48 bg-muted rounded" />
@@ -519,7 +519,7 @@ function DomainsCompactRows({
                   onOpen(domain.id)
                 }
               }}
-              className="flex cursor-pointer items-center gap-4 px-4 py-3 hover:bg-muted/40 transition-colors focus:outline-none focus:bg-muted/40"
+              className="flex cursor-pointer items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus:outline-none focus:bg-muted/40"
             >
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                 <Globe className="size-4 text-muted-foreground" />
@@ -556,7 +556,7 @@ function DomainsCompactRows({
                 onDelete={onDelete}
                 canManageCertificates={canManageCertificates}
               />
-              <ChevronRight className="size-4 shrink-0 text-muted-foreground/50" />
+              <ChevronRight className="hidden size-4 shrink-0 text-muted-foreground/50 sm:block" />
             </li>
           )
         })}

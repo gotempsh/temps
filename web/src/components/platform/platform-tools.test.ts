@@ -18,3 +18,10 @@ describe('platform tools AI discovery', () => {
     ).toBe('/ai-gateway')
   })
 })
+
+test('global observability is discoverable from platform tools', () => {
+  const observe = platformToolGroups.find((group) => group.label === 'Observe')
+  for (const path of ['/analytics', '/traces', '/logs', '/errors']) {
+    expect(observe?.items.some((item) => item.url === path)).toBe(true)
+  }
+})

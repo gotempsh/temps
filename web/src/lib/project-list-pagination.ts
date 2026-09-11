@@ -53,3 +53,15 @@ export function withProjectPagination(
   next.set('page_size', String(pagination.pageSize))
   return next
 }
+
+/** A filter starts at page one and preserves the rest of the current view. */
+export function withProjectSearch(
+  current: URLSearchParams,
+  value: string
+): URLSearchParams {
+  const next = new URLSearchParams(current)
+  if (value) next.set('q', value)
+  else next.delete('q')
+  next.set('page', '1')
+  return next
+}

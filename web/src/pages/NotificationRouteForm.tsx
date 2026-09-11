@@ -198,7 +198,7 @@ export function NotificationRouteForm() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="container mx-auto max-w-5xl space-y-6 py-6">
+      <div className="container mx-auto max-w-4xl space-y-6 py-6">
         <div className="space-y-4">
           <Button variant="ghost" className="-ml-3" onClick={returnToRoutes}>
             <ArrowLeft className="mr-2 h-4 w-4" />
@@ -217,7 +217,7 @@ export function NotificationRouteForm() {
         </div>
 
         <form onSubmit={save}>
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+          <div className="grid gap-6">
             <Card>
               <CardHeader>
                 <CardTitle>Route configuration</CardTitle>
@@ -225,7 +225,7 @@ export function NotificationRouteForm() {
                   Define when this route matches and where notifications go.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-6">
+              <CardContent className="flex flex-col gap-6">
                 <div className="space-y-2">
                   <Label htmlFor="route-name">Name</Label>
                   <Input
@@ -309,7 +309,7 @@ export function NotificationRouteForm() {
                   </Badge>
                 </div>
 
-                <div className="space-y-3">
+                <div className="order-first space-y-3">
                   <div>
                     <Label>Destinations</Label>
                     <p className="mt-1 text-sm text-muted-foreground">
@@ -414,18 +414,18 @@ export function NotificationRouteForm() {
                 </CardContent>
               </Card>
 
-              <div className="flex gap-3 lg:flex-col-reverse">
+              <div className="flex justify-end gap-3">
                 <Button
                   type="button"
                   variant="outline"
-                  className="flex-1"
+                  className="sm:min-w-28"
                   onClick={returnToRoutes}
                 >
                   Cancel
                 </Button>
                 <Button
                   type="submit"
-                  className="flex-1"
+                  className="sm:min-w-36"
                   disabled={isLoading || isSaving}
                 >
                   {isSaving

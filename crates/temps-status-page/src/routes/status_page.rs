@@ -24,7 +24,7 @@ use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
     IncidentResponse, IncidentUpdateResponse, MonitorResponse, ProjectMonitorHealth,
     StatusBucketedResponse, StatusPageError, StatusPageOverview, StatusPageService,
-    UpdateIncidentStatusRequest, UptimeHistoryResponse,
+    UpdateIncidentStatusRequest, UpdateMonitorRequest, UptimeHistoryResponse,
 };
 
 /// Application state trait for status page routes
@@ -44,6 +44,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         create_monitor,
         list_monitors,
         get_monitor,
+        update_monitor,
         delete_monitor,
         get_current_monitor_status,
         get_uptime_history,
@@ -61,6 +62,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             StatusPageOverview,
             MonitorResponse,
             CreateMonitorRequest,
+            UpdateMonitorRequest,
             CurrentStatusResponse,
             UptimeHistoryResponse,
             StatusBucketedResponse,
@@ -297,6 +299,76 @@ where
         .await
         .map(Json)
         .map_err(map_error)
+}
+
+/// Update a monitor's check path
+#[utoipa::path(
+    patch,
+    path = "/monitors/{monitor_id}",
+    request_body = UpdateMonitorRequest,
+    params(
+        ("monitor_id" = i32, Path, description = "Monitor ID"),
+    ),
+    responses(
+        (status = 200, description = "Monitor updated successfully", body = MonitorResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Monitor not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn update_monitor<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(monitor_id): Path<i32>,
+    Json(request): Json<UpdateMonitorRequest>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .status_page_service()
+        .monitor_service()
+        .get_monitor_project_id(monitor_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+
+    let monitor = app_state
+        .status_page_service()
+        .monitor_service()
+        .update_monitor(monitor_id, request)
+        .await
+        .map_err(map_error)?;
+
+    record_status_page_audit(
+        app_state.as_ref(),
+        StatusPageMutationAudit {
+            actor_user_id: auth.user_id_opt(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+            action: StatusPageMutationAction::MonitorUpdated,
+            project_id,
+            resource_type: "monitor",
+            resource_id: monitor_id,
+            environment_id: monitor.environment_id,
+            monitor_id: Some(monitor_id),
+            status: None,
+        },
+    )
+    .await;
+
+    Ok(Json(monitor))
 }
 
 /// Delete a monitor
@@ -1112,6 +1184,7 @@ where
             get(get_projects_monitor_health),
         )
         .route("/monitors/{monitor_id}", get(get_monitor))
+        .route("/monitors/{monitor_id}", patch(update_monitor))
         .route("/monitors/{monitor_id}", delete(delete_monitor))
         .route(
             "/monitors/{monitor_id}/current-status",
@@ -1708,6 +1781,20 @@ mod tests {
         .expect("an effective project viewer must not update an incident");
         assert_project_permission_denied(update_incident_error, "status_page:write");
 
+        let update_monitor_error = update_monitor(
+            RequireAuth(AuthContext::new_session(test_user(), Role::User)),
+            State(fx.app_state.clone()),
+            Extension(test_request_metadata()),
+            Path(fx.monitor_id),
+            Json(UpdateMonitorRequest {
+                check_path: "/forbidden".to_string(),
+            }),
+        )
+        .await
+        .err()
+        .expect("an effective project viewer must not update a monitor");
+        assert_project_permission_denied(update_monitor_error, "status_page:write");
+
         let delete_monitor_error = delete_monitor(
             RequireAuth(status_page_delete_api_key_auth()),
             State(fx.app_state.clone()),
@@ -1797,6 +1884,21 @@ mod tests {
             "a project admin should be able to update an incident"
         );
 
+        let update_monitor_result = update_monitor(
+            RequireAuth(AuthContext::new_session(test_user(), Role::User)),
+            State(fx.app_state.clone()),
+            Extension(test_request_metadata()),
+            Path(fx.monitor_id),
+            Json(UpdateMonitorRequest {
+                check_path: "/ready".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            update_monitor_result.is_ok(),
+            "a project admin should be able to update a monitor"
+        );
+
         let delete_monitor_result = delete_monitor(
             RequireAuth(status_page_delete_api_key_auth()),
             State(fx.app_state.clone()),
@@ -1880,6 +1982,18 @@ mod tests {
         .await;
         assert!(update_result.is_ok());
 
+        let update_monitor_result = update_monitor(
+            RequireAuth(AuthContext::new_session(test_user(), Role::User)),
+            State(fx.app_state.clone()),
+            Extension(test_request_metadata()),
+            Path(fx.monitor_id),
+            Json(UpdateMonitorRequest {
+                check_path: "/audit-unavailable".to_string(),
+            }),
+        )
+        .await;
+        assert!(update_monitor_result.is_ok());
+
         let delete_result = delete_monitor(
             RequireAuth(status_page_delete_api_key_auth()),
             State(fx.app_state.clone()),
@@ -1888,7 +2002,7 @@ mod tests {
         )
         .await;
         assert!(delete_result.is_ok());
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

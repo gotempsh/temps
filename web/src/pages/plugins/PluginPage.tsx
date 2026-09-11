@@ -3,8 +3,10 @@
 
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import { Loader2 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import { Loader2, Puzzle, RefreshCw } from 'lucide-react'
+import { createElement, useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router'
 
 /**
@@ -42,7 +44,7 @@ export function PluginPage() {
     pluginName: string
     '*': string
   }>()
-  const { getPlugin } = usePluginsContext()
+  const { getPlugin, isLoading: pluginsLoading } = usePluginsContext()
   const navigate = useNavigate()
   const location = useLocation()
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -213,15 +215,43 @@ export function PluginPage() {
     setHasError(true)
   }, [])
 
-  if (!plugin) {
+  if (pluginsLoading) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[400px] text-muted-foreground">
-        <p>Plugin not found: {pluginName}</p>
+      <div className="flex min-h-[400px] items-center justify-center">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
       </div>
     )
   }
 
-  const Icon = resolvePluginIcon(plugin.nav[0]?.icon ?? 'puzzle')
+  if (!plugin) {
+    return (
+      <div className="flex min-h-[400px] items-center justify-center p-4">
+        <Card className="w-full max-w-lg">
+          <CardContent className="flex flex-col items-center px-6 py-10 text-center">
+            <div className="mb-4 flex size-12 items-center justify-center rounded-full bg-muted">
+              <Puzzle className="size-6 text-muted-foreground" />
+            </div>
+            <h1 className="text-lg font-semibold">Plugin isn&apos;t loaded</h1>
+            <p className="mt-2 max-w-sm text-sm text-muted-foreground">
+              Reload installed plugins, then return here. If it still does not
+              appear, check that its binary is in the configured plugins
+              directory.
+            </p>
+            <div className="mt-6 flex flex-col gap-2 sm:flex-row">
+              <Button onClick={() => navigate('/settings/plugins')}>
+                <RefreshCw className="mr-2 size-4" />
+                Manage plugins
+              </Button>
+              <Button variant="outline" onClick={() => navigate('/tools')}>
+                Back to tools
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
   const displayName = plugin.display_name ?? plugin.name
   const base = `/api/x/${plugin.name}/ui/`
   const iframeSrc = initialPath ? `${base}#/${initialPath}` : base
@@ -238,7 +268,9 @@ export function PluginPage() {
       {!plugin.hide_header && (
         <div className="flex items-center gap-2 px-4 py-2 border-b bg-background shrink-0">
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-muted">
-            <Icon className="h-4 w-4" />
+            {createElement(resolvePluginIcon(plugin.nav[0]?.icon ?? 'puzzle'), {
+              className: 'h-4 w-4',
+            })}
           </div>
           <h1 className="text-sm font-medium">{displayName}</h1>
           <span className="text-xs text-muted-foreground font-mono">

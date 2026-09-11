@@ -40,8 +40,13 @@ export function PageContainer({
   children: ReactNode
 }) {
   return (
-    <div className={cn('w-full px-4 py-6 sm:px-6 lg:px-8', className)}>
-      <div className={cn(WIDTH_CLASS[width], 'min-w-0', innerClassName)}>
+    <div
+      data-page-container
+      className={cn('w-full px-4 py-6 sm:px-6 lg:px-8', className)}
+    >
+      <div
+        className={cn(WIDTH_CLASS[width], 'min-w-0 space-y-6', innerClassName)}
+      >
         {children}
       </div>
     </div>
@@ -68,6 +73,7 @@ export function PageHeader({
 }) {
   return (
     <div
+      data-page-header
       className={cn(
         'flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between',
         className

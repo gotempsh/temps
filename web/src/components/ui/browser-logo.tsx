@@ -20,6 +20,8 @@ const BROWSER_TO_LOGO: Record<string, string> = {
   'Opera GX': 'OperaGX.svg',
   'Samsung Internet': 'SamsungInternet.svg',
   Yandex: 'Yandex.svg',
+  'Yandex Browser': 'Yandex.svg',
+  Webview: 'Chromium.svg',
   QQBrowser: 'QQ.webp',
   Whale: 'Whale.svg',
   Baidu: 'Baidu.svg',

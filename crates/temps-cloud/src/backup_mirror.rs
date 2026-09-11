@@ -14,7 +14,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use sha2::{Digest, Sha256};
-use temps_cloud_client::CloudLink;
+use temps_cloud_client::{CloudError, CloudLink};
 use temps_cloud_protocol::{
     BackupCompression, BackupEngine, BackupFormat, NativeSnapshotIdentity,
     NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest,
@@ -91,6 +91,145 @@ LIMIT $4
 enum StageError {
     Unsupported(String),
     Retry(String),
+}
+
+/// How many individual object failures one upload pass keeps verbatim. The
+/// count is always reported; only the first few reasons are, so a pass that
+/// loses thousands of objects to the same outage does not write thousands of
+/// near-identical lines into the mirror state's `reason` column.
+const MAX_REPORTED_OBJECT_FAILURES: usize = 3;
+/// Consecutive object failures after which a pass stops walking the manifest.
+///
+/// Tolerating individual failures is what makes progress monotonic, but a
+/// *run* of them is not individual bad luck — it is the source bucket, its
+/// credential, or Cloud being down for everything. Each failed object has
+/// already spent up to three attempts against `S3_CONTROL_REQUEST_TIMEOUT`
+/// and `S3_STREAM_IDLE_TIMEOUT`, so continuing through a 100,000-object
+/// manifest during an outage would hold the sweep (which serves every other
+/// backup on this instance in series) for hours. Ten in a row is far more
+/// than a transient stall produces and far less than an outage costs.
+const MAX_CONSECUTIVE_OBJECT_FAILURES: usize = 10;
+
+/// Bookkeeping for one pass over a declared manifest.
+///
+/// A pass used to be all-or-nothing: the first object that failed after its
+/// bounded retries aborted the whole snapshot, and the next sweep started
+/// again from the first object — re-requesting a target and re-verifying
+/// every object Cloud already held. For an S3-mirror snapshot, whose manifest
+/// has as many objects as the source buckets, that meant one transient S3
+/// stall anywhere in a multi-thousand-object walk reset all the progress
+/// behind it, and a snapshot could stay "Uploading" on Cloud indefinitely.
+///
+/// A pass now records per-object failures and keeps going, so every object
+/// that *can* upload does, and Cloud's `completed_relative_keys` lets the
+/// next pass skip them. Progress is therefore monotonic across sweeps.
+#[derive(Debug, Default)]
+struct UploadPass {
+    /// Objects in the declared manifest.
+    declared: usize,
+    /// Objects Cloud reported as already complete before this pass began.
+    already_complete: usize,
+    /// Objects this pass uploaded and had Cloud verify.
+    uploaded: usize,
+    /// Objects that failed after their own bounded retries.
+    failed: usize,
+    /// `(relative_key, reason)` for the first `MAX_REPORTED_OBJECT_FAILURES`.
+    reported_failures: Vec<(String, String)>,
+    /// Failures since the last successful upload; drives the circuit breaker.
+    consecutive_failures: usize,
+    /// Set when the breaker tripped and the manifest walk stopped early, so
+    /// the recorded reason says so rather than implying every object was tried.
+    stopped_early: bool,
+}
+
+impl UploadPass {
+    fn record_success(&mut self) {
+        self.uploaded += 1;
+        self.consecutive_failures = 0;
+    }
+
+    /// Record one failed object. Returns `true` when the pass should stop
+    /// walking the manifest because failures are no longer isolated.
+    fn record_failure(&mut self, relative_key: &str, reason: &str) -> bool {
+        self.failed += 1;
+        self.consecutive_failures += 1;
+        if self.reported_failures.len() < MAX_REPORTED_OBJECT_FAILURES {
+            self.reported_failures
+                .push((relative_key.to_owned(), reason.to_owned()));
+        }
+        if self.consecutive_failures >= MAX_CONSECUTIVE_OBJECT_FAILURES {
+            self.stopped_early = true;
+        }
+        self.stopped_early
+    }
+
+    /// `Ok(())` when every declared object is now complete on Cloud, otherwise
+    /// a `Retry` describing what this pass did and did not manage, so the
+    /// mirror state an operator sees says "resumed 400 of 2,000, 3 failed"
+    /// rather than only the first object's error.
+    fn into_result(self) -> Result<(), StageError> {
+        if self.failed == 0 {
+            return Ok(());
+        }
+        let mut reason = format!(
+            "{} of {} objects did not upload this pass ({} were already complete on Cloud, \
+             {} uploaded now); the next pass resumes from Cloud's completed set",
+            self.failed, self.declared, self.already_complete, self.uploaded
+        );
+        if self.stopped_early {
+            reason.push_str(&format!(
+                "; stopped after {} consecutive failures, which points at the source, \
+                 its credential, or Cloud being unavailable rather than at these objects",
+                self.consecutive_failures
+            ));
+        }
+        for (relative_key, failure) in &self.reported_failures {
+            reason.push_str(&format!("; {relative_key}: {failure}"));
+        }
+        if self.failed > self.reported_failures.len() {
+            reason.push_str(&format!(
+                "; {} more not listed",
+                self.failed - self.reported_failures.len()
+            ));
+        }
+        Err(StageError::Retry(reason))
+    }
+}
+
+/// Split a declared manifest into the objects still to upload and the count
+/// Cloud already verified. `completed` is Cloud's own answer for this exact
+/// `backup_id`, so a key in it can be skipped without re-checking anything:
+/// Cloud verified the bytes and checksum against the manifest it bound the
+/// snapshot to, and that manifest is the one we just re-declared unchanged.
+///
+/// The set is still sanity-bounded by what *we* declared: Cloud can only have
+/// completed objects from that manifest, so a longer list is a protocol
+/// anomaly. It is ignored wholesale (every object uploads, as before this
+/// field existed) rather than trusted for whatever prefix happens to match.
+fn pending_objects<T>(
+    declarations: Vec<T>,
+    completed: &[String],
+    relative_key: impl Fn(&T) -> &str,
+) -> (Vec<T>, usize) {
+    if completed.is_empty() {
+        return (declarations, 0);
+    }
+    if completed.len() > declarations.len() {
+        warn!(
+            completed = completed.len(),
+            declared = declarations.len(),
+            "Cloud reported more completed objects than this snapshot declares; ignoring the set"
+        );
+        return (declarations, 0);
+    }
+    let completed: HashSet<&str> = completed.iter().map(String::as_str).collect();
+    let before = declarations.len();
+    let pending: Vec<T> = declarations
+        .into_iter()
+        .filter(|declaration| !completed.contains(relative_key(declaration)))
+        .collect();
+    let skipped = before - pending.len();
+    (pending, skipped)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1016,6 +1155,31 @@ async fn mirror_native_backup(
     .await
 }
 
+/// The root Cloud may catalog in place for this snapshot, if any.
+///
+/// A managed source's bucket is the tenant's cloud backup bucket, so the
+/// objects the engine wrote under `root` already are the offsite copy. Telling
+/// Cloud where they are lets it catalog them in place rather than have the
+/// sweep read every object back and upload it a second time into Cloud's own
+/// layout in the same bucket. A Cloud that predates the field answers
+/// `upload_required: true` and the copy path runs unchanged.
+///
+/// Only snapshot-exclusive layouts qualify: an object set or a logical dump
+/// lives under a root that belongs to this backup alone. A WAL-G stream
+/// snapshot (Redis/MongoDB `/walg`, MariaDB physical) selects its objects out
+/// of a repository shared by every backup of that service, and WAL-G's own
+/// retention later deletes from it, so cataloging those objects in place would
+/// leave Cloud pointing at files that disappear. They keep the copy path.
+fn in_place_root_for(
+    managed_by_cloud: bool,
+    compression: BackupCompression,
+    root: &str,
+) -> Option<String> {
+    (managed_by_cloud && compression != BackupCompression::WalGNative)
+        .then(|| root.trim_matches('/').to_string())
+        .filter(|root| !root.is_empty())
+}
+
 /// Declare, upload (if required), and complete a native snapshot against
 /// Cloud. Factored out of `mirror_native_backup` so [`mirror_control_plane_backup`]
 /// can reuse the same declare/upload/complete sequence without duplicating
@@ -1079,7 +1243,8 @@ async fn declare_and_complete_native_snapshot(
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let request = NativeSnapshotRequest {
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, compression, root);
+    let mut request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
         source,
@@ -1089,14 +1254,60 @@ async fn declare_and_complete_native_snapshot(
         identity,
         objects: declarations.clone(),
         source_image,
+        in_place_root,
     };
-    let snapshot = link
-        .declare_native_snapshot(&request)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let snapshot = match link.declare_native_snapshot(&request).await {
+        Ok(snapshot) => snapshot,
+        // Cloud understood the in-place request and refused it (a root it
+        // will not accept, a bucket that disagrees with the manifest). That
+        // is a verdict on this layout, not a transient fault: retrying the
+        // same declaration would loop forever. Fall back to the copy path,
+        // which is what Cloud always accepted, and say why.
+        Err(CloudError::Rejected { detail }) if request.in_place_root.is_some() => {
+            warn!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                %detail,
+                "Cloud declined to catalog the snapshot in place; mirroring a copy instead"
+            );
+            request.in_place_root = None;
+            link.declare_native_snapshot(&request)
+                .await
+                .map_err(|error| StageError::Retry(error.to_string()))?
+        }
+        Err(error) => return Err(StageError::Retry(error.to_string())),
+    };
+    if !snapshot.upload_required && request.in_place_root.is_some() {
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            objects = declarations.len(),
+            "Cloud cataloged the snapshot in place; no second copy uploaded"
+        );
+    }
     if snapshot.upload_required {
-        for declaration in declarations {
-            upload_native_object(
+        let mut pass = UploadPass {
+            declared: declarations.len(),
+            ..UploadPass::default()
+        };
+        let (pending, already_complete) = pending_objects(
+            declarations,
+            &snapshot.completed_relative_keys,
+            |declaration| declaration.relative_key.as_str(),
+        );
+        pass.already_complete = already_complete;
+        if already_complete > 0 {
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                already_complete,
+                pending = pending.len(),
+                "Cloud backup mirror resuming native snapshot from Cloud's completed set"
+            );
+        }
+        for declaration in pending {
+            let relative_key = declaration.relative_key.clone();
+            match upload_native_object(
                 link,
                 client,
                 &source_config.bucket_name,
@@ -1105,8 +1316,31 @@ async fn declare_and_complete_native_snapshot(
                 cloud_backup_id,
                 declaration,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => pass.record_success(),
+                Err(StageError::Retry(reason)) => {
+                    warn!(
+                        local_backup_id = %backup.backup_id,
+                        %relative_key,
+                        error = %reason,
+                        "Cloud backup mirror could not upload one object; continuing with the rest"
+                    );
+                    if pass.record_failure(&relative_key, &reason) {
+                        warn!(
+                            local_backup_id = %backup.backup_id,
+                            consecutive_failures = MAX_CONSECUTIVE_OBJECT_FAILURES,
+                            "Cloud backup mirror stopping this pass early; failures are no longer isolated"
+                        );
+                        break;
+                    }
+                }
+                // Structural: the same object will be rejected the same way
+                // on every pass, so finishing the walk cannot help.
+                Err(error @ StageError::Unsupported(_)) => return Err(error),
+            }
         }
+        pass.into_result()?;
     }
     link.complete_native_snapshot(&WalGSnapshotCompleted {
         backup_id: cloud_backup_id,
@@ -1371,8 +1605,28 @@ async fn mirror_walg_backup(
         .await
         .map_err(|error| StageError::Retry(error.to_string()))?;
     if snapshot.upload_required {
-        for declaration in declarations {
-            upload_repository_object(
+        let mut pass = UploadPass {
+            declared: declarations.len(),
+            ..UploadPass::default()
+        };
+        let (pending, already_complete) = pending_objects(
+            declarations,
+            &snapshot.completed_relative_keys,
+            |declaration| declaration.relative_key.as_str(),
+        );
+        pass.already_complete = already_complete;
+        if already_complete > 0 {
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                already_complete,
+                pending = pending.len(),
+                "Cloud backup mirror resuming WAL-G snapshot from Cloud's completed set"
+            );
+        }
+        for declaration in pending {
+            let relative_key = declaration.relative_key.clone();
+            match upload_repository_object(
                 link,
                 &client,
                 &source_config.bucket_name,
@@ -1381,8 +1635,29 @@ async fn mirror_walg_backup(
                 cloud_backup_id,
                 declaration,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => pass.record_success(),
+                Err(StageError::Retry(reason)) => {
+                    warn!(
+                        local_backup_id = %backup.backup_id,
+                        %relative_key,
+                        error = %reason,
+                        "Cloud backup mirror could not upload one object; continuing with the rest"
+                    );
+                    if pass.record_failure(&relative_key, &reason) {
+                        warn!(
+                            local_backup_id = %backup.backup_id,
+                            consecutive_failures = MAX_CONSECUTIVE_OBJECT_FAILURES,
+                            "Cloud backup mirror stopping this pass early; failures are no longer isolated"
+                        );
+                        break;
+                    }
+                }
+                Err(error @ StageError::Unsupported(_)) => return Err(error),
+            }
         }
+        pass.into_result()?;
     }
     link.complete_walg_snapshot(&WalGSnapshotCompleted {
         backup_id: cloud_backup_id,
@@ -2309,10 +2584,11 @@ mod tests {
     use super::{
         append_source_object, backup_engine_key, contains_backup_identity, deferred_legacy_state,
         ensure_json_object_size, image_tag_version, manifest_digest, merge_mirror_state,
-        mirror_backup, next_sweep_interval, parse_postgres_major, run, s3_key, select_due_backups,
-        sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
+        mirror_backup, next_sweep_interval, parse_postgres_major, pending_objects, run, s3_key,
+        select_due_backups, sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
         upload_native_object, wal_segment_name, wal_segment_of, walg_root_key, SourceObject,
-        StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL,
+        StageError, SweepOutcome, UploadPass, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
+        DUE_BACKUPS_SQL, MAX_CONSECUTIVE_OBJECT_FAILURES, MAX_REPORTED_OBJECT_FAILURES,
         MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
     use std::{
@@ -2340,10 +2616,147 @@ mod tests {
     use sha2::{Digest, Sha256};
     use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
     use temps_cloud_protocol::{
-        NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, WalGObjectCompleted,
+        BackupCompression, NativeSnapshot, NativeSnapshotObjectDeclaration,
+        NativeSnapshotObjectKind, NativeSnapshotRequest, WalGObjectCompleted,
         WalGObjectTargetRequest,
     };
     use uuid::Uuid;
+
+    fn native_declaration(relative_key: &str) -> NativeSnapshotObjectDeclaration {
+        NativeSnapshotObjectDeclaration {
+            relative_key: relative_key.to_owned(),
+            kind: NativeSnapshotObjectKind::Object,
+            bytes: 1,
+            checksum_sha256: "ab".repeat(32),
+        }
+    }
+
+    /// Cloud's completed set is authoritative for the exact manifest just
+    /// re-declared: those objects are skipped, everything else stays in
+    /// manifest order, and a key Cloud names that we never declared is
+    /// ignored rather than trusted.
+    #[test]
+    fn pending_objects_skips_only_what_cloud_reports_complete() {
+        let declarations = vec![
+            native_declaration("bucket-a/one"),
+            native_declaration("bucket-a/two"),
+            native_declaration("bucket-b/three"),
+        ];
+        let completed = vec!["bucket-a/two".to_owned(), "never-declared".to_owned()];
+
+        let (pending, skipped) =
+            pending_objects(declarations, &completed, |d| d.relative_key.as_str());
+
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|d| d.relative_key.as_str())
+                .collect::<Vec<_>>(),
+            ["bucket-a/one", "bucket-b/three"]
+        );
+    }
+
+    /// A Cloud that predates `completed_relative_keys` (or a fresh
+    /// declaration) reports nothing complete; the pass must then be exactly
+    /// the pre-resume behaviour, with no object skipped.
+    #[test]
+    fn pending_objects_without_completed_set_uploads_everything() {
+        let declarations = vec![native_declaration("one"), native_declaration("two")];
+        let (pending, skipped) = pending_objects(declarations, &[], |d| d.relative_key.as_str());
+        assert_eq!(skipped, 0);
+        assert_eq!(pending.len(), 2);
+    }
+
+    /// One failed object no longer aborts the pass, but it must still stop
+    /// the snapshot from being reported complete: the result is a `Retry`
+    /// whose reason accounts for every object, names the failures an
+    /// operator can act on, and stays bounded when many fail the same way.
+    #[test]
+    fn upload_pass_reports_partial_progress_as_retry() {
+        let mut pass = UploadPass {
+            declared: 2_000,
+            already_complete: 1_500,
+            uploaded: 495,
+            ..UploadPass::default()
+        };
+        for index in 0..5 {
+            pass.record_failure(
+                &format!("bucket-a/object-{index}"),
+                "source object made no progress for 60 seconds",
+            );
+        }
+        assert_eq!(pass.failed, 5);
+        assert_eq!(pass.reported_failures.len(), MAX_REPORTED_OBJECT_FAILURES);
+
+        let error = pass
+            .into_result()
+            .expect_err("a pass with failures must not complete the snapshot");
+        let StageError::Retry(reason) = error else {
+            panic!("partial progress is transient, not unsupported");
+        };
+        assert!(reason.starts_with("5 of 2000 objects did not upload this pass"));
+        assert!(reason.contains("1500 were already complete on Cloud"));
+        assert!(reason.contains("495 uploaded now"));
+        assert!(reason.contains("bucket-a/object-0: source object made no progress"));
+        assert!(reason.contains("bucket-a/object-2"));
+        assert!(!reason.contains("bucket-a/object-3"));
+        assert!(reason.ends_with("; 2 more not listed"));
+    }
+
+    /// A run of failures is an outage, not bad luck per object. The breaker
+    /// stops the walk so one wedged snapshot cannot hold the serial sweep for
+    /// hours, a success in between resets it, and the recorded reason says
+    /// the pass stopped early instead of implying every object was tried.
+    #[test]
+    fn upload_pass_breaker_trips_only_on_consecutive_failures() {
+        let mut pass = UploadPass {
+            declared: 100,
+            ..UploadPass::default()
+        };
+        for _ in 0..MAX_CONSECUTIVE_OBJECT_FAILURES - 1 {
+            assert!(!pass.record_failure("k", "stall"));
+        }
+        pass.record_success();
+        for _ in 0..MAX_CONSECUTIVE_OBJECT_FAILURES - 1 {
+            assert!(
+                !pass.record_failure("k", "stall"),
+                "a success in between must reset the run"
+            );
+        }
+        assert!(pass.record_failure("k", "stall"), "tenth in a row trips");
+        assert!(pass.stopped_early);
+
+        let StageError::Retry(reason) = pass.into_result().expect_err("failed pass retries") else {
+            panic!("an outage is transient");
+        };
+        assert!(reason.contains(&format!(
+            "stopped after {MAX_CONSECUTIVE_OBJECT_FAILURES} consecutive failures"
+        )));
+    }
+
+    /// Cloud can only have completed objects we declared. A longer list is a
+    /// protocol anomaly and must not be trusted even for the keys that match.
+    #[test]
+    fn pending_objects_ignores_a_completed_set_larger_than_the_manifest() {
+        let declarations = vec![native_declaration("one")];
+        let completed = vec!["one".to_owned(), "two".to_owned()];
+        let (pending, skipped) =
+            pending_objects(declarations, &completed, |d| d.relative_key.as_str());
+        assert_eq!(skipped, 0);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn upload_pass_without_failures_completes() {
+        let pass = UploadPass {
+            declared: 3,
+            already_complete: 2,
+            uploaded: 1,
+            ..UploadPass::default()
+        };
+        assert!(pass.into_result().is_ok());
+    }
 
     #[test]
     fn repository_discovery_rejects_excess_object_count() {
@@ -4036,6 +4449,314 @@ mod tests {
             "expected exactly the dump object and metadata.json to be read and checksummed, \
              proving the decoy object was excluded and both real objects were reached"
         );
+    }
+
+    #[test]
+    fn only_snapshot_exclusive_layouts_on_managed_sources_catalog_in_place() {
+        let root = "/t/managed-backups/external_services/s3/store/2026-09-11/backup-7/";
+        assert_eq!(
+            super::in_place_root_for(true, BackupCompression::None, root).as_deref(),
+            Some("t/managed-backups/external_services/s3/store/2026-09-11/backup-7")
+        );
+        assert!(super::in_place_root_for(true, BackupCompression::Gzip, root).is_some());
+        // Shared WAL-G repositories are rotated by WAL-G retention: copy.
+        assert!(super::in_place_root_for(true, BackupCompression::WalGNative, root).is_none());
+        // Operator-owned sources are not the cloud bucket: copy.
+        assert!(super::in_place_root_for(false, BackupCompression::None, root).is_none());
+        assert!(super::in_place_root_for(true, BackupCompression::None, "/").is_none());
+    }
+
+    struct InPlaceCloudStub {
+        /// Every declaration received, in order.
+        declared: Mutex<Vec<NativeSnapshotRequest>>,
+        /// Refuse declarations that carry `in_place_root` with a 400, the
+        /// way Cloud does for a root it will not catalog.
+        reject_in_place: bool,
+        target_calls: AtomicUsize,
+        completions: AtomicUsize,
+    }
+
+    /// Cloud's problem body for a refused request.
+    #[derive(serde::Serialize)]
+    struct StubRejection {
+        detail: &'static str,
+    }
+
+    /// Cloud's acknowledgement of a completed snapshot.
+    #[derive(serde::Serialize)]
+    struct StubCompletion {
+        state: &'static str,
+    }
+
+    async fn in_place_declare_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+        Json(request): Json<NativeSnapshotRequest>,
+    ) -> Result<(StatusCode, Json<NativeSnapshot>), (StatusCode, Json<StubRejection>)> {
+        let in_place = request.in_place_root.is_some();
+        let response = NativeSnapshot {
+            backup_id: request.backup_id,
+            upload_required: !in_place,
+            completed_relative_keys: Vec::new(),
+        };
+        state.declared.lock().expect("declared lock").push(request);
+        if in_place && state.reject_in_place {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(StubRejection {
+                    detail: "in_place_root must lie under this tenant's managed backup path",
+                }),
+            ));
+        }
+        Ok((StatusCode::CREATED, Json(response)))
+    }
+
+    async fn in_place_target_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+    ) -> (StatusCode, Json<StubRejection>) {
+        state.target_calls.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(StubRejection {
+                detail: "in-place snapshots never request targets",
+            }),
+        )
+    }
+
+    async fn in_place_complete_stub(
+        State(state): State<Arc<InPlaceCloudStub>>,
+    ) -> (StatusCode, Json<StubCompletion>) {
+        state.completions.fetch_add(1, Ordering::SeqCst);
+        (StatusCode::OK, Json(StubCompletion { state: "complete" }))
+    }
+
+    /// A managed source's bucket is the tenant's cloud bucket, so the sweep
+    /// declares the engine's own root and Cloud catalogs the objects where
+    /// they already are. Against a stub Cloud that answers
+    /// `upload_required: false`, the whole native flow must complete with
+    /// zero object targets and zero re-uploads.
+    #[tokio::test]
+    async fn managed_native_snapshots_are_declared_in_place_and_never_re_uploaded() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping in-place catalog test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: false,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        let expected_root = dump_key
+            .rsplit_once('/')
+            .expect("dump key has a parent")
+            .0
+            .to_string();
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        expect_stage_ok(
+            mirror_backup(&link, &mut resources, &backup, instance_id).await,
+            "in-place native mirror completes",
+        );
+
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(declared.len(), 1, "one declaration, accepted first time");
+        assert_eq!(
+            declared[0].in_place_root.as_deref(),
+            Some(expected_root.as_str())
+        );
+        assert_eq!(declared[0].objects.len(), 2);
+        assert_eq!(
+            cloud.target_calls.load(Ordering::SeqCst),
+            0,
+            "an in-place snapshot must never ask for an upload target"
+        );
+        assert_eq!(cloud.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Cloud answering 400 to an in-place declaration is a verdict on the
+    /// layout, not a transient fault. The sweep must not retry it forever:
+    /// it re-declares without the root and takes the copy path, which is
+    /// what Cloud always accepted. The stub's target endpoint returns 500,
+    /// so reaching it is the proof that the fallback happened, and the
+    /// resulting error is `Retry`, exactly as for any copy-path hiccup.
+    #[tokio::test]
+    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping in-place fallback test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: true,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("the copy path hits the stub's failing target endpoint");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => {
+                panic!("a copy-path target failure is transient, not Unsupported: {reason}")
+            }
+        }
+
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(
+            declared.len(),
+            2,
+            "in-place attempt, then the copy-path re-declaration"
+        );
+        assert!(declared[0].in_place_root.is_some());
+        assert!(
+            declared[1].in_place_root.is_none(),
+            "the fallback must not carry the rejected root"
+        );
+        assert!(
+            cloud.target_calls.load(Ordering::SeqCst) > 0,
+            "the copy path asked for an upload target"
+        );
+        assert_eq!(cloud.completions.load(Ordering::SeqCst), 0);
     }
 
     /// The `mirror_native_backup` fallback branch treats a dump with no

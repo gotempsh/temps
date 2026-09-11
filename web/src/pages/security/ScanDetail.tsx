@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ErrorBoundary } from '@/components/error/ErrorBoundary'
+import { scanVulnerabilities } from '@/lib/scan-vulnerabilities'
 import {
   getScanOptions,
   getScanVulnerabilitiesOptions,
@@ -23,13 +25,28 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VulnerabilityList } from '@/components/vulnerabilities/VulnerabilityList'
 import { Input } from '@/components/ui/input'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, Shield, Download, FileJson, FileSpreadsheet, Search, Package, Code, Filter, Sparkles, Copy } from 'lucide-react'
+import {
+  ArrowLeft,
+  Shield,
+  Download,
+  FileJson,
+  FileSpreadsheet,
+  Search,
+  Package,
+  Code,
+  Filter,
+  Sparkles,
+  Copy,
+} from 'lucide-react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { useState, useMemo } from 'react'
 import Fuse from 'fuse.js'
 
-function exportToJSON(vulnerabilities: VulnerabilityResponse[], scanId: string) {
+function exportToJSON(
+  vulnerabilities: VulnerabilityResponse[],
+  scanId: string
+) {
   const jsonData = JSON.stringify(vulnerabilities, null, 2)
   const blob = new Blob([jsonData], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
@@ -141,15 +158,26 @@ ${summaryLines}
 
   // Sort packages by highest severity first
   const sortedPackages = Object.entries(byPackage).sort((a, b) => {
-    const maxSevA = Math.min(...a[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))
-    const maxSevB = Math.min(...b[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))
+    const maxSevA = Math.min(
+      ...a[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN'))
+    )
+    const maxSevB = Math.min(
+      ...b[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN'))
+    )
     return maxSevA - maxSevB
   })
 
   for (const [pkg, vulns] of sortedPackages) {
-    const fixedVersions = [...new Set(vulns.map((v) => v.fixed_version).filter(Boolean))]
+    const fixedVersions = [
+      ...new Set(vulns.map((v) => v.fixed_version).filter(Boolean)),
+    ]
     const cveIds = vulns.map((v) => v.vulnerability_id).join(', ')
-    const maxSeverity = severityOrder[Math.min(...vulns.map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))]
+    const maxSeverity =
+      severityOrder[
+        Math.min(
+          ...vulns.map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN'))
+        )
+      ]
     const target = vulns[0].target || ''
 
     prompt += `\n### ${pkg} [${maxSeverity}]`
@@ -174,12 +202,51 @@ ${summaryLines}
 }
 
 export function ScanDetail() {
+  const { slug, scanId } = useParams()
+  return (
+    <ErrorBoundary
+      key={`${slug}:${scanId}`}
+      fallback={(_error, _info, reset) => (
+        <ScanLoadError slug={slug} retry={reset} />
+      )}
+    >
+      <ScanDetailContent />
+    </ErrorBoundary>
+  )
+}
+
+function ScanLoadError({ slug, retry }: { slug?: string; retry: () => void }) {
+  return (
+    <Card>
+      <CardContent className="space-y-4 py-8" role="alert">
+        <h2 className="text-lg font-semibold">Unable to load scan</h2>
+        <p className="text-sm text-muted-foreground">
+          The scan could not be displayed. Retry, or return to Security to
+          choose another scan.
+        </p>
+        <div className="flex gap-2">
+          <Button onClick={retry}>Retry</Button>
+          <Button variant="outline" asChild>
+            <Link to={`/projects/${slug}/security`}>Back to Security</Link>
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ScanDetailContent() {
   const { slug, scanId } = useParams<{ slug: string; scanId: string }>()
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set())
   const [showTypeFilters, setShowTypeFilters] = useState(false)
 
-  const { data: scan, isLoading: isScanLoading } = useQuery({
+  const {
+    data: scan,
+    isLoading: isScanLoading,
+    error: scanError,
+    refetch: refetchScan,
+  } = useQuery({
     ...getScanOptions({
       path: {
         scan_id: parseInt(scanId || '0'),
@@ -188,7 +255,12 @@ export function ScanDetail() {
     enabled: !!scanId,
   })
 
-  const { data: vulnerabilitiesData, isLoading: isVulnerabilitiesLoading } = useQuery({
+  const {
+    data: vulnerabilitiesData,
+    isLoading: isVulnerabilitiesLoading,
+    error: vulnerabilitiesError,
+    refetch: refetchVulnerabilities,
+  } = useQuery({
     ...getScanVulnerabilitiesOptions({
       path: {
         scan_id: parseInt(scanId || '0'),
@@ -199,6 +271,7 @@ export function ScanDetail() {
       },
     }),
     enabled: !!scanId,
+    select: scanVulnerabilities,
   })
 
   // Fetch environment details if available
@@ -212,7 +285,10 @@ export function ScanDetail() {
     enabled: !!scan?.project_id && !!scan?.environment_id,
   })
 
-  const vulnerabilities = vulnerabilitiesData || []
+  const vulnerabilities = useMemo(
+    () => vulnerabilitiesData ?? [],
+    [vulnerabilitiesData]
+  )
 
   // Filter vulnerabilities using Fuse.js fuzzy search AND type filter
   const filteredVulnerabilities = useMemo(() => {
@@ -245,9 +321,15 @@ export function ScanDetail() {
 
   // Group vulnerabilities by class (os-pkgs vs lang-pkgs)
   const groupedVulnerabilities = useMemo(() => {
-    const osPackages = filteredVulnerabilities.filter((v) => v.class === 'os-pkgs')
-    const sourceCode = filteredVulnerabilities.filter((v) => v.class === 'lang-pkgs')
-    const other = filteredVulnerabilities.filter((v) => !v.class || (v.class !== 'os-pkgs' && v.class !== 'lang-pkgs'))
+    const osPackages = filteredVulnerabilities.filter(
+      (v) => v.class === 'os-pkgs'
+    )
+    const sourceCode = filteredVulnerabilities.filter(
+      (v) => v.class === 'lang-pkgs'
+    )
+    const other = filteredVulnerabilities.filter(
+      (v) => !v.class || (v.class !== 'os-pkgs' && v.class !== 'lang-pkgs')
+    )
 
     return {
       osPackages,
@@ -266,6 +348,18 @@ export function ScanDetail() {
     })
     return Array.from(types).sort()
   }, [vulnerabilities])
+
+  if (scanError || vulnerabilitiesError) {
+    return (
+      <ScanLoadError
+        slug={slug}
+        retry={() => {
+          void refetchScan()
+          void refetchVulnerabilities()
+        }}
+      />
+    )
+  }
 
   if (isScanLoading) {
     return (
@@ -336,7 +430,9 @@ export function ScanDetail() {
             {scan.commit_hash && (
               <>
                 <span className="text-muted-foreground/50">•</span>
-                <span className="font-mono">{scan.commit_hash.substring(0, 7)}</span>
+                <span className="font-mono">
+                  {scan.commit_hash.substring(0, 7)}
+                </span>
               </>
             )}
           </div>
@@ -352,11 +448,15 @@ export function ScanDetail() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => exportToJSON(vulnerabilities, scanId || '0')}>
+                <DropdownMenuItem
+                  onClick={() => exportToJSON(vulnerabilities, scanId || '0')}
+                >
                   <FileJson className="h-4 w-4 mr-2" />
                   Export as JSON
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportToCSV(vulnerabilities, scanId || '0')}>
+                <DropdownMenuItem
+                  onClick={() => exportToCSV(vulnerabilities, scanId || '0')}
+                >
                   <FileSpreadsheet className="h-4 w-4 mr-2" />
                   Export as CSV
                 </DropdownMenuItem>
@@ -378,7 +478,9 @@ export function ScanDetail() {
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard.writeText(generateVulnerabilityPrompt(vulnerabilities))
+                    navigator.clipboard.writeText(
+                      generateVulnerabilityPrompt(vulnerabilities)
+                    )
                     toast.success('AI prompt copied for all vulnerabilities')
                   }}
                 >
@@ -390,7 +492,9 @@ export function ScanDetail() {
                     <DropdownMenuSeparator />
                     <DropdownMenuLabel>By type</DropdownMenuLabel>
                     {vulnerabilityTypes.map((type) => {
-                      const typeVulns = vulnerabilities.filter((v) => v.type === type)
+                      const typeVulns = vulnerabilities.filter(
+                        (v) => v.type === type
+                      )
                       return (
                         <DropdownMenuItem
                           key={type}
@@ -398,7 +502,9 @@ export function ScanDetail() {
                             navigator.clipboard.writeText(
                               generateVulnerabilityPrompt(typeVulns, type)
                             )
-                            toast.success(`AI prompt copied for ${type} vulnerabilities`)
+                            toast.success(
+                              `AI prompt copied for ${type} vulnerabilities`
+                            )
                           }}
                         >
                           <Copy className="h-4 w-4 mr-2" />
@@ -413,27 +519,42 @@ export function ScanDetail() {
           )}
 
           {scan.critical_count > 0 && (
-            <Badge variant="outline" className="bg-red-500/10 text-red-500 border-red-500/20">
+            <Badge
+              variant="outline"
+              className="bg-red-500/10 text-red-500 border-red-500/20"
+            >
               {scan.critical_count} Critical
             </Badge>
           )}
           {scan.high_count > 0 && (
-            <Badge variant="outline" className="bg-orange-500/10 text-orange-500 border-orange-500/20">
+            <Badge
+              variant="outline"
+              className="bg-orange-500/10 text-orange-500 border-orange-500/20"
+            >
               {scan.high_count} High
             </Badge>
           )}
           {scan.medium_count > 0 && (
-            <Badge variant="outline" className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20">
+            <Badge
+              variant="outline"
+              className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20"
+            >
               {scan.medium_count} Medium
             </Badge>
           )}
           {scan.low_count > 0 && (
-            <Badge variant="outline" className="bg-blue-500/10 text-blue-500 border-blue-500/20">
+            <Badge
+              variant="outline"
+              className="bg-blue-500/10 text-blue-500 border-blue-500/20"
+            >
               {scan.low_count} Low
             </Badge>
           )}
           {totalVulnerabilities === 0 && (
-            <Badge variant="outline" className="bg-green-500/10 text-green-500 border-green-500/20">
+            <Badge
+              variant="outline"
+              className="bg-green-500/10 text-green-500 border-green-500/20"
+            >
               Clean
             </Badge>
           )}
@@ -450,9 +571,12 @@ export function ScanDetail() {
               </div>
             </div>
             <div className="flex-1">
-              <h3 className="text-lg font-semibold text-red-500 mb-2">Scan Failed</h3>
+              <h3 className="text-lg font-semibold text-red-500 mb-2">
+                Scan Failed
+              </h3>
               <p className="text-sm text-muted-foreground mb-4">
-                The vulnerability scan encountered an error and could not complete.
+                The vulnerability scan encountered an error and could not
+                complete.
               </p>
               {scan.error_message && (
                 <div className="bg-background/50 rounded-md p-4 border border-red-500/20">
@@ -482,7 +606,9 @@ export function ScanDetail() {
             <div className="flex items-center gap-4">
               <p className="text-sm text-muted-foreground whitespace-nowrap">
                 {filteredVulnerabilities.length} of {vulnerabilities.length}{' '}
-                {vulnerabilities.length === 1 ? 'vulnerability' : 'vulnerabilities'}
+                {vulnerabilities.length === 1
+                  ? 'vulnerability'
+                  : 'vulnerabilities'}
               </p>
             </div>
           </div>
@@ -513,7 +639,10 @@ export function ScanDetail() {
                   <Filter className="h-4 w-4" />
                   Filter by type
                   {selectedTypes.size > 0 && (
-                    <Badge variant="secondary" className="ml-1 h-5 px-1.5 text-xs">
+                    <Badge
+                      variant="secondary"
+                      className="ml-1 h-5 px-1.5 text-xs"
+                    >
                       {selectedTypes.size}
                     </Badge>
                   )}
@@ -534,7 +663,9 @@ export function ScanDetail() {
                 </Button>
                 {vulnerabilityTypes.map((type) => {
                   const isSelected = selectedTypes.has(type)
-                  const typeCount = vulnerabilities.filter((v) => v.type === type).length
+                  const typeCount = vulnerabilities.filter(
+                    (v) => v.type === type
+                  ).length
 
                   return (
                     <Button
@@ -618,9 +749,12 @@ export function ScanDetail() {
                 <Card>
                   <CardContent className="flex flex-col items-center justify-center py-12">
                     <Package className="h-12 w-12 text-muted-foreground mb-4" />
-                    <h3 className="text-lg font-medium mb-2">No container/OS vulnerabilities</h3>
+                    <h3 className="text-lg font-medium mb-2">
+                      No container/OS vulnerabilities
+                    </h3>
                     <p className="text-muted-foreground text-center">
-                      No vulnerabilities found in operating system or container packages
+                      No vulnerabilities found in operating system or container
+                      packages
                     </p>
                   </CardContent>
                 </Card>
@@ -639,7 +773,9 @@ export function ScanDetail() {
                 <Card>
                   <CardContent className="flex flex-col items-center justify-center py-12">
                     <Code className="h-12 w-12 text-muted-foreground mb-4" />
-                    <h3 className="text-lg font-medium mb-2">No source code vulnerabilities</h3>
+                    <h3 className="text-lg font-medium mb-2">
+                      No source code vulnerabilities
+                    </h3>
                     <p className="text-muted-foreground text-center">
                       No vulnerabilities found in application dependencies
                     </p>
@@ -665,9 +801,12 @@ export function ScanDetail() {
             <Card>
               <CardContent className="flex flex-col items-center justify-center py-12">
                 <Search className="h-12 w-12 text-muted-foreground mb-4" />
-                <h3 className="text-lg font-medium mb-2">No vulnerabilities found</h3>
+                <h3 className="text-lg font-medium mb-2">
+                  No vulnerabilities found
+                </h3>
                 <p className="text-muted-foreground text-center mb-4">
-                  No vulnerabilities match your search query: "{searchQuery}"
+                  No vulnerabilities match your search query: &quot;
+                  {searchQuery}&quot;
                 </p>
                 <Button variant="outline" onClick={() => setSearchQuery('')}>
                   Clear search
@@ -683,9 +822,12 @@ export function ScanDetail() {
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-12">
             <Shield className="h-12 w-12 text-green-500 mb-4" />
-            <h3 className="text-lg font-medium mb-2">No vulnerabilities found</h3>
+            <h3 className="text-lg font-medium mb-2">
+              No vulnerabilities found
+            </h3>
             <p className="text-muted-foreground text-center">
-              This scan completed successfully with no security vulnerabilities detected
+              This scan completed successfully with no security vulnerabilities
+              detected
             </p>
           </CardContent>
         </Card>

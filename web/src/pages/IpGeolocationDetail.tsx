@@ -66,7 +66,7 @@ export default function IpGeolocationDetail() {
   }
 
   return (
-    <div className="container max-w-5xl mx-auto py-6 space-y-4">
+    <div className="container mx-auto max-w-4xl space-y-4 py-6">
       <div className="flex items-center gap-4">
         <Button onClick={handleBack} variant="ghost" size="sm">
           <ArrowLeft className="h-4 w-4 mr-2" />
@@ -75,7 +75,7 @@ export default function IpGeolocationDetail() {
       </div>
 
       <Card>
-        <CardHeader>
+        <CardHeader className="border-b">
           <div className="flex items-center gap-3">
             <Globe className="h-6 w-6" />
             <div>
@@ -98,7 +98,7 @@ export default function IpGeolocationDetail() {
             <div className="space-y-6">
               {/* IP Address Information */}
               <Card>
-                <CardHeader>
+                <CardHeader className="border-b px-5 py-4">
                   <CardTitle className="text-base flex items-center gap-2">
                     <MapPin className="h-4 w-4" />
                     IP Address Details
@@ -126,7 +126,7 @@ export default function IpGeolocationDetail() {
 
               {/* Location Information */}
               <Card>
-                <CardHeader>
+                <CardHeader className="border-b px-5 py-4">
                   <CardTitle className="text-base flex items-center gap-2">
                     <Globe className="h-4 w-4" />
                     Geographic Location
@@ -181,7 +181,7 @@ export default function IpGeolocationDetail() {
               {/* Coordinates */}
               {(geoData.latitude !== null || geoData.longitude !== null) && (
                 <Card>
-                  <CardHeader>
+                  <CardHeader className="border-b px-5 py-4">
                     <CardTitle className="text-base flex items-center gap-2">
                       <Globe className="h-4 w-4" />
                       Coordinates

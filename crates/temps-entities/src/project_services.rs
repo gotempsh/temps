@@ -14,6 +14,8 @@ pub struct Model {
     pub id: i32,
     pub project_id: i32,
     pub service_id: i32,
+    pub database_provisioning_mode: String,
+    pub custom_database_name: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

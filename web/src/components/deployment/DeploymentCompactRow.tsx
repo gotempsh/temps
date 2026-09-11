@@ -93,65 +93,77 @@ export default function DeploymentCompactRow({
   return (
     <li className="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center sm:gap-3">
       {/* Primary line: id + status + env + current */}
-      <div className="flex min-w-0 items-center gap-2 sm:shrink-0">
-        <span className="font-medium text-sm">#{deployment.id}</span>
-        <DeploymentStatusBadge
-          deployment={deployment}
-          className="text-[10px] px-1.5 py-0 h-5"
-        />
-        <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-5">
-          {deployment.environment.name}
-        </Badge>
-        {deployment.is_current && (
-          <Badge className="bg-green-600 hover:bg-green-700 flex items-center gap-0.5 text-[10px] px-1.5 py-0 h-5">
-            <CheckCircle2 className="h-2.5 w-2.5" />
-            Current
+      <div className="min-w-0 sm:shrink-0">
+        <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:block">
+          Deployment
+        </span>
+        <div className="flex items-center gap-2">
+          <span className="font-medium text-sm">#{deployment.id}</span>
+          <DeploymentStatusBadge
+            deployment={deployment}
+            className="text-[10px] px-1.5 py-0 h-5"
+          />
+          <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-5">
+            {deployment.environment.name}
           </Badge>
-        )}
+          {deployment.is_current && (
+            <Badge className="bg-green-600 hover:bg-green-700 flex items-center gap-0.5 text-[10px] px-1.5 py-0 h-5">
+              <CheckCircle2 className="h-2.5 w-2.5" />
+              Current
+            </Badge>
+          )}
+        </div>
       </div>
 
       {/* Meta line: source info — takes remaining space, truncates */}
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {source.kind === 'git' ? (
-          <>
-            {source.branch && (
-              <div className="flex shrink-0 items-center gap-1">
-                <GitBranch className="h-3 w-3" />
-                <span className="max-w-[100px] truncate">{source.branch}</span>
-              </div>
-            )}
-            {source.commit && (
-              <div className="flex shrink-0 items-center gap-1">
-                <GitCommit className="h-3 w-3" />
-                <span className="font-mono">{source.commit.slice(0, 7)}</span>
-              </div>
-            )}
-            {source.message && (
-              <span className="min-w-0 truncate">{source.message}</span>
-            )}
-          </>
-        ) : (
-          <div className="flex min-w-0 items-center gap-1.5">
-            {source.kind === 'docker_image' ? (
-              <Container className="h-3.5 w-3.5 shrink-0" />
-            ) : source.kind === 'manual' ? (
-              <Package className="h-3.5 w-3.5 shrink-0" />
-            ) : (
-              <FileArchive className="h-3.5 w-3.5 shrink-0" />
-            )}
-            <span className="shrink-0 font-medium text-foreground/80">
-              {source.label}
-            </span>
-            {source.detail && (
-              <span
-                className="min-w-0 truncate font-mono"
-                title={source.detail}
-              >
-                {source.detail}
+      <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+        <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide sm:block">
+          Source
+        </span>
+        <div className="flex min-w-0 items-center gap-3">
+          {source.kind === 'git' ? (
+            <>
+              {source.branch && (
+                <div className="flex shrink-0 items-center gap-1">
+                  <GitBranch className="h-3 w-3" />
+                  <span className="max-w-[100px] truncate">
+                    {source.branch}
+                  </span>
+                </div>
+              )}
+              {source.commit && (
+                <div className="flex shrink-0 items-center gap-1">
+                  <GitCommit className="h-3 w-3" />
+                  <span className="font-mono">{source.commit.slice(0, 7)}</span>
+                </div>
+              )}
+              {source.message && (
+                <span className="min-w-0 truncate">{source.message}</span>
+              )}
+            </>
+          ) : (
+            <div className="flex min-w-0 items-center gap-1.5">
+              {source.kind === 'docker_image' ? (
+                <Container className="h-3.5 w-3.5 shrink-0" />
+              ) : source.kind === 'manual' ? (
+                <Package className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <FileArchive className="h-3.5 w-3.5 shrink-0" />
+              )}
+              <span className="shrink-0 font-medium text-foreground/80">
+                {source.label}
               </span>
-            )}
-          </div>
-        )}
+              {source.detail && (
+                <span
+                  className="min-w-0 truncate font-mono"
+                  title={source.detail}
+                >
+                  {source.detail}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Right cluster: author + time + menu */}
@@ -167,9 +179,14 @@ export default function DeploymentCompactRow({
             </AvatarFallback>
           </Avatar>
         )}
-        <span className="text-xs text-muted-foreground whitespace-nowrap">
-          <TimeAgo date={deployment.created_at} />
-        </span>
+        <div>
+          <span className="mb-1 hidden text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:block">
+            Created
+          </span>
+          <span className="text-xs text-muted-foreground whitespace-nowrap">
+            <TimeAgo date={deployment.created_at} />
+          </span>
+        </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button

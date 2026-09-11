@@ -16,6 +16,40 @@ const project = {
 } as unknown as ProjectResponse
 
 describe('ProjectCard deployment state', () => {
+  test('compact identity consumes the row space left by bounded actions', () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProjectCard
+          project={{
+            ...project,
+            name: 'A project name long enough to need the available row width',
+          }}
+          layout="compact"
+        />
+      </MemoryRouter>
+    )
+
+    expect(markup).toContain('flex min-w-0 flex-1 items-center gap-3')
+    expect(markup).toContain(
+      'truncate font-semibold group-hover:underline'
+    )
+    expect(markup).toContain('flex min-w-0 items-center gap-2')
+    expect(markup).toContain('flex shrink-0 items-center gap-2')
+  })
+
+  test('does not repeat a slug that is identical to the project name', () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProjectCard
+          project={{ ...project, slug: project.name }}
+          layout="compact"
+        />
+      </MemoryRouter>
+    )
+
+    expect(markup.match(/>Example</g)).toHaveLength(1)
+  })
+
   for (const layout of ['compact', 'dense', 'wide'] as const) {
     test(`${layout} layout uses the latest deployment status`, () => {
       const markup = renderToStaticMarkup(

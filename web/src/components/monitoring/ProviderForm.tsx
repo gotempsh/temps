@@ -1,7 +1,9 @@
+'use client'
+
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
-'use client'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -716,7 +718,8 @@ export function ProviderForm({
                 Webhook Payload Format
               </h4>
               <pre className="text-xs text-muted-foreground overflow-x-auto">
-                {`{
+                <HighlightedCode
+                  code={`{
   "id": "notification-uuid",
   "title": "Alert Title",
   "message": "Alert message content",
@@ -726,6 +729,8 @@ export function ProviderForm({
   "timestamp": "2025-01-01T12:00:00Z",
   "metadata": { "key": "value" }
 }`}
+                  language="json"
+                />
               </pre>
             </div>
           </div>

@@ -582,6 +582,7 @@ export function DockBody({
         <ConversationList
           loading={loadingList}
           conversations={conversations}
+          compactEmpty
           activeId={activePublicId}
           onOpen={openConversation}
           onOpenSource={(c) => {
@@ -813,6 +814,21 @@ export function DockBody({
             />
           ) : picking ? (
             <ProjectPicker onSelect={startProjectChat} />
+          ) : isPage && conversations.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+              <MessageSquare className="size-8 text-muted-foreground" />
+              <div>
+                <p className="font-medium">No AI conversations yet</p>
+                <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                  Start a project chat to investigate deployments, logs, traces,
+                  and errors with context.
+                </p>
+              </div>
+              <Button size="sm" onClick={() => setPicking(true)}>
+                <Plus className="mr-1.5 size-4" />
+                Create first chat
+              </Button>
+            </div>
           ) : (
             <ConversationList
               loading={loadingList}
@@ -920,6 +936,7 @@ function ConversationList({
   onOpenSource,
   onRename,
   onDelete,
+  compactEmpty = false,
 }: {
   loading: boolean
   conversations: ProjectConversation[]
@@ -929,6 +946,7 @@ function ConversationList({
   onOpenSource: (c: ProjectConversation) => void
   onRename: (c: ProjectConversation) => void
   onDelete: (c: ProjectConversation) => void
+  compactEmpty?: boolean
 }) {
   if (loading) {
     return (
@@ -940,6 +958,11 @@ function ConversationList({
     )
   }
   if (conversations.length === 0) {
+    if (compactEmpty) {
+      return (
+        <p className="px-2 py-3 text-sm text-muted-foreground">No chats yet</p>
+      )
+    }
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
         <MessageSquare className="h-7 w-7 text-muted-foreground" />

@@ -213,6 +213,8 @@ pub struct ExternalServiceProjectLinkedAudit {
     pub service_id: i32,
     pub service_name: String,
     pub project_id: i32,
+    pub database_provisioning_mode: crate::services::DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

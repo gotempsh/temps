@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Fragment } from 'react'
 import { Badge } from '@/components/ui/badge'
@@ -212,12 +213,14 @@ function KindSpecificDetails({
           </Section>
           <Section title="Attributes">
             <pre className="overflow-x-auto rounded bg-muted p-3 text-xs">
-              {JSON.stringify(event.attributes, null, 2)}
+              <HighlightedCode
+                code={JSON.stringify(event.attributes, null, 2)}
+                language={'json'}
+              />
             </pre>
             {event.attributes_truncated && (
               <p className="text-xs text-muted-foreground">
-                Showing first attributes only — open the trace for the full
-                set.
+                Showing first attributes only — open the trace for the full set.
               </p>
             )}
           </Section>
@@ -244,7 +247,10 @@ function KindSpecificDetails({
           </Section>
           <Section title="Stack trace (preview)">
             <pre className="overflow-x-auto rounded bg-muted p-3 text-xs">
-              {JSON.stringify(event.stacktrace_preview, null, 2)}
+              <HighlightedCode
+                code={JSON.stringify(event.stacktrace_preview, null, 2)}
+                language={'json'}
+              />
             </pre>
             {event.stacktrace_truncated && (
               <Button asChild variant="link" size="sm" className="px-0">
@@ -330,7 +336,11 @@ function Section({
   )
 }
 
-function KvList({ items }: { items: Array<[string, string | null | undefined]> }) {
+function KvList({
+  items,
+}: {
+  items: Array<[string, string | null | undefined]>
+}) {
   return (
     <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
       {items

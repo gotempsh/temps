@@ -46,7 +46,7 @@ const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 type Step = 'select-container' | 'configure-service'
 
 export function ImportService() {
-  usePageTitle('Import Service')
+  usePageTitle('Import database')
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [step, setStep] = useState<Step>('select-container')
@@ -59,15 +59,18 @@ export function ImportService() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
-      { label: 'Import Service', href: '/storage/import' },
+      { label: 'Import database', href: '/storage/import' },
     ])
   }, [setBreadcrumbs])
 
   // Fetch available containers
-  const { data: containers, isLoading: isLoadingContainers, error: containersError } =
-    useQuery({
-      ...listAvailableContainersOptions(),
-    })
+  const {
+    data: containers,
+    isLoading: isLoadingContainers,
+    error: containersError,
+  } = useQuery({
+    ...listAvailableContainersOptions(),
+  })
 
   // Memoize service type extraction for each container
   const containerServiceTypes = useMemo(() => {
@@ -88,20 +91,6 @@ export function ImportService() {
   const { data: serviceTypes } = useQuery({
     ...getServiceTypesOptions(),
   })
-
-  // Auto-detect service type from container image when container is selected (only if not already set)
-  useEffect(() => {
-    if (selectedContainer && !selectedServiceType) {
-      const detectedType = getServiceTypeWithFallback(
-        selectedContainer.service_type,
-        selectedContainer.image
-      )
-      if (detectedType) {
-        setSelectedServiceType(detectedType)
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedContainer])
 
   // Fetch parameters for the selected service type
   const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery(
@@ -216,6 +205,8 @@ export function ImportService() {
     },
   })
 
+  const { setValue } = form
+
   // Set default values for parameters when they are loaded
   useEffect(() => {
     if (Array.isArray(parameters)) {
@@ -231,9 +222,9 @@ export function ImportService() {
         },
         {}
       )
-      form.setValue('parameters', defaultParameters)
+      setValue('parameters', defaultParameters)
     }
-  }, [parameters])
+  }, [parameters, setValue])
 
   const importServiceMut = useMutation({
     ...importExternalServiceMutation(),
@@ -264,7 +255,9 @@ export function ImportService() {
 
   const handleContainerSelected = (container: AvailableContainerInfo) => {
     setSelectedContainer(container)
-    setSelectedServiceType(null)
+    setSelectedServiceType(
+      getServiceTypeWithFallback(container.service_type, container.image)
+    )
     form.setValue('name', `${container.container_name}-${generateId()}`)
     setStep('configure-service')
   }
@@ -287,7 +280,7 @@ export function ImportService() {
             </Button>
           </Link>
           <div>
-            <h1 className="text-2xl font-semibold">Import Service</h1>
+            <h1 className="text-2xl font-semibold">Import database</h1>
             <p className="text-sm text-muted-foreground">
               {step === 'select-container'
                 ? 'Select a running container to import as a service'
@@ -320,8 +313,8 @@ export function ImportService() {
                 <Alert>
                   <AlertCircle className="h-4 w-4" />
                   <AlertDescription>
-                    No containers available to import. Make sure you have running
-                    containers in your environment.
+                    No containers available to import. Make sure you have
+                    running containers in your environment.
                   </AlertDescription>
                 </Alert>
               )}
@@ -350,7 +343,9 @@ export function ImportService() {
                             />
                           )}
                           <div className="flex-1 min-w-0">
-                            <h3 className="font-medium">{container.container_name}</h3>
+                            <h3 className="font-medium">
+                              {container.container_name}
+                            </h3>
                             <p className="text-sm text-muted-foreground font-mono truncate">
                               {container.image}
                             </p>
@@ -438,15 +433,19 @@ export function ImportService() {
                 parameters &&
                 Array.isArray(parameters) &&
                 parameters.map((param) => {
-                  if (!param || typeof param !== 'object' || !('name' in param)) {
+                  if (
+                    !param ||
+                    typeof param !== 'object' ||
+                    !('name' in param)
+                  ) {
                     return null
                   }
 
                   const paramName = param.name as string
                   const paramDescription = (param as { description?: string })
                     .description
-                  const isRequired = (param as { required?: boolean })
-                    .required || false
+                  const isRequired =
+                    (param as { required?: boolean }).required || false
 
                   return (
                     <FormField
@@ -504,7 +503,9 @@ export function ImportService() {
                     !form.formState.isValid
                   }
                 >
-                  {importServiceMut.isPending ? 'Importing...' : 'Import Service'}
+                  {importServiceMut.isPending
+                    ? 'Importing...'
+                    : 'Import database'}
                 </Button>
               </div>
             </form>

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
@@ -15,7 +15,8 @@ import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextSte
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import { Input } from '@/components/ui/input'
+import { ListToolbar } from '@/components/layout/ListToolbar'
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
@@ -24,7 +25,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
-import { ArrowRight, Search, X } from 'lucide-react'
+import { ArrowRight, RefreshCw } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
@@ -36,24 +37,35 @@ import {
   projectPageCount,
   readProjectPagination,
   withProjectPagination,
+  withProjectSearch,
 } from '@/lib/project-list-pagination'
 
 const SEARCH_CATALOG_LIMIT = 50
-const SEARCH_RESULTS_LIMIT = 18
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
-  const [projectSearch, setProjectSearch] = useState('')
+  const projectSearch = searchParams.get('q') ?? ''
+  const setProjectSearch = (value: string) => {
+    setSearchParams((current) => withProjectSearch(current, value), {
+      replace: true,
+    })
+  }
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
 
-  const { data: rawProjectsData, isLoading } = useQuery({
+  const {
+    data: rawProjectsData,
+    isLoading,
+    isError,
+    isFetching,
+    refetch,
+  } = useQuery({
     ...getProjectsOptions({
       query: {
         page: normalizedProjectSearch ? 1 : page,
         // The list endpoint has no text filter, so search a deliberately
-        // bounded catalogue and cap rendered cards below.
+        // bounded catalogue, with the scope disclosed beside the filter.
         per_page: normalizedProjectSearch ? SEARCH_CATALOG_LIMIT : pageSize,
       },
     }),
@@ -107,13 +119,11 @@ export function Projects() {
   const visibleProjects = useMemo(() => {
     const projects = projectsData?.projects ?? []
     if (!normalizedProjectSearch) return projects
-    return projects
-      .filter(
-        (project) =>
-          project.name.toLowerCase().includes(normalizedProjectSearch) ||
-          project.slug.toLowerCase().includes(normalizedProjectSearch)
-      )
-      .slice(0, SEARCH_RESULTS_LIMIT)
+    return projects.filter(
+      (project) =>
+        project.name.toLowerCase().includes(normalizedProjectSearch) ||
+        project.slug.toLowerCase().includes(normalizedProjectSearch)
+    )
   }, [normalizedProjectSearch, projectsData?.projects])
 
   useEffect(() => {
@@ -176,12 +186,6 @@ export function Projects() {
       <ProjectsHeader
         actions={
           <>
-            {(projectsData?.total ?? 0) > 0 && (
-              <ProjectSearch
-                value={projectSearch}
-                onChange={setProjectSearch}
-              />
-            )}
             <PlatformStrip />
             <CreateActionButton to="/projects/new" label="New Project" />
           </>
@@ -190,13 +194,62 @@ export function Projects() {
 
       {(projectsData?.total ?? 0) > 0 && <OnboardingNextStepCard />}
 
-      {isLoading || gitProvidersLoading || isPageOutOfRange ? (
-        <div className="overflow-hidden rounded-xl border bg-card divide-y">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <ProjectCardSkeleton key={i} />
+      {((projectsData?.total ?? 0) > 0 || Boolean(projectSearch)) && (
+        <ListToolbar
+          searchLabel="Filter projects by name or slug"
+          placeholder="Filter projects…"
+          value={projectSearch}
+          onChange={setProjectSearch}
+          summary={
+            !projectsData
+              ? isError
+                ? 'Project count unavailable'
+                : 'Loading projects…'
+              : normalizedProjectSearch
+                ? `${visibleProjects.length} matching ${visibleProjects.length === 1 ? 'project' : 'projects'} · searching ${projectsData.projects.length} of ${projectsData.total}`
+                : `${projectsData.total} ${projectsData.total === 1 ? 'project' : 'projects'}`
+          }
+        />
+      )}
+
+      {isError && (
+        <Alert variant="destructive">
+          <AlertTitle>Projects could not be loaded</AlertTitle>
+          <AlertDescription>
+            <p>
+              {projectsData
+                ? 'Showing previously loaded projects. Refresh to get the latest status.'
+                : 'Check your connection and retry loading your projects.'}
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3"
+              disabled={isFetching}
+              onClick={() => void refetch()}
+            >
+              <RefreshCw
+                className={isFetching ? 'size-4 animate-spin' : 'size-4'}
+              />
+              {isFetching ? 'Retrying…' : 'Retry loading projects'}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {isLoading ||
+      (projectsData?.total === 0 && gitProvidersLoading) ||
+      isPageOutOfRange ? (
+        <div
+          className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
+          aria-label="Loading projects"
+          aria-busy="true"
+        >
+          {Array.from({ length: pageSize }).map((_, i) => (
+            <ProjectCardSkeleton key={i} layout="compact" />
           ))}
         </div>
-      ) : projectsData?.total === 0 ? (
+      ) : isError && !projectsData ? null : projectsData?.total === 0 ? (
         // First-run onboarding. The component is context-aware: when a Git
         // provider is already connected it routes straight into the import
         // wizard (skipping the connect step), and it always surfaces the
@@ -244,68 +297,6 @@ export function Projects() {
           />
         )}
     </PageContainer>
-  )
-}
-
-function ProjectSearch({
-  value,
-  onChange,
-}: {
-  value: string
-  onChange: (value: string) => void
-}) {
-  const [isExpanded, setIsExpanded] = useState(Boolean(value))
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  useEffect(() => {
-    if (isExpanded) inputRef.current?.focus()
-  }, [isExpanded])
-
-  if (!isExpanded) {
-    return (
-      <Button
-        type="button"
-        variant="outline"
-        size="icon"
-        onClick={() => setIsExpanded(true)}
-        aria-label="Filter projects"
-        aria-expanded={false}
-        title="Filter projects"
-      >
-        <Search />
-      </Button>
-    )
-  }
-
-  return (
-    <div className="relative w-full sm:w-64 xl:w-72">
-      <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        ref={inputRef}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') {
-            onChange('')
-            setIsExpanded(false)
-          }
-        }}
-        placeholder="Filter projects…"
-        aria-label="Filter projects by name or slug"
-        className="pl-9 pr-9"
-      />
-      <button
-        type="button"
-        onClick={() => {
-          onChange('')
-          setIsExpanded(false)
-        }}
-        className="absolute right-2 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground"
-        aria-label="Close project filter"
-      >
-        <X className="size-4" />
-      </button>
-    </div>
   )
 }
 

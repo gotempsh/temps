@@ -249,6 +249,7 @@ mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
 mod m20260903_000004_repair_application_primary_projects;
 // This branch and main each shipped a migration with the same date and
 // sequence stamp. Preserve that upgrade history rather than renumbering.
+mod m20260901_000001_add_database_provisioning_to_project_services;
 mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
@@ -568,6 +569,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260903_000004_repair_application_primary_projects::Migration),
             Box::new(m20260908_000001_reconcile_legacy_status_monitors::Migration),
             Box::new(m20260909_000001_index_global_log_chunks::Migration),
+            Box::new(
+                m20260901_000001_add_database_provisioning_to_project_services::Migration,
+            ),
         ]
     }
 }
