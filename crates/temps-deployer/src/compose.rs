@@ -1603,12 +1603,12 @@ impl ComposeExecutor {
             }
         }
         command
-            .args(["down", "--remove-orphans", "--timeout", "30"])
+            .args(["down", "--remove-orphans", "--timeout", "80"])
             .current_dir(&project_dir)
             .kill_on_drop(true);
         let output = Self::bounded_command_output(
             command,
-            std::time::Duration::from_secs(35),
+            std::time::Duration::from_secs(90),
             project_name,
             "docker compose down",
         )
@@ -1652,11 +1652,11 @@ impl ComposeExecutor {
             command
                 .args(["compose", "-p", project_name])
                 .args(["-f", &compose_file])
-                .args(["down", "--remove-orphans", "--volumes", "--timeout", "30"])
+                .args(["down", "--remove-orphans", "--volumes", "--timeout", "80"])
                 .current_dir(&project_dir);
             let output = Self::bounded_command_output(
                 command,
-                std::time::Duration::from_secs(35),
+                std::time::Duration::from_secs(90),
                 project_name,
                 "docker compose destroy",
             )
@@ -1778,11 +1778,11 @@ impl ComposeExecutor {
         }
         Self::append_compose_env_file_args(&mut command, &project_dir);
         command
-            .args(["stop", "--timeout", "30"])
+            .args(["stop", "--timeout", "80"])
             .current_dir(&project_dir);
         let output = Self::bounded_command_output(
             command,
-            std::time::Duration::from_secs(35),
+            std::time::Duration::from_secs(90),
             project_name,
             "docker compose stop",
         )
