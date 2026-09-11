@@ -34,8 +34,12 @@ use utoipa::ToSchema;
 /// a spinner with a cancel-free retry rather than pretending it is instant.
 pub const DOCKER_DF_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Default Unix socket used when `DOCKER_HOST` is unset — the same default
-/// `bollard::Docker::connect_with_local_defaults` resolves to.
+/// The local daemon socket: the same one every other Docker call in Temps
+/// reaches through `bollard::Docker::connect_with_local_defaults`, so this
+/// service always measures the daemon that runs the workloads. Deliberately
+/// not a runtime setting and not read from the environment (CLAUDE.md:
+/// runtime configuration lives in the database; the host's Docker socket is
+/// a fixed property of the machine).
 const DEFAULT_UNIX_SOCKET: &str = "/var/run/docker.sock";
 
 #[derive(Debug, Error)]
@@ -60,8 +64,9 @@ pub enum DockerDiskUsageError {
     Parse { host: String, reason: String },
 }
 
-/// Where the Docker daemon lives, resolved from `DOCKER_HOST` the same way
-/// the Docker CLI and bollard do.
+/// Where the Docker daemon lives. Production always uses the local socket
+/// ([`DockerHost::local`]); the HTTP form exists so the parser can be tested
+/// against a stub daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerHost {
     /// `unix:///path/to/docker.sock` (or the default socket).
@@ -72,17 +77,14 @@ pub enum DockerHost {
 }
 
 impl DockerHost {
-    /// Resolve from the process environment: honours `DOCKER_HOST`, falls
-    /// back to the default Unix socket.
-    pub fn from_env() -> Self {
-        match std::env::var("DOCKER_HOST") {
-            Ok(v) if !v.trim().is_empty() => Self::parse(&v),
-            _ => Self::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET)),
-        }
+    /// The daemon on this machine, the one the workloads run on.
+    pub fn local() -> Self {
+        Self::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET))
     }
 
-    /// Parse a `DOCKER_HOST` value. Unknown schemes fall back to the default
-    /// socket so a typo degrades to "cannot reach daemon" instead of a panic.
+    /// Parse a Docker host URL (`unix://…`, `tcp://…`, `http(s)://…`, or a
+    /// bare socket path). Unknown schemes fall back to the local socket so a
+    /// typo degrades to "cannot reach daemon" instead of a panic.
     pub fn parse(value: &str) -> Self {
         let value = value.trim();
         if let Some(path) = value.strip_prefix("unix://") {
@@ -394,8 +396,9 @@ impl DockerDiskUsageService {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self::new(DockerHost::from_env())
+    /// The service for this machine's daemon.
+    pub fn local() -> Self {
+        Self::new(DockerHost::local())
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -564,7 +567,7 @@ impl DockerDiskUsageService {
 
 impl Default for DockerDiskUsageService {
     fn default() -> Self {
-        Self::from_env()
+        Self::local()
     }
 }
 
@@ -703,7 +706,7 @@ mod tests {
     /// (CLAUDE.md: Docker tests must not be `#[ignore]`d).
     #[tokio::test]
     async fn real_daemon_reports_a_consistent_total() {
-        let svc = DockerDiskUsageService::from_env();
+        let svc = DockerDiskUsageService::local();
         let usage = match svc.fetch(0).await {
             Ok(u) => u,
             Err(DockerDiskUsageError::Unavailable { .. }) => {

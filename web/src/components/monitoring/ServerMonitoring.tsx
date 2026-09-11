@@ -546,10 +546,12 @@ export function ServerMonitoring() {
   const silent =
     ageSeconds != null && ageSeconds > Math.max(3 * scrapeInterval, 180)
 
-  const firstError = [cpu, latest].find((q) => q.isError)?.error
+  // Any failed request surfaces at page level with one Retry that refetches
+  // everything; the chart it belongs to also says so in place.
+  const queries = [latest, cpu, memory, disk, rx, tx, read, write]
+  const firstError = queries.find((q) => q.isError)?.error
   const refreshAll = () => {
-    for (const q of [latest, cpu, memory, disk, rx, tx, read, write])
-      void q.refetch()
+    for (const q of queries) void q.refetch()
   }
 
   const bucketCaption = `${step >= 3600 ? `${step / 3600} h` : `${step / 60} min`} buckets · last ${range} · kept ${retentionDays} days`
