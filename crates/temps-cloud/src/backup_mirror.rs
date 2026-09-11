@@ -1155,6 +1155,31 @@ async fn mirror_native_backup(
     .await
 }
 
+/// The root Cloud may catalog in place for this snapshot, if any.
+///
+/// A managed source's bucket is the tenant's cloud backup bucket, so the
+/// objects the engine wrote under `root` already are the offsite copy. Telling
+/// Cloud where they are lets it catalog them in place rather than have the
+/// sweep read every object back and upload it a second time into Cloud's own
+/// layout in the same bucket. A Cloud that predates the field answers
+/// `upload_required: true` and the copy path runs unchanged.
+///
+/// Only snapshot-exclusive layouts qualify: an object set or a logical dump
+/// lives under a root that belongs to this backup alone. A WAL-G stream
+/// snapshot (Redis/MongoDB `/walg`, MariaDB physical) selects its objects out
+/// of a repository shared by every backup of that service, and WAL-G's own
+/// retention later deletes from it, so cataloging those objects in place would
+/// leave Cloud pointing at files that disappear. They keep the copy path.
+fn in_place_root_for(
+    managed_by_cloud: bool,
+    compression: BackupCompression,
+    root: &str,
+) -> Option<String> {
+    (managed_by_cloud && compression != BackupCompression::WalGNative)
+        .then(|| root.trim_matches('/').to_string())
+        .filter(|root| !root.is_empty())
+}
+
 /// Declare, upload (if required), and complete a native snapshot against
 /// Cloud. Factored out of `mirror_native_backup` so [`mirror_control_plane_backup`]
 /// can reuse the same declare/upload/complete sequence without duplicating
@@ -1218,16 +1243,7 @@ async fn declare_and_complete_native_snapshot(
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    // A managed source's bucket is the tenant's cloud backup bucket, so the
-    // objects the engine wrote under `root` already are the offsite copy.
-    // Tell Cloud where they are and let it catalog them in place rather than
-    // reading every object back and uploading it a second time into Cloud's
-    // own layout in the same bucket. A Cloud that predates the field answers
-    // `upload_required: true` and the copy path below runs unchanged.
-    let in_place_root = source_config
-        .managed_by_cloud
-        .then(|| root.trim_matches('/').to_string())
-        .filter(|root| !root.is_empty());
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, compression, root);
     let mut request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
@@ -2600,7 +2616,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
     use temps_cloud_protocol::{
-        NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, WalGObjectCompleted,
+        BackupCompression, NativeSnapshot, NativeSnapshotObjectDeclaration,
+        NativeSnapshotObjectKind, NativeSnapshotRequest, WalGObjectCompleted,
         WalGObjectTargetRequest,
     };
     use uuid::Uuid;
@@ -4434,9 +4451,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_snapshot_exclusive_layouts_on_managed_sources_catalog_in_place() {
+        let root = "/t/managed-backups/external_services/s3/store/2026-09-11/backup-7/";
+        assert_eq!(
+            super::in_place_root_for(true, BackupCompression::None, root).as_deref(),
+            Some("t/managed-backups/external_services/s3/store/2026-09-11/backup-7")
+        );
+        assert!(super::in_place_root_for(true, BackupCompression::Gzip, root).is_some());
+        // Shared WAL-G repositories are rotated by WAL-G retention: copy.
+        assert!(super::in_place_root_for(true, BackupCompression::WalGNative, root).is_none());
+        // Operator-owned sources are not the cloud bucket: copy.
+        assert!(super::in_place_root_for(false, BackupCompression::None, root).is_none());
+        assert!(super::in_place_root_for(true, BackupCompression::None, "/").is_none());
+    }
+
     struct InPlaceCloudStub {
-        /// Every declaration body received, in order.
-        declared: Mutex<Vec<serde_json::Value>>,
+        /// Every declaration received, in order.
+        declared: Mutex<Vec<NativeSnapshotRequest>>,
         /// Refuse declarations that carry `in_place_root` with a 400, the
         /// way Cloud does for a root it will not catalog.
         reject_in_place: bool,
@@ -4444,54 +4476,57 @@ mod tests {
         completions: AtomicUsize,
     }
 
+    /// Cloud's problem body for a refused request.
+    #[derive(serde::Serialize)]
+    struct StubRejection {
+        detail: &'static str,
+    }
+
+    /// Cloud's acknowledgement of a completed snapshot.
+    #[derive(serde::Serialize)]
+    struct StubCompletion {
+        state: &'static str,
+    }
+
     async fn in_place_declare_stub(
         State(state): State<Arc<InPlaceCloudStub>>,
-        Json(request): Json<serde_json::Value>,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        let backup_id = request["backup_id"].clone();
-        let declared = request["objects"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default();
-        let in_place = request.get("in_place_root").is_some();
+        Json(request): Json<NativeSnapshotRequest>,
+    ) -> Result<(StatusCode, Json<NativeSnapshot>), (StatusCode, Json<StubRejection>)> {
+        let in_place = request.in_place_root.is_some();
+        let response = NativeSnapshot {
+            backup_id: request.backup_id,
+            upload_required: !in_place,
+            completed_relative_keys: Vec::new(),
+        };
         state.declared.lock().expect("declared lock").push(request);
         if in_place && state.reject_in_place {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "detail": "in_place_root must lie under this tenant's managed backup path"
-                })),
-            );
+                Json(StubRejection {
+                    detail: "in_place_root must lie under this tenant's managed backup path",
+                }),
+            ));
         }
-        (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "backup_id": backup_id,
-                "upload_required": !in_place,
-                "declared_objects": declared,
-                "completed_relative_keys": [],
-            })),
-        )
+        Ok((StatusCode::CREATED, Json(response)))
     }
 
     async fn in_place_target_stub(
         State(state): State<Arc<InPlaceCloudStub>>,
-    ) -> (StatusCode, Json<serde_json::Value>) {
+    ) -> (StatusCode, Json<StubRejection>) {
         state.target_calls.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": "in-place snapshots never request targets"})),
+            Json(StubRejection {
+                detail: "in-place snapshots never request targets",
+            }),
         )
     }
 
     async fn in_place_complete_stub(
         State(state): State<Arc<InPlaceCloudStub>>,
-    ) -> (StatusCode, Json<serde_json::Value>) {
+    ) -> (StatusCode, Json<StubCompletion>) {
         state.completions.fetch_add(1, Ordering::SeqCst);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"state": "complete"})),
-        )
+        (StatusCode::OK, Json(StubCompletion { state: "complete" }))
     }
 
     /// A managed source's bucket is the tenant's cloud bucket, so the sweep
@@ -4594,8 +4629,11 @@ mod tests {
 
         let declared = cloud.declared.lock().expect("declared lock").clone();
         assert_eq!(declared.len(), 1, "one declaration, accepted first time");
-        assert_eq!(declared[0]["in_place_root"], expected_root);
-        assert_eq!(declared[0]["objects"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            declared[0].in_place_root.as_deref(),
+            Some(expected_root.as_str())
+        );
+        assert_eq!(declared[0].objects.len(), 2);
         assert_eq!(
             cloud.target_calls.load(Ordering::SeqCst),
             0,
@@ -4709,9 +4747,9 @@ mod tests {
             2,
             "in-place attempt, then the copy-path re-declaration"
         );
-        assert!(declared[0].get("in_place_root").is_some());
+        assert!(declared[0].in_place_root.is_some());
         assert!(
-            declared[1].get("in_place_root").is_none(),
+            declared[1].in_place_root.is_none(),
             "the fallback must not carry the rejected root"
         );
         assert!(
