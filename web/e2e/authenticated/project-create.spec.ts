@@ -74,7 +74,7 @@ test.describe('project creation', () => {
     // is what made the spec flaky in CI, where the first (cold) detection is
     // slow and only the warm retry passed.
     await expect(
-      page.getByText(/We detected the following presets/i),
+      page.getByText(/We detected the following presets?/i),
       'preset auto-detection must finish before submitting, or the form silently refuses'
     ).toBeVisible({ timeout: 90_000 })
 
