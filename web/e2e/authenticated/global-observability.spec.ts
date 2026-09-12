@@ -171,7 +171,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
             .getByRole('region', {
               name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
             })
-            .getByRole('combobox')
+            .getByRole('combobox', { name: 'Project scope' })
         ).toContainText('Storefront')
       expect(new URL(page.url()).searchParams.get('from')).toBe(frozen)
       expect(
