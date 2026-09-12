@@ -46,6 +46,21 @@ pub struct ManagedBackupSchedule {
     pub next_run: Option<DateTime<Utc>>,
 }
 
+/// A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is
+/// pinned to a source other than the managed destination. The nightly Cloud
+/// schedule cannot back it up: archiving must not silently move between
+/// sources, so every run of that service fails until the operator repoints
+/// it to Cloud or points its own schedule at the pinned source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ManagedBackupArchiveConflict {
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+    pub pinned_s3_source_id: i32,
+    /// Name of the pinned source, or its id as text when the row is gone.
+    pub pinned_s3_source_name: String,
+}
+
 /// What releasing a destination's schedules did (see
 /// [`ManagedBackupScheduleProvisioner::release_schedules_for_source`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -89,6 +104,15 @@ pub trait ManagedBackupScheduleProvisioner: Send + Sync {
         s3_source_id: i32,
         retention_days: u16,
     ) -> Result<ManagedBackupSchedule, ManagedBackupScheduleError>;
+
+    /// Services whose continuous archive is pinned to a source other than
+    /// `s3_source_id`. Empty when every archiving service already writes to
+    /// it or has not been pinned yet (unpinned services default to the
+    /// managed destination).
+    async fn archive_conflicts_for_source(
+        &self,
+        s3_source_id: i32,
+    ) -> Result<Vec<ManagedBackupArchiveConflict>, ManagedBackupScheduleError>;
 
     /// Stop every schedule targeting `s3_source_id`, for the moment the
     /// destination's credential is about to be revoked. The schedule

@@ -6289,10 +6289,15 @@ SELECT cp.id
     pub async fn reconcile_default_external_service_schedules(&self) -> Result<(), BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // 1. Resolve the default S3 source. If none is configured yet, this is
-        //    not an error — we simply have nothing to point a schedule at, so
-        //    we bail quietly and retry on the next tick.
-        let s3_source_id = match self.resolve_s3_source_id(None).await {
+        // 1. Resolve the destination. The Cloud-managed source wins when one
+        //    exists: new services' continuous archiving defaults to it (see
+        //    `temps_providers::continuous_archive`), so a base-backup
+        //    schedule pointed anywhere else would leave the binlog shipper
+        //    refusing to pin and PITR never starting. Otherwise the default
+        //    source; if neither is configured yet, this is not an error — we
+        //    simply have nothing to point a schedule at, so we bail quietly
+        //    and retry on the next tick.
+        let s3_source_id = match self.default_schedule_destination().await {
             Ok(id) => id,
             Err(_) => {
                 debug!(
@@ -6324,7 +6329,10 @@ SELECT cp.id
         // 3. For each, create a daily full-backup schedule targeting exactly
         //    that service, then flip the latch.
         for service in services {
-            if let Err(e) = self.provision_default_schedule_for_service(&service).await {
+            if let Err(e) = self
+                .provision_default_schedule_for_service(&service, s3_source_id)
+                .await
+            {
                 // Leave default_backup_provisioned = false so the next tick
                 // retries. One failing service must not block the others.
                 warn!(
@@ -6345,9 +6353,24 @@ SELECT cp.id
     /// service and mark it provisioned. Helper for
     /// [`reconcile_default_external_service_schedules`]; on success the
     /// service's `default_backup_provisioned` latch is set to `true`.
+    /// Where an auto-provisioned schedule writes: the Cloud-managed source
+    /// when the instance has one, else the default source.
+    async fn default_schedule_destination(&self) -> Result<i32, BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let managed = temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+        match managed {
+            Some(source) => Ok(source.id),
+            None => self.resolve_s3_source_id(None).await,
+        }
+    }
+
     async fn provision_default_schedule_for_service(
         &self,
         service: &temps_entities::external_services::Model,
+        s3_source_id: i32,
     ) -> Result<(), BackupError> {
         use sea_orm::{ActiveModelTrait, Set};
 
@@ -6364,8 +6387,9 @@ SELECT cp.id
             backup_type: "full".to_string(),
             // Days. 14 days of base backups is a sane default retention window.
             retention_period: 14,
-            // Use the resolved default S3 source.
-            s3_source_id: None,
+            // The destination resolved by the caller: the Cloud-managed
+            // source when one exists, the default source otherwise.
+            s3_source_id: Some(s3_source_id),
             schedule_expression: "0 0 3 * * *".to_string(),
             enabled: true,
             description: Some(

@@ -26104,6 +26104,37 @@
         ],
         "type": "object"
       },
+      "ManagedBackupArchiveConflict": {
+        "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
+        "properties": {
+          "pinned_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pinned_s3_source_name": {
+            "description": "Name of the pinned source, or its id as text when the row is gone.",
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "pinned_s3_source_id",
+          "pinned_s3_source_name"
+        ],
+        "type": "object"
+      },
       "ManagedBackupSchedule": {
         "description": "What the Cloud settings page shows about the schedule that targets the\nmanaged destination.",
         "properties": {
@@ -26146,6 +26177,21 @@
           "action": {
             "$ref": "#/components/schemas/ManagedBackupSetupAction"
           },
+          "archive_conflicts": {
+            "description": "Services whose continuous archive is pinned elsewhere. Each fails\nunder the nightly Cloud schedule until repointed (ADR-044).",
+            "items": {
+              "$ref": "#/components/schemas/ManagedBackupArchiveConflict"
+            },
+            "type": "array"
+          },
+          "managed_s3_source_id": {
+            "description": "The `s3_sources` row of the managed destination, when it exists, so a\nclient can repoint a conflicting service at it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "message": {
             "type": "string"
           },
@@ -26171,7 +26217,8 @@
           "status",
           "ready",
           "message",
-          "action"
+          "action",
+          "archive_conflicts"
         ],
         "type": "object"
       },

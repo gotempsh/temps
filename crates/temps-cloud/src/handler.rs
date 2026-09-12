@@ -699,6 +699,7 @@ pub fn cloud_routes(
         CloudStatus,
         ManagedBackupSetup,
         temps_core::ManagedBackupSchedule,
+        temps_core::ManagedBackupArchiveConflict,
         ManagedBackupSetupAction,
         ManagedBackupSetupStatus,
         CloudFeatureSwitchesRequest,

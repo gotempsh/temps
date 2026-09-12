@@ -89,6 +89,25 @@ backup → cloud protocol, not the reverse).
    provisioner is its own struct in `temps-backup`, built from the database
    connection and `BackupService`, so the service's internals stay private.
 
+7. **Services that archive elsewhere are named, not silently failed.**
+   Postgres WAL-G and MariaDB binlog archiving are pinned to one S3 source
+   per service and refuse to move on their own, so a service pinned to the
+   operator's own bucket fails every night under the Cloud schedule with a
+   permanent mismatch. `ManagedBackupSetup` carries `archive_conflicts` (the
+   service, its type, where it is pinned) and `managed_s3_source_id`; the
+   Cloud settings page lists them with "Repoint to Temps Cloud", which calls
+   the existing audited repoint endpoint, and `temps cloud status` prints
+   the exact `temps services repoint-continuous-archive-source` command.
+   Unpinned services are not conflicts: they default to the managed
+   destination on their first archiving run.
+
+8. **Auto-provisioned MariaDB base-backup schedules follow the same
+   default.** The per-service schedule the backup plugin creates for new
+   MariaDB services targeted the default S3 source. With a managed
+   destination present, the binlog shipper would refuse to pin there
+   (new services default to Cloud) and PITR would never start. It now
+   targets the managed source when one exists, the default source otherwise.
+
 ## Consequences
 
 - An enrolled instance backs up nightly to Cloud with the plan's retention
@@ -106,6 +125,9 @@ backup → cloud protocol, not the reverse).
   destination is recognised as "the" schedule, so upgrading does not create a
   second one. On disconnect it is disabled, not deleted, because it does not
   carry the `temps-cloud` tag.
+- Repointing is the operator's call, never automatic: it strands the WAL or
+  binlogs already under the old source for restores from this instance, and
+  the page says so before the button.
 - The backup plugin stays optional. Without it the Cloud plugin logs that
   schedules are unavailable, status carries no schedule, and the ensure
   endpoint answers with that reason.

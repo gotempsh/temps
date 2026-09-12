@@ -16,7 +16,8 @@ use temps_cloud_protocol::{
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
 use temps_core::{
-    ManagedBackupSchedule, ManagedBackupScheduleProvisioner, DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
+    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleProvisioner,
+    DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
@@ -137,6 +138,12 @@ pub struct ManagedBackupSetup {
     /// `None` on a ready destination means nothing backs up to Cloud yet:
     /// the console offers to create the nightly schedule (ADR-044).
     pub schedule: Option<ManagedBackupSchedule>,
+    /// The `s3_sources` row of the managed destination, when it exists, so a
+    /// client can repoint a conflicting service at it.
+    pub managed_s3_source_id: Option<i32>,
+    /// Services whose continuous archive is pinned elsewhere. Each fails
+    /// under the nightly Cloud schedule until repointed (ADR-044).
+    pub archive_conflicts: Vec<ManagedBackupArchiveConflict>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -308,12 +315,28 @@ impl CloudService {
                 return setup;
             }
         };
-        match provisioner.schedule_for_source(source_id).await {
-            Ok(schedule) => ManagedBackupSetup { schedule, ..setup },
+        let schedule = match provisioner.schedule_for_source(source_id).await {
+            Ok(schedule) => schedule,
             Err(error) => {
                 tracing::warn!(%error, "could not read the managed destination's backup schedule");
-                setup
+                return ManagedBackupSetup {
+                    managed_s3_source_id: Some(source_id),
+                    ..setup
+                };
             }
+        };
+        let archive_conflicts = match provisioner.archive_conflicts_for_source(source_id).await {
+            Ok(conflicts) => conflicts,
+            Err(error) => {
+                tracing::warn!(%error, "could not check which services archive elsewhere");
+                Vec::new()
+            }
+        };
+        ManagedBackupSetup {
+            schedule,
+            managed_s3_source_id: Some(source_id),
+            archive_conflicts,
+            ..setup
         }
     }
 
@@ -348,8 +371,14 @@ impl CloudService {
             retention_days = schedule.retention_period,
             "backup schedule targets the Temps Cloud managed destination"
         );
+        let archive_conflicts = provisioner
+            .archive_conflicts_for_source(source_id)
+            .await
+            .unwrap_or_default();
         Ok(ManagedBackupSetup {
             schedule: Some(schedule),
+            managed_s3_source_id: Some(source_id),
+            archive_conflicts,
             ..setup
         })
     }
@@ -1156,6 +1185,8 @@ fn parse_backend(value: &str, allow_loopback_development: bool) -> Result<Backen
 
 fn ready_managed_backup_setup() -> ManagedBackupSetup {
     ManagedBackupSetup {
+        managed_s3_source_id: None,
+        archive_conflicts: Vec::new(),
         schedule: None,
         status: ManagedBackupSetupStatus::Ready,
         ready: true,
@@ -1167,6 +1198,8 @@ fn ready_managed_backup_setup() -> ManagedBackupSetup {
 fn default_managed_backup_setup(backups_enabled: bool) -> ManagedBackupSetup {
     if backups_enabled {
         ManagedBackupSetup {
+            managed_s3_source_id: None,
+            archive_conflicts: Vec::new(),
             schedule: None,
             status: ManagedBackupSetupStatus::NeedsSetup,
             ready: false,
@@ -1175,6 +1208,8 @@ fn default_managed_backup_setup(backups_enabled: bool) -> ManagedBackupSetup {
         }
     } else {
         ManagedBackupSetup {
+            managed_s3_source_id: None,
+            archive_conflicts: Vec::new(),
             schedule: None,
             status: ManagedBackupSetupStatus::Disabled,
             ready: false,
@@ -1200,6 +1235,8 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
         // configured, no entitlement, instance too old, ...) rather than a
         // single message covering every case identically.
         ManagedBackupOutcome::NotConfigured { reason } => ManagedBackupSetup {
+            managed_s3_source_id: None,
+            archive_conflicts: Vec::new(),
             schedule: None,
             status: ManagedBackupSetupStatus::NeedsSetup,
             ready: false,
@@ -1216,6 +1253,8 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
         // raw transport internals, so it's safe and useful to show directly
         // rather than flattening every failure into one generic sentence.
         ManagedBackupOutcome::Unavailable(reason) => ManagedBackupSetup {
+            managed_s3_source_id: None,
+            archive_conflicts: Vec::new(),
             schedule: None,
             status: ManagedBackupSetupStatus::Unavailable,
             ready: false,
@@ -1229,6 +1268,8 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
 
 fn subscription_required_managed_backup_setup() -> ManagedBackupSetup {
     ManagedBackupSetup {
+        managed_s3_source_id: None,
+        archive_conflicts: Vec::new(),
         schedule: None,
         status: ManagedBackupSetupStatus::SubscriptionRequired,
         ready: false,
