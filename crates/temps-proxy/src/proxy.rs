@@ -2708,9 +2708,12 @@ fn response_body_filter_inner(
 /// makes header spoofing from untrusted origins impossible.
 ///
 /// Chain:
-/// 1. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
-/// 2. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
-/// 3. All other peers → use peer address directly.
+/// 1. Loopback peer → honor the rightmost `X-Forwarded-For`, or `X-Real-IP`
+///    when XFF is absent (see `client_ip`). The local proxy must overwrite or
+///    append the connection address; malformed headers fall back to the peer.
+/// 2. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
+/// 3. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
+/// 4. All other peers → use peer address directly.
 ///
 /// Returns `None` for non-inet peers (unix sockets) so callers keep their own
 /// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
@@ -2734,6 +2737,10 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     let headers = &session.req_header().headers;
 
     crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
+
+    if let Some(client_ip) = crate::client_ip::resolve_loopback_client_ip(peer, headers) {
+        return Some(client_ip.to_string());
+    }
 
     // --- Cloudflare: check peer first, then header ---
     if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
