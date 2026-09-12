@@ -311,7 +311,10 @@ impl ExternalPluginsService {
     pub async fn catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
         let registry_config = self.manager.config().registry.clone();
         let client = RegistryClient::new(registry_config.clone())?;
-        let registry = client.fetch().await?;
+        let keyset = client.fetch_keyset().await?;
+        self.accept_catalog_keyset(registry_config.clone(), &keyset)
+            .await?;
+        let registry = client.fetch_with_keyset(keyset).await?;
         // Catalogue access is the explicit network refresh boundary. Record
         // both the keyset generation and catalogue revision on first view and
         // every later view so discovery and reload remain fully local without
@@ -507,6 +510,22 @@ impl ExternalPluginsService {
             return Err(ExternalPluginsError::ShuttingDown);
         }
         self.accept_registry_state(registry_config, registry).await
+    }
+
+    async fn accept_catalog_keyset(
+        &self,
+        registry_config: crate::catalog::RegistryConfig,
+        keyset: &crate::trust::VerifiedKeyset,
+    ) -> Result<(), ExternalPluginsError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        let _registry_state = self.registry_state.lock().await;
+        PluginInstaller::new(registry_config)?
+            .refresh_keyset(&self.manager.config().plugins_dir, keyset)
+            .await?;
+        Ok(())
     }
 
     async fn accept_registry_state(
@@ -981,6 +1000,187 @@ except Exception:
     }
 
     #[tokio::test]
+    async fn failed_catalog_still_persists_fresh_revocation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[66; 32]);
+        let url = "http://127.0.0.1:1/invalid-catalogue".to_string();
+        let mut registry_config = crate::catalog::RegistryConfig::local(
+            url,
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let replacement = SigningKey::from_bytes(&[67; 32]);
+        let (_, revoked) = crate::trust::VerifiedKeyset::test_fixture_with_keys(
+            vec![
+                (
+                    "fixture-key".to_string(),
+                    signing.verifying_key().to_bytes(),
+                    crate::trust::CatalogKeyStatus::Revoked,
+                ),
+                (
+                    "replacement-key".to_string(),
+                    replacement.verifying_key().to_bytes(),
+                    crate::trust::CatalogKeyStatus::Active,
+                ),
+            ],
+            2,
+        );
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        )
+        .with_registry(registry_config.clone());
+        let service = ExternalPluginsService::new_empty(
+            config.clone(),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        let binary = b"fixture binary";
+        let artifact_url = serve_artifact_once(binary.to_vec()).await;
+        let old =
+            selected_plugin(artifact_url, binary, "fixture-plugin", "1.0.0", 7, &signing).registry;
+        service
+            .accept_registry_state(registry_config.clone(), &old)
+            .await
+            .expect("seed old catalogue");
+        let installer = PluginInstaller::new(registry_config.clone()).expect("installer");
+        let candidate = installer
+            .prepare(&config.plugins_dir, &old, &old.document.plugins[0])
+            .await
+            .expect("prepare active fixture");
+        installer
+            .activate(&candidate)
+            .await
+            .expect("activate fixture");
+        registry_config = registry_config.with_test_keyset(revoked.clone());
+        let refreshed = ExternalPluginsService::new_empty(
+            config.clone().with_registry(registry_config.clone()),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        assert!(matches!(
+            refreshed.catalog().await,
+            Err(ExternalPluginsError::Catalog(_))
+        ));
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(config.plugins_dir.join("registry-state.json")).expect("state"),
+        )
+        .expect("valid state");
+        assert_eq!(state["highest_revision"], 7);
+        assert_eq!(state["highest_keyset_generation"], 2);
+        assert!(matches!(
+            &crate::install::discover_active(&config.plugins_dir, &registry_config).await[..],
+            [Err(InstallError::InvalidReceipt { reason, .. })]
+                if reason.contains("key status is Revoked")
+        ));
+        assert!(matches!(
+            crate::catalog::verify_envelope(
+                old.envelope,
+                revoked,
+                &registry_config.url,
+                crate::trust::KeysetUse::FreshCatalog
+            ),
+            Err(crate::catalog::CatalogError::Trust(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_keyset_cannot_replace_persisted_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[68; 32]);
+        let registry_config = crate::catalog::RegistryConfig::local(
+            "http://127.0.0.1:1/catalog".to_string(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        )
+        .with_registry(registry_config.clone());
+        let service = ExternalPluginsService::new_empty(
+            config.clone(),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        service
+            .accept_registry_state(registry_config.clone(), &registry_revision(7, 1, &signing))
+            .await
+            .expect("seed state");
+        let state_path = config.plugins_dir.join("registry-state.json");
+        let before = std::fs::read(&state_path).expect("read state");
+        let mut invalid = crate::trust::VerifiedKeyset::test_fixture_with_keys(
+            vec![(
+                "fixture-key".to_string(),
+                signing.verifying_key().to_bytes(),
+                crate::trust::CatalogKeyStatus::Active,
+            )],
+            2,
+        )
+        .1
+        .envelope;
+        invalid.payload.push('x');
+        assert!(crate::trust::VerifiedKeyset::verify(
+            invalid,
+            &registry_config.root_trust,
+            chrono::Utc::now(),
+            crate::trust::KeysetUse::FreshCatalog,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(state_path).expect("read unchanged state"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_first_catalogue_keeps_keyset_generation_floor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[69; 32]);
+        let config = crate::catalog::RegistryConfig::local_with_generation(
+            "http://127.0.0.1:1/unavailable".to_string(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+            2,
+        );
+        let service = ExternalPluginsService::new_empty(
+            ExternalPluginConfig::new(
+                temp.path().to_path_buf(),
+                "postgres://localhost/test".to_string(),
+            )
+            .with_registry(config.clone()),
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        assert!(matches!(
+            service.catalog().await,
+            Err(ExternalPluginsError::Catalog(_))
+        ));
+        let stale = crate::trust::VerifiedKeyset::test_fixture(
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        )
+        .1;
+        assert!(matches!(
+            service.accept_catalog_keyset(config, &stale).await,
+            Err(ExternalPluginsError::Install(
+                InstallError::KeysetRollback {
+                    received: 1,
+                    highest: 2
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn concurrent_out_of_order_registry_updates_cannot_roll_back_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let signing = SigningKey::from_bytes(&[64; 32]);
@@ -1077,10 +1277,10 @@ except Exception:
         // parallel must not commit until that complete lifecycle ends.
         let install_lifecycle = service.lifecycle.lock().await;
         let catalogue_service = service.clone();
-        let newer_registry = registry_revision(2, 2, &signing);
+        let newer_keyset = registry_revision(2, 2, &signing).keyset;
         let mut catalogue_commit = tokio::spawn(async move {
             catalogue_service
-                .accept_catalog_state(registry_config, &newer_registry)
+                .accept_catalog_keyset(registry_config, &newer_keyset)
                 .await
         });
         assert!(

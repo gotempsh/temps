@@ -58,6 +58,10 @@ mock.module('@/hooks/usePlugins', () => ({
     isPending: false,
     mutateAsync: () => Promise.resolve(),
   }),
+  useUninstallPlugin: () => ({
+    isPending: false,
+    mutateAsync: () => Promise.resolve(),
+  }),
 }))
 
 const { PluginsPage } = await import('./PluginsPage')

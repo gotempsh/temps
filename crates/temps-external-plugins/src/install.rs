@@ -440,7 +440,19 @@ impl PluginInstaller {
     ) -> Result<(), InstallError> {
         let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
         let Some(previous) = read_registry_state(&state_path).await? else {
-            return Ok(());
+            ensure_directory("registry", plugins_dir).await?;
+            write_json_atomically(
+                "registry",
+                &state_path,
+                &RegistryState {
+                    highest_revision: 0,
+                    catalog_payload_sha256: String::new(),
+                    highest_keyset_generation: keyset.document.generation,
+                    keyset: keyset.envelope.clone(),
+                },
+            )
+            .await?;
+            return sync_directory("registry", plugins_dir).await;
         };
         if keyset.document.generation < previous.highest_keyset_generation {
             return Err(InstallError::KeysetRollback {
@@ -1194,7 +1206,15 @@ pub async fn discover_active(
             return results;
         }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                results.push(Err(io_error("registry", plugins_dir, error)));
+                break;
+            }
+        };
         let name = match entry.file_name().to_str() {
             Some(name) if !name.starts_with('.') => name.to_string(),
             _ => continue,
@@ -2153,6 +2173,36 @@ mod tests {
             .expect("registry state exists");
         assert_eq!(state.highest_revision, 7);
         assert_eq!(state.highest_keyset_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn first_keyset_refresh_persists_without_catalogue_and_accepts_first_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (registry, signing) = signed_registry_revision(
+            plugin("http://127.0.0.1/plugin".to_string(), b"fixture", "1.0.0"),
+            1,
+        );
+        let (installer, _) = installer("http://127.0.0.1/plugin", &signing);
+        installer
+            .refresh_keyset(temp.path(), &registry.keyset)
+            .await
+            .expect("persist first authenticated keyset");
+        let state_path = temp.path().join(REGISTRY_STATE_FILE);
+        let state = read_registry_state(&state_path)
+            .await
+            .expect("read state")
+            .expect("state exists");
+        assert_eq!(state.highest_revision, 0);
+        assert_eq!(state.highest_keyset_generation, 1);
+        installer
+            .accept_registry_revision(temp.path(), &registry)
+            .await
+            .expect("accept first catalogue revision");
+        let state = read_registry_state(&state_path)
+            .await
+            .expect("read state")
+            .expect("state exists");
+        assert_eq!(state.highest_revision, 1);
     }
 
     #[tokio::test]

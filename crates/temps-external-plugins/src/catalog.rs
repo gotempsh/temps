@@ -113,6 +113,12 @@ impl RegistryConfig {
         config.test_keyset_fetches = Some(fetches);
         config
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_keyset(mut self, keyset: VerifiedKeyset) -> Self {
+        self.test_keyset = Some(keyset);
+        self
+    }
 }
 
 /// The outer envelope signs the decoded bytes in `payload`. Encoding the
@@ -280,6 +286,13 @@ impl RegistryClient {
 
     pub async fn fetch(&self) -> Result<VerifiedRegistry, CatalogError> {
         let keyset = self.fetch_keyset().await?;
+        self.fetch_with_keyset(keyset).await
+    }
+
+    pub async fn fetch_with_keyset(
+        &self,
+        keyset: VerifiedKeyset,
+    ) -> Result<VerifiedRegistry, CatalogError> {
         let response = self
             .client
             .get(&self.config.url)

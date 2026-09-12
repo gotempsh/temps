@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { RegistryPlugin } from '@/api/client/types.gen'
+import type {
+  RegistryPlugin,
+  ReloadFailureResponse,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -36,6 +39,7 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import {
   canManageExternalPlugins,
   pluginInstallAction,
+  pluginReloadFailures,
   safeRegistryNavigationUrl,
 } from '@/lib/plugin-registry'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
@@ -64,6 +68,9 @@ export function PluginsPage() {
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
+  const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
+    []
+  )
   const managementPending =
     installPlugin.isPending ||
     reloadPlugins.isPending ||
@@ -81,8 +88,10 @@ export function PluginsPage() {
   usePageTitle('Plugins')
 
   const handleReload = async () => {
+    setReloadFailures([])
     try {
       const result = await reloadPlugins.mutateAsync()
+      setReloadFailures(pluginReloadFailures(result))
       if (result.failures.length > 0) {
         toast.warning(result.message)
       } else {
@@ -90,6 +99,7 @@ export function PluginsPage() {
       }
     } catch (error) {
       if (handleSensitiveActionError(error, () => void handleReload())) return
+      setReloadFailures(pluginReloadFailures(error))
       toast.error(
         sensitiveActionErrorMessage(error, 'Failed to reload plugins.')
       )
@@ -191,6 +201,25 @@ export function PluginsPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-6">
+          {canManagePlugins && reloadFailures.length > 0 && (
+            <Alert variant="destructive">
+              <AlertCircle className="size-4" />
+              <AlertTitle>Some plugins could not be reloaded</AlertTitle>
+              <AlertDescription>
+                <ul className="list-disc space-y-1 pl-4">
+                  {reloadFailures.map((failure, index) => (
+                    <li
+                      key={`${failure.plugin}-${index}`}
+                      className="break-words"
+                    >
+                      <strong>{failure.plugin || 'Plugin registry'}:</strong>{' '}
+                      {failure.reason}
+                    </li>
+                  ))}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          )}
           {canManagePlugins && (
             <RegistryCatalog
               catalog={catalog}

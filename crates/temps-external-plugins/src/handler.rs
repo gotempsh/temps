@@ -455,12 +455,15 @@ async fn list_plugin_catalog(
             reason: None,
             plugins: registry.document.plugins,
         })),
-        Err(error) => Ok(Json(PluginCatalogResponse {
-            available: false,
-            source,
-            reason: Some(error.to_string()),
-            plugins: Vec::new(),
-        })),
+        Err(error) => {
+            tracing::warn!(error = %error, "Plugin catalogue unavailable");
+            Ok(Json(PluginCatalogResponse {
+                available: false,
+                source,
+                reason: Some(public_error_detail(&error)),
+                plugins: Vec::new(),
+            }))
+        }
     }
 }
 
@@ -1214,6 +1217,27 @@ mod tests {
 
         // Assert
         assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_list_plugin_catalog_hides_internal_error_detail() {
+        let (temp, state, _, server) =
+            test_state_with_signed_registry(Arc::new(NoopAuditLogger)).await;
+        let state_path = temp.path().join("plugins/registry-state.json");
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create plugins directory");
+        std::fs::create_dir(&state_path).expect("make state path non-regular");
+        let Json(response) = list_plugin_catalog(user_auth(Role::PlatformAdmin), State(state))
+            .await
+            .expect("unavailable catalogue response");
+        server.abort();
+        assert!(!response.available);
+        let reason = response.reason.expect("public reason");
+        assert!(!reason.contains(&state_path.display().to_string()));
+        assert_eq!(
+            reason,
+            "Plugin 'registry' could not be installed or verified locally"
+        );
     }
 
     #[tokio::test]

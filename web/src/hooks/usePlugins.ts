@@ -111,8 +111,12 @@ export function useReloadPlugins() {
       const response = await reloadPlugins({ throwOnError: true })
       return response.data
     },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    // A 502 reload can stop every plugin; refresh navigation even on failure.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: PLUGINS_QUERY_KEY,
+        exact: true,
+      })
     },
   })
 }

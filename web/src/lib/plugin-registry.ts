@@ -1,6 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ReloadFailureResponse } from '@/api/client/types.gen'
+
+/** Reload returns the same failure list for HTTP 207 and thrown HTTP 502 bodies. */
+export function pluginReloadFailures(value: unknown): ReloadFailureResponse[] {
+  if (!value || typeof value !== 'object' || !('failures' in value)) return []
+  if (!Array.isArray(value.failures)) return []
+  return value.failures.filter(
+    (failure): failure is ReloadFailureResponse =>
+      failure !== null &&
+      typeof failure === 'object' &&
+      (failure.plugin == null || typeof failure.plugin === 'string') &&
+      typeof failure.reason === 'string'
+  )
+}
+
 /**
  * Registry metadata is signed but remains untrusted display input. Only
  * absolute HTTP(S) URLs may become browser navigation or image targets.
