@@ -311,6 +311,42 @@ jobs:
       - name: Install Playwright browser
         run: cd web && bunx playwright install --with-deps chromium
 
+      # The console suite runs in parallel against one fresh instance. Seed a
+      # durable project before it starts so project-scoped specs do not race
+      # the later deployment examples (or the project-creation test) for the
+      # first project in the account.
+      - name: Seed console UI project
+        run: |
+          set -euo pipefail
+
+          API_OUTPUT=$("$TEMPS_BIN" api-key \
+            --database-url "$DATABASE_URL" \
+            --name "e2e-console-ui" \
+            --role admin \
+            --output-format json)
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty')
+          test -n "$API_KEY"
+          echo "::add-mask::$API_KEY"
+
+          curl --fail-with-body -sS \
+            -X POST "$API_BASE/projects" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "e2e-console-ui",
+              "repo_name": "temps",
+              "repo_owner": "gotempsh",
+              "directory": "examples/nextjs/basic",
+              "main_branch": "main",
+              "preset": "nextjs",
+              "git_url": "https://github.com/gotempsh/temps.git",
+              "is_public_repo": true,
+              "automatic_deploy": false,
+              "storage_service_ids": [],
+              "performance_metrics_enabled": false
+            }' > /tmp/e2e-console-ui-project.json
+          jq -e '.id and .slug' /tmp/e2e-console-ui-project.json >/dev/null
+
       - name: Console UI end-to-end tests
         env:
           E2E_BASE_URL: http://localhost:8081

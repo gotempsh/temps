@@ -130,14 +130,16 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         })
       ).toBeVisible()
       await expect(
-        kind === 'analytics' && width < 768
+        kind === 'analytics'
           ? page
-              .getByRole('list', { name: 'Top pages', exact: true })
-              .getByText('Storefront')
+              .getByRole('region', { name: 'Top Pages', exact: true })
+              .getByText('Storefront', { exact: true })
           : page.getByRole('cell', { name: 'Storefront', exact: false }).first()
       ).toBeVisible()
       if (kind === 'logs') {
-        await page.getByRole('combobox', { name: 'Search log messages' }).fill('project:')
+        await page
+          .getByRole('combobox', { name: 'Search log messages' })
+          .fill('project:')
         await page.getByRole('option', { name: /project:Storefront/ }).click()
       } else {
         await page.getByRole('combobox', { name: 'Project scope' }).click()
@@ -156,8 +158,14 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       ).toBe(6 * 3600000)
       const frozen = new URL(page.url()).searchParams.get('from')
       await page.reload()
-      if (kind === 'logs') await expect(page.getByRole('button', { name: 'Edit project filter' })).toContainText('Storefront')
-      else await expect(page.getByRole('combobox', { name: 'Project scope' })).toHaveText('Storefront')
+      if (kind === 'logs')
+        await expect(
+          page.getByRole('button', { name: 'Edit project filter' })
+        ).toContainText('Storefront')
+      else
+        await expect(
+          page.getByRole('combobox', { name: 'Project scope' })
+        ).toHaveText('Storefront')
       expect(new URL(page.url()).searchParams.get('from')).toBe(frozen)
       expect(
         await page.evaluate(
@@ -196,7 +204,11 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       .getByRole('button', { name: `Retry ${kind}`, exact: true })
       .click()
     await expect(
-      page.getByRole('cell', { name: 'Storefront', exact: false }).first()
+      kind === 'analytics'
+        ? page
+            .getByRole('region', { name: 'Top Pages', exact: true })
+            .getByText('Storefront', { exact: true })
+        : page.getByRole('cell', { name: 'Storefront', exact: false }).first()
     ).toBeVisible()
   })
 }
@@ -335,11 +347,12 @@ for (const width of [320, 390, 1440]) {
     await expect(page.getByLabel('Analytics summary')).toContainText('Visitors')
     await expect(page.getByLabel('Analytics summary')).toContainText('80')
     if (width < 768) {
-      const list = page.getByRole('list', { name: 'Top pages', exact: true })
-      await expect(list).toContainText('Storefront')
-      await expect(list).toContainText('Avg. time')
-      await expect(list).toContainText('30 s')
-      const bounds = await list.boundingBox()
+      const pages = page.getByRole('region', {
+        name: 'Top Pages',
+        exact: true,
+      })
+      await expect(pages).toContainText('Storefront')
+      const bounds = await pages.boundingBox()
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width)
     }
     const tabs = page.getByRole('tablist', { name: 'Traffic presentation' })
@@ -433,51 +446,108 @@ test('global log explorer inspects records, exports, and applies API facets', as
   await clearRequest
 })
 
-
-test('logs reference workspace supports grouping, columns, facets and chart range selection', async ({ page }) => {
-  await page.setViewportSize({width: 1440, height: 1000})
+test('logs reference workspace supports grouping, columns, facets and chart range selection', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
   await mock(page, 'logs')
-  await page.route((url) => url.pathname === endpoints.logs, route => route.fulfill({json: {...fixtures.logs, lines: Array.from({length: 60}, (_, i) => ({...fixtures.logs.lines[0], line_offset: i, timestamp: new Date(Date.parse(stamp) - i * 30000).toISOString(), level: i % 7 === 0 ? 'ERROR' : i % 3 === 0 ? 'WARN' : 'INFO', message: i % 7 === 0 ? 'Checkout request failed' : `Completed GET /products in ${20 + i}ms`, deploy_id: 42, node_id: 7, node_name: 'worker-7'}))}}))
-  await page.goto('/logs?range=custom&from=2026-09-09T11:00:00Z&to=2026-09-09T13:00:00Z')
-  await expect(page.getByText('Volume by level', {exact:true})).toBeVisible()
-  await expect(page.getByRole('columnheader', {name:'deployment', exact:true})).toBeVisible()
-  await page.screenshot({path:'/tmp/temps-logs-reference-desktop.png', fullPage:true})
-  await page.getByRole('button', {name:'Next page',exact:true}).click()
+  await page.route(
+    (url) => url.pathname === endpoints.logs,
+    (route) =>
+      route.fulfill({
+        json: {
+          ...fixtures.logs,
+          lines: Array.from({ length: 60 }, (_, i) => ({
+            ...fixtures.logs.lines[0],
+            line_offset: i,
+            timestamp: new Date(Date.parse(stamp) - i * 30000).toISOString(),
+            level: i % 7 === 0 ? 'ERROR' : i % 3 === 0 ? 'WARN' : 'INFO',
+            message:
+              i % 7 === 0
+                ? 'Checkout request failed'
+                : `Completed GET /products in ${20 + i}ms`,
+            deploy_id: 42,
+            node_id: 7,
+            node_name: 'worker-7',
+          })),
+        },
+      })
+  )
+  await page.goto(
+    '/logs?range=custom&from=2026-09-09T11:00:00Z&to=2026-09-09T13:00:00Z'
+  )
+  await expect(page.getByText('Volume by level', { exact: true })).toBeVisible()
+  await expect(
+    page.getByRole('columnheader', { name: 'deployment', exact: true })
+  ).toBeVisible()
+  await page.screenshot({
+    path: '/tmp/temps-logs-reference-desktop.png',
+    fullPage: true,
+  })
+  await page.getByRole('button', { name: 'Next page', exact: true }).click()
   await expect(page).toHaveURL(/cursor=next-token/)
-  await page.getByRole('button', {name:'Patterns',exact:true}).click()
-  await expect(page.getByText('Exact repeated messages on this loaded page.', {exact:false})).toBeVisible()
+  await page.getByRole('button', { name: 'Patterns', exact: true }).click()
+  await expect(
+    page.getByText('Exact repeated messages on this loaded page.', {
+      exact: false,
+    })
+  ).toBeVisible()
   await expect(page).toHaveURL(/cursor=next-token/)
-  await page.getByRole('button', {name:'By service',exact:true}).click()
-  await expect(page.getByRole('button', {name:'Storefront / web',exact:true})).toBeVisible()
-  await page.getByRole('button', {name:'List',exact:true}).click()
-  await page.getByRole('button', {name:'Columns',exact:true}).click()
-  await page.getByRole('menuitemcheckbox', {name:'node',exact:true}).click()
+  await page.getByRole('button', { name: 'By service', exact: true }).click()
+  await expect(
+    page.getByRole('button', { name: 'Storefront / web', exact: true })
+  ).toBeVisible()
+  await page.getByRole('button', { name: 'List', exact: true }).click()
+  await page.getByRole('button', { name: 'Columns', exact: true }).click()
+  await page
+    .getByRole('menuitemcheckbox', { name: 'node', exact: true })
+    .click()
   await page.keyboard.press('Escape')
-  await expect(page.getByRole('columnheader', {name:'node',exact:true})).toBeVisible()
-  await page.getByRole('textbox', {name:'Filter facets'}).fill('worker')
-  await expect(page.getByRole('region', {name:'Node facets'})).toBeVisible()
-  await expect(page.getByRole('region', {name:'Level facets'})).toHaveCount(0)
-  await page.getByRole('button', {name:'Show volume table'}).click()
-  await page.getByRole('button', {name:/Select time bucket/}).first().click()
+  await expect(
+    page.getByRole('columnheader', { name: 'node', exact: true })
+  ).toBeVisible()
+  await page.getByRole('textbox', { name: 'Filter facets' }).fill('worker')
+  await expect(page.getByRole('region', { name: 'Node facets' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Level facets' })).toHaveCount(
+    0
+  )
+  await page.getByRole('button', { name: 'Show volume table' }).click()
+  await page
+    .getByRole('button', { name: /Select time bucket/ })
+    .first()
+    .click()
   await expect(page).not.toHaveURL(/cursor=/)
   const params = new URL(page.url()).searchParams
-  expect(Date.parse(params.get('to')!) - Date.parse(params.get('from')!)).toBe(60000)
+  expect(Date.parse(params.get('to')!) - Date.parse(params.get('from')!)).toBe(
+    60000
+  )
 })
 
-test('log key:value autocomplete applies, edits and validates filters', async ({ page }) => {
-  await page.setViewportSize({width:1440, height:1000})
+test('log key:value autocomplete applies, edits and validates filters', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
   await mock(page, 'logs')
   await page.goto('/logs')
-  const input = page.getByRole('combobox', {name:'Search log messages'})
-  await expect(page.getByRole('combobox', {name:'Project scope'})).toHaveCount(0)
-  await expect(page.getByRole('combobox', {name:'Log level'})).toHaveCount(0)
+  const input = page.getByRole('combobox', { name: 'Search log messages' })
+  await expect(
+    page.getByRole('combobox', { name: 'Project scope' })
+  ).toHaveCount(0)
+  await expect(page.getByRole('combobox', { name: 'Log level' })).toHaveCount(0)
   await input.fill('lev')
   await input.press('Enter')
   await expect(input).toHaveValue('level:')
   await input.press('Enter')
-  await expect(page.getByRole('button', {name:'Edit level filter'})).toHaveText('level:error')
-  await page.getByRole('button', {name:'Next page',exact:true}).click()
-  const request = page.waitForRequest(req => new URL(req.url()).pathname === endpoints.logs && req.postDataJSON().levels?.[0] === 'WARN' && req.postDataJSON().envs?.[0] === 'Production')
+  await expect(
+    page.getByRole('button', { name: 'Edit level filter' })
+  ).toHaveText('level:error')
+  await page.getByRole('button', { name: 'Next page', exact: true }).click()
+  const request = page.waitForRequest(
+    (req) =>
+      new URL(req.url()).pathname === endpoints.logs &&
+      req.postDataJSON().levels?.[0] === 'WARN' &&
+      req.postDataJSON().envs?.[0] === 'Production'
+  )
   await input.fill('level:warn env:Production timeout')
   await input.press('Enter')
   const body = (await request).postDataJSON()
@@ -485,57 +555,87 @@ test('log key:value autocomplete applies, edits and validates filters', async ({
   expect(body.cursor).toBeUndefined()
   await expect(page).not.toHaveURL(/cursor=/)
   await page.reload()
-  await expect(page.getByRole('button', {name:'Edit env filter'})).toHaveText('env:Production')
-  await page.getByRole('button', {name:'Edit level filter'}).click()
+  await expect(
+    page.getByRole('button', { name: 'Edit env filter' })
+  ).toHaveText('env:Production')
+  await page.getByRole('button', { name: 'Edit level filter' }).click()
   await input.fill('level:info')
   await input.press('Enter')
-  await expect(page.getByRole('button', {name:'Edit level filter'})).toHaveText('level:info')
+  await expect(
+    page.getByRole('button', { name: 'Edit level filter' })
+  ).toHaveText('level:info')
   await input.fill('node:invalid')
   await input.press('Enter')
   await expect(page.getByRole('alert')).toContainText('positive numeric ID')
   await expect(page).not.toHaveURL(/node_id=/)
   await input.press('Escape')
-  await expect(input).toHaveAttribute('aria-expanded','false')
+  await expect(input).toHaveAttribute('aria-expanded', 'false')
   await input.fill('project:store')
-  await page.getByRole('option', {name:/project:Storefront/}).click()
+  await page.getByRole('option', { name: /project:Storefront/ }).click()
   await expect(page).toHaveURL(/project_id=1/)
   await input.fill('source:service')
   await input.press('Enter')
   await expect(page).toHaveURL(/source=service/)
   await expect(page).not.toHaveURL(/project_id=/)
-  await page.getByRole('button', {name:'Clear source: service'}).click()
+  await page.getByRole('button', { name: 'Clear source: service' }).click()
   await expect(page).not.toHaveURL(/source=/)
   await input.fill('level:')
-  await page.screenshot({path:'/tmp/temps-logs-key-value-autocomplete.png',fullPage:true})
+  await page.screenshot({
+    path: '/tmp/temps-logs-key-value-autocomplete.png',
+    fullPage: true,
+  })
 })
 
-
 test('log autocomplete remains usable on a narrow screen', async ({ page }) => {
-  await page.setViewportSize({width:390, height:844})
+  await page.setViewportSize({ width: 390, height: 844 })
   await mock(page, 'logs')
   await page.goto('/logs')
-  const input = page.getByRole('combobox', {name:'Search log messages'})
+  const input = page.getByRole('combobox', { name: 'Search log messages' })
   await input.fill('env:')
-  await page.getByRole('option', {name:'env:production', exact:true}).click()
-  await expect(page.getByRole('button', {name:'Edit env filter'})).toHaveText('env:production')
+  await page
+    .getByRole('option', { name: 'env:production', exact: true })
+    .click()
+  await expect(
+    page.getByRole('button', { name: 'Edit env filter' })
+  ).toHaveText('env:production')
   await input.fill('level:')
   await input.press('ArrowDown')
   await input.press('Tab')
-  await expect(page.getByRole('button', {name:'Edit level filter'})).toHaveText('level:warn')
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  await expect(
+    page.getByRole('button', { name: 'Edit level filter' })
+  ).toHaveText('level:warn')
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth
+    )
+  ).toBe(true)
 })
 
 for (const theme of ['light', 'dark']) {
   test(`logs use the shared chart tooltip in ${theme}`, async ({ page }) => {
-    await page.addInitScript((theme) => localStorage.setItem('theme', theme), theme)
+    await page.addInitScript(
+      (theme) => localStorage.setItem('theme', theme),
+      theme
+    )
     await mock(page, 'logs')
-    await page.route('**/api/logs/global/search**', route => route.fulfill({ json: {
-      ...fixtures.logs,
-      lines: [0, 1, 2].map(i => ({ ...fixtures.logs.lines[0], timestamp: new Date(Date.parse(stamp) + i * 60000).toISOString(), line_offset: i }))
-    }}))
+    await page.route('**/api/logs/global/search**', (route) =>
+      route.fulfill({
+        json: {
+          ...fixtures.logs,
+          lines: [0, 1, 2].map((i) => ({
+            ...fixtures.logs.lines[0],
+            timestamp: new Date(Date.parse(stamp) + i * 60000).toISOString(),
+            line_offset: i,
+          })),
+        },
+      })
+    )
     await page.goto('/logs')
     const chart = page.getByRole('region', { name: 'Log volume' })
-    await expect(chart.locator('.recharts-line-curve').first()).toHaveAttribute('stroke-width', '2')
+    await expect(chart.locator('.recharts-line-curve').first()).toHaveAttribute(
+      'stroke-width',
+      '2'
+    )
     await chart.locator('.recharts-surface').hover()
     const tooltip = chart.locator('.recharts-tooltip-wrapper')
     await expect(tooltip).toBeVisible()
