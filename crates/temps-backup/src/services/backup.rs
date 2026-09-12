@@ -6289,14 +6289,16 @@ SELECT cp.id
     pub async fn reconcile_default_external_service_schedules(&self) -> Result<(), BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // 1. Resolve the destination. The Cloud-managed source wins when one
-        //    exists: new services' continuous archiving defaults to it (see
+        // 1. Resolve the destination for services not pinned anywhere yet.
+        //    The Cloud-managed source wins when one exists: new services'
+        //    continuous archiving defaults to it (see
         //    `temps_providers::continuous_archive`), so a base-backup
         //    schedule pointed anywhere else would leave the binlog shipper
         //    refusing to pin and PITR never starting. Otherwise the default
         //    source; if neither is configured yet, this is not an error — we
         //    simply have nothing to point a schedule at, so we bail quietly
-        //    and retry on the next tick.
+        //    and retry on the next tick. A service that already carries a
+        //    pin keeps it (see the loop below).
         let s3_source_id = match self.default_schedule_destination().await {
             Ok(id) => id,
             Err(_) => {
@@ -6329,8 +6331,15 @@ SELECT cp.id
         // 3. For each, create a daily full-backup schedule targeting exactly
         //    that service, then flip the latch.
         for service in services {
+            // A service already pinned somewhere (an upgraded instance whose
+            // binlogs ship to the operator's own bucket) keeps that
+            // destination: a schedule pointed anywhere else would fail
+            // every run on the pin mismatch.
+            let destination = service
+                .continuous_archive_s3_source_id
+                .unwrap_or(s3_source_id);
             if let Err(e) = self
-                .provision_default_schedule_for_service(&service, s3_source_id)
+                .provision_default_schedule_for_service(&service, destination)
                 .await
             {
                 // Leave default_backup_provisioned = false so the next tick

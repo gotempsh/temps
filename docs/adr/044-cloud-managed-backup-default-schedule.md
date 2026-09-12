@@ -99,14 +99,18 @@ backup → cloud protocol, not the reverse).
    the existing audited repoint endpoint, and `temps cloud status` prints
    the exact `temps services repoint-continuous-archive-source` command.
    Unpinned services are not conflicts: they default to the managed
-   destination on their first archiving run.
+   destination on their first archiving run. Only services the Cloud
+   schedule targets count: every service when it targets all (or when no
+   schedule exists yet, since the default one would), otherwise the selected
+   ones.
 
 8. **Auto-provisioned MariaDB base-backup schedules follow the same
    default.** The per-service schedule the backup plugin creates for new
    MariaDB services targeted the default S3 source. With a managed
    destination present, the binlog shipper would refuse to pin there
    (new services default to Cloud) and PITR would never start. It now
-   targets the managed source when one exists, the default source otherwise.
+   targets the managed source when one exists, the default source otherwise,
+   and keeps an existing pin when the service already has one.
 
 ## Consequences
 
