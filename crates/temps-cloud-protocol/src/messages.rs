@@ -363,6 +363,18 @@ pub struct NativeSnapshotRequest {
     /// instance falls back to the copy path unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +443,18 @@ pub struct WalGSnapshotRequest {
     /// `upload_required: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +495,166 @@ pub struct WalGObjectCompleted {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalGSnapshotCompleted {
     pub backup_id: Uuid,
+}
+
+// ---------------------------------------------------------------------------
+// Backup manifests — large object lists travel through the bucket
+// ---------------------------------------------------------------------------
+
+/// Above this many objects an in-place declaration is made by manifest
+/// ([`WalGSnapshotRequest::manifest_key`] / [`NativeSnapshotRequest::manifest_key`])
+/// rather than inline. Inline declarations stay well under Cloud's request
+/// body limit at this size; a manifest has no such limit short of
+/// [`MAX_BACKUP_MANIFEST_BYTES`].
+pub const MANIFEST_DECLARATION_THRESHOLD: usize = 10_000;
+
+/// Largest manifest object Cloud will read. About 150 bytes per object,
+/// so roughly 400,000 objects: four times the most an instance lists
+/// today, and a hard bound so a manifest can never be a memory attack on
+/// the reader (which holds at most one copy of it while parsing).
+pub const MAX_BACKUP_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Current [`BackupManifest::version`]. Bumped only for a breaking change
+/// to the manifest document.
+pub const BACKUP_MANIFEST_VERSION: u32 = 1;
+
+/// The object list of one snapshot, written by the instance into the
+/// Cloud-managed bucket and referenced from the declaration by key. The
+/// document names the snapshot it belongs to so a stale or misplaced
+/// manifest can never catalog objects under the wrong backup.
+///
+/// On the wire: `{"version":1,"backup_id":..,"instance_id":..,
+/// "engine":"wal_g"|"native","objects":[...]}`. `engine` precedes
+/// `objects`, and the reader relies on that: [`Deserialize`] is written by
+/// hand so the (possibly very long) object list is typed as it streams
+/// past instead of being buffered as an untyped tree first, which is what
+/// `#[serde(flatten)]` would do and what turns a 64 MiB document into
+/// gigabytes of heap on the reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackupManifest {
+    pub version: u32,
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    #[serde(flatten)]
+    pub objects: BackupManifestObjects,
+}
+
+impl<'de> Deserialize<'de> for BackupManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Engine {
+            WalG,
+            Native,
+        }
+
+        struct ManifestVisitor;
+
+        impl<'de> Visitor<'de> for ManifestVisitor {
+            type Value = BackupManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a backup manifest object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut version: Option<u32> = None;
+                let mut backup_id: Option<Uuid> = None;
+                let mut instance_id: Option<Uuid> = None;
+                let mut engine: Option<Engine> = None;
+                let mut objects: Option<BackupManifestObjects> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => version = Some(map.next_value()?),
+                        "backup_id" => backup_id = Some(map.next_value()?),
+                        "instance_id" => instance_id = Some(map.next_value()?),
+                        "engine" => engine = Some(map.next_value()?),
+                        "objects" => {
+                            // Typed straight from the stream: the engine must
+                            // already be known, which the writer guarantees.
+                            objects =
+                                Some(match engine {
+                                    Some(Engine::WalG) => {
+                                        BackupManifestObjects::WalG(map.next_value()?)
+                                    }
+                                    Some(Engine::Native) => {
+                                        BackupManifestObjects::Native(map.next_value()?)
+                                    }
+                                    None => return Err(A::Error::custom(
+                                        "backup manifest must name its engine before its objects",
+                                    )),
+                                });
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(BackupManifest {
+                    version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+                    backup_id: backup_id.ok_or_else(|| A::Error::missing_field("backup_id"))?,
+                    instance_id: instance_id
+                        .ok_or_else(|| A::Error::missing_field("instance_id"))?,
+                    objects: objects.ok_or_else(|| A::Error::missing_field("objects"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
+/// Which declaration the manifest stands in for. Serialized as
+/// `{"engine": "wal_g", "objects": [...]}` / `{"engine": "native", ...}` so
+/// the engine is visible before the (possibly very long) list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", content = "objects", rename_all = "snake_case")]
+pub enum BackupManifestObjects {
+    WalG(Vec<WalGObjectDeclaration>),
+    Native(Vec<NativeSnapshotObjectDeclaration>),
+}
+
+impl BackupManifest {
+    pub fn walg(backup_id: Uuid, instance_id: Uuid, objects: Vec<WalGObjectDeclaration>) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::WalG(objects),
+        }
+    }
+
+    pub fn native(
+        backup_id: Uuid,
+        instance_id: Uuid,
+        objects: Vec<NativeSnapshotObjectDeclaration>,
+    ) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::Native(objects),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.objects {
+            BackupManifestObjects::WalG(objects) => objects.len(),
+            BackupManifestObjects::Native(objects) => objects.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +967,77 @@ mod tests {
     /// declaration without it. The instance must decode that as "nothing
     /// complete yet" and fall back to uploading every object, not fail the
     /// whole mirror pass on a missing field.
+    #[test]
+    fn manifest_key_is_additive_and_manifest_round_trips() {
+        let walg: WalGSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "instance_id": Uuid::nil(),
+            "source": "db",
+            "engine": "postgres",
+            "postgres_major": 17,
+            "postgres_system_identifier": "1",
+            "backup_name": "base_000000010000000000000002",
+            "timeline": 1,
+            "start_lsn": "0/2000028",
+            "finish_lsn": "0/2000100",
+            "objects": []
+        }))
+        .unwrap();
+        assert!(walg.manifest_key.is_none());
+        let serialized = serde_json::to_value(&walg).unwrap();
+        assert!(serialized.get("manifest_key").is_none());
+
+        let manifest = BackupManifest::walg(
+            Uuid::nil(),
+            Uuid::nil(),
+            vec![WalGObjectDeclaration {
+                relative_key: "basebackups_005/base_1/tar_partitions/part_001.tar.lz4".into(),
+                kind: WalGObjectKind::BaseBackup,
+                bytes: 7,
+                checksum_sha256: None,
+            }],
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["engine"], "wal_g");
+        assert_eq!(json["version"], BACKUP_MANIFEST_VERSION);
+        assert_eq!(json["objects"][0]["kind"], "base_backup");
+        let back: BackupManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, manifest);
+        assert_eq!(back.len(), 1);
+
+        let native = BackupManifest::native(Uuid::nil(), Uuid::nil(), Vec::new());
+        let json = serde_json::to_value(&native).unwrap();
+        assert_eq!(json["engine"], "native");
+        assert!(serde_json::from_value::<BackupManifest>(json)
+            .unwrap()
+            .is_empty());
+
+        // The writer always puts `engine` before `objects`; the reader types
+        // the list as it streams and refuses a document it cannot type.
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        let engine_at = serialized.find("\"engine\"").unwrap();
+        let objects_at = serialized.find("\"objects\"").unwrap();
+        assert!(engine_at < objects_at, "{serialized}");
+        // `serde_json::json!` sorts keys, so spell the reordered document out.
+        let reordered = format!(
+            r#"{{"version":1,"backup_id":"{id}","instance_id":"{id}","objects":[],"engine":"native"}}"#,
+            id = Uuid::nil()
+        );
+        let error = serde_json::from_str::<BackupManifest>(&reordered).unwrap_err();
+        assert!(
+            error.to_string().contains("engine before its objects"),
+            "{error}"
+        );
+        // Unknown keys are ignored, so a future writer can add fields.
+        let extra = serde_json::json!({
+            "version": 1, "backup_id": Uuid::nil(), "instance_id": Uuid::nil(),
+            "written_by": "temps 0.2", "engine": "native", "objects": []
+        });
+        assert!(serde_json::from_str::<BackupManifest>(&extra.to_string())
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn snapshot_completed_keys_are_additive() {
         let native: NativeSnapshot = serde_json::from_value(serde_json::json!({
@@ -1119,6 +1374,7 @@ mod tests {
                 checksum_sha256: Some("00".repeat(32)),
             }],
             in_place_root: None,
+            manifest_key: None,
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["engine"], "postgres");
@@ -1190,6 +1446,7 @@ mod tests {
             }],
             source_image: None,
             in_place_root: None,
+            manifest_key: None,
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -1217,6 +1474,7 @@ mod tests {
             objects: vec![],
             source_image: None,
             in_place_root: Some("external_services/s3/object-store/2026-09-11/backup-7".into()),
+            manifest_key: None,
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(

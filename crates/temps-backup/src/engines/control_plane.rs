@@ -288,6 +288,7 @@ impl BackupEngine for ControlPlaneEngine {
             "application/x-gzip",
             file_size,
             Some(&tags),
+            &ctx.cancel,
         )
         .await?;
         v2_common::best_effort_remove(&host_dump_path).await;

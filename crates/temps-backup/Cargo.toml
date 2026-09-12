@@ -48,6 +48,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = "0.1.17"
+bytes = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }
