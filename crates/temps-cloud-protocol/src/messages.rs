@@ -586,6 +586,12 @@ pub struct ManagedBackupCapability {
     /// backend did not say".
     #[serde(default)]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many days the plan keeps each backup (ADR-044): the instance
+    /// creates its default nightly schedule with this retention, so the
+    /// schedule matches what the customer bought. `None` from a backend that
+    /// predates the field; the instance then falls back to its own default.
+    #[serde(default)]
+    pub retention_days: Option<u16>,
     /// e.g. "not available on Starter" — surfaced verbatim to the operator.
     pub reason: Option<String>,
 }
@@ -608,6 +614,7 @@ impl std::fmt::Debug for ManagedBackupCapability {
                 &self.session_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expires_at", &self.expires_at)
+            .field("retention_days", &self.retention_days)
             .field("reason", &self.reason)
             .finish()
     }
@@ -969,6 +976,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("super-secret-value".into()),
             session_token: None,
+            retention_days: None,
             expires_at: None,
             reason: None,
         };
@@ -989,6 +997,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("super-secret-value".into()),
             session_token: Some("super-secret-session-token".into()),
+            retention_days: None,
             expires_at: Some(
                 chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
                     .expect("valid timestamp")
@@ -1016,6 +1025,7 @@ mod tests {
             access_key_id: None,
             secret_key: None,
             session_token: None,
+            retention_days: None,
             expires_at: None,
             reason: Some("not available on Starter".into()),
         };
@@ -1062,6 +1072,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("secret".into()),
             session_token: Some("session-token".into()),
+            retention_days: None,
             expires_at: Some(expires_at),
             reason: None,
         };

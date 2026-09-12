@@ -26104,6 +26104,43 @@
         ],
         "type": "object"
       },
+      "ManagedBackupSchedule": {
+        "description": "What the Cloud settings page shows about the schedule that targets the\nmanaged destination.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_period": {
+            "description": "Days each backup is kept before the schedule's retention deletes it.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "schedule_expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "schedule_expression",
+          "retention_period",
+          "enabled"
+        ],
+        "type": "object"
+      },
       "ManagedBackupSetup": {
         "properties": {
           "action": {
@@ -26114,6 +26151,17 @@
           },
           "ready": {
             "type": "boolean"
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBackupSchedule",
+                "description": "The schedule that writes to the managed destination, when one does.\n`None` on a ready destination means nothing backs up to Cloud yet:\nthe console offers to create the nightly schedule (ADR-044)."
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/ManagedBackupSetupStatus"
@@ -65418,6 +65466,72 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
+    "/cloud/backups/schedule/ensure": {
+      "post": {
+        "operationId": "ensure_cloud_backup_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedBackupSetup"
+                }
+              }
+            },
+            "description": "The managed destination's setup with the schedule that targets it, created when none did"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database or link state failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create the nightly schedule for the Temps Cloud destination unless one\nalready targets it (ADR-044). Answers the same shape as the reconcile so\nthe console can swap it into the status it already holds.",
         "tags": [
           "Cloud"
         ]
