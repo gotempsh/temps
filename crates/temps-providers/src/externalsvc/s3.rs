@@ -3320,7 +3320,7 @@ mod tests {
             "access_key": source_minio.access_key.clone(),
             "secret_key": source_minio.secret_key.clone(),
             "region": "us-east-1",
-            "docker_image": "minio/minio:latest",
+            "docker_image": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
         });
 
         let s3_config = ServiceConfig {
