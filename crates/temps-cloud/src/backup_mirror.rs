@@ -16,10 +16,11 @@ use sea_orm::{
 use sha2::{Digest, Sha256};
 use temps_cloud_client::{CloudError, CloudLink};
 use temps_cloud_protocol::{
-    BackupCompression, BackupEngine, BackupFormat, NativeSnapshotIdentity,
+    BackupCompression, BackupEngine, BackupFormat, BackupManifest, NativeSnapshotIdentity,
     NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest,
     WalGObjectCompleted, WalGObjectDeclaration, WalGObjectKind, WalGObjectTargetRequest,
-    WalGSnapshotCompleted, WalGSnapshotRequest,
+    WalGSnapshotCompleted, WalGSnapshotRequest, MANIFEST_DECLARATION_THRESHOLD,
+    MAX_BACKUP_MANIFEST_BYTES,
 };
 use temps_core::EncryptionService;
 use temps_entities::{
@@ -45,6 +46,10 @@ const SWEEP_LIMIT: u64 = 50;
 /// A corrupt or hostile repository must not turn discovery into an unbounded
 /// allocation. This still permits years of WAL segments for ordinary fleets.
 const MAX_REPOSITORY_OBJECTS: usize = 100_000;
+/// How long one manifest upload may take end to end. Manifests are at most
+/// [`MAX_BACKUP_MANIFEST_BYTES`]; a slow link still finishes well inside
+/// this, and a stuck one is retried by the next sweep.
+const MANIFEST_UPLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_REPOSITORY_KEY_BYTES: usize = 16 * 1024 * 1024;
 /// WAL-G sentinels and Temps metadata are small JSON control objects. A larger
 /// object is malformed for this protocol and is rejected before allocation.
@@ -611,6 +616,11 @@ struct SweepResources<'a> {
     clients: HashMap<i32, S3Client>,
     object_inspections: HashMap<(i32, String, String), (u64, String)>,
     control_plane_postgres_major: Option<u16>,
+    /// Object count above which an in-place declaration travels as a
+    /// manifest object instead of inline. The protocol constant in
+    /// production; tests lower it to exercise the manifest path with a
+    /// handful of objects.
+    manifest_threshold: usize,
 }
 
 impl<'a> SweepResources<'a> {
@@ -675,6 +685,7 @@ impl<'a> SweepResources<'a> {
             clients: HashMap::new(),
             object_inspections: HashMap::new(),
             control_plane_postgres_major: None,
+            manifest_threshold: MANIFEST_DECLARATION_THRESHOLD,
         })
     }
 
@@ -718,6 +729,63 @@ impl<'a> SweepResources<'a> {
         // multiply the bounded per-repository allocation into process-wide
         // memory pressure.
         list_repository_objects(&client, bucket, root).await
+    }
+
+    /// List everything under an exact prefix (which must end in `/`).
+    async fn list_prefix(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<SourceObject>, StageError> {
+        let client = self.client(source_id)?;
+        list_objects(&client, bucket, prefix, None, None, |_| false).await
+    }
+
+    /// List only the objects directly under `prefix` (which must end in
+    /// `/`), not those in its subdirectories: a `/` delimiter makes the
+    /// store fold every subdirectory into one common prefix it never
+    /// returns as an object. For `basebackups_005/` that is one sentinel
+    /// per retained snapshot, however many tar parts each holds.
+    async fn list_direct_children(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<SourceObject>, StageError> {
+        let client = self.client(source_id)?;
+        list_objects(&client, bucket, prefix, None, Some("/"), |_| false).await
+    }
+
+    /// List the WAL objects whose segment name lies in `first..=last`,
+    /// without walking the rest of a repository that may hold years of
+    /// segments. `start-after` positions the listing at the first segment
+    /// and the walk stops at the first key past the last one, so the cost
+    /// is proportional to the snapshot's own WAL range.
+    async fn list_wal_range(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        wal_prefix: &str,
+        first: &str,
+        last: &str,
+    ) -> Result<Vec<SourceObject>, StageError> {
+        let client = self.client(source_id)?;
+        // `start-after` is exclusive and no real key is exactly the bare
+        // segment name (every object carries an extension), so starting
+        // after `<prefix><first>` includes `<prefix><first>.lz4`. `~` sorts
+        // after every character an extension uses, so `<prefix><last>~` is
+        // the first key that can no longer belong to the range.
+        let stop_after = format!("{wal_prefix}{last}~");
+        list_objects(
+            &client,
+            bucket,
+            wal_prefix,
+            Some(format!("{wal_prefix}{first}")),
+            None,
+            move |key| key > stop_after.as_str(),
+        )
+        .await
     }
 
     async fn read_json(
@@ -1164,20 +1232,154 @@ async fn mirror_native_backup(
 /// layout in the same bucket. A Cloud that predates the field answers
 /// `upload_required: true` and the copy path runs unchanged.
 ///
-/// Only snapshot-exclusive layouts qualify: an object set or a logical dump
-/// lives under a root that belongs to this backup alone. A WAL-G stream
-/// snapshot (Redis/MongoDB `/walg`, MariaDB physical) selects its objects out
-/// of a repository shared by every backup of that service, and WAL-G's own
-/// retention later deletes from it, so cataloging those objects in place would
-/// leave Cloud pointing at files that disappear. They keep the copy path.
-fn in_place_root_for(
-    managed_by_cloud: bool,
-    compression: BackupCompression,
-    root: &str,
-) -> Option<String> {
-    (managed_by_cloud && compression != BackupCompression::WalGNative)
+/// Every managed source qualifies, including WAL-G repositories shared by
+/// every backup of a service: Cloud confirms only the declared keys of a
+/// shared repository and hears about deletions through the `deleted`
+/// lifecycle event (and its own presence check), so WAL-G's retention no
+/// longer leaves it pointing at files that disappeared.
+/// Where a snapshot's manifest object lives in the managed bucket: beside
+/// the engine roots, under the source's own path, never inside a WAL-G
+/// repository (WAL-G must not see it) and never inside a native snapshot's
+/// exclusive root (Cloud would count it as an undeclared object).
+fn manifest_key_for(source_config: &s3_sources::Model, cloud_backup_id: Uuid) -> String {
+    let base = source_config.bucket_path.trim_matches('/');
+    if base.is_empty() {
+        format!("temps-cloud/manifests/{cloud_backup_id}.json")
+    } else {
+        format!("{base}/temps-cloud/manifests/{cloud_backup_id}.json")
+    }
+}
+
+/// Write the manifest object Cloud will read instead of an inline object
+/// list. Bounded by [`MAX_BACKUP_MANIFEST_BYTES`] before anything is sent.
+async fn put_manifest(
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
+    manifest: &BackupManifest,
+) -> Result<u64, StageError> {
+    let body = serde_json::to_vec(manifest).map_err(|error| {
+        StageError::Unsupported(format!("could not serialize backup manifest: {error}"))
+    })?;
+    let bytes = body.len() as u64;
+    if bytes > MAX_BACKUP_MANIFEST_BYTES {
+        return Err(StageError::Unsupported(format!(
+            "backup manifest of {} objects is {bytes} bytes, above the {MAX_BACKUP_MANIFEST_BYTES} \
+             byte limit Cloud reads",
+            manifest.len()
+        )));
+    }
+    tokio::time::timeout(
+        MANIFEST_UPLOAD_TIMEOUT,
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type("application/json")
+            .body(body.into())
+            .send(),
+    )
+    .await
+    .map_err(|_| StageError::Retry(format!("writing backup manifest {key} timed out")))?
+    .map_err(|error| {
+        StageError::Retry(format!("could not write backup manifest {key}: {error}"))
+    })?;
+    Ok(bytes)
+}
+
+/// Remove a manifest once Cloud has cataloged the snapshot it described,
+/// or refused it for good. Best effort: a manifest that outlives its
+/// declaration is a few megabytes at most and harmless, so a failure here
+/// is logged, never turned into a retry. A transient declaration failure
+/// keeps the manifest on purpose: the next sweep rewrites the same key.
+async fn delete_manifest(client: &S3Client, bucket: &str, key: &str) {
+    match tokio::time::timeout(
+        S3_CONTROL_REQUEST_TIMEOUT,
+        client.delete_object().bucket(bucket).key(key).send(),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(%key, %error, "could not remove a cataloged backup manifest"),
+        Err(_) => warn!(%key, "removing a cataloged backup manifest timed out"),
+    }
+}
+
+/// Explain a Cloud that refused, or asked for a copy of, a manifest
+/// declaration. Both are permanent: the manifest exists because the object
+/// list is too large to declare inline, so there is no other way to hand
+/// Cloud this snapshot.
+fn manifest_not_accepted(objects: usize, manifest_key: &str, why: &str) -> StageError {
+    StageError::Unsupported(format!(
+        "Cloud did not accept the manifest declaration of this {objects}-object snapshot \
+         ({manifest_key}): {why}. Snapshots above {MANIFEST_DECLARATION_THRESHOLD} objects are \
+         declared by manifest and cataloged in place only; a Cloud that predates manifest \
+         declarations cannot mirror them. Check for a Temps Cloud update, or shrink the \
+         snapshot (for example by rotating the repository)."
+    ))
+}
+
+fn in_place_root_for(managed_by_cloud: bool, root: &str) -> Option<String> {
+    managed_by_cloud
         .then(|| root.trim_matches('/').to_string())
         .filter(|root| !root.is_empty())
+}
+
+/// Build a native snapshot's object declarations from the listing. With
+/// `hash`, every object is streamed once for its SHA-256 (the copy path
+/// needs it: Cloud binds it into the presigned upload). Without, the listed
+/// size is the declaration and nothing is read: an in-place declaration is
+/// confirmed by Cloud against the bucket, and reading every object back
+/// only to hash it was the whole cost of a sweep.
+async fn native_declarations(
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    source_config: &s3_sources::Model,
+    root: &str,
+    selected: &[SourceObject],
+    engine: BackupEngine,
+    hash: bool,
+) -> Result<Vec<NativeSnapshotObjectDeclaration>, StageError> {
+    let mut declarations = Vec::with_capacity(selected.len());
+    for object in selected {
+        let (bytes, checksum_sha256) = if hash {
+            let (bytes, checksum) = resources
+                .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+                .await?;
+            if bytes != object.bytes {
+                return Err(StageError::Retry(format!(
+                    "native snapshot object {} changed while its manifest was built",
+                    object.key
+                )));
+            }
+            (bytes, Some(checksum))
+        } else {
+            (object.bytes, None)
+        };
+        let relative_key = object
+            .key
+            .strip_prefix(&format!("{root}/"))
+            .unwrap_or_else(|| object.key.rsplit('/').next().unwrap_or(&object.key))
+            .to_string();
+        let kind = if object.key.ends_with("_backup_stop_sentinel.json")
+            || object.key.ends_with("metadata.json")
+        {
+            NativeSnapshotObjectKind::Metadata
+        } else if engine == BackupEngine::MariaDb {
+            NativeSnapshotObjectKind::BaseBackup
+        } else if engine == BackupEngine::RustFs {
+            NativeSnapshotObjectKind::Object
+        } else {
+            NativeSnapshotObjectKind::Data
+        };
+        declarations.push(NativeSnapshotObjectDeclaration {
+            relative_key,
+            kind,
+            bytes,
+            checksum_sha256,
+        });
+    }
+    Ok(declarations)
 }
 
 /// Declare, upload (if required), and complete a native snapshot against
@@ -1203,47 +1405,45 @@ async fn declare_and_complete_native_snapshot(
     selected: &[SourceObject],
     source_image: Option<String>,
 ) -> Result<(), StageError> {
-    let mut declarations = Vec::with_capacity(selected.len());
-    for object in selected {
-        let (bytes, checksum_sha256) = resources
-            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
-            .await?;
-        if bytes != object.bytes {
-            return Err(StageError::Retry(format!(
-                "native snapshot object {} changed while its manifest was built",
-                object.key
-            )));
-        }
-        let relative_key = object
-            .key
-            .strip_prefix(&format!("{root}/"))
-            .unwrap_or_else(|| object.key.rsplit('/').next().unwrap_or(&object.key))
-            .to_string();
-        let kind = if object.key.ends_with("_backup_stop_sentinel.json")
-            || object.key.ends_with("metadata.json")
-        {
-            NativeSnapshotObjectKind::Metadata
-        } else if engine == BackupEngine::MariaDb {
-            NativeSnapshotObjectKind::BaseBackup
-        } else if engine == BackupEngine::RustFs {
-            NativeSnapshotObjectKind::Object
-        } else {
-            NativeSnapshotObjectKind::Data
-        };
-        declarations.push(NativeSnapshotObjectDeclaration {
-            relative_key,
-            kind,
-            bytes,
-            checksum_sha256,
-        });
-    }
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, root);
+    let mut declarations = native_declarations(
+        resources,
+        backup,
+        source_config,
+        root,
+        selected,
+        engine,
+        in_place_root.is_none(),
+    )
+    .await?;
     let cloud_backup_id = Uuid::new_v5(
         &link
             .tenant_id()
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let in_place_root = in_place_root_for(source_config.managed_by_cloud, compression, root);
+    let manifest_key =
+        if in_place_root.is_some() && declarations.len() > resources.manifest_threshold {
+            let key = manifest_key_for(source_config, cloud_backup_id);
+            let bytes = put_manifest(
+                client,
+                &source_config.bucket_name,
+                &key,
+                &BackupManifest::native(cloud_backup_id, instance_id, declarations.clone()),
+            )
+            .await?;
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                objects = declarations.len(),
+                manifest_bytes = bytes,
+                manifest_key = %key,
+                "Cloud backup mirror declaring native snapshot by manifest"
+            );
+            Some(key)
+        } else {
+            None
+        };
     let mut request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
@@ -1252,12 +1452,26 @@ async fn declare_and_complete_native_snapshot(
         format,
         compression,
         identity,
-        objects: declarations.clone(),
+        objects: if manifest_key.is_some() {
+            Vec::new()
+        } else {
+            declarations.clone()
+        },
         source_image,
         in_place_root,
+        manifest_key,
     };
-    let snapshot = match link.declare_native_snapshot(&request).await {
+    let mut snapshot = match link.declare_native_snapshot(&request).await {
         Ok(snapshot) => snapshot,
+        Err(CloudError::Rejected { detail }) if request.manifest_key.is_some() => {
+            let manifest_key = request.manifest_key.as_deref().unwrap_or_default();
+            delete_manifest(client, &source_config.bucket_name, manifest_key).await;
+            return Err(manifest_not_accepted(
+                declarations.len(),
+                manifest_key,
+                &detail,
+            ));
+        }
         // Cloud understood the in-place request and refused it (a root it
         // will not accept, a bucket that disagrees with the manifest). That
         // is a verdict on this layout, not a transient fault: retrying the
@@ -1270,13 +1484,65 @@ async fn declare_and_complete_native_snapshot(
                 %detail,
                 "Cloud declined to catalog the snapshot in place; mirroring a copy instead"
             );
+            // The copy path binds a checksum into every upload, so the
+            // objects are read now, once, for exactly the snapshots Cloud
+            // would not take in place.
+            declarations = native_declarations(
+                resources,
+                backup,
+                source_config,
+                root,
+                selected,
+                engine,
+                true,
+            )
+            .await?;
             request.in_place_root = None;
+            request.objects = declarations.clone();
             link.declare_native_snapshot(&request)
                 .await
                 .map_err(|error| StageError::Retry(error.to_string()))?
         }
         Err(error) => return Err(StageError::Retry(error.to_string())),
     };
+    if snapshot.upload_required {
+        if let Some(manifest_key) = request.manifest_key.as_deref() {
+            delete_manifest(client, &source_config.bucket_name, manifest_key).await;
+            return Err(manifest_not_accepted(
+                declarations.len(),
+                manifest_key,
+                "it accepted the declaration but asked for a copy",
+            ));
+        }
+    }
+    if snapshot.upload_required && request.in_place_root.is_some() {
+        // Cloud took the declaration but wants a copy anyway: a Cloud that
+        // does not know `in_place_root` ignores it and answers as it always
+        // did. Its uploads bind checksums the in-place declaration did not
+        // carry, so hash now and re-declare the copy manifest; Cloud
+        // replaces the never-completed draft.
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            "Cloud did not catalog the snapshot in place; mirroring a copy instead"
+        );
+        declarations = native_declarations(
+            resources,
+            backup,
+            source_config,
+            root,
+            selected,
+            engine,
+            true,
+        )
+        .await?;
+        request.in_place_root = None;
+        request.objects = declarations.clone();
+        snapshot = link
+            .declare_native_snapshot(&request)
+            .await
+            .map_err(|error| StageError::Retry(error.to_string()))?;
+    }
     if !snapshot.upload_required && request.in_place_root.is_some() {
         info!(
             local_backup_id = %backup.backup_id,
@@ -1346,7 +1612,11 @@ async fn declare_and_complete_native_snapshot(
         backup_id: cloud_backup_id,
     })
     .await
-    .map_err(|error| StageError::Retry(error.to_string()))
+    .map_err(|error| StageError::Retry(error.to_string()))?;
+    if let Some(manifest_key) = request.manifest_key.as_deref() {
+        delete_manifest(client, &source_config.bucket_name, manifest_key).await;
+    }
+    Ok(())
 }
 
 /// Mirror Temps' own control-plane database backup to Cloud.
@@ -1431,14 +1701,25 @@ async fn mirror_walg_backup(
     let (source, engine, postgres_major) = load_postgres_identity(resources, external).await?;
     let source_config = resources.source(backup.s3_source_id)?;
     let client = resources.client(backup.s3_source_id)?;
-    let objects = resources
-        .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+    // A WAL-G repository is shared by every snapshot of the service and
+    // holds every archived segment, so listing all of it grows with the
+    // service's history, not with this snapshot. Three bounded listings
+    // instead: the sentinels directly under `basebackups_005/` (one per
+    // retained snapshot, never their tar parts), then this snapshot's own
+    // base directory, then, once the sentinel says which LSN range it
+    // needs, exactly that WAL range.
+    let sentinels = resources
+        .list_direct_children(
+            backup.s3_source_id,
+            &source_config.bucket_name,
+            &format!("{root}/basebackups_005/"),
+        )
         .await?;
     let (sentinel_key, sentinel) = resources
         .find_snapshot_sentinel(
             backup.s3_source_id,
             &source_config.bucket_name,
-            &objects,
+            &sentinels,
             &backup.backup_id,
         )
         .await?;
@@ -1463,17 +1744,34 @@ async fn mirror_walg_backup(
     let last_wal = wal_segment_name(&finish_lsn, timeline)?;
     let base_prefix = format!("{root}/basebackups_005/{backup_name}/");
     let wal_prefix = format!("{root}/wal_005/");
-    let selected = objects
-        .iter()
-        .filter(|object| {
-            object.key == sentinel_key
-                || object.key.starts_with(&base_prefix)
-                || wal_segment_of(&object.key, &wal_prefix).is_some_and(|segment| {
-                    segment >= first_wal.as_str() && segment <= last_wal.as_str()
-                })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut base_objects = resources
+        .list_prefix(
+            backup.s3_source_id,
+            &source_config.bucket_name,
+            &base_prefix,
+        )
+        .await?;
+    if let Some(sentinel) = sentinels.iter().find(|object| object.key == sentinel_key) {
+        base_objects.push(sentinel.clone());
+    }
+    let wal_objects = resources
+        .list_wal_range(
+            backup.s3_source_id,
+            &source_config.bucket_name,
+            &wal_prefix,
+            &first_wal,
+            &last_wal,
+        )
+        .await?;
+    let selected = select_walg_snapshot_objects(
+        &base_objects,
+        &wal_objects,
+        &sentinel_key,
+        &base_prefix,
+        &wal_prefix,
+        &first_wal,
+        &last_wal,
+    );
     if selected.is_empty() {
         return Err(StageError::Retry(format!(
             "WAL-G snapshot {backup_name} has no repository objects"
@@ -1528,43 +1826,47 @@ async fn mirror_walg_backup(
         }
     }
 
-    let mut declarations = Vec::with_capacity(selected.len());
-    for object in &selected {
-        let (bytes, checksum_sha256) = resources
-            .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
-            .await?;
-        if bytes != object.bytes {
-            return Err(StageError::Retry(format!(
-                "WAL-G object {} changed while its manifest was being built",
-                object.key
-            )));
-        }
-        declarations.push(WalGObjectDeclaration {
-            relative_key: object
-                .key
-                .strip_prefix(&format!("{root}/"))
-                .ok_or_else(|| {
-                    StageError::Retry(format!("object {} escaped repository", object.key))
-                })?
-                .to_string(),
-            kind: if object.key == sentinel_key {
-                WalGObjectKind::Sentinel
-            } else if object.key.starts_with(&base_prefix) {
-                WalGObjectKind::BaseBackup
-            } else {
-                WalGObjectKind::Wal
-            },
-            bytes,
-            checksum_sha256,
-        });
-    }
+    let in_place_root = in_place_root_for(source_config.managed_by_cloud, &root);
+    let mut declarations = walg_declarations(
+        resources,
+        backup,
+        &source_config,
+        &root,
+        &selected,
+        &sentinel_key,
+        &base_prefix,
+        in_place_root.is_none(),
+    )
+    .await?;
     let cloud_backup_id = Uuid::new_v5(
         &link
             .tenant_id()
             .ok_or_else(|| StageError::Retry("Cloud link lost its tenant identity".into()))?,
         format!("{instance_id}:{}", backup.backup_id).as_bytes(),
     );
-    let request = WalGSnapshotRequest {
+    let manifest_key =
+        if in_place_root.is_some() && declarations.len() > resources.manifest_threshold {
+            let key = manifest_key_for(&source_config, cloud_backup_id);
+            let bytes = put_manifest(
+                &client,
+                &source_config.bucket_name,
+                &key,
+                &BackupManifest::walg(cloud_backup_id, instance_id, declarations.clone()),
+            )
+            .await?;
+            info!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                objects = declarations.len(),
+                manifest_bytes = bytes,
+                manifest_key = %key,
+                "Cloud backup mirror declaring WAL-G snapshot by manifest"
+            );
+            Some(key)
+        } else {
+            None
+        };
+    let mut request = WalGSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
         source,
@@ -1583,7 +1885,13 @@ async fn mirror_walg_backup(
         timeline,
         start_lsn,
         finish_lsn,
-        objects: declarations.clone(),
+        objects: if manifest_key.is_some() {
+            Vec::new()
+        } else {
+            declarations.clone()
+        },
+        in_place_root,
+        manifest_key,
     };
     // The declared manifest is what Cloud binds the snapshot to, and a retry
     // that computes a different one is rejected. Log the identity and the shape
@@ -1600,10 +1908,90 @@ async fn mirror_walg_backup(
         manifest_digest = %manifest_digest(&declarations),
         "Cloud backup mirror declaring WAL-G snapshot"
     );
-    let snapshot = link
-        .declare_walg_snapshot(&request)
-        .await
-        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let mut snapshot = match link.declare_walg_snapshot(&request).await {
+        Ok(snapshot) => snapshot,
+        Err(CloudError::Rejected { detail }) if request.manifest_key.is_some() => {
+            let manifest_key = request.manifest_key.as_deref().unwrap_or_default();
+            delete_manifest(&client, &source_config.bucket_name, manifest_key).await;
+            return Err(manifest_not_accepted(
+                declarations.len(),
+                manifest_key,
+                &detail,
+            ));
+        }
+        // Same reasoning as the native path: a 400 to an in-place
+        // declaration is a verdict on the layout, not a transient fault.
+        // Hash the objects now (the copy path needs it) and re-declare.
+        Err(CloudError::Rejected { detail }) if request.in_place_root.is_some() => {
+            warn!(
+                local_backup_id = %backup.backup_id,
+                %cloud_backup_id,
+                %detail,
+                "Cloud declined to catalog the WAL-G repository in place; mirroring a copy instead"
+            );
+            declarations = walg_declarations(
+                resources,
+                backup,
+                &source_config,
+                &root,
+                &selected,
+                &sentinel_key,
+                &base_prefix,
+                true,
+            )
+            .await?;
+            request.in_place_root = None;
+            request.objects = declarations.clone();
+            link.declare_walg_snapshot(&request)
+                .await
+                .map_err(|error| StageError::Retry(error.to_string()))?
+        }
+        Err(error) => return Err(StageError::Retry(error.to_string())),
+    };
+    if snapshot.upload_required {
+        if let Some(manifest_key) = request.manifest_key.as_deref() {
+            delete_manifest(&client, &source_config.bucket_name, manifest_key).await;
+            return Err(manifest_not_accepted(
+                declarations.len(),
+                manifest_key,
+                "it accepted the declaration but asked for a copy",
+            ));
+        }
+    }
+    if snapshot.upload_required && request.in_place_root.is_some() {
+        // See the native path: a Cloud that ignores `in_place_root` still
+        // wants a copy, and the copy needs hashes.
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            "Cloud did not catalog the WAL-G repository in place; mirroring a copy instead"
+        );
+        declarations = walg_declarations(
+            resources,
+            backup,
+            &source_config,
+            &root,
+            &selected,
+            &sentinel_key,
+            &base_prefix,
+            true,
+        )
+        .await?;
+        request.in_place_root = None;
+        request.objects = declarations.clone();
+        snapshot = link
+            .declare_walg_snapshot(&request)
+            .await
+            .map_err(|error| StageError::Retry(error.to_string()))?;
+    }
+    if !snapshot.upload_required && request.in_place_root.is_some() {
+        info!(
+            local_backup_id = %backup.backup_id,
+            %cloud_backup_id,
+            objects = declarations.len(),
+            "Cloud cataloged the WAL-G repository in place; no second copy uploaded"
+        );
+    }
     if snapshot.upload_required {
         let mut pass = UploadPass {
             declared: declarations.len(),
@@ -1663,7 +2051,63 @@ async fn mirror_walg_backup(
         backup_id: cloud_backup_id,
     })
     .await
-    .map_err(|error| StageError::Retry(error.to_string()))
+    .map_err(|error| StageError::Retry(error.to_string()))?;
+    if let Some(manifest_key) = request.manifest_key.as_deref() {
+        delete_manifest(&client, &source_config.bucket_name, manifest_key).await;
+    }
+    Ok(())
+}
+
+/// WAL-G counterpart of [`native_declarations`]: listed sizes without a
+/// read for an in-place declaration, one hashing read per object for the
+/// copy path.
+#[allow(clippy::too_many_arguments)]
+async fn walg_declarations(
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    source_config: &s3_sources::Model,
+    root: &str,
+    selected: &[SourceObject],
+    sentinel_key: &str,
+    base_prefix: &str,
+    hash: bool,
+) -> Result<Vec<WalGObjectDeclaration>, StageError> {
+    let mut declarations = Vec::with_capacity(selected.len());
+    for object in selected {
+        let (bytes, checksum_sha256) = if hash {
+            let (bytes, checksum) = resources
+                .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
+                .await?;
+            if bytes != object.bytes {
+                return Err(StageError::Retry(format!(
+                    "WAL-G object {} changed while its manifest was being built",
+                    object.key
+                )));
+            }
+            (bytes, Some(checksum))
+        } else {
+            (object.bytes, None)
+        };
+        declarations.push(WalGObjectDeclaration {
+            relative_key: object
+                .key
+                .strip_prefix(&format!("{root}/"))
+                .ok_or_else(|| {
+                    StageError::Retry(format!("object {} escaped repository", object.key))
+                })?
+                .to_string(),
+            kind: if object.key == sentinel_key {
+                WalGObjectKind::Sentinel
+            } else if object.key.starts_with(base_prefix) {
+                WalGObjectKind::BaseBackup
+            } else {
+                WalGObjectKind::Wal
+            },
+            bytes,
+            checksum_sha256,
+        });
+    }
+    Ok(declarations)
 }
 
 #[derive(Clone, Debug)]
@@ -1677,14 +2121,34 @@ async fn list_repository_objects(
     bucket: &str,
     root: &str,
 ) -> Result<Vec<SourceObject>, StageError> {
+    list_objects(client, bucket, &format!("{root}/"), None, None, |_| false).await
+}
+
+/// Paginated `ListObjectsV2` under `prefix`, optionally positioned with
+/// `start_after`, optionally folding subdirectories away with `delimiter`
+/// (only objects directly under the prefix are returned), and stopping
+/// early (without fetching further pages) as soon as `stop` says a key is
+/// past the range of interest. S3 lists keys in UTF-8 binary order, which
+/// is what makes an early stop sound.
+async fn list_objects(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    start_after: Option<String>,
+    delimiter: Option<&str>,
+    stop: impl Fn(&str) -> bool,
+) -> Result<Vec<SourceObject>, StageError> {
     let mut objects = Vec::new();
     let mut key_bytes = 0usize;
     let mut continuation = None;
     loop {
-        let mut request = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(format!("{root}/"));
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(start_after) = start_after.as_deref() {
+            request = request.start_after(start_after);
+        }
+        if let Some(delimiter) = delimiter {
+            request = request.delimiter(delimiter);
+        }
         if let Some(token) = continuation.take() {
             request = request.continuation_token(token);
         }
@@ -1692,13 +2156,18 @@ async fn list_repository_objects(
             .await
             .map_err(|_| StageError::Retry("listing the backup repository timed out".into()))?
             .map_err(|error| {
-                StageError::Retry(format!("could not list WAL-G repository: {error}"))
+                StageError::Retry(format!(
+                    "could not list backup repository {prefix}: {error}"
+                ))
             })?;
         for object in response.contents() {
             if let (Some(key), Some(bytes)) = (
                 object.key(),
                 object.size().and_then(|value| u64::try_from(value).ok()),
             ) {
+                if stop(key) {
+                    return Ok(objects);
+                }
                 append_source_object(
                     &mut objects,
                     &mut key_bytes,
@@ -1834,6 +2303,30 @@ fn sentinel_u32(value: &serde_json::Value, keys: &[&str]) -> Option<u32> {
 /// the repository's other bookkeeping out of a range comparison it has no
 /// business being in — a `.history` file is 8 characters and would otherwise be
 /// compared as a whole key against segment names.
+/// The objects one WAL-G snapshot consists of: its sentinel, everything
+/// under its base backup directory, and the WAL segments covering its
+/// start..=finish LSN range. Pure so the range arithmetic is testable
+/// without a bucket.
+fn select_walg_snapshot_objects(
+    base_objects: &[SourceObject],
+    wal_objects: &[SourceObject],
+    sentinel_key: &str,
+    base_prefix: &str,
+    wal_prefix: &str,
+    first_wal: &str,
+    last_wal: &str,
+) -> Vec<SourceObject> {
+    base_objects
+        .iter()
+        .filter(|object| object.key == sentinel_key || object.key.starts_with(base_prefix))
+        .chain(wal_objects.iter().filter(|object| {
+            wal_segment_of(&object.key, wal_prefix)
+                .is_some_and(|segment| segment >= first_wal && segment <= last_wal)
+        }))
+        .cloned()
+        .collect()
+}
+
 fn wal_segment_of<'a>(key: &'a str, wal_prefix: &str) -> Option<&'a str> {
     let segment = key.strip_prefix(wal_prefix)?.get(..24)?;
     segment
@@ -1858,7 +2351,7 @@ fn manifest_digest(declarations: &[WalGObjectDeclaration]) -> String {
         hasher.update(object.relative_key.as_bytes());
         hasher.update([0]);
         hasher.update(object.bytes.to_le_bytes());
-        hasher.update(object.checksum_sha256.as_bytes());
+        hasher.update(object.checksum_sha256.as_deref().unwrap_or("").as_bytes());
         hasher.update([0]);
     }
     hasher
@@ -1942,6 +2435,18 @@ async fn inspect_source_object(
     Ok((bytes, checksum))
 }
 
+/// The copy path uploads against a checksum Cloud bound into the target, so
+/// an object declared without one (an in-place declaration) can never be
+/// uploaded. The sweep re-declares with hashes before it ever gets here;
+/// reaching this is a programming error, not a transient condition.
+fn declared_checksum(relative_key: &str, checksum: &Option<String>) -> Result<String, StageError> {
+    checksum.clone().ok_or_else(|| {
+        StageError::Unsupported(format!(
+            "{relative_key} was declared without a checksum and cannot be uploaded"
+        ))
+    })
+}
+
 async fn upload_repository_object(
     link: &CloudLink,
     source_client: &S3Client,
@@ -1951,6 +2456,8 @@ async fn upload_repository_object(
     backup_id: Uuid,
     declaration: WalGObjectDeclaration,
 ) -> Result<(), StageError> {
+    let checksum_sha256 =
+        declared_checksum(&declaration.relative_key, &declaration.checksum_sha256)?;
     let target = link
         .walg_object_target(&WalGObjectTargetRequest {
             backup_id,
@@ -2049,7 +2556,7 @@ async fn upload_repository_object(
         backup_id,
         relative_key: declaration.relative_key,
         bytes: declaration.bytes,
-        checksum_sha256: declaration.checksum_sha256,
+        checksum_sha256,
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
@@ -2064,6 +2571,8 @@ async fn upload_native_object(
     backup_id: Uuid,
     declaration: NativeSnapshotObjectDeclaration,
 ) -> Result<(), StageError> {
+    let checksum_sha256 =
+        declared_checksum(&declaration.relative_key, &declaration.checksum_sha256)?;
     let target = link
         .native_object_target(&WalGObjectTargetRequest {
             backup_id,
@@ -2159,7 +2668,7 @@ async fn upload_native_object(
         backup_id,
         relative_key: declaration.relative_key,
         bytes: declaration.bytes,
-        checksum_sha256: declaration.checksum_sha256,
+        checksum_sha256,
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
@@ -2583,13 +3092,14 @@ fn deferred_legacy_state(metadata: &str, tenant_id: Uuid) -> Option<LegacyMirror
 mod tests {
     use super::{
         append_source_object, backup_engine_key, contains_backup_identity, deferred_legacy_state,
-        ensure_json_object_size, image_tag_version, manifest_digest, merge_mirror_state,
-        mirror_backup, next_sweep_interval, parse_postgres_major, pending_objects, run, s3_key,
-        select_due_backups, sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
-        upload_native_object, wal_segment_name, wal_segment_of, walg_root_key, SourceObject,
-        StageError, SweepOutcome, UploadPass, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
-        DUE_BACKUPS_SQL, MAX_CONSECUTIVE_OBJECT_FAILURES, MAX_REPORTED_OBJECT_FAILURES,
-        MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
+        ensure_json_object_size, image_tag_version, list_objects, manifest_digest,
+        manifest_key_for, merge_mirror_state, mirror_backup, next_sweep_interval,
+        parse_postgres_major, pending_objects, put_manifest, run, s3_key, select_due_backups,
+        select_walg_snapshot_objects, sentinel_lsn, supports_native_mirror, sweep,
+        timeline_from_backup_name, upload_native_object, wal_segment_name, wal_segment_of,
+        walg_root_key, SourceObject, StageError, SweepOutcome, UploadPass, BASE_SWEEP_INTERVAL,
+        DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL, MAX_CONSECUTIVE_OBJECT_FAILURES,
+        MAX_REPORTED_OBJECT_FAILURES, MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
     use std::{
         collections::HashMap,
@@ -2616,9 +3126,9 @@ mod tests {
     use sha2::{Digest, Sha256};
     use temps_cloud_client::{BackendUrl, CloudFeatureSwitches, CloudLink};
     use temps_cloud_protocol::{
-        BackupCompression, NativeSnapshot, NativeSnapshotObjectDeclaration,
-        NativeSnapshotObjectKind, NativeSnapshotRequest, WalGObjectCompleted,
-        WalGObjectTargetRequest,
+        BackupManifest, NativeSnapshot, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
+        NativeSnapshotRequest, WalGObjectCompleted, WalGObjectTargetRequest,
+        MANIFEST_DECLARATION_THRESHOLD,
     };
     use uuid::Uuid;
 
@@ -2627,7 +3137,7 @@ mod tests {
             relative_key: relative_key.to_owned(),
             kind: NativeSnapshotObjectKind::Object,
             bytes: 1,
-            checksum_sha256: "ab".repeat(32),
+            checksum_sha256: Some("ab".repeat(32)),
         }
     }
 
@@ -4254,6 +4764,11 @@ mod tests {
 
     struct RepositoryStub {
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        list_calls: AtomicUsize,
+        /// Every key written with PutObject, in order.
+        puts: Mutex<Vec<String>>,
+        /// Every key removed with DeleteObject, in order.
+        deletes: Mutex<Vec<String>>,
     }
 
     /// `aws-sdk-s3` percent-encodes query values (notably `/` as `%2F` in
@@ -4294,9 +4809,26 @@ mod tests {
             })
             .unwrap_or_default();
         let prefix = params.get("prefix").cloned().unwrap_or_default();
+        let start_after = params.get("start-after").cloned().unwrap_or_default();
+        let delimiter = params.get("delimiter").cloned();
         let objects = state.objects.lock().expect("repository stub objects lock");
+        state.list_calls.fetch_add(1, Ordering::SeqCst);
+        // Real S3 lists in binary key order, honours `start-after`, and
+        // with a delimiter returns only the keys directly under the prefix
+        // (deeper ones fold into common prefixes, which are not objects).
+        let mut listed = objects
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with(&prefix)
+                    && key.as_str() > start_after.as_str()
+                    && delimiter
+                        .as_deref()
+                        .is_none_or(|delimiter| !key[prefix.len()..].contains(delimiter))
+            })
+            .collect::<Vec<_>>();
+        listed.sort_by(|a, b| a.0.cmp(b.0));
         let mut contents = String::new();
-        for (key, body) in objects.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+        for (key, body) in listed {
             contents.push_str(&format!(
                 "<Contents><Key>{key}</Key><Size>{}</Size></Contents>",
                 body.len()
@@ -4339,6 +4871,33 @@ mod tests {
         }
     }
 
+    async fn repository_put_object_stub(
+        State(state): State<Arc<RepositoryStub>>,
+        Path((_bucket, key)): Path<(String, String)>,
+        body: axum::body::Bytes,
+    ) -> StatusCode {
+        state
+            .objects
+            .lock()
+            .expect("repository stub objects lock")
+            .insert(key.clone(), body.to_vec());
+        state.puts.lock().expect("puts lock").push(key);
+        StatusCode::OK
+    }
+
+    async fn repository_delete_object_stub(
+        State(state): State<Arc<RepositoryStub>>,
+        Path((_bucket, key)): Path<(String, String)>,
+    ) -> StatusCode {
+        state
+            .objects
+            .lock()
+            .expect("repository stub objects lock")
+            .remove(&key);
+        state.deletes.lock().expect("deletes lock").push(key);
+        StatusCode::NO_CONTENT
+    }
+
     /// Starts a minimal real S3-compatible stub (ListObjectsV2 + GetObject,
     /// backed by an in-memory key/value map) that `aws-sdk-s3` can talk to
     /// like any other endpoint. Returns `None` when the sandbox denies TCP
@@ -4358,6 +4917,9 @@ mod tests {
         let address = listener.local_addr().expect("repository stub address");
         let state = Arc::new(RepositoryStub {
             objects: Mutex::new(objects),
+            list_calls: AtomicUsize::new(0),
+            puts: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
         });
         let app = Router::new()
             // `list_objects_v2` with `force_path_style` requests
@@ -4365,7 +4927,12 @@ mod tests {
             // distinct from `GetObject`'s `/{bucket}/{key}`, which never has
             // a trailing slash of its own before the key.
             .route("/{bucket}/", get(repository_list_stub))
-            .route("/{bucket}/{*key}", get(repository_get_object_stub))
+            .route(
+                "/{bucket}/{*key}",
+                get(repository_get_object_stub)
+                    .put(repository_put_object_stub)
+                    .delete(repository_delete_object_stub),
+            )
             .with_state(state.clone());
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -4443,27 +5010,34 @@ mod tests {
                 "a real repository with a complete dump + metadata.json must not be Unsupported: {reason}"
             ),
         }
-        assert_eq!(
-            resources.object_inspections.len(),
-            2,
-            "expected exactly the dump object and metadata.json to be read and checksummed, \
-             proving the decoy object was excluded and both real objects were reached"
+        assert!(
+            resources.object_inspections.is_empty(),
+            "a managed source is declared in place from the listing: nothing is read back \
+             to be hashed (`managed_native_snapshots_are_declared_in_place_and_never_re_uploaded` \
+             proves the selection against the same decoy)"
         );
     }
 
     #[test]
-    fn only_snapshot_exclusive_layouts_on_managed_sources_catalog_in_place() {
+    fn every_managed_source_catalogs_in_place() {
         let root = "/t/managed-backups/external_services/s3/store/2026-09-11/backup-7/";
         assert_eq!(
-            super::in_place_root_for(true, BackupCompression::None, root).as_deref(),
+            super::in_place_root_for(true, root).as_deref(),
             Some("t/managed-backups/external_services/s3/store/2026-09-11/backup-7")
         );
-        assert!(super::in_place_root_for(true, BackupCompression::Gzip, root).is_some());
-        // Shared WAL-G repositories are rotated by WAL-G retention: copy.
-        assert!(super::in_place_root_for(true, BackupCompression::WalGNative, root).is_none());
+        // Shared WAL-G repositories too: Cloud confirms only the declared
+        // keys and learns of deletions through the lifecycle event.
+        assert_eq!(
+            super::in_place_root_for(
+                true,
+                "/t/managed-backups/external_services/postgres/main/walg"
+            )
+            .as_deref(),
+            Some("t/managed-backups/external_services/postgres/main/walg")
+        );
         // Operator-owned sources are not the cloud bucket: copy.
-        assert!(super::in_place_root_for(false, BackupCompression::None, root).is_none());
-        assert!(super::in_place_root_for(true, BackupCompression::None, "/").is_none());
+        assert!(super::in_place_root_for(false, root).is_none());
+        assert!(super::in_place_root_for(true, "/").is_none());
     }
 
     struct InPlaceCloudStub {
@@ -4472,6 +5046,9 @@ mod tests {
         /// Refuse declarations that carry `in_place_root` with a 400, the
         /// way Cloud does for a root it will not catalog.
         reject_in_place: bool,
+        /// Accept declarations but answer `upload_required: true` whatever
+        /// they carry, the way a Cloud that predates `in_place_root` does.
+        ignore_in_place: bool,
         target_calls: AtomicUsize,
         completions: AtomicUsize,
     }
@@ -4495,7 +5072,7 @@ mod tests {
         let in_place = request.in_place_root.is_some();
         let response = NativeSnapshot {
             backup_id: request.backup_id,
-            upload_required: !in_place,
+            upload_required: !in_place || state.ignore_in_place,
             completed_relative_keys: Vec::new(),
         };
         state.declared.lock().expect("declared lock").push(request);
@@ -4554,6 +5131,7 @@ mod tests {
         let cloud = Arc::new(InPlaceCloudStub {
             declared: Mutex::new(Vec::new()),
             reject_in_place: false,
+            ignore_in_place: false,
             target_calls: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
         });
@@ -4588,6 +5166,10 @@ mod tests {
             let mut objects = state.objects.lock().expect("repository stub objects lock");
             objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
             objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+            objects.insert(
+                format!("{expected_root}/unrelated-object.tmp"),
+                b"not part of this backup".to_vec(),
+            );
         }
 
         let temp = tempfile::tempdir().expect("cloud-link state dir");
@@ -4633,7 +5215,22 @@ mod tests {
             declared[0].in_place_root.as_deref(),
             Some(expected_root.as_str())
         );
-        assert_eq!(declared[0].objects.len(), 2);
+        assert_eq!(
+            declared[0].objects.len(),
+            2,
+            "the dump and its metadata.json, not the decoy"
+        );
+        assert!(
+            declared[0]
+                .objects
+                .iter()
+                .all(|object| object.checksum_sha256.is_none()),
+            "an in-place declaration carries sizes, not hashes"
+        );
+        assert!(
+            resources.object_inspections.is_empty(),
+            "nothing is read back from the bucket to declare in place"
+        );
         assert_eq!(
             cloud.target_calls.load(Ordering::SeqCst),
             0,
@@ -4642,14 +5239,491 @@ mod tests {
         assert_eq!(cloud.completions.load(Ordering::SeqCst), 1);
     }
 
+    /// Above the manifest threshold an in-place declaration carries no
+    /// objects at all: the list is written to the managed bucket as one
+    /// manifest object, Cloud is told its key, and once Cloud has cataloged
+    /// the snapshot the manifest is removed again. The threshold is lowered
+    /// to one so a two-object snapshot takes that path.
+    #[tokio::test]
+    async fn large_in_place_snapshots_are_declared_by_manifest_object() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping manifest declaration test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: false,
+            ignore_in_place: false,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key.clone(), b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(
+                metadata_key.clone(),
+                b"{\"redis_version\":\"7.4\"}".to_vec(),
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+        resources.manifest_threshold = 1;
+
+        // Capture the manifest body while it exists: the sweep removes it
+        // once Cloud has cataloged the snapshot.
+        let manifest_key = manifest_key_for(
+            resources
+                .sources
+                .get(&backup.s3_source_id)
+                .expect("managed source"),
+            Uuid::new_v5(
+                &link.tenant_id().expect("tenant id"),
+                format!("{instance_id}:{}", backup.backup_id).as_bytes(),
+            ),
+        );
+        assert!(
+            !manifest_key.contains("/walg/") && !manifest_key.starts_with('/'),
+            "manifest lives beside the engine roots: {manifest_key}"
+        );
+
+        expect_stage_ok(
+            mirror_backup(&link, &mut resources, &backup, instance_id).await,
+            "manifest-declared native mirror completes",
+        );
+
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(declared.len(), 1, "one declaration, accepted first time");
+        assert_eq!(
+            declared[0].manifest_key.as_deref(),
+            Some(manifest_key.as_str())
+        );
+        assert!(declared[0].in_place_root.is_some());
+        assert!(
+            declared[0].objects.is_empty(),
+            "a manifest declaration never inlines the object list"
+        );
+        let puts = state.puts.lock().expect("puts lock").clone();
+        assert_eq!(
+            puts,
+            vec![manifest_key.clone()],
+            "exactly one manifest written"
+        );
+        let deletes = state.deletes.lock().expect("deletes lock").clone();
+        assert_eq!(
+            deletes,
+            vec![manifest_key.clone()],
+            "the manifest is removed after Cloud completed the snapshot"
+        );
+        assert!(
+            !state
+                .objects
+                .lock()
+                .expect("repository stub objects lock")
+                .contains_key(&manifest_key),
+            "no manifest left behind"
+        );
+        assert_eq!(cloud.target_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cloud.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// The manifest body Cloud reads must name the very snapshot being
+    /// declared and carry the same object list an inline declaration
+    /// would, so a misplaced manifest can never catalog the wrong backup.
+    #[tokio::test]
+    async fn the_written_manifest_names_the_snapshot_and_its_objects() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let client = source_client(&origin);
+        let backup_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let manifest = BackupManifest::native(
+            backup_id,
+            instance_id,
+            vec![
+                native_declaration("dump.rdb"),
+                native_declaration("metadata.json"),
+            ],
+        );
+        let bytes = expect_stage_ok(
+            put_manifest(
+                &client,
+                "managed-bucket",
+                "p/temps-cloud/manifests/x.json",
+                &manifest,
+            )
+            .await,
+            "manifest written",
+        );
+        let stored = state
+            .objects
+            .lock()
+            .expect("repository stub objects lock")
+            .get("p/temps-cloud/manifests/x.json")
+            .cloned()
+            .expect("manifest object exists");
+        assert_eq!(stored.len() as u64, bytes);
+        let decoded: BackupManifest = serde_json::from_slice(&stored).expect("manifest parses");
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.backup_id, backup_id);
+        assert_eq!(decoded.instance_id, instance_id);
+        assert_eq!(decoded.len(), 2);
+    }
+
+    /// A Cloud that refuses a manifest declaration (one that predates the
+    /// field sees an empty object list) cannot be handed the snapshot any
+    /// other way: the object list was too large to inline. That is a
+    /// permanent, explained failure, never the copy-path fallback (which
+    /// would hash and re-upload every object) and never an endless retry.
+    #[tokio::test]
+    async fn a_rejected_manifest_declaration_is_permanent_and_never_falls_back_to_a_copy() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let cloud_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping manifest rejection test");
+                return;
+            }
+            Err(error) => panic!("bind Cloud stub: {error}"),
+        };
+        let cloud_origin = format!(
+            "http://{}",
+            cloud_listener.local_addr().expect("Cloud stub address")
+        );
+        let cloud = Arc::new(InPlaceCloudStub {
+            declared: Mutex::new(Vec::new()),
+            reject_in_place: true,
+            ignore_in_place: false,
+            target_calls: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/v1/backups/native/snapshots", post(in_place_declare_stub))
+            .route(
+                "/v1/backups/native/objects/target",
+                post(in_place_target_stub),
+            )
+            .route(
+                "/v1/backups/native/snapshots/complete",
+                post(in_place_complete_stub),
+            )
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            axum::serve(cloud_listener, app)
+                .await
+                .expect("serve Cloud stub");
+        });
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+        }
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        let instance_id = Uuid::new_v4();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": instance_id,
+                "base_url": cloud_origin,
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.set_feature_switches(CloudFeatureSwitches {
+            telemetry: false,
+            backups: true,
+            notifications: false,
+        })
+        .expect("enable backup mirroring");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+        resources.manifest_threshold = 1;
+
+        let error = match mirror_backup(&link, &mut resources, &backup, instance_id).await {
+            Ok(()) => panic!("a refused manifest declaration must fail"),
+            Err(error) => error,
+        };
+        match error {
+            StageError::Unsupported(reason) => {
+                assert!(
+                    reason.contains("manifest declaration")
+                        && reason.contains("Temps Cloud update"),
+                    "the failure explains itself: {reason}"
+                );
+            }
+            StageError::Retry(reason) => panic!("must be permanent, got Retry: {reason}"),
+        }
+        let declared = cloud.declared.lock().expect("declared lock").clone();
+        assert_eq!(declared.len(), 1, "no re-declaration without the manifest");
+        assert!(declared[0].manifest_key.is_some());
+        assert_eq!(
+            cloud.target_calls.load(Ordering::SeqCst),
+            0,
+            "the copy path is never attempted for a manifest-sized snapshot"
+        );
+        assert!(
+            resources.object_inspections.is_empty(),
+            "nothing is hashed for a copy that is never made"
+        );
+        let puts = state.puts.lock().expect("puts lock").clone();
+        let deletes = state.deletes.lock().expect("deletes lock").clone();
+        assert_eq!(puts.len(), 1, "the manifest was written once");
+        assert_eq!(
+            deletes, puts,
+            "a manifest Cloud refused for good is removed, not left billed"
+        );
+    }
+
+    /// Listing a WAL-G repository must cost what the snapshot needs, not
+    /// what the repository holds: the base backup directories plus the WAL
+    /// range between the snapshot's start and finish segments. The stub
+    /// honours `start-after` and binary key order like real S3, so a range
+    /// listing returns exactly the segments in range and stops at the first
+    /// key past it without another page.
+    #[tokio::test]
+    async fn wal_range_listing_reads_only_the_snapshots_segments() {
+        let repo = "svc/walg";
+        let mut objects = HashMap::new();
+        for segment in [
+            "000000010000000000000001",
+            "000000010000000000000002",
+            "000000010000000000000003",
+            "000000010000000000000004",
+            "000000010000000000000005",
+            "0000000100000000000000FF",
+        ] {
+            objects.insert(format!("{repo}/wal_005/{segment}.lz4"), vec![0u8; 3]);
+        }
+        objects.insert(format!("{repo}/wal_005/00000002.history.lz4"), vec![0u8; 1]);
+        objects.insert(
+            format!("{repo}/basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"),
+            vec![0u8; 9],
+        );
+        let Some((origin, state)) = spawn_repository_stub(objects).await else {
+            return;
+        };
+        let client = source_client(&origin);
+        let wal_prefix = format!("{repo}/wal_005/");
+        let stop_after = format!("{wal_prefix}000000010000000000000004~");
+        let listed = expect_stage_ok(
+            list_objects(
+                &client,
+                "managed-bucket",
+                &wal_prefix,
+                Some(format!("{wal_prefix}000000010000000000000002")),
+                None,
+                move |key| key > stop_after.as_str(),
+            )
+            .await,
+            "range listing",
+        );
+        let keys = listed
+            .iter()
+            .map(|object| object.key.rsplit('/').next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "000000010000000000000002.lz4",
+                "000000010000000000000003.lz4",
+                "000000010000000000000004.lz4",
+            ],
+            "segments before the start and after the finish are never fetched"
+        );
+        assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+
+        // Sentinels are listed with a delimiter, so a repository holding
+        // thousands of tar parts per retained base backup costs one entry
+        // per snapshot, not one per part.
+        let sentinels = expect_stage_ok(
+            list_objects(
+                &client,
+                "managed-bucket",
+                &format!("{repo}/basebackups_005/"),
+                None,
+                Some("/"),
+                |_| false,
+            )
+            .await,
+            "sentinel listing",
+        );
+        assert!(
+            sentinels.is_empty(),
+            "only direct children count; tar parts live one level down: {sentinels:?}"
+        );
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(
+                format!("{repo}/basebackups_005/base_000000010000000000000002_backup_stop_sentinel.json"),
+                vec![0u8; 2],
+            );
+        }
+        let sentinels = expect_stage_ok(
+            list_objects(
+                &client,
+                "managed-bucket",
+                &format!("{repo}/basebackups_005/"),
+                None,
+                Some("/"),
+                |_| false,
+            )
+            .await,
+            "sentinel listing",
+        );
+        assert_eq!(sentinels.len(), 1);
+        assert!(sentinels[0].key.ends_with("_backup_stop_sentinel.json"));
+
+        // The selection joins the base backup listing with the WAL range and
+        // keeps only real segments in range (history files are not WAL).
+        let base_objects = vec![
+            SourceObject {
+                key: format!("{repo}/basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"),
+                bytes: 9,
+            },
+            SourceObject {
+                key: format!("{repo}/basebackups_005/base_000000010000000000000002_backup_stop_sentinel.json"),
+                bytes: 2,
+            },
+            SourceObject {
+                key: format!("{repo}/basebackups_005/base_000000010000000000000009_backup_stop_sentinel.json"),
+                bytes: 2,
+            },
+        ];
+        let wal_objects = vec![
+            SourceObject {
+                key: format!("{wal_prefix}00000002.history.lz4"),
+                bytes: 1,
+            },
+            SourceObject {
+                key: format!("{wal_prefix}000000010000000000000002.lz4"),
+                bytes: 3,
+            },
+            SourceObject {
+                key: format!("{wal_prefix}000000010000000000000004.lz4"),
+                bytes: 3,
+            },
+        ];
+        let selected = select_walg_snapshot_objects(
+            &base_objects,
+            &wal_objects,
+            &format!(
+                "{repo}/basebackups_005/base_000000010000000000000002_backup_stop_sentinel.json"
+            ),
+            &format!("{repo}/basebackups_005/base_000000010000000000000002/"),
+            &wal_prefix,
+            "000000010000000000000002",
+            "000000010000000000000003",
+        );
+        let selected_keys = selected
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(selected_keys.len(), 3);
+        assert!(selected_keys
+            .iter()
+            .any(|key| key.ends_with("part_001.tar.lz4")));
+        assert!(selected_keys
+            .iter()
+            .any(|key| key.ends_with("000000010000000000000002_backup_stop_sentinel.json")));
+        assert!(selected_keys
+            .iter()
+            .any(|key| key.ends_with("000000010000000000000002.lz4")));
+        assert!(
+            !selected_keys.iter().any(|key| key.contains("000000010000000000000004") || key.contains("history") || key.contains("000000010000000000000009")),
+            "other snapshots' sentinels, out-of-range WAL and history files are not part of this snapshot"
+        );
+    }
+
     /// Cloud answering 400 to an in-place declaration is a verdict on the
     /// layout, not a transient fault. The sweep must not retry it forever:
     /// it re-declares without the root and takes the copy path, which is
     /// what Cloud always accepted. The stub's target endpoint returns 500,
     /// so reaching it is the proof that the fallback happened, and the
     /// resulting error is `Retry`, exactly as for any copy-path hiccup.
-    #[tokio::test]
-    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+    async fn copy_path_fallback_case(reject_in_place: bool, ignore_in_place: bool) {
         let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
             return;
         };
@@ -4667,7 +5741,8 @@ mod tests {
         );
         let cloud = Arc::new(InPlaceCloudStub {
             declared: Mutex::new(Vec::new()),
-            reject_in_place: true,
+            reject_in_place,
+            ignore_in_place,
             target_calls: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
         });
@@ -4748,15 +5823,41 @@ mod tests {
             "in-place attempt, then the copy-path re-declaration"
         );
         assert!(declared[0].in_place_root.is_some());
+        assert!(declared[0]
+            .objects
+            .iter()
+            .all(|object| object.checksum_sha256.is_none()));
         assert!(
             declared[1].in_place_root.is_none(),
             "the fallback must not carry the rejected root"
+        );
+        assert!(
+            declared[1]
+                .objects
+                .iter()
+                .all(|object| object.checksum_sha256.is_some()),
+            "the copy path re-declares with the hashes its uploads bind"
         );
         assert!(
             cloud.target_calls.load(Ordering::SeqCst) > 0,
             "the copy path asked for an upload target"
         );
         assert_eq!(cloud.completions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_in_place_declaration_falls_back_to_the_copy_path() {
+        copy_path_fallback_case(true, false).await;
+    }
+
+    /// A Cloud that predates `in_place_root` accepts the declaration and
+    /// answers `upload_required: true` as it always did. The in-place
+    /// declaration carried no checksums and uploads need them, so the sweep
+    /// must re-declare a hashed copy manifest before its first upload
+    /// rather than fail every object.
+    #[tokio::test]
+    async fn an_ignored_in_place_root_re_declares_with_checksums_before_uploading() {
+        copy_path_fallback_case(false, true).await;
     }
 
     /// The `mirror_native_backup` fallback branch treats a dump with no
@@ -4992,7 +6093,7 @@ mod tests {
             relative_key: key.to_owned(),
             kind: WalGObjectKind::Wal,
             bytes,
-            checksum_sha256: checksum.to_owned(),
+            checksum_sha256: Some(checksum.to_owned()),
         };
         let checksum = "a".repeat(64);
         let manifest = vec![
@@ -5018,7 +6119,7 @@ mod tests {
         assert_ne!(manifest_digest(&rekeyed), digest);
 
         let mut rechecksummed = manifest;
-        rechecksummed[1].checksum_sha256 = "b".repeat(64);
+        rechecksummed[1].checksum_sha256 = Some("b".repeat(64));
         assert_ne!(manifest_digest(&rechecksummed), digest);
     }
 
@@ -5383,6 +6484,7 @@ mod tests {
             clients,
             object_inspections: HashMap::new(),
             control_plane_postgres_major: None,
+            manifest_threshold: MANIFEST_DECLARATION_THRESHOLD,
         };
         let (bytes, checksum_sha256) = expect_stage_ok(
             resources
@@ -5402,7 +6504,7 @@ mod tests {
             relative_key: "object-0001.bin".into(),
             kind: NativeSnapshotObjectKind::Object,
             bytes,
-            checksum_sha256,
+            checksum_sha256: Some(checksum_sha256),
         };
 
         expect_stage_ok(
@@ -5531,7 +6633,7 @@ mod tests {
                     relative_key: "object-0001.bin".into(),
                     kind: NativeSnapshotObjectKind::Object,
                     bytes: source_body.len() as u64,
-                    checksum_sha256: expected_checksum,
+                    checksum_sha256: Some(expected_checksum),
                 },
             )
             .await,

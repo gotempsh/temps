@@ -115,7 +115,7 @@
     "@rsbuild/plugin-react": "^2.1.0",
     "@tailwindcss/typography": "^0.5.20",
     "@types/bun": "^1.4.0",
-    "@types/react": "19.3.0",
+    "@types/react": "^19.1.12",
     "@types/react-dom": "^19.2.7",
     "@types/react-simple-maps": "^3.0.6",
     "@typescript-eslint/eslint-plugin": "^8.69.0",
@@ -132,14 +132,12 @@
     "typescript-eslint": "^8.69.0"
   },
   "overrides": {
-    "@types/react": "19.3.0",
     "brace-expansion": "^5.0.9",
     "browserslist": "^4.28.8",
     "d3-color": "^3.1.0",
     "defu": "^6.1.5",
     "flatted": "^3.4.2",
     "handlebars": "^4.7.9",
-    "js-yaml": "4.3.2",
     "lodash": "^4.17.24",
     "minimatch": "^10.2.5",
     "nanoid": "^3.3.17",

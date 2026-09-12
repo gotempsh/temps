@@ -13,6 +13,15 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+} from '@/components/ui/alert-dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -21,6 +30,7 @@ import {
   usePluginCatalog,
   usePlugins,
   useReloadPlugins,
+  useUninstallPlugin,
 } from '@/hooks/usePlugins'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
@@ -36,7 +46,7 @@ import {
   Puzzle,
   RefreshCw,
 } from 'lucide-react'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 
@@ -52,6 +62,12 @@ export function PluginsPage() {
   } = usePluginCatalog(canManagePlugins)
   const installPlugin = useInstallPlugin()
   const reloadPlugins = useReloadPlugins()
+  const uninstallPlugin = useUninstallPlugin()
+  const [uninstallName, setUninstallName] = useState<string | null>(null)
+  const managementPending =
+    installPlugin.isPending ||
+    reloadPlugins.isPending ||
+    uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -94,9 +110,58 @@ export function PluginsPage() {
     }
   }
 
+  const handleUninstall = async (name: string) => {
+    try {
+      const result = await uninstallPlugin.mutateAsync(name)
+      setUninstallName(null)
+      toast.success(result.message)
+    } catch (error) {
+      if (handleSensitiveActionError(error, () => void handleUninstall(name))) {
+        setUninstallName(null)
+        return
+      }
+      toast.error(
+        sensitiveActionErrorMessage(error, `Failed to uninstall ${name}.`)
+      )
+    }
+  }
+
   return (
     <div className="space-y-6">
       {canManagePlugins && verificationDialog}
+      <AlertDialog
+        open={canManagePlugins && uninstallName !== null}
+        onOpenChange={(open) => {
+          if (!open && !uninstallPlugin.isPending) setUninstallName(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Uninstall {uninstallName}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This stops the plugin and removes it from navigation. Its data is
+              preserved so you can reinstall it later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={uninstallPlugin.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <Button
+              variant="destructive"
+              disabled={managementPending}
+              onClick={() => {
+                if (uninstallName) void handleUninstall(uninstallName)
+              }}
+            >
+              {uninstallPlugin.isPending && (
+                <Loader2 className="mr-2 size-4 animate-spin" />
+              )}
+              {uninstallPlugin.isPending ? 'Uninstalling…' : 'Uninstall'}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -112,7 +177,7 @@ export function PluginsPage() {
               <Button
                 variant="outline"
                 onClick={handleReload}
-                disabled={reloadPlugins.isPending}
+                disabled={managementPending}
               >
                 {reloadPlugins.isPending ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -138,6 +203,7 @@ export function PluginsPage() {
                 installPlugin.isPending ? installPlugin.variables : undefined
               }
               onInstall={(name) => void handleInstall(name)}
+              managementPending={managementPending}
             />
           )}
 
@@ -196,13 +262,25 @@ export function PluginsPage() {
                         </p>
                       )}
                     </div>
-                    {plugin.nav.some(
-                      (entry) => entry.section !== 'project'
-                    ) && (
-                      <Button asChild variant="outline" size="sm">
-                        <Link to={`/plugins/${plugin.name}`}>Open</Link>
-                      </Button>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {plugin.nav.some(
+                        (entry) => entry.section !== 'project'
+                      ) && (
+                        <Button asChild variant="outline" size="sm">
+                          <Link to={`/plugins/${plugin.name}`}>Open</Link>
+                        </Button>
+                      )}
+                      {canManagePlugins && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={managementPending}
+                          onClick={() => setUninstallName(plugin.name)}
+                        >
+                          Uninstall
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -215,6 +293,7 @@ export function PluginsPage() {
 }
 
 interface RegistryCatalogProps {
+  managementPending: boolean
   catalog?: {
     available: boolean
     plugins: RegistryPlugin[]
@@ -229,6 +308,7 @@ interface RegistryCatalogProps {
 }
 
 function RegistryCatalog({
+  managementPending,
   catalog,
   error,
   installedVersions,
@@ -295,7 +375,7 @@ function RegistryCatalog({
                 plugin={plugin}
                 installedVersion={installedVersions.get(plugin.name)}
                 installing={installingName === plugin.name}
-                installDisabled={installingName !== undefined}
+                installDisabled={managementPending}
                 onInstall={onInstall}
               />
             ))}

@@ -366,17 +366,20 @@ jobs:
 
       # Restore always, save only from `main` — see the cache-scoping note on
       # the toolchain export above.
+      # Exact-key only: a partial restore from another lockfile leaves
+      # packages the lockfile no longer pins, and `bun install` does not
+      # evict them, so tsc then checks against a node_modules nobody
+      # declared. Frozen, so a lockfile that does not match package.json
+      # fails here instead of being silently rewritten.
       - name: Restore Bun dependencies
         id: bun-cache
         uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install dependencies
-        run: cd web && bun install
+        run: cd web && bun install --frozen-lockfile
 
       - name: Save Bun dependencies
         if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
@@ -1022,12 +1025,12 @@ jobs:
 
       - name: Pull E2E images
         run: |
-          timeout 10m docker pull minio/minio:latest
+          timeout 10m docker pull quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
           timeout 10m docker build --pull \
             --build-arg MARIADB_VERSION=11.4 \
             --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
             images/mariadb-walg
-          docker image ls | grep -E '^(minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
+          docker image ls | grep -E '^(quay.io/minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:

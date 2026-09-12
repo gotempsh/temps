@@ -15060,6 +15060,82 @@
         },
         "type": "object"
       },
+      "DockerDiskUsage": {
+        "description": "Result of `docker system df` for the control-plane host.",
+        "properties": {
+          "api_version": {
+            "description": "Docker API version the daemon answered with, when it reported one\n(`Api-Version` header). Useful when a category shows `null`\nreclaimable bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_cache": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "collected_at": {
+            "description": "When this snapshot was taken (ISO 8601, UTC).",
+            "type": "string"
+          },
+          "containers": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "images": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "total_bytes": {
+            "description": "Sum of the four category sizes.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "volumes": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          }
+        },
+        "required": [
+          "images",
+          "containers",
+          "volumes",
+          "build_cache",
+          "total_bytes",
+          "collected_at"
+        ],
+        "type": "object"
+      },
+      "DockerDiskUsageCategory": {
+        "description": "One slice of the Docker disk-usage donut.",
+        "properties": {
+          "active_count": {
+            "description": "Objects currently in use (images referenced by a container, running\ncontainers, mounted volumes, in-use cache records).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "reclaimable_bytes": {
+            "description": "Bytes `docker system prune` could free from this category. `null`\nwhen the daemon is older than API 1.52 and does not report it.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "description": "Bytes on disk attributed to this category.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_count": {
+            "description": "Number of objects in this category (all images, all containers, …).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_count",
+          "active_count",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
       "DockerRegistrySettings": {
         "properties": {
           "ca_certificate": {
@@ -21973,7 +22049,7 @@
             ]
           },
           "scan_limit_reached": {
-            "description": "True means no complete ordered page could be established within the\nscan budget. Lines are empty; narrow the search rather than skipping logs.",
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
             "type": "boolean"
           },
           "scanned_bytes": {
@@ -24132,6 +24208,46 @@
         ],
         "type": "object"
       },
+      "InstallPluginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "InstallPluginResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "platform",
+          "sha256",
+          "message"
+        ],
+        "type": "object"
+      },
       "IntegrationResponse": {
         "properties": {
           "config": {
@@ -26028,16 +26144,110 @@
         ],
         "type": "object"
       },
+      "ManagedBackupArchiveConflict": {
+        "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
+        "properties": {
+          "pinned_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pinned_s3_source_name": {
+            "description": "Name of the pinned source, or its id as text when the row is gone.",
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "pinned_s3_source_id",
+          "pinned_s3_source_name"
+        ],
+        "type": "object"
+      },
+      "ManagedBackupSchedule": {
+        "description": "What the Cloud settings page shows about the schedule that targets the\nmanaged destination.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_period": {
+            "description": "Days each backup is kept before the schedule's retention deletes it.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "schedule_expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "schedule_expression",
+          "retention_period",
+          "enabled"
+        ],
+        "type": "object"
+      },
       "ManagedBackupSetup": {
         "properties": {
           "action": {
             "$ref": "#/components/schemas/ManagedBackupSetupAction"
+          },
+          "archive_conflicts": {
+            "description": "Services whose continuous archive is pinned elsewhere. Each fails\nunder the nightly Cloud schedule until repointed (ADR-044).",
+            "items": {
+              "$ref": "#/components/schemas/ManagedBackupArchiveConflict"
+            },
+            "type": "array"
+          },
+          "managed_s3_source_id": {
+            "description": "The `s3_sources` row of the managed destination, when it exists, so a\nclient can repoint a conflicting service at it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "message": {
             "type": "string"
           },
           "ready": {
             "type": "boolean"
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBackupSchedule",
+                "description": "The schedule that writes to the managed destination, when one does.\n`None` on a ready destination means nothing backs up to Cloud yet:\nthe console offers to create the nightly schedule (ADR-044)."
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/ManagedBackupSetupStatus"
@@ -26047,7 +26257,8 @@
           "status",
           "ready",
           "message",
-          "action"
+          "action",
+          "archive_conflicts"
         ],
         "type": "object"
       },
@@ -28491,6 +28702,29 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NpmRelease": {
+        "properties": {
+          "binary_path": {
+            "type": "string"
+          },
+          "integrity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "integrity",
+          "binary_path"
         ],
         "type": "object"
       },
@@ -31947,6 +32181,31 @@
         ],
         "type": "object"
       },
+      "PlatformRelease": {
+        "properties": {
+          "npm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NpmRelease"
+              }
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "sha256"
+        ],
+        "type": "object"
+      },
       "PluginCapability": {
         "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
         "enum": [
@@ -31954,6 +32213,34 @@
           "api_write"
         ],
         "type": "string"
+      },
+      "PluginCatalogResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryPlugin"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "source",
+          "plugins"
+        ],
+        "type": "object"
       },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
@@ -32039,6 +32326,27 @@
         "required": [
           "name",
           "version"
+        ],
+        "type": "object"
+      },
+      "PluginStatusResponse": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -36075,6 +36383,97 @@
         ],
         "type": "object"
       },
+      "RegistryEnvelope": {
+        "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
+        "properties": {
+          "key_id": {
+            "type": "string"
+          },
+          "payload": {
+            "description": "Standard-base64 encoded JSON [`RegistryDocument`].",
+            "type": "string"
+          },
+          "signature": {
+            "description": "Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key_id",
+          "payload",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "RegistryPlugin": {
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "docs_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "platforms": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PlatformRelease"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "title",
+          "summary",
+          "description",
+          "author",
+          "category",
+          "version",
+          "platforms"
+        ],
+        "type": "object"
+      },
       "ReinstallWebhookResponse": {
         "description": "Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`",
         "properties": {
@@ -36145,9 +36544,33 @@
         ],
         "type": "object"
       },
+      "ReloadFailureResponse": {
+        "properties": {
+          "plugin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
       "ReloadResponse": {
         "description": "Response from the reload endpoint.",
         "properties": {
+          "failures": {
+            "description": "Activated installs that could not be verified or started.",
+            "items": {
+              "$ref": "#/components/schemas/ReloadFailureResponse"
+            },
+            "type": "array"
+          },
           "loaded": {
             "description": "Number of plugins successfully loaded after reload",
             "minimum": 0,
@@ -36168,6 +36591,7 @@
         "required": [
           "loaded",
           "plugins",
+          "failures",
           "message"
         ],
         "type": "object"
@@ -47048,6 +47472,25 @@
           "has_redacted_spans",
           "truncated",
           "truncated_projects"
+        ],
+        "type": "object"
+      },
+      "UninstallPluginResponse": {
+        "properties": {
+          "data_preserved": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "message",
+          "data_preserved"
         ],
         "type": "object"
       },
@@ -65347,6 +65790,72 @@
         ]
       }
     },
+    "/cloud/backups/schedule/ensure": {
+      "post": {
+        "operationId": "ensure_cloud_backup_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedBackupSetup"
+                }
+              }
+            },
+            "description": "The managed destination's setup with the schedule that targets it, created when none did"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database or link state failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create the nightly schedule for the Temps Cloud destination unless one\nalready targets it (ADR-044). Answers the same shape as the reconcile so\nthe console can swap it into the status it already holds.",
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
     "/cloud/backups/source/reconcile": {
       "post": {
         "operationId": "reconcile_cloud_backup_source",
@@ -79367,6 +79876,123 @@
         "summary": "Update a node-scoped monitoring alert rule.",
         "tags": [
           "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/latest": {
+      "get": {
+        "description": "Node `0` is the synthetic control-plane node. This is what the server\nmonitoring page reads for its \"Used: X / Limit: Y\" headlines\n(`node.memory_used_bytes`, `node.disk_total_bytes`, …) and for the\ncumulative `*_bytes_total` I/O counters, without having to fetch a full\nrange for each series.",
+        "operationId": "NodeMetricsGetLatest",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Map of metric name to latest value"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Fetch the most-recent value of every metric on a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{node_id}/docker-disk-usage": {
+      "get": {
+        "description": "On-demand rather than sampled: walking every layer, rootfs and volume can\ntake seconds, so the server monitoring page fetches it when opened or when\nthe operator presses refresh. Node `0` only for now — a worker's daemon is\nonly reachable through its agent, which does not relay this yet, and the\nerror says exactly that instead of 404ing.",
+        "operationId": "NodeDockerDiskUsageGet",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockerDiskUsage"
+                }
+              }
+            },
+            "description": "Docker disk usage by category"
+          },
+          "400": {
+            "description": "Node is not the control plane"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Docker daemon answered with an unexpected response"
+          },
+          "503": {
+            "description": "Docker daemon unreachable"
+          },
+          "504": {
+            "description": "Docker daemon timed out"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Docker disk usage (`docker system df`) for the control-plane host.",
+        "tags": [
+          "Nodes"
         ],
         "x-maturity": "beta"
       }
@@ -113141,6 +113767,196 @@
         ]
       }
     },
+    "/x/plugins/catalog": {
+      "get": {
+        "operationId": "list_plugin_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginCatalogResponse"
+                }
+              }
+            },
+            "description": "Signed plugin catalogue, or an unavailable state when registry trust is not configured"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install": {
+      "post": {
+        "operationId": "install_plugin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin verified, installed, and started"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name or registry release"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry rollback refused"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the configured limit"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request content type is not application/json"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request JSON does not match the install schema"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local plugin installation failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry, artifact, or plugin startup verification failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry trust, plugin service, or security audit unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
     "/x/plugins/reload": {
       "post": {
         "description": "Stops all running plugin processes, re-scans the plugins directory,\nstarts any discovered binaries, and hot-swaps the proxy router so new\nand removed plugins take effect immediately without a server restart.\n\nRequires `SystemAdmin` permission.",
@@ -113154,13 +113970,33 @@
                 }
               }
             },
-            "description": "Plugins reloaded successfully"
+            "description": "All plugins reloaded successfully"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "Some plugins reloaded and some failed"
           },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "No activated plugin could be reloaded"
           }
         },
         "security": [
@@ -113169,6 +114005,177 @@
           }
         ],
         "summary": "Reload all external plugins.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/status": {
+      "get": {
+        "operationId": "get_plugin_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginStatusResponse"
+                }
+              }
+            },
+            "description": "Verified active plugin status"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/uninstall": {
+      "post": {
+        "operationId": "uninstall_plugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin deactivated; data and releases preserved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unsafe plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No active installation"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local deactivation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Audit or plugin service unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop and deactivate a plugin while preserving all installed releases and data.",
         "tags": [
           "External Plugins"
         ]

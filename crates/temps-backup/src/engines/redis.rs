@@ -233,6 +233,7 @@ impl BackupEngine for RedisEngine {
             "application/x-gzip",
             file_size,
             Some(&tags),
+            &ctx.cancel,
         )
         .await?;
         v2_common::best_effort_remove(&host_rdb_gz_path).await;

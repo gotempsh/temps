@@ -1291,6 +1291,63 @@ async fn get_node_metrics_range(
 }
 
 // ---------------------------------------------------------------------------
+// Nodes — latest values
+// ---------------------------------------------------------------------------
+
+/// Fetch the most-recent value of every metric on a node.
+///
+/// Node `0` is the synthetic control-plane node. This is what the server
+/// monitoring page reads for its "Used: X / Limit: Y" headlines
+/// (`node.memory_used_bytes`, `node.disk_total_bytes`, …) and for the
+/// cumulative `*_bytes_total` I/O counters, without having to fetch a full
+/// range for each series.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/latest",
+    operation_id = "NodeMetricsGetLatest",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "Map of metric name to latest value", body = HashMap<String, f64>),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_metrics_latest(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let query = LatestQuery {
+        source_kind: SourceKind::Node,
+        source_id: id,
+        names: vec![],
+    };
+
+    let values = store.query_latest(query).await.map_err(|e| {
+        error!(node_id = id, error = %e, "Failed to query latest node metrics");
+        internal_server_error()
+            .detail(format!("Failed to query latest metrics for node {id}: {e}"))
+            .build()
+    })?;
+
+    Ok((StatusCode::OK, Json(values)))
+}
+
+// ---------------------------------------------------------------------------
 // Nodes — alert rules
 // ---------------------------------------------------------------------------
 
@@ -1865,6 +1922,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         )
         // Node metrics
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
+        .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
         .route(
             "/nodes/{id}/metrics/alert-rules",
             get(list_node_alert_rules),
@@ -1895,6 +1953,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_deployment_metrics_latest,
         toggle_deployment_metrics,
         get_node_metrics_range,
+        get_node_metrics_latest,
         list_node_alert_rules,
         update_node_alert_rule,
     ),

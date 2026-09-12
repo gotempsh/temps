@@ -19,6 +19,9 @@ pub enum SensitiveAction {
     InstallExternalPlugin {
         name: String,
     },
+    UninstallExternalPlugin {
+        name: String,
+    },
     RotateApiKey {
         api_key_id: i32,
     },
@@ -90,6 +93,7 @@ impl SensitiveAction {
         match self {
             Self::CreateApiKey => "create_api_key",
             Self::InstallExternalPlugin { .. } => "install_external_plugin",
+            Self::UninstallExternalPlugin { .. } => "uninstall_external_plugin",
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",

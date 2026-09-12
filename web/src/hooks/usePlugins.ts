@@ -6,6 +6,7 @@ import {
   listExternalPlugins,
   listPluginCatalog,
   reloadPlugins,
+  uninstallPlugin,
 } from '@/api/client/sdk.gen'
 import type {
   InstallPluginResponse,
@@ -74,9 +75,29 @@ export function useInstallPlugin() {
     },
     onSuccess: async () => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY }),
+        queryClient.invalidateQueries({
+          queryKey: PLUGINS_QUERY_KEY,
+          exact: true,
+        }),
         queryClient.invalidateQueries({ queryKey: PLUGIN_CATALOG_QUERY_KEY }),
       ])
+    },
+  })
+}
+
+/** Stop and uninstall the selected plugin, retaining its application data. */
+export function useUninstallPlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) => {
+      const response = await uninstallPlugin({
+        path: { name },
+        throwOnError: true,
+      })
+      return response.data
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })
 }

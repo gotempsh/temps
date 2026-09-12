@@ -631,9 +631,137 @@ pub async fn upload_single_part(
     Ok(())
 }
 
-/// Multipart upload. Use for files over [`MULTIPART_THRESHOLD`]. Aborts the
-/// upload on any per-part failure so the bucket does not accumulate
-/// dangling multipart uploads after a transient error.
+/// Smallest part S3 and every compatible store accept for all but the last
+/// part of a multipart upload.
+pub const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Hard cap on parts per multipart upload (S3, R2, MinIO all enforce
+/// 10,000). At a fixed 5 MiB part this used to cap every backup at 50 GB:
+/// part 10,001 was rejected and the whole upload aborted.
+pub const MAX_MULTIPART_PARTS: u64 = 10_000;
+
+/// How many times one part, or the final completion call, is attempted
+/// before the upload is abandoned. Between attempts the parts already
+/// accepted by the store stay put, so a failure at 90% of a 200 GB upload
+/// resumes at 90% rather than at zero.
+pub const MULTIPART_PART_ATTEMPTS: u32 = 6;
+
+/// Part size for a file of `file_size` bytes: at least
+/// [`MIN_MULTIPART_PART_SIZE`], and large enough that the upload needs no
+/// more than [`MAX_MULTIPART_PARTS`] parts. Rounded up to a whole MiB so
+/// part boundaries are predictable in the store's `ListParts` output. One
+/// part is the upload's whole memory footprint, so this is also the
+/// memory bound: a 200 GB file uploads in 20 MiB parts, a 2 TB file in
+/// 200 MiB parts.
+pub fn multipart_part_size(file_size: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    let needed = file_size.div_ceil(MAX_MULTIPART_PARTS);
+    let rounded = needed.div_ceil(MIB).saturating_mul(MIB);
+    rounded.max(MIN_MULTIPART_PART_SIZE)
+}
+
+/// Whether a failed S3 call is worth retrying with the same input.
+///
+/// Transport failures, timeouts, unparsable responses, throttling and
+/// server-side errors are; a request the store understood and rejected
+/// (`AccessDenied`, `NoSuchBucket`, `NoSuchUpload`, `InvalidPart`, …) is
+/// not, because it will be rejected identically on every attempt.
+pub fn is_retryable_sdk_error<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
+where
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::SdkError;
+    match err {
+        SdkError::ConstructionFailure(_) => false,
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            true
+        }
+        SdkError::ServiceError(s) => {
+            let status = s.raw().status().as_u16();
+            status >= 500
+                || status == 429
+                || status == 408
+                || matches!(
+                    s.err().code(),
+                    Some("SlowDown" | "RequestTimeout" | "InternalError" | "ServiceUnavailable")
+                )
+        }
+        // `SdkError` is `#[non_exhaustive]`; an unknown variant is treated
+        // as transient so a future SDK cannot silently turn every failure
+        // permanent.
+        _ => true,
+    }
+}
+
+/// Run one S3 call up to [`MULTIPART_PART_ATTEMPTS`] times with exponential
+/// backoff, stopping early on a non-retryable error or when `cancel`
+/// fires. `describe` names the call in the error an operator eventually
+/// sees.
+async fn s3_call_with_retry<T, E, F, Fut>(
+    describe: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut call: F,
+) -> Result<T, BackupError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    let backoff = temps_core::retry::RetryConfig::new(MULTIPART_PART_ATTEMPTS)
+        .with_base_delay(std::time::Duration::from_secs(2))
+        .with_max_delay(std::time::Duration::from_secs(60));
+    let mut attempt = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(BackupError::Cancelled);
+        }
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                attempt += 1;
+                let retryable = is_retryable_sdk_error(&err);
+                if !retryable || attempt >= MULTIPART_PART_ATTEMPTS {
+                    return Err(BackupError::Failed {
+                        reason: format!(
+                            "{} (attempt {}/{}{})",
+                            describe_sdk_error(describe, &err),
+                            attempt,
+                            MULTIPART_PART_ATTEMPTS,
+                            if retryable { "" } else { ", not retryable" }
+                        ),
+                    });
+                }
+                let delay = backoff.compute_delay(attempt - 1);
+                warn!(
+                    op = %describe,
+                    attempt,
+                    max_attempts = MULTIPART_PART_ATTEMPTS,
+                    retry_in_secs = delay.as_secs(),
+                    error = %describe_sdk_error(describe, &err),
+                    "S3 call failed; retrying without discarding uploaded parts"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err(BackupError::Cancelled),
+                }
+            }
+        }
+    }
+}
+
+/// Multipart upload. Use for files over [`MULTIPART_THRESHOLD`].
+///
+/// Every part is retried on its own (see [`s3_call_with_retry`]) and the
+/// parts the store already accepted are kept between attempts: S3
+/// multipart *is* the resume protocol, the store holds completed parts
+/// server-side under `upload_id` until the upload is completed or
+/// aborted. The upload is aborted only once a part is given up on, on a
+/// non-retryable rejection, or on cancel, so a bucket never accumulates
+/// orphaned parts from this code path. (Parts orphaned by a process crash
+/// are the bucket lifecycle rule's job; nothing here can reach them.)
+///
+/// Memory is bounded by one part ([`multipart_part_size`]) regardless of
+/// file size.
 pub async fn upload_multipart(
     client: &S3Client,
     bucket: &str,
@@ -641,125 +769,61 @@ pub async fn upload_multipart(
     path: &str,
     content_type: &str,
     tags: Option<&BackupTags>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), BackupError> {
-    use tokio_stream::StreamExt as TokioStreamExt;
+    let file_size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| BackupError::Failed {
+            reason: format!("failed to stat {} for multipart upload: {}", path, e),
+        })?
+        .len();
+    let part_size = multipart_part_size(file_size);
+    let part_size_usize = usize::try_from(part_size).map_err(|_| BackupError::Failed {
+        reason: format!(
+            "multipart part size {} bytes does not fit this platform's address space",
+            part_size
+        ),
+    })?;
 
     // Tags are applied via PutObjectTagging *after* the upload completes
     // — see `apply_object_tags` for the R2-compatibility rationale. We
     // deliberately do not pass `.tagging(...)` on the create call here;
     // doing so makes Cloudflare R2 fail the upload with 501 NotImplemented.
-    let create_resp = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .content_type(content_type)
-        .send()
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: describe_sdk_error(
-                &format!("create_multipart_upload for s3://{}/{}", bucket, key),
-                &e,
-            ),
-        })?;
-
-    let upload_id = create_resp.upload_id().ok_or_else(|| BackupError::Failed {
-        reason: "create_multipart_upload returned no upload_id".into(),
-    })?;
-
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("failed to open {} for multipart upload: {}", path, e),
-        })?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut stream = tokio_util::io::ReaderStream::new(reader);
-
-    const CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5 MB
-    let mut buffer = Vec::with_capacity(CHUNK_SIZE);
-    let mut part_number = 1i32;
-    let mut parts = aws_sdk_s3::types::CompletedMultipartUpload::builder();
-
-    while let Some(chunk_result) = TokioStreamExt::next(&mut stream).await {
-        let chunk = chunk_result.map_err(|e| BackupError::Failed {
-            reason: format!("read error during multipart upload: {}", e),
-        })?;
-        buffer.extend_from_slice(&chunk);
-
-        if buffer.len() >= CHUNK_SIZE {
-            let data = std::mem::take(&mut buffer);
-            buffer.reserve(CHUNK_SIZE);
-
-            let part_resp = client
-                .upload_part()
+    let create_resp = s3_call_with_retry(
+        &format!("create_multipart_upload for s3://{}/{}", bucket, key),
+        cancel,
+        || {
+            client
+                .create_multipart_upload()
                 .bucket(bucket)
                 .key(key)
-                .upload_id(upload_id)
-                .part_number(part_number)
-                .body(data.into())
+                .content_type(content_type)
                 .send()
-                .await
-                .map_err(|e| {
-                    abort_multipart_detached(client.clone(), bucket, key, upload_id);
-                    BackupError::Failed {
-                        reason: describe_sdk_error(
-                            &format!("upload_part {} for s3://{}/{}", part_number, bucket, key),
-                            &e,
-                        ),
-                    }
-                })?;
+        },
+    )
+    .await?;
+    let upload_id = create_resp
+        .upload_id()
+        .ok_or_else(|| BackupError::Failed {
+            reason: "create_multipart_upload returned no upload_id".into(),
+        })?
+        .to_string();
 
-            let completed_part = aws_sdk_s3::types::CompletedPart::builder()
-                .e_tag(part_resp.e_tag().unwrap_or(""))
-                .part_number(part_number)
-                .build();
-            parts = parts.parts(completed_part);
-            part_number += 1;
-        }
+    let outcome = upload_multipart_parts(
+        client,
+        bucket,
+        key,
+        path,
+        &upload_id,
+        part_size_usize,
+        file_size,
+        cancel,
+    )
+    .await;
+    if let Err(error) = outcome {
+        abort_multipart_detached(client.clone(), bucket, key, &upload_id);
+        return Err(error);
     }
-
-    if !buffer.is_empty() {
-        let part_resp = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(buffer.into())
-            .send()
-            .await
-            .map_err(|e| {
-                abort_multipart_detached(client.clone(), bucket, key, upload_id);
-                BackupError::Failed {
-                    reason: describe_sdk_error(
-                        &format!(
-                            "upload_part {} (final) for s3://{}/{}",
-                            part_number, bucket, key
-                        ),
-                        &e,
-                    ),
-                }
-            })?;
-        let completed_part = aws_sdk_s3::types::CompletedPart::builder()
-            .e_tag(part_resp.e_tag().unwrap_or(""))
-            .part_number(part_number)
-            .build();
-        parts = parts.parts(completed_part);
-    }
-
-    client
-        .complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
-        .multipart_upload(parts.build())
-        .send()
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: describe_sdk_error(
-                &format!("complete_multipart_upload for s3://{}/{}", bucket, key),
-                &e,
-            ),
-        })?;
 
     if let Some(tags) = tags {
         apply_object_tags(client, bucket, key, tags).await?;
@@ -767,7 +831,119 @@ pub async fn upload_multipart(
     Ok(())
 }
 
+/// The part loop of [`upload_multipart`], separated so every error path
+/// aborts `upload_id` exactly once, in the caller.
+#[allow(clippy::too_many_arguments)]
+async fn upload_multipart_parts(
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
+    path: &str,
+    upload_id: &str,
+    part_size: usize,
+    file_size: u64,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), BackupError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| BackupError::Failed {
+            reason: format!("failed to open {} for multipart upload: {}", path, e),
+        })?;
+
+    let mut parts = aws_sdk_s3::types::CompletedMultipartUpload::builder();
+    let mut part_number = 1i32;
+    let mut uploaded_bytes = 0u64;
+    loop {
+        // Fill exactly one part (or whatever is left of the file).
+        let mut buffer = Vec::with_capacity(part_size);
+        while buffer.len() < part_size {
+            let read = file
+                .read_buf(&mut buffer)
+                .await
+                .map_err(|e| BackupError::Failed {
+                    reason: format!("read error during multipart upload of {}: {}", path, e),
+                })?;
+            if read == 0 {
+                break;
+            }
+        }
+        if buffer.is_empty() {
+            break;
+        }
+        let part_len = buffer.len() as u64;
+        // `Bytes` clones are reference-counted, so a retry re-sends the
+        // same part without a second copy of it in memory.
+        let data = bytes::Bytes::from(buffer);
+        let describe = format!(
+            "upload_part {} ({} bytes at offset {}) for s3://{}/{}",
+            part_number, part_len, uploaded_bytes, bucket, key
+        );
+        let part_resp = s3_call_with_retry(&describe, cancel, || {
+            client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(aws_sdk_s3::primitives::ByteStream::from(data.clone()))
+                .send()
+        })
+        .await?;
+        let e_tag = part_resp.e_tag().ok_or_else(|| BackupError::Failed {
+            reason: format!(
+                "upload_part {} for s3://{}/{} returned no ETag; the store cannot complete \
+                 an upload whose parts it does not identify",
+                part_number, bucket, key
+            ),
+        })?;
+        parts = parts.parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .e_tag(e_tag)
+                .part_number(part_number)
+                .build(),
+        );
+        uploaded_bytes += part_len;
+        part_number += 1;
+        if part_len < part_size as u64 {
+            break;
+        }
+    }
+
+    if uploaded_bytes != file_size {
+        return Err(BackupError::Failed {
+            reason: format!(
+                "{} changed while it was being uploaded: read {} bytes, expected {}",
+                path, uploaded_bytes, file_size
+            ),
+        });
+    }
+
+    let completed = parts.build();
+    s3_call_with_retry(
+        &format!("complete_multipart_upload for s3://{}/{}", bucket, key),
+        cancel,
+        || {
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(completed.clone())
+                .send()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Auto-route between single-part and multipart based on file size.
+///
+/// `cancel` is polled between parts and while backing off before a retry,
+/// so a cancelled backup stops uploading within one part rather than at
+/// the end of the file.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_file(
     client: &S3Client,
     bucket: &str,
@@ -776,9 +952,10 @@ pub async fn upload_file(
     content_type: &str,
     file_size: i64,
     tags: Option<&BackupTags>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), BackupError> {
     if file_size > MULTIPART_THRESHOLD {
-        upload_multipart(client, bucket, key, path, content_type, tags).await
+        upload_multipart(client, bucket, key, path, content_type, tags, cancel).await
     } else {
         upload_single_part(client, bucket, key, path, content_type, tags).await
     }
@@ -789,13 +966,22 @@ fn abort_multipart_detached(client: S3Client, bucket: &str, key: &str, upload_id
     let key = key.to_string();
     let upload_id = upload_id.to_string();
     tokio::spawn(async move {
-        let _ = client
+        if let Err(error) = client
             .abort_multipart_upload()
             .bucket(&bucket)
             .key(&key)
             .upload_id(&upload_id)
             .send()
-            .await;
+            .await
+        {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                error = %describe_sdk_error("abort_multipart_upload", &error),
+                "could not abort an abandoned multipart upload; its parts stay billed until \
+                 the bucket's AbortIncompleteMultipartUpload lifecycle rule removes them"
+            );
+        }
     });
 }
 
@@ -987,5 +1173,273 @@ mod tests {
                 backup_id
             )
         );
+    }
+
+    #[test]
+    fn multipart_part_size_respects_the_part_count_and_minimum_size() {
+        use super::{multipart_part_size, MAX_MULTIPART_PARTS, MIN_MULTIPART_PART_SIZE};
+        const MIB: u64 = 1024 * 1024;
+        // Small files: the S3 minimum.
+        assert_eq!(multipart_part_size(0), MIN_MULTIPART_PART_SIZE);
+        assert_eq!(multipart_part_size(31 * MIB), MIN_MULTIPART_PART_SIZE);
+        assert_eq!(multipart_part_size(50_000 * MIB), MIN_MULTIPART_PART_SIZE);
+        // 200 GB used to need 40,000 five-MiB parts, four times the cap.
+        let two_hundred_gb = 200 * 1000 * MIB;
+        let part = multipart_part_size(two_hundred_gb);
+        assert_eq!(part, 20 * MIB);
+        assert!(two_hundred_gb.div_ceil(part) <= MAX_MULTIPART_PARTS);
+        // Whole MiB boundaries, never more than the cap, for any size.
+        for size in [50_001 * MIB, 123_457 * MIB, 2 * 1024 * 1024 * MIB] {
+            let part = multipart_part_size(size);
+            assert_eq!(part % MIB, 0);
+            assert!(size.div_ceil(part) <= MAX_MULTIPART_PARTS, "{size}");
+        }
+    }
+
+    /// Minimal S3 multipart stub: create / upload part / complete / abort.
+    /// `fail_part` makes the first attempt of that part answer `status`,
+    /// which is how a transient outage (503) and a hard rejection (403) are
+    /// simulated.
+    struct MultipartStub {
+        creates: std::sync::atomic::AtomicUsize,
+        part_attempts: std::sync::atomic::AtomicUsize,
+        completes: std::sync::atomic::AtomicUsize,
+        aborts: std::sync::atomic::AtomicUsize,
+        fail_part: i32,
+        status: axum::http::StatusCode,
+        /// How many attempts of `fail_part` answer `status` before it is
+        /// accepted. The SDK's own retry layer absorbs a couple of 5xx
+        /// answers on its own; failing more often than that is what proves
+        /// the resume in `upload_multipart` rather than the SDK's.
+        fail_times: usize,
+        failures: std::sync::atomic::AtomicUsize,
+        parts: std::sync::Mutex<std::collections::BTreeMap<i32, Vec<u8>>>,
+    }
+
+    async fn multipart_stub_handler(
+        axum::extract::State(state): axum::extract::State<Arc<MultipartStub>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+        let query = uri.query().unwrap_or_default();
+        let params: std::collections::HashMap<&str, &str> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
+            .collect();
+        let xml = |body: String| {
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                body,
+            )
+                .into_response()
+        };
+        match method {
+            axum::http::Method::POST if params.contains_key("uploads") => {
+                state.creates.fetch_add(1, Ordering::SeqCst);
+                xml(
+                    "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                     <UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+                        .into(),
+                )
+            }
+            axum::http::Method::PUT => {
+                state.part_attempts.fetch_add(1, Ordering::SeqCst);
+                let part: i32 = params
+                    .get("partNumber")
+                    .and_then(|value| value.parse().ok())
+                    .expect("partNumber");
+                if part == state.fail_part
+                    && state.failures.fetch_add(1, Ordering::SeqCst) < state.fail_times
+                {
+                    let code = if state.status.is_server_error() {
+                        "SlowDown"
+                    } else {
+                        "AccessDenied"
+                    };
+                    return (
+                        state.status,
+                        [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                        format!("<Error><Code>{code}</Code><Message>simulated</Message></Error>"),
+                    )
+                        .into_response();
+                }
+                state
+                    .parts
+                    .lock()
+                    .expect("parts lock")
+                    .insert(part, body.to_vec());
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::ETAG, format!("\"etag-{part}\""))],
+                    "",
+                )
+                    .into_response()
+            }
+            axum::http::Method::POST => {
+                state.completes.fetch_add(1, Ordering::SeqCst);
+                xml(
+                    "<CompleteMultipartUploadResult><Location>l</Location><Bucket>b</Bucket>\
+                     <Key>k</Key><ETag>\"done\"</ETag></CompleteMultipartUploadResult>"
+                        .into(),
+                )
+            }
+            axum::http::Method::DELETE => {
+                state.aborts.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::NO_CONTENT.into_response()
+            }
+            _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    async fn spawn_multipart_stub(
+        fail_part: i32,
+        fail_times: usize,
+        status: axum::http::StatusCode,
+    ) -> Option<(aws_sdk_s3::Client, Arc<MultipartStub>)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping multipart stub test");
+                return None;
+            }
+            Err(error) => panic!("bind multipart stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stub address");
+        let state = Arc::new(MultipartStub {
+            creates: Default::default(),
+            part_attempts: Default::default(),
+            completes: Default::default(),
+            aborts: Default::default(),
+            fail_part,
+            status,
+            fail_times,
+            failures: Default::default(),
+            parts: Default::default(),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::any(multipart_stub_handler),
+            )
+            // Parts are 5 MiB; Axum's default body limit is 2 MiB.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve multipart stub");
+        });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .endpoint_url(format!("http://{address}"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .build();
+        Some((aws_sdk_s3::Client::from_conf(config), state))
+    }
+
+    fn twelve_mib_file() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        for _ in 0..12 {
+            file.write_all(&chunk).expect("write chunk");
+        }
+        file.flush().expect("flush");
+        file
+    }
+
+    /// A transient failure on one part must not throw away the parts the
+    /// store already holds: the part is retried, the upload is completed
+    /// from where it was, and nothing is aborted.
+    #[tokio::test]
+    async fn a_transient_part_failure_resumes_the_upload_without_aborting() {
+        use std::sync::atomic::Ordering;
+        // The SDK retries a 503 a few times on its own before surfacing an
+        // error; four failures force one retry through this crate's layer.
+        let Some((client, state)) =
+            spawn_multipart_stub(2, 4, axum::http::StatusCode::SERVICE_UNAVAILABLE).await
+        else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let started = std::time::Instant::now();
+        super::upload_multipart(
+            &client,
+            "b",
+            "k",
+            &path,
+            "application/octet-stream",
+            None,
+            &cancel,
+        )
+        .await
+        .expect("upload completes after the retry");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "the crate-level retry backs off before re-sending the part"
+        );
+        assert_eq!(state.creates.load(Ordering::SeqCst), 1);
+        // Three parts (5 + 5 + 2 MiB); part 2 needed five attempts.
+        assert_eq!(state.part_attempts.load(Ordering::SeqCst), 7);
+        assert_eq!(state.completes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.aborts.load(Ordering::SeqCst),
+            0,
+            "no part was discarded"
+        );
+        let parts = state.parts.lock().expect("parts lock");
+        let assembled: Vec<u8> = parts.values().flatten().copied().collect();
+        assert_eq!(assembled, std::fs::read(&path).expect("file"));
+        assert_eq!(parts.len(), 3);
+    }
+
+    /// A rejection the store will repeat (403) is not retried: the upload is
+    /// abandoned at once and its parts aborted exactly once.
+    #[tokio::test]
+    async fn a_rejected_part_aborts_the_upload_without_retrying() {
+        use std::sync::atomic::Ordering;
+        let Some((client, state)) =
+            spawn_multipart_stub(1, 1, axum::http::StatusCode::FORBIDDEN).await
+        else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = super::upload_multipart(
+            &client,
+            "b",
+            "k",
+            &path,
+            "application/octet-stream",
+            None,
+            &cancel,
+        )
+        .await
+        .expect_err("a 403 fails the upload");
+        assert!(
+            error.to_string().contains("not retryable"),
+            "the reason says why it stopped: {error}"
+        );
+        assert_eq!(state.part_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.completes.load(Ordering::SeqCst), 0);
+        // The abort is spawned detached; give it a moment to land.
+        for _ in 0..50 {
+            if state.aborts.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.aborts.load(Ordering::SeqCst), 1);
     }
 }

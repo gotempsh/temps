@@ -64,7 +64,9 @@ mod docker_utils {
             // Pull MinIO image
             let mut pull_stream = docker.create_image(
                 Some(CreateImageOptions {
-                    from_image: Some("minio/minio:latest".to_string()),
+                    from_image: Some(
+                        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+                    ),
                     ..Default::default()
                 }),
                 None,
@@ -81,7 +83,7 @@ mod docker_utils {
                 rand::random::<u32>()
             );
             let minio_config = bollard::models::ContainerCreateBody {
-                image: Some("minio/minio:latest".to_string()),
+                image: Some("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
                 cmd: Some(vec!["server".to_string(), "/data".to_string()]),
                 env: Some(vec![
                     format!("MINIO_ROOT_USER={}", access_key),

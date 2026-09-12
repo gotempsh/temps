@@ -3,24 +3,29 @@
 
 //! Bounded direct-binary installation and authenticated activation records.
 
-use std::io::{Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::catalog::{
-    validate_url, PlatformRelease, RegistryConfig, RegistryEnvelope, RegistryPlugin,
+    validate_url, NpmRelease, PlatformRelease, RegistryConfig, RegistryEnvelope, RegistryPlugin,
     VerifiedRegistry,
 };
 use crate::trust::{KeysetEnvelope, KeysetUse, VerifiedKeyset};
 
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TARBALL_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_PACKAGE_JSON_BYTES: u64 = 64 * 1024;
+const MAX_OTHER_ENTRY_BYTES: u64 = 1024 * 1024;
 const BINARY_TIMEOUT: Duration = Duration::from_secs(120);
 const ACTIVE_FILE: &str = "active.json";
 const RECEIPT_FILE: &str = "receipt.json";
@@ -71,6 +76,18 @@ pub enum InstallError {
         version: String,
         expected: String,
         actual: String,
+    },
+    #[error("Invalid npm release for plugin '{plugin}' v{version}: {reason}")]
+    InvalidNpmRelease {
+        plugin: String,
+        version: String,
+        reason: String,
+    },
+    #[error("Invalid npm tarball for plugin '{plugin}' v{version}: {reason}")]
+    InvalidNpmTarball {
+        plugin: String,
+        version: String,
+        reason: String,
     },
     #[error("Failed to write plugin '{plugin}' installation path {path}: {reason}")]
     Io {
@@ -184,6 +201,15 @@ struct RegistryState {
     keyset: KeysetEnvelope,
 }
 
+#[derive(Deserialize)]
+struct NpmPackageManifest {
+    name: String,
+    version: String,
+    os: Option<Vec<String>>,
+    cpu: Option<Vec<String>>,
+    libc: Option<Vec<String>>,
+}
+
 #[derive(Clone)]
 pub struct PluginInstaller {
     registry: RegistryConfig,
@@ -191,6 +217,52 @@ pub struct PluginInstaller {
 }
 
 impl PluginInstaller {
+    /// Deactivate an installation without deleting release receipts, binaries,
+    /// rollback versions, or plugin-owned data. The active record is the only
+    /// discovery selector, so removing it prevents restart resurrection.
+    pub async fn deactivate(plugins_dir: &Path, name: &str) -> Result<bool, InstallError> {
+        validate_plugin_name(name)?;
+        #[cfg(unix)]
+        {
+            deactivate_fd_relative(plugins_dir, name)
+        }
+        #[cfg(not(unix))]
+        {
+            for directory in [plugins_dir, &plugins_dir.join(name)] {
+                let metadata = match tokio::fs::symlink_metadata(directory).await {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(io_error(name, directory, error)),
+                };
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(InstallError::Io {
+                        plugin: name.to_string(),
+                        path: directory.display().to_string(),
+                        reason: "installation directory is not a real directory".to_string(),
+                    });
+                }
+            }
+            let active = plugins_dir.join(name).join(ACTIVE_FILE);
+            let metadata = match tokio::fs::symlink_metadata(&active).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(io_error(name, &active, error)),
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(InstallError::Io {
+                    plugin: name.to_string(),
+                    path: active.display().to_string(),
+                    reason: "active selection is not a regular file".to_string(),
+                });
+            }
+            tokio::fs::remove_file(&active)
+                .await
+                .map_err(|error| io_error(name, &active, error))?;
+            sync_directory(name, &plugins_dir.join(name)).await?;
+            Ok(true)
+        }
+    }
+
     pub fn new(registry: RegistryConfig) -> Result<Self, InstallError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -221,12 +293,7 @@ impl PluginInstaller {
                 platform: platform.clone(),
             })?;
         let sha256 = normalize_digest(&plugin.name, &plugin.version, &release.sha256)?;
-        validate_url(&release.url, &self.registry, false).map_err(|_| {
-            InstallError::UnsafeArtifactUrl {
-                plugin: plugin.name.clone(),
-                url: release.url.clone(),
-            }
-        })?;
+        validate_release_for_install(plugin, release, &self.registry)?;
 
         ensure_directory(&plugin.name, plugins_dir).await?;
         let staging_root = plugins_dir.join(".staging");
@@ -240,8 +307,14 @@ impl PluginInstaller {
         let version_dir = plugin_root.join(&directory);
         let mut moved_to_version_dir = false;
         let prepared = async {
-            self.download_binary(plugin, release, &sha256, &staged_binary)
-                .await?;
+            if let Some(npm) = &release.npm {
+                self.download_npm_binary(plugin, release, npm, &sha256, &staged_binary)
+                    .await?;
+            } else {
+                #[cfg(test)]
+                self.download_binary(plugin, release, &sha256, &staged_binary)
+                    .await?;
+            }
             let receipt = InstallReceipt {
                 keyset: registry.keyset.envelope.clone(),
                 keyset_generation: registry.keyset.document.generation,
@@ -433,6 +506,95 @@ impl PluginInstaller {
         sync_directory(&candidate.name, &candidate.plugin_root).await
     }
 
+    async fn download_npm_binary(
+        &self,
+        plugin: &RegistryPlugin,
+        release: &PlatformRelease,
+        npm: &NpmRelease,
+        expected: &str,
+        destination: &Path,
+    ) -> Result<(), InstallError> {
+        let response = self
+            .client
+            .get(&release.url)
+            .header("User-Agent", "temps-plugin-installer")
+            .send()
+            .await
+            .map_err(|error| InstallError::Download {
+                plugin: plugin.name.clone(),
+                url: release.url.clone(),
+                reason: error.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(InstallError::DownloadStatus {
+                url: release.url.clone(),
+                status: response.status().as_u16(),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_TARBALL_BYTES)
+        {
+            return Err(InstallError::TooLarge {
+                url: release.url.clone(),
+                limit: MAX_TARBALL_BYTES,
+            });
+        }
+        let mut tarball = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| InstallError::Download {
+                plugin: plugin.name.clone(),
+                url: release.url.clone(),
+                reason: error.to_string(),
+            })?;
+            if tarball.len().saturating_add(chunk.len()) > MAX_TARBALL_BYTES as usize {
+                return Err(InstallError::TooLarge {
+                    url: release.url.clone(),
+                    limit: MAX_TARBALL_BYTES,
+                });
+            }
+            tarball.extend_from_slice(&chunk);
+        }
+        let plugin_owned = plugin.clone();
+        let npm_owned = npm.clone();
+        let expected_owned = expected.to_string();
+        let bytes = tokio::task::spawn_blocking(move || {
+            verify_npm_tarball(&plugin_owned, &npm_owned, &tarball, &expected_owned)
+        })
+        .await
+        .map_err(|error| {
+            npm_tar_error(plugin, format!("archive verification task failed: {error}"))
+        })??;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .await
+            .map_err(|error| io_error(&plugin.name, destination, error))?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|error| io_error(&plugin.name, destination, error))?;
+        file.flush()
+            .await
+            .map_err(|error| io_error(&plugin.name, destination, error))?;
+        file.sync_all()
+            .await
+            .map_err(|error| io_error(&plugin.name, destination, error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o500))
+                .await
+                .map_err(|error| io_error(&plugin.name, destination, error))?;
+            file.sync_all()
+                .await
+                .map_err(|error| io_error(&plugin.name, destination, error))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn download_binary(
         &self,
         plugin: &RegistryPlugin,
@@ -521,6 +683,430 @@ impl PluginInstaller {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn deactivate_fd_relative(plugins_dir: &Path, name: &str) -> Result<bool, InstallError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path =
+        CString::new(plugins_dir.as_os_str().as_bytes()).map_err(|error| InstallError::Io {
+            plugin: name.to_string(),
+            path: plugins_dir.display().to_string(),
+            reason: error.to_string(),
+        })?;
+    // SAFETY: all pointers are NUL-terminated and OwnedFd closes successful descriptors.
+    let root_raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(io_error(name, plugins_dir, error));
+    }
+    // SAFETY: open returned a fresh owned descriptor.
+    let root = unsafe { OwnedFd::from_raw_fd(root_raw) };
+    let child = CString::new(name).map_err(|error| InstallError::Io {
+        plugin: name.to_string(),
+        path: plugins_dir.display().to_string(),
+        reason: error.to_string(),
+    })?;
+    // SAFETY: root is live; child is a validated single path component.
+    let plugin_raw = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            child.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if plugin_raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(io_error(name, &plugins_dir.join(name), error));
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    let plugin = unsafe { OwnedFd::from_raw_fd(plugin_raw) };
+    let active = CString::new(ACTIVE_FILE).map_err(|error| InstallError::Io {
+        plugin: name.to_string(),
+        path: plugins_dir.join(name).display().to_string(),
+        reason: error.to_string(),
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: plugin is live, active is NUL-terminated, stat has writable space.
+    let status = unsafe {
+        libc::fstatat(
+            plugin.as_raw_fd(),
+            active.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(io_error(
+            name,
+            &plugins_dir.join(name).join(ACTIVE_FILE),
+            error,
+        ));
+    }
+    // SAFETY: fstatat succeeded and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(InstallError::Io {
+            plugin: name.to_string(),
+            path: plugins_dir
+                .join(name)
+                .join(ACTIVE_FILE)
+                .display()
+                .to_string(),
+            reason: "active selection is not a regular file".to_string(),
+        });
+    }
+    // SAFETY: unlink is relative to the verified directory descriptor, so
+    // replacing any pathname component cannot redirect the deletion.
+    if unsafe { libc::unlinkat(plugin.as_raw_fd(), active.as_ptr(), 0) } < 0 {
+        return Err(io_error(
+            name,
+            &plugins_dir.join(name).join(ACTIVE_FILE),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: plugin is a live directory descriptor.
+    if unsafe { libc::fsync(plugin.as_raw_fd()) } < 0 {
+        tracing::warn!(plugin = %name, error = %std::io::Error::last_os_error(), "Plugin deactivation committed but directory fsync failed");
+    }
+    Ok(true)
+}
+
+#[cfg(all(test, unix))]
+mod deactivate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_symlinked_plugin_directory_without_touching_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugins = temp.path().join("plugins");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&plugins).expect("plugins dir");
+        std::fs::create_dir(&outside).expect("outside dir");
+        std::fs::write(outside.join(ACTIVE_FILE), b"preserved").expect("outside marker");
+        std::os::unix::fs::symlink(&outside, plugins.join("example")).expect("symlink");
+        assert!(PluginInstaller::deactivate(&plugins, "example")
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(outside.join(ACTIVE_FILE)).expect("marker"),
+            b"preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_symlinked_active_record_without_touching_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugins = temp.path().join("plugins");
+        let plugin = plugins.join("example");
+        std::fs::create_dir(&plugins).expect("plugins dir");
+        std::fs::create_dir(&plugin).expect("plugin dir");
+        let outside = temp.path().join("outside.json");
+        std::fs::write(&outside, b"preserved").expect("outside marker");
+        std::os::unix::fs::symlink(&outside, plugin.join(ACTIVE_FILE)).expect("symlink");
+        assert!(PluginInstaller::deactivate(&plugins, "example")
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&outside).expect("marker"), b"preserved");
+    }
+}
+
+fn npm_error(plugin: &RegistryPlugin, reason: impl Into<String>) -> InstallError {
+    InstallError::InvalidNpmRelease {
+        plugin: plugin.name.clone(),
+        version: plugin.version.clone(),
+        reason: reason.into(),
+    }
+}
+
+fn npm_tar_error(plugin: &RegistryPlugin, reason: impl Into<String>) -> InstallError {
+    InstallError::InvalidNpmTarball {
+        plugin: plugin.name.clone(),
+        version: plugin.version.clone(),
+        reason: reason.into(),
+    }
+}
+
+pub(crate) fn validate_release_for_install(
+    plugin: &RegistryPlugin,
+    release: &PlatformRelease,
+    config: &RegistryConfig,
+) -> Result<(), InstallError> {
+    if let Some(npm) = release.npm.as_ref() {
+        validate_npm_release(plugin, release, npm, config)
+    } else {
+        #[cfg(test)]
+        if config.allow_http {
+            return validate_url(&release.url, config, false)
+                .map(|_| ())
+                .map_err(|_| InstallError::UnsafeArtifactUrl {
+                    plugin: plugin.name.clone(),
+                    url: release.url.clone(),
+                });
+        }
+        Err(npm_error(plugin, "signed release has no npm metadata"))
+    }
+}
+
+fn validate_npm_release(
+    plugin: &RegistryPlugin,
+    release: &PlatformRelease,
+    npm: &NpmRelease,
+    config: &RegistryConfig,
+) -> Result<(), InstallError> {
+    let package = npm
+        .name
+        .strip_prefix('@')
+        .ok_or_else(|| npm_error(plugin, "package must be scoped"))?;
+    let (scope, name) = package
+        .split_once('/')
+        .ok_or_else(|| npm_error(plugin, "invalid scoped package name"))?;
+    let valid_part = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 214
+            && s.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+            })
+    };
+    if !valid_part(scope)
+        || !valid_part(name)
+        || npm.version != plugin.version
+        || semver::Version::parse(&npm.version).is_err()
+    {
+        return Err(npm_error(plugin, "invalid package name or exact version"));
+    }
+    let digest = npm
+        .integrity
+        .strip_prefix("sha512-")
+        .ok_or_else(|| npm_error(plugin, "integrity must use sha512"))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(digest)
+        .map_err(|_| npm_error(plugin, "invalid SHA-512 base64"))?;
+    if decoded.len() != 64 || base64::engine::general_purpose::STANDARD.encode(&decoded) != digest {
+        return Err(npm_error(plugin, "noncanonical SHA-512 integrity"));
+    }
+    let binary = npm
+        .binary_path
+        .strip_prefix("package/")
+        .ok_or_else(|| npm_error(plugin, "binary_path must be inside package/"))?;
+    if binary.is_empty()
+        || binary
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || npm.binary_path.contains('\\')
+    {
+        return Err(npm_error(plugin, "unsafe binary_path"));
+    }
+    let parsed =
+        url::Url::parse(&release.url).map_err(|_| npm_error(plugin, "invalid tarball URL"))?;
+    let canonical = format!("/@{scope}/{name}/-/{name}-{}.tgz", npm.version);
+    let local_test = cfg!(test) && config.allow_http;
+    if !local_test
+        && (parsed.scheme() != "https"
+            || parsed.host_str() != Some("registry.npmjs.org")
+            || parsed.port().is_some()
+            || parsed.path() != canonical
+            || parsed.as_str() != release.url)
+    {
+        return Err(InstallError::UnsafeArtifactUrl {
+            plugin: plugin.name.clone(),
+            url: release.url.clone(),
+        });
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || (!local_test && release.url.contains('%'))
+    {
+        return Err(InstallError::UnsafeArtifactUrl {
+            plugin: plugin.name.clone(),
+            url: release.url.clone(),
+        });
+    }
+    if local_test {
+        validate_url(&release.url, config, false).map_err(|_| InstallError::UnsafeArtifactUrl {
+            plugin: plugin.name.clone(),
+            url: release.url.clone(),
+        })?;
+    }
+    Ok(())
+}
+
+fn verify_npm_tarball(
+    plugin: &RegistryPlugin,
+    npm: &NpmRelease,
+    tarball: &[u8],
+    expected: &str,
+) -> Result<Vec<u8>, InstallError> {
+    let actual = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(tarball));
+    if actual != npm.integrity.strip_prefix("sha512-").unwrap_or("") {
+        return Err(npm_tar_error(plugin, "tarball SHA-512 integrity mismatch"));
+    }
+    extract_npm_binary(plugin, npm, tarball, expected)
+}
+
+fn extract_npm_binary(
+    plugin: &RegistryPlugin,
+    npm: &NpmRelease,
+    tarball: &[u8],
+    expected: &str,
+) -> Result<Vec<u8>, InstallError> {
+    let decoder = flate2::read::GzDecoder::new(tarball);
+    let limited = decoder.take(MAX_UNPACKED_BYTES + 1);
+    let mut archive = tar::Archive::new(limited);
+    let entries = archive
+        .entries()
+        .map_err(|e| npm_tar_error(plugin, format!("archive header: {e}")))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut binary = None;
+    let mut identity = None;
+    let mut total = 0u64;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            return Err(npm_tar_error(plugin, "archive entry count exceeded"));
+        }
+        let mut entry = entry.map_err(|e| npm_tar_error(plugin, format!("archive entry: {e}")))?;
+        let raw = entry.path_bytes();
+        let path = std::str::from_utf8(&raw)
+            .map_err(|_| npm_tar_error(plugin, "non-UTF-8 entry path"))?
+            .to_string();
+        let clean = path.trim_end_matches('/');
+        if (clean != "package" && !clean.starts_with("package/"))
+            || clean
+                .split('/')
+                .any(|segment| segment == "." || segment == ".." || segment.is_empty())
+            || path.contains('\\')
+            || !seen.insert(path.clone())
+        {
+            return Err(npm_tar_error(
+                plugin,
+                format!("unsafe or duplicate entry path '{path}'"),
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(npm_tar_error(
+                plugin,
+                format!("unsupported entry type at '{path}'"),
+            ));
+        }
+        let size = entry
+            .header()
+            .size()
+            .map_err(|e| npm_tar_error(plugin, format!("invalid entry size at '{path}': {e}")))?;
+        if path != npm.binary_path && path != "package/package.json" && size > MAX_OTHER_ENTRY_BYTES
+        {
+            return Err(npm_tar_error(
+                plugin,
+                format!("metadata entry '{path}' too large"),
+            ));
+        }
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| npm_tar_error(plugin, "archive size overflow"))?;
+        if total > MAX_UNPACKED_BYTES {
+            return Err(npm_tar_error(plugin, "unpacked archive size exceeded"));
+        }
+        if path == "package/package.json" {
+            if size > MAX_PACKAGE_JSON_BYTES {
+                return Err(npm_tar_error(plugin, "package.json too large"));
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| npm_tar_error(plugin, format!("package.json read: {e}")))?;
+            identity = Some(data);
+        } else if path == npm.binary_path {
+            if !kind.is_file() || size > MAX_BINARY_BYTES {
+                return Err(npm_tar_error(
+                    plugin,
+                    "binary is not a bounded regular file",
+                ));
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| npm_tar_error(plugin, format!("binary read: {e}")))?;
+            binary = Some(data);
+        }
+    }
+    let metadata = identity.ok_or_else(|| npm_tar_error(plugin, "missing package.json"))?;
+    let manifest: NpmPackageManifest = serde_json::from_slice(&metadata)
+        .map_err(|e| npm_tar_error(plugin, format!("invalid package.json: {e}")))?;
+    if manifest.name != npm.name || manifest.version != npm.version {
+        return Err(npm_tar_error(
+            plugin,
+            "package identity does not match signed metadata",
+        ));
+    }
+    let platform = platform_target()?;
+    let os = if platform.starts_with("darwin") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let cpu = if platform.contains("amd64") {
+        "x64"
+    } else {
+        "arm64"
+    };
+    for (key, expected_value, values) in [("os", os, manifest.os), ("cpu", cpu, manifest.cpu)] {
+        if let Some(array) = values {
+            if !array.iter().any(|item| item == expected_value)
+                || array
+                    .iter()
+                    .any(|item| item == &format!("!{expected_value}"))
+            {
+                return Err(npm_tar_error(
+                    plugin,
+                    format!("package does not support host {key} '{expected_value}'"),
+                ));
+            }
+        }
+    }
+    if let Some(array) = manifest.libc {
+        let expected_value = if platform.ends_with("musl") {
+            "musl"
+        } else {
+            "glibc"
+        };
+        if os == "linux" && !array.iter().any(|item| item == expected_value) {
+            return Err(npm_tar_error(
+                plugin,
+                format!("package does not support host libc '{expected_value}'"),
+            ));
+        }
+    }
+    let binary = binary.ok_or_else(|| npm_tar_error(plugin, "declared binary missing"))?;
+    let actual = hex::encode(Sha256::digest(&binary));
+    if actual != expected {
+        return Err(InstallError::DigestMismatch {
+            plugin: plugin.name.clone(),
+            version: plugin.version.clone(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    Ok(binary)
 }
 
 async fn read_registry_state(state_path: &Path) -> Result<Option<RegistryState>, InstallError> {
@@ -624,6 +1210,16 @@ pub async fn discover_active(
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
+        // A retained release directory without an active selector is an
+        // intentionally uninstalled plugin, not a broken active install.
+        match tokio::fs::symlink_metadata(path.join(ACTIVE_FILE)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                results.push(Err(io_error(&name, &path.join(ACTIVE_FILE), error)));
+                continue;
+            }
+            Ok(_) => {} // verify_active rejects malformed or symlinked records.
+        }
         results.push(verify_active(&name, &path, registry, &accepted_keyset).await);
     }
     results
@@ -643,6 +1239,9 @@ async fn has_plugin_directories(plugins_dir: &Path) -> bool {
         if tokio::fs::symlink_metadata(entry.path())
             .await
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            && tokio::fs::symlink_metadata(entry.path().join(ACTIVE_FILE))
+                .await
+                .is_ok()
         {
             return true;
         }
@@ -1333,6 +1932,7 @@ mod tests {
                 PlatformRelease {
                     url,
                     sha256: hex::encode(Sha256::digest(bytes)),
+                    npm: None,
                 },
             )]),
         }
@@ -1971,5 +2571,237 @@ mod tests {
                 .await,
             Err(InstallError::Io { .. })
         ));
+    }
+
+    fn npm_fixture(entries: &[(&str, &[u8], tar::EntryType)]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, bytes, kind) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.as_mut_bytes()[..100].fill(0);
+            header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, *bytes).expect("append fixture");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    fn npm_test_plugin() -> RegistryPlugin {
+        plugin(
+            "https://registry.npmjs.org/@temps/test-plugin/-/test-plugin-1.0.0.tgz".to_string(),
+            b"binary",
+            "1.0.0",
+        )
+    }
+
+    #[test]
+    fn npm_archive_accepts_only_declared_binary_and_identity() {
+        let plugin = npm_test_plugin();
+        let mut npm = NpmRelease {
+            name: "@temps/test-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: String::new(),
+            binary_path: "package/plugin".to_string(),
+        };
+        let tarball = npm_fixture(&[
+            (
+                "package/package.json",
+                br#"{"name":"@temps/test-plugin","version":"1.0.0"}"#,
+                tar::EntryType::Regular,
+            ),
+            ("package/plugin", b"binary", tar::EntryType::Regular),
+        ]);
+        let binary = extract_npm_binary(
+            &plugin,
+            &npm,
+            &tarball,
+            &hex::encode(Sha256::digest(b"binary")),
+        )
+        .expect("extract binary");
+        assert_eq!(binary, b"binary");
+        npm.integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tarball))
+        );
+        assert_eq!(
+            verify_npm_tarball(
+                &plugin,
+                &npm,
+                &tarball,
+                &hex::encode(Sha256::digest(b"binary"))
+            )
+            .expect("verified tarball"),
+            b"binary"
+        );
+        let mut corrupted = tarball.clone();
+        corrupted[0] ^= 1;
+        assert!(matches!(
+            verify_npm_tarball(
+                &plugin,
+                &npm,
+                &corrupted,
+                &hex::encode(Sha256::digest(b"binary"))
+            ),
+            Err(InstallError::InvalidNpmTarball { .. })
+        ));
+        assert!(matches!(
+            extract_npm_binary(&plugin, &npm, &tarball, &"00".repeat(32)),
+            Err(InstallError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn npm_archive_rejects_links_duplicates_and_missing_identity() {
+        let plugin = npm_test_plugin();
+        let npm = NpmRelease {
+            name: "@temps/test-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: String::new(),
+            binary_path: "package/plugin".to_string(),
+        };
+        let digest = hex::encode(Sha256::digest(b"binary"));
+        for entries in [
+            vec![(
+                "package/plugin",
+                b"binary".as_slice(),
+                tar::EntryType::Regular,
+            )],
+            vec![
+                (
+                    "package/package.json",
+                    br#"{"name":"@temps/test-plugin","version":"1.0.0"}"#.as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Symlink,
+                ),
+            ],
+            vec![
+                (
+                    "package/package.json",
+                    br#"{"name":"@temps/test-plugin","version":"1.0.0"}"#.as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+        ] {
+            let tarball = npm_fixture(&entries);
+            assert!(matches!(
+                extract_npm_binary(&plugin, &npm, &tarball, &digest),
+                Err(InstallError::InvalidNpmTarball { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn npm_release_rejects_noncanonical_url_and_integrity() {
+        let plugin = npm_test_plugin();
+        let mut release = plugin.platforms.values().next().expect("release").clone();
+        let mut npm = NpmRelease {
+            name: "@temps/test-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+            ),
+            binary_path: "package/plugin".to_string(),
+        };
+        validate_npm_release(&plugin, &release, &npm, &RegistryConfig::default())
+            .expect("valid release");
+        release.url.push_str("?token=secret");
+        assert!(validate_npm_release(&plugin, &release, &npm, &RegistryConfig::default()).is_err());
+        release.url =
+            "https://registry.npmjs.org/@temps/test-plugin/-/test-plugin-1.0.0.tgz".to_string();
+        npm.integrity = "sha256-abc".to_string();
+        assert!(matches!(
+            validate_npm_release(&plugin, &release, &npm, &RegistryConfig::default()),
+            Err(InstallError::InvalidNpmRelease { .. })
+        ));
+    }
+
+    #[test]
+    fn npm_archive_rejects_traversal_missing_binary_and_wrong_platform() {
+        let plugin = npm_test_plugin();
+        let npm = NpmRelease {
+            name: "@temps/test-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: String::new(),
+            binary_path: "package/plugin".to_string(),
+        };
+        let digest = hex::encode(Sha256::digest(b"binary"));
+        let manifest = br#"{"name":"@temps/test-plugin","version":"1.0.0"}"#;
+        for entries in [
+            vec![
+                (
+                    "package/../escape",
+                    b"evil".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/package.json",
+                    manifest.as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+            vec![(
+                "package/package.json",
+                manifest.as_slice(),
+                tar::EntryType::Regular,
+            )],
+            vec![
+                (
+                    "package/package.json",
+                    br#"{"name":"@other/test-plugin","version":"1.0.0"}"#.as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+            vec![
+                (
+                    "package/package.json",
+                    br#"{"name":"@temps/test-plugin","version":"1.0.0","os":["unsupported"]}"#
+                        .as_slice(),
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "package/plugin",
+                    b"binary".as_slice(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+        ] {
+            let tarball = npm_fixture(&entries);
+            assert!(matches!(
+                extract_npm_binary(&plugin, &npm, &tarball, &digest),
+                Err(InstallError::InvalidNpmTarball { .. })
+            ));
+        }
     }
 }

@@ -1506,6 +1506,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "DeploymentMetricsGetRange",
         "DeploymentMetricsGetLatest",
         "NodeMetricsGetRange",
+        "NodeMetricsGetLatest",
         // ── Domains: metadata (no challenge tokens) ──
         "list_domains",
         "get_domain",
@@ -4541,6 +4542,7 @@ mod ai_tool_allowlist_tests {
             "DeploymentMetricsGetRange",
             "DeploymentMetricsGetLatest",
             "NodeMetricsGetRange",
+            "NodeMetricsGetLatest",
         ] {
             assert!(
                 index.get(tool).is_some(),

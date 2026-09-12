@@ -162,6 +162,16 @@ pub struct RegistryPlugin {
 pub struct PlatformRelease {
     pub url: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npm: Option<NpmRelease>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct NpmRelease {
+    pub name: String,
+    pub version: String,
+    pub integrity: String,
+    pub binary_path: String,
 }
 
 #[derive(Debug, Clone)]

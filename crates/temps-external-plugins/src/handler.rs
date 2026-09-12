@@ -331,6 +331,8 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             "Plugin Registry Verification Failed",
         ),
         ExternalPluginsError::Install(InstallError::InvalidDigest { .. })
+        | ExternalPluginsError::Install(InstallError::InvalidNpmRelease { .. })
+        | ExternalPluginsError::Install(InstallError::InvalidNpmTarball { .. })
         | ExternalPluginsError::Install(InstallError::UnsafeArtifactUrl { .. })
         | ExternalPluginsError::Install(InstallError::Client { .. })
         | ExternalPluginsError::Install(InstallError::Download { .. })
@@ -360,6 +362,9 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::SERVICE_UNAVAILABLE,
             "Plugin Service Is Shutting Down",
         ),
+        ExternalPluginsError::NotInstalled { .. } => {
+            (StatusCode::NOT_FOUND, "Plugin Not Installed")
+        }
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
@@ -380,6 +385,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
             | InstallError::UnsupportedPlatform { .. }
             | InstallError::NoRelease { .. }
             | InstallError::InvalidDigest { .. }
+            | InstallError::InvalidNpmRelease { .. }
             | InstallError::RegistryRollback { .. }
             | InstallError::RegistryRevisionConflict { .. }
             | InstallError::KeysetRollback { .. }
@@ -388,6 +394,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::NotInRegistry { .. }
         | ExternalPluginsError::DuplicateRegistryEntry { .. }
         | ExternalPluginsError::ShuttingDown => error.to_string(),
+        ExternalPluginsError::NotInstalled { .. } => error.to_string(),
         ExternalPluginsError::Catalog(CatalogError::Trust(_)) => {
             "The registry catalogue-key document did not pass offline-root verification".to_string()
         }
@@ -402,6 +409,9 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         }) => format!(
             "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
         ),
+        ExternalPluginsError::Install(InstallError::InvalidNpmTarball {
+            plugin, version, ..
+        }) => format!("Plugin '{plugin}' v{version} npm package did not pass verification"),
         ExternalPluginsError::Install(
             InstallError::UnsafeArtifactUrl { plugin, .. } | InstallError::Download { plugin, .. },
         ) => format!("Plugin '{plugin}' could not be downloaded securely"),
@@ -592,6 +602,79 @@ async fn install_plugin(
     }))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UninstallPluginResponse {
+    pub name: String,
+    pub message: String,
+    pub data_preserved: bool,
+}
+
+/// Stop and deactivate a plugin while preserving all installed releases and data.
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/{name}/uninstall",
+    operation_id = "uninstall_plugin",
+    params(("name" = String, Path)),
+    responses(
+        (status = 200, description = "Plugin deactivated; data and releases preserved", body = UninstallPluginResponse),
+        (status = 400, description = "Unsafe plugin name", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 404, description = "No active installation", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "Local deactivation failed", body = temps_core::ProblemDetails),
+        (status = 503, description = "Audit or plugin service unavailable", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn uninstall_plugin(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(name): Path<String>,
+) -> Result<Json<UninstallPluginResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    crate::install::validate_plugin_name(&name)
+        .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::UninstallExternalPlugin { name: name.clone() },
+    )
+    .await?;
+    let context = audit_context(&auth, &metadata);
+    let audit = |operation: &str, failure: Option<String>| ExternalPluginWriteAudit {
+        context: context.clone(),
+        operation: operation.to_string(),
+        plugin_name: Some(name.clone()),
+        version: None,
+        platform: None,
+        sha256: None,
+        signer_key_id: None,
+        registry_source: None,
+        failure,
+    };
+    record_required_audit(&state, &audit("EXTERNAL_PLUGIN_UNINSTALL_REQUESTED", None)).await?;
+    if let Err(error) = state.service.uninstall_plugin(&name).await {
+        record_audit(
+            &state,
+            &audit(
+                "EXTERNAL_PLUGIN_UNINSTALL_FAILED",
+                Some(public_error_detail(&error)),
+            ),
+        )
+        .await;
+        return Err(service_problem(&error));
+    }
+    record_audit(&state, &audit("EXTERNAL_PLUGIN_UNINSTALLED", None)).await;
+    Ok(Json(UninstallPluginResponse {
+        message: format!("Plugin '{name}' was stopped and deactivated; its data was preserved"),
+        name,
+        data_preserved: true,
+    }))
+}
+
 #[utoipa::path(
     tag = "External Plugins",
     get,
@@ -629,6 +712,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route("/x/plugins/reload", post(reload_plugins))
         .route("/x/plugins/catalog", get(list_plugin_catalog))
         .route("/x/plugins/install", post(install_plugin))
+        .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
 }
 
@@ -639,6 +723,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         reload_plugins,
         list_plugin_catalog,
         install_plugin,
+        uninstall_plugin,
         get_plugin_status,
     ),
     components(
@@ -655,6 +740,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::catalog::PlatformRelease,
             InstallPluginRequest,
             InstallPluginResponse,
+            UninstallPluginResponse,
             PluginCatalogResponse,
             PluginStatusResponse,
             temps_core::ProblemDetails,
@@ -669,6 +755,62 @@ pub struct ExternalPluginsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn uninstall_rejects_non_admin_before_audit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let error = uninstall_plugin(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            Path("example".to_string()),
+        )
+        .await
+        .expect_err("non-admin must be rejected");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn uninstall_missing_installation_returns_not_found_with_failure_audit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let error = uninstall_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Path("example".to_string()),
+        )
+        .await
+        .expect_err("missing install must be rejected");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            *audit.operations.lock().expect("audit lock"),
+            vec![
+                "EXTERNAL_PLUGIN_UNINSTALL_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_UNINSTALL_FAILED".to_string(),
+            ]
+        );
+    }
 
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -864,6 +1006,7 @@ mod tests {
                     crate::catalog::PlatformRelease {
                         url: format!("http://{address}/artifact"),
                         sha256: "00".repeat(32),
+                        npm: None,
                     },
                 )]),
             }],
@@ -1027,6 +1170,11 @@ mod tests {
         );
         std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
             .expect("broken active plugin directory");
+        std::fs::write(
+            config.plugins_dir.join("broken-plugin/active.json"),
+            b"invalid",
+        )
+        .expect("malformed active record");
         let audit = Arc::new(RecordingAuditLogger::default());
         let state = ExternalPluginsAppState {
             service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),

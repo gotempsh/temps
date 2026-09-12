@@ -3181,311 +3181,31 @@ SELECT cp.id
         s3_location: &str,
     ) -> Result<()> {
         info!("Uploading backup to S3: {}", s3_location);
-
-        // Get file size
         let file_size = temp_file.as_file().metadata()?.len();
-
-        // Use multipart upload for files larger than 30MB
-        const MULTIPART_THRESHOLD: u64 = 30 * 1024 * 1024; // 30MB in bytes
-
-        if file_size > MULTIPART_THRESHOLD {
-            self.upload_multipart(s3_client, s3_source, temp_file, s3_location)
-                .await
-        } else {
-            self.upload_single_part(s3_client, s3_source, temp_file, s3_location)
-                .await
-        }
-    }
-
-    async fn upload_single_part(
-        &self,
-        s3_client: &S3Client,
-        s3_source: &S3Source,
-        temp_file: &NamedTempFile,
-        s3_location: &str,
-    ) -> Result<()> {
-        // Stream from file instead of reading entire contents into memory
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create byte stream from backup file: {}", e))?;
-
-        match s3_client
-            .put_object()
-            .bucket(&s3_source.bucket_name)
-            .key(s3_location)
-            .body(body)
-            .content_type("application/x-gzip")
-            .send()
-            .await
-        {
-            Ok(_) => {
-                info!("Successfully uploaded backup using single-part upload");
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(service_error) = e.as_service_error() {
-                    error!(
-                        "S3 service error during single-part upload: {:?} - Message: {}, Code: {:?}",
-                        service_error,
-                        service_error.message().unwrap_or("no message"),
-                        service_error.code()
-                    );
-                    Err(anyhow::anyhow!(
-                        "S3 upload failed: {} (code: {:?})",
-                        service_error.message().unwrap_or("unknown error"),
-                        service_error.code()
-                    ))
-                } else {
-                    error!("Failed to upload backup: {}", e);
-                    Err(anyhow::anyhow!("Failed to upload backup: {}", e))
-                }
-            }
-        }
-    }
-
-    async fn upload_multipart(
-        &self,
-        s3_client: &S3Client,
-        s3_source: &S3Source,
-        temp_file: &NamedTempFile,
-        s3_location: &str,
-    ) -> Result<()> {
-        // Create multipart upload
-        let create_multipart_resp = match s3_client
-            .create_multipart_upload()
-            .bucket(&s3_source.bucket_name)
-            .key(s3_location)
-            .content_type("application/x-gzip")
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                if let Some(service_error) = e.as_service_error() {
-                    error!(
-                        "S3 service error creating multipart upload: {:?} - Message: {}, Code: {:?}",
-                        service_error,
-                        service_error.message().unwrap_or("no message"),
-                        service_error.code()
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Failed to create multipart upload: {} (code: {:?})",
-                        service_error.message().unwrap_or("unknown error"),
-                        service_error.code()
-                    ));
-                }
-                return Err(anyhow::anyhow!("Failed to create multipart upload: {}", e));
-            }
-        };
-
-        let upload_id = create_multipart_resp
-            .upload_id()
-            .ok_or_else(|| anyhow::anyhow!("No upload ID received from S3"))?;
-
-        let mut part_number = 1;
-        let mut parts = aws_sdk_s3::types::CompletedMultipartUpload::builder();
-        let mut total_size = 0;
-
-        // Stream and upload file in chunks
-        let file = tokio::fs::File::open(temp_file.path()).await?;
-        let reader = tokio::io::BufReader::new(file);
-        let mut stream = tokio_util::io::ReaderStream::new(reader);
-
-        let chunk_size = 5 * 1024 * 1024; // 5MB chunks
-        let mut buffer = Vec::with_capacity(chunk_size);
-
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| anyhow::anyhow!("Failed to read chunk from file: {}", e))?;
-            buffer.extend_from_slice(&chunk);
-
-            if buffer.len() >= chunk_size {
-                let chunk_len = buffer.len();
-                match self
-                    .upload_part(
-                        s3_client,
-                        &s3_source.bucket_name,
-                        s3_location,
-                        upload_id,
-                        part_number,
-                        std::mem::take(&mut buffer),
-                    )
-                    .await
-                {
-                    Ok(part) => {
-                        parts = parts.parts(part);
-                        total_size += chunk_len;
-                        part_number += 1;
-                        buffer.reserve(chunk_size);
-                    }
-                    Err(e) => {
-                        self.abort_multipart_upload(
-                            s3_client,
-                            &s3_source.bucket_name,
-                            s3_location,
-                            upload_id,
-                        )
-                        .await;
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        // Handle remaining data
-        if !buffer.is_empty() {
-            let chunk_len = buffer.len();
-            match self
-                .upload_part(
-                    s3_client,
-                    &s3_source.bucket_name,
-                    s3_location,
-                    upload_id,
-                    part_number,
-                    std::mem::take(&mut buffer),
-                )
-                .await
-            {
-                Ok(part) => {
-                    parts = parts.parts(part);
-                    total_size += chunk_len;
-                }
-                Err(e) => {
-                    self.abort_multipart_upload(
-                        s3_client,
-                        &s3_source.bucket_name,
-                        s3_location,
-                        upload_id,
-                    )
-                    .await;
-                    return Err(e);
-                }
-            }
-        }
-
-        // Complete multipart upload
-        match s3_client
-            .complete_multipart_upload()
-            .bucket(&s3_source.bucket_name)
-            .key(s3_location)
-            .upload_id(upload_id)
-            .multipart_upload(parts.build())
-            .send()
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    "Successfully uploaded backup with size: {} bytes",
-                    total_size
-                );
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(service_error) = e.as_service_error() {
-                    error!(
-                        "S3 service error completing multipart upload: {:?} - Message: {}, Code: {:?}",
-                        service_error,
-                        service_error.message().unwrap_or("no message"),
-                        service_error.code()
-                    );
-                    Err(anyhow::anyhow!(
-                        "Failed to complete multipart upload: {} (code: {:?})",
-                        service_error.message().unwrap_or("unknown error"),
-                        service_error.code()
-                    ))
-                } else {
-                    error!("Failed to complete multipart upload: {}", e);
-                    Err(anyhow::anyhow!(
-                        "Failed to complete multipart upload: {}",
-                        e
-                    ))
-                }
-            }
-        }
-    }
-
-    async fn upload_part(
-        &self,
-        s3_client: &S3Client,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        body: Vec<u8>,
-    ) -> Result<aws_sdk_s3::types::CompletedPart> {
-        match s3_client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .body(body.into())
-            .part_number(part_number)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let etag = response
-                    .e_tag
-                    .ok_or_else(|| anyhow::anyhow!("No ETag received for part {}", part_number))?;
-
-                Ok(aws_sdk_s3::types::CompletedPart::builder()
-                    .e_tag(etag)
-                    .part_number(part_number)
-                    .build())
-            }
-            Err(e) => {
-                if let Some(service_error) = e.as_service_error() {
-                    error!(
-                        "S3 service error uploading part {}: {:?} - Message: {}, Code: {:?}",
-                        part_number,
-                        service_error,
-                        service_error.message().unwrap_or("no message"),
-                        service_error.code()
-                    );
-                    Err(anyhow::anyhow!(
-                        "Failed to upload part {}: {} (code: {:?})",
-                        part_number,
-                        service_error.message().unwrap_or("unknown error"),
-                        service_error.code()
-                    ))
-                } else {
-                    error!("Failed to upload part {}: {}", part_number, e);
-                    Err(anyhow::anyhow!(
-                        "Failed to upload part {}: {}",
-                        part_number,
-                        e
-                    ))
-                }
-            }
-        }
-    }
-
-    async fn abort_multipart_upload(
-        &self,
-        s3_client: &S3Client,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-    ) {
-        if let Err(e) = s3_client
-            .abort_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await
-        {
-            if let Some(service_error) = e.as_service_error() {
-                error!(
-                    "S3 service error aborting multipart upload: {:?} - Message: {}, Code: {:?}",
-                    service_error,
-                    service_error.message().unwrap_or("no message"),
-                    service_error.code()
-                );
-            } else {
-                error!("Failed to abort multipart upload: {}", e);
-            }
-        }
+        let path = temp_file.path().to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "backup temp file path {} is not valid UTF-8",
+                temp_file.path().display()
+            )
+        })?;
+        // One upload implementation for every engine: single PUT below the
+        // multipart threshold, otherwise a multipart upload whose parts are
+        // retried individually and never thrown away on a transient error.
+        crate::engines::v2_common::upload_file(
+            s3_client,
+            &s3_source.bucket_name,
+            s3_location,
+            path,
+            "application/x-gzip",
+            i64::try_from(file_size).unwrap_or(i64::MAX),
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        // Keep the typed error as the source (downcastable) instead of
+        // flattening it to text; this legacy path is still `anyhow` at its
+        // boundary but must not lose whether the upload was cancelled.
+        .map_err(anyhow::Error::from)
     }
 
     pub async fn restore_backup(&self, backup_id: &str) -> Result<(), BackupError> {
@@ -4746,6 +4466,24 @@ SELECT cp.id
         }
 
         info!(backup_id = %backup.backup_id, "Backup deleted successfully");
+        // Tell anyone cataloging this instance's backups elsewhere. Best
+        // effort: the deletion is done either way, and the Cloud mirror has
+        // its own presence check for events that never arrive.
+        if let Some(queue) = self.queue.get() {
+            if let Err(error) = queue
+                .send(temps_core::Job::BackupDeleted(
+                    temps_core::BackupDeletedJob {
+                        backup_id: backup.id,
+                        backup_uuid: backup.backup_id.clone(),
+                        engine: engine.to_string(),
+                        s3_location: backup.s3_location.clone(),
+                    },
+                ))
+                .await
+            {
+                warn!(backup_id = %backup.backup_id, error = %error, "could not publish BackupDeleted");
+            }
+        }
         Ok((backup, deleted_objects))
     }
 
@@ -6271,10 +6009,17 @@ SELECT cp.id
     pub async fn reconcile_default_external_service_schedules(&self) -> Result<(), BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // 1. Resolve the default S3 source. If none is configured yet, this is
-        //    not an error — we simply have nothing to point a schedule at, so
-        //    we bail quietly and retry on the next tick.
-        let s3_source_id = match self.resolve_s3_source_id(None).await {
+        // 1. Resolve the destination for services not pinned anywhere yet.
+        //    The Cloud-managed source wins when one exists: new services'
+        //    continuous archiving defaults to it (see
+        //    `temps_providers::continuous_archive`), so a base-backup
+        //    schedule pointed anywhere else would leave the binlog shipper
+        //    refusing to pin and PITR never starting. Otherwise the default
+        //    source; if neither is configured yet, this is not an error — we
+        //    simply have nothing to point a schedule at, so we bail quietly
+        //    and retry on the next tick. A service that already carries a
+        //    pin keeps it (see the loop below).
+        let s3_source_id = match self.default_schedule_destination().await {
             Ok(id) => id,
             Err(_) => {
                 debug!(
@@ -6306,7 +6051,17 @@ SELECT cp.id
         // 3. For each, create a daily full-backup schedule targeting exactly
         //    that service, then flip the latch.
         for service in services {
-            if let Err(e) = self.provision_default_schedule_for_service(&service).await {
+            // A service already pinned somewhere (an upgraded instance whose
+            // binlogs ship to the operator's own bucket) keeps that
+            // destination: a schedule pointed anywhere else would fail
+            // every run on the pin mismatch.
+            let destination = service
+                .continuous_archive_s3_source_id
+                .unwrap_or(s3_source_id);
+            if let Err(e) = self
+                .provision_default_schedule_for_service(&service, destination)
+                .await
+            {
                 // Leave default_backup_provisioned = false so the next tick
                 // retries. One failing service must not block the others.
                 warn!(
@@ -6327,9 +6082,24 @@ SELECT cp.id
     /// service and mark it provisioned. Helper for
     /// [`reconcile_default_external_service_schedules`]; on success the
     /// service's `default_backup_provisioned` latch is set to `true`.
+    /// Where an auto-provisioned schedule writes: the Cloud-managed source
+    /// when the instance has one, else the default source.
+    async fn default_schedule_destination(&self) -> Result<i32, BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let managed = temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+        match managed {
+            Some(source) => Ok(source.id),
+            None => self.resolve_s3_source_id(None).await,
+        }
+    }
+
     async fn provision_default_schedule_for_service(
         &self,
         service: &temps_entities::external_services::Model,
+        s3_source_id: i32,
     ) -> Result<(), BackupError> {
         use sea_orm::{ActiveModelTrait, Set};
 
@@ -6346,8 +6116,9 @@ SELECT cp.id
             backup_type: "full".to_string(),
             // Days. 14 days of base backups is a sane default retention window.
             retention_period: 14,
-            // Use the resolved default S3 source.
-            s3_source_id: None,
+            // The destination resolved by the caller: the Cloud-managed
+            // source when one exists, the default source otherwise.
+            s3_source_id: Some(s3_source_id),
             schedule_expression: "0 0 3 * * *".to_string(),
             enabled: true,
             description: Some(
@@ -10794,6 +10565,53 @@ mod tests {
 
     struct NoopJobQueue;
 
+    /// Records every job sent, so a test can assert what the service
+    /// published without a live consumer. Flip `refuse` to make every send
+    /// fail, the way a queue does when its backing channel is gone.
+    struct RecordingJobQueue {
+        sent: std::sync::Mutex<Vec<temps_core::Job>>,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingJobQueue {
+        fn new() -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                refuse: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// The `BackupDeleted` jobs published so far, in order.
+        fn deleted_jobs(&self) -> Vec<temps_core::BackupDeletedJob> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|job| match job {
+                    temps_core::Job::BackupDeleted(job) => Some(job.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for RecordingJobQueue {
+        async fn send(&self, job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(temps_core::QueueError::SendError(
+                    "queue refused the job for the test".to_string(),
+                ));
+            }
+            self.sent.lock().unwrap().push(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("RecordingJobQueue does not support subscribing in tests")
+        }
+    }
+
     #[async_trait::async_trait]
     impl temps_core::JobQueue for NoopJobQueue {
         async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
@@ -11197,13 +11015,14 @@ mod tests {
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
         // Start MinIO container
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
 
         let minio_port = minio_container
             .get_host_port_ipv4(9000)
@@ -11277,6 +11096,8 @@ mod tests {
             config_service,
             encryption_service,
         );
+        let published = Arc::new(RecordingJobQueue::new());
+        backup_service.set_queue(published.clone());
 
         // Create a test user for backup operations
         use sea_orm::{ActiveModelTrait, Set};
@@ -11455,6 +11276,19 @@ mod tests {
             .await
             .expect("backup deletion should complete");
         assert_eq!(deleted_objects, 2, "dump and metadata must be deleted");
+        // Anything cataloging this backup elsewhere (the Cloud mirror) hears
+        // about the deletion, keyed on the stable backup uuid, and only once
+        // the row is gone: the job is the last thing the deletion does.
+        let deleted_jobs = published.deleted_jobs();
+        assert_eq!(deleted_jobs.len(), 1, "one BackupDeleted per deletion");
+        assert_eq!(deleted_jobs[0].backup_uuid, backup_result.backup_id);
+        assert_eq!(deleted_jobs[0].backup_id, backup_result.id);
+        assert_eq!(deleted_jobs[0].s3_location, backup_result.s3_location);
+        assert!(backup_service
+            .get_backup(&backup_result.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
         let remaining = s3_client
             .list_objects_v2()
             .bucket(bucket_name)
@@ -11492,6 +11326,85 @@ mod tests {
             .expect("backup index must contain an array")
             .iter()
             .all(|entry| entry["backup_id"] != backup_result.backup_id));
+
+        // Retention deletion goes through the same path and publishes the
+        // same job. Age a second backup past the schedule's retention period
+        // and let the scheduler's sweep delete it.
+        let retained = backup_service
+            .create_backup(Some(schedule.id), s3_source.id, "full", 1)
+            .await
+            .expect("Failed to create the backup that retention will expire");
+        temps_entities::backups::Entity::update_many()
+            .col_expr(
+                temps_entities::backups::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::days(8)),
+            )
+            .filter(temps_entities::backups::Column::Id.eq(retained.id))
+            .exec(test_db.db.as_ref())
+            .await
+            .expect("aging the backup should succeed");
+        let report = backup_service
+            .enforce_retention(Some(schedule.id), None)
+            .await
+            .expect("retention enforcement should complete");
+        assert_eq!(report.deleted, 1, "the aged backup is the only candidate");
+        assert_eq!(report.failed, 0, "{:?}", report.failures);
+        let deleted_jobs = published.deleted_jobs();
+        assert_eq!(
+            deleted_jobs.len(),
+            2,
+            "retention publishes BackupDeleted too"
+        );
+        assert_eq!(deleted_jobs[1].backup_uuid, retained.backup_id);
+        assert_eq!(deleted_jobs[1].backup_id, retained.id);
+        assert!(backup_service
+            .get_backup(&retained.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
+
+        // Publishing is best effort: a queue that refuses the job must not
+        // turn a finished deletion into an error, and must not leave the row
+        // or the objects behind.
+        let unannounced = backup_service
+            .create_backup(Some(schedule.id), s3_source.id, "full", 1)
+            .await
+            .expect("Failed to create the backup deleted without a queue");
+        published
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, deleted_objects) = backup_service
+            .delete_backup(&unannounced.backup_id)
+            .await
+            .expect("a refused publication must not fail the deletion");
+        assert_eq!(
+            deleted_objects, 2,
+            "dump and metadata must still be deleted"
+        );
+        assert_eq!(
+            published.deleted_jobs().len(),
+            2,
+            "the refused job is not recorded"
+        );
+        assert!(backup_service
+            .get_backup(&unannounced.backup_id)
+            .await
+            .expect("database lookup should succeed")
+            .is_none());
+        let unannounced_prefix =
+            validated_snapshot_prefix(&unannounced.s3_location, &s3_source, &unannounced.backup_id)
+                .expect("backup must have an attributable snapshot prefix");
+        let remaining = s3_client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(format!("{unannounced_prefix}/"))
+            .send()
+            .await
+            .expect("snapshot prefix should remain listable");
+        assert!(
+            remaining.contents().is_empty(),
+            "snapshot prefix must be empty"
+        );
 
         println!("\n✓ Integration test passed:");
         println!("  - Database container started (timescale/timescaledb-ha)");
@@ -11532,13 +11445,14 @@ mod tests {
         use temps_database::test_utils::TestDatabase;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
         let minio_port = minio_container
             .get_host_port_ipv4(9000)
             .await
@@ -11750,13 +11664,14 @@ mod tests {
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
         // Start MinIO container
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
 
         let minio_port = minio_container
             .get_host_port_ipv4(9000)

@@ -188,13 +188,11 @@ jobs:
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install web dependencies
         run: |
           cd web
-          bun install
+          bun install --frozen-lockfile
 
       # Fails the job if any high or critical severity advisory is found in
       # web/'s dependency tree. `bun audit` exits non-zero when findings meet

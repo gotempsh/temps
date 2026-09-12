@@ -16,13 +16,11 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use crate::catalog::{
-    validate_url, CatalogError, RegistryClient, RegistryPlugin, VerifiedRegistry,
-};
+use crate::catalog::{CatalogError, RegistryClient, RegistryPlugin, VerifiedRegistry};
 use crate::event_listener::PluginEventListener;
 use crate::install::{
-    normalize_digest, platform_target, validate_plugin_name, validate_version, InstallError,
-    PluginInstaller,
+    normalize_digest, platform_target, validate_plugin_name, validate_release_for_install,
+    validate_version, InstallError, PluginInstaller,
 };
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
@@ -69,6 +67,8 @@ pub enum ExternalPluginsError {
     },
     #[error("External plugin service is shutting down and cannot accept lifecycle changes")]
     ShuttingDown,
+    #[error("Plugin '{name}' has no active installation to uninstall")]
+    NotInstalled { name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +330,14 @@ impl ExternalPluginsService {
             return Err(ExternalPluginsError::ShuttingDown);
         }
         let registry = self.catalog().await?;
+        self.select_from_registry(name, registry)
+    }
+
+    fn select_from_registry(
+        &self,
+        name: &str,
+        registry: VerifiedRegistry,
+    ) -> Result<SelectedPlugin, ExternalPluginsError> {
         let mut matches = registry
             .document
             .plugins
@@ -357,12 +365,7 @@ impl ExternalPluginsService {
                 platform: platform.clone(),
             })?;
         let sha256 = normalize_digest(&plugin.name, &plugin.version, &release.sha256)?;
-        validate_url(&release.url, &self.manager.config().registry, false).map_err(|_| {
-            InstallError::UnsafeArtifactUrl {
-                plugin: plugin.name.clone(),
-                url: release.url.clone(),
-            }
-        })?;
+        validate_release_for_install(&plugin, release, &self.manager.config().registry)?;
         let identity = ReleaseIdentity {
             name: plugin.name.clone(),
             version: plugin.version.clone(),
@@ -452,6 +455,23 @@ impl ExternalPluginsService {
             signer_key_id: selected.identity.signer_key_id,
             registry_source: selected.identity.registry_source,
         })
+    }
+
+    /// Deactivate only the named plugin, preserving all releases and data.
+    pub async fn uninstall_plugin(&self, name: &str) -> Result<(), ExternalPluginsError> {
+        validate_plugin_name(name)?;
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
+            return Err(ExternalPluginsError::NotInstalled {
+                name: name.to_string(),
+            });
+        }
+        self.manager.shutdown_plugin(name).await;
+        self.refresh_runtime_surfaces().await;
+        Ok(())
     }
 
     /// Shut down all external plugins gracefully.
@@ -724,6 +744,7 @@ except Exception:
                 crate::catalog::PlatformRelease {
                     url,
                     sha256: sha256.clone(),
+                    npm: None,
                 },
             )]),
         };
@@ -814,6 +835,67 @@ except Exception:
         let registry = &service.manager().config().registry;
         assert_eq!(registry.root_trust.threshold, 2);
         assert_eq!(registry.root_trust.keys.len(), 3);
+    }
+
+    #[test]
+    fn selection_accepts_canonical_npm_release() {
+        let signing = SigningKey::from_bytes(&[71; 32]);
+        let mut registry = registry_revision(1, 1, &signing);
+        let release = registry.document.plugins[0]
+            .platforms
+            .values_mut()
+            .next()
+            .expect("platform release");
+        release.url = "https://registry.npmjs.org/@temps/fixture-plugin/-/fixture-plugin-1.0.0.tgz"
+            .to_string();
+        release.npm = Some(crate::catalog::NpmRelease {
+            name: "@temps/fixture-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+            ),
+            binary_path: "package/plugin".to_string(),
+        });
+        let selected = service()
+            .select_from_registry("fixture-plugin", registry)
+            .expect("canonical npm release selected");
+        assert_eq!(selected.identity.version, "1.0.0");
+    }
+
+    #[test]
+    fn selection_rejects_unsafe_npm_url_and_direct_only_release() {
+        let signing = SigningKey::from_bytes(&[72; 32]);
+        let mut registry = registry_revision(1, 1, &signing);
+        assert!(matches!(
+            service().select_from_registry("fixture-plugin", registry.clone()),
+            Err(ExternalPluginsError::Install(
+                InstallError::InvalidNpmRelease { .. }
+            ))
+        ));
+        let release = registry.document.plugins[0]
+            .platforms
+            .values_mut()
+            .next()
+            .expect("platform release");
+        release.url =
+            "https://registry.npmjs.org/@temps/fixture-plugin/-/fixture-plugin-1.0.0.tgz?token=x"
+                .to_string();
+        release.npm = Some(crate::catalog::NpmRelease {
+            name: "@temps/fixture-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+            ),
+            binary_path: "package/plugin".to_string(),
+        });
+        assert!(matches!(
+            service().select_from_registry("fixture-plugin", registry),
+            Err(ExternalPluginsError::Install(
+                InstallError::UnsafeArtifactUrl { .. }
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -1064,6 +1146,37 @@ except Exception:
             .plugins_dir
             .join("fixture-plugin/active.json")
             .is_file());
+        let plugin_root = config.plugins_dir.join("fixture-plugin");
+        let release_count_before = std::fs::read_dir(&plugin_root)
+            .expect("plugin root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
+        service
+            .uninstall_plugin("fixture-plugin")
+            .await
+            .expect("uninstall");
+        assert!(!plugin_root.join("active.json").exists());
+        assert!(service.manifests().await.is_empty());
+        assert!(!service.manager().is_running("fixture-plugin").await);
+        assert_eq!(
+            std::fs::read_dir(&plugin_root)
+                .expect("preserved plugin root")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .count(),
+            release_count_before,
+            "all release and plugin data directories remain intact"
+        );
+        let reload = service.reload_plugins().await.expect("reload");
+        assert!(
+            reload.manifests.is_empty(),
+            "uninstalled plugin must not resurrect"
+        );
+        assert!(
+            reload.failures.is_empty(),
+            "retained releases are not broken active installs"
+        );
         service.shutdown_all().await;
     }
 
@@ -1181,6 +1294,7 @@ except Exception:
                 crate::catalog::PlatformRelease {
                     url: "https://registry.temps.sh/safe-plugin".to_string(),
                     sha256: "00".repeat(32),
+                    npm: None,
                 },
             )]),
         };

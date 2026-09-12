@@ -1548,6 +1548,11 @@ mod tests {
         );
         std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
             .expect("broken plugin directory");
+        std::fs::write(
+            config.plugins_dir.join("broken-plugin/active.json"),
+            b"invalid",
+        )
+        .expect("malformed active record");
         let manager = ExternalPluginManager::new(config, mock_db());
 
         // Act
