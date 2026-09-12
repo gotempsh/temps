@@ -15,8 +15,8 @@ use super::user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR,
 };
 use super::{
-    ExecStream, OnStreamEventCallback, PtyAttachment, SandboxCreateConfig, SandboxExecResult,
-    SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
+    ExecStream, OnStreamEventCallback, PtyAttachment, RuntimeCompatibility, SandboxCreateConfig,
+    SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::docker_network_isolation::{
@@ -30,6 +30,34 @@ use crate::error::AgentError;
 
 /// Container naming prefix — used for recovery after server restarts.
 const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
+
+fn agent_runtime_exec_config() -> bollard::models::ExecConfig {
+    bollard::models::ExecConfig {
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(false),
+        user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+        cmd: Some(vec![
+            "/usr/local/bin/temps-sandbox-runtime".into(),
+            "connect".into(),
+        ]),
+        ..Default::default()
+    }
+}
+
+fn runtime_health_exec_config() -> bollard::models::ExecConfig {
+    bollard::models::ExecConfig {
+        user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+        cmd: Some(vec![
+            "/usr/local/bin/temps-sandbox-runtime".into(),
+            "request".into(),
+        ]),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        ..Default::default()
+    }
+}
 
 /// Naming prefix for the named volume backing a sandbox's `/home/temps`.
 pub(crate) const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
@@ -693,15 +721,35 @@ function parseAuthority(value, defaultPort) {
 
 function modelRelayTarget(request) {
   const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
-  if (request.method !== "POST" || incoming.host !== proxyAuthority) return null;
-  const match = incoming.pathname.match(
-    /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?)$/
-  );
+  if (incoming.host !== proxyAuthority) return null;
+  let match;
+  if (request.method === "POST") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?|responses)$/
+    );
+    const isAnthropicMessages = match && match[2].startsWith("v1/messages");
+    if (incoming.search && (!isAnthropicMessages || incoming.search !== "?beta=true")) {
+      return null;
+    }
+  } else if (request.method === "GET") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(models)$/
+    );
+    const queryKeys = [...incoming.searchParams.keys()];
+    const clientVersion = incoming.searchParams.get("client_version");
+    if (queryKeys.some((key) => key !== "client_version") ||
+        queryKeys.filter((key) => key === "client_version").length > 1 ||
+        (clientVersion !== null && !/^[A-Za-z0-9._+-]{1,64}$/.test(clientVersion))) {
+      return null;
+    }
+  } else {
+    return null;
+  }
   if (!match) return null;
   const basePath = controlPlane.pathname.replace(/\/$/, "");
   const target = new URL(controlPlane.toString());
   target.pathname = `${basePath}/api/ai/sandbox-models/${match[1]}/${match[2]}`;
-  target.search = "";
+  target.search = incoming.search;
   return target;
 }
 
@@ -715,6 +763,47 @@ function mcpTarget(request) {
   target.pathname = `${basePath}/api/ai/sandbox-tools/${match[1]}/mcp`;
   target.search = "";
   return target;
+}
+
+function gitRelayTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (incoming.host !== proxyAuthority) return null;
+  let match;
+  if (request.method === "GET") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/git\/([a-f0-9]{32})\/([1-9][0-9]*)\/(info\/refs)$/
+    );
+    if (!match ||
+        !["?service=git-upload-pack", "?service=git-receive-pack"].includes(incoming.search)) {
+      return null;
+    }
+  } else if (request.method === "POST") {
+    match = incoming.pathname.match(
+      /^\/\.temps\/git\/([a-f0-9]{32})\/([1-9][0-9]*)\/(git-upload-pack|git-receive-pack)$/
+    );
+    if (!match || incoming.search) return null;
+  } else {
+    return null;
+  }
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/git/sandbox-relay/${match[1]}/${match[2]}/${match[3]}`;
+  target.search = incoming.search;
+  return target;
+}
+
+function gitRelayAuthorized(_request) {
+  // Fail closed until the control plane issues and the sidecar verifies a
+  // credential that is independent of the relay URL and Host header.
+  return false;
+}
+
+async function forwardGitRelay(request, response) {
+  const target = gitRelayTarget(request);
+  if (!target || !gitRelayAuthorized(request)) {
+    throw new Error("Git relay target is not authorized");
+  }
+  await forward(request, response, target, true);
 }
 
 async function forward(request, response, target, allowPrivate) {
@@ -745,7 +834,7 @@ async function forward(request, response, target, allowPrivate) {
   request.pipe(upstream);
 }
 
-const server = http.createServer(async (request, response) => {
+async function handleRequest(request, response) {
   try {
     const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
     const relayTarget = modelRelayTarget(request);
@@ -761,6 +850,10 @@ const server = http.createServer(async (request, response) => {
       await forward(request, response, target, true);
       return;
     }
+    if (incoming.host === proxyAuthority && incoming.pathname.startsWith("/.temps/git/")) {
+      await forwardGitRelay(request, response);
+      return;
+    }
     const target = new URL(request.url);
     const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
     if (target.protocol !== "http:" || target.username || target.password ||
@@ -772,7 +865,9 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(403, { "content-type": "text/plain" });
     response.end("destination denied\n");
   }
-});
+}
+
+const server = http.createServer(handleRequest);
 
 server.on("connect", async (request, client, head) => {
   try {
@@ -1366,27 +1461,35 @@ impl DockerSandboxProvider {
         label: &str,
         cmd: Vec<String>,
     ) -> Result<i64, AgentError> {
+        self.run_exec_config(
+            container_id,
+            run_id,
+            label,
+            bollard::models::ExecConfig {
+                user: Some("0:0".to_string()),
+                cmd: Some(cmd),
+                // Root maintenance commands (`chown`, `su`, `cp`, `curl`,
+                // `sh`) are resolved through PATH. The sandbox image puts
+                // user-writable directories ahead of system ones.
+                env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn run_exec_config(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        config: bollard::models::ExecConfig,
+    ) -> Result<i64, AgentError> {
         let exec = self
             .docker
-            .create_exec(
-                container_id,
-                bollard::models::ExecConfig {
-                    user: Some("0:0".to_string()),
-                    cmd: Some(cmd),
-                    // Root maintenance commands (`chown`, `su`, `cp`, `curl`,
-                    // `sh`) are resolved through PATH. The sandbox image puts
-                    // user-writable directories — `{home}/.local/bin`,
-                    // `{home}/.bun/bin` — ahead of the system ones, so a
-                    // sandbox user could drop their own `chown` there and have
-                    // it executed as container root on the next recovery or
-                    // restart. Pin PATH to system directories only; nothing
-                    // Temps runs as root lives in the sandbox user's tree.
-                    env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
+            .create_exec(container_id, config)
             .await
             .map_err(|e| AgentError::SandboxCreationFailed {
                 run_id,
@@ -1417,7 +1520,9 @@ impl DockerSandboxProvider {
         if let StartExecResults::Attached { mut output, .. } = output {
             while let Some(chunk) = output.next().await {
                 if let Ok(LogOutput::StdErr { message }) = chunk {
-                    let text = String::from_utf8_lossy(&message);
+                    // A faulty image can print indefinitely; retain only a small diagnostic tail.
+                    let available = 4096usize.saturating_sub(stderr_tail.len());
+                    let text = String::from_utf8_lossy(&message[..message.len().min(available)]);
                     stderr_tail.push_str(&text);
                 }
             }
@@ -3031,6 +3136,104 @@ impl DockerSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for DockerSandboxProvider {
+    async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        let info = self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("inspect immutable container image identity: {source}"),
+            })?;
+        info.image
+            .filter(|id| {
+                id.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+            .ok_or_else(|| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "container has no immutable sha256 image identity".into(),
+            })
+    }
+    async fn check_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        let config = bollard::models::ExecConfig {
+            user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+            cmd: Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "check".into(),
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.run_exec_config(&handle.sandbox_id, 0, "runtime-compatibility", config),
+        )
+        .await
+        {
+            Ok(Ok(0)) => Ok(RuntimeCompatibility::Compatible),
+            Ok(Ok(2)) => Ok(RuntimeCompatibility::Unavailable {
+                reason: "retained agent runtime socket is unavailable or probe timed out".into(),
+            }),
+            Ok(Ok(code)) => Ok(RuntimeCompatibility::Incompatible {
+                reason: format!(
+                    "runtime SDK protocol probe exited {code}; image may have an older runtime"
+                ),
+            }),
+            Ok(Err(error)) => Ok(RuntimeCompatibility::Unavailable {
+                reason: error.to_string(),
+            }),
+            Err(_) => Ok(RuntimeCompatibility::Unavailable {
+                reason: "runtime SDK protocol probe timed out after 5 seconds".into(),
+            }),
+        }
+    }
+    async fn recover_agent_harness(
+        &self,
+        handle: &SandboxHandle,
+        epoch: u64,
+    ) -> Result<(), AgentError> {
+        let config = bollard::models::ExecConfig {
+            // Only a host-issued root Docker exec may reclaim daemon turns.
+            // Ordinary harness processes run as SANDBOX_UID.
+            user: Some("0:0".into()),
+            cmd: Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "recover-harness".into(),
+                epoch.to_string(),
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.run_exec_config(&handle.sandbox_id, 0, "recover-harness", config),
+        ).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("harness recovery exited {code}; update the workspace runtime if its image lacks recover-harness"),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "harness recovery timed out before provider termination could be confirmed".into(),
+            }),
+        }
+    }
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
         // Resolve the request override exactly once. Provisioning, proxy
@@ -3406,14 +3609,11 @@ impl SandboxProvider for DockerSandboxProvider {
             let mut ready = false;
             for _ in 0..20 {
                 if matches!(
-                    self.run_root_exec(
+                    self.run_exec_config(
                         &container.id,
                         config.run_id,
                         "runtime-health",
-                        vec![
-                            "/usr/local/bin/temps-sandbox-runtime".into(),
-                            "request".into(),
-                        ],
+                        runtime_health_exec_config(),
                     )
                     .await,
                     Ok(0)
@@ -3462,6 +3662,19 @@ impl SandboxProvider for DockerSandboxProvider {
         )
         .await?;
         Ok(SANDBOX_MODEL_RELAY_BASE_URL.to_string())
+    }
+
+    async fn git_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        _control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "Git relay is disabled until sidecar capability authentication is implemented"
+                .to_string(),
+        })
     }
 
     async fn harness_mcp_url(
@@ -3648,6 +3861,61 @@ impl SandboxProvider for DockerSandboxProvider {
             }
         }
         Ok(())
+    }
+
+    async fn connect_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<PtyAttachment, AgentError> {
+        let failure = |operation: &str, error: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("retained agent runtime {operation} failed: {error}"),
+        };
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, agent_runtime_exec_config())
+            .await
+            .map_err(|error| failure("create connection", error.to_string()))?;
+        let attached = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    tty: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| failure("open connection", error.to_string()))?;
+        match attached {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                let output = output.filter_map(move |item| {
+                    let sandbox_id = sandbox_id.clone();
+                    async move {
+                        match item {
+                            Ok(LogOutput::StdOut { message }) => Some(Ok(message)),
+                            // Never mix diagnostics into binary protocol frames or expose their payload.
+                            Ok(LogOutput::StdErr { .. }) | Err(_) => Some(Err(AgentError::SandboxExecFailed {
+                                run_id: 0, sandbox_id,
+                                reason: "retained agent runtime connection failed; verify the sandbox image supports the agent daemon protocol".into(),
+                            })),
+                            Ok(_) => None,
+                        }
+                    }
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(failure(
+                "open connection",
+                "Docker did not attach the protocol streams".into(),
+            )),
+        }
     }
 
     async fn exec(
@@ -3982,6 +4250,11 @@ impl SandboxProvider for DockerSandboxProvider {
 
         let options = bollard::query_parameters::UploadToContainerOptionsBuilder::default()
             .path(&parent_dir)
+            // Preserve the tar header's explicit uid/gid. Docker's
+            // copyUIDGID=true rewrites uploads to the configured container
+            // user, which would make root-staged attachments mutable by the
+            // harness uid.
+            .copy_uidgid("false")
             .build();
 
         let body = bollard::body_full(tar_bytes.into());
@@ -5554,6 +5827,24 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn retained_runtime_connection_is_unprivileged_binary_duplex_not_a_shell() {
+        let config = super::agent_runtime_exec_config();
+        assert_eq!(config.user.as_deref(), Some("1000:1000"));
+        assert_eq!(config.tty, Some(false));
+        assert_eq!(config.attach_stdin, Some(true));
+        assert_eq!(config.attach_stdout, Some(true));
+        assert_eq!(config.attach_stderr, Some(true));
+        assert_eq!(
+            config.cmd,
+            Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".into(),
+                "connect".into()
+            ])
+        );
+        assert!(config.env.is_none());
+    }
+
+    #[test]
     fn exec_frames_preserve_split_utf8_and_json_lines() {
         let mut bytes = b"{\"text\":\"".to_vec();
         let mut emitted = 0;
@@ -6014,6 +6305,23 @@ mod tests {
         assert!(entries.contains(&"/bin"));
         assert!(entries.contains(&"/usr/sbin"));
         assert!(entries.contains(&"/sbin"));
+    }
+
+    #[test]
+    fn runtime_health_probe_uses_sandbox_uid_without_a_tty() {
+        let config = runtime_health_exec_config();
+        assert_eq!(
+            config.user.as_deref(),
+            Some(format!("{SANDBOX_UID}:{SANDBOX_GID}").as_str())
+        );
+        assert_eq!(
+            config.cmd,
+            Some(vec![
+                "/usr/local/bin/temps-sandbox-runtime".to_string(),
+                "request".to_string(),
+            ])
+        );
+        assert_ne!(config.tty, Some(true));
     }
 
     /// Regression: the PATH pin has to cover *every* root exec, not just
@@ -7556,13 +7864,17 @@ mod tests {
             "http://temps-sandbox-egress-proxy:3128/.temps/model-relay"
         );
         for required_guard in [
-            "request.method !== \"POST\"",
             "incoming.host !== proxyAuthority",
-            "incoming.pathname.match",
+            "request.method === \"POST\"",
+            "request.method === \"GET\"",
             "[a-f0-9]{32}",
             "v1\\/messages(?:\\/count_tokens)?",
+            "|responses",
+            r"\/(models)",
+            "key !== \"client_version\"",
+            "[A-Za-z0-9._+-]{1,64}",
             "/api/ai/sandbox-models/",
-            "target.search = \"\";",
+            "target.search = incoming.search",
             "if (!relayTarget) throw new Error",
         ] {
             assert!(
@@ -7586,6 +7898,221 @@ mod tests {
             &matching_container,
             SANDBOX_HOST_GATEWAY
         ));
+    }
+
+    #[test]
+    fn sandbox_proxy_executes_strict_model_relay_query_policy() {
+        let function_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function modelRelayTarget(request) {")
+            .expect("model relay policy function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[function_start..]
+            .find("\n\nfunction mcpTarget(request) {")
+            .map(|offset| function_start + offset)
+            .expect("end of model relay policy function");
+        let function = &SANDBOX_EGRESS_PROXY_SCRIPT[function_start..function_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL("http://host.docker.internal:8080");
+{function}
+const relay = "0123456789abcdef0123456789abcdef";
+const target = (method, suffix) => modelRelayTarget({{
+  method,
+  url: `/.temps/model-relay/${{relay}}/${{suffix}}`,
+  headers: {{ host: proxyAuthority }},
+}});
+const accepted = [
+  target("POST", "v1/messages?beta=true"),
+  target("POST", "v1/messages/count_tokens?beta=true"),
+];
+if (accepted.some((value) => !value || value.search !== "?beta=true")) process.exit(1);
+const denied = [
+  target("POST", "responses?beta=true"),
+  target("POST", "v1/messages?beta=false"),
+  target("POST", "v1/messages?beta=true&beta=true"),
+  target("POST", "v1/messages?other=true"),
+  target("POST", "v1/messages?beta=true&other=true"),
+];
+if (denied.some(Boolean)) process.exit(2);
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping executable proxy policy regression: Node.js is unavailable");
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js proxy policy regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "proxy policy regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_bounded_git_smart_http_routes() {
+        for required_guard in [
+            "incoming.host !== proxyAuthority",
+            "request.method === \"GET\"",
+            "request.method === \"POST\"",
+            "([a-f0-9]{32})",
+            "([1-9][0-9]*)",
+            "git-upload-pack|git-receive-pack",
+            "?service=git-upload-pack",
+            "?service=git-receive-pack",
+            "/api/git/sandbox-relay/",
+            "if (!target || !gitRelayAuthorized(request))",
+            "await forwardGitRelay(request, response)",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "Git relay reverse proxy is missing guard: {required_guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_proxy_executes_strict_git_smart_http_policy() {
+        let function_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function gitRelayTarget(request) {")
+            .expect("Git relay policy function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[function_start..]
+            .find("\n\nasync function forward(request, response, target, allowPrivate) {")
+            .map(|offset| function_start + offset)
+            .expect("end of Git relay policy function");
+        let function = &SANDBOX_EGRESS_PROXY_SCRIPT[function_start..function_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL("http://host.docker.internal:8080/base");
+{function}
+const relay = "0123456789abcdef0123456789abcdef";
+const target = (method, suffix, host = proxyAuthority) => gitRelayTarget({{
+  method,
+  url: `/.temps/git/${{relay}}/42/${{suffix}}`,
+  headers: {{ host }},
+}});
+const accepted = [
+  target("GET", "info/refs?service=git-upload-pack"),
+  target("GET", "info/refs?service=git-receive-pack"),
+  target("POST", "git-upload-pack"),
+  target("POST", "git-receive-pack"),
+];
+if (accepted.some((value) => !value ||
+    !value.pathname.startsWith("/base/api/git/sandbox-relay/"))) process.exit(1);
+const denied = [
+  target("PUT", "git-upload-pack"),
+  target("GET", "git-upload-pack"),
+  target("POST", "info/refs?service=git-upload-pack"),
+  target("GET", "info/refs"),
+  target("GET", "info/refs?service=git-upload-pack&x=1"),
+  target("GET", "info/refs?service=git%2dupload-pack"),
+  target("POST", "git-upload-pack?service=git-upload-pack"),
+  target("POST", "git%2dupload-pack"),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}/0/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}/01/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay.toUpperCase()}}/42/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  gitRelayTarget({{ method: "POST", url: `/.temps/git/${{relay}}%2f42/git-upload-pack`, headers: {{ host: proxyAuthority }} }}),
+  target("POST", "git-upload-pack", "control-plane.test:8080"),
+];
+if (denied.some(Boolean)) process.exit(2);
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping executable Git relay policy regression: Node.js is unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js Git relay policy regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "Git relay policy regression failed (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_proxy_never_forwards_git_without_independent_authorization() {
+        let authorization_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("function gitRelayAuthorized(_request) {")
+            .expect("Git relay authorization function");
+        let function_end = SANDBOX_EGRESS_PROXY_SCRIPT[authorization_start..]
+            .find("\n\nasync function forward(request, response, target, allowPrivate) {")
+            .map(|offset| authorization_start + offset)
+            .expect("end of Git relay forwarding function");
+        let functions = &SANDBOX_EGRESS_PROXY_SCRIPT[authorization_start..function_end];
+        let handler_start = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find("async function handleRequest(request, response) {")
+            .expect("HTTP request handler");
+        let handler_end = SANDBOX_EGRESS_PROXY_SCRIPT[handler_start..]
+            .find("\n\nconst server = http.createServer(handleRequest);")
+            .map(|offset| handler_start + offset)
+            .expect("end of HTTP request handler");
+        let handler = &SANDBOX_EGRESS_PROXY_SCRIPT[handler_start..handler_end];
+        let script = format!(
+            r#"
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+let privateForwardCalls = 0;
+function modelRelayTarget() {{ return null; }}
+function mcpTarget() {{ return null; }}
+function gitRelayTarget() {{ return new URL("http://control-plane.test/api/git/sandbox-relay/id/1/git-upload-pack"); }}
+async function forward(_request, response, _target, allowPrivate) {{
+  if (allowPrivate) privateForwardCalls += 1;
+  response.end();
+}}
+{functions}
+{handler}
+function response() {{
+  return {{ status: 0, writeHead(code) {{ this.status = code; }}, end() {{}} }};
+}}
+(async () => {{
+  const relay = "0123456789abcdef0123456789abcdef";
+  const attempts = [
+    {{ method: "GET", url: `/.temps/git/${{relay}}/42/info/refs?service=git-upload-pack`, headers: {{ host: proxyAuthority, authorization: "Bearer fake" }} }},
+    {{ method: "POST", url: `/.temps/git/${{relay}}/42/git-receive-pack`, headers: {{ host: proxyAuthority, authorization: "Basic fake" }} }},
+    {{ method: "POST", url: `http://example.test/.temps/git/${{relay}}/42/git-upload-pack`, headers: {{ host: "example.test", authorization: "Bearer fake" }} }},
+  ];
+  for (const request of attempts) {{
+    const reply = response();
+    await handleRequest(request, reply);
+    if (request.url.startsWith("/.temps/git/") && reply.status !== 403) process.exit(1);
+  }}
+  process.exit(privateForwardCalls === 0 ? 0 : 2);
+}})();
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping executable Git authorization regression: Node.js is unavailable"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js Git authorization regression: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "unauthorized Git relay reached private forwarding (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

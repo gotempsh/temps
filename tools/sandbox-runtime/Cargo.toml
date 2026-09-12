@@ -7,16 +7,17 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Development-only package: the runtime checkout is a sibling of the Temps worktree.
+# Standalone package: the SDK revision is shared with the Temps bridge.
 [workspace]
 
 [dependencies]
-temps-agent-runtime = { path = "../../../temps-agent-runtime", default-features = false, features = ["claude", "codex", "opencode"] }
+temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "91ef59ba85140bafba6fcd50d91114e7edee99e8", default-features = false, features = ["claude", "codex", "opencode"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+async-trait = "0.1"
 base64 = "0.22"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "io-std", "process", "sync", "signal", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

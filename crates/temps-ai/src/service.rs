@@ -57,6 +57,94 @@ pub struct AiResponse {
     pub model: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeSessionExportRequest {
+    pub principal_id: i32,
+    pub provider: String,
+    pub session_id: String,
+    pub harness_workspace: crate::HarnessWorkspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeSessionExport {
+    pub provider: String,
+    pub session_id: String,
+    pub format: String,
+    pub json: String,
+    pub truncated: bool,
+}
+
+/// One server-authorized operation against the managed process supervisor in
+/// an already-running application sandbox.
+#[derive(Debug, Clone)]
+pub struct RuntimeProcessRequest {
+    pub principal_id: i32,
+    pub provider: String,
+    pub harness_workspace: crate::HarnessWorkspace,
+    pub operation: RuntimeProcessOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeProcessOperation {
+    Start {
+        idempotency_key: String,
+        name: String,
+        program: String,
+        args: Vec<String>,
+        directory: String,
+        restart: bool,
+    },
+    Status {
+        process_id: String,
+    },
+    Logs {
+        process_id: String,
+        after_sequence: Option<u64>,
+        limit: Option<u16>,
+    },
+    Stop {
+        process_id: String,
+    },
+    Restart {
+        process_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeProcessSnapshot {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    pub pid: Option<u32>,
+    pub restart_count: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeProcessLogLine {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub stream: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeProcessResponse {
+    Process {
+        process: RuntimeProcessSnapshot,
+    },
+    Logs {
+        process_id: String,
+        lines: Vec<RuntimeProcessLogLine>,
+        next_sequence: Option<u64>,
+        truncated: bool,
+    },
+}
+
 /// Why an AI call could not be completed. All variants are non-fatal — callers
 /// fall back to non-AI behaviour.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +159,9 @@ pub enum AiError {
     /// The provider/gateway returned an error.
     #[error("AI provider error for '{purpose}': {reason}")]
     Provider { purpose: String, reason: String },
+    /// Retained runtime diagnostic after exact turn-secret redaction at source.
+    #[error("retained AI harness error for '{purpose}': {reason}")]
+    RetainedHarnessDiagnostic { purpose: String, reason: String },
 }
 
 /// The governed AI capability. Object-safe so it can be registered and resolved
@@ -157,6 +248,27 @@ pub trait AiService: Send + Sync {
 
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
+
+    /// Export a provider-native session after the caller has resolved and
+    /// authorized its persistent workspace. Implementations must sanitize and
+    /// bound the payload; `None` means the selected provider has no native
+    /// export contract.
+    async fn export_native_session(
+        &self,
+        _request: NativeSessionExportRequest,
+    ) -> Result<Option<NativeSessionExport>, AiError> {
+        Ok(None)
+    }
+
+    /// Operate the runtime daemon's bounded process supervisor in a workspace
+    /// that the caller has already authorized. Implementations must not create,
+    /// wake, or replace a sandbox while serving this method.
+    async fn runtime_process(
+        &self,
+        _request: RuntimeProcessRequest,
+    ) -> Result<RuntimeProcessResponse, AiError> {
+        Err(AiError::NotAvailable)
+    }
 
     /// Low-level completion. Prefer the [`crate::complete_text`] /
     /// [`crate::complete_typed`] helpers for everyday use.

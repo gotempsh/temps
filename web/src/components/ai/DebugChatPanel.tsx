@@ -40,7 +40,17 @@ import {
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
+import { SessionDiagnostics } from './SessionDiagnostics'
+import { ContextWindow, type ContextUsage } from './ContextWindow'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -69,7 +79,6 @@ import {
   Shield,
   Sparkles,
   Square,
-  Wrench,
   X,
 } from 'lucide-react'
 import {
@@ -98,6 +107,7 @@ import {
   chatHarnessProviderOptions,
   providerCatalogNeedsRefresh,
   chatModelLabel,
+  chatModelProviderLabel,
   chatPermissionLabel,
   chatProviderLabel,
   chatThinkingItemContent,
@@ -115,6 +125,8 @@ import {
 } from './chat-page-state'
 import {
   assistantParts,
+  upsertMessageTool,
+  toolExecutionState,
   isTempsWriteToolName,
   type ChatMessage,
   type ChatAttachment,
@@ -133,9 +145,12 @@ import {
   projectCollectionFromTool,
 } from './tool-result-presentation'
 import {
+  attachmentSelectionError,
   createPendingAttachment,
   revokeAttachmentPreviews,
 } from './attachment-previews'
+import { ChatFailureActions } from './ChatFailureActions'
+import { isHarnessFailure } from './chat-failure-recovery'
 
 /** A minimal mdast node (only the fields this file touches). */
 interface MdNode {
@@ -257,7 +272,7 @@ function formatAttachmentSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
-function ChatAttachments({
+export function ChatAttachments({
   attachments,
   onRemove,
   contentBase,
@@ -273,9 +288,13 @@ function ChatAttachments({
         const contentUrl = contentBase
           ? `${contentBase}/${encodeURIComponent(attachment.id)}?name=${encodeURIComponent(attachment.name)}`
           : undefined
-        const previewUrl =
-          attachment.preview_url ??
-          (attachment.is_image ? contentUrl : undefined)
+        // Composer blobs are revoked after send. Optimistic sent messages may
+        // still carry that blob URL, so persisted cards must prefer the server.
+        const previewUrl = attachment.is_image
+          ? onRemove
+            ? (attachment.preview_url ?? contentUrl)
+            : (contentUrl ?? attachment.preview_url)
+          : undefined
         const contents = (
           <>
             {attachment.is_image && previewUrl ? (
@@ -295,20 +314,51 @@ function ChatAttachments({
                 {formatAttachmentSize(attachment.size_bytes)}
               </p>
             </div>
-            {onRemove && (
-              <button
-                type="button"
-                onClick={() => onRemove(attachment.id)}
-                className="absolute right-1 top-1 rounded-full bg-background/90 p-0.5 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/attachment:opacity-100"
-                aria-label={`Remove ${attachment.name}`}
-              >
-                <X className="size-3" />
-              </button>
-            )}
           </>
         )
         const className =
           'group/attachment relative flex max-w-56 items-center gap-2 overflow-hidden rounded-lg border border-border/70 bg-background/80 p-1.5 text-left text-foreground'
+        if (attachment.is_image && previewUrl) {
+          return (
+            <div key={attachment.id} className="group/attachment relative">
+              <Dialog>
+                <DialogTrigger asChild>
+                  <button
+                    type="button"
+                    className={`${className} cursor-zoom-in pr-6 transition-colors hover:bg-muted/70`}
+                    aria-label={`Expand ${attachment.name}`}
+                  >
+                    {contents}
+                  </button>
+                </DialogTrigger>
+                <DialogContent className="w-[calc(100vw-2rem)] max-w-5xl">
+                  <DialogTitle className="break-all pr-6">
+                    {attachment.name}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {formatAttachmentSize(attachment.size_bytes)} · Image
+                    attachment
+                  </DialogDescription>
+                  <img
+                    src={previewUrl}
+                    alt={attachment.name}
+                    className="max-h-[75dvh] w-full object-contain"
+                  />
+                </DialogContent>
+              </Dialog>
+              {onRemove && (
+                <button
+                  type="button"
+                  onClick={() => onRemove(attachment.id)}
+                  className="absolute right-1 top-1 rounded-full bg-background/90 p-0.5 text-muted-foreground hover:text-foreground"
+                  aria-label={`Remove ${attachment.name}`}
+                >
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          )
+        }
         return contentUrl && !onRemove ? (
           <a
             key={attachment.id}
@@ -323,6 +373,15 @@ function ChatAttachments({
         ) : (
           <div key={attachment.id} className={className}>
             {contents}
+            {onRemove && (
+              <button
+                type="button"
+                onClick={() => onRemove(attachment.id)}
+                aria-label={`Remove ${attachment.name}`}
+              >
+                <X className="size-3" />
+              </button>
+            )}
           </div>
         )
       })}
@@ -336,7 +395,7 @@ function ChatAttachments({
  * answerable card rather than the inert "asked" text alone — used both on
  * initial load and by `pollForReply`'s fallback refetch.
  */
-function mapConversationDetail(detail: {
+export function mapConversationDetail(detail: {
   messages?: Array<{
     cursor?: string
     role: string
@@ -347,15 +406,35 @@ function mapConversationDetail(detail: {
     attachments?: ChatAttachment[] | null
   }> | null
   pending_permission?: PermissionRequest | null
+  turn_status?: string | null
 }): ChatMessage[] {
+  const interrupted =
+    !detail.pending_permission &&
+    ['completed', 'failed', 'cancelled', 'canceled', 'interrupted'].includes(
+      detail.turn_status ?? ''
+    )
+  const finishTool = (tool: ToolCall): ToolCall =>
+    interrupted && tool.result == null
+      ? {
+          ...tool,
+          result: JSON.stringify({
+            is_error: true,
+            status: 'interrupted',
+            error:
+              'Tool interrupted: the turn ended before a result was received.',
+          }),
+        }
+      : tool
   const mapped: ChatMessage[] = (detail.messages ?? []).map((m) => {
-    const rawParts = m.parts
+    const rawParts = m.parts?.map((part): ChatPart =>
+      part.type === 'tool' ? { ...part, tool: finishTool(part.tool) } : part
+    )
     return {
       server_cursor: m.cursor,
       role: m.role,
       content: m.content,
       created_at: m.created_at,
-      tools: m.tools ?? undefined,
+      tools: m.tools?.map(finishTool) ?? undefined,
       parts: rawParts && rawParts.length > 0 ? rawParts : undefined,
       attachments: m.attachments ?? undefined,
     }
@@ -466,6 +545,22 @@ export function parseChatFailure(data: string): ChatFailure {
     // A legacy server may send a raw provider error. Never render it.
   }
   return UNKNOWN_CHAT_FAILURE
+}
+
+/** Restore the durable failure, including when its live event was missed. */
+export function conversationFailure(detail: {
+  turn_status?: string
+  failure?: ChatFailure | null
+}): ChatFailure | null {
+  if (detail.turn_status !== 'failed') return null
+  if (detail.failure) return parseChatFailure(JSON.stringify(detail.failure))
+  return {
+    code: 'harness_failure_details_unavailable',
+    title: 'This turn failed',
+    detail:
+      'The error explanation was not retained for this turn. Retry the message to get a current result or an error explanation.',
+    retryable: true,
+  }
 }
 
 export function chatFailureFromProblem(
@@ -579,7 +674,7 @@ export function appendLiveUserTurn(
  * is a short-lived HTTP command; all live token/tool/permission output has one
  * transport and therefore cannot be duplicated by an SSE echo.
  */
-function applyWireEvent(
+export function applyWireEvent(
   eventName: string,
   data: string,
   setMessages: SetMessages,
@@ -597,8 +692,14 @@ function applyWireEvent(
         name: string
         arguments: string
       }
+      if (
+        typeof t.id !== 'string' ||
+        typeof t.name !== 'string' ||
+        typeof t.arguments !== 'string'
+      )
+        return
       setMessages((m) => {
-        const copy = [...m]
+        const copy = [...ensureRunningAssistant(m, true)]
         const last = copy[copy.length - 1]
         if (last?.role === 'assistant') {
           const tool: ToolCall = {
@@ -607,11 +708,7 @@ function applyWireEvent(
             arguments: t.arguments,
             result: undefined,
           }
-          copy[copy.length - 1] = {
-            ...last,
-            tools: [...(last.tools ?? []), tool],
-            parts: [...(last.parts ?? []), { type: 'tool', tool }],
-          }
+          copy[copy.length - 1] = upsertMessageTool(last, tool)
         }
         return copy
       })
@@ -627,21 +724,22 @@ function applyWireEvent(
         name: string
         content: string
       }
+      if (
+        typeof t.id !== 'string' ||
+        typeof t.name !== 'string' ||
+        typeof t.content !== 'string'
+      )
+        return
       setMessages((m) => {
-        const copy = [...m]
+        const copy = [...ensureRunningAssistant(m, true)]
         const last = copy[copy.length - 1]
         if (last?.role === 'assistant') {
-          copy[copy.length - 1] = {
-            ...last,
-            tools: (last.tools ?? []).map((tool) =>
-              tool.id === t.id ? { ...tool, result: t.content } : tool
-            ),
-            parts: (last.parts ?? []).map((part) =>
-              part.type === 'tool' && part.tool.id === t.id
-                ? { type: 'tool', tool: { ...part.tool, result: t.content } }
-                : part
-            ),
-          }
+          copy[copy.length - 1] = upsertMessageTool(last, {
+            id: t.id,
+            name: t.name,
+            arguments: '',
+            result: t.content,
+          })
         }
         return copy
       })
@@ -738,12 +836,63 @@ function messageCopyText(m: ChatMessage): string {
  * Falls back to the tool name for other tools or unparsable args.
  */
 export function toolLabel(tool: ToolCall): string {
+  const summary = toolOperationLabel(tool)
+  if (!tool.name.startsWith('mcp__')) return summary
+  const [, server, ...functionParts] = tool.name.split('__')
+  const functionName = functionParts.join('__')
+  if (!server || !functionName) return summary
+  const identity = `${server} · ${functionName}`
+  if (summary === tool.name || summary === functionName) return identity
+  const details = summary.startsWith(`${functionName} · `)
+    ? summary.slice(functionName.length + 3)
+    : summary
+  return `${identity} · ${details}`
+}
+
+function toolOperationLabel(tool: ToolCall): string {
   // MCP clients qualify tool names as `mcp__<server>__<tool>`. The chat wire
   // persists that provider-native name so it can be inspected later, but the
-  // compact row should describe the operation rather than the transport.
+  // compact row also describes the operation; toolLabel retains MCP identity.
   const qualifiedNameParts = tool.name.split('__')
   const baseName =
     qualifiedNameParts[qualifiedNameParts.length - 1] || tool.name
+
+  const processLabels: Record<string, string> = {
+    temps_process_start: 'Start process',
+    temps_process_status: 'Process status',
+    temps_process_logs: 'Process logs',
+    temps_process_stop: 'Stop process',
+    temps_process_restart: 'Restart process',
+  }
+  const processLabel = Object.prototype.hasOwnProperty.call(
+    processLabels,
+    baseName
+  )
+    ? processLabels[baseName]
+    : undefined
+  if (processLabel) {
+    try {
+      const input: unknown = JSON.parse(tool.arguments)
+      if (typeof input === 'object' && input !== null) {
+        const args = input as Record<string, unknown>
+        const target =
+          baseName === 'temps_process_start' ? args.name : args.process_id
+        const details = [
+          target,
+          baseName === 'temps_process_start' ? args.program : undefined,
+        ]
+          .filter(
+            (value): value is string =>
+              typeof value === 'string' && value.trim().length > 0
+          )
+          .map((value) => value.trim())
+        if (details.length) return `${processLabel} · ${details.join(' · ')}`
+      }
+    } catch {
+      // Keep the operation visible while streamed arguments are incomplete.
+    }
+    return processLabel
+  }
 
   if (baseName === 'temps' || baseName === 'temps_write') {
     try {
@@ -772,7 +921,7 @@ export function toolLabel(tool: ToolCall): string {
   // Native harness events (Claude Code today) use the same tool card. Surface
   // the command directly so a sequence of `Bash` calls is useful at a glance;
   // the full, redacted arguments remain available when expanded.
-  if (baseName === 'Bash') {
+  if (baseName.toLowerCase() === 'bash') {
     try {
       const args = JSON.parse(tool.arguments) as { command?: unknown }
       if (typeof args.command === 'string' && args.command.trim()) {
@@ -786,10 +935,11 @@ export function toolLabel(tool: ToolCall): string {
   // cards. The path is safe to surface here: it is already part of the
   // redacted native tool event, and it gives the person reviewing the turn a
   // precise answer to "what did it touch?" without opening every card.
-  if (baseName === 'Read' || baseName === 'Edit' || baseName === 'Write') {
+  if (['read', 'edit', 'write'].includes(baseName.toLowerCase())) {
     try {
       const args = JSON.parse(tool.arguments) as Record<string, unknown>
-      const path = args.file_path ?? args.path ?? args.target_file
+      const path =
+        args.file_path ?? args.filePath ?? args.path ?? args.target_file
       if (typeof path === 'string' && path.trim()) {
         return `${baseName} · ${path.trim()}`
       }
@@ -797,11 +947,107 @@ export function toolLabel(tool: ToolCall): string {
       /* fall through to the tool name */
     }
   }
+  try {
+    const input = JSON.parse(tool.arguments)
+    const summary =
+      typeof input === 'object' && input !== null
+        ? (input.command ??
+          input.query ??
+          input.description ??
+          input.path ??
+          JSON.stringify(input))
+        : input
+    if (typeof summary === 'string' && summary && summary !== '{}') {
+      return `${baseName} · ${summary}`
+    }
+  } catch {
+    // Partial streamed JSON is available under Input once complete.
+  }
   return tool.name
 }
 
 const toolBlockClasses =
   'max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 font-mono text-[11px]'
+
+/** A process receipt is a lifecycle observation, never an HTTP readiness claim. */
+export function processToolSummary(tool: ToolCall): string | undefined {
+  const name = tool.name.split('__').at(-1)
+  if (
+    !name ||
+    ![
+      'temps_process_start',
+      'temps_process_status',
+      'temps_process_logs',
+      'temps_process_stop',
+      'temps_process_restart',
+    ].includes(name) ||
+    !tool.result
+  )
+    return undefined
+  try {
+    const receipt = JSON.parse(tool.result)
+    if (!receipt || typeof receipt !== 'object') return undefined
+    if (
+      receipt.type === 'process' &&
+      receipt.process &&
+      typeof receipt.process === 'object'
+    ) {
+      const process = receipt.process
+      const states: Record<string, string> = {
+        starting: 'Starting',
+        running: 'Running',
+        stopped: 'Stopped',
+        stopping: 'Stopping',
+        exited: 'Exited',
+        failed: 'Failed',
+        restarting: 'Restarting',
+        queued: 'Queued',
+        succeeded: 'Exited successfully',
+        cancelled: 'Stopped',
+      }
+      if (
+        typeof process.status !== 'string' ||
+        !Object.prototype.hasOwnProperty.call(states, process.status)
+      )
+        return undefined
+      const pid =
+        Number.isInteger(process.pid) && process.pid > 0
+          ? ` · PID ${process.pid}`
+          : ''
+      const failure =
+        process.status === 'failed' &&
+        typeof process.detail === 'string' &&
+        process.detail.trim()
+          ? ` · ${process.detail.trim().slice(0, 240)}`
+          : ''
+      return `${states[process.status]}${pid}${failure}`
+    }
+    if (receipt.type === 'logs' && Array.isArray(receipt.lines)) {
+      return `${receipt.lines.length} log ${receipt.lines.length === 1 ? 'line' : 'lines'}${receipt.truncated === true ? ' · Limited output' : ''}`
+    }
+  } catch {
+    // Unknown/older result formats remain available in the expanded result.
+  }
+  return undefined
+}
+
+function toolFailureText(result: string | null | undefined): string {
+  if (!result) return 'The tool failed without providing error details.'
+  try {
+    const error = JSON.parse(result)
+    if (
+      error &&
+      typeof error === 'object' &&
+      error.is_error === true &&
+      typeof error.error === 'string'
+    ) {
+      return error.error
+    }
+  } catch {
+    // Native command output is already readable text.
+  }
+  return result
+}
 
 /**
  * Render a tool's arguments/result. JSON is syntax-highlighted via the same
@@ -831,36 +1077,77 @@ function ToolBlock({ value }: { value: string }) {
 }
 
 /** A collapsible card for one tool invocation + its result. */
-function ToolCard({ tool }: { tool: ToolCall }) {
+export function ToolCard({ tool }: { tool: ToolCall }) {
   const [open, setOpen] = useState(false)
-  const running = tool.result === undefined
+  const state = toolExecutionState(tool)
+  const running = state === 'running'
+  const failed = state === 'failed'
   const label = toolLabel(tool)
+  const processSummary =
+    !running && !failed ? processToolSummary(tool) : undefined
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border bg-muted/40 text-xs">
+    <div
+      className={cn(
+        'min-w-0 overflow-hidden rounded-lg border bg-muted/40 text-xs',
+        failed && 'border-destructive/40'
+      )}
+    >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
         className="flex w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-muted/70"
         aria-expanded={open}
       >
-        <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        {running ? (
+          <Loader2
+            className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground"
+            aria-label="Tool running"
+          />
+        ) : failed ? (
+          <X
+            className="h-3.5 w-3.5 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+        ) : (
+          <Check
+            className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+            aria-label="Tool completed"
+          />
+        )}
         <span
           className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium"
           title={label}
         >
           {label}
         </span>
-        {running && <ActivityIndicator compact label="Running" />}
+        {failed && (
+          <span className="shrink-0 font-medium text-destructive">Failed</span>
+        )}
         {open ? (
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         ) : (
           <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         )}
       </button>
+      {processSummary && !open && (
+        <div className="border-t px-2.5 py-1.5 text-muted-foreground">
+          {processSummary}
+        </div>
+      )}
+      {failed && !open && (
+        <div
+          className="max-h-32 overflow-auto border-t border-destructive/20 px-2.5 py-2 text-destructive"
+          role="alert"
+        >
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11px]">
+            {toolFailureText(tool.result)}
+          </pre>
+        </div>
+      )}
       {open && (
         <div className="min-w-0 space-y-2 border-t px-2.5 py-2">
           <div className="min-w-0 space-y-1">
-            <div className="font-medium text-muted-foreground">Arguments</div>
+            <div className="font-medium text-muted-foreground">Input</div>
             <ToolBlock value={tool.arguments} />
           </div>
           {!running && (
@@ -1742,6 +2029,8 @@ interface DebugChatPanelProps {
   onConversationStatusInvalidated?: () => void
   /** Show persisted history without exposing mutation controls. */
   readOnly?: boolean
+  /** Prevent new turns without hiding saved history or the composer draft. */
+  runtimeUpdateRequired?: boolean
 }
 
 export function chatApiPaths(userScoped: boolean, projectId?: number) {
@@ -2117,9 +2406,10 @@ function AssistantBody({
           <MarkdownText key={`text-${idx}`} text={part.text} />
         )
       )}
-      {shouldShowAssistantActivityAfterContent(parts.length, streaming) && (
-        <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
-      )}
+      {shouldShowAssistantActivityAfterContent(parts.length, streaming) &&
+        !parts.some((part) => part.type === 'tool') && (
+          <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+        )}
     </>
   )
 }
@@ -2233,6 +2523,7 @@ function useConversationStream(
   suppressRef: { current: number },
   setMessages: SetMessages,
   setError: SetChatFailure,
+  setContextUsage: React.Dispatch<React.SetStateAction<ContextUsage | null>>,
   setWsTurnActive: React.Dispatch<React.SetStateAction<boolean>>,
   setTurnStartedAt: React.Dispatch<React.SetStateAction<string | null>>,
   setLiveUpdatesUnavailable: React.Dispatch<React.SetStateAction<boolean>>,
@@ -2296,6 +2587,8 @@ function useConversationStream(
           )
           setWsTurnActive(running)
           setTurnStartedAt(running ? (data.turn_started_at ?? null) : null)
+          setError(conversationFailure(data))
+          setContextUsage(data.context_usage ?? null)
           return running
         }
       } catch {
@@ -2336,6 +2629,21 @@ function useConversationStream(
         const data = frame.data ?? ''
         liveEventRevision += 1
         onLiveEventRef.current?.(eventName, data)
+        if (eventName === 'context_usage') {
+          try {
+            const usage = JSON.parse(data) as ContextUsage | null
+            if (
+              usage === null ||
+              (Number.isSafeInteger(usage.used_tokens) &&
+                usage.used_tokens >= 0)
+            ) {
+              setContextUsage(usage)
+            }
+          } catch {
+            // The next authoritative snapshot restores malformed/missed events.
+          }
+          return
+        }
         if (shouldSuppressPermissionPollEvent(eventName, suppressRef.current)) {
           return
         }
@@ -2359,10 +2667,10 @@ function useConversationStream(
             const running = turnStateNeedsResync(state.status)
             setWsTurnActive(running)
             setTurnStartedAt(running ? (state.turn_started_at ?? null) : null)
-            // The initial WS snapshot contains lifecycle state, not the
-            // pending permission payload. Reconcile immediately so a request
-            // emitted before this tab subscribed is still actionable.
-            if (running) void resync()
+            // Lifecycle snapshots omit both approvals and failure details.
+            // Reconcile terminal states too: a failure may have happened
+            // between the initial history request and this subscription.
+            void resync()
           } catch {
             setWsTurnActive(false)
             setTurnStartedAt(null)
@@ -2454,6 +2762,7 @@ function useConversationStream(
     suppressRef,
     setMessages,
     setError,
+    setContextUsage,
     setWsTurnActive,
     setTurnStartedAt,
     setLiveUpdatesUnavailable,
@@ -2507,6 +2816,7 @@ export function DebugChatPanel({
   onLiveEvent,
   onConversationStatusInvalidated,
   readOnly = false,
+  runtimeUpdateRequired = false,
 }: DebugChatPanelProps) {
   const paths = chatApiPaths(userScoped, projectId)
   const base = paths.conversations
@@ -2565,6 +2875,13 @@ export function DebugChatPanel({
     return provider.models.map((model) => ({
       value: model.id,
       label: chatModelLabel(provider, model),
+      group: chatModelProviderLabel(provider, model),
+      groupIcon: (
+        <AiAgentLogo
+          provider={chatModelProviderLabel(provider, model)}
+          size={20}
+        />
+      ),
       keywords: model.id,
     }))
   })()
@@ -2575,6 +2892,7 @@ export function DebugChatPanel({
   const pendingAttachmentsRef = useRef<ChatAttachment[]>([])
   const attachmentsMountedRef = useRef(true)
   const [attachmentUploads, setAttachmentUploads] = useState(0)
+  const attachmentUploadLock = useRef(false)
   const attachmentInputRef = useRef<HTMLInputElement>(null)
   const [input, setInput] = useState(() => {
     try {
@@ -2605,6 +2923,7 @@ export function DebugChatPanel({
     setHistoryReloadNonce((nonce) => nonce + 1)
   }, [])
   const [error, setError] = useState<ChatFailure | null>(null)
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const historyPageRequestRef = useRef(false)
   const prependScrollAnchorRef = useRef<{
@@ -2835,6 +3154,7 @@ export function DebugChatPanel({
     wsSuppressRef,
     setMessages,
     setError,
+    setContextUsage,
     setWsTurnActive,
     setTurnStartedAt,
     setLiveUpdatesUnavailable,
@@ -2878,7 +3198,9 @@ export function DebugChatPanel({
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
   const composerDisabled =
-    readOnly || isChatComposerDisabled(Boolean(publicId), starting, lazyCreate)
+    readOnly ||
+    runtimeUpdateRequired ||
+    isChatComposerDisabled(Boolean(publicId), starting, lazyCreate)
 
   // `autoFocus` handles a composer that mounts enabled. Existing chats first
   // mount disabled while their conversation id loads, so focus again whenever
@@ -2940,12 +3262,17 @@ export function DebugChatPanel({
   }, [])
 
   const send = useCallback(
-    async (text: string, conversationId?: string) => {
+    async (
+      text: string,
+      conversationId?: string,
+      retryAttachments?: ChatAttachment[]
+    ) => {
       let id = conversationId ?? publicId
       const content = text.trim()
-      const attachments = pendingAttachments
+      const attachments = retryAttachments ?? pendingAttachments
       // Need either an existing conversation or permission to create one lazily.
       if (
+        runtimeUpdateRequired ||
         (!content && attachments.length === 0) ||
         attachmentUploads > 0 ||
         (!id && !lazyCreate) ||
@@ -3134,6 +3461,7 @@ export function DebugChatPanel({
       }
     },
     [
+      runtimeUpdateRequired,
       publicId,
       lazyCreate,
       userScoped,
@@ -3156,6 +3484,7 @@ export function DebugChatPanel({
     sendAfterInterruptRef.current = (text) => void send(text)
   }, [send])
   const submitComposer = useCallback(() => {
+    if (readOnly || runtimeUpdateRequired) return
     if (!input.trim() && pendingAttachments.length > 0 && !turnActive) {
       void send('')
       return
@@ -3169,37 +3498,50 @@ export function DebugChatPanel({
       return
     }
     void send(input)
-  }, [input, pendingAttachments.length, turnActive, send, stop])
+  }, [
+    input,
+    pendingAttachments.length,
+    turnActive,
+    send,
+    stop,
+    readOnly,
+    runtimeUpdateRequired,
+  ])
 
   const uploadAttachments = useCallback(
     async (files: FileList | null) => {
       if (!files || !publicId || !userScoped) return
-      const available = Math.max(0, 8 - pendingAttachments.length)
-      const selected = Array.from(files).slice(0, available)
-      if (selected.length === 0) {
+      if (attachmentUploadLock.current) {
         setError(
           localChatFailure(
-            'Attachment limit reached',
-            'A message may include at most 8 files.',
+            'Upload in progress',
+            'Wait for the current files to finish uploading, then try again.',
+            'attachment_upload_busy'
+          )
+        )
+        return
+      }
+      const selected = Array.from(files)
+      if (selected.length === 0) return
+      const selectionError = attachmentSelectionError(
+        selected,
+        pendingAttachmentsRef.current.length
+      )
+      if (selectionError) {
+        setError(
+          localChatFailure(
+            'Cannot attach these files',
+            selectionError,
             'attachment_limit'
           )
         )
         return
       }
+      attachmentUploadLock.current = true
       setAttachmentUploads((count) => count + selected.length)
       setError(null)
       await Promise.all(
         selected.map(async (file) => {
-          if (file.size > 20 * 1024 * 1024) {
-            setError(
-              localChatFailure(
-                'File is too large',
-                `${file.name} exceeds the 20 MB attachment limit.`,
-                'attachment_too_large'
-              )
-            )
-            return
-          }
           try {
             const {
               data: payload,
@@ -3240,6 +3582,7 @@ export function DebugChatPanel({
         })
       )
       setAttachmentUploads((count) => Math.max(0, count - selected.length))
+      attachmentUploadLock.current = false
       if (attachmentInputRef.current) attachmentInputRef.current.value = ''
     },
     [pendingAttachments.length, publicId, userScoped]
@@ -3445,6 +3788,8 @@ export function DebugChatPanel({
           setHistoryPage(
             conversationHistoryPage(detail as PaginatedConversationDetail)
           )
+          setError(conversationFailure(detail))
+          setContextUsage(detail.context_usage ?? null)
           setWsTurnActive(running)
           setTurnStartedAt(running ? (detail.turn_started_at ?? null) : null)
         }
@@ -3607,6 +3952,7 @@ export function DebugChatPanel({
         hasPendingPermission
       )
       if (terminal) {
+        setError(conversationFailure(detail))
         setMessages((current) =>
           reconcileLatestHistoryPage(current, mapConversationDetail(detail))
         )
@@ -3929,6 +4275,36 @@ export function DebugChatPanel({
             <p className="text-xs leading-relaxed text-muted-foreground">
               {error.detail}
             </p>
+            {isHarnessFailure(error.code) && (
+              <ChatFailureActions
+                key={`${selectedProvider}:${error.code}:${messages.length}`}
+                code={error.code}
+                provider={selectedProvider}
+                retryable={error.retryable}
+                busy={
+                  turnActive ||
+                  attachmentUploads > 0 ||
+                  pendingAttachments.length > 0 ||
+                  input.trim().length > 0
+                }
+                onRefresh={() => loadProviderStatus(false)}
+                onRetry={
+                  messages.some((message) => message.role === 'user')
+                    ? () => {
+                        const failedMessage = [...messages]
+                          .reverse()
+                          .find((message) => message.role === 'user')
+                        if (failedMessage)
+                          void send(
+                            failedMessage.content,
+                            undefined,
+                            failedMessage.attachments ?? []
+                          )
+                      }
+                    : undefined
+                }
+              />
+            )}
           </div>
         </div>
       )}
@@ -4048,7 +4424,40 @@ export function DebugChatPanel({
           continue the conversation.
         </div>
       ) : (
-        <div className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
+        <div
+          className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20"
+          onDragOver={(event) => {
+            if (event.dataTransfer.types.includes('Files'))
+              event.preventDefault()
+          }}
+          onDrop={(event) => {
+            if (!event.dataTransfer.types.includes('Files')) return
+            event.preventDefault()
+            if (!userScoped || !publicId) {
+              setError(
+                localChatFailure(
+                  'Workspace thread required',
+                  'Open a persistent workspace thread before attaching files.',
+                  'attachment_workspace_required'
+                )
+              )
+              return
+            }
+            void uploadAttachments(event.dataTransfer.files)
+          }}
+          onPaste={(event) => {
+            if (!event.clipboardData.files.length || !userScoped || !publicId)
+              return
+            event.preventDefault()
+            void uploadAttachments(event.clipboardData.files)
+          }}
+        >
+          {userScoped && publicId && (
+            <p className="px-3 pt-2 text-xs text-muted-foreground">
+              Attach, drop, or paste images and files · up to 8 files, 20 MB
+              each
+            </p>
+          )}
           {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
             <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
               <ChatAttachments
@@ -4086,6 +4495,13 @@ export function DebugChatPanel({
           />
           <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5 sm:px-3 sm:py-2">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
+              {userScoped && publicId && (
+                <SessionDiagnostics key={publicId} publicId={publicId} />
+              )}
+              <ContextWindow
+                usage={contextUsage}
+                model={runtimeSelection.modelId ?? undefined}
+              />
               <input
                 ref={attachmentInputRef}
                 type="file"
@@ -4358,6 +4774,7 @@ export function DebugChatPanel({
               <Button
                 onClick={submitComposer}
                 disabled={
+                  runtimeUpdateRequired ||
                   (!input.trim() && pendingAttachments.length === 0) ||
                   attachmentUploads > 0 ||
                   (!publicId && !lazyCreate) ||

@@ -241,6 +241,12 @@ const mainNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Workspaces',
+    url: '/workspaces',
+    icon: Folder,
+    keywords: ['workspace', 'context', 'persistent'],
+  },
+  {
     title: 'Create New Project',
     url: '/projects/new',
     icon: FolderPlus,

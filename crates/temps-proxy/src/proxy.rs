@@ -4016,6 +4016,7 @@ impl ProxyHttp for LoadBalancer {
                             preview_host.port,
                             &next,
                             true,
+                            settings.external_url.as_deref(),
                         );
                         let html_bytes = Bytes::from(html);
                         let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
@@ -4066,7 +4067,13 @@ impl ProxyHttp for LoadBalancer {
                     let html = if has_session_grant {
                         generate_preview_bridge_html(&label, &next)
                     } else {
-                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false)
+                        generate_preview_form_html_labeled(
+                            &label,
+                            preview_host.port,
+                            &next,
+                            false,
+                            settings.external_url.as_deref(),
+                        )
                     };
                     let html_bytes = Bytes::from(html);
                     let mut response = ResponseHeader::build(StatusCode::OK, None)?;

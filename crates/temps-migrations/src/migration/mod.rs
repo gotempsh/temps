@@ -257,6 +257,11 @@ mod m20260904_000003_add_continuous_archive_source_to_external_services;
 mod m20260907_000001_add_mfa_pending_origin_to_sessions;
 mod m20260908_000001_reconcile_legacy_status_monitors;
 mod m20260909_000001_index_global_log_chunks;
+mod m20260910_000001_managed_daemon_workspace_images;
+mod m20260911_000001_create_ai_application_git_bindings;
+mod m20260912_000001_expand_managed_daemon_workspace_images;
+mod m20260912_000002_managed_daemon_workspace_images_v031;
+mod m20260912_000003_managed_daemon_workspace_images_v032;
 
 pub struct Migrator;
 
@@ -572,6 +577,11 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260901_000001_add_database_provisioning_to_project_services::Migration,
             ),
+            Box::new(m20260910_000001_managed_daemon_workspace_images::Migration),
+            Box::new(m20260911_000001_create_ai_application_git_bindings::Migration),
+            Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
+            Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
+            Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
         ]
     }
 }

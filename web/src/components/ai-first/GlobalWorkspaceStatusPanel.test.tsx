@@ -18,6 +18,7 @@ describe('GlobalWorkspaceStatusPanel', () => {
             desired_state: 'running',
             sandbox_public_id: 'sbx_abcdef0123456789',
             runtime: 'node',
+            runtime_update_available: false,
             image: 'temps-agent:latest',
             cpu_limit: 4,
             memory_limit_mb: 8192,

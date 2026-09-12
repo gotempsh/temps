@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 
 use temps_agents::sandbox::SandboxCreateConfig;
@@ -216,6 +216,29 @@ pub struct ApplicationWorkspaceConfig {
     pub idle_timeout_secs: u64,
 }
 
+/// Resolve application runtime choices to the pinned, managed daemon images.
+///
+/// This mapping is intentionally separate from the legacy agent-sandbox image
+/// resolver. Application workspaces run the daemon protocol and must never
+/// silently fall back to a general-purpose agent image when their desired
+/// image is NULL.
+pub fn managed_application_workspace_image(runtime: &str) -> Option<&'static str> {
+    match runtime {
+        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2"),
+        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2"),
+        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2"),
+        _ => None,
+    }
+}
+
+pub fn is_managed_application_workspace_image(image: &str) -> bool {
+    ["nodejs", "python", "all"].iter().any(|flavor| {
+        ["0.2.0", "0.3.0", "0.3.1", "0.3.2"]
+            .iter()
+            .any(|version| image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:{version}"))
+    }) || image == "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
+}
+
 impl Default for ApplicationWorkspaceConfig {
     fn default() -> Self {
         Self {
@@ -225,9 +248,7 @@ impl Default for ApplicationWorkspaceConfig {
             // the provider-resolved Node image, then made the very next lookup
             // treat that healthy row as configuration-mismatched and rebuild
             // the shared workspace container on every new chat.
-            image: Some(temps_agents::sandbox::docker::image_name_for_runtime(
-                "node",
-            )),
+            image: managed_application_workspace_image("node").map(str::to_string),
             cpu_limit: 4.0,
             memory_limit_mb: 8192,
             pids_limit: 512,
@@ -242,8 +263,7 @@ impl From<&ai_application_workspaces::Model> for ApplicationWorkspaceConfig {
         Self {
             desired_state: value.desired_state.clone(),
             image: value.image.clone().or_else(|| {
-                (value.runtime != "custom")
-                    .then(|| temps_agents::sandbox::docker::image_name_for_runtime(&value.runtime))
+                managed_application_workspace_image(&value.runtime).map(str::to_string)
             }),
             cpu_limit: value.cpu_limit,
             memory_limit_mb: value.memory_limit_mb.max(0) as u64,
@@ -829,6 +849,20 @@ git config --local --get user.email >/dev/null 2>&1 || git config --local user.e
 git config --local --get commit.gpgSign >/dev/null 2>&1 || git config --local commit.gpgSign false
 "#;
 
+fn application_workspace_mutex(
+    locks: &mut HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    application_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = locks.get(application_id).and_then(std::sync::Weak::upgrade) {
+        existing
+    } else {
+        let created = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(application_id.to_string(), Arc::downgrade(&created));
+        created
+    }
+}
+
 pub struct SandboxService {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
@@ -851,7 +885,8 @@ pub struct SandboxService {
     /// Serializes one-to-one application workspace realization. Concurrent
     /// preview, diff and chat requests must never create two containers over
     /// the same persistent bind mount.
-    application_workspace_lock: Arc<tokio::sync::Mutex<()>>,
+    application_workspace_locks:
+        Arc<tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     /// One source import per process prevents two requests targeting the same
     /// sandbox from sharing its root-owned staging boundary.
     source_import_lock: Arc<tokio::sync::Mutex<()>>,
@@ -880,7 +915,7 @@ impl SandboxService {
             git_provider_manager,
             data_root,
             snapshot_service: None,
-            application_workspace_lock: Arc::new(tokio::sync::Mutex::new(())),
+            application_workspace_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             source_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             runtime_credentials: None,
         }
@@ -892,6 +927,17 @@ impl SandboxService {
     ) -> Self {
         self.runtime_credentials = Some(provider);
         self
+    }
+
+    async fn lock_application_workspace(
+        &self,
+        application_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.application_workspace_locks.lock().await;
+            application_workspace_mutex(&mut locks, application_id)
+        };
+        lock.lock_owned().await
     }
 
     /// Set the snapshot service after construction (two-phase init).
@@ -1652,7 +1698,7 @@ impl SandboxService {
         config: ApplicationWorkspaceConfig,
         authorized_project_ids: &[i32],
     ) -> Result<ApplicationWorkspaceSandbox, SandboxError> {
-        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let _workspace_mutation = self.lock_application_workspace(application_public_id).await;
         if application_public_id.is_empty()
             || application_public_id.len() > 200
             || !application_public_id
@@ -1803,9 +1849,260 @@ impl SandboxService {
         host_work_dir: PathBuf,
         config: ApplicationWorkspaceConfig,
     ) -> Result<SandboxSummary, SandboxError> {
-        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
         self.rebuild_application_workspace_locked(user_id, sandbox_public_id, host_work_dir, config)
             .await
+    }
+
+    /// Explicitly replace an application runtime only after a disposable,
+    /// volume-free instance has passed the daemon protocol probe.
+    #[allow(clippy::too_many_arguments)] // Identity, authorization scope and old-volume path stay explicit at the irreversible boundary.
+    pub async fn update_application_workspace_runtime(
+        &self,
+        user_id: i32,
+        application_id: i64,
+        application_public_id: &str,
+        sandbox_public_id: &str,
+        host_work_dir: PathBuf,
+        runtime: &str,
+        authorized_project_ids: &[i32],
+        config: ApplicationWorkspaceConfig,
+    ) -> Result<SandboxSummary, SandboxError> {
+        let _workspace_mutation = self.lock_application_workspace(application_public_id).await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        ensure_not_agent_run(&row)?;
+        if managed_application_id_from_name(&row.name) != Some(application_public_id) {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: sandbox_public_id.to_string(),
+                state: format!("does not belong to application {application_public_id}"),
+                operation: "update runtime".to_string(),
+            });
+        }
+        let image = config
+            .image
+            .as_deref()
+            .ok_or_else(|| SandboxError::Validation {
+                message: format!(
+                    "runtime update for sandbox {sandbox_public_id} requires a pinned image"
+                ),
+            })?;
+        if !is_managed_application_workspace_image(image) {
+            return Err(SandboxError::Validation {
+                message: format!("runtime update for sandbox {sandbox_public_id} rejects unmanaged image {image}"),
+            });
+        }
+        if managed_application_workspace_image(runtime) != Some(image) {
+            return Err(SandboxError::Validation {
+                message: format!("runtime {runtime} and pinned image {image} disagree for application {application_public_id}"),
+            });
+        }
+        let app_workspace = ai_application_workspaces::Entity::find()
+            .filter(ai_application_workspaces::Column::ApplicationId.eq(application_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SandboxError::NotFound {
+                sandbox_id: format!("application-workspace:{application_public_id}"),
+            })?;
+        let _recorded_old_image = row
+            .image
+            .clone()
+            .ok_or_else(|| SandboxError::InvalidState {
+                sandbox_id: sandbox_public_id.to_string(),
+                state: "missing recorded image".to_string(),
+                operation: "update runtime with rollback".to_string(),
+            })?;
+        let old_handle = self
+            .registry
+            .get(row.id, sandbox_public_id)
+            .await
+            .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+        let immutable_old_image = self
+            .registry
+            .provider()
+            .image_identity(&old_handle)
+            .await
+            .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+        let mut previous_config = ApplicationWorkspaceConfig::from(&app_workspace);
+        previous_config.image = Some(immutable_old_image);
+        let previous =
+            application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
+        let mut replacement =
+            application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+
+        let probe_id = hex::encode(rand::random::<[u8; 12]>());
+        let probe_dir = std::env::temp_dir().join(format!("temps-runtime-probe-{probe_id}"));
+        tokio::fs::create_dir(&probe_dir)
+            .await
+            .map_err(|source| SandboxError::CreateFailed {
+                user_id,
+                reason: format!(
+                    "create isolated runtime probe directory {}: {source}",
+                    probe_dir.display()
+                ),
+            })?;
+        let mut probe = application_sandbox_create_config(&row, probe_dir.clone(), &config)?;
+        probe.container_name_override = Some(format!("runtime-probe-{probe_id}"));
+        probe.workspace_volume = None;
+        probe.network_mode = Some("none".to_string());
+        let provider = self.registry.provider_arc();
+        let probe_result = async {
+            let handle = provider
+                .create(probe)
+                .await
+                .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+            let compatibility = provider.check_agent_runtime(&handle).await;
+            let candidate_identity = if matches!(
+                compatibility,
+                Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible)
+            ) {
+                provider
+                    .image_identity(&handle)
+                    .await
+                    .map_err(|error| from_agent_error(sandbox_public_id, error))
+            } else {
+                Ok(String::new())
+            };
+            let cleanup = provider.destroy(&handle, true).await;
+            if let Err(error) = cleanup {
+                return Err(from_agent_error(sandbox_public_id, error));
+            }
+            Ok::<_, SandboxError>((
+                compatibility.map_err(|error| from_agent_error(sandbox_public_id, error))?,
+                candidate_identity?,
+            ))
+        }
+        .await;
+        let _ = tokio::fs::remove_dir(&probe_dir).await;
+        let (compatibility, candidate_identity) = probe_result?;
+        if !matches!(
+            compatibility,
+            temps_agents::sandbox::RuntimeCompatibility::Compatible
+        ) {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: sandbox_public_id.to_string(),
+                state: format!("candidate image {image} failed daemon protocol preflight"),
+                operation: "update runtime".to_string(),
+            });
+        }
+        replacement.image = Some(candidate_identity);
+        let handle = match self
+            .registry
+            .replace_with_rollback(row.id, sandbox_public_id, replacement, previous)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                // A failed candidate create may already have recreated the
+                // previous container. Its data network is not reattached by
+                // provider.create, so restoring compute alone is incomplete.
+                let old_compute = self.registry.get(row.id, sandbox_public_id).await;
+                if old_compute.is_ok() {
+                    self.configure_application_data_network_locked(&row, authorized_project_ids)
+                        .await
+                        .map_err(|network_error| SandboxError::CreateFailed {
+                            user_id,
+                            reason: format!("runtime update for {sandbox_public_id} failed: {error}; previous compute was recreated but its data network could not be restored: {network_error}"),
+                        })?;
+                }
+                return Err(from_agent_error(sandbox_public_id, error));
+            }
+        };
+        let actual_compatibility = self.registry.provider().check_agent_runtime(&handle).await;
+        if !matches!(
+            actual_compatibility,
+            Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible)
+        ) {
+            let restore =
+                application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
+            let mut retry =
+                application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+            retry.image = Some(handle.image.clone());
+            self.registry
+                .replace_with_rollback(row.id, sandbox_public_id, restore, retry)
+                .await
+                .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+            self.configure_application_data_network_locked(&row, authorized_project_ids)
+                .await?;
+            return Err(SandboxError::InvalidState {
+                sandbox_id: sandbox_public_id.to_string(),
+                state: format!("replacement failed actual daemon protocol check ({actual_compatibility:?}); previous compute restored"),
+                operation: "update runtime".to_string(),
+            });
+        }
+        if let Err(network_error) = self
+            .configure_application_data_network_locked(&row, authorized_project_ids)
+            .await
+        {
+            let restore =
+                application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
+            let mut retry =
+                application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+            retry.image = Some(handle.image.clone());
+            self.registry.replace_with_rollback(row.id, sandbox_public_id, restore, retry).await
+                .map_err(|rollback_error| SandboxError::CreateFailed {
+                    user_id,
+                    reason: format!("runtime update for {sandbox_public_id} could not configure data network: {network_error}; rollback failed: {rollback_error}"),
+                })?;
+            self.configure_application_data_network_locked(&row, authorized_project_ids)
+                .await?;
+            return Err(network_error);
+        }
+        let mut active: sandboxes::ActiveModel = row.clone().into();
+        active.image = Set(Some(image.to_string()));
+        active.status = Set("running".to_string());
+        active.last_activity_at = Set(Utc::now());
+        let db_result = async {
+            let txn = self.db.begin().await?;
+            let updated = active.update(&txn).await?;
+            let mut app_active: ai_application_workspaces::ActiveModel = app_workspace.into();
+            app_active.runtime = Set(runtime.to_string());
+            app_active.image = Set(Some(image.to_string()));
+            app_active.last_error = Set(None);
+            app_active.updated_at = Set(Utc::now());
+            app_active.update(&txn).await?;
+            txn.commit().await?;
+            Ok::<_, sea_orm::DbErr>(updated)
+        }
+        .await;
+        let updated = match db_result {
+            Ok(updated) => updated,
+            Err(db_error) => {
+                let restore = application_sandbox_create_config(
+                    &row,
+                    host_work_dir.clone(),
+                    &previous_config,
+                )?;
+                let replacement_for_rollback =
+                    application_sandbox_create_config(&row, host_work_dir, &config)?;
+                self.registry.replace_with_rollback(row.id, sandbox_public_id, restore, replacement_for_rollback).await
+                    .map_err(|rollback_error| SandboxError::CreateFailed {
+                        user_id,
+                        reason: format!("runtime update for sandbox {sandbox_public_id} could not save image {image}: {db_error}; rollback failed: {rollback_error}"),
+                    })?;
+                self.configure_application_data_network_locked(&row, authorized_project_ids)
+                    .await?;
+                return Err(SandboxError::CreateFailed {
+                    user_id,
+                    reason: format!("runtime update for sandbox {sandbox_public_id} rolled back after database persistence failed: {db_error}"),
+                });
+            }
+        };
+        self.record_event(updated.id, "runtime_updated", None).await;
+        Ok(SandboxSummary::from(&updated))
+    }
+
+    pub async fn application_workspace_runtime_compatibility(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<temps_agents::sandbox::RuntimeCompatibility, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        self.registry
+            .runtime_compatibility(row.id, sandbox_public_id)
+            .await
+            .map_err(|error| from_agent_error(sandbox_public_id, error))
     }
 
     async fn rebuild_application_workspace_locked(
@@ -1850,7 +2147,9 @@ impl SandboxService {
         config: ApplicationWorkspaceConfig,
         artifact: &temps_agents::sandbox::SnapshotArtifact,
     ) -> Result<SandboxSummary, SandboxError> {
-        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         ensure_not_agent_run(&row)?;
         self.jobs.abort_all(row.id).await;
@@ -1985,7 +2284,9 @@ impl SandboxService {
         sandbox_public_id: &str,
         project_ids: &[i32],
     ) -> Result<Vec<String>, SandboxError> {
-        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         self.configure_application_data_network_locked(&row, project_ids)
             .await
@@ -3353,6 +3654,24 @@ TEMPS_ASKPASS_EOF\n\
         Ok((row, id))
     }
 
+    /// Read-only preview renewal preflight. A stale `running` row is not enough:
+    /// the provider runtime must still be alive. This never wakes a workspace.
+    pub async fn preview_ready_sandbox(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if row.status != "running" || self.registry.get(row.id, public_id_value).await.is_err() {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: "unavailable".into(),
+                operation: "renew preview access while the workspace is running".into(),
+            });
+        }
+        Ok(row)
+    }
+
     /// Load + authorize + return the internal ID, or a typed error that
     /// already includes the public ID. Exec/fs modules call this first.
     /// Explicitly stopped ephemeral sandboxes return `InvalidState` (→ HTTP
@@ -3852,6 +4171,95 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::{Job, JobQueue, JobReceiver, QueueError};
 
+    #[tokio::test]
+    async fn application_workspace_mutations_serialize_only_the_same_application() {
+        let mut locks = HashMap::new();
+        let first = application_workspace_mutex(&mut locks, "app-a");
+        let same = application_workspace_mutex(&mut locks, "app-a");
+        let other = application_workspace_mutex(&mut locks, "app-b");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        let _held = first.lock_owned().await;
+        assert!(same.try_lock_owned().is_err());
+        assert!(other.try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn application_workspace_runtimes_resolve_to_managed_daemon_images() {
+        assert_eq!(
+            managed_application_workspace_image("node"),
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+        );
+        assert_eq!(
+            managed_application_workspace_image("bun"),
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+        );
+        assert_eq!(
+            managed_application_workspace_image("python"),
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+        );
+        for runtime in ["rust", "go", "full"] {
+            assert_eq!(
+                managed_application_workspace_image(runtime),
+                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2")
+            );
+        }
+        assert_eq!(managed_application_workspace_image("custom"), None);
+        assert_eq!(managed_application_workspace_image("unknown"), None);
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:0.2.0"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.0"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.1"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.2"
+        ));
+        assert!(!is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:0.1.0"
+        ));
+    }
+
+    #[test]
+    fn application_workspace_config_preserves_explicit_image_and_maps_null_runtime() {
+        let now = Utc::now();
+        let mut row = ai_application_workspaces::Model {
+            id: 1,
+            application_id: 2,
+            sandbox_public_id: None,
+            desired_state: "running".to_string(),
+            runtime: "python".to_string(),
+            image: None,
+            cpu_limit: 1.0,
+            memory_limit_mb: 1024,
+            pids_limit: 128,
+            disk_limit_mb: 2048,
+            idle_timeout_secs: 900,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mapped = ApplicationWorkspaceConfig::from(&row);
+        assert_eq!(
+            mapped.image.as_deref(),
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+        );
+
+        row.image = Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0".to_string());
+        let explicit = ApplicationWorkspaceConfig::from(&row);
+        assert_eq!(
+            explicit.image.as_deref(),
+            Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0")
+        );
+    }
+
     #[test]
     fn sandbox_data_network_names_are_stable_and_scoped() {
         assert_eq!(
@@ -4299,6 +4707,29 @@ mod tests {
             "log: {statements}"
         );
         assert!(!statements.contains("session_grant"), "log: {statements}");
+    }
+
+    #[tokio::test]
+    async fn preview_renewal_does_not_wake_stopped_workspace() {
+        let mut row = protected_preview_row(1);
+        row.status = "stopped".to_string();
+        let (service, _) = preview_test_service(vec![vec![row]]);
+        let error = service
+            .preview_ready_sandbox("sbx_deadbeef01234567", 1)
+            .await
+            .expect_err("stopped preview runtime is unavailable");
+        assert!(matches!(error, SandboxError::InvalidState { .. }));
+    }
+
+    #[tokio::test]
+    async fn preview_renewal_hides_unowned_sandbox() {
+        let row = protected_preview_row(2);
+        let (service, _) = preview_test_service(vec![vec![row]]);
+        let error = service
+            .preview_ready_sandbox("sbx_deadbeef01234567", 1)
+            .await
+            .expect_err("another user's preview sandbox must stay hidden");
+        assert!(matches!(error, SandboxError::NotFound { .. }));
     }
 
     #[tokio::test]

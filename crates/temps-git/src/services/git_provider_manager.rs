@@ -150,6 +150,16 @@ pub enum GitProviderManagerError {
     #[error("Connection token expired for connection ID {connection_id}. Please update your access token.")]
     ConnectionTokenExpired { connection_id: i32 },
 
+    #[error(
+        "Failed to create repository '{repository_name}' through connection {connection_id}: {source}"
+    )]
+    RepositoryCreation {
+        connection_id: i32,
+        repository_name: String,
+        #[source]
+        source: GitProviderError,
+    },
+
     #[error("Queue error: {0}")]
     QueueError(String),
 
@@ -5028,6 +5038,54 @@ impl GitProviderManager {
         Ok(commit_sha)
     }
 
+    /// Create a repository through a connection owned by `user_id`.
+    ///
+    /// Repository creation is a credentialed mutation. This method verifies
+    /// ownership and active state before resolving the provider and refreshing
+    /// its token. It deliberately does not download or push template content.
+    pub async fn create_repository_for_user(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+        repo_name: &str,
+        repo_owner: Option<&str>,
+        description: Option<&str>,
+        private: bool,
+    ) -> Result<super::git_provider::Repository, GitProviderManagerError> {
+        let connection = self.get_connection_for_user(connection_id, user_id).await?;
+        // MockDatabase does not apply query predicates, and this defense also
+        // protects future alternative data-access implementations.
+        if connection.user_id != Some(user_id) {
+            return Err(GitProviderManagerError::ConnectionNotFound(
+                connection_id.to_string(),
+            ));
+        }
+        if !connection.is_active || connection.is_expired {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Git connection {connection_id} for user {user_id} is inactive or expired"
+            )));
+        }
+        let provider = self.get_provider(connection.provider_id).await?;
+        if !provider.is_active {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Git provider {} for connection {connection_id} is inactive",
+                provider.id
+            )));
+        }
+        let provider_service = self.get_provider_service(provider.id).await?;
+        let access_token = self
+            .validate_and_refresh_connection_token(connection_id)
+            .await?;
+        provider_service
+            .create_repository(&access_token, repo_name, repo_owner, description, private)
+            .await
+            .map_err(|source| GitProviderManagerError::RepositoryCreation {
+                connection_id,
+                repository_name: repo_name.to_string(),
+                source,
+            })
+    }
+
     /// Create a repository on the git provider and push template files
     ///
     /// This method:
@@ -6209,6 +6267,148 @@ mod tests {
         );
 
         assert_eq!(manager.get_valid_github_token_for_user(5).await, None);
+    }
+
+    #[tokio::test]
+    async fn create_repository_for_user_rejects_foreign_and_inactive_connections() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        for (connection, expected_inactive) in [
+            (connection_fixture(11, Some(6)), false),
+            (
+                {
+                    let mut connection = connection_fixture(11, Some(5));
+                    connection.is_active = false;
+                    connection
+                },
+                true,
+            ),
+        ] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([[connection]])
+                    .into_connection(),
+            );
+            let manager = GitProviderManager::new(
+                db.clone(),
+                Arc::new(
+                    temps_core::EncryptionService::new(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    )
+                    .expect("test encryption key should be valid"),
+                ),
+                Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+                create_test_config_service(db),
+            );
+
+            let error = manager
+                .create_repository_for_user(11, 5, "new-repo", None, None, true)
+                .await
+                .expect_err("unusable connection must be rejected before provider access");
+            if expected_inactive {
+                assert!(
+                    matches!(error, GitProviderManagerError::InvalidConfiguration(reason)
+                    if reason.contains("connection 11") && reason.contains("user 5") && reason.contains("inactive or expired"))
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    GitProviderManagerError::ConnectionNotFound(id) if id == "11"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_repository_for_user_uses_owned_connection_and_refreshed_token_path() {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/user/repos")
+            .match_header("authorization", "Bearer owned-create-token")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "new-repo",
+                "private": true,
+                "auto_init": true
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": 99,
+                    "name": "new-repo",
+                    "full_name": "owner/new-repo",
+                    "owner": {"login": "owner"},
+                    "description": "created by Temps",
+                    "private": true,
+                    "default_branch": "main",
+                    "clone_url": "https://example.test/owner/new-repo.git",
+                    "ssh_url": "git@example.test:owner/new-repo.git",
+                    "html_url": "https://example.test/owner/new-repo",
+                    "language": null,
+                    "size": 0,
+                    "stargazers_count": 0,
+                    "forks_count": 0,
+                    "created_at": "2026-09-11T00:00:00Z",
+                    "updated_at": "2026-09-11T00:00:00Z",
+                    "pushed_at": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("owned-create-token")
+                .expect("test token should encrypt"),
+        );
+        let mut provider_model = github_provider_fixture();
+        provider_model.auth_config = serde_json::to_value(AuthMethod::PersonalAccessToken {
+            token: "unused-provider-token".to_string(),
+        })
+        .unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[provider_model.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[provider_model]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        manager.providers_cache.write().await.insert(
+            7,
+            Arc::new(GitHubProvider::new(
+                Some(server.url()),
+                AuthMethod::PersonalAccessToken {
+                    token: "unused-provider-token".to_string(),
+                },
+            )) as Arc<dyn GitProviderService>,
+        );
+
+        let repository = manager
+            .create_repository_for_user(11, 5, "new-repo", None, Some("created by Temps"), true)
+            .await
+            .expect("owned active connection creates repository");
+
+        assert_eq!(repository.full_name, "owner/new-repo");
+        assert_eq!(repository.default_branch, "main");
+        create.assert_async().await;
     }
 
     fn mock_manager_with_repository(connection_owner_user_id: Option<i32>) -> GitProviderManager {

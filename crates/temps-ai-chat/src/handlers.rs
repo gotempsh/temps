@@ -38,8 +38,9 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use temps_auth::permissions::Permission;
 use temps_auth::{
-    context::AuthContext, deny_deployment_token, permission_guard, project_access_guard,
-    project_scope_guard, RequireAuth,
+    context::{AuthContext, AuthSource},
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
+    RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
@@ -134,10 +135,56 @@ pub struct ConversationResponse {
     pub turn_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ChatFailureResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextWindowUsageResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ChatFailureResponse {
+    pub code: String,
+    pub title: String,
+    pub detail: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ContextWindowUsageResponse {
+    pub used_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub source: String,
+    pub estimated: bool,
+    pub updated_at: String,
+}
+
+fn conversation_failure(
+    metadata: Option<&serde_json::Value>,
+    turn_status: &str,
+) -> Option<ChatFailureResponse> {
+    if turn_status != "failed" {
+        return None;
+    }
+    metadata
+        .and_then(|metadata| metadata.get("last_failure"))
+        .and_then(|failure| serde_json::from_value(failure.clone()).ok())
+}
+
+fn conversation_context_usage(
+    metadata: Option<&serde_json::Value>,
+) -> Option<ContextWindowUsageResponse> {
+    metadata
+        .and_then(|metadata| metadata.get("context_usage"))
+        .and_then(|usage| serde_json::from_value(usage.clone()).ok())
 }
 
 impl From<ai_conversations::Model> for ConversationResponse {
     fn from(m: ai_conversations::Model) -> Self {
+        let failure = conversation_failure(m.metadata.as_ref(), &m.turn_status);
+        let context_usage = conversation_context_usage(m.metadata.as_ref());
         Self {
             public_id: m.public_id,
             project_id: m.project_id,
@@ -155,6 +202,8 @@ impl From<ai_conversations::Model> for ConversationResponse {
             active_turn_id: m.active_turn_id,
             turn_started_at: m.turn_started_at.map(|value| value.to_rfc3339()),
             application_id: m.application_id,
+            failure,
+            context_usage,
         }
     }
 }
@@ -310,6 +359,14 @@ pub struct CreateApplicationPreviewLinkRequest {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AuthorizeWorkspacePreviewRequest {
+    pub sandbox_public_id: String,
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApplicationPreviewLinkResponse {
     /// A short-lived authenticated URL. Its fragment carries the grant and
@@ -415,6 +472,10 @@ pub struct ApplicationWorkspaceResponse {
     pub sandbox_public_id: Option<String>,
     pub runtime: String,
     pub image: Option<String>,
+    pub runtime_compatible: Option<bool>,
+    pub runtime_update_available: bool,
+    pub runtime_update_image: Option<String>,
+    pub runtime_update_error: Option<String>,
     pub cpu_limit: f64,
     pub memory_limit_mb: i64,
     pub pids_limit: i64,
@@ -437,6 +498,9 @@ pub struct ApplicationWorkspaceResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateApplicationWorkspaceRequest {
     pub runtime: Option<String>,
+    /// Pinned Temps-managed daemon image. Empty string restores the runtime default.
+    /// Omit to leave the selected image unchanged. Arbitrary images are rejected.
+    pub image: Option<String>,
     pub cpu_limit: Option<f64>,
     pub memory_limit_mb: Option<i64>,
     pub pids_limit: Option<i64>,
@@ -445,9 +509,14 @@ pub struct UpdateApplicationWorkspaceRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ControlApplicationWorkspaceRequest {
-    /// restart, pause, resume, rebuild, snapshot, or restore
+    /// restart, pause, resume, rebuild, snapshot, restore, or update_runtime
     pub action: String,
+    /// Must be true for update_runtime because compute is replaced.
+    pub confirm: Option<bool>,
+    /// Optional built-in flavor to select during update_runtime.
+    pub runtime: Option<String>,
     pub snapshot_id: Option<String>,
     pub label: Option<String>,
 }
@@ -541,6 +610,56 @@ pub struct GlobalConversationResponse {
     pub ai_permission_mode: String,
     /// Server-authoritative lifecycle for the current/most recent turn.
     pub turn_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ChatFailureResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextWindowUsageResponse>,
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct WorkspaceActivityQuery {
+    /// Comma-separated application public IDs (maximum 100). Omit for the global workspace only.
+    pub application_public_ids: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceActivityResponse {
+    pub workspaces: Vec<WorkspaceActivitySummary>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceActivitySummary {
+    /// Null identifies the user's global workspace.
+    pub application_public_id: Option<String>,
+    pub total: u64,
+    pub harnesses: Vec<WorkspaceHarnessActivity>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceHarnessActivity {
+    pub ai_provider: String,
+    pub total: u64,
+    pub pending: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub idle: u64,
+}
+
+impl WorkspaceHarnessActivity {
+    fn add_status(&mut self, turn_status: &str, count: u64) {
+        self.total = self.total.saturating_add(count);
+        let bucket = match turn_status {
+            "pending" => &mut self.pending,
+            "running" => &mut self.running,
+            "completed" => &mut self.completed,
+            "failed" => &mut self.failed,
+            "cancelled" => &mut self.cancelled,
+            _ => &mut self.idle,
+        };
+        *bucket = bucket.saturating_add(count);
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -566,7 +685,7 @@ pub struct MessageResponse {
     pub attachments: Option<Vec<ChatAttachmentResponse>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChatAttachmentResponse {
     pub id: String,
     pub name: String,
@@ -574,6 +693,27 @@ pub struct ChatAttachmentResponse {
     pub size_bytes: u64,
     pub sandbox_path: String,
     pub is_image: bool,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) contents: Vec<u8>,
+}
+
+impl std::fmt::Debug for ChatAttachmentResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatAttachmentResponse")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("mime_type", &self.mime_type)
+            .field("size_bytes", &self.size_bytes)
+            .field("sandbox_path", &self.sandbox_path)
+            .field("is_image", &self.is_image)
+            .field(
+                "contents",
+                &format_args!("[REDACTED; {} bytes]", self.contents.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -686,9 +826,112 @@ pub struct ConversationDetailResponse {
     pub pending_permission: Option<PermissionRequest>,
 }
 
+const DIAGNOSTIC_MAX_MESSAGES: u64 = 25;
+const DIAGNOSTIC_MAX_TEXT_BYTES: usize = 12 * 1024;
+const DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8 * 1024;
+const DIAGNOSTIC_MAX_NATIVE_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationDiagnosticResponse {
+    pub schema_version: u8,
+    pub conversation: ConversationDiagnosticRuntimeResponse,
+    pub source: ConversationDiagnosticSourceResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_session: Option<ConversationNativeDiagnosticResponse>,
+    pub messages: Vec<ConversationDiagnosticMessageResponse>,
+    pub returned_message_count: usize,
+    pub message_limit: u64,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationDiagnosticRuntimeResponse {
+    pub public_id: String,
+    pub context_type: String,
+    pub context_id: String,
+    pub provider: String,
+    pub model: String,
+    pub thinking_level: Option<String>,
+    pub permission_mode: String,
+    pub turn_status: String,
+    pub active_turn_id: Option<String>,
+    pub last_turn_id: Option<String>,
+    pub turn_started_at: Option<String>,
+    pub native_session_id: Option<String>,
+    pub context_usage: Option<ContextWindowUsageResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationDiagnosticSourceResponse {
+    pub normalized_history: bool,
+    pub native_session_status: &'static str,
+    pub native_session_note: &'static str,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationNativeDiagnosticResponse {
+    pub provider: String,
+    pub session_id: String,
+    pub format: String,
+    pub json: serde_json::Value,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationDiagnosticMessageResponse {
+    pub role: String,
+    pub content: String,
+    pub metadata: Option<serde_json::Value>,
+    pub tokens_in: Option<i32>,
+    pub tokens_out: Option<i32>,
+    pub cost_microcents: Option<i64>,
+    pub created_at: String,
+    pub truncated: bool,
+}
+
+fn bounded_redacted_text(value: &str, max_bytes: usize) -> (String, bool) {
+    let redacted = redact_text(value);
+    if redacted.len() <= max_bytes {
+        return (redacted, false);
+    }
+    let mut end = max_bytes;
+    while !redacted.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    (redacted[..end].to_string(), true)
+}
+
+fn bounded_redacted_metadata(value: &serde_json::Value) -> (serde_json::Value, bool) {
+    let redacted = redact_value(value);
+    let encoded = redacted.to_string();
+    let (preview, truncated) = bounded_redacted_text(&encoded, DIAGNOSTIC_MAX_METADATA_BYTES);
+    if truncated {
+        (
+            serde_json::json!({ "truncated": true, "preview": preview }),
+            true,
+        )
+    } else {
+        (redacted, false)
+    }
+}
+
+fn diagnostic_response_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    headers
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ConversationMessagesQuery {
     pub before: Option<String>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct ConversationDiagnosticsQuery {
+    /// Persisted rows to include, newest window first (default/max 25).
     pub limit: Option<u64>,
 }
 
@@ -940,6 +1183,13 @@ impl From<ChatError> for Problem {
                     .with_title("AI Turn Already Running")
                     .with_detail(e.to_string())
             }
+            ChatError::WorkspaceRuntimeBusy { .. }
+            | ChatError::WorkspaceRuntimeUpdateRequired { .. } => {
+                let failure = e.public_failure();
+                problemdetails::new(axum::http::StatusCode::CONFLICT)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
+            }
             chat_error @ ChatError::AuthorizationRefresh(_) => {
                 let failure = chat_error.public_failure();
                 error!(
@@ -976,6 +1226,16 @@ impl From<ChatError> for Problem {
                 error!(
                     failure_code = failure.code,
                     "AI chat provider operation failed: {error}"
+                );
+                problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
+            }
+            error @ ChatError::RetainedHarnessDiagnostic { .. } => {
+                let failure = error.public_failure();
+                tracing::error!(
+                    failure_code = failure.code,
+                    "retained AI harness failed: {error}"
                 );
                 problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title(failure.title)
@@ -1467,7 +1727,7 @@ async fn application_project_access_map(
 /// Enforce one permission across every project linked to an application.
 /// Instance permissions are the ceiling; a project role may narrow them but
 /// can never grant a permission that the instance role does not hold.
-async fn ensure_application_project_permission(
+pub(crate) async fn ensure_application_project_permission(
     auth: &AuthContext,
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     project_ids: &[i32],
@@ -2186,6 +2446,11 @@ pub async fn create_application_project(
         &Permission::SandboxesWrite,
     )
     .await?;
+    let _runtime_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
     let project = create_starter_project(&state.project_service, &request)
         .await
         .map_err(Problem::from)?;
@@ -2519,6 +2784,11 @@ pub async fn link_application_project(
         )
         .await?;
     }
+    let _runtime_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
     let application = state
         .applications
         .link_project(auth.user_id(), &application_public_id, request.project_id)
@@ -2649,6 +2919,11 @@ pub async fn unlink_application_project(
         &Permission::SandboxesWrite,
     )
     .await?;
+    let _runtime_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
     let project_slug = current
         .projects
         .iter()
@@ -2923,6 +3198,12 @@ pub async fn archive_application(
     )
     .await?;
 
+    let _runtime_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
+
     let mut paused_sandbox = None;
     if let Some(sandboxes) = state.application_sandboxes.as_ref() {
         if let Some(summary) = sandboxes
@@ -3024,6 +3305,11 @@ pub async fn restore_application(
         &Permission::SandboxesWrite,
     )
     .await?;
+    let _runtime_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
     let restored = state
         .applications
         .restore(auth.user_id(), &application_public_id)
@@ -3275,6 +3561,146 @@ pub async fn create_global_workspace_preview_link(
             port: request.port,
         })
         .await;
+    Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
+}
+
+fn require_console_preview_session(auth: &AuthContext) -> Result<(), Problem> {
+    if matches!(
+        &auth.source,
+        AuthSource::Session {
+            session_id: Some(_),
+            ..
+        }
+    ) {
+        Ok(())
+    } else {
+        Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Console Session Required")
+            .with_detail("Preview renewal requires an active console session."))
+    }
+}
+
+/// Renew a managed preview only for an already-bound, running workspace. The
+/// requested sandbox ID is an object selector, never an authorization grant.
+#[utoipa::path(
+    post, tag = "AI Chat", path = "/ai/preview/authorize",
+    operation_id = "authorize_workspace_preview",
+    request_body = AuthorizeWorkspacePreviewRequest,
+    responses((status = 200, body = ApplicationPreviewLinkResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 503)),
+    security(("bearer_auth" = []))
+)]
+pub async fn authorize_workspace_preview(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<AuthorizeWorkspacePreviewRequest>,
+) -> Result<Json<ApplicationPreviewLinkResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    require_console_preview_session(&auth)?;
+    if request.port == 0 {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Preview Port")
+            .with_detail("The preview port must be between 1 and 65535."));
+    }
+    let sandboxes = state.application_sandboxes.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Workspace Preview Unavailable")
+            .with_detail("The instance sandbox service is not configured.")
+    })?;
+    let sandbox = sandboxes
+        .find_by_public_id(&request.sandbox_public_id, auth.user_id())
+        .await
+        .map_err(Problem::from)?;
+    let global_workspace_id = global_workspace_context_id(auth.user_id());
+    if sandbox.name == format!("ai-application:{global_workspace_id}") {
+        // Global workspaces are bound by their deterministic user-scoped name.
+    } else {
+        let application_public_id = state
+            .applications
+            .preview_application_for_sandbox(auth.user_id(), &request.sandbox_public_id)
+            .await?
+            .ok_or_else(|| {
+                problemdetails::new(StatusCode::NOT_FOUND).with_title("Workspace Preview Not Found")
+            })?;
+        if sandbox.name != format!("ai-application:{application_public_id}") {
+            return Err(problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Workspace Preview Not Found"));
+        }
+        let application = state
+            .applications
+            .get(auth.user_id(), &application_public_id)
+            .await?;
+        let project_ids = application
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        ensure_application_project_permission(
+            &auth,
+            &state.project_access_checker,
+            &project_ids,
+            &Permission::SandboxesWrite,
+        )
+        .await?;
+        ensure_application_project_permission(
+            &auth,
+            &state.project_access_checker,
+            &project_ids,
+            &Permission::ProjectsWrite,
+        )
+        .await?;
+        let workspace = state
+            .applications
+            .workspace(application.application.id)
+            .await?;
+        if workspace.desired_state == "quarantined" {
+            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Application Workspace Quarantined")
+                .with_detail(
+                    "Workspace preview access is blocked until linked project access is restored.",
+                ));
+        }
+    }
+    sandboxes.preview_ready_sandbox(&request.sandbox_public_id, auth.user_id()).await.map_err(|error| {
+        error!(%error, sandbox_id = %request.sandbox_public_id, "managed preview runtime unavailable");
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Workspace Preview Unavailable")
+            .with_detail("The workspace sandbox is not running. Resume the workspace and try again.")
+    })?;
+    let (url, expires_at) = sandboxes
+        .preview_share_link(
+            &request.sandbox_public_id,
+            auth.user_id(),
+            request.port,
+            request.path.as_deref().unwrap_or("/"),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .map_err(Problem::from)?;
+    if sandbox.name == format!("ai-application:{global_workspace_id}") {
+        state
+            .audit(&GlobalWorkspacePreviewLinkCreatedAudit {
+                context: audit_context(&auth, &metadata),
+                workspace_id: global_workspace_id,
+                sandbox_id: request.sandbox_public_id,
+                port: request.port,
+            })
+            .await;
+    } else {
+        state
+            .audit(&ApplicationPreviewLinkCreatedAudit {
+                context: audit_context(&auth, &metadata),
+                application_id: sandbox
+                    .name
+                    .trim_start_matches("ai-application:")
+                    .to_string(),
+                sandbox_id: request.sandbox_public_id,
+                port: request.port,
+            })
+            .await;
+    }
     Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
 }
 
@@ -5166,6 +5592,11 @@ pub async fn list_all_conversations(
         .await?;
     let mut conversations = Vec::with_capacity(items.len());
     for item in items {
+        let failure = conversation_failure(
+            item.conversation.metadata.as_ref(),
+            &item.conversation.turn_status,
+        );
+        let context_usage = conversation_context_usage(item.conversation.metadata.as_ref());
         conversations.push(GlobalConversationResponse {
             public_id: item.conversation.public_id,
             project_id: item.conversation.project_id,
@@ -5182,9 +5613,143 @@ pub async fn list_all_conversations(
             ai_thinking_level: item.conversation.ai_thinking_level,
             ai_permission_mode: item.conversation.ai_permission_mode,
             turn_status: item.conversation.turn_status,
+            failure,
+            context_usage,
         });
     }
     Ok(Json(conversations))
+}
+
+fn parse_workspace_activity_ids(query: &WorkspaceActivityQuery) -> Result<Vec<String>, Problem> {
+    let Some(raw) = query.application_public_ids.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = raw.split(',').collect::<Vec<_>>();
+    if ids.len() > 100
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 200
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Workspace Activity Scope")
+            .with_detail("Provide at most 100 comma-separated application public IDs."));
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Aggregate all active threads for the caller's global workspace and up to
+/// 100 requested, visible application workspaces. Thread history is not paged.
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/ai/workspace-activity",
+    operation_id = "get_workspace_activity",
+    params(WorkspaceActivityQuery),
+    responses((status = 200, body = WorkspaceActivityResponse), (status = 400), (status = 401), (status = 403)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_workspace_activity(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WorkspaceActivityQuery>,
+) -> Result<Json<WorkspaceActivityResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let requested = parse_workspace_activity_ids(&query)?;
+    let candidates = state
+        .applications
+        .project_scopes_for_listing_bounded(auth.user_id(), Some("active"), Some(&requested))
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let project_ids = candidates
+        .iter()
+        .flat_map(|(_, scope)| scope.project_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let access =
+        application_project_access_map(&auth, &state.project_access_checker, &project_ids).await?;
+    let mut visible_by_public = HashMap::new();
+    for (id, scope) in candidates {
+        let visible = access.as_ref().is_none_or(|access| {
+            scope
+                .project_ids
+                .iter()
+                .all(|project_id| access.get(project_id).copied().unwrap_or(false))
+        });
+        if visible {
+            visible_by_public.insert(scope.public_id, id);
+        }
+    }
+    let visible = requested
+        .into_iter()
+        .filter_map(|public_id| {
+            visible_by_public
+                .remove(&public_id)
+                .map(|id| (id, public_id))
+        })
+        .collect::<Vec<_>>();
+    let visible_ids = visible.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let hidden_project_ids =
+        hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
+    let counts = state
+        .service
+        .workspace_activity_counts(auth.user_id(), &hidden_project_ids, &visible_ids)
+        .await?;
+    let mut grouped: HashMap<Option<i64>, HashMap<String, WorkspaceHarnessActivity>> =
+        HashMap::new();
+    for row in counts {
+        let harness = grouped
+            .entry(row.application_id)
+            .or_default()
+            .entry(row.ai_provider.clone())
+            .or_insert_with(|| WorkspaceHarnessActivity {
+                ai_provider: row.ai_provider,
+                total: 0,
+                pending: 0,
+                running: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                idle: 0,
+            });
+        harness.add_status(&row.turn_status, row.thread_count.max(0) as u64);
+    }
+    let mut workspace_keys = vec![(None, None)];
+    workspace_keys.extend(
+        visible
+            .into_iter()
+            .map(|(id, public_id)| (Some(id), Some(public_id))),
+    );
+    let workspaces = workspace_keys
+        .into_iter()
+        .map(|(id, application_public_id)| {
+            let mut harnesses = grouped
+                .remove(&id)
+                .unwrap_or_default()
+                .into_values()
+                .collect::<Vec<_>>();
+            harnesses.sort_by(|a, b| a.ai_provider.cmp(&b.ai_provider));
+            WorkspaceActivitySummary {
+                application_public_id,
+                total: harnesses
+                    .iter()
+                    .fold(0_u64, |total, harness| total.saturating_add(harness.total)),
+                harnesses,
+            }
+        })
+        .collect();
+    Ok(Json(WorkspaceActivityResponse { workspaces }))
 }
 
 /// Create a private user-owned operator thread without binding its lifetime or
@@ -5375,6 +5940,10 @@ pub async fn get_global_ai_workspace(
             .as_ref()
             .and_then(|summary| summary.image.clone())
             .or(defaults.image),
+        runtime_compatible: None,
+        runtime_update_available: false,
+        runtime_update_image: None,
+        runtime_update_error: None,
         cpu_limit: defaults.cpu_limit,
         memory_limit_mb: defaults.memory_limit_mb as i64,
         pids_limit: defaults.pids_limit,
@@ -5479,6 +6048,45 @@ async fn application_workspace_response(
     let persistent_volume_healthy = tokio::fs::metadata(volume_path)
         .await
         .is_ok_and(|metadata| metadata.is_dir());
+    let target_image =
+        temps_sandbox::services::managed_application_workspace_image(&desired.runtime)
+            .map(str::to_string);
+    let (runtime_compatible, runtime_update_error) = if let Some(summary) = summary
+        .as_ref()
+        .filter(|summary| summary.status == "running")
+    {
+        match sandboxes
+            .application_workspace_runtime_compatibility(auth.user_id(), &summary.public_id)
+            .await
+        {
+            Ok(temps_agents::sandbox::RuntimeCompatibility::Compatible) => (Some(true), None),
+            Ok(temps_agents::sandbox::RuntimeCompatibility::Incompatible { reason }) => {
+                tracing::info!(application_id = %application.application.public_id, %reason, "Workspace runtime is incompatible");
+                (Some(false), Some("This workspace uses an older runtime protocol. Update the runtime to continue chatting.".to_string()))
+            }
+            Ok(temps_agents::sandbox::RuntimeCompatibility::Unavailable { reason }) => {
+                tracing::warn!(application_id = %application.application.public_id, %reason, "Workspace runtime compatibility unavailable");
+                (
+                    None,
+                    Some("Runtime compatibility is temporarily unavailable.".to_string()),
+                )
+            }
+            Err(error) => {
+                tracing::warn!(application_id = %application.application.public_id, %error, "Runtime compatibility check failed");
+                (
+                    None,
+                    Some("Runtime compatibility is temporarily unavailable.".to_string()),
+                )
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let runtime_update_available = summary.as_ref().is_some_and(|summary| {
+        summary.status == "running"
+            && summary.backend.as_deref() == Some("docker")
+            && target_image.is_some()
+    });
     Ok(ApplicationWorkspaceResponse {
         state: state_name.to_string(),
         desired_state: desired.desired_state,
@@ -5488,6 +6096,10 @@ async fn application_workspace_response(
             .as_ref()
             .and_then(|summary| summary.image.clone())
             .or(desired.image),
+        runtime_compatible,
+        runtime_update_available,
+        runtime_update_image: runtime_update_available.then_some(target_image).flatten(),
+        runtime_update_error,
         cpu_limit: desired.cpu_limit,
         memory_limit_mb: desired.memory_limit_mb,
         pids_limit: desired.pids_limit,
@@ -5774,6 +6386,11 @@ pub async fn update_application_workspace(
     permission_guard!(auth, ProjectsWrite);
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
+    if request.image.is_some() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Use Explicit Runtime Update")
+            .with_detail("Image changes require the confirmed update_runtime control action; arbitrary image input is not accepted."));
+    }
     let application = authorized_application(&state, &auth, &application_public_id).await?;
     let project_ids = application
         .projects
@@ -5794,6 +6411,39 @@ pub async fn update_application_workspace(
         &Permission::SandboxesWrite,
     )
     .await?;
+    let _turn_gate = state
+        .service
+        .lock_application_runtime_update(&application_public_id)
+        .await
+        .map_err(Problem::from)?;
+    if let Some(runtime) = request.runtime.as_deref() {
+        let current = state
+            .applications
+            .workspace(application.application.id)
+            .await?;
+        if runtime != current.runtime {
+            let has_compute = if let Some(sandboxes) = state.application_sandboxes.as_ref() {
+                sandboxes
+                    .application_workspace_summary(auth.user_id(), &application_public_id)
+                    .await
+                    .map_err(|error| {
+                        application_workspace_provider_problem(
+                            error,
+                            &application_public_id,
+                            "inspect before runtime setting",
+                        )
+                    })?
+                    .is_some()
+            } else {
+                false
+            };
+            if has_compute {
+                return Err(problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Confirm Runtime Change")
+                    .with_detail("Use the update_runtime control action with confirm: true and the selected built-in runtime to safely replace existing compute."));
+            }
+        }
+    }
     let desired = state
         .applications
         .update_workspace(
@@ -5801,7 +6451,9 @@ pub async fn update_application_workspace(
             application.application.id,
             crate::applications::WorkspaceSettingsUpdate {
                 runtime: request.runtime,
-                image: None,
+                image: request
+                    .image
+                    .map(|image| (!image.is_empty()).then_some(image)),
                 cpu_limit: request.cpu_limit,
                 memory_limit_mb: request.memory_limit_mb,
                 pids_limit: request.pids_limit,
@@ -5921,8 +6573,102 @@ pub async fn control_application_workspace(
             .with_detail("The instance sandbox service is not configured.")
     })?;
     let action = request.action.clone();
+    let _other_action_gate = if action == "update_runtime" {
+        None
+    } else {
+        Some(
+            state
+                .service
+                .lock_application_runtime_update(&application_public_id)
+                .await
+                .map_err(Problem::from)?,
+        )
+    };
     let mut snapshot_id = None;
     match request.action.as_str() {
+        "update_runtime" => {
+            if request.confirm != Some(true) {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Runtime Update Confirmation Required")
+                    .with_detail("Set confirm: true to replace workspace compute after an isolated runtime preflight."));
+            }
+            let _turn_gate = state
+                .service
+                .lock_application_runtime_update(&application_public_id)
+                .await
+                .map_err(Problem::from)?;
+            let desired = state
+                .applications
+                .workspace(application.application.id)
+                .await?;
+            let next_runtime = request.runtime.as_deref().unwrap_or(&desired.runtime);
+            let pinned_image = temps_sandbox::services::managed_application_workspace_image(next_runtime)
+                .ok_or_else(|| problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Unsupported Workspace Runtime")
+                    .with_detail(format!("Application {application_public_id} has unsupported runtime {next_runtime}")))?
+                .to_string();
+            let summary = sandboxes
+                .application_workspace_summary(auth.user_id(), &application_public_id)
+                .await
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "inspect before runtime update",
+                    )
+                })?
+                .ok_or_else(|| {
+                    ApplicationError::NotFound(format!("workspace:{application_public_id}"))
+                })?;
+            if summary.status != "running" {
+                return Err(problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Workspace Must Be Running")
+                    .with_detail(format!("Workspace {application_public_id} is {}; resume it before updating the runtime.", summary.status)));
+            }
+            if summary.backend.as_deref() != Some("docker") {
+                return Err(problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Runtime Update Unsupported")
+                    .with_detail(format!("Workspace {application_public_id} does not run on the Docker backend required for safe image rollback.")));
+            }
+            let workspace = state
+                .application_workspaces
+                .ensure(&application_public_id, &application.projects)
+                .await?;
+            let mut config: temps_sandbox::services::ApplicationWorkspaceConfig = (&desired).into();
+            config.image = Some(pinned_image.clone());
+            let sandboxes = Arc::clone(sandboxes);
+            let app_id = application.application.id;
+            let user_id = auth.user_id();
+            let application_id = application_public_id.clone();
+            let sandbox_id = summary.public_id;
+            let selected_runtime = next_runtime.to_string();
+            let authorized_project_ids = project_ids.clone();
+            let audit_service = Arc::clone(&state.audit_service);
+            let audit_context = audit_context(&auth, &metadata);
+            // Keep the write gate and rollback operation alive if the HTTP
+            // client disconnects midway through replacement.
+            tokio::spawn(async move {
+                let _turn_gate = _turn_gate;
+                sandboxes.update_application_workspace_runtime(user_id, app_id, &application_id, &sandbox_id, workspace.host_work_dir, &selected_runtime, &authorized_project_ids, config).await
+                    .map_err(|error| application_workspace_provider_problem(error, &application_id, "update runtime"))?;
+                if let Err(error) = audit_service.create_audit_log(&ApplicationWorkspaceChangedAudit {
+                    context: audit_context,
+                    application_id: application_id.clone(),
+                    action: "update_runtime".to_string(),
+                    sandbox_id: Some(sandbox_id),
+                    runtime: Some(selected_runtime),
+                    cpu_limit: None,
+                    memory_limit_mb: None,
+                    pids_limit: None,
+                    disk_limit_mb: None,
+                }).await {
+                    tracing::error!(application_id = %application_id, %error, "Failed to audit runtime update");
+                }
+                Ok::<(), Problem>(())
+            }).await.map_err(|error| problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Runtime Update Task Failed")
+                .with_detail(format!("Runtime update task for {application_public_id} failed: {error}")))??;
+        }
         "pause" => {
             let summary = sandboxes
                 .application_workspace_summary(auth.user_id(), &application_public_id)
@@ -6151,10 +6897,13 @@ pub async fn control_application_workspace(
         _ => {
             return Err(problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Workspace Action")
-                .with_detail("Expected restart, pause, resume, rebuild, snapshot, or restore."));
+                .with_detail("Expected restart, pause, resume, rebuild, snapshot, restore, or update_runtime."));
         }
     }
     let response = application_workspace_response(&state, &auth, &application, snapshot_id).await?;
+    if action == "update_runtime" {
+        return Ok(Json(response));
+    }
     state
         .audit(&ApplicationWorkspaceChangedAudit {
             context: audit_context(&auth, &metadata),
@@ -6470,6 +7219,160 @@ pub async fn get_user_conversation(
     }))
 }
 
+/// Export the bounded, server-redacted diagnostic state Temps currently owns.
+#[utoipa::path(
+    get,
+    operation_id = "getUserConversationDiagnostics",
+    tag = "AI Chat",
+    path = "/ai/conversations/{public_id}/diagnostics",
+    params(
+        ("public_id" = String, Path,),
+        ConversationDiagnosticsQuery,
+    ),
+    responses(
+        (status = 200, body = ConversationDiagnosticResponse),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_user_conversation_diagnostics(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(public_id): Path<String>,
+    Query(query): Query<ConversationDiagnosticsQuery>,
+) -> Result<Response, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let limit = query.limit.unwrap_or(DIAGNOSTIC_MAX_MESSAGES);
+    if limit == 0 || limit > DIAGNOSTIC_MAX_MESSAGES {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid diagnostic message limit")
+            .with_detail(format!(
+                "limit must be between 1 and {DIAGNOSTIC_MAX_MESSAGES}"
+            )));
+    }
+    let snapshot = state
+        .service
+        .diagnostic_messages(conversation.id, limit)
+        .await?;
+    let (native_session, native_session_status, native_session_note) = match state
+        .service
+        .export_native_session(&conversation, auth.user_id())
+        .await
+    {
+        crate::service::NativeSessionDiagnostic::Available(export) => {
+            match (export.json.len() <= DIAGNOSTIC_MAX_NATIVE_BYTES)
+                .then(|| serde_json::from_str::<serde_json::Value>(&export.json))
+                .transpose()
+            {
+                Ok(Some(json)) => (
+                    Some(ConversationNativeDiagnosticResponse {
+                        provider: export.provider,
+                        session_id: export.session_id,
+                        format: export.format,
+                        json: redact_value(&json),
+                        truncated: export.truncated,
+                    }),
+                    "available",
+                    "The provider-native session is sanitized and bounded. OpenCode removes tool inputs and outputs; terminal-only events absent from normalized history may still appear structurally in this export.",
+                ),
+                Ok(None) | Err(_) => (
+                    None,
+                    "invalid_export",
+                    "The provider returned a native session export that could not be safely decoded as JSON.",
+                ),
+            }
+        }
+        crate::service::NativeSessionDiagnostic::NotAvailable => (
+            None,
+            "not_available",
+            "No active, supported provider-native session export is available. Normalized persisted history is still included.",
+        ),
+        crate::service::NativeSessionDiagnostic::Busy => (
+            None,
+            "busy",
+            "The provider-native session is busy with another operation. Normalized persisted history is still included; refresh diagnostics after the turn finishes.",
+        ),
+        crate::service::NativeSessionDiagnostic::Error => (
+            None,
+            "error",
+            "The provider-native session could not be exported safely. Normalized persisted history is still included.",
+        ),
+    };
+    let mut any_truncated = snapshot.truncated;
+    let messages: Vec<ConversationDiagnosticMessageResponse> = snapshot
+        .messages
+        .into_iter()
+        .map(|message| {
+            let (content, content_truncated) =
+                bounded_redacted_text(&message.content, DIAGNOSTIC_MAX_TEXT_BYTES);
+            let (metadata, metadata_truncated) = message
+                .metadata
+                .as_ref()
+                .map(bounded_redacted_metadata)
+                .map_or((None, false), |(metadata, truncated)| {
+                    (Some(metadata), truncated)
+                });
+            let truncated = content_truncated || metadata_truncated;
+            any_truncated |= truncated;
+            ConversationDiagnosticMessageResponse {
+                role: message.role,
+                content,
+                metadata,
+                tokens_in: message.tokens_in,
+                tokens_out: message.tokens_out,
+                cost_microcents: message.cost_microcents,
+                created_at: message.created_at.to_rfc3339(),
+                truncated,
+            }
+        })
+        .collect();
+    let pending_permission = state
+        .service
+        .pending_permission_for(&conversation.public_id)
+        .and_then(|permission| serde_json::to_value(permission).ok())
+        .map(|value| bounded_redacted_metadata(&value).0);
+    let context_id = bounded_redacted_text(&conversation.context_id, 1024).0;
+    let context_usage = conversation_context_usage(conversation.metadata.as_ref());
+    let response = ConversationDiagnosticResponse {
+        schema_version: 1,
+        conversation: ConversationDiagnosticRuntimeResponse {
+            public_id: conversation.public_id,
+            context_type: conversation.context_type,
+            context_id,
+            provider: conversation.ai_provider,
+            model: conversation.ai_model,
+            thinking_level: conversation.ai_thinking_level,
+            permission_mode: conversation.ai_permission_mode,
+            turn_status: conversation.turn_status,
+            active_turn_id: conversation.active_turn_id,
+            last_turn_id: conversation.last_turn_id,
+            turn_started_at: conversation.turn_started_at.map(|value| value.to_rfc3339()),
+            native_session_id: conversation.cli_session_id,
+            context_usage,
+        },
+        source: ConversationDiagnosticSourceResponse {
+            normalized_history: true,
+            native_session_status,
+            native_session_note,
+        },
+        native_session,
+        returned_message_count: messages.len(),
+        message_limit: limit,
+        messages,
+        truncated: any_truncated,
+        pending_permission,
+    };
+    Ok((diagnostic_response_headers(), Json(response)).into_response())
+}
+
 /// Live wire for a conversation — cross-tab sync (not represented in the
 /// OpenAPI schema; WS upgrades aren't expressible there). Read-only: a second
 /// tab watching the same conversation subscribes here to the same authoritative
@@ -6693,6 +7596,7 @@ pub async fn send_message(
             &req.content,
             None,
             None,
+            Vec::new(),
             page_context,
             &auth,
             &metadata,
@@ -6702,7 +7606,10 @@ pub async fn send_message(
     {
         Ok(()) => {}
         Err(error) => {
-            if let Err(finish_error) = state.service.finish_turn(conv.id, &turn_id, "failed").await
+            if let Err(finish_error) = state
+                .service
+                .finish_failed_turn(conv.id, &turn_id, &error)
+                .await
             {
                 error!(
                     conversation_id = conv.id,
@@ -6826,6 +7733,14 @@ pub async fn send_user_message(
     let attachment_metadata =
         (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }));
     let attachment_context = attachment_prompt_context(&attachments);
+    let sandbox_attachments = attachments
+        .iter()
+        .map(|attachment| temps_ai::SandboxAttachment {
+            name: attachment.name.clone(),
+            bytes: Arc::from(attachment.contents.clone()),
+            is_image: attachment.is_image,
+        })
+        .collect();
     let page_context = req
         .page_context
         .as_deref()
@@ -6844,6 +7759,7 @@ pub async fn send_user_message(
             &req.content,
             attachment_metadata,
             attachment_context.as_deref(),
+            sandbox_attachments,
             page_context,
             &auth,
             &metadata,
@@ -6853,7 +7769,7 @@ pub async fn send_user_message(
     {
         if let Err(finish_error) = state
             .service
-            .finish_turn(conversation.id, &turn_id, "failed")
+            .finish_failed_turn(conversation.id, &turn_id, &error)
             .await
         {
             error!(
@@ -7001,21 +7917,30 @@ async fn resolve_chat_attachments(
             )
             .into());
         }
-        let size_bytes = state
+        let contents = state
             .application_workspaces
-            .chat_attachment_size(&workspace_id, &conversation.public_id, &reference.id, &name)
+            .read_chat_attachment(
+                &workspace_id,
+                &conversation.public_id,
+                &reference.id,
+                &name,
+                MAX_CHAT_ATTACHMENT_BYTES,
+            )
             .await?;
+        let size_bytes = contents.len() as u64;
         let mime_type = attachment_mime_type(&name, None);
+        let is_image = verified_workspace_image_media_type(&name, &contents).is_some();
         attachments.push(ChatAttachmentResponse {
             id: reference.id.clone(),
             name,
-            is_image: mime_type.starts_with("image/"),
+            is_image,
             mime_type,
             size_bytes,
             sandbox_path: format!(
                 "/home/temps/workspace/.temps/chat-attachments/{}/{}/{}",
                 conversation.public_id, reference.id, reference.name
             ),
+            contents,
         });
     }
     Ok(attachments)
@@ -7030,8 +7955,8 @@ fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<S
     );
     for attachment in attachments {
         context.push_str(&format!(
-            "- {} ({}, {} bytes): {}\n",
-            attachment.name, attachment.mime_type, attachment.size_bytes, attachment.sandbox_path
+            "- {} ({}, {} bytes)\n",
+            attachment.name, attachment.mime_type, attachment.size_bytes
         ));
     }
     Some(context)
@@ -7151,7 +8076,8 @@ pub async fn upload_user_conversation_attachment(
             "/home/temps/workspace/.temps/chat-attachments/{}/{}/{}",
             conversation.public_id, attachment_id, name
         ),
-        is_image: mime_type.starts_with("image/"),
+        is_image: verified_workspace_image_media_type(&name, &bytes).is_some(),
+        contents: bytes.to_vec(),
     };
     state
         .audit(&ConversationAttachmentUploadedAudit {
@@ -8580,6 +9506,8 @@ async fn sandbox_tools_mcp(
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/ai/preview/authorize", post(authorize_workspace_preview))
+        .route("/ai/workspace-activity", get(get_workspace_activity))
         .route("/ai/workspace", get(get_global_ai_workspace))
         .route("/ai/workspace/file-limits", get(get_workspace_file_limits))
         .route(
@@ -8708,6 +9636,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/ai/conversations/{public_id}/messages",
             post(send_user_message),
+        )
+        .route(
+            "/ai/conversations/{public_id}/diagnostics",
+            get(get_user_conversation_diagnostics),
         )
         .route(
             "/ai/conversations/{public_id}/attachments",
@@ -8844,6 +9776,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_application,
         create_application_preview_link,
         create_global_workspace_preview_link,
+        authorize_workspace_preview,
         get_workspace_file_limits,
         get_application_workspace_changes,
         get_global_workspace_changes,
@@ -8870,9 +9803,11 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         find_conversation,
         list_conversations,
         list_all_conversations,
+        get_workspace_activity,
         create_global_conversation,
         get_global_ai_workspace,
         get_user_conversation,
+        get_user_conversation_diagnostics,
         send_user_message,
         upload_user_conversation_attachment,
         get_user_conversation_attachment,
@@ -8904,6 +9839,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ApplicationProjectEnvironmentResponse,
         ApplicationResponse,
         CreateApplicationPreviewLinkRequest,
+        AuthorizeWorkspacePreviewRequest,
         ApplicationPreviewLinkResponse,
         ApplicationWorkspaceFileResponse,
         ApplicationWorkspaceChangesResponse,
@@ -8935,6 +9871,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ConversationDetailResponse,
         ConversationListStatus,
         ConversationListScope,
+        WorkspaceActivityResponse,
+        WorkspaceActivitySummary,
+        WorkspaceHarnessActivity,
         CreateConversationRequest,
         CreateGlobalConversationRequest,
         RenameConversationRequest,
@@ -8958,6 +9897,161 @@ mod tests {
     use crate::PendingPermissionEntry;
     use axum::http::{StatusCode, Uri};
     use temps_auth::permissions::Role;
+
+    #[test]
+    fn workspace_activity_scope_is_bounded_and_deduplicated() {
+        let query = WorkspaceActivityQuery {
+            application_public_ids: Some("app_a,app_b,app_a".to_string()),
+        };
+        assert_eq!(
+            parse_workspace_activity_ids(&query).expect("valid scope"),
+            vec!["app_a", "app_b"]
+        );
+        assert!(parse_workspace_activity_ids(&WorkspaceActivityQuery {
+            application_public_ids: Some("app_a,,app_b".to_string())
+        })
+        .is_err());
+        assert!(parse_workspace_activity_ids(&WorkspaceActivityQuery {
+            application_public_ids: Some("bad/id".to_string())
+        })
+        .is_err());
+        assert!(parse_workspace_activity_ids(&WorkspaceActivityQuery {
+            application_public_ids: Some(vec!["app"; 101].join(","))
+        })
+        .is_err());
+        assert!(parse_workspace_activity_ids(&WorkspaceActivityQuery {
+            application_public_ids: None
+        })
+        .expect("global only")
+        .is_empty());
+    }
+
+    #[test]
+    fn workspace_activity_statuses_keep_untouched_threads_idle() {
+        let mut harness = WorkspaceHarnessActivity {
+            ai_provider: "codex".to_string(),
+            total: 0,
+            pending: 0,
+            running: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            idle: 0,
+        };
+        for status in [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "idle",
+            "legacy",
+        ] {
+            harness.add_status(status, 1);
+        }
+        assert_eq!(harness.total, 7);
+        assert_eq!(
+            (
+                harness.pending,
+                harness.running,
+                harness.completed,
+                harness.failed,
+                harness.cancelled,
+                harness.idle
+            ),
+            (1, 1, 1, 1, 1, 2)
+        );
+    }
+
+    #[test]
+    fn conversation_failure_exposes_only_the_durable_public_envelope() {
+        let metadata = serde_json::json!({
+            "last_failure": {
+                "code": "provider_rate_limited",
+                "title": "AI provider rate limited",
+                "detail": "Wait briefly, then retry this message.",
+                "retryable": true
+            },
+            "raw_provider_error": "token=must-not-be-returned"
+        });
+        let failure =
+            conversation_failure(Some(&metadata), "failed").expect("failure should decode");
+
+        assert_eq!(failure.code, "provider_rate_limited");
+        assert!(failure.retryable);
+        assert!(!serde_json::to_string(&failure)
+            .expect("failure serializes")
+            .contains("must-not-be-returned"));
+        assert!(conversation_failure(Some(&metadata), "completed").is_none());
+        assert!(conversation_failure(
+            Some(&serde_json::json!({
+                "last_failure": { "code": "incomplete" }
+            })),
+            "failed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn conversation_context_usage_is_optional_and_strictly_typed() {
+        let metadata = serde_json::json!({
+            "context_usage": {
+                "used_tokens": 4096,
+                "limit_tokens": null,
+                "model": "model-a",
+                "source": "provider_reported",
+                "estimated": true,
+                "updated_at": "2026-01-01T00:00:00Z"
+            }
+        });
+        let usage = conversation_context_usage(Some(&metadata)).expect("usage should decode");
+        assert_eq!(usage.used_tokens, 4096);
+        assert_eq!(usage.limit_tokens, None);
+        assert!(usage.estimated);
+        assert!(conversation_context_usage(Some(&serde_json::json!({
+            "context_usage": { "used_tokens": "invalid" }
+        })))
+        .is_none());
+    }
+
+    #[test]
+    fn diagnostic_text_and_metadata_are_redacted_and_bounded() {
+        let secret = format!("token={} {}", "secret-value", "x".repeat(20_000));
+        let (text, text_truncated) = bounded_redacted_text(&secret, 128);
+        assert!(text_truncated);
+        assert!(text.len() <= 128);
+        assert!(!text.contains("secret-value"));
+
+        let (metadata, metadata_truncated) = bounded_redacted_metadata(&serde_json::json!({
+            "authorization": "Bearer private-token",
+            "output": "x".repeat(DIAGNOSTIC_MAX_METADATA_BYTES * 2),
+        }));
+        assert!(metadata_truncated);
+        assert!(!metadata.to_string().contains("private-token"));
+        assert!(metadata.to_string().len() <= DIAGNOSTIC_MAX_METADATA_BYTES + 64);
+    }
+
+    #[test]
+    fn diagnostic_response_disables_browser_and_intermediary_caching() {
+        let headers = diagnostic_response_headers();
+        assert_eq!(
+            headers
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
+    }
+
+    #[test]
+    fn diagnostic_conversation_requires_context_read_permission() {
+        let mut conversation = conversation_with_runtime("opencode", "default");
+        conversation.context_type = "deployment".to_string();
+        let unauthorized = custom_auth(vec![Permission::ProjectsRead]);
+        let authorized = custom_auth(vec![Permission::ProjectsRead, Permission::DeploymentsRead]);
+
+        assert!(ensure_conversation_read_permission(&unauthorized, &conversation).is_err());
+        assert!(ensure_conversation_read_permission(&authorized, &conversation).is_ok());
+    }
 
     #[test]
     fn workspace_import_body_limit_fits_the_bounded_base64_request() {
@@ -9715,6 +10809,26 @@ mod tests {
     }
 
     #[test]
+    fn preview_renewal_requires_persisted_console_session() {
+        let browser = AuthContext::new_persisted_session(test_user(), Role::User, 17);
+        assert!(require_console_preview_session(&browser).is_ok());
+        let api_key = custom_auth(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]);
+        assert_eq!(
+            require_console_preview_session(&api_key)
+                .expect_err("API keys cannot renew browser previews")
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+        let unbound_session = AuthContext::new_session(test_user(), Role::User);
+        assert_eq!(
+            require_console_preview_session(&unbound_session)
+                .expect_err("unpersisted session is insufficient")
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
     fn seeded_contexts_require_their_domain_read_permissions() {
         let project_writer = custom_auth(vec![Permission::ProjectsWrite]);
         assert!(!can_read_context(&project_writer, "deployment"));
@@ -9790,6 +10904,8 @@ mod tests {
             ai_thinking_level: conversation.ai_thinking_level,
             ai_permission_mode: conversation.ai_permission_mode,
             turn_status: conversation.turn_status,
+            failure: None,
+            context_usage: None,
         };
 
         let value = serde_json::to_value(response).expect("response serializes");
@@ -10217,12 +11333,9 @@ mod tests {
             "claude_cli"
         );
 
-        let codex = require_application_harness(Some("codex_cli"))
-            .expect_err("Codex does not yet have a secure workspace relay");
-        assert_eq!(codex.status_code, StatusCode::CONFLICT);
         assert_eq!(
-            codex.body.get("title").and_then(serde_json::Value::as_str),
-            Some("Workspace Harness Not Supported")
+            require_application_harness(Some("codex_cli")).expect("Codex is registered"),
+            "codex_cli"
         );
     }
 

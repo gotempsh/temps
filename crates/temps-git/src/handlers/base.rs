@@ -126,6 +126,16 @@ impl From<GitProviderManagerError> for Problem {
                     .with_value("code", "expired_token")
                     .with_value("connection_id", connection_id)
             }
+            GitProviderManagerError::RepositoryCreation {
+                connection_id,
+                repository_name,
+                source: _,
+            } => problem_new(StatusCode::BAD_GATEWAY)
+                .with_title("Repository Creation Failed")
+                .with_detail(format!(
+                    "The git provider could not create repository '{}' through connection {}.",
+                    repository_name, connection_id
+                )),
             GitProviderManagerError::QueueError(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
                 .with_detail(msg),

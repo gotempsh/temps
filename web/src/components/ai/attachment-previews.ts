@@ -3,6 +3,19 @@
 
 import type { ChatAttachment } from './chat-message-parts'
 
+/** Reject the entire selection rather than silently dropping excess files. */
+export function attachmentSelectionError(
+  files: readonly Pick<File, 'name' | 'size'>[],
+  pendingCount: number
+): string | null {
+  if (files.length + pendingCount > 8)
+    return 'A message may include at most 8 files.'
+  const oversized = files.find((file) => file.size > 20 * 1024 * 1024)
+  return oversized
+    ? `${oversized.name} exceeds the 20 MB attachment limit.`
+    : null
+}
+
 interface ObjectUrlApi {
   createObjectURL(blob: Blob): string
   revokeObjectURL(url: string): void

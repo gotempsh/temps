@@ -185,6 +185,8 @@
             letter-spacing: 0.04em;
             text-transform: uppercase;
         }
+        .managed-help { margin: 0 0 18px; color: #a1a1aa; font-size: 0.82rem; line-height: 1.5; text-align: center; }
+        .managed-help a { color: #93c5fd; }
     </style>
 </head>
 <body>
@@ -207,6 +209,7 @@
 
         <h1>Preview Password Required</h1>
         <p class="subtitle">This workspace preview is protected. Enter the password to continue.</p>
+        {{MANAGED_LINK}}
 
         <div class="error-msg">
             <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -225,5 +228,6 @@
 
         <div class="footer">Protected by Temps</div>
     </div>
+{{MANAGED_SCRIPT}}
 </body>
 </html>

@@ -67,6 +67,13 @@ export const platformToolGroups: PlatformToolGroup[] = [
         featureKey: 'sandboxes-preview-environments',
       },
       {
+        title: 'Workspaces',
+        description: 'Persistent working contexts with optional compute.',
+        url: '/workspaces',
+        icon: Folder,
+        keywords: ['context', 'workspace', 'projects'],
+      },
+      {
         title: 'Git providers',
         description: 'Connect repositories and source providers.',
         url: '/git-providers',

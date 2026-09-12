@@ -315,6 +315,14 @@ pub struct SandboxExecResult {
     pub stderr: String,
 }
 
+/// Read-only compatibility result for the retained SDK runtime transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCompatibility {
+    Compatible,
+    Unavailable { reason: String },
+    Incompatible { reason: String },
+}
+
 /// A live bidirectional byte channel into a sandbox's PTY agent.
 ///
 /// Returned by [`SandboxProvider::attach_pty`]. The two halves are separate
@@ -365,6 +373,48 @@ pub trait SandboxProvider: Send + Sync {
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
 
+    /// Immutable image identity backing an existing sandbox, suitable for rollback.
+    async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "provider '{}' cannot resolve immutable image identity",
+                self.name()
+            ),
+        })
+    }
+
+    /// Probe the retained SDK protocol without creating a runtime or changing sandbox state.
+    async fn check_agent_runtime(
+        &self,
+        _handle: &SandboxHandle,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        Ok(RuntimeCompatibility::Incompatible {
+            reason: format!(
+                "provider '{}' does not support the retained agent runtime",
+                self.name()
+            ),
+        })
+    }
+
+    /// Confirm orphan harness termination after recovering a live sandbox.
+    /// Implementations must not stop managed application processes.
+    async fn recover_agent_harness(
+        &self,
+        handle: &SandboxHandle,
+        _epoch: u64,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "provider '{}' requires a workspace runtime update for safe harness recovery",
+                self.name()
+            ),
+        })
+    }
+
     /// Return the base URL a process inside `handle` must use for its
     /// turn-scoped model relay. Backends with ordinary reachability can use
     /// the control-plane URL directly. Network-isolated backends override
@@ -375,6 +425,24 @@ pub trait SandboxProvider: Send + Sync {
         control_plane_url: &str,
     ) -> Result<String, AgentError> {
         Ok(direct_model_relay_base_url(control_plane_url))
+    }
+
+    /// Return the base URL a process inside `handle` must use for bounded Git
+    /// SmartHTTP access. Providers must explicitly opt in because this route
+    /// can bridge an otherwise isolated sandbox to the control plane.
+    async fn git_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        _control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "Git relay is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
     }
 
     /// Return the URL a process inside `handle` must use for a turn-scoped
@@ -406,6 +474,22 @@ pub trait SandboxProvider: Send + Sync {
             sandbox_id: handle.sandbox_id.clone(),
             reason: format!(
                 "application networks are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Open the private retained-agent daemon protocol, without a TTY or shell.
+    /// The caller must authorize this sandbox before opening the connection.
+    async fn connect_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<PtyAttachment, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "retained agent runtime transport is unavailable for provider '{}'",
                 self.name()
             ),
         })

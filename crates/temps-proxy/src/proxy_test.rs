@@ -38,11 +38,15 @@ pub mod proxy_tests {
 
     /// Simple mock server that just accepts connections
     async fn start_simple_server() -> String {
-        let port = get_next_port();
-        let addr = format!("127.0.0.1:{}", port);
-
-        let listener = TcpListener::bind(&addr).await.unwrap();
-        let server_addr = addr.clone();
+        // Let the OS reserve a free port atomically. A process-local counter
+        // cannot account for other tests or an operator's running services.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback listener for the proxy test");
+        let server_addr = listener
+            .local_addr()
+            .expect("read the proxy test listener's assigned address")
+            .to_string();
 
         // Start a simple server that accepts and closes connections
         tokio::spawn(async move {
@@ -56,6 +60,18 @@ pub mod proxy_tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         server_addr
+    }
+
+    #[tokio::test]
+    async fn test_mock_servers_keep_distinct_reserved_ports() {
+        let first = start_simple_server().await;
+        let second = start_simple_server().await;
+        assert_ne!(first, second, "live mock listeners must not share a port");
+        for address in [first, second] {
+            tokio::net::TcpStream::connect(&address)
+                .await
+                .expect("the assigned mock listener must accept connections");
+        }
     }
 
     #[allow(dead_code)]

@@ -10323,6 +10323,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-agent-runtime"
+version = "0.1.0"
+source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=91ef59ba85140bafba6fcd50d91114e7edee99e8#91ef59ba85140bafba6fcd50d91114e7edee99e8"
+dependencies = [
+ "async-trait",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "temps-agents"
 version = "0.1.0-beta.56"
 dependencies = [
@@ -10405,12 +10421,15 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
+ "temps-agent-runtime",
  "temps-agents",
  "temps-ai",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "uuid",
@@ -10478,6 +10497,7 @@ dependencies = [
  "tracing",
  "unicode-casefold",
  "unicode-normalization",
+ "url",
  "utoipa",
  "uuid",
  "walkdir",

@@ -64,19 +64,101 @@ export function isTempsWriteToolName(name: string): boolean {
  */
 export function assistantParts(message: ChatMessage): ChatPart[] {
   if (message.parts && message.parts.length > 0) {
+    const represented = new Set(
+      message.parts.flatMap((part) =>
+        part.type === 'tool' ? [part.tool.id] : []
+      )
+    )
+    const toolsById = new Map(
+      (message.tools ?? []).map((tool) => [tool.id, tool])
+    )
+    const parts: ChatPart[] = message.parts.map((part) => {
+      if (part.type !== 'tool') return part
+      const stored = toolsById.get(part.tool.id)
+      return stored
+        ? {
+            type: 'tool',
+            tool: {
+              ...part.tool,
+              arguments: part.tool.arguments || stored.arguments,
+              result: part.tool.result ?? stored.result,
+            },
+          }
+        : part
+    })
+    for (const tool of message.tools ?? []) {
+      if (!represented.has(tool.id)) {
+        parts.push({ type: 'tool', tool })
+        represented.add(tool.id)
+      }
+    }
     if (
       message.content &&
       !message.parts.some((part) => part.type === 'text')
     ) {
-      return [...message.parts, { type: 'text', text: message.content }]
+      return [...parts, { type: 'text', text: message.content }]
     }
-    return message.parts
+    return parts
   }
 
   const parts: ChatPart[] = []
   for (const tool of message.tools ?? []) parts.push({ type: 'tool', tool })
   if (message.content) parts.push({ type: 'text', text: message.content })
   return parts
+}
+
+/** A terminal event is still evidence when its start was missed on reconnect. */
+export function upsertMessageTool(
+  message: ChatMessage,
+  incoming: ToolCall
+): ChatMessage {
+  const parts = assistantParts(message)
+  const previous = parts.find(
+    (part) => part.type === 'tool' && part.tool.id === incoming.id
+  )
+  const old = previous?.type === 'tool' ? previous.tool : undefined
+  const tool = {
+    ...old,
+    ...incoming,
+    arguments: incoming.arguments || old?.arguments || '',
+    result: incoming.result ?? old?.result,
+  }
+  const tools =
+    message.tools ??
+    parts.flatMap((part) => (part.type === 'tool' ? [part.tool] : []))
+  return {
+    ...message,
+    tools: tools.some((item) => item.id === tool.id)
+      ? tools.map((item) => (item.id === tool.id ? tool : item))
+      : [...tools, tool],
+    parts: previous
+      ? parts.map((part) =>
+          part.type === 'tool' && part.tool.id === tool.id
+            ? { type: 'tool', tool }
+            : part
+        )
+      : [...parts, { type: 'tool', tool }],
+  }
+}
+
+/** Read explicit failure receipts, never guess from words in ordinary output. */
+export function toolExecutionState(tool: ToolCall): 'running' | 'completed' | 'failed' {
+  if (tool.result == null) return 'running'
+  try {
+    const result = JSON.parse(tool.result)
+    if (result && typeof result === 'object' && (
+      result.is_error === true || result.isError === true ||
+      (typeof result.error === 'string' && result.error.length > 0) ||
+      result.status === 'failed' || result.status === 'error' ||
+      (typeof result.exit_code === 'number' && result.exit_code !== 0) ||
+      (typeof result.status === 'number' && result.status >= 400)
+    )) return 'failed'
+  } catch {
+    // Native command receipts include a trailing exit status outside JSON.
+  }
+  const exit = tool.result.match(/(?:^|\n)Process exited with code (-?\d+)\.\s*$/)
+    ?? tool.result.match(/^Exit code (-?\d+)(?:\r?\n|$)/)
+  return exit && Number(exit[1]) !== 0 ? 'failed' : 'completed'
 }
 
 /** Action ids already represented by persisted `temps_write` tool results. */

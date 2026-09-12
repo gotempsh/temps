@@ -2,11 +2,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { renderToStaticMarkup } from 'react-dom/server'
+import { renderToStaticMarkup as renderMarkup } from 'react-dom/server'
+import type { ReactNode } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 
 import type { ApplicationWorkspaceResponse } from '@/api/client'
-import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
+import {
+  ApplicationWorkspaceSettingsPanel,
+  workspaceResourceFingerprint,
+} from './ApplicationWorkspaceSettingsPanel'
+
+function renderToStaticMarkup(children: ReactNode) {
+  return renderMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      {children}
+    </QueryClientProvider>
+  )
+}
 
 const workspace: ApplicationWorkspaceResponse = {
   cpu_limit: 2,
@@ -21,11 +34,38 @@ const workspace: ApplicationWorkspaceResponse = {
   persistent_volume_healthy: true,
   pids_limit: 1024,
   runtime: 'node',
+  runtime_update_available: false,
   sandbox_public_id: 'sbx_abcdef0123456789',
   state: 'running',
 }
 
 describe('ApplicationWorkspaceSettingsPanel', () => {
+  test('uses a responsive settings grid for full-page workspace detail', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ApplicationWorkspaceSettingsPanel layout="page" applicationPublicId="app_example" initialWorkspace={workspace} />
+      </MemoryRouter>
+    )
+    expect(html).toContain('lg:grid-cols-2')
+    expect(html).not.toContain('max-w-')
+    expect(html).toContain('Desired resources')
+    expect(html).toContain('Harness maintenance')
+  })
+  test('status polling does not invalidate resource drafts, but configuration changes do', () => {
+    expect(
+      workspaceResourceFingerprint({
+        ...workspace,
+        memory_used_bytes: 123,
+        state: 'running',
+      })
+    ).toBe(workspaceResourceFingerprint(workspace))
+    expect(
+      workspaceResourceFingerprint({ ...workspace, runtime: 'full' })
+    ).not.toBe(workspaceResourceFingerprint(workspace))
+    expect(
+      workspaceResourceFingerprint({ ...workspace, cpu_limit: 8 })
+    ).not.toBe(workspaceResourceFingerprint(workspace))
+  })
   test('shows sandbox-specific harness maintenance commands and console link', () => {
     const html = renderToStaticMarkup(
       <MemoryRouter>
@@ -40,7 +80,9 @@ describe('ApplicationWorkspaceSettingsPanel', () => {
     expect(html).toContain('claude update &amp;&amp; claude --version')
     expect(html).toContain('@openai/codex@latest')
     expect(html).toContain('opencode upgrade --method curl')
-    expect(html).toContain('/sandboxes/sbx_abcdef0123456789')
+    expect(html).toContain('/workspaces/app_example')
+    expect(html).toContain('Workspace details')
+    expect(html).not.toContain('/sandboxes/sbx_abcdef0123456789')
     expect(html).toContain(
       'bunx @temps-sdk/cli sandbox shell sbx_abcdef0123456789'
     )

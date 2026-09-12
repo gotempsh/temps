@@ -1714,6 +1714,11 @@ export type AppSettingsResponse = {
     tenant_resource_ceilings: TenantResourceCeilings;
 };
 
+export type ApplicationGitConnectionsResponse = {
+    bindings: Array<GitBindingResponse>;
+    eligibleRepositories: Array<EligibleGitRepositoryResponse>;
+};
+
 export type ApplicationPreviewLinkResponse = {
     expires_at: number;
     /**
@@ -1853,6 +1858,10 @@ export type ApplicationWorkspaceResponse = {
     pids_limit: number;
     pids_used?: number | null;
     runtime: string;
+    runtime_compatible?: boolean | null;
+    runtime_update_available: boolean;
+    runtime_update_error?: string | null;
+    runtime_update_image?: string | null;
     sandbox_public_id?: string | null;
     snapshot_id?: string | null;
     state: string;
@@ -2024,6 +2033,12 @@ export type AuthTokenResponse = {
     access_token: string;
     expires_at: number;
     refresh_token: string;
+};
+
+export type AuthorizeWorkspacePreviewRequest = {
+    path?: string | null;
+    port: number;
+    sandbox_public_id: string;
 };
 
 /**
@@ -2322,6 +2337,13 @@ export type BackupScheduleResponse = {
      */
     target_all_services: boolean;
     updated_at: number;
+};
+
+export type BindApplicationGitConnectionRequest = {
+    connectionId: number;
+    projectId: number;
+    remoteName: string;
+    repositoryId: number;
 };
 
 /**
@@ -2865,6 +2887,13 @@ export type ChatCompletionResponse = {
     model: string;
     object: string;
     usage?: null | UsageInfo;
+};
+
+export type ChatFailureResponse = {
+    code: string;
+    detail: string;
+    retryable: boolean;
+    title: string;
 };
 
 export type ChatMessage = {
@@ -4293,6 +4322,15 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ContextWindowUsageResponse = {
+    estimated: boolean;
+    limit_tokens?: number | null;
+    model?: string | null;
+    source: string;
+    updated_at: string;
+    used_tokens: number;
+};
+
 export type ContinuousArchiveSourceResponse = {
     continuous_archive_pinned_at: string;
     continuous_archive_s3_source_id: number;
@@ -4301,10 +4339,18 @@ export type ContinuousArchiveSourceResponse = {
 
 export type ControlApplicationWorkspaceRequest = {
     /**
-     * restart, pause, resume, rebuild, snapshot, or restore
+     * restart, pause, resume, rebuild, snapshot, restore, or update_runtime
      */
     action: string;
+    /**
+     * Must be true for update_runtime because compute is replaced.
+     */
+    confirm?: boolean | null;
     label?: string | null;
+    /**
+     * Optional built-in flavor to select during update_runtime.
+     */
+    runtime?: string | null;
     snapshot_id?: string | null;
 };
 
@@ -4317,6 +4363,51 @@ export type ConversationDetailResponse = ConversationResponse & {
     pending_permission?: null | PermissionRequest;
 };
 
+export type ConversationDiagnosticMessageResponse = {
+    content: string;
+    cost_microcents?: number | null;
+    created_at: string;
+    metadata?: unknown;
+    role: string;
+    tokens_in?: number | null;
+    tokens_out?: number | null;
+    truncated: boolean;
+};
+
+export type ConversationDiagnosticResponse = {
+    conversation: ConversationDiagnosticRuntimeResponse;
+    message_limit: number;
+    messages: Array<ConversationDiagnosticMessageResponse>;
+    native_session?: null | ConversationNativeDiagnosticResponse;
+    pending_permission?: unknown;
+    returned_message_count: number;
+    schema_version: number;
+    source: ConversationDiagnosticSourceResponse;
+    truncated: boolean;
+};
+
+export type ConversationDiagnosticRuntimeResponse = {
+    active_turn_id?: string | null;
+    context_id: string;
+    context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
+    last_turn_id?: string | null;
+    model: string;
+    native_session_id?: string | null;
+    permission_mode: string;
+    provider: string;
+    public_id: string;
+    thinking_level?: string | null;
+    turn_started_at?: string | null;
+    turn_status: string;
+};
+
+export type ConversationDiagnosticSourceResponse = {
+    native_session_note: string;
+    native_session_status: string;
+    normalized_history: boolean;
+};
+
 export type ConversationListScope = 'all' | 'global';
 
 export type ConversationListStatus = 'active' | 'archived';
@@ -4324,6 +4415,14 @@ export type ConversationListStatus = 'active' | 'archived';
 export type ConversationMessagePageResponse = {
     has_more: boolean;
     next_before?: string | null;
+};
+
+export type ConversationNativeDiagnosticResponse = {
+    format: string;
+    json: unknown;
+    provider: string;
+    session_id: string;
+    truncated: boolean;
 };
 
 export type ConversationResponse = {
@@ -4335,7 +4434,9 @@ export type ConversationResponse = {
     application_id?: number | null;
     context_id: string;
     context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
     created_at: string;
+    failure?: null | ChatFailureResponse;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -7483,6 +7584,15 @@ export type DropPresetCandidate = {
     reason: string;
 };
 
+export type EligibleGitRepositoryResponse = {
+    accountName: string;
+    connectionId: number;
+    fullName: string;
+    private: boolean;
+    repositoryId: number;
+    repositoryUrl: string;
+};
+
 export type EmailConfig = {
     accept_invalid_certs?: boolean;
     from_address: string;
@@ -10048,6 +10158,21 @@ export type GetVisitorSessionsResponse = {
     total_count: number;
 };
 
+export type GitBindingResponse = {
+    connectionId: number;
+    createdAt: string;
+    id: number;
+    projectId: number;
+    remoteName: string;
+    repositoryId: number;
+    repositoryUrl: string;
+    /**
+     * `configured` means the durable authorization exists; it does not claim a live remote.
+     */
+    status: string;
+    updatedAt: string;
+};
+
 /**
  * Git push event information that triggered the deployment
  */
@@ -10169,7 +10294,9 @@ export type GlobalConversationResponse = {
     ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
     created_at: string;
+    failure?: null | ChatFailureResponse;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -21888,6 +22015,11 @@ export type UpdateApplicationWorkspaceRequest = {
     cpu_limit?: number | null;
     disk_limit_mb?: number | null;
     idle_timeout_secs?: number | null;
+    /**
+     * Pinned Temps-managed daemon image. Empty string restores the runtime default.
+     * Omit to leave the selected image unchanged. Arbitrary images are rejected.
+     */
+    image?: string | null;
     memory_limit_mb?: number | null;
     pids_limit?: number | null;
     runtime?: string | null;
@@ -23936,6 +24068,30 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'cron-job' | 'other';
 
+export type WorkspaceActivityResponse = {
+    workspaces: Array<WorkspaceActivitySummary>;
+};
+
+export type WorkspaceActivitySummary = {
+    /**
+     * Null identifies the user's global workspace.
+     */
+    application_public_id?: string | null;
+    harnesses: Array<WorkspaceHarnessActivity>;
+    total: number;
+};
+
+export type WorkspaceHarnessActivity = {
+    ai_provider: string;
+    cancelled: number;
+    completed: number;
+    failed: number;
+    idle: number;
+    pending: number;
+    running: number;
+    total: number;
+};
+
 export type WriteApplicationWorkspaceFilesRequest = {
     files: Array<ApplicationWorkspaceFileWrite>;
 };
@@ -24974,6 +25130,72 @@ export type CreateThreadArtifactResponses = {
 
 export type CreateThreadArtifactResponse = CreateThreadArtifactResponses[keyof CreateThreadArtifactResponses];
 
+export type ListApplicationGitConnectionsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections';
+};
+
+export type ListApplicationGitConnectionsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListApplicationGitConnectionsResponses = {
+    200: ApplicationGitConnectionsResponse;
+};
+
+export type ListApplicationGitConnectionsResponse = ListApplicationGitConnectionsResponses[keyof ListApplicationGitConnectionsResponses];
+
+export type BindApplicationGitConnectionData = {
+    body: BindApplicationGitConnectionRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections';
+};
+
+export type BindApplicationGitConnectionErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type BindApplicationGitConnectionResponses = {
+    201: GitBindingResponse;
+};
+
+export type BindApplicationGitConnectionResponse = BindApplicationGitConnectionResponses[keyof BindApplicationGitConnectionResponses];
+
+export type DisconnectApplicationGitConnectionData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        binding_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections/{binding_id}';
+};
+
+export type DisconnectApplicationGitConnectionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type DisconnectApplicationGitConnectionResponses = {
+    204: void;
+};
+
+export type DisconnectApplicationGitConnectionResponse = DisconnectApplicationGitConnectionResponses[keyof DisconnectApplicationGitConnectionResponses];
+
 export type CreateApplicationPreviewLinkData = {
     body: CreateApplicationPreviewLinkRequest;
     path: {
@@ -25597,6 +25819,32 @@ export type GetUserConversationAttachmentResponses = {
 
 export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
 
+export type GetUserConversationDiagnosticsData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Persisted rows to include, newest window first (default/max 25).
+         */
+        limit?: number | null;
+    };
+    url: '/ai/conversations/{public_id}/diagnostics';
+};
+
+export type GetUserConversationDiagnosticsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationDiagnosticsResponses = {
+    200: ConversationDiagnosticResponse;
+};
+
+export type GetUserConversationDiagnosticsResponse = GetUserConversationDiagnosticsResponses[keyof GetUserConversationDiagnosticsResponses];
+
 export type SendUserMessageData = {
     body: SendMessageRequest;
     path: {
@@ -25794,6 +26042,27 @@ export type RejectUserPendingActionResponses = {
 };
 
 export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
+
+export type AuthorizeWorkspacePreviewData = {
+    body: AuthorizeWorkspacePreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/preview/authorize';
+};
+
+export type AuthorizeWorkspacePreviewErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type AuthorizeWorkspacePreviewResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type AuthorizeWorkspacePreviewResponse = AuthorizeWorkspacePreviewResponses[keyof AuthorizeWorkspacePreviewResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -26711,6 +26980,30 @@ export type GetGlobalAiWorkspaceResponses = {
 };
 
 export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
+
+export type GetWorkspaceActivityData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Comma-separated application public IDs (maximum 100). Omit for the global workspace only.
+         */
+        application_public_ids?: string | null;
+    };
+    url: '/ai/workspace-activity';
+};
+
+export type GetWorkspaceActivityErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+};
+
+export type GetWorkspaceActivityResponses = {
+    200: WorkspaceActivityResponse;
+};
+
+export type GetWorkspaceActivityResponse = GetWorkspaceActivityResponses[keyof GetWorkspaceActivityResponses];
 
 export type GetGlobalWorkspaceChangesData = {
     body?: never;

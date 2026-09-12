@@ -2,12 +2,9 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # syntax=docker/dockerfile:1
-# runtime-src is an explicit named context, never the developer's home directory.
+# Cargo.toml and Cargo.lock pin the public SDK; no sibling checkout is required.
 FROM rust:1-bookworm AS build
 WORKDIR /build
-COPY --from=runtime-src Cargo.toml Cargo.lock temps-agent-runtime/
-COPY --from=runtime-src src temps-agent-runtime/src
-COPY --from=runtime-src examples/*.rs temps-agent-runtime/examples/
 COPY Cargo.toml Cargo.lock temps/tools/sandbox-runtime/
 COPY src temps/tools/sandbox-runtime/src
 WORKDIR /build/temps/tools/sandbox-runtime
@@ -18,7 +15,7 @@ FROM node:22-bookworm-slim AS common
 ARG CODEX_VERSION=0.154.0
 ARG CLAUDE_VERSION=2.1.263
 ARG OPENCODE_VERSION=1.18.23
-RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates git curl jq sudo \
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates git curl jq sudo procps iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && usermod -l temps -d /home/temps -m node \
     && groupmod -n temps node \
@@ -30,9 +27,10 @@ COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=build /build/temps/tools/sandbox-runtime/target/release/temps-sandbox-runtime /usr/local/bin/temps-sandbox-runtime
 ENV HOME=/home/temps
 LABEL sh.temps.runtime.protocol="1"
+LABEL sh.temps.runtime.agent-protocol="4"
 USER temps
 WORKDIR /home/temps/workspace
-HEALTHCHECK --interval=10s --timeout=3s CMD ["temps-sandbox-runtime", "request"]
+HEALTHCHECK --interval=30s --timeout=5s CMD ["temps-sandbox-runtime", "check"]
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/temps-sandbox-runtime"]
 CMD ["serve"]
 

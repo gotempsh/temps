@@ -35,6 +35,7 @@ import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
+import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
 import { AiAssistantProvider } from './components/ai/AiAssistantContext'
@@ -71,6 +72,7 @@ const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
+const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
@@ -597,7 +599,9 @@ const FullAppRoutes = () => {
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
-                    <Route path="/sandboxes" element={<Sandboxes />} />
+              <Route path="/sandboxes" element={<Sandboxes />} />
+              <Route path="/workspaces" element={<Sandboxes key="workspaces" workspacesOnly />} />
+              <Route path="/workspaces/:workspaceId" element={<WorkspaceDetail />} />
                     <Route
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}
@@ -1015,6 +1019,10 @@ const AppContent = () => {
                 />
 
                 {/* Protected routes - layout determined by demo mode */}
+                <Route
+                  path="/sandbox-preview"
+                  element={<SandboxPreviewAccess />}
+                />
                 <Route
                   path="/*"
                   element={
