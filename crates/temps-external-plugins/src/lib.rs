@@ -12,14 +12,17 @@
 //! - Event delivery: forwarding platform events to subscribing plugins
 //! - API: listing plugin manifests via REST endpoint
 
+pub mod catalog;
 pub mod channel;
 pub mod event_listener;
 pub mod handler;
 pub mod host_api;
+pub mod install;
 pub mod manager;
 pub mod plugin;
 pub mod proxy;
 pub mod service;
+pub mod trust;
 
 pub use channel::PluginChannel;
 pub use event_listener::PluginEventListener;

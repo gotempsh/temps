@@ -16,12 +16,13 @@
  * PR bumped react-dom to 19.2.8 and left react on 19.2.7. Dependabot grouping
  * makes that less likely but does not guarantee it -- the two packages were
  * already in the same group when it happened -- so this check is the actual
- * guarantee. It reads the resolved versions out of bun.lock rather than the
- * declared ranges in package.json, because it is the resolved versions that
- * end up in the bundle.
+ * guarantee. It checks both the resolved versions in bun.lock and any
+ * workspace-local copies left in node_modules, because either can end up in
+ * the bundle.
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const webDir = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -44,7 +45,7 @@ function readLockfile(path) {
 }
 
 function fail(message) {
-  console.error(`\n❌ react version check failed\n\n${message}\n`)
+  process.stderr.write(`\n❌ react version check failed\n\n${message}\n\n`)
   process.exit(1)
 }
 
@@ -64,11 +65,15 @@ if (!packages || typeof packages !== 'object') {
 function resolvedVersion(name) {
   const entry = packages[name]
   if (!entry) {
-    fail(`"${name}" is not present in ${lockPath}. Run \`bun install\` in web/.`)
+    fail(
+      `"${name}" is not present in ${lockPath}. Run \`bun install\` in web/.`
+    )
   }
   const specifier = Array.isArray(entry) ? entry[0] : entry
   if (typeof specifier !== 'string') {
-    fail(`Unexpected lockfile entry shape for "${name}": ${JSON.stringify(entry)}`)
+    fail(
+      `Unexpected lockfile entry shape for "${name}": ${JSON.stringify(entry)}`
+    )
   }
   const at = specifier.lastIndexOf('@')
   if (at <= 0) {
@@ -88,8 +93,49 @@ if (react !== reactDom) {
       `A mismatch makes the console throw React error #527 at startup and render\n` +
       `a blank page (https://react.dev/errors/527).\n\n` +
       `Fix: set both to the same version in web/package.json, then run\n` +
-      `\`bun install\` in web/ to refresh bun.lock.`,
+      `\`bun install\` in web/ to refresh bun.lock.`
   )
 }
 
-console.log(`✓ react and react-dom both resolve to ${react}`)
+// Bun can leave a previously installed workspace-local React behind even when
+// bun.lock has been updated to a single hoisted version. Imports from that
+// workspace then resolve to the stale copy and hooks fail at runtime with an
+// "Invalid hook call" even though the lockfile-only check above passes.
+const workspaceReactCopies = Object.keys(lock.workspaces ?? {})
+  .filter((workspace) => workspace !== '')
+  .flatMap((workspace) =>
+    ['react', 'react-dom'].map((name) => ({
+      name,
+      path: join(webDir, workspace, 'node_modules', name, 'package.json'),
+    }))
+  )
+  .filter(({ path }) => existsSync(path))
+  .map(({ name, path }) => {
+    try {
+      return {
+        name,
+        path,
+        version: JSON.parse(readFileSync(path, 'utf8')).version,
+      }
+    } catch (error) {
+      fail(
+        `Could not read installed package metadata at ${path}: ${error.message}`
+      )
+    }
+  })
+
+const mismatchedCopies = workspaceReactCopies.filter(
+  ({ name, version }) => version !== (name === 'react' ? react : reactDom)
+)
+if (mismatchedCopies.length > 0) {
+  fail(
+    `Workspace-local React copies do not match the application runtime:\n` +
+      mismatchedCopies
+        .map(({ name, path, version }) => `  ${name} ${version}: ${path}`)
+        .join('\n') +
+      `\n\nRemove the stale workspace node_modules directory and run \`bun install\` ` +
+      `in web/. The Rsbuild config also deduplicates React as a runtime safeguard.`
+  )
+}
+
+process.stdout.write(`✓ react and react-dom both resolve to ${react}\n`)

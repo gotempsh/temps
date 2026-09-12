@@ -1257,6 +1257,9 @@ pub struct ConsoleApiParams {
     /// connection handling. The watcher's writes reach the route table through
     /// the `route_table_changes` NOTIFY path, not through this handle.
     pub traefik_discovery: Arc<temps_deployer::traefik_discovery::TraefikDiscoveryHandle>,
+    /// Authenticated external-plugin registry configuration resolved from the
+    /// paired `temps serve` bootstrap options.
+    pub external_plugin_registry: temps_external_plugins::catalog::RegistryConfig,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -2180,6 +2183,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         update_status,
         self_updater,
         traefik_discovery,
+        external_plugin_registry,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2667,7 +2671,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // through the proxy, so a plugin that has to hand out a URL to something
     // outside the request (a sandboxed agent, a webhook receiver) cannot
     // construct one without being told the address the proxy listens on.
-    .with_proxy_address(&config.address);
+    .with_proxy_address(&config.address)
+    .with_registry(external_plugin_registry);
     let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
         external_plugin_config,
     ));
