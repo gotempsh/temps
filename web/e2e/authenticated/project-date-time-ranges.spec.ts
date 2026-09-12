@@ -26,6 +26,11 @@ for (const [path, endpoint, fromKey, toKey] of cases) {
       await page.route(/\/has-events(?:\?|$)/, (route) =>
         route.fulfill({ json: { has_events: true } })
       )
+      // A fresh e2e project has never received traces. Keep the filter view
+      // mounted so this test measures time ranges rather than onboarding.
+      await page.route('**/api/otel/has-traces/*', (route) =>
+        route.fulfill({ json: { has_traces: true } })
+      )
       await page.route(/\/has-error-groups(?:\?|$)/, (route) =>
         route.fulfill({ json: { has_error_groups: true } })
       )

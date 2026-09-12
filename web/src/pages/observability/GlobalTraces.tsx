@@ -176,6 +176,12 @@ export default function GlobalTraces() {
                         {trace.trace_id.slice(0, 8)}
                       </span>
                     </p>
+                    <Link
+                      className="text-xs text-muted-foreground underline whitespace-nowrap"
+                      to={`/traces/global/${trace.trace_id}`}
+                    >
+                      Cross-project waterfall
+                    </Link>
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
                     <Link

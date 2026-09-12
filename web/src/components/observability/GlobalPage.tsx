@@ -68,6 +68,7 @@ export function ProjectScope({
 }) {
   return (
     <ProjectSelect
+      ariaLabel="Project scope"
       value={disabled ? null : (view.projectId ?? null)}
       onValueChange={(id) =>
         view.patch({ project_id: id == null ? undefined : String(id) })
