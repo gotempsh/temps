@@ -142,8 +142,11 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
           .fill('project:')
         await page.getByRole('option', { name: /project:Storefront/ }).click()
       } else {
-        await page.getByRole('combobox', { name: 'Project scope' }).click()
-        await page.getByRole('option', { name: 'Storefront' }).click()
+        const filters = page.getByRole('region', {
+          name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
+        })
+        await filters.getByRole('combobox', { name: 'Project scope' }).click()
+        await page.getByRole('option', { name: /Storefront/ }).click()
       }
       await expect(page).toHaveURL(/project_id=1/)
       for (const preset of ['1h', '6h', '1d', '7d'])
@@ -164,8 +167,12 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         ).toContainText('Storefront')
       else
         await expect(
-          page.getByRole('combobox', { name: 'Project scope' })
-        ).toHaveText('Storefront')
+          page
+            .getByRole('region', {
+              name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
+            })
+            .getByRole('combobox', { name: 'Project scope' })
+        ).toContainText('Storefront')
       expect(new URL(page.url()).searchParams.get('from')).toBe(frozen)
       expect(
         await page.evaluate(
@@ -198,11 +205,14 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
           : route.fulfill({ json: fixtures[kind] })
     )
     await page.goto(`/${kind}`)
+    const retry = page.getByRole('button', {
+      name: `Retry ${kind === 'analytics' ? 'analytics metrics' : kind}`,
+      exact: true,
+    })
+    await expect(retry).toBeVisible()
     await expect(page.getByText('Access denied').first()).toBeVisible()
     failed = false
-    await page
-      .getByRole('button', { name: `Retry ${kind}`, exact: true })
-      .click()
+    await retry.click()
     await expect(
       kind === 'analytics'
         ? page
@@ -402,15 +412,17 @@ for (const width of [320, 390, 1440]) {
       const bounds = await pages.boundingBox()
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width)
     }
-    const tabs = page.getByRole('tablist', { name: 'Traffic presentation' })
-    await tabs.getByRole('tab', { name: 'Data table' }).click()
-    await expect(
-      page.getByRole('columnheader', { name: 'Hour (UTC)' })
-    ).toBeVisible()
-    await tabs.getByRole('tab', { name: 'Data table' }).press('ArrowLeft')
-    await expect(
-      tabs.getByRole('tab', { name: 'Chart', exact: true })
-    ).toHaveAttribute('aria-selected', 'true')
+    const tabs = page.getByRole('tablist', { name: 'Analytics breakdowns' })
+    await tabs.getByRole('tab', { name: 'Audience' }).click()
+    await expect(tabs.getByRole('tab', { name: 'Audience' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    )
+    await tabs.getByRole('tab', { name: 'Audience' }).press('ArrowLeft')
+    await expect(tabs.getByRole('tab', { name: 'Traffic' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    )
     await expect(page.getByRole('tabpanel')).toBeVisible()
     await page.screenshot({
       path: `/tmp/temps-mobile-analytics-${width}.png`,

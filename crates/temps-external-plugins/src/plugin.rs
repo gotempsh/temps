@@ -92,6 +92,9 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Register the handler app state
             let app_state = Arc::new(ExternalPluginsAppState {
                 service: service.clone(),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                sensitive_action_authorizer: context
+                    .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
             });
 
             // External plugin OpenAPI schemas would normally be merged into
@@ -102,7 +105,12 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // dramatically faster boot, which is the right call when the
             // common case is "no external plugins installed".
             {
-                let mut cache = self.cached_schemas.lock().unwrap();
+                let mut cache = self.cached_schemas.lock().map_err(|error| {
+                    PluginError::PluginRegistrationFailed {
+                        plugin_name: self.name().to_string(),
+                        error: format!("failed to lock external-plugin OpenAPI cache: {error}"),
+                    }
+                })?;
                 *cache = Some(Vec::new());
             }
 

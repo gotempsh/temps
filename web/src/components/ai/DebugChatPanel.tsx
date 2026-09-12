@@ -971,7 +971,7 @@ const toolBlockClasses =
 
 /** A process receipt is a lifecycle observation, never an HTTP readiness claim. */
 export function processToolSummary(tool: ToolCall): string | undefined {
-  const name = tool.name.split('__').at(-1)
+  const name = tool.name.split('__').pop()
   if (
     !name ||
     ![

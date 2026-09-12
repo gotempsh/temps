@@ -38,6 +38,10 @@ const consoleKitEntry = path.resolve(
 export default defineConfig({
   plugins: [pluginReact()],
   resolve: {
+    // Workspace packages can retain their own node_modules trees (especially
+    // after a dependency update). Always resolve React from the application
+    // root so contexts and hooks share the renderer's singleton runtime.
+    dedupe: ['react', 'react-dom'],
     alias: {
       // Local workspace package — pin explicitly so rsbuild resolves it even
       // when node_modules/@temps-sdk/console-kit is missing or stale.

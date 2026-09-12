@@ -25,6 +25,8 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, ChevronsUpDown, RefreshCw } from 'lucide-react'
 
 interface ProjectSelectProps {
+  /** Accessible name for the picker in its specific context. */
+  ariaLabel?: string
   /** Selected project id, or null for the "All projects" row. */
   value: number | null
   onValueChange: (projectId: number | null) => void
@@ -45,6 +47,7 @@ interface ProjectSelectProps {
  * findable here without a timed wait.
  */
 export function ProjectSelect({
+  ariaLabel,
   value,
   onValueChange,
   allowAll = true,
@@ -128,6 +131,7 @@ export function ProjectSelect({
           type="button"
           variant="outline"
           role="combobox"
+          aria-label={ariaLabel}
           aria-expanded={open}
           disabled={disabled}
           className={cn(

@@ -16,6 +16,12 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SensitiveAction {
     CreateApiKey,
+    InstallExternalPlugin {
+        name: String,
+    },
+    UninstallExternalPlugin {
+        name: String,
+    },
     RotateApiKey {
         api_key_id: i32,
     },
@@ -86,6 +92,8 @@ impl SensitiveAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateApiKey => "create_api_key",
+            Self::InstallExternalPlugin { .. } => "install_external_plugin",
+            Self::UninstallExternalPlugin { .. } => "uninstall_external_plugin",
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
@@ -172,6 +180,13 @@ mod tests {
     #[test]
     fn action_identifiers_are_stable_and_resource_independent() {
         assert_eq!(SensitiveAction::CreateApiKey.as_str(), "create_api_key");
+        assert_eq!(
+            SensitiveAction::InstallExternalPlugin {
+                name: "example".to_string(),
+            }
+            .as_str(),
+            "install_external_plugin"
+        );
         assert_eq!(
             SensitiveAction::RotateClusterCa.as_str(),
             "rotate_cluster_ca"

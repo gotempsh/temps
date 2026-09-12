@@ -11369,6 +11369,22 @@ export type InsightsResponse = {
     data: Array<Insight>;
 };
 
+export type InstallPluginRequest = {
+    /**
+     * Validated registry name only. URLs, paths, versions, and hashes are not
+     * accepted from HTTP callers.
+     */
+    name: string;
+};
+
+export type InstallPluginResponse = {
+    message: string;
+    name: string;
+    platform: string;
+    sha256: string;
+    version: string;
+};
+
 export type IntegrationResponse = {
     config?: null | ProviderConfig;
     created_at: string;
@@ -13251,6 +13267,13 @@ export type NotificationRoutePage = {
     total: number;
 };
 
+export type NpmRelease = {
+    binary_path: string;
+    integrity: string;
+    name: string;
+    version: string;
+};
+
 /**
  * TimescaleDB compression policy configuration for append-only observability
  * tables. Values are expressed in hours so operators can choose sub-day
@@ -14776,6 +14799,12 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
+export type PlatformRelease = {
+    npm?: null | NpmRelease;
+    sha256: string;
+    url: string;
+};
+
 /**
  * What a plugin is allowed to do with the platform API over the channel.
  *
@@ -14785,6 +14814,13 @@ export type PlatformInfo = {
  * whether it intends to *write* at all, without reading its source.
  */
 export type PluginCapability = 'api_read' | 'api_write';
+
+export type PluginCatalogResponse = {
+    available: boolean;
+    plugins: Array<RegistryPlugin>;
+    reason?: string | null;
+    source: string;
+};
 
 /**
  * The complete plugin manifest — the handshake contract.
@@ -14885,6 +14921,12 @@ export type PluginManifest = {
      * SemVer version string
      */
     version: string;
+};
+
+export type PluginStatusResponse = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
 };
 
 /**
@@ -16854,6 +16896,40 @@ export type RegisterRequest = {
 };
 
 /**
+ * The outer envelope signs the decoded bytes in `payload`. Encoding the
+ * payload instead of reserializing a JSON object avoids ambiguous map order,
+ * whitespace, and number representations.
+ */
+export type RegistryEnvelope = {
+    key_id: string;
+    /**
+     * Standard-base64 encoded JSON [`RegistryDocument`].
+     */
+    payload: string;
+    /**
+     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
+     */
+    signature: string;
+};
+
+export type RegistryPlugin = {
+    author: string;
+    category: string;
+    description: string;
+    docs_url?: string | null;
+    keywords?: Array<string>;
+    logo_url?: string | null;
+    name: string;
+    platforms: {
+        [key: string]: PlatformRelease;
+    };
+    repository?: string | null;
+    summary: string;
+    title: string;
+    version: string;
+};
+
+/**
  * Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`
  */
 export type ReinstallWebhookResponse = {
@@ -16899,10 +16975,19 @@ export type ReleaseListResponse = {
     releases: Array<string>;
 };
 
+export type ReloadFailureResponse = {
+    plugin?: string | null;
+    reason: string;
+};
+
 /**
  * Response from the reload endpoint.
  */
 export type ReloadResponse = {
+    /**
+     * Activated installs that could not be verified or started.
+     */
+    failures: Array<ReloadFailureResponse>;
     /**
      * Number of plugins successfully loaded after reload
      */
@@ -21857,6 +21942,12 @@ export type UnifiedTrace = {
      * project_ids excluded due to truncation (most-recent first_seen dropped first).
      */
     truncated_projects: Array<number>;
+};
+
+export type UninstallPluginResponse = {
+    data_preserved: boolean;
+    message: string;
+    name: string;
 };
 
 /**
@@ -61515,6 +61606,100 @@ export type ListExternalPluginsResponses = {
 
 export type ListExternalPluginsResponse = ListExternalPluginsResponses[keyof ListExternalPluginsResponses];
 
+export type ListPluginCatalogData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/catalog';
+};
+
+export type ListPluginCatalogErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListPluginCatalogError = ListPluginCatalogErrors[keyof ListPluginCatalogErrors];
+
+export type ListPluginCatalogResponses = {
+    /**
+     * Signed plugin catalogue, or an unavailable state when registry trust is not configured
+     */
+    200: PluginCatalogResponse;
+};
+
+export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
+
+export type InstallPluginData = {
+    body: InstallPluginRequest;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/install';
+};
+
+export type InstallPluginErrors = {
+    /**
+     * Invalid plugin name or registry release
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Registry rollback refused
+     */
+    409: ProblemDetails;
+    /**
+     * Request body exceeds the configured limit
+     */
+    413: ProblemDetails;
+    /**
+     * Request content type is not application/json
+     */
+    415: ProblemDetails;
+    /**
+     * Request JSON does not match the install schema
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * Local plugin installation failed
+     */
+    500: ProblemDetails;
+    /**
+     * Registry, artifact, or plugin startup verification failed
+     */
+    502: ProblemDetails;
+    /**
+     * Registry trust, plugin service, or security audit unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type InstallPluginError = InstallPluginErrors[keyof InstallPluginErrors];
+
+export type InstallPluginResponses = {
+    /**
+     * Plugin verified, installed, and started
+     */
+    200: InstallPluginResponse;
+};
+
+export type InstallPluginResponse2 = InstallPluginResponses[keyof InstallPluginResponses];
+
 export type ReloadPluginsData = {
     body?: never;
     path?: never;
@@ -61531,16 +61716,112 @@ export type ReloadPluginsErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * No activated plugin could be reloaded
+     */
+    502: ReloadResponse;
 };
+
+export type ReloadPluginsError = ReloadPluginsErrors[keyof ReloadPluginsErrors];
 
 export type ReloadPluginsResponses = {
     /**
-     * Plugins reloaded successfully
+     * All plugins reloaded successfully
      */
     200: ReloadResponse;
+    /**
+     * Some plugins reloaded and some failed
+     */
+    207: ReloadResponse;
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginStatusData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/status';
+};
+
+export type GetPluginStatusErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetPluginStatusError = GetPluginStatusErrors[keyof GetPluginStatusErrors];
+
+export type GetPluginStatusResponses = {
+    /**
+     * Verified active plugin status
+     */
+    200: PluginStatusResponse;
+};
+
+export type GetPluginStatusResponse = GetPluginStatusResponses[keyof GetPluginStatusResponses];
+
+export type UninstallPluginData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/uninstall';
+};
+
+export type UninstallPluginErrors = {
+    /**
+     * Unsafe plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No active installation
+     */
+    404: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * Local deactivation failed
+     */
+    500: ProblemDetails;
+    /**
+     * Audit or plugin service unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type UninstallPluginError = UninstallPluginErrors[keyof UninstallPluginErrors];
+
+export type UninstallPluginResponses = {
+    /**
+     * Plugin deactivated; data and releases preserved
+     */
+    200: UninstallPluginResponse;
+};
+
+export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

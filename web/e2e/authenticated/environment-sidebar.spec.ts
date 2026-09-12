@@ -3,6 +3,44 @@
 
 import { expect, test } from '@playwright/test'
 
+async function mockEnvironmentMetrics(
+  page: import('@playwright/test').Page,
+  projectId: number,
+  environmentId: number
+) {
+  await page.route(
+    `**/api/projects/${projectId}/environments/${environmentId}/container-history**`,
+    (route) =>
+      route.fulfill({
+        json: {
+          containers: [
+            {
+              id: 1,
+              container_id: 'e2e-container',
+              container_name: 'web',
+              deployment_id: 1,
+              deployed_at: new Date().toISOString(),
+              is_current: true,
+            },
+          ],
+          total_count: 1,
+        },
+      })
+  )
+  await page.route(
+    `**/api/projects/${projectId}/environments/${environmentId}/containers/*/metrics/history**`,
+    (route) => {
+      const now = Date.now()
+      return route.fulfill({
+        json: [0, 1, 2, 3].map((index) => ({
+          time: new Date(now - (3 - index) * 60_000).toISOString(),
+          value: index + 1,
+        })),
+      })
+    }
+  )
+}
+
 test('environment sidebar preserves the selected page when switching environments', async ({
   page,
 }) => {
@@ -26,6 +64,7 @@ test('environment sidebar preserves the selected page when switching environment
   await page.route(`**/api/projects/${project.id}/environments`, (route) =>
     route.fulfill({ json: [production, staging] })
   )
+  await mockEnvironmentMetrics(page, project.id, production.id)
   await page.route(
     `**/api/projects/${project.id}/environments/${staging.id}`,
     (route) => route.fulfill({ json: staging })
@@ -143,6 +182,10 @@ test('environment charts render with themed axis labels in dark mode', async ({
       item.slug.startsWith('observability-starter')
     ) ?? projects[0]
   await page.setViewportSize({ width: 1440, height: 1000 })
+  const environments = await (
+    await page.request.get(`/api/projects/${project.id}/environments`)
+  ).json()
+  await mockEnvironmentMetrics(page, project.id, environments[0].id)
   await page.goto(`/projects/${project.slug}/environments?view=metrics`)
   await expect(page.locator('html')).toHaveClass(/dark/)
   await expect(page.locator('[data-chart] .recharts-surface')).toHaveCount(3)
