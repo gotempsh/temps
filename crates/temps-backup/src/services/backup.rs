@@ -11262,13 +11262,14 @@ mod tests {
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
         // Start MinIO container
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
 
         let minio_port = minio_container
             .get_host_port_ipv4(9000)
@@ -11691,13 +11692,14 @@ mod tests {
         use temps_database::test_utils::TestDatabase;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
         let minio_port = minio_container
             .get_host_port_ipv4(9000)
             .await
@@ -11909,13 +11911,14 @@ mod tests {
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
         // Start MinIO container
-        let minio_container = GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-            .expect("Failed to start MinIO container");
+        let minio_container =
+            GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+                .expect("Failed to start MinIO container");
 
         let minio_port = minio_container
             .get_host_port_ipv4(9000)

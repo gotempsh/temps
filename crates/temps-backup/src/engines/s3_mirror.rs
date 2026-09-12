@@ -52,7 +52,7 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 use temps_providers::externalsvc::SensitiveValues;
 
 const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str = "minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
+const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
