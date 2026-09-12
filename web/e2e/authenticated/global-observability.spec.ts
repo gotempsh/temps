@@ -145,7 +145,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         const filters = page.getByRole('region', {
           name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
         })
-        await filters.getByRole('combobox', { name: 'All projects' }).click()
+        await filters.getByRole('combobox', { name: 'Project scope' }).click()
         await page.getByRole('option', { name: /Storefront/ }).click()
       }
       await expect(page).toHaveURL(/project_id=1/)
