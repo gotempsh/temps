@@ -739,7 +739,22 @@ impl<'a> SweepResources<'a> {
         prefix: &str,
     ) -> Result<Vec<SourceObject>, StageError> {
         let client = self.client(source_id)?;
-        list_objects(&client, bucket, prefix, None, |_| false).await
+        list_objects(&client, bucket, prefix, None, None, |_| false).await
+    }
+
+    /// List only the objects directly under `prefix` (which must end in
+    /// `/`), not those in its subdirectories: a `/` delimiter makes the
+    /// store fold every subdirectory into one common prefix it never
+    /// returns as an object. For `basebackups_005/` that is one sentinel
+    /// per retained snapshot, however many tar parts each holds.
+    async fn list_direct_children(
+        &mut self,
+        source_id: i32,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<SourceObject>, StageError> {
+        let client = self.client(source_id)?;
+        list_objects(&client, bucket, prefix, None, Some("/"), |_| false).await
     }
 
     /// List the WAL objects whose segment name lies in `first..=last`,
@@ -767,6 +782,7 @@ impl<'a> SweepResources<'a> {
             bucket,
             wal_prefix,
             Some(format!("{wal_prefix}{first}")),
+            None,
             move |key| key > stop_after.as_str(),
         )
         .await
@@ -1271,10 +1287,11 @@ async fn put_manifest(
     Ok(bytes)
 }
 
-/// Remove a manifest once Cloud has cataloged the snapshot it described.
-/// Best effort: a manifest that outlives its declaration is a few
-/// megabytes at most and harmless, so a failure here is logged, never
-/// turned into a retry of a snapshot that is already mirrored.
+/// Remove a manifest once Cloud has cataloged the snapshot it described,
+/// or refused it for good. Best effort: a manifest that outlives its
+/// declaration is a few megabytes at most and harmless, so a failure here
+/// is logged, never turned into a retry. A transient declaration failure
+/// keeps the manifest on purpose: the next sweep rewrites the same key.
 async fn delete_manifest(client: &S3Client, bucket: &str, key: &str) {
     match tokio::time::timeout(
         S3_CONTROL_REQUEST_TIMEOUT,
@@ -1447,9 +1464,11 @@ async fn declare_and_complete_native_snapshot(
     let mut snapshot = match link.declare_native_snapshot(&request).await {
         Ok(snapshot) => snapshot,
         Err(CloudError::Rejected { detail }) if request.manifest_key.is_some() => {
+            let manifest_key = request.manifest_key.as_deref().unwrap_or_default();
+            delete_manifest(client, &source_config.bucket_name, manifest_key).await;
             return Err(manifest_not_accepted(
                 declarations.len(),
-                request.manifest_key.as_deref().unwrap_or_default(),
+                manifest_key,
                 &detail,
             ));
         }
@@ -1488,6 +1507,7 @@ async fn declare_and_complete_native_snapshot(
     };
     if snapshot.upload_required {
         if let Some(manifest_key) = request.manifest_key.as_deref() {
+            delete_manifest(client, &source_config.bucket_name, manifest_key).await;
             return Err(manifest_not_accepted(
                 declarations.len(),
                 manifest_key,
@@ -1683,11 +1703,13 @@ async fn mirror_walg_backup(
     let client = resources.client(backup.s3_source_id)?;
     // A WAL-G repository is shared by every snapshot of the service and
     // holds every archived segment, so listing all of it grows with the
-    // service's history, not with this snapshot. List only the base
-    // backups (one directory per retained snapshot) and, once the sentinel
-    // says which LSN range this snapshot needs, exactly that WAL range.
-    let base_objects = resources
-        .list_prefix(
+    // service's history, not with this snapshot. Three bounded listings
+    // instead: the sentinels directly under `basebackups_005/` (one per
+    // retained snapshot, never their tar parts), then this snapshot's own
+    // base directory, then, once the sentinel says which LSN range it
+    // needs, exactly that WAL range.
+    let sentinels = resources
+        .list_direct_children(
             backup.s3_source_id,
             &source_config.bucket_name,
             &format!("{root}/basebackups_005/"),
@@ -1697,7 +1719,7 @@ async fn mirror_walg_backup(
         .find_snapshot_sentinel(
             backup.s3_source_id,
             &source_config.bucket_name,
-            &base_objects,
+            &sentinels,
             &backup.backup_id,
         )
         .await?;
@@ -1722,6 +1744,16 @@ async fn mirror_walg_backup(
     let last_wal = wal_segment_name(&finish_lsn, timeline)?;
     let base_prefix = format!("{root}/basebackups_005/{backup_name}/");
     let wal_prefix = format!("{root}/wal_005/");
+    let mut base_objects = resources
+        .list_prefix(
+            backup.s3_source_id,
+            &source_config.bucket_name,
+            &base_prefix,
+        )
+        .await?;
+    if let Some(sentinel) = sentinels.iter().find(|object| object.key == sentinel_key) {
+        base_objects.push(sentinel.clone());
+    }
     let wal_objects = resources
         .list_wal_range(
             backup.s3_source_id,
@@ -1879,9 +1911,11 @@ async fn mirror_walg_backup(
     let mut snapshot = match link.declare_walg_snapshot(&request).await {
         Ok(snapshot) => snapshot,
         Err(CloudError::Rejected { detail }) if request.manifest_key.is_some() => {
+            let manifest_key = request.manifest_key.as_deref().unwrap_or_default();
+            delete_manifest(&client, &source_config.bucket_name, manifest_key).await;
             return Err(manifest_not_accepted(
                 declarations.len(),
-                request.manifest_key.as_deref().unwrap_or_default(),
+                manifest_key,
                 &detail,
             ));
         }
@@ -1916,6 +1950,7 @@ async fn mirror_walg_backup(
     };
     if snapshot.upload_required {
         if let Some(manifest_key) = request.manifest_key.as_deref() {
+            delete_manifest(&client, &source_config.bucket_name, manifest_key).await;
             return Err(manifest_not_accepted(
                 declarations.len(),
                 manifest_key,
@@ -2086,18 +2121,21 @@ async fn list_repository_objects(
     bucket: &str,
     root: &str,
 ) -> Result<Vec<SourceObject>, StageError> {
-    list_objects(client, bucket, &format!("{root}/"), None, |_| false).await
+    list_objects(client, bucket, &format!("{root}/"), None, None, |_| false).await
 }
 
 /// Paginated `ListObjectsV2` under `prefix`, optionally positioned with
-/// `start_after`, stopping early (and not fetching further pages) as soon
-/// as `stop` says a key is past the range of interest. S3 lists keys in
-/// UTF-8 binary order, which is what makes an early stop sound.
+/// `start_after`, optionally folding subdirectories away with `delimiter`
+/// (only objects directly under the prefix are returned), and stopping
+/// early (without fetching further pages) as soon as `stop` says a key is
+/// past the range of interest. S3 lists keys in UTF-8 binary order, which
+/// is what makes an early stop sound.
 async fn list_objects(
     client: &S3Client,
     bucket: &str,
     prefix: &str,
     start_after: Option<String>,
+    delimiter: Option<&str>,
     stop: impl Fn(&str) -> bool,
 ) -> Result<Vec<SourceObject>, StageError> {
     let mut objects = Vec::new();
@@ -2107,6 +2145,9 @@ async fn list_objects(
         let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
         if let Some(start_after) = start_after.as_deref() {
             request = request.start_after(start_after);
+        }
+        if let Some(delimiter) = delimiter {
+            request = request.delimiter(delimiter);
         }
         if let Some(token) = continuation.take() {
             request = request.continuation_token(token);
@@ -4769,13 +4810,21 @@ mod tests {
             .unwrap_or_default();
         let prefix = params.get("prefix").cloned().unwrap_or_default();
         let start_after = params.get("start-after").cloned().unwrap_or_default();
+        let delimiter = params.get("delimiter").cloned();
         let objects = state.objects.lock().expect("repository stub objects lock");
         state.list_calls.fetch_add(1, Ordering::SeqCst);
-        // Real S3 lists in binary key order and honours `start-after`;
-        // the ranged WAL listing depends on both.
+        // Real S3 lists in binary key order, honours `start-after`, and
+        // with a delimiter returns only the keys directly under the prefix
+        // (deeper ones fold into common prefixes, which are not objects).
         let mut listed = objects
             .iter()
-            .filter(|(key, _)| key.starts_with(&prefix) && key.as_str() > start_after.as_str())
+            .filter(|(key, _)| {
+                key.starts_with(&prefix)
+                    && key.as_str() > start_after.as_str()
+                    && delimiter
+                        .as_deref()
+                        .is_none_or(|delimiter| !key[prefix.len()..].contains(delimiter))
+            })
             .collect::<Vec<_>>();
         listed.sort_by(|a, b| a.0.cmp(b.0));
         let mut contents = String::new();
@@ -5499,6 +5548,13 @@ mod tests {
             resources.object_inspections.is_empty(),
             "nothing is hashed for a copy that is never made"
         );
+        let puts = state.puts.lock().expect("puts lock").clone();
+        let deletes = state.deletes.lock().expect("deletes lock").clone();
+        assert_eq!(puts.len(), 1, "the manifest was written once");
+        assert_eq!(
+            deletes, puts,
+            "a manifest Cloud refused for good is removed, not left billed"
+        );
     }
 
     /// Listing a WAL-G repository must cost what the snapshot needs, not
@@ -5538,6 +5594,7 @@ mod tests {
                 "managed-bucket",
                 &wal_prefix,
                 Some(format!("{wal_prefix}000000010000000000000002")),
+                None,
                 move |key| key > stop_after.as_str(),
             )
             .await,
@@ -5557,6 +5614,47 @@ mod tests {
             "segments before the start and after the finish are never fetched"
         );
         assert_eq!(state.list_calls.load(Ordering::SeqCst), 1);
+
+        // Sentinels are listed with a delimiter, so a repository holding
+        // thousands of tar parts per retained base backup costs one entry
+        // per snapshot, not one per part.
+        let sentinels = expect_stage_ok(
+            list_objects(
+                &client,
+                "managed-bucket",
+                &format!("{repo}/basebackups_005/"),
+                None,
+                Some("/"),
+                |_| false,
+            )
+            .await,
+            "sentinel listing",
+        );
+        assert!(
+            sentinels.is_empty(),
+            "only direct children count; tar parts live one level down: {sentinels:?}"
+        );
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(
+                format!("{repo}/basebackups_005/base_000000010000000000000002_backup_stop_sentinel.json"),
+                vec![0u8; 2],
+            );
+        }
+        let sentinels = expect_stage_ok(
+            list_objects(
+                &client,
+                "managed-bucket",
+                &format!("{repo}/basebackups_005/"),
+                None,
+                Some("/"),
+                |_| false,
+            )
+            .await,
+            "sentinel listing",
+        );
+        assert_eq!(sentinels.len(), 1);
+        assert!(sentinels[0].key.ends_with("_backup_stop_sentinel.json"));
 
         // The selection joins the base backup listing with the WAL range and
         // keeps only real segments in range (history files are not WAL).

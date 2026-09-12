@@ -3202,7 +3202,10 @@ SELECT cp.id
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("{}", e))
+        // Keep the typed error as the source (downcastable) instead of
+        // flattening it to text; this legacy path is still `anyhow` at its
+        // boundary but must not lose whether the upload was cancelled.
+        .map_err(anyhow::Error::from)
     }
 
     pub async fn restore_backup(&self, backup_id: &str) -> Result<(), BackupError> {
