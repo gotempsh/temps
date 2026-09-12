@@ -12028,6 +12028,24 @@ export type LogsResponse = {
 };
 
 /**
+ * A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is
+ * pinned to a source other than the managed destination. The nightly Cloud
+ * schedule cannot back it up: archiving must not silently move between
+ * sources, so every run of that service fails until the operator repoints
+ * it to Cloud or points its own schedule at the pinned source.
+ */
+export type ManagedBackupArchiveConflict = {
+    pinned_s3_source_id: number;
+    /**
+     * Name of the pinned source, or its id as text when the row is gone.
+     */
+    pinned_s3_source_name: string;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+};
+
+/**
  * What the Cloud settings page shows about the schedule that targets the
  * managed destination.
  */
@@ -12045,6 +12063,16 @@ export type ManagedBackupSchedule = {
 
 export type ManagedBackupSetup = {
     action: ManagedBackupSetupAction;
+    /**
+     * Services whose continuous archive is pinned elsewhere. Each fails
+     * under the nightly Cloud schedule until repointed (ADR-044).
+     */
+    archive_conflicts: Array<ManagedBackupArchiveConflict>;
+    /**
+     * The `s3_sources` row of the managed destination, when it exists, so a
+     * client can repoint a conflicting service at it.
+     */
+    managed_s3_source_id?: number | null;
     message: string;
     ready: boolean;
     schedule?: null | ManagedBackupSchedule;

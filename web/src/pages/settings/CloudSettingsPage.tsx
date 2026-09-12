@@ -8,10 +8,12 @@ import {
   getCloudCapabilityOptions,
   getCloudStatusOptions,
   reconcileCloudBackupSourceMutation,
+  repointContinuousArchiveSourceMutation,
   updateCloudFeaturesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CloudStatus,
+  ManagedBackupArchiveConflict,
   ManagedBackupSchedule,
   ManagedBackupSetup,
 } from '@/api/client/types.gen'
@@ -79,6 +81,7 @@ export function CloudSettingsPage() {
   const ensureBackupSchedule = useMutation(
     ensureCloudBackupScheduleMutation()
   )
+  const repointArchive = useMutation(repointContinuousArchiveSourceMutation())
   const form = useForm<EnrollmentForm>({
     resolver: zodResolver(enrollmentSchema),
     defaultValues: { enrollmentCode: '' },
@@ -142,6 +145,26 @@ export function CloudSettingsPage() {
     } catch (error) {
       toast.error(
         getErrorMessage(error, 'Could not create the nightly backup schedule')
+      )
+    }
+  }
+
+  // Move one service's continuous archive to the managed destination so the
+  // nightly Cloud schedule can back it up. The endpoint is the same one the
+  // service page uses; the status poll picks up the cleared conflict.
+  const repointToCloud = async (conflict: ManagedBackupArchiveConflict) => {
+    const managedSourceId = status.data?.managed_backup_setup?.managed_s3_source_id
+    if (managedSourceId == null) return
+    try {
+      await repointArchive.mutateAsync({
+        path: { id: conflict.service_id },
+        body: { new_s3_source_id: managedSourceId },
+      })
+      await refresh()
+      toast.success(`${conflict.service_name} now archives to Temps Cloud`)
+    } catch (error) {
+      toast.error(
+        getErrorMessage(error, `Could not repoint ${conflict.service_name}`)
       )
     }
   }
@@ -410,6 +433,12 @@ export function CloudSettingsPage() {
                     onRetry={() => void retryBackupSource()}
                     isCreatingSchedule={ensureBackupSchedule.isPending}
                     onCreateSchedule={() => void createBackupSchedule()}
+                    repointingServiceId={
+                      repointArchive.isPending
+                        ? (repointArchive.variables?.path.id ?? null)
+                        : null
+                    }
+                    onRepoint={(conflict) => void repointToCloud(conflict)}
                   />
                 ) : null}
                 <FeatureToggle
@@ -547,6 +576,8 @@ function BackupSourceStatus({
   onRetry,
   isCreatingSchedule,
   onCreateSchedule,
+  repointingServiceId,
+  onRepoint,
 }: {
   setup: ManagedBackupSetup
   cloudBillingUrl: string
@@ -554,6 +585,8 @@ function BackupSourceStatus({
   onRetry: () => void
   isCreatingSchedule: boolean
   onCreateSchedule: () => void
+  repointingServiceId: number | null
+  onRepoint: (conflict: ManagedBackupArchiveConflict) => void
 }) {
   const subscriptionRequired = setup.status === 'subscription_required'
   const ready = setup.status === 'ready'
@@ -622,6 +655,13 @@ function BackupSourceStatus({
           schedule={setup.schedule ?? null}
           isCreating={isCreatingSchedule}
           onCreate={onCreateSchedule}
+        />
+      ) : null}
+      {ready && setup.archive_conflicts.length > 0 ? (
+        <ArchiveConflicts
+          conflicts={setup.archive_conflicts}
+          repointingServiceId={repointingServiceId}
+          onRepoint={onRepoint}
         />
       ) : null}
     </div>
@@ -706,6 +746,70 @@ function BackupScheduleStatus({
             Or pick the destination on an existing schedule
           </Link>
         </div>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+/**
+ * A Postgres or MariaDB service whose WAL or binlog archive is pinned to
+ * another S3 source fails every night under the Cloud schedule: archiving
+ * must not move between sources silently. Name each one and offer the
+ * audited repoint (ADR-044).
+ */
+function ArchiveConflicts({
+  conflicts,
+  repointingServiceId,
+  onRepoint,
+}: {
+  conflicts: ManagedBackupArchiveConflict[]
+  repointingServiceId: number | null
+  onRepoint: (conflict: ManagedBackupArchiveConflict) => void
+}) {
+  return (
+    <Alert variant="warning" className="mt-3">
+      <AlertCircle className="size-4" />
+      <AlertTitle>
+        {conflicts.length === 1
+          ? '1 service archives somewhere else'
+          : `${conflicts.length} services archive somewhere else`}
+      </AlertTitle>
+      <AlertDescription className="space-y-3">
+        <p>
+          These services keep their WAL or binlog archive on another S3
+          source, so the Cloud schedule cannot back them up and their runs
+          fail. Repointing moves archiving to Temps Cloud from now on; data
+          already archived stays under the old source and is no longer
+          replayable from here.
+        </p>
+        <ul className="space-y-2">
+          {conflicts.map((conflict) => (
+            <li
+              key={conflict.service_id}
+              className="flex flex-wrap items-center justify-between gap-2"
+            >
+              <span>
+                <span className="font-medium">{conflict.service_name}</span>{' '}
+                <span className="text-muted-foreground">
+                  ({conflict.service_type}) archives to{' '}
+                  {conflict.pinned_s3_source_name}
+                </span>
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => onRepoint(conflict)}
+                disabled={repointingServiceId !== null}
+              >
+                {repointingServiceId === conflict.service_id ? (
+                  <Loader2 className="animate-spin" />
+                ) : null}
+                Repoint to Temps Cloud
+              </Button>
+            </li>
+          ))}
+        </ul>
       </AlertDescription>
     </Alert>
   )

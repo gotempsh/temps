@@ -11,12 +11,14 @@ use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
 };
+use std::collections::HashSet;
 use temps_core::{
-    ManagedBackupSchedule, ManagedBackupScheduleError, ManagedBackupScheduleProvisioner,
-    ReleasedManagedBackupSchedules, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
-    MANAGED_BACKUP_SCHEDULE_NAME,
+    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
+    ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
+    MANAGED_BACKUP_SCHEDULE_EXPRESSION, MANAGED_BACKUP_SCHEDULE_NAME,
 };
-use temps_entities::backup_schedules;
+
+use temps_entities::{backup_schedule_services, backup_schedules, external_services, s3_sources};
 use tokio::sync::Mutex;
 
 use crate::handlers::backup_handler::CreateBackupScheduleRequest;
@@ -73,6 +75,43 @@ fn summary(model: backup_schedules::Model) -> ManagedBackupSchedule {
         enabled: model.enabled,
         next_run: model.next_run,
     }
+}
+
+/// Pair every service the Cloud schedule targets that is pinned somewhere
+/// other than `managed_source_id` with the name of where it is pinned.
+/// `targeted` is `None` when the schedule (existing, or the default one
+/// "ensure" would create) covers every service. Pure so a test can pin
+/// the rule.
+pub fn archive_conflicts(
+    services: &[external_services::Model],
+    sources: &[s3_sources::Model],
+    managed_source_id: i32,
+    targeted: Option<&HashSet<i32>>,
+) -> Vec<ManagedBackupArchiveConflict> {
+    services
+        .iter()
+        .filter_map(|service| {
+            let pinned = service.continuous_archive_s3_source_id?;
+            if pinned == managed_source_id {
+                return None;
+            }
+            if targeted.is_some_and(|targeted| !targeted.contains(&service.id)) {
+                return None;
+            }
+            let pinned_s3_source_name = sources
+                .iter()
+                .find(|source| source.id == pinned)
+                .map(|source| source.name.clone())
+                .unwrap_or_else(|| format!("S3 source {pinned}"));
+            Some(ManagedBackupArchiveConflict {
+                service_id: service.id,
+                service_name: service.name.clone(),
+                service_type: service.service_type.clone(),
+                pinned_s3_source_id: pinned,
+                pinned_s3_source_name,
+            })
+        })
+        .collect()
 }
 
 /// Whether a schedule still carries the tag enrollment put on it.
@@ -142,6 +181,59 @@ impl ManagedBackupScheduleProvisioner for ManagedScheduleProvisioner {
                 s3_source_id,
                 reason: error.to_string(),
             })
+    }
+
+    async fn archive_conflicts_for_source(
+        &self,
+        s3_source_id: i32,
+    ) -> Result<Vec<ManagedBackupArchiveConflict>, ManagedBackupScheduleError> {
+        let lookup = |error: sea_orm::DbErr| ManagedBackupScheduleError::Lookup {
+            s3_source_id,
+            reason: error.to_string(),
+        };
+        let services = external_services::Entity::find()
+            .filter(external_services::Column::ContinuousArchiveS3SourceId.is_not_null())
+            .filter(external_services::Column::ContinuousArchiveS3SourceId.ne(s3_source_id))
+            .order_by_asc(external_services::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(lookup)?;
+        if services.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Only a service the Cloud schedule targets can fail under it. With
+        // no schedule yet, the default one "ensure" creates targets every
+        // service, so every pinned-elsewhere service counts.
+        let schedules = self.schedules_for_source(s3_source_id).await?;
+        let targeted = if schedules.is_empty()
+            || schedules
+                .iter()
+                .any(|schedule| schedule.target_all_services)
+        {
+            None
+        } else {
+            let ids: Vec<i32> = schedules.iter().map(|schedule| schedule.id).collect();
+            Some(
+                backup_schedule_services::Entity::find()
+                    .filter(backup_schedule_services::Column::ScheduleId.is_in(ids))
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(lookup)?
+                    .into_iter()
+                    .map(|row| row.service_id)
+                    .collect::<HashSet<i32>>(),
+            )
+        };
+        let sources = s3_sources::Entity::find()
+            .all(self.db.as_ref())
+            .await
+            .map_err(lookup)?;
+        Ok(archive_conflicts(
+            &services,
+            &sources,
+            s3_source_id,
+            targeted.as_ref(),
+        ))
     }
 
     async fn release_schedules_for_source(
@@ -217,6 +309,98 @@ mod tests {
     #[test]
     fn a_zero_retention_from_the_backend_is_floored_to_one_day() {
         assert_eq!(default_managed_schedule_request(1, 0).retention_period, 1);
+    }
+
+    fn service(id: i32, name: &str, pinned: Option<i32>) -> external_services::Model {
+        external_services::Model {
+            id,
+            name: name.to_string(),
+            service_type: "postgres".to_string(),
+            topology: "standalone".to_string(),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            node_id: None,
+            version: None,
+            slug: None,
+            config: None,
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            created_by_user_id: None,
+            container_name: None,
+            continuous_archive_s3_source_id: pinned,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn source(id: i32, name: &str) -> s3_sources::Model {
+        s3_sources::Model {
+            id,
+            name: name.to_string(),
+            bucket_name: "bucket".to_string(),
+            region: "auto".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "enc".to_string(),
+            secret_key: "enc".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: None,
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            backing_service_id: None,
+        }
+    }
+
+    /// Only a pin that points elsewhere is a conflict: unpinned services
+    /// default to the managed destination, pinned-to-managed ones already
+    /// write there. A pinned source whose row is gone is still named.
+    #[test]
+    fn only_services_pinned_elsewhere_conflict() {
+        let sources = vec![source(3, "My own bucket"), source(9, "Temps Cloud")];
+        let services = vec![
+            service(1, "pg-main", None),
+            service(2, "pg-cloud", Some(9)),
+            service(3, "pg-own", Some(3)),
+            service(4, "maria-gone", Some(42)),
+        ];
+        let conflicts = archive_conflicts(&services, &sources, 9, None);
+        assert_eq!(
+            conflicts
+                .iter()
+                .map(|c| (c.service_id, c.pinned_s3_source_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "My own bucket"), (4, "S3 source 42")]
+        );
+    }
+
+    /// A Cloud schedule that targets selected services only conflicts with
+    /// the pinned-elsewhere services among those; the rest are not its
+    /// business.
+    #[test]
+    fn conflicts_are_scoped_to_the_schedule_targets() {
+        let sources = vec![source(3, "My own bucket")];
+        let services = vec![
+            service(3, "pg-own", Some(3)),
+            service(4, "maria-own", Some(3)),
+        ];
+        let targeted: HashSet<i32> = [4].into_iter().collect();
+        let conflicts = archive_conflicts(&services, &sources, 9, Some(&targeted));
+        assert_eq!(
+            conflicts.iter().map(|c| c.service_id).collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 
     /// An operator who removes the tag has claimed the schedule: disconnect

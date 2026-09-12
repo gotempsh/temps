@@ -286,6 +286,17 @@ function printManagedBackupSetup(setup: ManagedBackupSetup): void {
         'to create the nightly default, or point an existing schedule at the destination.',
     )
   }
+  if (setup.archive_conflicts.length > 0) {
+    keyValue('Archive conflicts', String(setup.archive_conflicts.length))
+    for (const conflict of setup.archive_conflicts) {
+      info(
+        `${conflict.service_name} (${conflict.service_type}, id ${conflict.service_id}) ` +
+          `archives to "${conflict.pinned_s3_source_name}" and fails under the Cloud schedule. ` +
+          `Move it with: temps services repoint-continuous-archive-source ` +
+          `--id ${conflict.service_id} --s3-source ${setup.managed_s3_source_id ?? '<managed source id>'}`,
+      )
+    }
+  }
 }
 
 async function ensureBackupSchedule(options: { json?: boolean }): Promise<void> {
