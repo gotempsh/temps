@@ -366,17 +366,20 @@ jobs:
 
       # Restore always, save only from `main` — see the cache-scoping note on
       # the toolchain export above.
+      # Exact-key only: a partial restore from another lockfile leaves
+      # packages the lockfile no longer pins, and `bun install` does not
+      # evict them, so tsc then checks against a node_modules nobody
+      # declared. Frozen, so a lockfile that does not match package.json
+      # fails here instead of being silently rewritten.
       - name: Restore Bun dependencies
         id: bun-cache
         uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install dependencies
-        run: cd web && bun install
+        run: cd web && bun install --frozen-lockfile
 
       - name: Save Bun dependencies
         if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
