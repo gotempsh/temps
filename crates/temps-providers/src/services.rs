@@ -1946,7 +1946,7 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "minio/minio:latest".to_string());
+                    .unwrap_or_else(|| "quay.io/minio/minio:latest".to_string());
                 let access_key = parameters
                     .get("access_key")
                     .cloned()

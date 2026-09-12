@@ -4,12 +4,17 @@
 import {
   disconnectCloudMutation,
   enrollCloudMutation,
+  ensureCloudBackupScheduleMutation,
   getCloudCapabilityOptions,
   getCloudStatusOptions,
   reconcileCloudBackupSourceMutation,
   updateCloudFeaturesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { ManagedBackupSetup } from '@/api/client/types.gen'
+import type {
+  CloudStatus,
+  ManagedBackupSchedule,
+  ManagedBackupSetup,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -27,6 +32,7 @@ import {
   Bell,
   Check,
   CheckCircle2,
+  CalendarClock,
   Cloud,
   DatabaseBackup,
   ExternalLink,
@@ -39,6 +45,7 @@ import {
 import { useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useForm } from 'react-hook-form'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -68,6 +75,9 @@ export function CloudSettingsPage() {
   const updateFeatures = useMutation(updateCloudFeaturesMutation())
   const reconcileBackupSource = useMutation(
     reconcileCloudBackupSourceMutation()
+  )
+  const ensureBackupSchedule = useMutation(
+    ensureCloudBackupScheduleMutation()
   )
   const form = useForm<EnrollmentForm>({
     resolver: zodResolver(enrollmentSchema),
@@ -118,6 +128,24 @@ export function CloudSettingsPage() {
     }
   }
 
+  const createBackupSchedule = async () => {
+    try {
+      const managedBackupSetup = await ensureBackupSchedule.mutateAsync({})
+      mergeManagedBackupSetup(managedBackupSetup)
+      if (managedBackupSetup.schedule) {
+        toast.success(
+          `Schedule "${managedBackupSetup.schedule.name}" targets Temps Cloud`
+        )
+      } else {
+        toast.error(managedBackupSetup.message)
+      }
+    } catch (error) {
+      toast.error(
+        getErrorMessage(error, 'Could not create the nightly backup schedule')
+      )
+    }
+  }
+
   const setFeature = async (
     feature: 'telemetry_enabled' | 'backups_enabled' | 'notifications_enabled',
     enabled: boolean,
@@ -142,15 +170,19 @@ export function CloudSettingsPage() {
     }
   }
 
+  // Merge into whatever the 5s poll has fetched since the request started,
+  // not into the snapshot captured before it.
+  const mergeManagedBackupSetup = (managedBackupSetup: ManagedBackupSetup) =>
+    queryClient.setQueryData(
+      getCloudStatusOptions().queryKey,
+      (current: CloudStatus | undefined) =>
+        current ? { ...current, managed_backup_setup: managedBackupSetup } : current
+    )
+
   const retryBackupSource = async () => {
     try {
       const managedBackupSetup = await reconcileBackupSource.mutateAsync({})
-      if (status.data) {
-        queryClient.setQueryData(getCloudStatusOptions().queryKey, {
-          ...status.data,
-          managed_backup_setup: managedBackupSetup,
-        })
-      }
+      mergeManagedBackupSetup(managedBackupSetup)
 
       if (managedBackupSetup.ready) {
         toast.success('Managed backup source is ready')
@@ -376,6 +408,8 @@ export function CloudSettingsPage() {
                     cloudBillingUrl={cloudBillingUrl}
                     isRetrying={reconcileBackupSource.isPending}
                     onRetry={() => void retryBackupSource()}
+                    isCreatingSchedule={ensureBackupSchedule.isPending}
+                    onCreateSchedule={() => void createBackupSchedule()}
                   />
                 ) : null}
                 <FeatureToggle
@@ -511,11 +545,15 @@ function BackupSourceStatus({
   cloudBillingUrl,
   isRetrying,
   onRetry,
+  isCreatingSchedule,
+  onCreateSchedule,
 }: {
   setup: ManagedBackupSetup
   cloudBillingUrl: string
   isRetrying: boolean
   onRetry: () => void
+  isCreatingSchedule: boolean
+  onCreateSchedule: () => void
 }) {
   const subscriptionRequired = setup.status === 'subscription_required'
   const ready = setup.status === 'ready'
@@ -579,7 +617,97 @@ function BackupSourceStatus({
           ) : null}
         </AlertDescription>
       </Alert>
+      {ready ? (
+        <BackupScheduleStatus
+          schedule={setup.schedule ?? null}
+          isCreating={isCreatingSchedule}
+          onCreate={onCreateSchedule}
+        />
+      ) : null}
     </div>
+  )
+}
+
+/**
+ * A ready destination that nothing writes to is not "nightly backups". This
+ * block states which schedule targets Temps Cloud, or that none does and
+ * what one click would create (ADR-044).
+ */
+function BackupScheduleStatus({
+  schedule,
+  isCreating,
+  onCreate,
+}: {
+  schedule: ManagedBackupSchedule | null
+  isCreating: boolean
+  onCreate: () => void
+}) {
+  if (schedule) {
+    const nextRun = schedule.next_run
+      ? new Date(schedule.next_run).toLocaleString()
+      : 'not scheduled'
+    return (
+      <div className="mt-3 flex items-start gap-3 rounded-md border border-border p-4 text-sm">
+        <CalendarClock className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1 space-y-1">
+          <p className="font-medium">
+            {schedule.name}
+            {schedule.enabled ? null : (
+              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                (paused)
+              </span>
+            )}
+          </p>
+          <p className="text-muted-foreground">
+            Runs <code className="font-mono">{schedule.schedule_expression}</code>,
+            keeps each backup {schedule.retention_period} day
+            {schedule.retention_period === 1 ? '' : 's'}. Next run: {nextRun}.
+          </p>
+          <Link
+            to="/backups"
+            className="inline-block text-xs underline underline-offset-4 hover:text-foreground"
+          >
+            Edit in Backups
+          </Link>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <Alert className="mt-3">
+      <CalendarClock className="size-4" />
+      <AlertTitle>No schedule writes to Temps Cloud yet</AlertTitle>
+      <AlertDescription className="space-y-3">
+        <p>
+          The destination is ready, but no backup schedule targets it, so
+          nothing is being backed up to Cloud. Creating the default schedule
+          backs up every database and the control plane nightly at 02:00 and
+          keeps each backup for your plan&apos;s retention. You can rename,
+          retime or delete it afterwards like any other schedule.
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            type="button"
+            size="sm"
+            onClick={onCreate}
+            disabled={isCreating}
+          >
+            {isCreating ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <CalendarClock />
+            )}
+            Create nightly schedule
+          </Button>
+          <Link
+            to="/backups"
+            className="text-xs underline underline-offset-4 hover:text-foreground"
+          >
+            Or pick the destination on an existing schedule
+          </Link>
+        </div>
+      </AlertDescription>
+    </Alert>
   )
 }
 

@@ -1025,12 +1025,12 @@ jobs:
 
       - name: Pull E2E images
         run: |
-          timeout 10m docker pull minio/minio:latest
+          timeout 10m docker pull quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
           timeout 10m docker build --pull \
             --build-arg MARIADB_VERSION=11.4 \
             --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
             images/mariadb-walg
-          docker image ls | grep -E '^(minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
+          docker image ls | grep -E '^(quay.io/minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:
