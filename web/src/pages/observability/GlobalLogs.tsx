@@ -73,30 +73,33 @@ export default function GlobalLogs() {
     setAuto(false)
     view.patch(patch)
   }
-  const ready =
-    !query.error && !query.isPending && !query.data?.scan_limit_reached
+  const ready = !query.error && !query.isPending
+  const incomplete = ready && !!query.data?.scan_limit_reached
   const lines = ready ? (query.data?.lines ?? []) : []
-  const status =
-    query.data?.scan_limit_reached && !query.error ? (
-      <Alert variant="warning">
-        <AlertTitle>Search limit reached</AlertTitle>
-        <AlertDescription>
-          No complete result page could be established. Choose a shorter time
-          range or narrow the project, source, or message filters, then search
-          again.
-        </AlertDescription>
-      </Alert>
-    ) : !ready || !lines.length ? (
-      <QueryContent
-        title="Logs"
-        loading={query.isPending}
-        error={query.error}
-        empty={!lines.length}
-        retry={() => void query.refetch()}
-      >
-        {null}
-      </QueryContent>
-    ) : undefined
+  const status = incomplete ? (
+    <Alert variant="warning">
+      <AlertTitle>
+        {lines.length ? 'Partial results' : 'Search limit reached'}
+      </AlertTitle>
+      <AlertDescription>
+        {lines.length
+          ? 'Showing logs found before the search limit was reached. Some matching logs may be missing.'
+          : 'The search limit was reached before any matching logs were found.'}{' '}
+        Choose a shorter time range or narrow the project or source to search
+        fewer archives.
+      </AlertDescription>
+    </Alert>
+  ) : !ready || !lines.length ? (
+    <QueryContent
+      title="Logs"
+      loading={query.isPending}
+      error={query.error}
+      empty={!lines.length}
+      retry={() => void query.refetch()}
+    >
+      {null}
+    </QueryContent>
+  ) : undefined
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
@@ -203,7 +206,7 @@ export default function GlobalLogs() {
           <div className="flex flex-wrap items-center justify-between gap-2 border-t py-2 text-xs text-muted-foreground">
             <span>
               {ready
-                ? `${lines.length} loaded lines · newest first`
+                ? `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · ${incomplete ? 'partial results' : 'newest first'}`
                 : query.isPending
                   ? 'Loading logs…'
                   : 'Search incomplete'}
@@ -226,7 +229,10 @@ export default function GlobalLogs() {
                 size="sm"
                 className="h-7 text-xs"
                 disabled={
-                  !query.data?.next_cursor || query.isFetching || !ready
+                  !query.data?.next_cursor ||
+                  query.isFetching ||
+                  !ready ||
+                  incomplete
                 }
                 onClick={() => {
                   setAuto(false)
