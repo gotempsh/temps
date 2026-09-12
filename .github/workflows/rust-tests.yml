@@ -51,6 +51,9 @@ jobs:
       - name: Verify nextest target seed contracts
         run: python3 .github/scripts/test-nextest-cache-seed.py
 
+      - name: Verify pinned agent SDK and daemon build inputs
+        run: python3 tools/sandbox-runtime/test_build_inputs.py
+
       - name: Test CAPTCHA WASM rebuild gate
         run: python3 scripts/test_captcha_wasm_build.py
 

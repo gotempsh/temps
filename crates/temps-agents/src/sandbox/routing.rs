@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    KillSignal, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig, SandboxExecResult,
-    SandboxHandle, SandboxProvider, SnapshotArtifact,
+    KillSignal, OnStreamEventCallback, RuntimeCompatibility, SandboxBackend, SandboxCreateConfig,
+    SandboxExecResult, SandboxHandle, SandboxProvider, SnapshotArtifact,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -89,6 +89,24 @@ impl RoutingSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for RoutingSandboxProvider {
+    async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        self.owner_of(handle).image_identity(handle).await
+    }
+    async fn check_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        self.owner_of(handle).check_agent_runtime(handle).await
+    }
+    async fn recover_agent_harness(
+        &self,
+        handle: &SandboxHandle,
+        epoch: u64,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .recover_agent_harness(handle, epoch)
+            .await
+    }
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         let backend = config.backend.unwrap_or(self.default);
         self.get(backend)?.create(config).await
@@ -101,6 +119,16 @@ impl SandboxProvider for RoutingSandboxProvider {
     ) -> Result<String, AgentError> {
         self.owner_of(handle)
             .model_relay_base_url(handle, control_plane_url)
+            .await
+    }
+
+    async fn git_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        self.owner_of(handle)
+            .git_relay_base_url(handle, control_plane_url)
             .await
     }
 

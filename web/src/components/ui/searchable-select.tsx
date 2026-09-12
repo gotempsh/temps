@@ -25,6 +25,7 @@ export interface SearchableSelectOption {
   label: string
   /** Optional group label — items sharing a group render together under it. */
   group?: string
+  groupIcon?: React.ReactNode
   /** Extra text included in the search string (e.g. description or id). */
   keywords?: string
   disabled?: boolean
@@ -126,12 +127,20 @@ export function SearchableSelect({
             {grouped.map(([group, items]) => (
               <CommandGroup
                 key={group || '__default'}
-                heading={group || undefined}
+                className="[&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:bg-popover"
+                heading={
+                  group ? (
+                    <span className="flex items-center gap-2">
+                      <span aria-hidden="true">{items[0]?.groupIcon}</span>
+                      {group}
+                    </span>
+                  ) : undefined
+                }
               >
                 {items.map((opt) => (
                   <CommandItem
                     key={opt.value}
-                    value={`${opt.label} ${opt.keywords ?? ''} ${opt.value}`}
+                    value={`${opt.label} ${opt.group ?? ''} ${opt.keywords ?? ''} ${opt.value}`}
                     disabled={opt.disabled}
                     onSelect={() => {
                       onValueChange(opt.value)

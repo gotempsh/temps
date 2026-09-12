@@ -23,6 +23,7 @@ import {
 import { toast } from 'sonner'
 
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -151,8 +152,14 @@ const PAGE_SIZE = 20
 
 type StatusFilter = 'active' | 'expired' | 'all'
 
-export default function Sandboxes() {
-  usePageTitle('Sandboxes')
+export default function Sandboxes({
+  workspacesOnly = false,
+}: {
+  workspacesOnly?: boolean
+}) {
+  usePageTitle(workspacesOnly ? 'Workspaces' : 'Sandboxes')
+  const [includeWorkspaceCompute, setIncludeWorkspaceCompute] = useState(false)
+  const loadWorkspaces = workspacesOnly || includeWorkspaceCompute
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState<StatusFilter>('active')
   const [stopTarget, setStopTarget] = useState<SandboxView | null>(null)
@@ -163,16 +170,18 @@ export default function Sandboxes() {
   })
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     ...listQuery,
+    enabled: !workspacesOnly,
     refetchInterval: 15_000,
   })
 
   const applicationsQuery = useQuery({
     ...listApplicationsOptions(),
+    enabled: loadWorkspaces,
     refetchInterval: 15_000,
   })
   const applications = applicationsQuery.data ?? []
   const applicationWorkspaceQueries = useQueries({
-    queries: applications.map((application) => ({
+    queries: (loadWorkspaces ? applications : []).map((application) => ({
       ...getApplicationWorkspaceOptions({
         path: { application_public_id: application.public_id },
       }),
@@ -185,6 +194,7 @@ export default function Sandboxes() {
   }))
   const globalWorkspaceQuery = useQuery({
     ...getGlobalAiWorkspaceOptions(),
+    enabled: loadWorkspaces,
     refetchInterval: 15_000,
   })
   const managedWorkspacesLoading =
@@ -202,10 +212,12 @@ export default function Sandboxes() {
     globalWorkspaceQuery.isFetching
 
   const refreshAll = () => {
-    void refetch()
-    void applicationsQuery.refetch()
-    void globalWorkspaceQuery.refetch()
-    for (const query of applicationWorkspaceQueries) void query.refetch()
+    if (!workspacesOnly) void refetch()
+    if (loadWorkspaces) {
+      void applicationsQuery.refetch()
+      void globalWorkspaceQuery.refetch()
+      for (const query of applicationWorkspaceQueries) void query.refetch()
+    }
   }
 
   const items: SandboxView[] = (data?.sandboxes ?? []).map(toSandboxView)
@@ -254,223 +266,245 @@ export default function Sandboxes() {
   })
 
   return (
-    <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
-      {/* Page header — canonical pattern from DESIGN.md §4.4 */}
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Sandboxes</h1>
-          <p className="text-sm text-muted-foreground">
-            Isolated compute for persistent application workspaces and one-off
-            tasks.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {/* Segmented filter — defaults to Active so expired/destroyed rows
+    <PageContainer>
+      <PageHeader
+        title={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
+        description={
+          workspacesOnly
+            ? 'Persistent projects and working context, with compute when you need it.'
+            : 'Standalone compute environments managed through the CLI, API, or SDK.'
+        }
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Segmented filter — defaults to Active so expired/destroyed rows
               don't clutter the everyday view, but stay one click away for
               cleanup or audit. Counts are computed from the current page. */}
-          {items.length > 0 && (
-            <div className="inline-flex rounded-md border bg-background p-0.5">
-              {(
-                [
-                  { key: 'active', label: 'Active', count: activeCount },
-                  { key: 'expired', label: 'Expired', count: expiredCount },
-                  { key: 'all', label: 'All', count: items.length },
-                ] as const
-              ).map((tab) => {
-                const selected = filter === tab.key
-                return (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    onClick={() => setFilter(tab.key)}
-                    className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                      selected
-                        ? 'bg-muted text-foreground'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                    aria-pressed={selected}
-                  >
-                    {tab.label}
-                    <span className="ml-1 tabular-nums text-muted-foreground">
-                      {tab.count}
-                    </span>
-                  </button>
-                )
-              })}
-            </div>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={refreshAll}
-            disabled={refreshing}
-          >
-            <RefreshCw
-              className={`mr-1.5 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
-            />
-            <span className="hidden sm:inline">Refresh</span>
-          </Button>
-        </div>
-      </div>
-
-      <ManagedApplicationWorkspaces
-        entries={managedWorkspaces}
-        error={managedWorkspacesError}
-        globalWorkspace={globalWorkspaceQuery.data ?? null}
-        loading={managedWorkspacesLoading}
-      />
-
-      <div className="space-y-1 border-t pt-6">
-        <h2 className="text-base font-semibold tracking-tight">
-          Standalone sandboxes
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          Sandboxes you create and control directly through the CLI, API, or
-          SDK.
-        </p>
-      </div>
-
-      {isLoading ? (
-        <div className="space-y-3">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Card key={i}>
-              <CardContent className="py-4 space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex-1 space-y-2">
-                    <div className="h-5 w-48 rounded bg-muted animate-pulse" />
-                    <div className="h-3 w-32 rounded bg-muted animate-pulse" />
-                  </div>
-                  <div className="flex gap-2">
-                    <div className="h-8 w-20 rounded bg-muted animate-pulse" />
-                    <div className="h-8 w-20 rounded bg-muted animate-pulse" />
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      ) : isError ? (
-        <Card>
-          <CardContent className="py-12 text-center space-y-2">
-            <Box className="mx-auto h-8 w-8 text-destructive" />
-            <p className="text-sm font-medium">Failed to load sandboxes</p>
-            <p className="text-xs text-muted-foreground">
-              {(error as Error)?.message ?? 'Unknown error'}
-            </p>
+            {!workspacesOnly && items.length > 0 && (
+              <div className="inline-flex rounded-md border bg-background p-0.5">
+                {(
+                  [
+                    { key: 'active', label: 'Active', count: activeCount },
+                    { key: 'expired', label: 'Expired', count: expiredCount },
+                    { key: 'all', label: 'All', count: items.length },
+                  ] as const
+                ).map((tab) => {
+                  const selected = filter === tab.key
+                  return (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      onClick={() => setFilter(tab.key)}
+                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                        selected
+                          ? 'bg-muted text-foreground'
+                          : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                      aria-pressed={selected}
+                    >
+                      {tab.label}
+                      <span className="ml-1 tabular-nums text-muted-foreground">
+                        {tab.count}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
             <Button
               variant="outline"
               size="sm"
-              onClick={() => refetch()}
-              className="mt-2"
+              onClick={refreshAll}
+              disabled={refreshing}
             >
-              <RefreshCw className="mr-1.5 h-4 w-4" />
-              Try again
-            </Button>
-          </CardContent>
-        </Card>
-      ) : items.length === 0 ? (
-        // Empty state — there's no "Create Sandbox" button in the UI yet, so
-        // surface the three real ways to create one (CLI / REST / SDK) right
-        // here instead of making the user hunt for docs.
-        <CreateSandboxDocs variant="full" />
-      ) : (
-        <div className="space-y-3">
-          {/* Collapsible docs banner. Creation still only happens from outside
-              the UI, so keep the instructions one click away even when the
-              user already has sandboxes. */}
-          <CreateSandboxDocs variant="compact" />
-          {visible.length === 0 ? (
-            <Card>
-              <CardContent className="py-10 text-center space-y-2">
-                <Box className="mx-auto h-6 w-6 text-muted-foreground" />
-                <p className="text-sm font-medium">No {filter} sandboxes</p>
-                <p className="text-xs text-muted-foreground">
-                  {filter === 'active'
-                    ? 'All sandboxes on this page have expired.'
-                    : 'Nothing to show in this view.'}
-                </p>
-                {filter !== 'all' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setFilter('all')}
-                    className="mt-2"
-                  >
-                    Show all
-                  </Button>
-                )}
-              </CardContent>
-            </Card>
-          ) : (
-            visible.map((sbx) => (
-              <SandboxRow
-                key={sbx.id}
-                sandbox={sbx}
-                now={now}
-                onDeleteRequest={setStopTarget}
+              <RefreshCw
+                className={`mr-1.5 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
-            ))
-          )}
-        </div>
-      )}
-
-      {(hasNext || hasPrev) && (
-        <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-          <p className="text-xs text-muted-foreground tabular-nums">
-            Page {page}
-          </p>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!hasPrev}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-            >
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!hasNext}
-              onClick={() => setPage((p) => p + 1)}
-            >
-              Next
+              <span className="hidden sm:inline">Refresh</span>
             </Button>
           </div>
-        </div>
+        }
+      />
+
+      {!workspacesOnly && (
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            name="includeWorkspaceCompute"
+            checked={includeWorkspaceCompute}
+            onChange={(event) =>
+              setIncludeWorkspaceCompute(event.target.checked)
+            }
+          />
+          Include workspace-owned sandboxes (operator view)
+        </label>
       )}
 
-      <AlertDialog
-        open={stopTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setStopTarget(null)
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This tears down the container for{' '}
-              <span className="font-mono">{stopTarget?.id}</span>. The row is
-              kept for audit but cannot be restarted. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (stopTarget)
-                  deleteMutation.mutate({ path: { id: stopTarget.id } })
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </div>
+      {loadWorkspaces && (
+        <ManagedApplicationWorkspaces
+          entries={managedWorkspaces}
+          error={managedWorkspacesError}
+          globalWorkspace={globalWorkspaceQuery.data ?? null}
+          loading={managedWorkspacesLoading}
+          computeOnly={!workspacesOnly}
+        />
+      )}
+
+      {!workspacesOnly && (
+        <>
+          <div className="space-y-1 border-t pt-6">
+            <h2 className="text-base font-semibold tracking-tight">
+              Standalone sandboxes
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Sandboxes you create and control directly through the CLI, API, or
+              SDK.
+            </p>
+          </div>
+
+          {isLoading ? (
+            <div className="space-y-3">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <Card key={i}>
+                  <CardContent className="py-4 space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex-1 space-y-2">
+                        <div className="h-5 w-48 rounded bg-muted animate-pulse" />
+                        <div className="h-3 w-32 rounded bg-muted animate-pulse" />
+                      </div>
+                      <div className="flex gap-2">
+                        <div className="h-8 w-20 rounded bg-muted animate-pulse" />
+                        <div className="h-8 w-20 rounded bg-muted animate-pulse" />
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          ) : isError ? (
+            <Card>
+              <CardContent className="py-12 text-center space-y-2">
+                <Box className="mx-auto h-8 w-8 text-destructive" />
+                <p className="text-sm font-medium">Failed to load sandboxes</p>
+                <p className="text-xs text-muted-foreground">
+                  {(error as Error)?.message ?? 'Unknown error'}
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => refetch()}
+                  className="mt-2"
+                >
+                  <RefreshCw className="mr-1.5 h-4 w-4" />
+                  Try again
+                </Button>
+              </CardContent>
+            </Card>
+          ) : items.length === 0 ? (
+            // Empty state — there's no "Create Sandbox" button in the UI yet, so
+            // surface the three real ways to create one (CLI / REST / SDK) right
+            // here instead of making the user hunt for docs.
+            <CreateSandboxDocs variant="full" />
+          ) : (
+            <div className="space-y-3">
+              {/* Collapsible docs banner. Creation still only happens from outside
+              the UI, so keep the instructions one click away even when the
+              user already has sandboxes. */}
+              <CreateSandboxDocs variant="compact" />
+              {visible.length === 0 ? (
+                <Card>
+                  <CardContent className="py-10 text-center space-y-2">
+                    <Box className="mx-auto h-6 w-6 text-muted-foreground" />
+                    <p className="text-sm font-medium">No {filter} sandboxes</p>
+                    <p className="text-xs text-muted-foreground">
+                      {filter === 'active'
+                        ? 'All sandboxes on this page have expired.'
+                        : 'Nothing to show in this view.'}
+                    </p>
+                    {filter !== 'all' && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setFilter('all')}
+                        className="mt-2"
+                      >
+                        Show all
+                      </Button>
+                    )}
+                  </CardContent>
+                </Card>
+              ) : (
+                visible.map((sbx) => (
+                  <SandboxRow
+                    key={sbx.id}
+                    sandbox={sbx}
+                    now={now}
+                    onDeleteRequest={setStopTarget}
+                  />
+                ))
+              )}
+            </div>
+          )}
+
+          {(hasNext || hasPrev) && (
+            <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs text-muted-foreground tabular-nums">
+                Page {page}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!hasPrev}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                >
+                  Previous
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!hasNext}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <AlertDialog
+            open={stopTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) setStopTarget(null)
+            }}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This tears down the container for{' '}
+                  <span className="font-mono">{stopTarget?.id}</span>. The row
+                  is kept for audit but cannot be restarted. This cannot be
+                  undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={() => {
+                    if (stopTarget)
+                      deleteMutation.mutate({ path: { id: stopTarget.id } })
+                  }}
+                  disabled={deleteMutation.isPending}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </>
+      )}
+    </PageContainer>
   )
 }
 
@@ -479,19 +513,24 @@ type ManagedWorkspaceEntry = {
   workspace: ApplicationWorkspaceResponse | null
 }
 
-function ManagedApplicationWorkspaces({
+export function ManagedApplicationWorkspaces({
   entries,
   globalWorkspace,
   loading,
   error,
+  computeOnly = false,
 }: {
   entries: ManagedWorkspaceEntry[]
   globalWorkspace: ApplicationWorkspaceResponse | null
   loading: boolean
   error: boolean
+  computeOnly?: boolean
 }) {
-  if (!loading && !error && entries.length === 0 && !globalWorkspace)
-    return null
+  const visibleEntries = computeOnly
+    ? entries.filter(({ workspace }) => workspace?.sandbox_public_id)
+    : entries
+  const visibleGlobal =
+    computeOnly && !globalWorkspace?.sandbox_public_id ? null : globalWorkspace
 
   return (
     <section
@@ -504,16 +543,17 @@ function ManagedApplicationWorkspaces({
             className="text-base font-semibold tracking-tight"
             id="application-workspaces-title"
           >
-            Managed AI workspaces
+            {computeOnly ? 'Workspace-owned sandboxes' : 'Working contexts'}
           </h2>
           <p className="text-sm text-muted-foreground">
-            Persistent sandboxes that Temps wakes and recovers for global and
-            application chats.
+            {computeOnly
+              ? 'Compute attached to a workspace. Manage its lifecycle from the owning workspace.'
+              : 'Projects and persistent context, with optional compute and AI threads.'}
           </p>
         </div>
         {entries.length > 0 && (
           <Badge variant="secondary" className="shrink-0 tabular-nums">
-            {entries.length + (globalWorkspace ? 1 : 0)}
+            {visibleEntries.length + (visibleGlobal ? 1 : 0)}
           </Badge>
         )}
       </div>
@@ -531,10 +571,10 @@ function ManagedApplicationWorkspaces({
         </div>
       ) : (
         <div className="space-y-3">
-          {globalWorkspace && (
-            <ManagedGlobalWorkspaceRow workspace={globalWorkspace} />
+          {visibleGlobal && (
+            <ManagedGlobalWorkspaceRow workspace={visibleGlobal} />
           )}
-          {entries.map(({ application, workspace }) => (
+          {visibleEntries.map(({ application, workspace }) => (
             <ManagedApplicationWorkspaceRow
               application={application}
               key={application.public_id}
@@ -542,6 +582,14 @@ function ManagedApplicationWorkspaces({
             />
           ))}
         </div>
+      )}
+
+      {!loading && !error && visibleEntries.length === 0 && !visibleGlobal && (
+        <p className="text-sm text-muted-foreground">
+          {computeOnly
+            ? 'No workspace-owned compute is attached.'
+            : 'No workspaces are available yet.'}
+        </p>
       )}
 
       {error && (
@@ -560,9 +608,9 @@ export function ManagedApplicationWorkspaceRow({
 }: ManagedWorkspaceEntry) {
   return (
     <ManagedWorkspaceRow
-      href={`/ai-first?application=${encodeURIComponent(application.public_id)}`}
+      href={`/workspaces/${encodeURIComponent(application.public_id)}`}
       name={application.name}
-      notStartedMessage="Sandbox starts on the first application turn"
+      notStartedMessage="No compute attached. Workspace context is retained."
       workspace={workspace}
     />
   )
@@ -575,9 +623,9 @@ export function ManagedGlobalWorkspaceRow({
 }) {
   return (
     <ManagedWorkspaceRow
-      href="/ai-first?scope=global"
-      name="Global AI workspace"
-      notStartedMessage="Sandbox starts on the first global AI turn"
+      href="/workspaces/global"
+      name="Default workspace"
+      notStartedMessage="No compute attached. Workspace context is retained."
       workspace={workspace}
     />
   )

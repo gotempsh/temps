@@ -257,6 +257,39 @@ export function chatModelLabel(
   return name.replace(/^default\s*·\s*/i, '')
 }
 
+/** Provider-qualified IDs are authoritative; never infer a vendor from a model name. */
+export function chatModelProviderLabel(
+  provider: Pick<ChatProviderOption, 'id' | 'name'>,
+  model: Pick<ChatModelOption, 'id'>
+): string {
+  const prefix = model.id.includes('/') ? model.id.split('/')[0] : null
+  const id =
+    prefix ??
+    (
+      {
+        claude_cli: 'anthropic',
+        claude: 'anthropic',
+        codex_cli: 'openai',
+        codex: 'openai',
+      } as Record<string, string>
+    )[provider.id]
+  const labels: Record<string, string> = {
+    openai: 'OpenAI',
+    anthropic: 'Anthropic',
+    google: 'Google',
+    mistral: 'Mistral',
+    xai: 'xAI',
+    cohere: 'Cohere',
+    deepseek: 'DeepSeek',
+    openrouter: 'OpenRouter',
+    opencode: 'OpenCode',
+    'amazon-bedrock': 'Amazon Bedrock',
+    azure: 'Azure',
+    groq: 'Groq',
+  }
+  return id ? (labels[id.toLowerCase()] ?? id) : provider.name
+}
+
 export function chatThinkingLabel(option: ChatSelectOption): string {
   return option.id === 'default' ? 'Auto' : option.name
 }

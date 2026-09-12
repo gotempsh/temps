@@ -496,6 +496,9 @@ pub async fn refresh_ai_provider_models(
             temps_ai::AiError::NotAvailable => ("not_available", None),
             temps_ai::AiError::NoModel { purpose } => ("no_model", Some(purpose.as_str())),
             temps_ai::AiError::Provider { purpose, .. } => ("provider", Some(purpose.as_str())),
+            temps_ai::AiError::RetainedHarnessDiagnostic { purpose, .. } => {
+                ("retained_harness", Some(purpose.as_str()))
+            }
         };
         tracing::warn!(
             provider_id,
@@ -697,6 +700,10 @@ async fn provider_catalog_dto(
             .or(snapshot.capabilities.default_model_id);
         dto.model_source = snapshot.model_source;
         dto.models_refreshed_at = snapshot.models_refreshed_at;
+        if entry.id == "opencode" {
+            dto.workspace_ready = true;
+            dto.workspace_readiness_hint = None;
+        }
     }
     dto
 }
@@ -716,7 +723,11 @@ fn provider_catalog_dto_from_runtime(
     models_refreshed_at: Option<String>,
     local_credential: Option<LocalCredentialSummary>,
 ) -> ProviderCatalogDto {
-    let workspace_ready = entry.workspace_chat_supported && credential_saved;
+    // OpenCode config files require semantic validation and a successful
+    // native runtime probe. An encrypted blob alone must never be presented
+    // as executable.
+    let workspace_ready =
+        entry.workspace_chat_supported && credential_saved && entry.id != "opencode";
     let workspace_readiness_hint = if workspace_ready {
         None
     } else if !entry.workspace_chat_supported {
@@ -724,6 +735,8 @@ fn provider_catalog_dto_from_runtime(
             "{} is available for host workflows, but its secure persistent-workspace relay is not implemented yet.",
             entry.name
         ))
+    } else if entry.id == "opencode" && credential_saved {
+        Some("The saved OpenCode credential has not completed a successful workspace model refresh. Refresh models to validate its Anthropic or OpenAI API-key/OAuth entries; custom providers remain unsupported.".to_string())
     } else {
         Some(format!(
             "Save a {} credential to run this harness inside a persistent workspace.",
@@ -994,7 +1007,9 @@ pub async fn import_local_ai_provider_credential(
         provider_id,
         auth_type: discovered.auth_type,
         source: discovered.source.as_str().to_string(),
-        workspace_ready: provider.workspace_chat_supported,
+        // Import alone cannot promote OpenCode: strict validation and a
+        // successful native runtime model refresh establish readiness.
+        workspace_ready: provider.workspace_chat_supported && provider.id != "opencode",
     }))
 }
 
@@ -1674,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_refresh_uses_host_without_a_saved_workspace_credential() {
+    fn workspace_capable_providers_discover_models_only_with_a_saved_credential() {
         let claude =
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
         assert!(!uses_workspace_model_discovery(
@@ -1690,7 +1705,7 @@ mod tests {
 
         let codex =
             crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
-        assert!(!uses_workspace_model_discovery(codex, &configured));
+        assert!(uses_workspace_model_discovery(codex, &configured));
     }
 
     #[test]
@@ -1846,10 +1861,7 @@ mod tests {
             None,
             None,
         );
-        assert!(!codex_configured.workspace_ready);
-        assert!(codex_configured
-            .workspace_readiness_hint
-            .as_deref()
-            .is_some_and(|hint| hint.contains("secure persistent-workspace relay")));
+        assert!(codex_configured.workspace_ready);
+        assert!(codex_configured.workspace_readiness_hint.is_none());
     }
 }

@@ -43,6 +43,7 @@ export function workspaceNeedsAutomaticWake(
   workspace: ApplicationWorkspaceResponse | null
 ): boolean {
   return (
+    workspace?.runtime_compatible !== false &&
     workspace?.desired_state === 'running' &&
     (workspace.state === 'sleeping' || workspace.state === 'failed')
   )
@@ -67,6 +68,20 @@ export function workspaceStatusPresentation(
   loading: boolean,
   waking = false
 ): WorkspaceStatusPresentation {
+  if (workspace?.runtime_compatible === false) {
+    return {
+      label: 'Runtime update required',
+      detail: workspace.runtime_update_error ?? 'Open Workspace settings and update the runtime. Restarting the same image will not fix compatibility.',
+      dot: 'bg-amber-500',
+    }
+  }
+  if (workspace?.runtime_update_error && workspace.runtime_compatible == null) {
+    return {
+      label: 'Runtime unavailable',
+      detail: workspace.runtime_update_error,
+      dot: 'bg-red-500',
+    }
+  }
   if (waking) {
     return {
       label: 'Sandbox waking',

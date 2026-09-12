@@ -128,6 +128,9 @@ impl ChatMessage {
 /// model may answer with tool calls instead of text (see [`crate::AiService::chat`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnRequest {
+    /// Server-owned conversation identity for daemon-retained harness sessions.
+    /// Never populated directly from a provider or an unvalidated HTTP payload.
+    pub conversation_id: Option<String>,
     /// Stable opaque id used only to correlate latency and lifecycle telemetry
     /// across chat orchestration, sandbox setup, and the harness adapter.
     pub trace_id: Option<String>,
@@ -144,6 +147,17 @@ pub struct ChatTurnRequest {
     pub provider: Option<String>,
     /// Full conversation history, oldest first (system prompt usually first).
     pub messages: Vec<ChatMessage>,
+    /// Server-resolved image files mounted inside the managed sandbox for this
+    /// turn. HTTP clients cannot populate these paths. Harness adapters must
+    /// validate them against the attachment mount before using native image
+    /// input flags.
+    pub sandbox_image_paths: Vec<String>,
+    /// Ephemeral root-owned paths for native harness file forwarding. Populated
+    /// only by the sandbox adapter after staging verified bytes.
+    pub sandbox_file_paths: Vec<String>,
+    /// Host-verified attachment bytes. Sandboxed adapters stage these into a
+    /// root-owned per-turn directory before passing paths to a native CLI.
+    pub sandbox_attachments: Vec<SandboxAttachment>,
     /// Tools the model may call this turn. Empty = plain chat.
     pub tools: Vec<ChatTool>,
     /// Override the configured default model.
@@ -184,6 +198,27 @@ pub struct ChatTurnRequest {
     pub capture_session_title: bool,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SandboxAttachment {
+    pub name: String,
+    pub bytes: std::sync::Arc<[u8]>,
+    pub is_image: bool,
+}
+
+impl std::fmt::Debug for SandboxAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxAttachment")
+            .field("name", &self.name)
+            .field(
+                "bytes",
+                &format_args!("[REDACTED; {} bytes]", self.bytes.len()),
+            )
+            .field("is_image", &self.is_image)
+            .finish()
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -337,6 +372,10 @@ pub enum ChatStreamDelta {
     /// call made inside a CLI process). Gateway providers never emit this: the
     /// outer conversation loop executes their `ToolCall` values itself.
     ToolResult { call: ToolCall, result: String },
+    /// Point-in-time occupancy of the provider's active context window. This
+    /// is not cumulative billing usage and consumers must replace the prior
+    /// snapshot rather than add successive values.
+    ContextUsage(ContextWindowUsage),
     /// The interactive CLI subprocess is waiting for the user to approve or deny
     /// a tool/question/plan (ADR-038 Phase 2, milestone 3+).  The SSE handler
     /// emits this as a `permission_requested` event; the user resolves it via
@@ -353,6 +392,23 @@ pub enum ChatStreamDelta {
         session_id: Option<String>,
         title: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextWindowUsage {
+    pub used_tokens: u64,
+    pub limit_tokens: Option<u64>,
+    pub model: Option<String>,
+    pub source: ContextUsageSource,
+    /// True when occupancy is derived from provider-reported components
+    /// rather than supplied as one explicit context-window field.
+    pub estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextUsageSource {
+    ProviderReported,
 }
 
 /// A stream of [`ChatStreamDelta`]s for one agentic turn. Errors are terminal.
