@@ -22,7 +22,7 @@ pub(crate) fn resolve_loopback_client_ip(peer: IpAddr, headers: &HeaderMap) -> O
     // Use the final entry in the final field: an earlier field/list entry can
     // have been supplied by the client before the local proxy appended its IP.
     // A malformed XFF fails closed to the peer, not to an earlier entry or XRI.
-    let forwarded = if let Some(value) = headers.get_all("x-forwarded-for").iter().last() {
+    let forwarded = if let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() {
         value
             .to_str()
             .ok()
