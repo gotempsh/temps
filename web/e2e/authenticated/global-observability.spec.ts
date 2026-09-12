@@ -257,6 +257,53 @@ test('scan-budget exhaustion asks for a narrower search instead of claiming no l
 })
 
 for (const width of [1440, 390]) {
+  test(`scan-budget exhaustion keeps partial logs visible at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 1000 })
+    await mock(page, 'logs')
+    await page.route(
+      (url) => url.pathname === endpoints.logs,
+      (route) =>
+        route.fulfill({
+          json: {
+            ...fixtures.logs,
+            scan_limit_reached: true,
+            scanned_chunks: 512,
+            next_cursor: null,
+          },
+        })
+    )
+    await page.goto('/logs')
+    await expect(
+      page.getByText('Partial results', { exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('cell', { name: 'Checkout request failed', exact: false })
+    ).toBeVisible()
+    await expect(
+      page.getByText('1 loaded line · partial results', { exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Next page', exact: true })
+    ).toBeDisabled()
+    await expect(page.getByText('No logs in this view')).toHaveCount(0)
+    await page.screenshot({
+      path: `/tmp/temps-log-partial-results-${width}.png`,
+      fullPage: true,
+    })
+    await page.getByRole('button', { name: 'Patterns', exact: true }).click()
+    await expect(
+      page.getByText('Checkout request failed', { exact: true })
+    ).toBeVisible()
+    await page.getByRole('button', { name: 'By service', exact: true }).click()
+    await expect(
+      page.getByRole('button', { name: 'Storefront / web', exact: true })
+    ).toBeVisible()
+  })
+}
+
+for (const width of [1440, 390]) {
   test(`custom range validates, applies, and survives reload at ${width}px`, async ({
     page,
   }) => {

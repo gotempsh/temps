@@ -22049,7 +22049,7 @@
             ]
           },
           "scan_limit_reached": {
-            "description": "True means no complete ordered page could be established within the\nscan budget. Lines are empty; narrow the search rather than skipping logs.",
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
             "type": "boolean"
           },
           "scanned_bytes": {

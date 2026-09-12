@@ -10265,8 +10265,9 @@ export type GlobalLogSearchResponse = {
     lines: Array<GlobalLogLine>;
     next_cursor?: string | null;
     /**
-     * True means no complete ordered page could be established within the
-     * scan budget. Lines are empty; narrow the search rather than skipping logs.
+     * True means the scan budget was exhausted. Lines contain the newest
+     * matches found so far, but unread chunks may contain newer lines.
+     * No cursor is returned because the partial results cannot be paginated safely.
      */
     scan_limit_reached: boolean;
     scanned_bytes: number;

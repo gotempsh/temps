@@ -240,7 +240,8 @@ export function LogExplorer({
             </Button>
           </div>
         </div>
-        {status ||
+        {status}
+        {(!status || lines.length > 0) &&
           (mode !== 'list' ? (
             <div className="border-x border-b">
               <p className="border-b px-3 py-2 text-xs text-muted-foreground">
