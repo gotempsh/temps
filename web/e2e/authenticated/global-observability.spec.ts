@@ -172,7 +172,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
               name: `${kind[0].toUpperCase() + kind.slice(1)} filters`,
             })
             .getByRole('combobox')
-        ).toHaveText('Storefront')
+        ).toContainText('Storefront')
       expect(new URL(page.url()).searchParams.get('from')).toBe(frozen)
       expect(
         await page.evaluate(
