@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
@@ -48,7 +51,6 @@ import {
   ChevronRight as ChevronExpand,
   ChevronsLeft,
   ChevronsRight,
-  Clock,
   Columns,
   ExternalLink,
   Filter,
@@ -119,20 +121,6 @@ function positiveIntegerParam(value: string | null): number | undefined {
   if (!value || !/^\d+$/.test(value)) return undefined
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
-}
-
-function dateTimeLocalValue(value: string | undefined): string {
-  if (!value) return ''
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime())
-    ? value
-    : format(parsed, "yyyy-MM-dd'T'HH:mm")
-}
-
-function dateTimeLocalIso(value: string): string | undefined {
-  if (!value) return undefined
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
 }
 
 /**
@@ -753,22 +741,29 @@ export function ProxyLogsDataTable({
               1h when no start_date is sent, and rejects a custom range wider
               than 7 days), so this control is the primary way to reach older
               traffic — up to the retention horizon. */}
-          <Select
-            value={timeRange}
-            onValueChange={(v) => changeTimeRange(v as TimeRange)}
-          >
-            <SelectTrigger className="w-full sm:w-[170px]">
-              <Clock className="h-4 w-4 mr-2 shrink-0 opacity-60" />
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {TIME_RANGES.map((r) => (
-                <SelectItem key={r.value} value={r.value}>
-                  {r.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <DateTimeRange
+            value={
+              timeRange === 'custom' && timeWindow.start && timeWindow.end
+                ? {
+                    from: timeWindow.start,
+                    to: timeWindow.end,
+                    preset: 'custom',
+                  }
+                : resolveTimeRange(timeRange)
+            }
+            maxRangeDays={7}
+            onChange={(next) => {
+              if (next.preset !== 'custom')
+                changeTimeRange(next.preset === '1d' ? '24h' : next.preset)
+              else {
+                const dates = { start_date: next.from, end_date: next.to }
+                setFilters((prev) => ({ ...prev, ...dates }))
+                setPendingFilters((prev) => ({ ...prev, ...dates }))
+                setTimeRange('custom')
+                setPage(1)
+              }
+            }}
+          />
           <Button
             variant={showFilters ? 'default' : 'outline'}
             size="sm"
@@ -839,36 +834,6 @@ export function ProxyLogsDataTable({
         <Card>
           <CardContent className="pt-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {/* Date Range */}
-              <div>
-                <Label>Start Date</Label>
-                <Input
-                  type="datetime-local"
-                  value={dateTimeLocalValue(pendingFilters.start_date)}
-                  onChange={(e) =>
-                    setPendingFilters({
-                      ...pendingFilters,
-                      start_date: dateTimeLocalIso(e.target.value),
-                    })
-                  }
-                  onKeyDown={handleFilterKeyDown}
-                />
-              </div>
-              <div>
-                <Label>End Date</Label>
-                <Input
-                  type="datetime-local"
-                  value={dateTimeLocalValue(pendingFilters.end_date)}
-                  onChange={(e) =>
-                    setPendingFilters({
-                      ...pendingFilters,
-                      end_date: dateTimeLocalIso(e.target.value),
-                    })
-                  }
-                  onKeyDown={handleFilterKeyDown}
-                />
-              </div>
-
               {/* HTTP Fields */}
               <div>
                 <Label>Method</Label>

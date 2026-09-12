@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -227,9 +228,11 @@ function ClusterNetworkConfiguration({
             control-plane host to set the pool safely:
           </p>
           <div className="flex items-center gap-2 rounded-md bg-muted p-3">
-            <code className="min-w-0 flex-1 overflow-x-auto text-xs">
-              {setupCommand}
-            </code>
+            <HighlightedCode
+              className="min-w-0 flex-1 overflow-x-auto text-xs"
+              code={setupCommand}
+              language="bash"
+            />
             <CopyButton
               minimal
               value={setupCommand}

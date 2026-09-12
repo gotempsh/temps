@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
+import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 
 /**
  * ADR-038 Phase 2 — PermissionCard
@@ -28,7 +30,6 @@ import { Check, HelpCircle, Loader2, MapPin, Shield, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import rehypeHighlight from 'rehype-highlight'
 import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
@@ -89,9 +90,7 @@ const proseClasses =
   'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-[#0d1117] prose-pre:text-xs prose-pre:border-0 prose-pre:overflow-x-auto prose-pre:rounded-lg prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border'
 
 const markdownComponents: Components = {
-  pre({ node: _node, className, ...props }) {
-    return <pre {...props} className={cn('scrollbar-thin', className)} />
-  },
+  pre: MarkdownCodeBlock,
   ...untrustedMarkdownImage,
   ...untrustedMarkdownLink,
 }
@@ -313,9 +312,6 @@ function PlanApprovalVariant({
         <div className={cn(proseClasses, 'max-h-72 overflow-auto')}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            rehypePlugins={[
-              [rehypeHighlight, { detect: true, ignoreMissing: true }],
-            ]}
             components={markdownComponents}
           >
             {plan}
@@ -496,9 +492,11 @@ function ToolApprovalVariant({
                 <div className="mb-0.5 font-medium text-muted-foreground">
                   {key}
                 </div>
-                <code className="block whitespace-pre-wrap break-all rounded bg-muted/60 px-2 py-1 font-mono text-[11px]">
-                  {String(value)}
-                </code>
+                <HighlightedCode
+                  code={String(value)}
+                  language="bash"
+                  className="block whitespace-pre-wrap break-all rounded bg-muted/60 px-2 py-1 font-mono text-[11px]"
+                />
               </div>
             ) : (
               <div key={key} className="flex gap-2">

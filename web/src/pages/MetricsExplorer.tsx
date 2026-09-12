@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import {
   EnvironmentResponse,
   HistogramSummary,
@@ -31,7 +34,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { DateRangePicker } from '@/components/ui/date-range-picker'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
@@ -77,7 +79,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 
 interface MetricsExplorerProps {
   project: ProjectResponse
@@ -120,6 +122,20 @@ function timeRangeToFrom(range: TimeRange): Date {
     '30d': 30 * 24 * 60 * 60 * 1000,
   }
   return new Date(now - map[range])
+}
+
+function anomalyBandSeries(
+  severity: string | undefined,
+  sufficient: boolean | undefined,
+  pointCount: number
+): ThresholdBandSeries | undefined {
+  if (!severity || !sufficient || pointCount === 0) return undefined
+  return {
+    lowerKey: 'bandLower',
+    spanKey: 'bandSpan',
+    breachKey: 'bandBreach',
+    tone: severity === 'critical' ? 'poor' : 'warn',
+  }
 }
 
 /**
@@ -336,7 +352,10 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     enabled: !!project.id,
   })
 
-  const allNames = namesQuery.data?.names ?? []
+  const allNames = useMemo(
+    () => namesQuery.data?.names ?? [],
+    [namesQuery.data]
+  )
   const filteredNames = useMemo(() => {
     const q = nameSearch.trim().toLowerCase()
     if (!q) return allNames
@@ -349,7 +368,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   // React Query into an infinite refetch loop.
   const fromDate = useMemo(
     () => (isCustom ? new Date(customStartStr!) : timeRangeToFrom(timeRange)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
     [isCustom, customStartStr, timeRange]
   )
   const toDate = useMemo(
@@ -397,36 +416,32 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     ...listAlertsOptions({ query: { project_id: project.id } }),
     enabled: !!project.id && metricName.length > 0,
   })
-  const thresholds = useMemo<ThresholdBand[]>(() => {
-    if (!metricName) return []
-    return (alertsQuery.data?.data ?? [])
-      .filter((r) => r.enabled && r.metric_name === metricName)
-      .flatMap((r) => {
-        // Only static rules have a single horizontal threshold to overlay.
-        const cfg = r.detection_config
-        if (cfg.kind !== 'static') return []
-        return [
-          {
-            value: cfg.threshold,
-            tone: r.severity === 'critical' ? 'poor' : 'warn',
-            label: `${comparatorSymbol(cfg.comparator)} ${cfg.threshold}`,
-          } satisfies ThresholdBand,
-        ]
-      })
-  }, [alertsQuery.data, metricName])
+  const thresholds: ThresholdBand[] = metricName
+    ? (alertsQuery.data?.data ?? [])
+        .filter((r) => r.enabled && r.metric_name === metricName)
+        .flatMap((r) => {
+          // Only static rules have a single horizontal threshold to overlay.
+          const cfg = r.detection_config
+          if (cfg.kind !== 'static') return []
+          return [
+            {
+              value: cfg.threshold,
+              tone: r.severity === 'critical' ? 'poor' : 'warn',
+              label: `${comparatorSymbol(cfg.comparator)} ${cfg.threshold}`,
+            } satisfies ThresholdBand,
+          ]
+        })
+    : []
 
   // Anomaly band overlay: for an enabled anomaly rule on this metric, backtest
   // its band over the visible range and shade the expected region.
-  const anomalyRule = useMemo(
-    () =>
-      (alertsQuery.data?.data ?? []).find(
-        (r) =>
-          r.enabled &&
-          r.metric_name === metricName &&
-          r.detection_config.kind === 'anomaly'
-      ) ?? null,
-    [alertsQuery.data, metricName]
-  )
+  const anomalyRule =
+    (alertsQuery.data?.data ?? []).find(
+      (r) =>
+        r.enabled &&
+        r.metric_name === metricName &&
+        r.detection_config.kind === 'anomaly'
+    ) ?? null
   const bandPreview = useMutation({ ...previewAlertMutation() })
   const { mutate: previewBand, reset: resetBand } = bandPreview
   // Backtest with the DISPLAYED aggregation (not the rule's), so the band always
@@ -460,22 +475,16 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   // breaching points marked. Present only when an anomaly rule covers this
   // metric and the backtest had enough history. The per-bucket values are merged
   // into the chart data below (chartDataWithBand).
-  const bandSeries = useMemo<ThresholdBandSeries | undefined>(() => {
-    if (
-      !anomalyRule ||
-      !bandPreview.data?.sufficient ||
-      (bandPreview.data?.points?.length ?? 0) === 0
-    )
-      return undefined
-    return {
-      lowerKey: 'bandLower',
-      spanKey: 'bandSpan',
-      breachKey: 'bandBreach',
-      tone: anomalyRule.severity === 'critical' ? 'poor' : 'warn',
-    }
-  }, [anomalyRule, bandPreview.data])
+  const bandSeries = anomalyBandSeries(
+    anomalyRule?.severity,
+    bandPreview.data?.sufficient,
+    bandPreview.data?.points?.length ?? 0
+  )
 
-  const buckets = metricsQuery.data?.data ?? []
+  const buckets = useMemo(
+    () => metricsQuery.data?.data ?? [],
+    [metricsQuery.data]
+  )
 
   // Map the `MetricBucket` rows into the chart point shape. `value` carries the
   // requested aggregation; for histogram metrics the percentile aggregations are
@@ -483,44 +492,36 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   // the server's scalar quantile runs over the synthetic mean rather than the
   // true distribution.
   const isPercentile = aggregation.startsWith('p')
-  const chartData = useMemo(
-    () =>
-      buckets.map((b) => {
-        const hs = b.histogram_summary
-        const value =
-          isPercentile && hs && hs.bounds.length > 0
-            ? histogramQuantile(
-                hs.bounds,
-                hs.bucket_counts,
-                percentileFromAgg(aggregation),
-                hs.min,
-                hs.max
-              )
-            : (b.value ?? b.avg_value)
-        return {
-          bucket: b.bucket,
-          value,
-          avg_value: b.avg_value,
-          min_value: b.min_value,
-          max_value: b.max_value,
-          count: b.count,
-        }
-      }),
-    [buckets, isPercentile, aggregation]
-  )
+  const chartData = buckets.map((b) => {
+    const hs = b.histogram_summary
+    const value =
+      isPercentile && hs && hs.bounds.length > 0
+        ? histogramQuantile(
+            hs.bounds,
+            hs.bucket_counts,
+            percentileFromAgg(aggregation),
+            hs.min,
+            hs.max
+          )
+        : (b.value ?? b.avg_value)
+    return {
+      bucket: b.bucket,
+      value,
+      avg_value: b.avg_value,
+      min_value: b.min_value,
+      max_value: b.max_value,
+      count: b.count,
+    }
+  })
 
   // When a group_by is set the query returns per-`series_key` buckets; pivot
   // them into one line per distinct label combination via the shared pivot the
   // dashboard tiles use. Anomaly bands / thresholds are per-metric aggregates
   // and don't compose with a breakdown, so the grouped path skips them.
   const isGrouped = groupBy.length > 0
-  const breakdown = useMemo<BreakdownModel | undefined>(
-    () =>
-      isGrouped
-        ? buildBreakdownData(buckets, isPercentile, aggregation)
-        : undefined,
-    [isGrouped, buckets, isPercentile, aggregation]
-  )
+  const breakdown: BreakdownModel | undefined = isGrouped
+    ? buildBreakdownData(buckets, isPercentile, aggregation)
+    : undefined
 
   // Merge the anomaly band onto each chart bucket. The backtest buckets by the
   // rule's window, which may not line up 1:1 with the chart's interval, so align
@@ -658,6 +659,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             projectSlug={project.slug}
             projectName={project.name}
             focusMetric={metricName || undefined}
+            disabled={!namesQuery.isPending && allNames.length === 0}
           />
           <Button
             variant="outline"
@@ -813,35 +815,23 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                   Range
                 </label>
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <Select
-                    value={isCustom ? 'custom' : timeRange}
-                    onValueChange={(v) => {
-                      // "custom" seeds the picker with the window currently on screen.
-                      if (v === 'custom') setCustomRange(fromDate, toDate)
-                      else setTimeRange(v as TimeRange)
+                  <DateTimeRange
+                    value={{
+                      from: fromDate.toISOString(),
+                      to: toDate.toISOString(),
+                      preset: isCustom
+                        ? 'custom'
+                        : resolveTimeRange(timeRange).preset,
                     }}
-                  >
-                    <SelectTrigger className="w-full sm:w-[160px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TIME_RANGES.map((r) => (
-                        <SelectItem key={r.value} value={r.value}>
-                          {r.label}
-                        </SelectItem>
-                      ))}
-                      <SelectItem value="custom">Custom range…</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  {isCustom && (
-                    <DateRangePicker
-                      date={{ from: fromDate, to: toDate }}
-                      onDateChange={(range) => {
-                        if (range?.from && range?.to)
-                          setCustomRange(range.from, range.to)
-                      }}
-                    />
-                  )}
+                    maxRangeDays={365}
+                    onChange={(next) =>
+                      next.preset === 'custom'
+                        ? setCustomRange(new Date(next.from), new Date(next.to))
+                        : setTimeRange(
+                            next.preset === '1d' ? '24h' : next.preset
+                          )
+                    }
+                  />
                 </div>
               </div>
             </div>
@@ -1003,6 +993,7 @@ function MetricsOverview({
     return (
       <div className="rounded-lg border border-border bg-card p-4">
         <EmptyState
+          size="compact"
           icon={LineChartIcon}
           title={
             totalCount === 0 ? 'No metrics ingested yet' : 'No metrics match'
@@ -1011,6 +1002,15 @@ function MetricsOverview({
             totalCount === 0
               ? 'Point an OpenTelemetry exporter at this project to start seeing metrics here.'
               : 'No metrics match your search. Clear the filter to see them all.'
+          }
+          action={
+            totalCount === 0 ? (
+              <Button asChild size="sm">
+                <Link to={`/projects/${project.slug}/traces#traces-setup`}>
+                  Connect metrics
+                </Link>
+              </Button>
+            ) : undefined
           }
         />
       </div>
@@ -1032,7 +1032,7 @@ function MetricsOverview({
             aggregation={aggregation}
             status={alerts.statusFor(n, aggregation)}
             dynamicFiringCount={dynamicFiringSeriesCount(
-              alerts.rulesFor(n, aggregation),
+              alerts.rulesFor(n, aggregation)
             )}
             onSelect={onSelect}
           />
@@ -1055,7 +1055,7 @@ function MetricsOverview({
  */
 function alertStatusTooltip(
   status: AlertStatusLevel,
-  dynamicFiringCount: number | null,
+  dynamicFiringCount: number | null
 ): string {
   if (dynamicFiringCount != null) {
     return `${dynamicFiringCount} series breaching`

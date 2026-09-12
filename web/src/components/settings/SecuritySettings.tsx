@@ -2,15 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { SettingsSection } from '@/components/ui/settings-section'
 import {
   Select,
   SelectContent,
@@ -20,7 +14,14 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { Trash2, Plus, Shield, Info } from 'lucide-react'
+import {
+  Gauge,
+  Info,
+  ListFilter,
+  Plus,
+  ShieldCheck,
+  Trash2,
+} from 'lucide-react'
 import {
   Control,
   Controller,
@@ -157,18 +158,12 @@ export function SecuritySettings({
 
   return (
     <div className="space-y-6">
-      {/* Security Headers Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Security Headers
-          </CardTitle>
-          <CardDescription>
-            Configure HTTP security headers for all deployments
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Security Headers"
+        icon={ShieldCheck}
+        description="Configure HTTP security headers for all deployments"
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="security-headers-enabled">
@@ -344,21 +339,15 @@ export function SecuritySettings({
               )}
             </>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
-      {/* Rate Limiting Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Rate Limiting
-          </CardTitle>
-          <CardDescription>
-            Configure rate limiting to prevent abuse
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Rate Limiting"
+        icon={Gauge}
+        description="Configure rate limiting to prevent abuse"
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
@@ -460,11 +449,16 @@ export function SecuritySettings({
               </div>
             </>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
-      {/* IP Access Control - Uses dedicated API */}
-      <IpAccessControl />
+      <SettingsSection
+        title="IP access control"
+        description="Allow or block access by IP address and network range"
+        icon={ListFilter}
+      >
+        <IpAccessControl />
+      </SettingsSection>
     </div>
   )
 }

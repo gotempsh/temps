@@ -1,5 +1,7 @@
+import { SettingsSection } from '@/components/ui/settings-section'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { getCurrentBulkActivationJobOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -7,13 +9,6 @@ import type { BulkActivationJobProjectResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -75,19 +70,8 @@ export function CloudTelemetryBackfillCard({
   )
 
   return (
-    <Card className="bg-background text-foreground">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Cloud className="h-4 w-4" aria-hidden="true" />
-          Temps Cloud telemetry backfill
-        </CardTitle>
-        <CardDescription>
-          Raising this project&apos;s telemetry fidelity only affects spans
-          received afterwards. The backfill sends the history you already have
-          so Cloud can serve it back.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
+    <SettingsSection title="Cloud telemetry backfill" icon={Cloud}>
+      <div className="space-y-4">
         <BackfillBody
           isPending={isPending}
           isError={isError}
@@ -97,8 +81,8 @@ export function CloudTelemetryBackfillCard({
           bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
           bulkJobProject={bulkJobProject}
         />
-      </CardContent>
-    </Card>
+      </div>
+    </SettingsSection>
   )
 }
 
@@ -351,9 +335,11 @@ function CommandBlock({
             : 'Run this on the instance to start another backfill'}
       </p>
       <div className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3">
-        <code className="min-w-0 flex-1 font-mono text-xs break-all">
-          {status.command}
-        </code>
+        <HighlightedCode
+          className="min-w-0 flex-1 font-mono text-xs break-all"
+          code={status.command}
+          language="bash"
+        />
         <CopyButton value={status.command} minimal label="Copy command" />
       </div>
       <p className="text-sm text-muted-foreground">

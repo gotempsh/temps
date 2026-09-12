@@ -9,7 +9,8 @@
 // `AiProviderIcon`'s switch below. Keep the `id` string matched to the
 // backend's provider enum (lowercase, no spaces).
 
-export type AiProviderId = 'openai' | 'anthropic' | 'xai' | 'gemini' | 'openrouter'
+export type AiProviderId =
+  'openai' | 'anthropic' | 'xai' | 'gemini' | 'openrouter'
 
 export interface AiProviderMeta {
   id: AiProviderId
@@ -76,8 +77,7 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     tagline: 'One key, hundreds of models from every vendor',
     models: 'GPT-4o, Claude Sonnet 5, Llama 3.3, DeepSeek, and more',
     defaultModel: 'openai/gpt-4o-mini',
-    accentClass:
-      'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    accentClass: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
     keyDocsUrl: 'https://openrouter.ai/keys',
   },
 ]
@@ -222,6 +222,32 @@ export function AiProviderIcon({
   height,
 }: AiProviderIconProps) {
   const meta = getAiProvider(provider)
+  const asset = ['openrouter', 'mistral', 'deepseek'].includes(provider)
+    ? `/ai-agents/${provider}.svg`
+    : undefined
+  if (asset) {
+    const mark = (
+      <img
+        src={asset}
+        alt=""
+        aria-hidden="true"
+        width={tinted ? Math.round(size * 0.55) : (width ?? size)}
+        height={tinted ? Math.round(size * 0.55) : (height ?? size)}
+        className={`shrink-0 dark:invert ${tinted ? '' : className}`}
+      />
+    )
+    return tinted ? (
+      <span
+        aria-hidden="true"
+        className={`inline-flex shrink-0 items-center justify-center rounded-lg ${meta?.accentClass ?? 'bg-muted'} ${className}`}
+        style={{ width: size, height: size }}
+      >
+        {mark}
+      </span>
+    ) : (
+      mark
+    )
+  }
   const Mark =
     provider === 'openai'
       ? OpenAIMark

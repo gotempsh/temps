@@ -285,11 +285,12 @@ mod tests {
         assert!(store.points().is_empty());
     }
 
-    /// An unreadable `data_dir` yields no disk points; on a platform without
-    /// `/proc` that leaves nothing to write, and the sampler must short-circuit
-    /// rather than hand the store an empty batch.
+    /// An unreadable `data_dir` yields no disk-space points. The rest of the
+    /// host (cpu, memory, I/O counters) is still collected, from `/proc` on
+    /// Linux and from `sysinfo` elsewhere, so the batch is written without
+    /// any `node.disk_*_bytes` / `node.disk_percent` point in it.
     #[tokio::test]
-    async fn sample_once_skips_write_when_nothing_collected() {
+    async fn sample_once_drops_disk_points_when_data_dir_is_unreadable() {
         let store = Arc::new(SpyStore::recording());
         let sampler = NodeMetricsSampler::new(
             store.clone() as Arc<dyn MetricsStore>,
@@ -299,13 +300,24 @@ mod tests {
 
         sampler.sample_once().await;
 
-        // Where /proc exists the fd/cpu/memory points still land; where it
-        // doesn't, the batch is empty and no write should have happened.
-        if !Path::new("/proc").exists() {
-            assert!(
-                store.points().is_empty(),
-                "no collectable metrics should mean no write"
-            );
-        }
+        let points = store.points();
+        assert!(
+            !points.is_empty(),
+            "cpu and memory are collected on every platform, so a write must happen"
+        );
+        let disk_space: Vec<&str> = points
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|n| {
+                matches!(
+                    *n,
+                    "node.disk_used_bytes" | "node.disk_total_bytes" | "node.disk_percent"
+                )
+            })
+            .collect();
+        assert!(
+            disk_space.is_empty(),
+            "an unreadable data_dir must not produce disk-space points, got {disk_space:?}"
+        );
     }
 }

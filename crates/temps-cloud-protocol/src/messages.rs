@@ -314,7 +314,12 @@ pub struct NativeSnapshotObjectDeclaration {
     pub relative_key: String,
     pub kind: NativeSnapshotObjectKind,
     pub bytes: u64,
-    pub checksum_sha256: String,
+    /// Hex SHA-256 of the object. Optional: an object Cloud catalogs in
+    /// place (`in_place_root`) is declared by size alone, so the instance
+    /// never reads it back to hash it. The copy path always carries one,
+    /// because Cloud binds it into the presigned upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
 }
 
 /// Engine-neutral registration envelope for physical/native backups.
@@ -347,12 +352,44 @@ pub struct NativeSnapshotRequest {
     /// unvalidated.
     #[serde(default)]
     pub source_image: Option<String>,
+    /// Key prefix in the Cloud-managed bucket under which the backup engine
+    /// already wrote every object in `objects` (their keys are
+    /// `<in_place_root>/<relative_key>`). Set only for sources the cloud
+    /// manages (`s3_sources.managed_by_cloud`), whose bucket *is* the
+    /// tenant's cloud backup bucket: it tells Cloud to catalog the objects
+    /// where they sit rather than asking the instance to upload a second
+    /// copy into Cloud's own layout in the same bucket. A Cloud that predates
+    /// the field ignores it and answers `upload_required: true`, so the
+    /// instance falls back to the copy path unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// `relative_key`s from the declared manifest that Cloud has already
+    /// verified as complete for this `backup_id`. A re-declaration of an
+    /// unchanged manifest returns every object a previous, interrupted pass
+    /// managed to finish, so the instance can resume from where it stopped
+    /// instead of re-requesting a target and re-verifying every object.
+    /// Empty when nothing has completed yet, when the manifest was replaced,
+    /// or when talking to a Cloud that predates this field.
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,8 +411,11 @@ pub struct WalGObjectDeclaration {
     pub bytes: u64,
     /// Hex SHA-256 computed by streaming the source object once. Cloud binds
     /// it into the presigned PUT; the subsequent upload is a second bounded-
-    /// memory stream and never requires a local staging file.
-    pub checksum_sha256: String,
+    /// memory stream and never requires a local staging file. Optional for
+    /// the same reason as on `NativeSnapshotObjectDeclaration`: a
+    /// repository cataloged in place is declared by size alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
 }
 
 /// Register a physical PostgreSQL snapshot before mirroring its objects.
@@ -393,12 +433,37 @@ pub struct WalGSnapshotRequest {
     pub start_lsn: String,
     pub finish_lsn: String,
     pub objects: Vec<WalGObjectDeclaration>,
+    /// The WAL-G repository root in the Cloud-managed bucket under which
+    /// every object in `objects` already sits (`<in_place_root>/<relative_key>`).
+    /// Same contract as `NativeSnapshotRequest::in_place_root`: set only for
+    /// sources the cloud manages, so Cloud catalogs the repository where it
+    /// is instead of asking for a second copy. The repository is shared by
+    /// every snapshot of the service; Cloud confirms only the declared keys.
+    /// A Cloud that predates the field ignores it and answers
+    /// `upload_required: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalGSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
+    /// Same contract as [`NativeSnapshot::completed_relative_keys`].
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +495,166 @@ pub struct WalGObjectCompleted {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalGSnapshotCompleted {
     pub backup_id: Uuid,
+}
+
+// ---------------------------------------------------------------------------
+// Backup manifests — large object lists travel through the bucket
+// ---------------------------------------------------------------------------
+
+/// Above this many objects an in-place declaration is made by manifest
+/// ([`WalGSnapshotRequest::manifest_key`] / [`NativeSnapshotRequest::manifest_key`])
+/// rather than inline. Inline declarations stay well under Cloud's request
+/// body limit at this size; a manifest has no such limit short of
+/// [`MAX_BACKUP_MANIFEST_BYTES`].
+pub const MANIFEST_DECLARATION_THRESHOLD: usize = 10_000;
+
+/// Largest manifest object Cloud will read. About 150 bytes per object,
+/// so roughly 400,000 objects: four times the most an instance lists
+/// today, and a hard bound so a manifest can never be a memory attack on
+/// the reader (which holds at most one copy of it while parsing).
+pub const MAX_BACKUP_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Current [`BackupManifest::version`]. Bumped only for a breaking change
+/// to the manifest document.
+pub const BACKUP_MANIFEST_VERSION: u32 = 1;
+
+/// The object list of one snapshot, written by the instance into the
+/// Cloud-managed bucket and referenced from the declaration by key. The
+/// document names the snapshot it belongs to so a stale or misplaced
+/// manifest can never catalog objects under the wrong backup.
+///
+/// On the wire: `{"version":1,"backup_id":..,"instance_id":..,
+/// "engine":"wal_g"|"native","objects":[...]}`. `engine` precedes
+/// `objects`, and the reader relies on that: [`Deserialize`] is written by
+/// hand so the (possibly very long) object list is typed as it streams
+/// past instead of being buffered as an untyped tree first, which is what
+/// `#[serde(flatten)]` would do and what turns a 64 MiB document into
+/// gigabytes of heap on the reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackupManifest {
+    pub version: u32,
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    #[serde(flatten)]
+    pub objects: BackupManifestObjects,
+}
+
+impl<'de> Deserialize<'de> for BackupManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Engine {
+            WalG,
+            Native,
+        }
+
+        struct ManifestVisitor;
+
+        impl<'de> Visitor<'de> for ManifestVisitor {
+            type Value = BackupManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a backup manifest object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut version: Option<u32> = None;
+                let mut backup_id: Option<Uuid> = None;
+                let mut instance_id: Option<Uuid> = None;
+                let mut engine: Option<Engine> = None;
+                let mut objects: Option<BackupManifestObjects> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => version = Some(map.next_value()?),
+                        "backup_id" => backup_id = Some(map.next_value()?),
+                        "instance_id" => instance_id = Some(map.next_value()?),
+                        "engine" => engine = Some(map.next_value()?),
+                        "objects" => {
+                            // Typed straight from the stream: the engine must
+                            // already be known, which the writer guarantees.
+                            objects =
+                                Some(match engine {
+                                    Some(Engine::WalG) => {
+                                        BackupManifestObjects::WalG(map.next_value()?)
+                                    }
+                                    Some(Engine::Native) => {
+                                        BackupManifestObjects::Native(map.next_value()?)
+                                    }
+                                    None => return Err(A::Error::custom(
+                                        "backup manifest must name its engine before its objects",
+                                    )),
+                                });
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(BackupManifest {
+                    version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+                    backup_id: backup_id.ok_or_else(|| A::Error::missing_field("backup_id"))?,
+                    instance_id: instance_id
+                        .ok_or_else(|| A::Error::missing_field("instance_id"))?,
+                    objects: objects.ok_or_else(|| A::Error::missing_field("objects"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
+/// Which declaration the manifest stands in for. Serialized as
+/// `{"engine": "wal_g", "objects": [...]}` / `{"engine": "native", ...}` so
+/// the engine is visible before the (possibly very long) list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", content = "objects", rename_all = "snake_case")]
+pub enum BackupManifestObjects {
+    WalG(Vec<WalGObjectDeclaration>),
+    Native(Vec<NativeSnapshotObjectDeclaration>),
+}
+
+impl BackupManifest {
+    pub fn walg(backup_id: Uuid, instance_id: Uuid, objects: Vec<WalGObjectDeclaration>) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::WalG(objects),
+        }
+    }
+
+    pub fn native(
+        backup_id: Uuid,
+        instance_id: Uuid,
+        objects: Vec<NativeSnapshotObjectDeclaration>,
+    ) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::Native(objects),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.objects {
+            BackupManifestObjects::WalG(objects) => objects.len(),
+            BackupManifestObjects::Native(objects) => objects.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +770,12 @@ pub struct ManagedBackupCapability {
     /// backend did not say".
     #[serde(default)]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many days the plan keeps each backup (ADR-044): the instance
+    /// creates its default nightly schedule with this retention, so the
+    /// schedule matches what the customer bought. `None` from a backend that
+    /// predates the field; the instance then falls back to its own default.
+    #[serde(default)]
+    pub retention_days: Option<u16>,
     /// e.g. "not available on Starter" — surfaced verbatim to the operator.
     pub reason: Option<String>,
 }
@@ -567,6 +798,7 @@ impl std::fmt::Debug for ManagedBackupCapability {
                 &self.session_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expires_at", &self.expires_at)
+            .field("retention_days", &self.retention_days)
             .field("reason", &self.reason)
             .finish()
     }
@@ -641,6 +873,9 @@ pub enum BackupLifecycleStage {
     Started,
     Completed,
     Failed,
+    /// The instance deleted the backup (schedule retention or by hand), so
+    /// Cloud's catalog entry for it must stop being offered as restorable.
+    Deleted,
 }
 
 /// A backup lifecycle transition reported by an instance. `instance_id`
@@ -661,6 +896,12 @@ pub struct BackupLifecycleEventRequest {
     pub size_bytes: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// The instance's own `backups.backup_id` (its stable UUID string), the
+    /// value the mirror sweep hashes with `instance_id` into the catalog
+    /// `backup_id`. Sent with `Deleted` so Cloud can find the catalog entry
+    /// without a lookup table; older instances never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -720,6 +961,100 @@ mod tests {
         let env = Envelope::new("heartbeat", &hb).unwrap();
         let back: Heartbeat = env.decode("heartbeat").unwrap();
         assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    /// A Cloud built before `completed_relative_keys` existed answers a
+    /// declaration without it. The instance must decode that as "nothing
+    /// complete yet" and fall back to uploading every object, not fail the
+    /// whole mirror pass on a missing field.
+    #[test]
+    fn manifest_key_is_additive_and_manifest_round_trips() {
+        let walg: WalGSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "instance_id": Uuid::nil(),
+            "source": "db",
+            "engine": "postgres",
+            "postgres_major": 17,
+            "postgres_system_identifier": "1",
+            "backup_name": "base_000000010000000000000002",
+            "timeline": 1,
+            "start_lsn": "0/2000028",
+            "finish_lsn": "0/2000100",
+            "objects": []
+        }))
+        .unwrap();
+        assert!(walg.manifest_key.is_none());
+        let serialized = serde_json::to_value(&walg).unwrap();
+        assert!(serialized.get("manifest_key").is_none());
+
+        let manifest = BackupManifest::walg(
+            Uuid::nil(),
+            Uuid::nil(),
+            vec![WalGObjectDeclaration {
+                relative_key: "basebackups_005/base_1/tar_partitions/part_001.tar.lz4".into(),
+                kind: WalGObjectKind::BaseBackup,
+                bytes: 7,
+                checksum_sha256: None,
+            }],
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["engine"], "wal_g");
+        assert_eq!(json["version"], BACKUP_MANIFEST_VERSION);
+        assert_eq!(json["objects"][0]["kind"], "base_backup");
+        let back: BackupManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, manifest);
+        assert_eq!(back.len(), 1);
+
+        let native = BackupManifest::native(Uuid::nil(), Uuid::nil(), Vec::new());
+        let json = serde_json::to_value(&native).unwrap();
+        assert_eq!(json["engine"], "native");
+        assert!(serde_json::from_value::<BackupManifest>(json)
+            .unwrap()
+            .is_empty());
+
+        // The writer always puts `engine` before `objects`; the reader types
+        // the list as it streams and refuses a document it cannot type.
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        let engine_at = serialized.find("\"engine\"").unwrap();
+        let objects_at = serialized.find("\"objects\"").unwrap();
+        assert!(engine_at < objects_at, "{serialized}");
+        // `serde_json::json!` sorts keys, so spell the reordered document out.
+        let reordered = format!(
+            r#"{{"version":1,"backup_id":"{id}","instance_id":"{id}","objects":[],"engine":"native"}}"#,
+            id = Uuid::nil()
+        );
+        let error = serde_json::from_str::<BackupManifest>(&reordered).unwrap_err();
+        assert!(
+            error.to_string().contains("engine before its objects"),
+            "{error}"
+        );
+        // Unknown keys are ignored, so a future writer can add fields.
+        let extra = serde_json::json!({
+            "version": 1, "backup_id": Uuid::nil(), "instance_id": Uuid::nil(),
+            "written_by": "temps 0.2", "engine": "native", "objects": []
+        });
+        assert!(serde_json::from_str::<BackupManifest>(&extra.to_string())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_completed_keys_are_additive() {
+        let native: NativeSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true
+        }))
+        .unwrap();
+        assert!(native.upload_required);
+        assert!(native.completed_relative_keys.is_empty());
+
+        let walg: WalGSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true,
+            "completed_relative_keys": ["basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"]
+        }))
+        .unwrap();
+        assert_eq!(walg.completed_relative_keys.len(), 1);
     }
 
     #[test]
@@ -896,6 +1231,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("super-secret-value".into()),
             session_token: None,
+            retention_days: None,
             expires_at: None,
             reason: None,
         };
@@ -916,6 +1252,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("super-secret-value".into()),
             session_token: Some("super-secret-session-token".into()),
+            retention_days: None,
             expires_at: Some(
                 chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
                     .expect("valid timestamp")
@@ -943,6 +1280,7 @@ mod tests {
             access_key_id: None,
             secret_key: None,
             session_token: None,
+            retention_days: None,
             expires_at: None,
             reason: Some("not available on Starter".into()),
         };
@@ -989,6 +1327,7 @@ mod tests {
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("secret".into()),
             session_token: Some("session-token".into()),
+            retention_days: None,
             expires_at: Some(expires_at),
             reason: None,
         };
@@ -1032,13 +1371,58 @@ mod tests {
                     "basebackups_005/base_00000001000000000000000A_backup_stop_sentinel.json".into(),
                 kind: WalGObjectKind::Sentinel,
                 bytes: 512,
-                checksum_sha256: "00".repeat(32),
+                checksum_sha256: Some("00".repeat(32)),
             }],
+            in_place_root: None,
+            manifest_key: None,
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["engine"], "postgres");
         assert_eq!(value["objects"][0]["kind"], "sentinel");
         assert_eq!(value["timeline"], 1);
+    }
+
+    /// An in-place declaration carries no checksum and the WAL-G root; the
+    /// keys are absent from the wire, not null, so a Cloud built before them
+    /// sees the request it always did.
+    #[test]
+    fn in_place_declarations_omit_absent_checksums_and_carry_the_root() {
+        let object = WalGObjectDeclaration {
+            relative_key: "wal_005/000000010000000000000005.lz4".into(),
+            kind: WalGObjectKind::Wal,
+            bytes: 16_777_216,
+            checksum_sha256: None,
+        };
+        let value = serde_json::to_value(&object).unwrap();
+        assert!(value.get("checksum_sha256").is_none());
+        let parsed: WalGObjectDeclaration = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, object);
+        let with_hash: WalGObjectDeclaration = serde_json::from_value(serde_json::json!({
+            "relative_key": "a",
+            "kind": "wal",
+            "bytes": 1,
+            "checksum_sha256": "ab".repeat(32),
+        }))
+        .unwrap();
+        assert_eq!(
+            with_hash.checksum_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+
+        let event = BackupLifecycleEventRequest {
+            instance_id: Uuid::new_v4(),
+            backup_id: 3,
+            engine: "postgres_walg".into(),
+            stage: BackupLifecycleStage::Deleted,
+            occurred_at: chrono::Utc::now(),
+            s3_location: None,
+            size_bytes: None,
+            error_message: None,
+            backup_uuid: Some("backup-uuid".into()),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["stage"], "deleted");
+        assert_eq!(value["backup_uuid"], "backup-uuid");
     }
 
     #[test]
@@ -1058,9 +1442,11 @@ mod tests {
                 relative_key: "streams/mongodb.archive.lz4".into(),
                 kind: NativeSnapshotObjectKind::Data,
                 bytes: 1_024,
-                checksum_sha256: "ab".repeat(32),
+                checksum_sha256: Some("ab".repeat(32)),
             }],
             source_image: None,
+            in_place_root: None,
+            manifest_key: None,
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -1068,6 +1454,41 @@ mod tests {
         assert_eq!(value["format"], "mongo_dump_archive");
         assert_eq!(value["identity"]["kind"], "mongo_db_stream");
         assert_eq!(value["objects"][0]["kind"], "data");
+        // Absent by default so an older Cloud sees the exact request it
+        // always did; present verbatim when the sweep sets it.
+        assert!(value.get("in_place_root").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_in_place_root_round_trips_and_defaults() {
+        let mut request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "s3/object-store".into(),
+            engine: BackupEngine::RustFs,
+            format: BackupFormat::ObjectSet,
+            compression: BackupCompression::None,
+            identity: NativeSnapshotIdentity::ObjectSet {
+                snapshot_name: "backup-7".into(),
+            },
+            objects: vec![],
+            source_image: None,
+            in_place_root: Some("external_services/s3/object-store/2026-09-11/backup-7".into()),
+            manifest_key: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["in_place_root"],
+            "external_services/s3/object-store/2026-09-11/backup-7"
+        );
+        let decoded: NativeSnapshotRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, request);
+
+        request.in_place_root = None;
+        let mut without = serde_json::to_value(&request).unwrap();
+        without.as_object_mut().unwrap().remove("in_place_root");
+        let decoded: NativeSnapshotRequest = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded.in_place_root, None);
     }
 
     #[test]

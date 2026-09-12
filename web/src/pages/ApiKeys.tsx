@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -98,17 +100,17 @@ export default function ApiKeys() {
   }
 
   return (
-    <div className="container mx-auto px-4 py-6 space-y-6 sm:px-6">
-      {/* Page Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">API Keys</h1>
-          <p className="text-muted-foreground mt-2">
-            Manage your API keys for programmatic access
-          </p>
-        </div>
-        <CreateActionButton onClick={handleCreateClick} label="Create API Key" />
-      </div>
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="API Keys"
+        description="Manage your API keys for programmatic access"
+        actions={
+          <CreateActionButton
+            onClick={handleCreateClick}
+            label="Create API Key"
+          />
+        }
+      />
 
       {/* Statistics Cards */}
       {apiKeys && apiKeys.length > 0 && (
@@ -186,6 +188,6 @@ export default function ApiKeys() {
         onConfirm={handleDeleteConfirm}
         isPending={deleteMutation.isPending}
       />
-    </div>
+    </PageContainer>
   )
 }

@@ -6,10 +6,7 @@ import {
   getPagePathDetailOptions,
   getPagePathVisitorsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  PageVisitorSession,
-  ProjectResponse,
-} from '@/api/client/types.gen'
+import { PageVisitorSession, ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -235,7 +232,7 @@ export function PageDetail({
             title="View AI crawler requests for this page"
           >
             <StatCard
-              label="AI Agents"
+              label="AI Crawlers"
               value={
                 aiLoading ? '…' : (aiStats?.agent_count ?? 0).toLocaleString()
               }
@@ -427,8 +424,7 @@ export function PageDetail({
                 ))}
               </TableBody>
             </Table>
-          ) : !visitorsData?.sessions ||
-            visitorsData.sessions.length === 0 ? (
+          ) : !visitorsData?.sessions || visitorsData.sessions.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
                 No visitor sessions found for this page in the selected date
@@ -500,7 +496,9 @@ export function PageDetail({
                             </TooltipTrigger>
                             <TooltipContent>
                               <div className="text-xs">
-                                {session.city && <div>City: {session.city}</div>}
+                                {session.city && (
+                                  <div>City: {session.city}</div>
+                                )}
                                 {session.country && (
                                   <div>Country: {session.country}</div>
                                 )}
@@ -568,7 +566,7 @@ export function PageDetail({
                               </TooltipTrigger>
                               <TooltipContent>
                                 This was page #{session.session_page_number} in
-                                the visitor's session
+                                the visitor&apos;s session
                               </TooltipContent>
                             </Tooltip>
                           )}
@@ -590,9 +588,7 @@ export function PageDetail({
                       variant="outline"
                       size="sm"
                       disabled={currentPage <= 1}
-                      onClick={() =>
-                        setCurrentPage((p) => Math.max(1, p - 1))
-                      }
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                     >
                       Previous
                     </Button>

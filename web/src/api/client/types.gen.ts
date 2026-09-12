@@ -5889,6 +5889,12 @@ export type DatabaseMetricsRow = {
 };
 
 /**
+ * Controls which logical database a deployment receives through a
+ * project-to-service link.
+ */
+export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
+
+/**
  * Request to delete keys
  */
 export type DelRequest = {
@@ -7208,6 +7214,54 @@ export type DockerComposePresetConfig = {
      * Services granted the limited startup capability profile after explicit approval.
      */
     relaxedCapabilityServices?: Array<string>;
+};
+
+/**
+ * Result of `docker system df` for the control-plane host.
+ */
+export type DockerDiskUsage = {
+    /**
+     * Docker API version the daemon answered with, when it reported one
+     * (`Api-Version` header). Useful when a category shows `null`
+     * reclaimable bytes.
+     */
+    api_version?: string | null;
+    build_cache: DockerDiskUsageCategory;
+    /**
+     * When this snapshot was taken (ISO 8601, UTC).
+     */
+    collected_at: string;
+    containers: DockerDiskUsageCategory;
+    images: DockerDiskUsageCategory;
+    /**
+     * Sum of the four category sizes.
+     */
+    total_bytes: number;
+    volumes: DockerDiskUsageCategory;
+};
+
+/**
+ * One slice of the Docker disk-usage donut.
+ */
+export type DockerDiskUsageCategory = {
+    /**
+     * Objects currently in use (images referenced by a container, running
+     * containers, mounted volumes, in-use cache records).
+     */
+    active_count: number;
+    /**
+     * Bytes `docker system prune` could free from this category. `null`
+     * when the daemon is older than API 1.52 and does not report it.
+     */
+    reclaimable_bytes?: number | null;
+    /**
+     * Bytes on disk attributed to this category.
+     */
+    size_bytes: number;
+    /**
+     * Number of objects in this category (all images, all containers, …).
+     */
+    total_count: number;
 };
 
 export type DockerRegistrySettings = {
@@ -10211,8 +10265,9 @@ export type GlobalLogSearchResponse = {
     lines: Array<GlobalLogLine>;
     next_cursor?: string | null;
     /**
-     * True means no complete ordered page could be established within the
-     * scan budget. Lines are empty; narrow the search rather than skipping logs.
+     * True means the scan budget was exhausted. Lines contain the newest
+     * matches found so far, but unread chunks may contain newer lines.
+     * No cursor is returned because the partial results cannot be paginated safely.
      */
     scan_limit_reached: boolean;
     scanned_bytes: number;
@@ -11511,6 +11566,14 @@ export type LinkApplicationProjectRequest = {
 };
 
 export type LinkServiceRequest = {
+    /**
+     * Exact database name used when `database_provisioning_mode` is `custom`.
+     */
+    custom_database_name?: string | null;
+    /**
+     * How deployments linked through this service select a logical database.
+     */
+    database_provisioning_mode?: DatabaseProvisioningMode;
     project_id: number;
 };
 
@@ -11964,10 +12027,55 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+/**
+ * A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is
+ * pinned to a source other than the managed destination. The nightly Cloud
+ * schedule cannot back it up: archiving must not silently move between
+ * sources, so every run of that service fails until the operator repoints
+ * it to Cloud or points its own schedule at the pinned source.
+ */
+export type ManagedBackupArchiveConflict = {
+    pinned_s3_source_id: number;
+    /**
+     * Name of the pinned source, or its id as text when the row is gone.
+     */
+    pinned_s3_source_name: string;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+};
+
+/**
+ * What the Cloud settings page shows about the schedule that targets the
+ * managed destination.
+ */
+export type ManagedBackupSchedule = {
+    enabled: boolean;
+    id: number;
+    name: string;
+    next_run?: string | null;
+    /**
+     * Days each backup is kept before the schedule's retention deletes it.
+     */
+    retention_period: number;
+    schedule_expression: string;
+};
+
 export type ManagedBackupSetup = {
     action: ManagedBackupSetupAction;
+    /**
+     * Services whose continuous archive is pinned elsewhere. Each fails
+     * under the nightly Cloud schedule until repointed (ADR-044).
+     */
+    archive_conflicts: Array<ManagedBackupArchiveConflict>;
+    /**
+     * The `s3_sources` row of the managed destination, when it exists, so a
+     * client can repoint a conflicting service at it.
+     */
+    managed_s3_source_id?: number | null;
     message: string;
     ready: boolean;
+    schedule?: null | ManagedBackupSchedule;
     status: ManagedBackupSetupStatus;
 };
 
@@ -15366,6 +15474,8 @@ export type ProjectSecretResponse = {
 };
 
 export type ProjectServiceInfo = {
+    custom_database_name?: string | null;
+    database_provisioning_mode: DatabaseProvisioningMode;
     id: number;
     project: ProjectInfo;
     service: ExternalServiceInfo;
@@ -22435,6 +22545,10 @@ export type UpdateMetricAlertRequest = {
     name?: string | null;
     severity?: string | null;
     window_secs?: number | null;
+};
+
+export type UpdateMonitorRequest = {
+    check_path: string;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -30932,6 +31046,43 @@ export type GetCloudAiCapabilityResponses = {
 
 export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
 
+export type EnsureCloudBackupScheduleData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/backups/schedule/ensure';
+};
+
+export type EnsureCloudBackupScheduleErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)
+     */
+    409: ProblemDetails;
+    /**
+     * Database or link state failure
+     */
+    500: ProblemDetails;
+};
+
+export type EnsureCloudBackupScheduleError = EnsureCloudBackupScheduleErrors[keyof EnsureCloudBackupScheduleErrors];
+
+export type EnsureCloudBackupScheduleResponses = {
+    /**
+     * The managed destination's setup with the schedule that targets it, created when none did
+     */
+    200: ManagedBackupSetup;
+};
+
+export type EnsureCloudBackupScheduleResponse = EnsureCloudBackupScheduleResponses[keyof EnsureCloudBackupScheduleResponses];
+
 export type ReconcileCloudBackupSourceData = {
     body?: never;
     path?: never;
@@ -35299,6 +35450,10 @@ export type LinkServiceToProjectData = {
 };
 
 export type LinkServiceToProjectErrors = {
+    /**
+     * Invalid database provisioning configuration
+     */
+    400: unknown;
     /**
      * Authentication required
      */
@@ -40233,6 +40388,50 @@ export type GetMonitorResponses = {
 
 export type GetMonitorResponse = GetMonitorResponses[keyof GetMonitorResponses];
 
+export type UpdateMonitorData = {
+    body: UpdateMonitorRequest;
+    path: {
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/monitors/{monitor_id}';
+};
+
+export type UpdateMonitorErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMonitorResponses = {
+    /**
+     * Monitor updated successfully
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];
+
 export type GetBucketedStatusData = {
     body?: never;
     path: {
@@ -40546,6 +40745,96 @@ export type NodeMetricsUpdateAlertRuleResponses = {
 };
 
 export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
+export type NodeMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/latest';
+};
+
+export type NodeMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetLatestResponse = NodeMetricsGetLatestResponses[keyof NodeMetricsGetLatestResponses];
+
+export type NodeDockerDiskUsageGetData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/nodes/{node_id}/docker-disk-usage';
+};
+
+export type NodeDockerDiskUsageGetErrors = {
+    /**
+     * Node is not the control plane
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Docker daemon answered with an unexpected response
+     */
+    502: unknown;
+    /**
+     * Docker daemon unreachable
+     */
+    503: unknown;
+    /**
+     * Docker daemon timed out
+     */
+    504: unknown;
+};
+
+export type NodeDockerDiskUsageGetResponses = {
+    /**
+     * Docker disk usage by category
+     */
+    200: DockerDiskUsage;
+};
+
+export type NodeDockerDiskUsageGetResponse = NodeDockerDiskUsageGetResponses[keyof NodeDockerDiskUsageGetResponses];
 
 export type DeletePreferencesData = {
     body?: never;

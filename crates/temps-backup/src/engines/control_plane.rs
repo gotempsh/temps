@@ -213,6 +213,7 @@ impl BackupEngine for ControlPlaneEngine {
             // control-plane Postgres binds under `temps serve`.
             network_mode: Some("host".to_string()),
             user: Some("root".to_string()),
+            stderr_watch: None,
         };
 
         let result = match run_one_shot(&docker, spec, &ctx.cancel).await {
@@ -287,6 +288,7 @@ impl BackupEngine for ControlPlaneEngine {
             "application/x-gzip",
             file_size,
             Some(&tags),
+            &ctx.cancel,
         )
         .await?;
         v2_common::best_effort_remove(&host_dump_path).await;

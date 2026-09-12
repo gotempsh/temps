@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   assignRoleMutation,
   deleteUserMutation,
@@ -130,7 +132,9 @@ export function UsersManagement({
       reloadUsers()
     },
     onError: (error, variables) => {
-      if (handleSensitiveActionError(error, () => assignRole.mutate(variables))) {
+      if (
+        handleSensitiveActionError(error, () => assignRole.mutate(variables))
+      ) {
         return
       }
       const problem = error as { detail?: string; message?: string }
@@ -209,19 +213,17 @@ export function UsersManagement({
   return (
     <div className="space-y-4">
       {verificationDialog}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">Users</h2>
-          <p className="text-sm text-muted-foreground">
-            Manage user access and roles
-          </p>
-        </div>
-        <CreateActionButton
-          onClick={() => navigate('/settings/users/new')}
-          label="Add User"
-          icon={<UserPlus className="h-4 w-4" />}
-        />
-      </div>
+      <PageHeader
+        title="Users"
+        description="Manage user access and roles"
+        actions={
+          <CreateActionButton
+            onClick={() => navigate('/settings/users/new')}
+            label="Add User"
+            icon={<UserPlus className="h-4 w-4" />}
+          />
+        }
+      />
 
       <AlertDialog
         open={userToDelete !== null}

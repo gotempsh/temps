@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   Activity,
@@ -414,9 +415,11 @@ export function ApplicationWorkspaceSettingsPanel({
                     value={sandboxShellCommand(workspace.sandbox_public_id)}
                   />
                 </div>
-                <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-                  {sandboxShellCommand(workspace.sandbox_public_id)}
-                </code>
+                <HighlightedCode
+                  className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                  code={sandboxShellCommand(workspace.sandbox_public_id)}
+                  language="bash"
+                />
                 <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
                   Run from an authenticated Temps CLI. Detach with Ctrl-P,
                   Ctrl-Q and reattach with the same command.
@@ -445,17 +448,21 @@ export function ApplicationWorkspaceSettingsPanel({
                           value={upgrade.command}
                         />
                       </div>
-                      <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-                        {upgrade.command}
-                      </code>
+                      <HighlightedCode
+                        className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                        code={upgrade.command}
+                        language="bash"
+                      />
                       <details className="mt-2 text-[10px] text-muted-foreground">
                         <summary className="cursor-pointer select-none">
                           Run as a one-shot CLI command
                         </summary>
                         <div className="mt-1.5 flex items-start gap-1.5 rounded bg-background p-2">
-                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
-                            {upgrade.cliCommand}
-                          </code>
+                          <HighlightedCode
+                            className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap"
+                            code={upgrade.cliCommand}
+                            language="bash"
+                          />
                           <CopyButton
                             className="size-6 shrink-0 rounded"
                             label={`Copy ${upgrade.name} Temps CLI command`}

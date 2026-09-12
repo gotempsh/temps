@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ReactNode, useCallback, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useMemo, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
@@ -13,7 +13,7 @@ import {
   YAxis,
 } from 'recharts'
 import {
-  ChartConfig,
+  type ChartConfig,
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
@@ -101,6 +101,7 @@ interface ThresholdLineChartProps {
   /** Height of the chart in px. Defaults to 300. */
   height?: number
   /** Format the Y-axis ticks (e.g. "2.5s"). */
+  allowDecimals?: boolean
   yTickFormatter?: (value: number) => string
   /** Format categorical X-axis ticks without changing their unique values. */
   xTickFormatter?: (value: string | number) => string
@@ -119,6 +120,13 @@ interface ThresholdLineChartProps {
   onRangeSelect?: (from: Date, to: Date) => void
   /** Confirmed-but-not-yet-applied range to keep highlighted on the chart. */
   selectedRange?: ChartDateRange | null
+  /**
+   * Recharts sync group: charts sharing an id show the tooltip and cursor at
+   * the same x value together (hover, or ←/→ once a chart is focused), so
+   * several panels on one time axis can be read at one instant. Matched by
+   * x value, so the panels need not share identical rows.
+   */
+  syncId?: string
   className?: string
 }
 
@@ -201,6 +209,7 @@ export function ThresholdLineChart({
   markers = [],
   bandSeries,
   height = 300,
+  allowDecimals = true,
   yTickFormatter,
   xTickFormatter,
   tooltipValueFormatter,
@@ -209,6 +218,7 @@ export function ThresholdLineChart({
   selectionKey,
   onRangeSelect,
   selectedRange,
+  syncId,
   className,
 }: ThresholdLineChartProps) {
   const isMulti = Array.isArray(series)
@@ -428,6 +438,8 @@ export function ThresholdLineChart({
     >
       <ComposedChart
         data={data}
+        syncId={syncId}
+        syncMethod={syncId ? 'value' : undefined}
         margin={{ top: 12, right: 24, left: 8, bottom: 0 }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
@@ -486,6 +498,7 @@ export function ThresholdLineChart({
           className="text-xs"
         />
         <YAxis
+          allowDecimals={allowDecimals}
           tickLine={false}
           axisLine={false}
           tickMargin={8}

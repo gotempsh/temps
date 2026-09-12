@@ -3,12 +3,15 @@
 
 import {
   Activity,
+  BarChart3,
+  Bug,
   Bot,
   Box,
   Cloud,
   Database,
   DatabaseBackup,
   Folder,
+  Cpu,
   Gauge,
   GitBranch,
   Globe,
@@ -126,6 +129,46 @@ export const platformToolGroups: PlatformToolGroup[] = [
     description: 'Understand platform health, traffic, and operator activity.',
     icon: Radar,
     items: [
+      {
+        title: 'Server',
+        description:
+          'CPU, memory, disk, Docker disk usage and I/O of the control-plane host.',
+        url: '/monitoring/server',
+        icon: Cpu,
+        keywords: [
+          'cpu',
+          'memory',
+          'disk',
+          'docker',
+          'network',
+          'host',
+          'resources',
+        ],
+      },
+      {
+        title: 'Analytics',
+        description: 'Compare traffic across projects.',
+        url: '/analytics',
+        icon: BarChart3,
+      },
+      {
+        title: 'Traces',
+        description: 'Follow requests across projects and services.',
+        url: '/traces',
+        icon: Workflow,
+      },
+      {
+        title: 'Logs',
+        description: 'Search collected application and database logs.',
+        url: '/logs',
+        icon: ScrollText,
+      },
+      {
+        title: 'Errors',
+        description: 'Review application issues across projects.',
+        url: '/errors',
+        icon: Bug,
+      },
       {
         title: 'Monitoring',
         description:

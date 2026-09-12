@@ -53,4 +53,22 @@ const TabsContent = React.forwardRef<
 ))
 TabsContent.displayName = TabsPrimitive.Content.displayName
 
-export { Tabs, TabsList, TabsTrigger, TabsContent }
+/** Scrolls only the tab strip; Radix retains keyboard navigation and panel semantics. */
+const ScrollableTabsList = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.List>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.List>
+>(({ className, ...props }, ref) => (
+  <div className="min-w-0 max-w-full overflow-x-auto overscroll-x-contain pb-1">
+    <TabsList
+      ref={ref}
+      className={cn(
+        'h-auto min-h-10 w-max min-w-full justify-start sm:min-w-0 [&>button]:shrink-0 [&>button]:min-h-9',
+        className
+      )}
+      {...props}
+    />
+  </div>
+))
+ScrollableTabsList.displayName = 'ScrollableTabsList'
+
+export { Tabs, TabsList, ScrollableTabsList, TabsTrigger, TabsContent }

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import {
   getServiceOptions,
   listServiceProjectsOptions,
@@ -8,18 +11,11 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { DateRangePicker } from '@/components/ui/date-range-picker'
 import { ServiceHealthBadge } from '@/components/storage/ServiceHealthCard'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import {
   type LogLevel,
   type LogSearchLine,
@@ -60,7 +56,7 @@ const LOAD_OLDER_THRESHOLD = 48
 
 // ── Time range ─────────────────────────────────────────────────────────────
 
-type TimePreset = '15m' | '1h' | '24h' | '7d' | 'custom'
+type TimePreset = '15m' | '6h' | '1h' | '24h' | '7d' | 'custom'
 
 const PRESETS: { value: TimePreset; label: string }[] = [
   { value: '15m', label: 'Last 15 minutes' },
@@ -71,6 +67,7 @@ const PRESETS: { value: TimePreset; label: string }[] = [
 ]
 
 const PRESET_MS: Record<Exclude<TimePreset, 'custom'>, number> = {
+  '6h': 6 * 60 * 60 * 1000,
   '15m': 15 * 60 * 1000,
   '1h': 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
@@ -379,38 +376,29 @@ export function ServiceLogs() {
             className="w-full sm:w-[320px]"
           />
 
-          {/* Time range preset selector */}
-          <Select
-            value={preset}
-            onValueChange={(v) => handlePresetChange(v as TimePreset)}
-          >
-            <SelectTrigger className="w-full sm:w-[180px]">
-              <SelectValue placeholder="Time range" />
-            </SelectTrigger>
-            <SelectContent>
-              {PRESETS.map((p) => (
-                <SelectItem key={p.value} value={p.value}>
-                  {p.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          {/* Custom date/time picker — only shown when "Custom range…" is selected */}
-          {preset === 'custom' ? (
-            <DateRangePicker
-              date={customRange}
-              onDateChange={(range) => {
-                setCustomRange(range)
-                // Re-tail when a complete custom range is applied.
-                if (range?.from && range?.to) {
-                  setRefreshKey((k) => k + 1)
-                }
-              }}
-              showTime
-              className="w-full sm:w-auto"
-            />
-          ) : null}
+          <DateTimeRange
+            value={
+              preset === 'custom' && customRange?.from && customRange.to
+                ? {
+                    from: customRange.from.toISOString(),
+                    to: customRange.to.toISOString(),
+                    preset: 'custom',
+                  }
+                : resolveTimeRange(preset, rangeAnchor)
+            }
+            maxRangeDays={365}
+            onChange={(next) => {
+              if (next.preset === 'custom') {
+                setCustomRange({
+                  from: new Date(next.from),
+                  to: new Date(next.to),
+                })
+                setPreset('custom')
+                setRefreshKey((k) => k + 1)
+              } else
+                handlePresetChange(next.preset === '1d' ? '24h' : next.preset)
+            }}
+          />
 
           <div className="flex flex-wrap gap-1">
             {LEVELS.map((level) => (
