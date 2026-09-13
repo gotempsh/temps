@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Command } from 'commander'
+import { registerPluginCommands } from './commands/plugin/index.js'
 import chalk from 'chalk'
 import { colors } from './ui/output.js'
 import { setQuietMode } from './ui/spinner.js'
@@ -241,6 +242,7 @@ export function createProgram(): Command {
   registerExecCommands(program)
   registerDevCommand(program)
   registerCloudCommands(program)
+  registerPluginCommands(program)
 
   registerDocsCommand(program)
 
