@@ -169,6 +169,11 @@ describe("TypeScript plugin publishing", () => {
       expect(pkg.files).toEqual(["plugin"]);
       expect(pkg.temps?.verification).toBe("proof");
       expect(pkg).not.toHaveProperty("scripts");
+      const target = TARGETS[platform];
+      expect(pkg.os).toEqual([target.os]);
+      expect(pkg.cpu).toEqual([target.cpu]);
+      if ("libc" in target) expect(pkg.libc).toEqual([target.libc]);
+      else expect(pkg).not.toHaveProperty("libc");
     }
     expect(releaseMetadata(config).packages[0]?.name).toBe(
       "@example/pulse-linux-x64-gnu",

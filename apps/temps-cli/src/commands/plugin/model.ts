@@ -165,7 +165,9 @@ export function platformManifest(
     description: c.description,
     author: c.author,
     repository: c.repository,
-    ...native,
+    os: [native.os],
+    cpu: [native.cpu],
+    ...("libc" in native ? { libc: [native.libc] } : {}),
     files: ["plugin"],
     ...(code ? { temps: { verification: code } } : {}),
   };
