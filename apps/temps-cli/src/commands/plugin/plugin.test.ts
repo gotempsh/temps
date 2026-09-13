@@ -2,19 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, test, expect } from "bun:test";
-import {
-  mkdtemp,
-  mkdir,
-  writeFile,
-  readFile,
-  rm,
-  stat,
-  readdir,
-  symlink,
-} from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, readdir, symlink } from "node:fs/promises";
 import { saveAtomic, readState } from "./state.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Command } from "commander";
+import { registerPluginCommands } from "./index.js";
 import {
   TARGETS,
   parseConfig,
@@ -28,6 +21,7 @@ import {
   validateState,
   validateStatus,
   configDigest,
+  command,
   type PublishDependencies,
 } from "./workflow.js";
 const config: PluginConfig = {
@@ -56,6 +50,65 @@ const draft = () => ({
 const statusPackages = () =>
   draft().challenges.map((p) => ({ id: p.id, verifiedAt: null }));
 describe("TypeScript plugin publishing", () => {
+  test("Bun subprocesses preserve literal arguments and report failed or missing executables", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "temps-plugin-command-"));
+    try {
+      const literal = "literal; $(not-a-shell-command)";
+      await command(
+        [
+          process.execPath,
+          "-e",
+          "await Bun.write('argument.txt', process.argv.at(-1))",
+          literal,
+        ],
+        dir,
+      );
+      expect(await Bun.file(join(dir, "argument.txt")).text()).toBe(literal);
+      await expect(
+        command([process.execPath, "-e", "process.exit(7)"], dir),
+      ).rejects.toThrow("failed (7)");
+      await expect(
+        command([join(dir, "missing-executable")], dir),
+      ).rejects.toThrow("Could not start");
+      await expect(command([], dir)).rejects.toThrow(
+        "Missing command executable",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  test("Bun scaffolding writes a complete project without overwriting an existing directory", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "temps-plugin-init-"));
+    const target = join(dir, "plugin");
+    const program = new Command();
+    registerPluginCommands(program);
+    try {
+      await program.parseAsync(
+        ["plugin", "init", target, "--name", "@example/hello"],
+        { from: "user" },
+      );
+      expect((await Bun.file(join(target, "package.json")).json()).name).toBe(
+        "@example/hello",
+      );
+      expect(await Bun.file(join(target, ".gitignore")).text()).toContain(
+        ".temps-plugin/",
+      );
+      expect(await Bun.file(join(target, "src/index.ts")).text()).toContain(
+        "runPlugin",
+      );
+      await expect(
+        program.parseAsync(
+          ["plugin", "init", target, "--name", "@example/replacement"],
+          { from: "user" },
+        ),
+      ).rejects.toThrow();
+      expect((await Bun.file(join(target, "package.json")).json()).name).toBe(
+        "@example/hello",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   test("recovers the same durable create request after the server commits but its response is lost", async () => {
     const dir = await mkdtemp(join(tmpdir(), "temps-plugin-recovery-"));
     const tokens: string[] = [];
@@ -73,12 +126,9 @@ describe("TypeScript plugin publishing", () => {
       publisher: async (body) => {
         const b = body as { operation: string; recoveryToken: string };
         if (b.operation === "create") {
-          const journal = JSON.parse(
-            await readFile(
-              join(dir, ".temps-plugin", config.version, "request.json"),
-              "utf8",
-            ),
-          );
+          const journal = await Bun.file(
+            join(dir, ".temps-plugin", config.version, "request.json"),
+          ).json();
           expect(journal.recoveryToken).toBe(b.recoveryToken);
           tokens.push(b.recoveryToken);
           if (tokens.length === 1)
@@ -97,11 +147,10 @@ describe("TypeScript plugin publishing", () => {
       expect(tokens[0]).toBe(tokens[1]);
       expect(builds).toBe(1);
       expect(
-        JSON.parse(
-          await readFile(
+        (
+          await Bun.file(
             join(dir, ".temps-plugin", config.version, "release.json"),
-            "utf8",
-          ),
+          ).json()
         ).id,
       ).toBe(response.id);
     } finally {
@@ -155,7 +204,7 @@ describe("TypeScript plugin publishing", () => {
       expect(await readState(path)).toEqual({ id: "replacement" });
       await symlink(path, join(dir, "link.json"));
       await expect(saveAtomic(join(dir, "link.json"), {})).rejects.toThrow();
-      await writeFile(path, '{"id":');
+      await Bun.write(path, '{"id":');
       await expect(readState(path)).rejects.toThrow("Preserve it for recovery");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -204,13 +253,13 @@ describe("TypeScript plugin publishing", () => {
   test("builds isolated allowlisted packages and resumes npm interruption without a second draft", async () => {
     const dir = await mkdtemp(join(tmpdir(), "temps-plugin-workflow-test-"));
     await mkdir(join(dir, "src"));
-    await writeFile(join(dir, "src/index.ts"), 'console.log("fixture")');
+    await Bun.write(join(dir, "src/index.ts"), 'console.log("fixture")');
     const events: string[] = [];
     const remote = new Set<string>();
     let fail = true;
     const runner: PublishDependencies["command"] = async (argv) => {
       if (argv[0] === "bun") {
-        await writeFile(argv[argv.length - 1]!, "native fixture");
+        await Bun.write(argv[argv.length - 1]!, "native fixture");
         return;
       }
     };
@@ -218,9 +267,7 @@ describe("TypeScript plugin publishing", () => {
       buildPlugin: (cwd, c, state) => buildPlugin(cwd, c, state, runner),
       npmExists: async (name) => remote.has(name),
       command: async (_argv, cwd) => {
-        const pkg = JSON.parse(
-          await readFile(join(cwd, "package.json"), "utf8"),
-        );
+        const pkg = await Bun.file(join(cwd, "package.json")).json();
         events.push("npm:" + pkg.name);
         if (fail) {
           fail = false;

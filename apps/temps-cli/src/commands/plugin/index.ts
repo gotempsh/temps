@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import type { Command } from "commander";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { promptConfirm } from "../../ui/prompts.js";
 import { TARGETS, validName, PluginPublishError } from "./model.js";
@@ -11,6 +11,12 @@ export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
     .description("Create, cross-compile and publish TypeScript plugins");
+  plugin.hook("preAction", () => {
+    if (typeof Bun === "undefined")
+      throw new PluginPublishError(
+        "Plugin commands require Bun. Run bunx --bun @temps-sdk/cli plugin <command>.",
+      );
+  });
   plugin
     .command("init")
     .argument("<directory>", "New plugin directory")
@@ -27,7 +33,7 @@ export function registerPluginCommands(program: Command) {
         .slice(options.name.indexOf("/") + 1)
         .replace(/[._]/g, "-");
       await mkdir(join(path, "src"));
-      await writeFile(
+      await Bun.write(
         join(path, "package.json"),
         JSON.stringify(
           {
@@ -50,17 +56,14 @@ export function registerPluginCommands(program: Command) {
           null,
           2,
         ) + "\n",
-        { flag: "wx" },
       );
-      await writeFile(
+      await Bun.write(
         join(path, ".gitignore"),
         "node_modules/\n.temps-plugin/\n.env\n.env.*\n",
-        { flag: "wx" },
       );
-      await writeFile(
+      await Bun.write(
         join(path, "src/index.ts"),
         `import {runPlugin,createManifest} from '@temps-sdk/plugin';\nimport pkg from '../package.json';\nawait runPlugin({manifest:()=>createManifest(pkg.temps.name,pkg.version).displayName(pkg.temps.title).build(),handler:()=>async(_req,res)=>{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({message:'Hello from '+pkg.temps.title}));}});\n`,
-        { flag: "wx" },
       );
       console.log(
         `Created ${path}. Edit package.json metadata, run bun install there, then temps plugin build --all.`,

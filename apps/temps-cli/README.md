@@ -16,6 +16,30 @@
 
 ---
 
+## TypeScript plugin publishing
+
+Run plugin commands with Bun: `bunx --bun @temps-sdk/cli plugin init`,
+`plugin build --all`, and `plugin publish`. Bun compiles the native platform
+packages; `npm publish` handles npm's interactive browser/2FA approval, with
+lifecycle scripts disabled. Do not substitute a bypass token.
+
+Publication keeps a private, mode-0600 journal in `.temps-plugin/`. Preserve it
+until publication completes; do not commit or share it. Before the first remote
+create, the CLI durably records a metadata digest and random 256-bit recovery
+token. The publisher API must accept `recoveryToken` and replay the same draft,
+expiry, package IDs, and verification codes for that account and exact metadata.
+Different tokens or metadata must fail for an existing release, and another
+account must never retrieve its challenges. Deploy the companion API before
+releasing this CLI; do not retry an older API with the token removed.
+
+State writes use Bun file I/O through exclusively opened descriptors, then
+fsync, atomic rename, and directory fsync. Invalid state or mismatched responses
+stop publication instead of creating another draft. Existing valid
+`release.json` files resume without a create call. Orphaned drafts without a
+recovery journal require maintainer assistance or a new version. Publication to
+npm is separate from protected registry signing; check the publisher dashboard
+for catalog publication status.
+
 ```bash
 # npm
 npm install -g @temps-sdk/cli

@@ -4,7 +4,6 @@
 import { open, rename, unlink, lstat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
 import { PluginPublishError } from "./model.js";
 
 export const object = (v: unknown): v is Record<string, unknown> =>
@@ -19,8 +18,11 @@ export const timestamp = (v: unknown): v is string =>
 
 // Never truncate the recoverable copy. Sync content before rename, then sync
 // the directory entry before allowing a remote side effect.
+// Bun handles file contents. Keep Node's Bun-compatible filesystem primitives
+// for O_EXCL/O_NOFOLLOW, atomic rename and fsync: Bun.write alone cannot provide
+// these crash-recovery and symlink-safety guarantees.
 export async function saveAtomic(path: string, value: unknown) {
-  const temp = `${path}.${randomUUID()}.tmp`;
+  const temp = `${path}.${crypto.randomUUID()}.tmp`;
   let created = false;
   try {
     const current = await lstat(path).catch((error: NodeJS.ErrnoException) => {
@@ -39,7 +41,7 @@ export async function saveAtomic(path: string, value: unknown) {
     );
     created = true;
     try {
-      await file.writeFile(JSON.stringify(value, null, 2) + "\n");
+      await Bun.write(Bun.file(file.fd), JSON.stringify(value, null, 2) + "\n");
       await file.sync();
     } finally {
       await file.close();
@@ -64,7 +66,7 @@ export async function readState(path: string): Promise<unknown | undefined> {
   try {
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
-      return JSON.parse(await file.readFile("utf8"));
+      return await Bun.file(file.fd).json();
     } finally {
       await file.close();
     }

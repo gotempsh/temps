@@ -1,18 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { spawn } from "node:child_process";
 import {
   chmod,
   lstat,
   mkdir,
-  readFile,
   realpath,
   readdir,
   open,
   unlink,
 } from "node:fs/promises";
 import { resolve, join, sep } from "node:path";
-import { createHash, randomBytes } from "node:crypto";
 import {
   saveAtomic as save,
   readState,
@@ -34,34 +31,29 @@ import {
 export async function command(argv: string[], cwd: string) {
   const executable = argv[0];
   if (!executable) throw new PluginPublishError("Missing command executable.");
-  await new Promise<void>((ok, fail) => {
-    const child = spawn(executable, argv.slice(1), {
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn(argv, {
       cwd,
-      stdio: "inherit",
-      shell: false,
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
     });
-    child.on("error", () =>
-      fail(
-        new PluginPublishError(
-          `Could not start ${argv[0]}. Install it and retry.`,
-        ),
-      ),
+  } catch {
+    throw new PluginPublishError(
+      `Could not start ${executable}. Install it and retry.`,
     );
-    child.on("exit", (code) =>
-      code === 0
-        ? ok()
-        : fail(
-            new PluginPublishError(
-              `${argv[0]} failed (${code}); no further packages were published. Retry plugin publish to resume.`,
-            ),
-          ),
+  }
+  const code = await child.exited;
+  if (code !== 0)
+    throw new PluginPublishError(
+      `${executable} failed (${code}); no further packages were published. Retry plugin publish to resume.`,
     );
-  });
 }
 export async function loadConfig(cwd: string) {
   let value: unknown;
   try {
-    value = JSON.parse(await readFile(join(cwd, "package.json"), "utf8"));
+    value = await Bun.file(join(cwd, "package.json")).json();
   } catch {
     throw new PluginPublishError(
       `Could not read valid package.json in ${cwd}. Run plugin init in a new directory or correct the file.`,
@@ -89,7 +81,7 @@ export type State = {
   }>;
 };
 export const configDigest = (c: PluginConfig) =>
-  createHash("sha256")
+  new Bun.CryptoHasher("sha256")
     .update(JSON.stringify(releaseMetadata(c)))
     .digest("hex");
 export function validateState(
@@ -297,7 +289,9 @@ async function publishLocked(
       await buildPlugin(cwd, c);
       request = {
         digest: configDigest(c),
-        recoveryToken: randomBytes(32).toString("base64url"),
+        recoveryToken: Buffer.from(
+          crypto.getRandomValues(new Uint8Array(32)),
+        ).toString("base64url"),
       };
       // This journal must reach disk BEFORE create. The API must replay the same
       // draft and challenge codes for this token, including after a lost response.
