@@ -2,7 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, test, expect } from "bun:test";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  readFile,
+  rm,
+  stat,
+  readdir,
+  symlink,
+} from "node:fs/promises";
+import { saveAtomic, readState } from "./state.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +25,9 @@ import {
 import {
   buildPlugin,
   publishPlugin,
+  validateState,
+  validateStatus,
+  configDigest,
   type PublishDependencies,
 } from "./workflow.js";
 const config: PluginConfig = {
@@ -31,7 +44,123 @@ const config: PluginConfig = {
     platforms: ["linux-amd64-gnu", "darwin-arm64"],
   },
 };
+const draft = () => ({
+  id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  expiresAt: new Date(Date.now() + 3600000).toISOString(),
+  challenges: releaseMetadata(config).packages.map((p, i) => ({
+    ...p,
+    id: `00000000-0000-0000-0000-00000000000${i}`,
+    code: "a".repeat(43),
+  })),
+});
+const statusPackages = () =>
+  draft().challenges.map((p) => ({ id: p.id, verifiedAt: null }));
 describe("TypeScript plugin publishing", () => {
+  test("recovers the same durable create request after the server commits but its response is lost", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "temps-plugin-recovery-"));
+    const tokens: string[] = [];
+    let builds = 0;
+    const response = draft();
+    const deps: PublishDependencies = {
+      npmExists: async () => false,
+      buildPlugin: async () => {
+        builds++;
+        return dir;
+      },
+      command: async () => {
+        throw new Error("Unexpected npm invocation");
+      },
+      publisher: async (body) => {
+        const b = body as { operation: string; recoveryToken: string };
+        if (b.operation === "create") {
+          const journal = JSON.parse(
+            await readFile(
+              join(dir, ".temps-plugin", config.version, "request.json"),
+              "utf8",
+            ),
+          );
+          expect(journal.recoveryToken).toBe(b.recoveryToken);
+          tokens.push(b.recoveryToken);
+          if (tokens.length === 1)
+            throw new Error("Response lost after commit");
+          return response;
+        }
+        return { status: "pending", packages: statusPackages() };
+      },
+    };
+    try {
+      await expect(publishPlugin(dir, config, deps)).rejects.toThrow(
+        "Response lost",
+      );
+      await publishPlugin(dir, config, deps);
+      expect(tokens).toHaveLength(2);
+      expect(tokens[0]).toBe(tokens[1]);
+      expect(builds).toBe(1);
+      expect(
+        JSON.parse(
+          await readFile(
+            join(dir, ".temps-plugin", config.version, "release.json"),
+            "utf8",
+          ),
+        ).id,
+      ).toBe(response.id);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  test("rejects malformed create/status responses before use", () => {
+    const state = { ...draft(), digest: configDigest(config) };
+    for (const value of [
+      null,
+      [],
+      { ...state, expiresAt: undefined },
+      { ...state, expiresAt: "not a date" },
+      { ...state, challenges: [null, null] },
+      { ...state, challenges: [state.challenges[0], state.challenges[0]] },
+    ])
+      expect(() => validateState(value, config)).toThrow();
+    for (const value of [
+      null,
+      {},
+      { status: "draft" },
+      { status: "unknown", packages: statusPackages() },
+      { status: "draft", packages: [] },
+      {
+        status: "draft",
+        packages: [
+          { id: state.challenges[0]!.id, verifiedAt: "invalid" },
+          statusPackages()[1],
+        ],
+      },
+    ])
+      expect(() => validateStatus(value, state)).toThrow(
+        "Invalid publisher status",
+      );
+    expect(() =>
+      validateStatus({ status: "draft", packages: statusPackages() }, state),
+    ).not.toThrow();
+  });
+  test("atomic state writes preserve the old copy on serialization failure and reject corrupt state", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "temps-plugin-atomic-"));
+    const path = join(dir, "release.json");
+    try {
+      await saveAtomic(path, { id: "original" });
+      await expect(saveAtomic(path, { bad: 1n })).rejects.toThrow(
+        "durably save",
+      );
+      expect(await readState(path)).toEqual({ id: "original" });
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(await readdir(dir)).toEqual(["release.json"]);
+      await saveAtomic(path, { id: "replacement" });
+      expect(await readState(path)).toEqual({ id: "replacement" });
+      await symlink(path, join(dir, "link.json"));
+      await expect(saveAtomic(join(dir, "link.json"), {})).rejects.toThrow();
+      await writeFile(path, '{"id":');
+      await expect(readState(path)).rejects.toThrow("Preserve it for recovery");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   test("validates metadata and maps all six native platforms", () => {
     expect(parseConfig(config)).toEqual(config);
     expect(Object.keys(TARGETS)).toHaveLength(6);
@@ -107,7 +236,8 @@ describe("TypeScript plugin publishing", () => {
               code: "a".repeat(43),
             })),
           };
-        if (b.operation === "status") return { status: "draft", packages: [] };
+        if (b.operation === "status")
+          return { status: "draft", packages: statusPackages() };
         return {};
       },
     };
@@ -123,7 +253,10 @@ describe("TypeScript plugin publishing", () => {
       const before = events.length;
       await publishPlugin(dir, config, {
         ...deps,
-        publisher: async () => ({ status: "pending", packages: [] }),
+        publisher: async () => ({
+          status: "pending",
+          packages: statusPackages(),
+        }),
       });
       expect(events.length).toBe(before);
       await expect(

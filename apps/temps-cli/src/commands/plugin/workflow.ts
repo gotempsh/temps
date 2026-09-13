@@ -11,9 +11,15 @@ import {
   open,
   unlink,
 } from "node:fs/promises";
-import { constants } from "node:fs";
 import { resolve, join, sep } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  saveAtomic as save,
+  readState,
+  object,
+  uuid,
+  timestamp,
+} from "./state.js";
 import { getCloudUrl, requireCloudAuth } from "../../lib/cloud-client.js";
 import {
   TARGETS,
@@ -71,22 +77,6 @@ async function directory(path: string) {
   )
     throw new PluginPublishError(`Refusing non-directory or symlink: ${path}`);
 }
-async function save(path: string, value: unknown) {
-  // No symlink following, including when resuming a partially published release.
-  const file = await open(
-    path,
-    constants.O_WRONLY |
-      constants.O_CREAT |
-      constants.O_TRUNC |
-      constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    await file.writeFile(JSON.stringify(value, null, 2) + "\n");
-  } finally {
-    await file.close();
-  }
-}
 export type State = {
   digest: string;
   id: string;
@@ -102,22 +92,60 @@ export const configDigest = (c: PluginConfig) =>
   createHash("sha256")
     .update(JSON.stringify(releaseMetadata(c)))
     .digest("hex");
-export function validateState(state: State, c: PluginConfig) {
+export function validateState(
+  state: unknown,
+  c: PluginConfig,
+): asserts state is State {
   if (
+    !object(state) ||
     state.digest !== configDigest(c) ||
-    !/^[0-9a-f-]{36}$/.test(state.id) ||
+    !uuid(state.id) ||
+    !timestamp(state.expiresAt) ||
     !Array.isArray(state.challenges) ||
     state.challenges.length !== c.temps.platforms.length ||
+    new Set(
+      state.challenges.map((p: unknown) => (object(p) ? p.id : undefined)),
+    ).size !== state.challenges.length ||
     state.challenges.some(
       (p, i) =>
+        !object(p) ||
         p.platform !== c.temps.platforms[i] ||
-        p.name !== packageName(c, p.platform) ||
-        !/^[0-9a-f-]{36}$/.test(p.id) ||
+        p.name !== packageName(c, c.temps.platforms[i]!) ||
+        !uuid(p.id) ||
+        typeof p.code !== "string" ||
         !/^[A-Za-z0-9_-]{43}$/.test(p.code),
     )
   )
     throw new PluginPublishError(
       "Saved release does not match package.json. Restore its metadata or choose a new version.",
+    );
+}
+export function validateStatus(
+  value: unknown,
+  state: State,
+): asserts value is {
+  status: "draft" | "pending" | "approved" | "rejected";
+  packages: Array<{ id: string; verifiedAt: string | null }>;
+} {
+  if (
+    !object(value) ||
+    !["draft", "pending", "approved", "rejected"].includes(
+      String(value.status),
+    ) ||
+    !Array.isArray(value.packages) ||
+    value.packages.length !== state.challenges.length ||
+    new Set(value.packages.map((p: unknown) => (object(p) ? p.id : undefined)))
+      .size !== state.challenges.length ||
+    value.packages.some(
+      (p: unknown) =>
+        !object(p) ||
+        !uuid(p.id) ||
+        !state.challenges.some((c) => c.id === p.id) ||
+        (p.verifiedAt !== null && !timestamp(p.verifiedAt)),
+    )
+  )
+    throw new PluginPublishError(
+      "Invalid publisher status response. Update the CLI/API together; no further packages were published.",
     );
 }
 async function publisher(operation: unknown): Promise<unknown> {
@@ -144,10 +172,14 @@ async function publisher(operation: unknown): Promise<unknown> {
     },
     body: JSON.stringify(operation),
   });
-  const data = (await response.json()) as { error?: string };
+  const data: unknown = await response.json().catch(() => {
+    throw new PluginPublishError(
+      `Publisher returned non-JSON data (${response.status}). Check the API deployment and retry.`,
+    );
+  });
   if (!response.ok)
     throw new PluginPublishError(
-      typeof data.error === "string"
+      object(data) && typeof data.error === "string"
         ? data.error
         : `Publisher returned ${response.status}.`,
     );
@@ -247,33 +279,53 @@ async function publishLocked(
   const out = join(base, c.version);
   await directory(out);
   const stateFile = join(out, "release.json");
-  const stat = await lstat(stateFile).catch(() => null);
-  if (stat && (!stat.isFile() || stat.isSymbolicLink()))
-    throw new PluginPublishError("Unsafe release state file.");
+  const savedState = await readState(stateFile);
   let state: State;
-  if (stat) {
-    state = JSON.parse(await readFile(stateFile, "utf8")) as State;
-    validateState(state, c);
+  if (savedState !== undefined) {
+    validateState(savedState, c);
+    state = savedState;
   } else {
-    for (const platform of c.temps.platforms)
-      if (await npmExists(packageName(c, platform), c.version))
-        throw new PluginPublishError(
-          `${packageName(c, platform)}@${c.version} already exists. Choose a new unpublished version.`,
-        );
-    // Compile before creating the expiring challenge; no npm publication yet.
-    await buildPlugin(cwd, c);
-    const created = (await publisher({
+    const requestFile = join(out, "request.json");
+    let request = await readState(requestFile);
+    if (request === undefined) {
+      for (const platform of c.temps.platforms)
+        if (await npmExists(packageName(c, platform), c.version))
+          throw new PluginPublishError(
+            `${packageName(c, platform)}@${c.version} already exists. Choose a new unpublished version.`,
+          );
+      // Compile before creating the expiring challenge; no npm publication yet.
+      await buildPlugin(cwd, c);
+      request = {
+        digest: configDigest(c),
+        recoveryToken: randomBytes(32).toString("base64url"),
+      };
+      // This journal must reach disk BEFORE create. The API must replay the same
+      // draft and challenge codes for this token, including after a lost response.
+      await save(requestFile, request);
+    }
+    if (
+      !object(request) ||
+      request.digest !== configDigest(c) ||
+      typeof request.recoveryToken !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(request.recoveryToken)
+    )
+      throw new PluginPublishError(
+        "Saved create request does not match package.json. Preserve its metadata and recovery state.",
+      );
+    const created = await publisher({
       operation: "create",
       metadata: releaseMetadata(c),
-    })) as Omit<State, "digest">;
-    state = { ...created, digest: configDigest(c) };
-    validateState(state, c);
+      recoveryToken: request.recoveryToken,
+    });
+    const candidate = object(created)
+      ? { ...created, digest: configDigest(c) }
+      : created;
+    validateState(candidate, c);
+    state = candidate;
     await save(stateFile, state);
   }
-  const status = (await publisher({ operation: "status", id: state.id })) as {
-    status: string;
-    packages: Array<{ id: string; verifiedAt: string | null }>;
-  };
+  const status = await publisher({ operation: "status", id: state.id });
+  validateStatus(status, state);
   if (status.status === "pending" || status.status === "approved") {
     console.log(
       `Release already ${status.status}. See https://temps.sh/dashboard/plugins`,
