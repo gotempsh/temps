@@ -78,6 +78,7 @@ jobs:
           load: true
           push: false
           tags: temps-daemon-release:check
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
 
       - name: Install Rust for the typed SDK smoke client
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -101,6 +102,7 @@ jobs:
           load: true
           push: false
           tags: temps-daemon-release:check
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
 
       - name: Verify arm64 daemon lifecycle without provider credentials
         env:
@@ -126,9 +128,14 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
-          # No floating legacy tags or cache writes: python shares a package
-          # name with the standalone images, but not its version or channel aliases.
-          cache-from: type=gha,scope=daemon-${{ matrix.flavor }}
+          # Share intermediate layers across main and release tags without
+          # consuming the GitHub Actions cache budget. The daemon-only tag
+          # cannot collide with the standalone Python image in this package.
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
+          # Populate only after both architectures pass, using the same trusted
+          # publication gate as the image. PRs/dry-runs never write. A cache
+          # export outage must not fail an otherwise valid image publication.
+          cache-to: ${{ steps.metadata.outputs.publish == 'true' && format('type=registry,ref=ghcr.io/gotempsh/temps-sandbox-{0}:daemon-buildcache,mode=max,ignore-error=true', matrix.flavor) || '' }}
 
       - name: Record runtime image digest
         if: inputs.revision_only

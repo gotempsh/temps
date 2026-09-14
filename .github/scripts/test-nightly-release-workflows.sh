@@ -135,6 +135,14 @@ publish_index = steps.index { |step| step["name"] == "Build and publish daemon i
 abort "daemon publication step is missing or bypasses failed checks" unless
   publish_index && !steps[publish_index].key?("if") && !steps[publish_index].key?("continue-on-error")
 published_platforms = steps[publish_index].fetch("with").fetch("platforms").split(",")
+daemon_cache = "type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache"
+daemon_builds = steps.select { |step| step.fetch("uses", "").start_with?("docker/build-push-action@") }
+abort "every daemon build must read the persistent flavor-specific registry cache" unless
+  daemon_builds.length == 3 && daemon_builds.all? { |step| step.dig("with", "cache-from") == daemon_cache }
+abort "only validated publishing runs may export the daemon cache after lifecycle checks" unless
+  steps[publish_index].dig("with", "cache-to") ==
+    "${{ steps.metadata.outputs.publish == 'true' && format('type=registry,ref=ghcr.io/gotempsh/temps-sandbox-{0}:daemon-buildcache,mode=max,ignore-error=true', matrix.flavor) || '' }}" &&
+  steps.each_with_index.all? { |step, index| index == publish_index || !step.fetch("with", {}).key?("cache-to") }
 abort "daemon publication must cover both supported architectures" unless
   published_platforms.sort == %w[linux/amd64 linux/arm64]
 published_platforms.each do |platform|
@@ -162,6 +170,10 @@ abort "PR checks must exercise every published flavor and architecture" unless
   check_job.dig("strategy", "matrix", "arch") == ["amd64", "arm64"] &&
   !check_job.key?("continue-on-error")
 check_steps = check_job.fetch("steps")
+check_builds = check_steps.select { |step| step.fetch("uses", "").start_with?("docker/build-push-action@") }
+abort "PR builds must consume daemon cache without registry login or cache writes" unless
+  check_builds.length == 1 && check_builds.all? { |step| step.dig("with", "cache-from") == daemon_cache } &&
+  check_steps.all? { |step| !step.fetch("with", {}).key?("cache-to") && !step.fetch("uses", "").start_with?("docker/login-action@") }
 check_load_index = check_steps.index { |step| step["name"] == "Load image for lifecycle verification" }
 check_smoke_index = check_steps.index { |step| step["name"] == "Verify daemon lifecycle without provider credentials" }
 abort "PR image smoke checks must not skip matrix entries" unless
