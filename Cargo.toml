@@ -265,9 +265,9 @@ webpki-roots = "1.0"
 # ============================================================================
 # Reverse Proxy (Pingora)
 # ============================================================================
-pingora = { version = "0.8.0" }
-pingora-core = { version = "0.8.0", features = ["openssl", "connection_filter"] }
-pingora-proxy = { version = "0.8.0" }
+pingora = { version = "0.9.0" }
+pingora-core = { version = "0.9.0", features = ["openssl", "connection_filter"] }
+pingora-proxy = { version = "0.9.0" }
 prometheus = "0.14"
 
 # ============================================================================
@@ -384,30 +384,14 @@ debug = false
 # Known vulnerabilities from transitive dependencies (blocked on upstream):
 #
 # 1. RUSTSEC-2024-0437 / GHSA-2gh3-rmm4-6rq5 / CVE-2025-53605: protobuf 2.28.0 (MEDIUM)
-#    - Path: pingora-core 0.8.0 → prometheus 0.13.4 → protobuf 2.28.0
-#    - Fix: needs prometheus 0.14+ (protobuf 3.7.2+). pingora-core 0.8.0 AND 0.8.1
-#      both pin prometheus ^0.13, and a [patch.crates-io] to protobuf 3.x fails to
-#      compile (prometheus 0.13's generated code uses 2.x-only RepeatedField /
-#      CodedInputStream APIs).
-#    - Upstream status (checked 2026-08-04): FIXED ON pingora main, NOT YET RELEASED.
-#      pingora main @402acae (2026-07-27) removed prometheus from pingora-core
-#      entirely and split it into a new `pingora-prometheus` crate that declares
-#      `prometheus = "0.14"` (i.e. protobuf 3.x). crates.io latest is still 0.8.1,
-#      which predates the split, so the released graph still pulls protobuf 2.28.0.
-#      ACTION: bump pingora as soon as the release carrying the split ships (0.9.0).
-#      Deliberately NOT pinning pingora to a git rev in the meantime -- putting the
-#      whole proxy/edge hot path on unreleased upstream code is a materially larger
-#      risk than an advisory verified unreachable below.
-#    - Reachability: the vuln is a recursion crash when PARSING untrusted protobuf.
-#      pingora emits metrics via TextEncoder (not ProtobufEncoder); its
-#      PrometheusServer is not wired into any temps listener; the OTLP ingest path
-#      uses prost, not protobuf 2.x. The 2.x parse code is compiled in but never
-#      fed attacker input -> not reachable. (re-verified 2026-08-04: no
-#      ProtobufEncoder/TextEncoder/protobuf::/PrometheusServer reference anywhere
-#      under crates/. Root cause of the pull is structural: pingora-core 0.8.1
-#      declares `prometheus = "0.13"` with default features, and `protobuf` is a
-#      DEFAULT feature of prometheus 0.13 -- features are additive, so it cannot be
-#      turned off from this workspace without vendoring a pingora fork.)
+#    - RESOLVED 2026-09-14: bumped the whole pingora crate family to 0.9.0
+#      (pingora, pingora-core, pingora-proxy, pingora-http, pingora-load-balancing).
+#      0.9.0 carries the prometheus split (pingora main @402acae) into a separate
+#      `pingora-prometheus` crate declaring `prometheus = "0.14"` (protobuf 3.x),
+#      so pingora-core no longer pulls prometheus 0.13 / protobuf 2.28.0 at all.
+#      See PR that bumped the family together (supersedes 5 single-crate Dependabot
+#      PRs that each failed CI because Dependabot proposed bumping one pingora
+#      crate at a time, leaving the rest pinned to 0.8.1 and breaking compilation).
 #
 # 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
 #    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
