@@ -221,6 +221,8 @@ pub struct JoinTokenStatusResponse {
 /// Safe response for application settings that masks sensitive fields
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppSettingsResponse {
+    /// Consent for verified external-plugin installation count reporting.
+    pub plugin_installation_reporting_enabled: bool,
     // Core settings
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
@@ -485,6 +487,7 @@ impl From<AppSettings> for AppSettingsResponse {
         // `settings`; absence means "never configured", which reads as default.
         let self_update = settings.self_update();
         Self {
+            plugin_installation_reporting_enabled: settings.plugin_installation_reporting_enabled,
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
@@ -1790,6 +1793,12 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
+fn discard_plugin_reporting_consent(body: &mut serde_json::Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("plugin_installation_reporting_enabled");
+    }
+}
+
 /// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
 /// carried.
 ///
@@ -2318,7 +2327,7 @@ async fn update_settings(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<SettingsState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
@@ -2326,6 +2335,9 @@ async fn update_settings(
     // because which `cloud.*` keys the client sent is information
     // `#[serde(default)]` destroys: it cannot be recovered from the
     // deserialized document. See `CloudFieldsSent`.
+    // Dedicated SystemAdmin plugin endpoint owns this consent. Strip it from
+    // generic SettingsWrite requests, including full-document round trips.
+    discard_plugin_reporting_consent(&mut body);
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
     let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
         let field = e.path().to_string();
@@ -2447,6 +2459,8 @@ async fn update_settings(
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
             preserve_omitted_security_fields(&mut settings, &current_settings);
+            settings.plugin_installation_reporting_enabled =
+                current_settings.plugin_installation_reporting_enabled;
             // The `cloud` block was already merged, further up: the ADR-042
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
@@ -2959,6 +2973,21 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_settings_write_cannot_enable_plugin_reporting() {
+        let mut body = serde_json::json!({
+            "preview_domain": "apps.example.test",
+            "plugin_installation_reporting_enabled": true
+        });
+        discard_plugin_reporting_consent(&mut body);
+        assert!(body.get("plugin_installation_reporting_enabled").is_none());
+        let mut incoming: AppSettings = serde_json::from_value(body).expect("settings body");
+        let current = AppSettings::default();
+        incoming.plugin_installation_reporting_enabled =
+            current.plugin_installation_reporting_enabled;
+        assert!(!incoming.plugin_installation_reporting_enabled);
+    }
     use temps_core::{
         AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
         ProviderConfig,

@@ -867,7 +867,7 @@ export function NodeDetailPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6">
+    <div className="w-full space-y-6">
       <NodeDetail nodeId={id} onBack={() => navigate('/settings/nodes')} />
     </div>
   )

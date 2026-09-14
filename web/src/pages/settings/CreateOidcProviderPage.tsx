@@ -114,7 +114,7 @@ export function CreateOidcProviderPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-6 py-2">
+    <div className="w-full space-y-6 py-2">
       {verificationDialog}
       <div className="flex items-start gap-4">
         <Button

@@ -381,6 +381,6 @@ async function publishLocked(
   }
   await publisher({ operation: "submit", id: state.id });
   console.log(
-    "Submitted for review. Approval and protected registry signing remain separate. https://temps.sh/dashboard/plugins",
+    "Submission accepted. Check verification and protected publication status at https://temps.sh/dashboard/plugins (published to npm does not yet mean available in the catalog).",
   );
 }

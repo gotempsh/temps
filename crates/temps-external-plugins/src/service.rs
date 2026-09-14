@@ -20,15 +20,17 @@ use crate::catalog::{CatalogError, RegistryClient, RegistryPlugin, VerifiedRegis
 use crate::event_listener::PluginEventListener;
 use crate::install::{
     normalize_digest, platform_target, validate_plugin_name, validate_release_for_install,
-    validate_version, InstallError, PluginInstaller,
+    validate_version, InstallError, PluginInstaller, RepositoryReceipt,
 };
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
+use crate::repository::{self, RepositoryError};
 
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
 pub struct ExternalPluginsService {
     manager: Arc<ExternalPluginManager>,
+    db: Arc<sea_orm::DatabaseConnection>,
     /// Cached manifests from discovery — refreshed on reload.
     manifests: RwLock<Vec<PluginManifest>>,
     /// Event listener that delivers platform events to subscribing plugins
@@ -44,6 +46,7 @@ pub struct ExternalPluginsService {
     /// trust state. Catalogue requests can overlap on the network, but they
     /// must be committed in a single monotonic order with installations.
     registry_state: tokio::sync::Mutex<()>,
+    source_catalog: crate::source_catalog::SourceCatalog,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     closing: AtomicBool,
@@ -55,6 +58,8 @@ pub enum ExternalPluginsError {
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     Install(#[from] InstallError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
     #[error("Plugin '{name}' is not present in the authenticated registry document")]
     NotInRegistry { name: String },
     #[error("Authenticated registry document contains duplicate entries for plugin '{name}'")]
@@ -97,7 +102,212 @@ pub struct SelectedPlugin {
     pub identity: ReleaseIdentity,
 }
 
+pub struct SelectedRepository {
+    source: repository::RepositorySource,
+    _temporary: tempfile::TempDir,
+    pub name: String,
+}
+
+impl SelectedRepository {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn repository(&self) -> &str {
+        &self.source.repository
+    }
+    pub fn source_commit(&self) -> &str {
+        &self.source.commit
+    }
+    pub fn version(&self) -> &str {
+        &self.source.version
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryInstallOutcome {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub source_commit: String,
+}
+
 impl ExternalPluginsService {
+    pub async fn installation_reporting_consent(
+        &self,
+    ) -> Result<bool, crate::reporting::ReportingError> {
+        crate::reporting::consent(&self.db).await
+    }
+
+    pub async fn set_installation_reporting_consent(
+        &self,
+        enabled: bool,
+    ) -> Result<(), crate::reporting::ReportingError> {
+        crate::reporting::set_consent(&self.db, enabled).await
+    }
+
+    async fn ensure_repository_identity(
+        &self,
+        name: &str,
+        repository_url: &str,
+    ) -> Result<(), ExternalPluginsError> {
+        let (owner, repo) = repository::parse_repository(repository_url)?;
+        let canonical = format!("https://github.com/{owner}/{repo}");
+        let plugins_dir = &self.manager.config().plugins_dir;
+        let existing = crate::install::repository_source(plugins_dir, name).await?;
+        let active_exists = tokio::fs::symlink_metadata(plugins_dir.join(name).join("active.json"))
+            .await
+            .is_ok();
+        if active_exists
+            && existing
+                .as_ref()
+                .is_none_or(|source| source.repository != canonical)
+        {
+            return Err(repository::RepositoryError::SourceConflict {
+                name: name.to_string(),
+                repository: canonical,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn repository_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<RepositoryReceipt>, ExternalPluginsError> {
+        Ok(crate::install::repository_source(&self.manager.config().plugins_dir, name).await?)
+    }
+
+    /// Resolve the source commit before the required execution audit.
+    pub async fn select_repository(
+        &self,
+        requested_name: Option<&str>,
+        repository_url: &str,
+        reference: Option<&str>,
+    ) -> Result<SelectedRepository, ExternalPluginsError> {
+        if let Some(name) = requested_name {
+            validate_plugin_name(name)?;
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        if repository::bun_target().is_none() {
+            return Err(InstallError::UnsupportedPlatform {
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                target_env: "Bun repository builds support Linux and macOS x64/arm64".to_string(),
+            }
+            .into());
+        }
+        let staging = self.manager.config().plugins_dir.join(".staging");
+        crate::install::ensure_directory("repository", &staging).await?;
+        let temporary = tempfile::Builder::new()
+            .prefix("repository-")
+            .tempdir_in(&staging)
+            .map_err(|error| InstallError::Io {
+                plugin: requested_name.unwrap_or("repository").to_string(),
+                path: staging.display().to_string(),
+                reason: error.to_string(),
+            })?;
+        let source = repository::fetch_source(
+            repository_url,
+            reference,
+            temporary.path().join("source"),
+            requested_name,
+        )
+        .await?;
+        validate_plugin_name(&source.name)?;
+        self.ensure_repository_identity(&source.name, repository_url)
+            .await?;
+        Ok(SelectedRepository {
+            name: source.name.clone(),
+            source,
+            _temporary: temporary,
+        })
+    }
+
+    pub async fn install_repository(
+        &self,
+        selected: SelectedRepository,
+    ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        self.ensure_repository_identity(&selected.name, &selected.source.repository)
+            .await?;
+        let output = selected._temporary.path().join("plugin");
+        repository::build(&selected.source, &output).await?;
+        let sha256 = crate::install::hash_regular_file_capped(
+            &selected.name,
+            &output,
+            crate::install::MAX_BINARY_BYTES,
+        )
+        .await?;
+        let platform = platform_target()?;
+        let receipt = RepositoryReceipt {
+            source: "github".to_string(),
+            repository: selected.source.repository.clone(),
+            ref_name: selected.source.ref_name.clone(),
+            commit: selected.source.commit.clone(),
+            builder: repository::BUILDER_IMAGE.to_string(),
+            plugin_name: selected.name.clone(),
+            version: selected.source.version.clone(),
+            platform: platform.clone(),
+            sha256: sha256.clone(),
+        };
+        let candidate = PluginInstaller::prepare_repository(
+            &self.manager.config().plugins_dir,
+            receipt,
+            &output,
+        )
+        .await?;
+        let pending = match self
+            .manager
+            .prepare_candidate(
+                &candidate.name,
+                &candidate.version,
+                &candidate.sha256,
+                &candidate.binary_path,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(reason) => {
+                tracing::warn!(
+                    plugin = %candidate.name,
+                    version = %candidate.version,
+                    reason = %reason,
+                    "Repository plugin candidate failed startup verification"
+                );
+                let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
+                if let Err(error) = installer.discard(&candidate).await {
+                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected repository candidate");
+                }
+                return Err(ExternalPluginsError::CandidateRejected {
+                    name: candidate.name,
+                    version: candidate.version,
+                    reason,
+                });
+            }
+        };
+        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
+        if let Err(error) = installer.activate(&candidate).await {
+            self.manager.discard_candidate(pending).await;
+            let _ = installer.discard(&candidate).await;
+            return Err(error.into());
+        }
+        self.manager.promote_candidate(pending).await;
+        self.refresh_runtime_surfaces().await;
+        Ok(RepositoryInstallOutcome {
+            name: candidate.name,
+            version: candidate.version,
+            platform,
+            sha256,
+            source_commit: selected.source.commit,
+        })
+    }
     /// Install the bridge plugins use to call the platform's own HTTP API.
     ///
     /// The console builds its router *after* plugins start (the router
@@ -126,15 +336,17 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db));
+        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
         Self {
             manager,
+            db,
             manifests: RwLock::new(Vec::new()),
             event_listener: RwLock::new(None),
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
+            source_catalog: crate::source_catalog::SourceCatalog::default(),
             closing: AtomicBool::new(false),
         }
     }
@@ -192,7 +404,7 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db));
+        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
         let manifests = manager.discover_and_start().await;
 
         if !manifests.is_empty() {
@@ -217,12 +429,14 @@ impl ExternalPluginsService {
 
         Self {
             manager,
+            db,
             manifests: RwLock::new(manifests),
             event_listener: RwLock::new(event_listener),
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
             lifecycle: tokio::sync::Mutex::new(()),
             registry_state: tokio::sync::Mutex::new(()),
+            source_catalog: crate::source_catalog::SourceCatalog::default(),
             closing: AtomicBool::new(false),
         }
     }
@@ -230,6 +444,16 @@ impl ExternalPluginsService {
     /// Get a snapshot of the current plugin manifests.
     pub async fn manifests(&self) -> Vec<PluginManifest> {
         self.manifests.read().await.clone()
+    }
+
+    pub async fn repository_catalog(
+        &self,
+        platform: &str,
+    ) -> Result<
+        Vec<crate::source_catalog::RepositoryCatalogPlugin>,
+        crate::source_catalog::SourceCatalogError,
+    > {
+        self.source_catalog.list(platform).await
     }
 
     /// Get the swappable proxy router reference.
@@ -395,6 +619,22 @@ impl ExternalPluginsService {
             return Err(ExternalPluginsError::ShuttingDown);
         }
 
+        // Source identity is bidirectional: signed registry installs must not
+        // silently replace an administrator-selected repository release.
+        if crate::install::repository_source(
+            &self.manager.config().plugins_dir,
+            &selected.identity.name,
+        )
+        .await?
+        .is_some()
+        {
+            return Err(repository::RepositoryError::SourceConflict {
+                name: selected.identity.name.clone(),
+                repository: "signed registry".to_string(),
+            }
+            .into());
+        }
+
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         {
             let _registry_state = self.registry_state.lock().await;
@@ -449,6 +689,17 @@ impl ExternalPluginsService {
         }
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
+
+        if let Err(error) = crate::reporting::report_if_enabled(
+            &self.db,
+            &self.manager.config().plugins_dir,
+            &self.manager.config().registry.url,
+            &candidate.name,
+        )
+        .await
+        {
+            tracing::warn!(plugin = %candidate.name, error = %error, "Optional installation report failed");
+        }
 
         Ok(InstallOutcome {
             name: candidate.name,
@@ -622,6 +873,67 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn registry_install_cannot_replace_repository_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let plugins_dir = config.plugins_dir.clone();
+        let service = ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        let binary = temp.path().join("built-plugin");
+        tokio::fs::write(&binary, b"fixture")
+            .await
+            .expect("write binary");
+        let receipt = RepositoryReceipt {
+            source: "github".into(),
+            repository: "https://github.com/example/plugin".into(),
+            ref_name: "main".into(),
+            commit: "a".repeat(40),
+            builder: repository::BUILDER_IMAGE.into(),
+            plugin_name: "fixture-plugin".into(),
+            version: "1.0.0".into(),
+            platform: platform_target().expect("platform"),
+            sha256: hex::encode(Sha256::digest(b"fixture")),
+        };
+        let candidate = PluginInstaller::prepare_repository(&plugins_dir, receipt, &binary)
+            .await
+            .expect("prepare repo");
+        PluginInstaller::new(service.manager.config().registry.clone())
+            .expect("installer")
+            .activate(&candidate)
+            .await
+            .expect("activate repo");
+        let selected = selected_plugin(
+            "http://127.0.0.1/artifact".into(),
+            b"fixture",
+            "fixture-plugin",
+            "2.0.0",
+            1,
+            &signing,
+        );
+        assert!(matches!(
+            service.install_selected(selected).await,
+            Err(ExternalPluginsError::Repository(
+                RepositoryError::SourceConflict { .. }
+            ))
+        ));
+        let source = service
+            .repository_source("fixture-plugin")
+            .await
+            .expect("read active source")
+            .expect("repo source");
+        assert_eq!(source.commit, "a".repeat(40));
+    }
 
     async fn serve_artifact_once(body: Vec<u8>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -223,7 +223,7 @@ export function CloudSettingsPage() {
 
   if (status.isLoading || capability.isLoading) {
     return (
-      <div className="mx-auto max-w-5xl space-y-6 pb-12">
+      <div className="w-full space-y-6 pb-12">
         <Skeleton className="h-24 w-full" />
         <Skeleton className="h-64 w-full" />
       </div>
@@ -236,7 +236,7 @@ export function CloudSettingsPage() {
       ? 'Temps Cloud status unavailable'
       : 'Temps Cloud capability unavailable'
     return (
-      <div className="mx-auto max-w-5xl pb-12">
+      <div className="w-full pb-12">
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
           <AlertTitle>{title}</AlertTitle>
@@ -266,7 +266,7 @@ export function CloudSettingsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-8 pb-12">
+    <div className="w-full space-y-8 pb-12">
       <header className="border-b border-border pb-7">
         <div className="mb-3 flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
           <Cloud className="size-3.5" /> Optional control plane

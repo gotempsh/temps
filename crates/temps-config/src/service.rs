@@ -956,7 +956,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     }
 
     /// Update the application settings
-    pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
+    pub async fn update_settings(
+        &self,
+        mut settings: AppSettings,
+    ) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
 
         // The settings row can drift from the actual TimescaleDB jobs (for
@@ -999,6 +1002,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             existing_query
         };
         let existing = existing_query.one(&txn).await?;
+
+        // Consent is owned by the SystemAdmin-only plugin endpoint. Read it
+        // under this row lock so a concurrent generic settings save cannot
+        // undo a just-committed consent change using an earlier snapshot.
+        settings.plugin_installation_reporting_enabled = existing.as_ref().is_some_and(|row| {
+            AppSettings::from_json(row.data.clone()).plugin_installation_reporting_enabled
+        });
 
         let previous_compression = existing
             .as_ref()

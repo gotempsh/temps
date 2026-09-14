@@ -192,6 +192,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub require_mfa_for_admins: bool,
 
+    /// Share verified external-plugin installation counts with the official
+    /// registry. Defaults to off; each plugin receives an unlinkable ID.
+    #[serde(default)]
+    pub plugin_installation_reporting_enabled: bool,
+
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
     ///
@@ -1600,6 +1605,7 @@ impl Default for AppSettings {
             mcp_server: McpServerSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            plugin_installation_reporting_enabled: false,
             self_update: None,
             console_version: None,
         }
