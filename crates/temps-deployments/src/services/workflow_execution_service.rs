@@ -2982,18 +2982,20 @@ impl WorkflowExecutionService {
     async fn teardown_registered_container(
         &self,
         container: temps_entities::deployment_containers::Model,
+        retry_failed_cleanup: bool,
     ) -> Result<String, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
         let container_id = container.container_id.clone();
         let node_id = container.node_id;
         let original_status = container.status.clone();
-        let was_retained = original_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("retained:"));
+        let rotate_retry = retry_failed_cleanup
+            || original_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("retained:"));
         let deployer = match self.teardown_deployer_for_node(container.node_id).await {
             Ok(deployer) => deployer,
-            Err(error) if was_retained => {
+            Err(error) if rotate_retry => {
                 if let Err(rotation_error) = self
                     .rotate_retained_cleanup_retry(&container, &container_id)
                     .await
@@ -3028,7 +3030,7 @@ impl WorkflowExecutionService {
                 // Retained failures receive a timestamped, lexically-last state,
                 // which moves them behind unattempted rows and rotates retries
                 // fairly inside the bounded cleanup window.
-                if was_retained {
+                if rotate_retry {
                     self.rotate_retained_cleanup_retry(&container, &container_id)
                         .await?;
                 } else {
@@ -3139,7 +3141,7 @@ impl WorkflowExecutionService {
             );
 
             for container in containers {
-                match self.teardown_registered_container(container).await {
+                match self.teardown_registered_container(container, false).await {
                     Ok(container_id) => {
                         info!("Removed container {}", container_id);
                         if first_stopped_container_id.is_none() {
@@ -3152,16 +3154,16 @@ impl WorkflowExecutionService {
             }
         }
 
-        // Failed candidates are deliberately kept for debugging. Query their
-        // live rows directly rather than applying the active-deployment cap.
-        // The per-sweep limit below bounds latency, and status ordering gives
-        // unattempted rows priority while timestamped retry rows rotate fairly.
+        // Failed candidates include legacy rows without a retained status and
+        // rows left by unsuccessful failure cleanup. Ownership and deployment
+        // state determine eligibility, not the container status. Keep failure
+        // history intact while removing these containers after a newer success.
+        // Prioritize unattempted rows, then rotate timestamped retries fairly.
         const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
         const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
         let retained_failed = deployment_containers::Entity::find()
             .find_also_related(deployments::Entity)
             .filter(deployment_containers::Column::DeletedAt.is_null())
-            .filter(deployment_containers::Column::Status.starts_with("retained:"))
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(deployments::Column::State.eq("failed"))
@@ -3174,6 +3176,17 @@ impl WorkflowExecutionService {
                             .add(deployments::Column::Id.lt(current_deployment.id)),
                     ),
             )
+            .order_by_asc(sea_orm::sea_query::SimpleExpr::Case(Box::new(
+                sea_orm::sea_query::Expr::case(
+                    sea_orm::sea_query::Expr::col((
+                        deployment_containers::Entity,
+                        deployment_containers::Column::Status,
+                    ))
+                    .like(format!("{RETAINED_CLEANUP_RETRY_PREFIX}%")),
+                    1,
+                )
+                .finally(0),
+            )))
             .order_by_asc(deployment_containers::Column::Status)
             .order_by_asc(deployment_containers::Column::Id)
             .limit(MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT)
@@ -3190,7 +3203,7 @@ impl WorkflowExecutionService {
         let cleanup_results = futures::stream::iter(
             retained_failed
                 .into_iter()
-                .map(|(container, _)| self.teardown_registered_container(container)),
+                .map(|(container, _)| self.teardown_registered_container(container, true)),
         )
         .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -4480,6 +4493,10 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use temps_entities::{deployment_containers, nodes};
 
+        if !docker_available().await {
+            eprintln!("Skipping container teardown integration test: Docker unavailable");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -4542,6 +4559,27 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // Older failed deployments and interrupted cleanup need not have the
+        // retained prefix. They must still be selected by the failure sweep.
+        let mut legacy_containers = Vec::new();
+        for (index, status) in [None, Some("running"), Some("exited")]
+            .into_iter()
+            .enumerate()
+        {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(failed_deployment.id),
+                container_id: Set(format!("legacy-failed-{index}")),
+                container_name: Set(format!("legacy-failed-{index}")),
+                container_port: Set(3000),
+                status: Set(status.map(str::to_string)),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            legacy_containers.push(container);
+        }
+
         // A remote retained row whose deployer cannot be constructed must move
         // into the retry rotation. Otherwise twenty unavailable workers can
         // permanently starve every newer diagnostic container.
@@ -4566,6 +4604,19 @@ mod tests {
             container_name: Set("failed-remote-container".to_string()),
             container_port: Set(3000),
             status: Set(Some("retained:failed-readiness".to_string())),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let legacy_retry_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("legacy-remote-failure".to_string()),
+            container_name: Set("legacy-remote-failure".to_string()),
+            container_port: Set(3000),
+            status: Set(None),
             node_id: Set(Some(unavailable_node.id)),
             deployed_at: Set(Utc::now()),
             ..Default::default()
@@ -4667,6 +4718,36 @@ mod tests {
             "deployer lookup failures must rotate instead of starving cleanup: {:?}",
             retry_refreshed.status
         );
+
+        let legacy_retry = deployment_containers::Entity::find_by_id(legacy_retry_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("legacy retry row remains");
+        assert!(legacy_retry.deleted_at.is_none());
+        assert!(
+            legacy_retry
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "legacy removal failures must remain eligible and rotate behind unattempted rows"
+        );
+
+        for legacy in legacy_containers {
+            let refreshed = deployment_containers::Entity::find_by_id(legacy.id)
+                .one(db.as_ref())
+                .await?
+                .expect("legacy row remains for history");
+            assert!(
+                refreshed.deleted_at.is_some(),
+                "legacy failed container {} was skipped",
+                legacy.container_id
+            );
+        }
+        let failed_after = deployments::Entity::find_by_id(failed_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("failure history remains");
+        assert_eq!(failed_after.state, "failed");
 
         let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
             .one(db.as_ref())
