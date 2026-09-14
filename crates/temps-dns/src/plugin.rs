@@ -20,7 +20,8 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, dns_sync::DnsSyncAppState, DnsApiDoc, DnsAppState};
-use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry};
+use crate::services::domain_delivery::DomainDeliveryService;
+use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService};
 
 /// DNS Plugin for managing DNS providers and automatic DNS record configuration
 pub struct DnsPlugin;
@@ -69,16 +70,16 @@ impl TempsPlugin for DnsPlugin {
             let record_service = Arc::new(DnsRecordService::new(provider_service.clone()));
             context.register_service(record_service.clone());
 
-            // Create DnsAppState for handlers
-            let queue = context.require_service::<dyn temps_core::JobQueue>();
-            let audit = context.require_service::<dyn temps_core::AuditLogger>();
-            let app_state = Arc::new(DnsAppState {
-                provider_service,
-                record_service,
-                queue,
-                audit,
-            });
-            context.register_service(app_state);
+            let managed_record_service = Arc::new(ManagedDnsRecordService::new(
+                db.clone(),
+                provider_service.clone(),
+                encryption_service.clone(),
+            ));
+            context.register_service(managed_record_service.clone());
+            context.register_service(Arc::new(DomainDeliveryService::new(
+                db.clone(),
+                managed_record_service,
+            )));
 
             // Internal DNS registry (ADR-011) — separate state, separate
             // auth model, separate consumer (per-node agents).
@@ -97,7 +98,15 @@ impl TempsPlugin for DnsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // User-facing routes
-        let app_state = context.require_service::<DnsAppState>();
+        let app_state = Arc::new(DnsAppState {
+            provider_service: context.require_service::<DnsProviderService>(),
+            record_service: context.require_service::<DnsRecordService>(),
+            managed_record_service: context.require_service::<ManagedDnsRecordService>(),
+            domain_delivery_service: context.require_service::<DomainDeliveryService>(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+            queue: context.require_service::<dyn temps_core::JobQueue>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
         let dns_routes = handlers::configure_routes().with_state(app_state);
 
         // Internal sync routes (per-node agent → control plane)

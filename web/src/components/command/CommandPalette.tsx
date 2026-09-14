@@ -560,6 +560,12 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Delivery Profiles',
+    url: '/delivery-profiles',
+    icon: Cloud,
+    keywords: ['delivery', 'cdn', 'cloudflare', 'direct', 'domains'],
+  },
+  {
     title: 'Add DNS Provider',
     url: '/dns-providers/add',
     icon: Cloud,

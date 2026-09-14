@@ -109,14 +109,27 @@ fn router() -> axum::Router {
     // returning the same status for the wrong reason.
     let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
     let provider_service = Arc::new(DnsProviderService::new(
-        db,
+        db.clone(),
+        Arc::new(temps_core::EncryptionService::new_from_password("test")),
+    ));
+    let managed_record_service = Arc::new(temps_dns::services::ManagedDnsRecordService::new(
+        db.clone(),
+        provider_service.clone(),
         Arc::new(temps_core::EncryptionService::new_from_password("test")),
     ));
     let state = Arc::new(DnsAppState {
+        domain_delivery_service: Arc::new(
+            temps_dns::services::domain_delivery::DomainDeliveryService::new(
+                db.clone(),
+                managed_record_service.clone(),
+            ),
+        ),
+        managed_record_service,
+        project_access_checker: None,
         record_service: Arc::new(DnsRecordService::new(provider_service.clone())),
         provider_service,
         queue: Arc::new(NoopQueue),
-        audit: Arc::new(NoopAudit),
+        audit_service: Arc::new(NoopAudit),
     });
     configure_routes().with_state(state)
 }
@@ -125,12 +138,25 @@ fn router_with_db(
     db: Arc<sea_orm::DatabaseConnection>,
     encryption: Arc<temps_core::EncryptionService>,
 ) -> axum::Router {
-    let provider_service = Arc::new(DnsProviderService::new(db, encryption));
+    let provider_service = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+    let managed_record_service = Arc::new(temps_dns::services::ManagedDnsRecordService::new(
+        db.clone(),
+        provider_service.clone(),
+        Arc::new(temps_core::EncryptionService::new_from_password("test")),
+    ));
     let state = Arc::new(DnsAppState {
+        domain_delivery_service: Arc::new(
+            temps_dns::services::domain_delivery::DomainDeliveryService::new(
+                db.clone(),
+                managed_record_service.clone(),
+            ),
+        ),
+        managed_record_service,
+        project_access_checker: None,
         record_service: Arc::new(DnsRecordService::new(provider_service.clone())),
         provider_service,
         queue: Arc::new(NoopQueue),
-        audit: Arc::new(NoopAudit),
+        audit_service: Arc::new(NoopAudit),
     });
     configure_routes().with_state(state)
 }
@@ -299,13 +325,26 @@ async fn test_add_managed_domain_success_emits_governance_audit() {
     .insert(db.as_ref())
     .await
     .expect("insert provider");
-    let provider_service = Arc::new(DnsProviderService::new(db, encryption));
+    let provider_service = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
     let audit = Arc::new(RecordingAudit::default());
+    let managed_record_service = Arc::new(temps_dns::services::ManagedDnsRecordService::new(
+        db.clone(),
+        provider_service.clone(),
+        Arc::new(temps_core::EncryptionService::new_from_password("test")),
+    ));
     let state = Arc::new(DnsAppState {
+        domain_delivery_service: Arc::new(
+            temps_dns::services::domain_delivery::DomainDeliveryService::new(
+                db.clone(),
+                managed_record_service.clone(),
+            ),
+        ),
+        managed_record_service,
+        project_access_checker: None,
         record_service: Arc::new(DnsRecordService::new(provider_service.clone())),
         provider_service,
         queue: Arc::new(NoopQueue),
-        audit: audit.clone(),
+        audit_service: audit.clone(),
     });
     let mut request = Request::builder()
         .method(Method::POST)
@@ -509,7 +548,7 @@ async fn test_find_provider_for_duplicate_zone_skips_inactive_provider_candidate
         .iter()
         .find_map(|(id, active)| active.then_some(*id))
         .unwrap();
-    let service = DnsProviderService::new(db, encryption);
+    let service = DnsProviderService::new(db.clone(), encryption.clone());
 
     let (provider, managed) = service
         .find_provider_for_domain("app.example.com")
@@ -601,13 +640,14 @@ async fn test_add_managed_domain_canonical_duplicate_returns_conflict() {
         .unwrap()
         .contains("canonicalizes to 'example.com', which is already managed"));
 
-    let service = DnsProviderService::new(db, encryption);
+    let service = DnsProviderService::new(db.clone(), encryption.clone());
     let fresh = service
         .add_managed_domain(
             target_provider.id,
             AddManagedDomainRequest {
                 domain: "  *.Fresh.Example.NET. ".to_string(),
                 auto_manage: false,
+                proxied_by_default: false,
                 generated_hostname_mode: None,
                 sync_generated_records: false,
             },

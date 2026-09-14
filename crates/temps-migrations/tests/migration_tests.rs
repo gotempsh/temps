@@ -2185,6 +2185,32 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         }
     }
 
+    for (column, default_fragment) in [
+        ("proxied_by_default", "false"),
+        ("generated_hostname_mode", "standard"),
+        ("sync_generated_records", "false"),
+    ] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT is_nullable, column_default FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = 'dns_managed_domains' \
+                       AND column_name = '{column}'"
+                ),
+            ))
+            .await?
+            .unwrap_or_else(|| panic!("dns_managed_domains.{column} should exist"));
+        let nullable: String = row.try_get("", "is_nullable")?;
+        let default: String = row.try_get("", "column_default")?;
+        assert_eq!(nullable, "NO", "{column} must be non-null");
+        assert!(
+            default.contains(default_fragment),
+            "{column} default {default:?} should contain {default_fragment:?}"
+        );
+    }
+
     println!("✅ All expected tables exist");
     Ok(())
 }

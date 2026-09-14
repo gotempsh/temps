@@ -1205,6 +1205,11 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Circular Redirect")
                     .with_detail(msg)
             }
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(format!("Custom domain {domain_id} has delivery binding {binding_id}; remove the delivery binding before deleting the domain"))
+            }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Redirect URL")

@@ -11,13 +11,11 @@
 //! record for an IP, otherwise a `CNAME`).
 //!
 //! Safety rules (learned the hard way against a live zone):
-//! - **Never delete pre-existing/user records.** Deletion is limited to records
-//!   Temps itself tagged as managed. Providers whose API exposes no record
-//!   comment (e.g. the cloudflare crate we use) can't carry that tag, so for
-//!   them deletion is effectively a no-op — the sync only creates/updates.
-//! - **Production environments are excluded** from the generated-DNS sync. The
-//!   `edge_target` is the staging/preview edge; production hosts live elsewhere
-//!   and must not be pointed at it.
+//! - **Never update or delete pre-existing/user records.** Every mutation uses
+//!   ADR-031's signed TXT ownership registry; an unowned name is a conflict.
+//! - **Only explicitly classified preview environments are included.** The
+//!   `edge_target` is the preview edge; inferring production from a slug or
+//!   display name is not safe enough for public DNS automation.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -26,12 +24,10 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use temps_core::PublicHostnameStrategy;
 use temps_entities::{environments, preset::PresetConfig, projects};
 
-use crate::providers::{DnsProvider, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
-
-/// Record comment Temps stamps on records it manages, so the sync only ever
-/// deletes its own records and never user-created ones. Surfaced via a record's
-/// `metadata["comment"]` when the provider exposes it.
-pub const MANAGED_TAG: &str = "temps:managed";
+use crate::errors::DnsError;
+use crate::ownership::{check_proxy_allowed, record_fingerprint};
+use crate::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest, DnsRecordType};
+use crate::services::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
 
 /// A generated public hostname under a managed domain.
 #[derive(Debug, Clone)]
@@ -54,7 +50,7 @@ pub struct HostChange {
 }
 
 /// A DNS record action the sync would perform.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecordChange {
     pub action: String,
     pub name: String,
@@ -71,20 +67,10 @@ pub struct HostnameModeResult {
     pub zone_access_ok: Option<bool>,
 }
 
-/// Whether an environment is a production environment (and so excluded from the
-/// generated-DNS sync, which targets the staging/preview edge). Matches `prod`
-/// or `production` on either the slug or the display name, case-insensitively.
-pub fn is_production_env(slug: &str, name: &str) -> bool {
-    let is_prod = |s: &str| {
-        let s = s.trim().to_ascii_lowercase();
-        s == "prod" || s == "production"
-    };
-    is_prod(slug) || is_prod(name)
-}
-
-/// Whether an environment's generated hostnames should be synced to the edge.
-fn should_sync_environment(slug: &str, name: &str) -> bool {
-    !is_production_env(slug, name)
+/// Whether an environment's generated hostnames should be synced to the
+/// preview edge. This uses the persisted classification, never a name guess.
+fn should_sync_environment(is_preview: bool) -> bool {
+    is_preview
 }
 
 /// Enumerate every generated public hostname under `preview_domain` for the
@@ -98,17 +84,13 @@ pub async fn enumerate_generated_hosts(
     db: &DatabaseConnection,
     preview_domain: &str,
     strategy: PublicHostnameStrategy,
-) -> Vec<GeneratedHost> {
-    let envs = environments::Entity::find()
-        .all(db)
-        .await
-        .unwrap_or_default();
+) -> Result<Vec<GeneratedHost>, DnsError> {
+    let envs = environments::Entity::find().all(db).await?;
 
     // project_id -> public compose service names
     let public_services: HashMap<i32, Vec<String>> = projects::Entity::find()
         .all(db)
-        .await
-        .unwrap_or_default()
+        .await?
         .into_iter()
         .map(|p| {
             let services = match p.preset_config {
@@ -126,7 +108,7 @@ pub async fn enumerate_generated_hosts(
         if env.deleted_at.is_some() {
             continue;
         }
-        if !should_sync_environment(&env.slug, &env.name) {
+        if !should_sync_environment(env.is_preview) {
             continue;
         }
         let label = env.subdomain.as_str();
@@ -149,7 +131,7 @@ pub async fn enumerate_generated_hosts(
         }
     }
 
-    hosts
+    Ok(hosts)
 }
 
 /// Compute the generated-hostname changes between the current `Standard` layout
@@ -159,15 +141,15 @@ pub async fn compute_hostname_changes(
     db: &DatabaseConnection,
     preview_domain: &str,
     target: PublicHostnameStrategy,
-) -> Vec<HostChange> {
+) -> Result<Vec<HostChange>, DnsError> {
     if target == PublicHostnameStrategy::Standard {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let before =
-        enumerate_generated_hosts(db, preview_domain, PublicHostnameStrategy::Standard).await;
-    let after = enumerate_generated_hosts(db, preview_domain, target).await;
+        enumerate_generated_hosts(db, preview_domain, PublicHostnameStrategy::Standard).await?;
+    let after = enumerate_generated_hosts(db, preview_domain, target).await?;
 
-    before
+    Ok(before
         .into_iter()
         .zip(after)
         .filter(|(b, a)| b.fqdn != a.fqdn)
@@ -177,12 +159,12 @@ pub async fn compute_hostname_changes(
             old: b.fqdn,
             new: a.fqdn,
         })
-        .collect()
+        .collect())
 }
 
 /// Build the desired DNS record content for a generated hostname, choosing the
 /// record type from the shape of `edge_target`.
-fn desired_content(edge_target: &str) -> (DnsRecordType, DnsRecordContent, String) {
+pub(crate) fn desired_content(edge_target: &str) -> (DnsRecordType, DnsRecordContent, String) {
     if let Ok(ip) = edge_target.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(_) => (
@@ -211,44 +193,35 @@ fn desired_content(edge_target: &str) -> (DnsRecordType, DnsRecordContent, Strin
     }
 }
 
-/// Extract the comparable value (address/target) from a record's content.
-fn record_value(content: &DnsRecordContent) -> Option<String> {
-    match content {
-        DnsRecordContent::A { address } => Some(address.clone()),
-        DnsRecordContent::AAAA { address } => Some(address.clone()),
-        DnsRecordContent::CNAME { target } => Some(target.clone()),
-        _ => None,
-    }
-}
-
-/// Whether a record was tagged by Temps as managed (and so is eligible for
-/// deletion when no longer desired). Pre-existing/user records are never tagged
-/// and are therefore never deleted.
-fn record_is_managed(record: &DnsRecord) -> bool {
-    record
-        .metadata
-        .get("comment")
-        .map(|c| c == MANAGED_TAG)
-        .unwrap_or(false)
-}
-
 /// Reconcile the provider's DNS zone so every desired generated hostname has a
-/// proxied record pointing at `edge_target`.
+/// record pointing at `edge_target`.
 ///
 /// - **Creates** a record for a desired host that doesn't exist.
-/// - **Updates** a desired host whose record points somewhere else.
-/// - **Deletes** ONLY records Temps tagged as managed that are no longer desired
-///   — never pre-existing/user records.
+/// - **Updates** only a desired host carrying this installation's signed marker.
+/// - **Deletes** only signed, owned records that are no longer desired.
 ///
 /// When `dry_run` is true, nothing is written; the returned [`RecordChange`]
 /// list is the plan.
+pub struct ReconcileOptions<'a> {
+    pub proxied: bool,
+    pub instance_id: &'a str,
+    pub signing_key: &'a [u8; 32],
+    pub dry_run: bool,
+}
+
 pub async fn reconcile_zone_records(
     provider: &dyn DnsProvider,
     base_domain: &str,
     desired_hosts: &[GeneratedHost],
     edge_target: &str,
-    dry_run: bool,
+    options: ReconcileOptions<'_>,
 ) -> Result<Vec<RecordChange>, crate::errors::DnsError> {
+    let ReconcileOptions {
+        proxied,
+        instance_id,
+        signing_key,
+        dry_run,
+    } = options;
     let suffix = format!(".{}", base_domain.to_ascii_lowercase());
     let desired_fqdns: std::collections::HashSet<String> = desired_hosts
         .iter()
@@ -256,27 +229,65 @@ pub async fn reconcile_zone_records(
         .collect();
 
     let existing = provider.list_records(base_domain).await?;
-    let existing_by_fqdn: HashMap<String, &DnsRecord> = existing
-        .iter()
-        .map(|r| (r.fqdn.to_ascii_lowercase(), r))
-        .collect();
-
-    let (record_type, _content, type_str) = desired_content(edge_target);
-    let proxied = provider.capabilities().proxy;
+    let (record_type, content, type_str) = desired_content(edge_target);
+    let provider_name = provider.provider_type().to_string();
+    ManagedDnsRecordService::validate_provider_capabilities(
+        &provider.capabilities(),
+        &provider_name,
+        record_type,
+    )?;
+    let desired_fingerprint = record_fingerprint(&content, proxied)?;
     let mut changes = Vec::new();
+    let mut planned_sets = Vec::new();
+    let mut planned_removals = Vec::new();
 
-    // Create or update desired hosts. Use the upsert `set_record`.
+    // Create or update desired hosts through the signed ownership guard.
     for host in desired_hosts {
-        let fqdn = host.fqdn.to_ascii_lowercase();
-        let action = match existing_by_fqdn.get(&fqdn) {
-            None => Some("create"),
-            Some(rec) => {
-                if record_value(&rec.content).as_deref() != Some(edge_target) {
-                    Some("update")
-                } else {
-                    None // already correct
-                }
+        let name = relative_name(&host.fqdn, &suffix)?;
+        let request = DnsRecordRequest {
+            name: name.clone(),
+            content: content.clone(),
+            ttl: None,
+            proxied,
+        };
+        ManagedDnsRecordService::validate_record_request(base_domain, &request)?;
+        if proxied {
+            check_proxy_allowed(&provider.capabilities(), &provider_name, base_domain, &name)?;
+        }
+        let ownership = ManagedDnsRecordService::ownership_of(
+            provider,
+            base_domain,
+            &name,
+            record_type,
+            instance_id,
+            signing_key,
+        )
+        .await?;
+        let action = match &ownership {
+            RecordOwnership::NotFound => Some("create"),
+            RecordOwnership::Orphaned(marker)
+                if marker.controller.as_deref() == Some("generated-hostname") =>
+            {
+                Some("create")
             }
+            RecordOwnership::Owned(record, marker)
+                if marker.controller.as_deref() == Some("generated-hostname")
+                    && record_fingerprint(&record.content, record.proxied)?
+                        != desired_fingerprint =>
+            {
+                Some("update")
+            }
+            RecordOwnership::Owned(_, marker)
+                if marker.controller.as_deref() == Some("generated-hostname") =>
+            {
+                None
+            }
+            RecordOwnership::Orphaned(_)
+            | RecordOwnership::Owned(_, _)
+            | RecordOwnership::Unmanaged(_)
+            | RecordOwnership::OwnedByOther(_, _)
+            | RecordOwnership::BlockedByOther(_)
+            | RecordOwnership::RegistryConflict => Some("conflict"),
         };
         let Some(action) = action else { continue };
 
@@ -286,41 +297,89 @@ pub async fn reconcile_zone_records(
             record_type: type_str.clone(),
             value: edge_target.to_string(),
         });
-        if !dry_run {
-            let (_t, content, _s) = desired_content(edge_target);
-            let name = relative_name(&host.fqdn, &suffix);
-            provider
-                .set_record(
-                    base_domain,
-                    DnsRecordRequest {
-                        name,
-                        content,
-                        ttl: None,
-                        proxied,
-                    },
-                )
-                .await?;
+        if action == "conflict" {
+            if !dry_run {
+                return Err(DnsError::RecordConflict {
+                    domain: base_domain.to_string(),
+                    name,
+                    record_type: record_type.to_string(),
+                    reason: "generated hostname is already managed by another owner or has no valid generated-hostname marker".to_string(),
+                });
+            }
+            continue;
         }
+        planned_sets.push((request, host.owner_id));
     }
 
-    // Delete ONLY Temps-tagged records that are no longer desired. Untagged
-    // (pre-existing/user) records are never deleted.
+    // Delete only records whose signed marker proves this install owns them.
     for record in &existing {
         let fqdn = record.fqdn.to_ascii_lowercase();
-        if desired_fqdns.contains(&fqdn) || !record_is_managed(record) {
+        let stale_type = record.content.record_type();
+        if desired_fqdns.contains(&fqdn)
+            || !matches!(
+                stale_type,
+                DnsRecordType::A | DnsRecordType::AAAA | DnsRecordType::CNAME
+            )
+        {
+            continue;
+        }
+        let name = relative_name(&record.fqdn, &suffix)?;
+        let ownership = ManagedDnsRecordService::ownership_of(
+            provider,
+            base_domain,
+            &name,
+            stale_type,
+            instance_id,
+            signing_key,
+        )
+        .await?;
+        if !matches!(
+            ownership,
+            RecordOwnership::Owned(
+                _,
+                ref marker
+            ) if marker.controller.as_deref() == Some("generated-hostname")
+        ) {
             continue;
         }
         changes.push(RecordChange {
             action: "delete".to_string(),
             name: record.fqdn.clone(),
-            record_type: format!("{:?}", record_type),
+            record_type: stale_type.to_string(),
             value: String::new(),
         });
-        if !dry_run {
-            let name = relative_name(&record.fqdn, &suffix);
-            provider
-                .remove_record(base_domain, &name, record_type)
-                .await?;
+        planned_removals.push((name, stale_type));
+    }
+
+    if !dry_run {
+        for (request, environment_id) in planned_sets {
+            let _record_lock =
+                ManagedDnsRecordService::lock_record(base_domain, &request.name).await;
+            ManagedDnsRecordService::guarded_set(
+                provider,
+                base_domain,
+                request,
+                instance_id,
+                signing_key,
+                OwnershipScope {
+                    project_id: None,
+                    environment_id: Some(environment_id),
+                    controller: Some("generated-hostname"),
+                },
+            )
+            .await?;
+        }
+        for (name, stale_type) in planned_removals {
+            let _record_lock = ManagedDnsRecordService::lock_record(base_domain, &name).await;
+            ManagedDnsRecordService::guarded_remove(
+                provider,
+                base_domain,
+                &name,
+                stale_type,
+                instance_id,
+                signing_key,
+            )
+            .await?;
         }
     }
 
@@ -328,15 +387,17 @@ pub async fn reconcile_zone_records(
 }
 
 /// Strip the zone suffix to get the relative record name (`@` for the apex).
-fn relative_name(fqdn: &str, suffix: &str) -> String {
+pub(crate) fn relative_name(fqdn: &str, suffix: &str) -> Result<String, DnsError> {
     let fqdn = fqdn.to_ascii_lowercase();
     let base = suffix.trim_start_matches('.');
     if fqdn == base {
-        "@".to_string()
+        Ok("@".to_string())
     } else if let Some(stripped) = fqdn.strip_suffix(suffix) {
-        stripped.to_string()
+        Ok(stripped.to_string())
     } else {
-        fqdn
+        Err(DnsError::Validation(format!(
+            "Generated hostname '{fqdn}' is outside managed zone '{base}'"
+        )))
     }
 }
 
@@ -344,12 +405,17 @@ fn relative_name(fqdn: &str, suffix: &str) -> String {
 mod tests {
     use super::*;
     use crate::errors::DnsError;
+    use crate::ownership::{registry_record_name, OwnershipMarker};
     use crate::providers::{
         DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,
         DnsRecordRequest, DnsRecordType, DnsZone,
     };
     use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
     use std::sync::Mutex;
+
+    const INSTANCE: &str = "test-install";
+    const SIGNING_KEY: [u8; 32] = [29; 32];
 
     fn host(fqdn: &str) -> GeneratedHost {
         GeneratedHost {
@@ -359,16 +425,12 @@ mod tests {
         }
     }
 
-    fn record(name: &str, base: &str, ip: &str, managed: bool) -> DnsRecord {
+    fn record(name: &str, base: &str, ip: &str) -> DnsRecord {
         let fqdn = if name == "@" {
             base.to_string()
         } else {
             format!("{name}.{base}")
         };
-        let mut metadata = HashMap::new();
-        if managed {
-            metadata.insert("comment".to_string(), MANAGED_TAG.to_string());
-        }
         DnsRecord {
             id: Some(format!("id-{name}")),
             zone: base.to_string(),
@@ -378,9 +440,49 @@ mod tests {
                 address: ip.to_string(),
             },
             ttl: 1,
-            proxied: true,
-            metadata,
+            proxied: false,
+            metadata: HashMap::new(),
         }
+    }
+
+    fn owned_records(name: &str, base: &str, ip: &str) -> Vec<DnsRecord> {
+        owned_records_for_controller(name, base, ip, Some("generated-hostname"))
+    }
+
+    fn owned_records_for_controller(
+        name: &str,
+        base: &str,
+        ip: &str,
+        controller: Option<&str>,
+    ) -> Vec<DnsRecord> {
+        let target = record(name, base, ip);
+        let fingerprint = record_fingerprint(&target.content, target.proxied).unwrap();
+        let marker = OwnershipMarker::new_signed(
+            &SIGNING_KEY,
+            INSTANCE,
+            base,
+            name,
+            DnsRecordType::A,
+            &fingerprint,
+            None,
+            Some(1),
+            controller,
+        )
+        .unwrap();
+        let marker_name = registry_record_name(name, DnsRecordType::A);
+        let marker_record = DnsRecord {
+            id: Some(format!("id-{marker_name}")),
+            zone: base.to_string(),
+            name: marker_name.clone(),
+            fqdn: format!("{marker_name}.{base}"),
+            content: DnsRecordContent::TXT {
+                content: marker.to_txt_content().unwrap(),
+            },
+            ttl: 1,
+            proxied: false,
+            metadata: HashMap::new(),
+        };
+        vec![target, marker_record]
     }
 
     /// In-memory DnsProvider for CF-free reconciliation tests.
@@ -411,7 +513,13 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|r| r.fqdn == fqdn)
-                .and_then(|r| record_value(&r.content))
+                .and_then(|record| match &record.content {
+                    DnsRecordContent::A { address } | DnsRecordContent::AAAA { address } => {
+                        Some(address.clone())
+                    }
+                    DnsRecordContent::CNAME { target } => Some(target.clone()),
+                    _ => None,
+                })
         }
     }
 
@@ -422,6 +530,10 @@ mod tests {
         }
         fn capabilities(&self) -> DnsProviderCapabilities {
             DnsProviderCapabilities {
+                a_record: true,
+                aaaa_record: true,
+                cname_record: true,
+                txt_record: true,
                 proxy: true,
                 ..Default::default()
             }
@@ -461,7 +573,11 @@ mod tests {
         ) -> Result<DnsRecord, DnsError> {
             self.set_record(domain, request).await
         }
-        async fn delete_record(&self, _domain: &str, _record_id: &str) -> Result<(), DnsError> {
+        async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|record| record.id.as_deref() != Some(record_id));
             Ok(())
         }
         async fn set_record(
@@ -510,13 +626,9 @@ mod tests {
     }
 
     #[test]
-    fn production_environments_are_excluded() {
-        assert!(is_production_env("prod", "prod"));
-        assert!(is_production_env("production", "Production"));
-        assert!(is_production_env("staging", "Production")); // name matches
-        assert!(!is_production_env("staging", "staging"));
-        assert!(!is_production_env("preview", "preview"));
-        assert!(!is_production_env("staging-t", "staging-t"));
+    fn only_explicit_preview_environments_are_included() {
+        assert!(should_sync_environment(true));
+        assert!(!should_sync_environment(false));
     }
 
     #[test]
@@ -535,37 +647,61 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn generated_host_enumeration_propagates_database_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("environment query unavailable".to_string())])
+            .into_connection();
+
+        let error =
+            enumerate_generated_hosts(&db, "preview.example.com", PublicHostnameStrategy::Standard)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, DnsError::Database(_)));
+    }
+
     #[test]
     fn relative_name_strips_suffix() {
         assert_eq!(
-            relative_name("careowner-staging.cp.careowner.com", ".careowner.com"),
+            relative_name("careowner-staging.cp.careowner.com", ".careowner.com").unwrap(),
             "careowner-staging.cp"
         );
-        assert_eq!(relative_name("careowner.com", ".careowner.com"), "@");
+        assert_eq!(
+            relative_name("careowner.com", ".careowner.com").unwrap(),
+            "@"
+        );
+        assert!(relative_name("outside.example.net", ".careowner.com").is_err());
     }
 
     // The bug we discovered against careowner.com: a domain-wide sync must NEVER
     // delete pre-existing single-label records like app.careowner.com.
     #[tokio::test]
-    async fn reconcile_never_deletes_untagged_records() {
+    async fn reconcile_refuses_to_update_untagged_records() {
         let base = "careowner.com";
         let provider = MockProvider::new(vec![
-            record("app", base, "10.0.0.1", false),    // prod, other VM
-            record("www", base, "10.0.0.2", false),    // user record
-            record("sentry", base, "10.0.0.3", false), // user record
-            record("careowner-staging.cp", base, "9.9.9.9", false), // stale generated, untagged
+            record("app", base, "10.0.0.1"),
+            record("www", base, "10.0.0.2"),
+            record("sentry", base, "10.0.0.3"),
+            record("careowner-staging.cp", base, "9.9.9.9"),
         ]);
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-            .await
-            .unwrap();
-
-        // Only the staging record is updated; nothing is deleted.
-        assert!(changes.iter().all(|c| c.action != "delete"), "{changes:?}");
-        assert!(changes
-            .iter()
-            .any(|c| c.action == "update" && c.name == "careowner-staging.cp.careowner.com"));
+        let error = reconcile_zone_records(
+            &provider,
+            base,
+            &desired,
+            "35.163.83.53",
+            ReconcileOptions {
+                proxied: false,
+                instance_id: INSTANCE,
+                signing_key: &SIGNING_KEY,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DnsError::RecordConflict { .. }));
 
         // app / www / sentry survive untouched.
         let fqdns = provider.fqdns();
@@ -580,31 +716,39 @@ mod tests {
             provider.value_of("app.careowner.com").as_deref(),
             Some("10.0.0.1")
         );
-        // staging now points at the edge.
         assert_eq!(
             provider
                 .value_of("careowner-staging.cp.careowner.com")
                 .as_deref(),
-            Some("35.163.83.53")
+            Some("9.9.9.9")
         );
     }
 
     #[tokio::test]
     async fn reconcile_creates_missing_and_skips_correct() {
         let base = "careowner.com";
-        let provider = MockProvider::new(vec![
-            record("app", base, "10.0.0.1", false),
-            // already-correct staging record → no change
-            record("careowner-staging.cp", base, "35.163.83.53", false),
-        ]);
+        let mut records = vec![record("app", base, "10.0.0.1")];
+        records.extend(owned_records("careowner-staging.cp", base, "35.163.83.53"));
+        let provider = MockProvider::new(records);
         let desired = vec![
             host("careowner-staging.cp.careowner.com"), // unchanged
             host("careowner-preview.cp.careowner.com"), // new → create
         ];
 
-        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-            .await
-            .unwrap();
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &desired,
+            "35.163.83.53",
+            ReconcileOptions {
+                proxied: false,
+                instance_id: INSTANCE,
+                signing_key: &SIGNING_KEY,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, "create");
@@ -617,13 +761,24 @@ mod tests {
     #[tokio::test]
     async fn reconcile_dry_run_writes_nothing() {
         let base = "careowner.com";
-        let provider = MockProvider::new(vec![record("app", base, "10.0.0.1", false)]);
+        let provider = MockProvider::new(vec![record("app", base, "10.0.0.1")]);
         let before = provider.fqdns();
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", true)
-            .await
-            .unwrap();
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &desired,
+            "35.163.83.53",
+            ReconcileOptions {
+                proxied: false,
+                instance_id: INSTANCE,
+                signing_key: &SIGNING_KEY,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, "create");
@@ -632,23 +787,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_deletes_only_tagged_stale_records() {
+    async fn reconcile_deletes_only_signed_owned_stale_records() {
         let base = "careowner.com";
-        let provider = MockProvider::new(vec![
-            record("app", base, "10.0.0.1", false), // untagged → keep
-            record("old-preview.cp", base, "9.9.9.9", true), // tagged + not desired → delete
-        ]);
+        let mut records = vec![record("app", base, "10.0.0.1")];
+        records.extend(owned_records("old-preview.cp", base, "9.9.9.9"));
+        records.extend(owned_records_for_controller(
+            "manual-owned",
+            base,
+            "9.9.9.8",
+            None,
+        ));
+        let provider = MockProvider::new(records);
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-            .await
-            .unwrap();
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &desired,
+            "35.163.83.53",
+            ReconcileOptions {
+                proxied: false,
+                instance_id: INSTANCE,
+                signing_key: &SIGNING_KEY,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(changes
             .iter()
             .any(|c| c.action == "delete" && c.name == "old-preview.cp.careowner.com"));
         let fqdns = provider.fqdns();
         assert!(fqdns.contains(&"app.careowner.com".to_string()));
+        assert!(fqdns.contains(&"manual-owned.careowner.com".to_string()));
         assert!(!fqdns.contains(&"old-preview.cp.careowner.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_to_claim_a_manual_owned_desired_record() {
+        let base = "careowner.com";
+        let mut records =
+            owned_records_for_controller("careowner-staging.cp", base, "9.9.9.9", None);
+        records.extend(owned_records("unrelated-preview.cp", base, "35.163.83.53"));
+        let provider = MockProvider::new(records);
+        let before = provider.fqdns();
+
+        let error = reconcile_zone_records(
+            &provider,
+            base,
+            &[host("careowner-staging.cp.careowner.com")],
+            "35.163.83.53",
+            ReconcileOptions {
+                proxied: false,
+                instance_id: INSTANCE,
+                signing_key: &SIGNING_KEY,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::RecordConflict { .. }));
+        assert_eq!(provider.fqdns(), before);
+        assert_eq!(
+            provider
+                .value_of("careowner-staging.cp.careowner.com")
+                .as_deref(),
+            Some("9.9.9.9")
+        );
     }
 }

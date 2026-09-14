@@ -154,6 +154,8 @@ mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260713_000002_add_dns_ownership;
+mod m20260714_000001_create_domain_delivery;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
 mod m20260714_000001_secure_sns_email_events;
 mod m20260716_000001_observability_compression_24h;
@@ -582,6 +584,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
             Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
             Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
+            Box::new(m20260713_000002_add_dns_ownership::Migration),
+            Box::new(m20260714_000001_create_domain_delivery::Migration),
         ]
     }
 }
@@ -605,6 +609,14 @@ mod registry_tests {
         );
 
         for (shipped, added) in [
+            (
+                "m20260912_000003_managed_daemon_workspace_images_v032",
+                "m20260713_000002_add_dns_ownership",
+            ),
+            (
+                "m20260713_000002_add_dns_ownership",
+                "m20260714_000001_create_domain_delivery",
+            ),
             (
                 "m20260810_000001_create_sandbox_snapshots",
                 "m20260810_000001_add_cli_session_id_to_ai_conversations",

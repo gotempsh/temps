@@ -522,6 +522,14 @@ impl DnsProvider for NamecheapProvider {
 
         Ok(())
     }
+
+    async fn delete_exact_record(&self, domain: &str, record: &DnsRecord) -> Result<(), DnsError> {
+        self.delete_record(
+            domain,
+            &format!("{}:{}", record.name, record.content.record_type()),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
