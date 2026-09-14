@@ -63,9 +63,17 @@ export function AiCrawlerActivityFeed({
   const [searchParams, setSearchParams] = useSearchParams()
 
   const range = searchParams.get('range') || '24h'
-  const [now, setNow] = useState(Date.now)
-  // Freeze the window while paging so new requests cannot shift page boundaries.
-  const timeRange = useMemo(() => resolveTimeRange(range, now), [range, now])
+  const rangeEnd = searchParams.get('range_end')
+  const [initialAnchor] = useState(Date.now)
+  // Store preset and anchor together in the URL: changing either must not
+  // briefly query the previous preset with the new anchor. Paging keeps both.
+  const timeRange = useMemo(() => {
+    const anchor = rangeEnd ? Date.parse(rangeEnd) : NaN
+    return resolveTimeRange(
+      range,
+      Number.isFinite(anchor) ? anchor : initialAnchor
+    )
+  }, [range, rangeEnd, initialAnchor])
 
   const provider = searchParams.get('ai_provider') || ''
   const agent = searchParams.get('ai_agent') || ''
@@ -133,7 +141,12 @@ export function AiCrawlerActivityFeed({
           value={timeRange}
           maxRangeDays={projectId ? 30 : 7}
           onChange={(value) => {
-            setParam('range', serializeTimeRange(value))
+            const next = new URLSearchParams(searchParams)
+            next.set('range', serializeTimeRange(value))
+            if (value.preset === 'custom') next.delete('range_end')
+            else next.set('range_end', value.to)
+            next.delete('page')
+            setSearchParams(next, { replace: true })
           }}
         />
         <Button
@@ -141,8 +154,11 @@ export function AiCrawlerActivityFeed({
           size="sm"
           aria-label="Refresh AI crawler activity"
           onClick={() => {
-            setNow(Date.now())
-            setParam('page', null)
+            const next = new URLSearchParams(searchParams)
+            if (timeRange.preset !== 'custom')
+              next.set('range_end', new Date().toISOString())
+            next.delete('page')
+            setSearchParams(next, { replace: true })
             if (timeRange.preset === 'custom' && page === 1) void refetch()
           }}
         >

@@ -45,7 +45,7 @@ async function mockCrawlerPage(page: Page) {
           {
             request_id: `request-${currentPage}`,
             timestamp: new Date().toISOString(),
-            bot_name: 'GPTBot',
+            bot_name: 'SyntheticCrawler',
             method: 'GET',
             host: 'example.test',
             path: `/page-${currentPage}`,
@@ -78,7 +78,7 @@ for (const width of [1440, 390]) {
       (q) => q.has('start_date') && q.has('end_date')
     )
     await page.goto(
-      '/projects/crawler-test/ai-crawlers?ai_provider=OpenAI&ai_agent=GPTBot&path=%2Fpage&page_size=25'
+      '/projects/crawler-test/ai-crawlers?ai_provider=SyntheticProvider&ai_agent=SyntheticCrawler&path=%2Fpage&page_size=25'
     )
     const first = new URL((await initial).url()).searchParams
     expect(
@@ -117,8 +117,8 @@ for (const width of [1440, 390]) {
       expect(q.get('page')).toBe('1')
       expect(q.get('project_id')).toBe('2')
       expect(q.get('is_ai_agent')).toBe('true')
-      expect(q.get('ai_provider')).toBe('OpenAI')
-      expect(q.get('ai_agent')).toBe('GPTBot')
+      expect(q.get('ai_provider')).toBe('SyntheticProvider')
+      expect(q.get('ai_agent')).toBe('SyntheticCrawler')
       expect(q.get('path')).toBe('/page')
       expect(q.get('page_size')).toBe('25')
       await expect(
@@ -208,4 +208,51 @@ test('crawler custom dates survive reload and empty and failed requests are dist
     page.getByText('Failed to load AI crawler activity. Please try again.')
   ).toBeVisible()
   await expect(page.getByText('0 requests in selected range')).not.toBeVisible()
+})
+
+test('delayed preset selections use current time atomically and paging keeps it', async ({
+  page,
+}) => {
+  const mounted = new Date('2026-09-14T10:00:00Z')
+  await page.clock.setFixedTime(mounted)
+  await mockCrawlerPage(page)
+  await page.goto('/projects/crawler-test/ai-crawlers')
+  await expect(page.getByText('143 requests in selected range')).toBeVisible()
+  const control = page.getByRole('group', {
+    name: 'Date and time range',
+    exact: true,
+  })
+  const requests: URLSearchParams[] = []
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (url.pathname === '/api/proxy-logs') requests.push(url.searchParams)
+  })
+  for (const [preset, hours, end] of [
+    ['6h', 6, '2026-09-14T11:00:00.000Z'],
+    ['6h', 6, '2026-09-14T12:00:00.000Z'],
+    ['1d', 24, '2026-09-14T13:00:00.000Z'],
+  ] as const) {
+    await page.clock.setFixedTime(new Date(end))
+    requests.length = 0
+    const response = page.waitForResponse(
+      (r) => new URL(r.url()).pathname === '/api/proxy-logs'
+    )
+    await control.getByRole('button', { name: preset, exact: true }).click()
+    await response
+    await expect(page.getByText('143 requests in selected range')).toBeVisible()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].get('end_date')).toBe(end)
+    expect(Date.parse(requests[0].get('start_date')!)).toBe(
+      Date.parse(end) - hours * 3600000
+    )
+    const paging = waitForLogs(page, (q) => q.get('page') === '2')
+    await page
+      .getByRole('button', { name: /^(Go to n|N)ext page$/ })
+      .filter({ visible: true })
+      .click()
+    expect(new URL((await paging).url()).searchParams.get('end_date')).toBe(end)
+    await expect(
+      page.getByText('example.test/page-2', { exact: false })
+    ).toBeVisible()
+  }
 })
