@@ -1,7 +1,13 @@
 # @temps-sdk/ds
 
-The Temps **operator design system**: the primitives every console screen is
-built from, plus the skin they render in, as one self-contained package.
+The retained Temps operator UI package, for existing consumers. It is not the
+console's current design standard. Console contributors must follow
+[DESIGN.md](../../../DESIGN.md) and use the existing shared shadcn/ui components.
+
+The prototype app has been removed. References to its files in source comments
+and historical changelog entries describe the retired implementation; retrieve
+them from the [archived prototype](https://github.com/gotempsh/temps/tree/5169ea3513f99462b872a3a891cdfe47a874923f/design-system).
+They are not instructions to run a current app or migrate the console.
 
 This is not a shadcn re-export. The `src/ui/*` files here are a *private,
 minimal* copy of the shadcn-style primitives the op components need — they are
@@ -11,8 +17,8 @@ along.
 
 ## Install
 
-Inside this repo it is a bun workspace of `web`, so the console and the
-sandbox get it for nothing. Outside it:
+Inside this repo it is a Bun workspace of `web`. Workspace membership does not
+mean the console imports it. Existing external consumers can install it with:
 
 ```bash
 bun add @temps-sdk/ds
@@ -45,8 +51,7 @@ The `@source` line is not optional and it is the step that gets forgotten.
 The primitives are written in Tailwind utility classes, and Tailwind only
 generates a class it has seen in a file it scanned; without it the components
 mount with the tokens applied and no layout. `op.css` carries `@source "./"`
-for consumers that resolve the package to *source* (this monorepo, and the
-design-system sandbox through its Vite alias), where the TSX is beside the
+for consumers that resolve the package to *source*, where the TSX is beside the
 stylesheet — an installed copy publishes `dist/`, not `src/`, so the app has
 to point at `dist` itself.
 
@@ -88,28 +93,20 @@ holds — the metrics are close enough that nothing reflows badly.
 
 ### Version alignment
 
-Match the version the console ships. A plugin or a downstream app that renders
-beside the console and pins a different minor will drift visibly — a token
-value, a glyph, a row height — and the drift shows up as "this page looks
-slightly wrong", which is the hardest kind of bug to report. The console's
-`web/package.json` (and, in this repo, `web/packages/ds/package.json`) is the
-number to match; `CHANGELOG.md` in this package is the record of what changed
-between two of them.
+Existing consumers should pin a compatible package version and review
+`CHANGELOG.md` when upgrading. The console does not currently consume this
+package, so its package manifest does not prescribe a version for plugins.
 
 ### Bundler note
 
-The package lives under `web/node_modules`' scope. Any consumer outside `web`
-(the design-system sandbox, for one) must dedupe React or it will load a second
-copy and throw *"Invalid hook call"*:
+Workspace consumers must deduplicate React, React DOM, and React Router to
+avoid loading multiple copies and causing invalid hook calls. For Vite:
 
 ```ts
 resolve: { dedupe: ['react', 'react-dom', 'react-router'] }
 ```
 
-The sandbox goes further and aliases the package to its source
-(`design-system/vite.config.ts`), so an edit to a primitive hot-reloads
-without a build step. The `"source"` export condition says the same thing to
-bundlers that honour it.
+The `"source"` export condition is available to bundlers that support it.
 
 ### Building
 
@@ -122,24 +119,13 @@ from their source paths, so `@temps-sdk/ds/op.css` and
 `@temps-sdk/ds/tokens.json` resolve the same whether the consumer is on the
 tarball or on the workspace.
 
-## Read these three before adding a primitive
+## Maintenance scope
 
-Do not copy them here — they are the source of truth and they move:
-
-1. `design-system/docs/brand-guidelines.md` §6 — the op layer: what the skin
-   is allowed to do, colour-means-status-only, the white/black rule.
-2. `design-system/docs/design-system-handoff.md` §6 — the primitive catalogue
-   and when to reach for each one.
-3. `design-system/docs/design-system-handoff.md` §7 — the page templates
-   (`Ledger`, `Detail`, `Settings`) and how a screen is assembled from them.
-
-## The rule
-
-**Every primitive follows the record recipe.** A screen is a record: identity
-line, then status, then the facts, then the actions — never a grid of cards.
-A new primitive earns its place only by making some record read faster; if it
-decorates, it does not belong here. `design-system/scripts/audit-records.mjs`
-enforces the mechanical half of this, and `bun run lint` in the sandbox runs it.
+The package remains available for existing consumers. Its former sandbox,
+gallery, and audit commands are no longer present. Do not claim those checks
+ran. Check the package build and the actual consuming application when changing
+a primitive. New console design work follows root `DESIGN.md`, not the
+archived prototype rules.
 
 ## Layout
 
@@ -162,14 +148,11 @@ src/
 in the query string, so a reload, a pasted link and a second tab rebuild the
 same screen. They sit on `react-router`'s `useSearchParams` and must be called
 under a router. The import is bare **`react-router`**, not `react-router-dom`:
-that is the package the console and the sandbox are both on (v8, where
-`react-router-dom` is only a compatibility shim).
+that is the router package used by this implementation.
 
 `forNewView(params)` drops the view state when the reader navigates to another
 record, keeping only the routing keys — `p`, `fresh`, `fail` by default
 (`KEPT_ON_NAVIGATION`). An app with other routing conventions passes its own
 list: `forNewView(params, ['project', 'env'])`.
 
-The rules these hooks exist to enforce are in
-`design-system/docs/requirements.md`; the catalogue entry is
-`design-system/docs/design-system-handoff.md` §6 "useUrlState".
+See the archived prototype linked above for the original hook design notes.

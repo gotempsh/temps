@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
@@ -883,11 +884,10 @@ export function ServiceRestore() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                <input
+                <Checkbox
                   id="pitr-new"
-                  type="checkbox"
                   checked={pitrToNewService}
-                  onChange={(e) => setPitrToNewService(e.target.checked)}
+                  onCheckedChange={(checked) => setPitrToNewService(checked === true)}
                 />
                 <Label htmlFor="pitr-new" className="cursor-pointer">
                   Restore into a new service (leaves {service.name} untouched)

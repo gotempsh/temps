@@ -3,6 +3,7 @@
 
 'use client'
 
+import { Checkbox } from '@/components/ui/checkbox'
 import { createS3SourceMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -226,15 +227,13 @@ export function CreateS3Source() {
                   htmlFor="forcePathStyle"
                   className="flex items-center space-x-2"
                 >
-                  <Input
+                  <Checkbox
                     id="forcePathStyle"
-                    type="checkbox"
-                    className="h-4 w-4"
                     checked={formData.force_path_style || false}
-                    onChange={(e) =>
+                    onCheckedChange={(checked) =>
                       setFormData({
                         ...formData,
-                        force_path_style: e.target.checked,
+                        force_path_style: checked === true,
                       })
                     }
                   />

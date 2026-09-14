@@ -7,7 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { checkProviderDeletionSafety } from '@/api/client/sdk.gen'
 import { ProviderResponse } from '@/api/client/types.gen'
-import { PageHeader } from '@/components/layout/PageContainer'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -175,7 +175,7 @@ export function GitSources() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-4 sm:p-6">
+      <PageContainer>
         <PageHeader
           title="Git Providers"
           description="Manage your Git providers for repository access and deployments"
@@ -373,7 +373,7 @@ export function GitSources() {
             )
           })()
         )}
-      </div>
+      </PageContainer>
 
       {/* Single controlled confirm dialog, rendered once at the page level so
           it survives the dropdown closing. Driven by `providerToDelete`. */}

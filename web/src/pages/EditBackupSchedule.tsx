@@ -16,6 +16,7 @@
  * body, keeping the audit log clean.
  */
 
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   getBackupScheduleOptions,
   getS3SourceOptions,
@@ -488,12 +489,10 @@ export function EditBackupSchedule() {
               </div>
 
               <div className="flex items-center gap-2">
-                <input
+                <Checkbox
                   id="edit-enabled"
-                  type="checkbox"
                   checked={enabled}
-                  onChange={(e) => setEnabled(e.target.checked)}
-                  className="h-4 w-4"
+                  onCheckedChange={(checked) => setEnabled(checked === true)}
                 />
                 <Label htmlFor="edit-enabled">Enabled</Label>
               </div>

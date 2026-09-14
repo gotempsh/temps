@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Checkbox } from '@/components/ui/checkbox'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import {
@@ -327,12 +328,11 @@ export default function Sandboxes({
 
       {!workspacesOnly && (
         <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
+          <Checkbox
             name="includeWorkspaceCompute"
             checked={includeWorkspaceCompute}
-            onChange={(event) =>
-              setIncludeWorkspaceCompute(event.target.checked)
+            onCheckedChange={(checked) =>
+              setIncludeWorkspaceCompute(checked === true)
             }
           />
           Include workspace-owned sandboxes (operator view)

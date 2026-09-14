@@ -1021,8 +1021,8 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 - React + TypeScript, Tanstack Query, shadcn/ui, Tailwind CSS, Rsbuild
 - Package manager: `bun` (not npm/yarn)
 
-### Design system (redesign)
-- New screens on the operator design system use `@temps-sdk/ds` (`web/packages/ds`) and follow `design-system/docs/RULES.md`. Use the `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) for the procedure and the scope boundary; the rules below still govern the legacy `web/src` console.
+### Console design standard
+- Follow root `DESIGN.md` for all console UI: full-width pages, compact empty states, shared tables and pagination, and existing shadcn/ui controls. The separate prototype app is retired. The `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) points to this standard. Do not introduce the retained `web/packages/ds` package without an explicit product decision.
 
 ### Critical React Rules
 
@@ -1057,17 +1057,17 @@ if (isLoading) return <Spinner />
 ### UI Rules
 - Always provide visual feedback (toast/loading/error states) for every user action
 - Use `CopyButton` component for copy-to-clipboard (never manual clipboard handlers)
-- Center content with `mx-auto` when using `max-w-*` constraints
+- Sidebar pages are full width with one PageContainer padding owner; do not center them inside max-width wrappers. See `DESIGN.md`.
 - Use cards for selections instead of dropdowns where practical
 - **Skeletons over spinners for content loading** -- when a page, card, or list is waiting on data, render `Skeleton` placeholders that match the real layout. Never use centered `Loader2` spinners for content loading; the page should not visibly "collapse" then "expand" when data arrives. Inline button spinners on mutations (`verify.isPending`) are still fine since they indicate action execution, not content loading.
 
 ### Mobile Responsiveness
-- **Tables**: wrap in `overflow-x-auto`; hide secondary columns with `hidden md:table-cell`
+- **Tables**: use the shared Table's overflow wrapper; hide secondary columns only if their information remains available in a detail view.
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
 - **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
-- **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
+- **Headers**: use the shared PageHeader from `web/src/components/layout/PageContainer.tsx`.
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
 

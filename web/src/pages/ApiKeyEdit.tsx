@@ -108,7 +108,7 @@ export default function ApiKeyEdit() {
 
   if (isLoading) {
     return (
-      <div className="container max-w-4xl mx-auto py-6 space-y-6">
+      <div className="w-full min-w-0 space-y-6">
         <div className="flex items-center gap-4">
           <Skeleton className="h-10 w-10" />
           <div className="space-y-2">
@@ -137,7 +137,7 @@ export default function ApiKeyEdit() {
 
   if (!apiKey && apiKeyError && !isNotFound) {
     return (
-      <div className="container max-w-4xl mx-auto py-6">
+      <div className="w-full min-w-0 space-y-6">
         <Card>
           <CardContent className="py-12 text-center">
             <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
@@ -152,7 +152,10 @@ export default function ApiKeyEdit() {
                 <RotateCcw className="mr-2 h-4 w-4" />
                 Retry
               </Button>
-              <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
+              <Button
+                variant="ghost"
+                onClick={() => navigate('/settings/keys')}
+              >
                 <ArrowLeft className="mr-2 h-4 w-4" />
                 Back to API Keys
               </Button>
@@ -165,7 +168,7 @@ export default function ApiKeyEdit() {
 
   if (!apiKey) {
     return (
-      <div className="container max-w-4xl mx-auto py-6">
+      <div className="w-full min-w-0 space-y-6">
         <Card>
           <CardContent className="py-12 text-center">
             <AlertCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
@@ -187,14 +190,20 @@ export default function ApiKeyEdit() {
     apiKey.expires_at && new Date(apiKey.expires_at) < new Date()
 
   return (
-    <div className="container max-w-4xl mx-auto py-6 space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate('/settings/keys')}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => navigate('/settings/keys')}
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h1 className="text-3xl font-bold">Edit API Key</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Edit API Key
+            </h1>
             <p className="text-muted-foreground mt-1">
               Update settings for your API key
             </p>

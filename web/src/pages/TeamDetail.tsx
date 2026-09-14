@@ -75,7 +75,14 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { ArrowLeft, FolderGit2, Pencil, Plus, Trash2, Users } from 'lucide-react'
+import {
+  ArrowLeft,
+  FolderGit2,
+  Pencil,
+  Plus,
+  Trash2,
+  Users,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -99,8 +106,10 @@ const TEAM_ROLES: TeamRole[] = ['owner', 'admin', 'deployer', 'viewer']
  * role is chosen.
  */
 export const ROLE_DESCRIPTIONS: Record<TeamRole, string> = {
-  owner: 'Deploy, manage env vars, settings and domains, and delete the project',
-  admin: 'Deploy, manage env vars, settings and domains. Cannot delete the project',
+  owner:
+    'Deploy, manage env vars, settings and domains, and delete the project',
+  admin:
+    'Deploy, manage env vars, settings and domains. Cannot delete the project',
   deployer: 'Deploy and manage env vars. Cannot change settings or domains',
   viewer: 'Cannot deploy, or change env vars, settings or domains',
 }
@@ -318,8 +327,8 @@ function EditTeamDialog({
         <DialogHeader>
           <DialogTitle>Edit team</DialogTitle>
           <DialogDescription>
-            Changing the name doesn't affect who can reach what — membership
-            and project grants stay as they are.
+            Changing the name doesn't affect who can reach what — membership and
+            project grants stay as they are.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
@@ -477,14 +486,15 @@ export function TeamDetail() {
   // Grants store project ids, but the project route is keyed by slug —
   // linking by id 404s. Fall back to showing the id un-linked when the
   // project isn't in the caller's own visible list.
-  const projectFor = (id: number) => projects?.projects?.find((p) => p.id === id)
+  const projectFor = (id: number) =>
+    projects?.projects?.find((p) => p.id === id)
   const projectName = (id: number) => projectFor(id)?.name ?? `Project ${id}`
 
   const memberList = members ?? []
   const grantList = grants ?? []
 
   return (
-    <div className="container mx-auto space-y-6 px-4 py-6 sm:px-6">
+    <div className="w-full min-w-0 space-y-6">
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -501,11 +511,11 @@ export function TeamDetail() {
           {teamLoading ? (
             <Skeleton className="h-9 w-64" />
           ) : (
-            <h1 className="text-2xl font-bold sm:text-3xl">
+            <h1 className="text-2xl font-semibold tracking-tight">
               {team?.name ?? 'Team'}
             </h1>
           )}
-          <p className="mt-2 text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground">
             {team?.description || 'No description'}
           </p>
         </div>
@@ -628,7 +638,9 @@ export function TeamDetail() {
                     <TableRow
                       key={grant.id}
                       className={
-                        projectFor(grant.project_id) ? 'cursor-pointer' : undefined
+                        projectFor(grant.project_id)
+                          ? 'cursor-pointer'
+                          : undefined
                       }
                       onClick={() => {
                         const slug = projectFor(grant.project_id)?.slug
@@ -678,8 +690,8 @@ export function TeamDetail() {
             <AlertDialogTitle>Remove member?</AlertDialogTitle>
             <AlertDialogDescription>
               {memberToRemove?.user_name ?? 'This user'} loses access to every
-              project they could only reach through this team. This takes
-              effect immediately.
+              project they could only reach through this team. This takes effect
+              immediately.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

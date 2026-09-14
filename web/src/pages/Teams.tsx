@@ -280,11 +280,11 @@ export function Teams() {
   const teams = data?.teams ?? []
 
   return (
-    <div className="container mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-6">
+    <div className="w-full min-w-0 space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold sm:text-3xl">Teams</h1>
-          <p className="mt-2 text-muted-foreground">
+          <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
             Group users, then grant each team access to the projects it should
             reach. Projects with no grants stay open to everyone.
           </p>

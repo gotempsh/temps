@@ -1,481 +1,263 @@
-# Temps Web — Design System
+# Temps console design standard
 
-Single source of truth for UI/UX decisions in `temps/web/`. If a pattern isn't
-here, it isn't standard. Prefer editing this file over inventing a one-off.
+This is the authoritative UI reference for contributors working in `web/src`.
+Use the existing shadcn/ui components, Tailwind semantic tokens, and shared
+layouts. The separate prototype app has been retired; it is not an alternative
+design direction. The retained `web/packages/ds` package is not the default
+for console work and must not be introduced as an incidental redesign.
 
-- **Stack:** React 19 · TypeScript · Rsbuild · Tailwind v4 · shadcn/ui (Radix)
-- **Tokens:** defined in `src/globals.css` via CSS variables, consumed through
-  Tailwind utilities (`bg-background`, `text-muted-foreground`, etc.)
-- **Icons:** `lucide-react` only
-- **Forms:** `react-hook-form` + `zod`
-- **Data:** TanStack Query — use `isPending` / `isLoading` / `isError`, never
-  manual `useState` for loading
+The product should feel like one application: consistent page width, compact
+resource lists, predictable controls, and useful states when data is absent.
+These rules describe the target standard, not a claim that every old screen
+already follows it. When changing a screen, bring its affected layout and states
+into line. Do not copy a legacy inconsistency into new code.
 
-> **Rule of thumb:** if a color, spacing, or radius value is hardcoded and not
-> a token, stop and use a token instead.
+## 1. Page layout: full width, one padding owner
 
----
+Every sidebar destination uses the available content width, including settings,
+users, teams, API keys, notifications, and their create/edit/detail routes.
 
-## 1. Design principles
+- Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
+  `PageContainer` defaults to `width="full"`.
+- The route layout owns page gutters: `px-4 py-6 sm:px-6 lg:px-8`.
+  Do not repeat those gutters inside the page.
+- Settings routes inherit the container from their parent layout. Their root
+  should be `w-full min-w-0 space-y-6`, not another `PageContainer`.
+- Do not center sidebar pages inside `container`, `max-w-7xl`, `max-w-3xl`,
+  or `mx-auto`. Existing `wide` and `form` variants are not the default
+  for these routes.
+- Constrain explanatory text where it improves reading, not the entire page,
+  form, table, or resource surface.
+- Align the heading, toolbar, collection, and footer to the same content edges.
+  Use `min-w-0` for flex/grid children containing long names or URLs.
+- Use `space-y-6` between major sections, `gap-4` within groups, and
+  `gap-2` between related controls.
 
-1. **Content over chrome.** Cards, borders, and shadows exist to group
-   content, not decorate it. Default to flat surfaces; add depth only when
-   elevation has meaning.
-2. **Tokens over values.** No hex codes, no raw `rgb()`, no one-off radii.
-   Everything flows from the tokens in §3.
-3. **One obvious next action.** Every page has a primary CTA. Secondary and
-   tertiary actions step down in visual weight.
-4. **Feedback for every action.** Toast (`sonner`), inline error, or state
-   change — never silent.
-5. **Progressive disclosure.** Don't show settings, options, or data the user
-   doesn't need at this step. Use dialogs, accordions, and detail routes.
-6. **Tabular numbers for numbers.** Use `tabular-nums` anywhere digits may
-   change (metrics, pagination, timestamps).
-7. **Mobile-first, desktop-great.** Never hide critical actions behind
-   overflow on mobile. On desktop (>`xl`), constrain width with `max-w-7xl`.
+A page header has one `h1`, a short description, and its primary action.
+Use `PageHeader` instead of hand-written variants. The title is
+`text-2xl font-semibold tracking-tight`; the description is
+`text-sm text-muted-foreground`. Actions wrap below the title on small screens.
+No large hero, oversized title, or decorative introduction before useful content.
 
----
+## 2. Canonical resource-list structure
 
-## 2. Typography
+Use the Teams page's structural approach, with a **compact** empty state.
+Do not copy its oversized empty panel or Authentication's nested dashed box.
 
-The app uses a **Geist-based** type system — `Geist` for UI/body (via
-`--font-sans`) and `Geist Mono` for code, IDs, and anything requiring
-monospace (via `--font-mono`). This matches Vercel's product surfaces for a
-professional, modern dashboard feel. Do not introduce additional font
-families without updating this doc and `globals.css`.
+The order is:
 
-| Role             | Classes                                                      | Notes                              |
-| ---------------- | ------------------------------------------------------------ | ---------------------------------- |
-| Page title (H1)  | `text-2xl font-semibold tracking-tight`                      | One per page, in the page header   |
-| Section (H2)     | `text-base font-semibold tracking-tight`                     | Above a group of cards/lists       |
-| Card title       | `font-semibold leading-none`                                 | Inside shadcn `CardTitle`          |
-| Body             | `text-sm` (default in cards/forms), `text-base` (prose only) | Geist sans — never `font-mono`     |
-| Muted / meta     | `text-xs text-muted-foreground`                              | Timestamps, helper text, captions  |
-| Label (uppercase)| `text-xs font-medium uppercase tracking-wide text-muted-foreground` | Metric card titles, table headers |
-| Metric value     | `text-2xl font-semibold tracking-tight tabular-nums`         | KPIs                               |
-| Code / IDs       | `font-mono text-xs`                                          | Commit hashes, IDs, paths, tokens — **only** place `font-mono` is allowed |
+1. Page heading, description, and primary create/add action.
+2. Search, filters, and optional bulk actions when applicable.
+3. One full-width, solid-bordered collection surface.
+4. Shared pagination when needed.
 
-**Rules**
-- Never use `font-bold` — prefer `font-semibold` for emphasis.
-- Never apply `font-mono` to body copy, labels, titles, or buttons. Reserve
-  it for code fragments, IDs, hashes, file paths, and CLI output.
-- Never hardcode colors on text — use `text-foreground`, `text-muted-foreground`,
-  or semantic tokens (`text-destructive`, `text-emerald-600 dark:text-emerald-400`).
-- Truncate long strings with `truncate` on a `min-w-0` parent.
+The surface is `rounded-lg border bg-card text-card-foreground`. It has no
+decorative shadow. A shared `Card` may be used with `shadow-none`; do not
+put another bordered card or dashed empty box inside it. Use dividers between
+rows and sections rather than nesting surfaces.
 
----
+The same collection surface holds loading, empty, error, or populated content.
+An empty collection must not become a separate page design.
 
-## 3. Color tokens
+## 3. Collection states
 
-Colors are defined in `src/globals.css` as OKLCH CSS variables, exposed to
-Tailwind as `bg-*`, `text-*`, `border-*`. **Never use literal colors** except
-for the sanctioned status hues in §3.2.
+Never infer "empty" from a failed or still-loading request.
 
-The only branding exception is an official third-party logo whose SVG uses
-`currentColor`: its icon wrapper may use the vendor's documented light/dark
-brand color. The exception applies to the mark only, never to text, borders,
-backgrounds, status, or decorative accents.
+| State | Content | Action |
+| --- | --- | --- |
+| Initial loading | Skeletons shaped like the expected list/table | Keep the page heading visible |
+| No records yet | Compact icon, specific title, short explanation | Create/add if permitted |
+| No filter matches | "No matching …", explain the active filters | Clear filters; do not imply there are no records |
+| Request failed | Contextual error in the collection surface | Retry; retain filters and useful existing data |
+| Feature not configured | Name the missing dependency and explain the outcome | Link directly to setup |
+| Records available | Shared table or an explicitly justified card collection | Row actions and pagination |
 
-### 3.1 Semantic surfaces
+Background refreshes must not replace usable rows with an empty state.
+Keep existing data visible and communicate the refresh or refresh failure
+without losing the user's position.
 
-| Token                | Use                                                 |
-| -------------------- | --------------------------------------------------- |
-| `background`         | Page background                                     |
-| `foreground`         | Primary text                                        |
-| `card`               | Elevated content surface (cards, metric cards)      |
-| `muted`              | Subtle fills (skeletons, locked states, hover rows) |
-| `muted-foreground`   | Secondary text, icon defaults                       |
-| `accent`             | Hover backgrounds for nav, menu items               |
-| `border` / `input`   | All borders and form control outlines               |
-| `ring`               | Focus rings only — never decorative                 |
-| `popover`            | Dropdown / menu / tooltip surfaces                  |
-| `primary`            | Default button, solid emphasis                      |
-| `secondary`          | Secondary button, quiet emphasis                    |
-| `destructive`        | Errors, destructive actions                         |
-| `sidebar*`           | All sidebar surfaces — do NOT reuse these elsewhere |
+Unconfigured features remain discoverable. A permission restriction changes
+the available action and explanation; it does not turn a failed request into
+an empty collection.
 
-### 3.2 Status colors (sanctioned literals)
+### Compact empty state
 
-Only these literal hues are allowed, and only for status meaning — never
-decoration. Always provide both light and dark variants.
-
-| Meaning       | Light                    | Dark                              |
-| ------------- | ------------------------ | --------------------------------- |
-| Success / up  | `text-emerald-600`       | `dark:text-emerald-400`           |
-| Warning       | `text-amber-600`         | `dark:text-amber-400`             |
-| Error / down  | `text-red-600`           | `dark:text-red-400`               |
-| Info          | use `text-muted-foreground` (don't add blue) |               |
-| Neutral / off | `text-muted-foreground`  |                                    |
-
-Status **dots** use solid fills:
-`bg-emerald-500` · `bg-amber-500` · `bg-red-500` · `bg-zinc-400`
-(size: `h-2 w-2 rounded-full`).
-
----
-
-## 4. Spacing & layout
-
-Tailwind spacing = 0.25rem (4px) base. Stick to the scale; no arbitrary values
-unless aligning to a specific pixel asset.
-
-### 4.1 Page wrapper
-
-Every top-level page uses the same **full-width** wrapper — content fills the
-available space next to the sidebar rather than being capped and centered.
-Readability of individual blocks is handled per-section (grids, `max-w-*` on
-prose/forms where a narrow measure helps), not by constraining the whole page.
+Use [EmptyState](web/src/components/ui/empty-state.tsx) with
+`size="compact"` explicitly. Its compact variant uses a 240px minimum height,
+a small muted icon circle, a base-size title, and a short muted description.
+The height may grow for wrapped content; it is not a fixed-height clipping box.
 
 ```tsx
-<div className="w-full p-4 sm:p-6 lg:p-8">
-  {/* content */}
+import { Users } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
+
+<div className="rounded-lg border bg-card text-card-foreground">
+  <EmptyState
+    size="compact"
+    icon={Users}
+    title="No teams yet"
+    description="Create a team to organize people and grant project access."
+    action={<Button onClick={openCreateTeam}>Create team</Button>}
+  />
 </div>
 ```
 
-Do **not** wrap a page in `mx-auto max-w-7xl` (or similar) — that leaves large
-empty gutters on wide displays. If a specific block reads better narrow, cap
-that block, e.g. a settings form in `<div className="max-w-2xl">`.
-
-### 4.2 Vertical rhythm
-
-| Gap              | Class     | Use                                                |
-| ---------------- | --------- | -------------------------------------------------- |
-| Within a card    | `gap-2` / `space-y-1` | Tight groups (title + meta)           |
-| Between fields   | `gap-4` / `space-y-4` | Form fields, stacked inputs           |
-| Between sections | `space-y-6` (mobile) `space-y-8` (desktop) | Section groups   |
-| Below page header| `mb-6 sm:mb-8`        | Standard                              |
-
-### 4.3 Grids
-
-| Context           | Classes                                                       |
-| ----------------- | ------------------------------------------------------------- |
-| Metric cards      | `grid gap-4 grid-cols-2 lg:grid-cols-4`                       |
-| Project / entity  | `grid gap-4 md:grid-cols-2 xl:grid-cols-3`                    |
-| Stat tiles (dense)| `grid gap-3 grid-cols-2 md:grid-cols-4`                       |
-| Detail page       | `flex flex-col lg:flex-row gap-6` (main + side panel)         |
-
-### 4.4 Page header pattern
-
-```tsx
-<div className="mb-6 flex flex-col gap-4 sm:mb-8 sm:flex-row sm:items-end sm:justify-between">
-  <div className="space-y-1">
-    <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-    <p className="text-sm text-muted-foreground">{subtitle}</p>
-  </div>
-  <div className="flex items-center gap-2">
-    {/* filters, then primary CTA last */}
-  </div>
-</div>
-```
-
-Primary CTA is always right-most on desktop, full-width on mobile.
-
----
-
-## 5. Radius & elevation
-
-### Radius
-Base token: `--radius: 0.5rem`. Use Tailwind radius classes:
-- `rounded-sm` (xs inputs, dots) · `rounded-md` (inputs, small cards) ·
-  `rounded-lg` (cards, panels, buttons) · `rounded-xl` (large hero surfaces) ·
-  `rounded-full` (avatars, status dots, chips)
-
-Never use arbitrary radii like `rounded-[7px]`.
-
-### Shadows
-- Default surface: **no shadow**. Use `border` for separation.
-- Floating surfaces (dropdowns, popovers, dialogs): use the component default
-  (shadcn applies `shadow-md` or `shadow-lg` internally).
-- Never stack shadows. Never use colored shadows.
-
----
-
-## 6. Components — standards
-
-All primitives live in `src/components/ui/`. **Do not fork them**; extend via
-props or wrap in a feature component.
-
-### 6.1 Buttons
-Use shadcn `Button` + `variant` / `size`. Map intent → variant:
-
-| Intent         | Variant         | Example                        |
-| -------------- | --------------- | ------------------------------ |
-| Primary action | `default`       | "New project"                  |
-| Secondary      | `outline`       | "Cancel", filter toggles       |
-| Quiet / inline | `ghost`         | Icon buttons in toolbars       |
-| Destructive    | `destructive`   | Delete, disconnect             |
-| Link           | `link`          | In-text navigation             |
-
-Sizes: `sm` in toolbars and row actions, default on primary CTAs, `icon` for
-icon-only (must include `<span className="sr-only">`).
-
-**Icon + label:**
-```tsx
-<Plus className="mr-1.5 h-4 w-4" />
-<span className="hidden sm:inline">New project</span>
-<span className="sm:hidden">New</span>
-```
-
-### 6.2 Cards
-```tsx
-<Card>
-  <CardHeader>
-    <CardTitle>...</CardTitle>
-  </CardHeader>
-  <CardContent>...</CardContent>
-</Card>
-```
-- Hover-linked cards wrap the card in `<Link>` and add
-  `hover:bg-muted/50 transition-colors` on the `Card`.
-- `CardContent` default padding is fine; override with `p-4` for dense grids.
-- Keep card anatomy predictable: avatar/thumbnail (left) · title + meta
-  (center) · actions/badge (right).
-
-### 6.3 Metric cards
-Use the shared `components/dashboard/MetricCard.tsx`. Never build an ad-hoc
-metric card — add a prop instead.
-
-Pattern:
-- Uppercase tracked label (§2)
-- Large tabular-nums value
-- Trend line: icon + `vs prev. period`
-- Locked state: `locked` prop renders a "Coming soon" chip + em-dash value
-- Optional `sparkline` slot
-
-### 6.4 Badges
-shadcn `Badge` variants: `default` · `secondary` · `destructive` · `outline`.
-- `outline` for neutral tags (branch, environment)
-- `secondary` for counts
-- `destructive` only for errors
-- Never put more than 3 badges in a row — collapse into a popover.
-
-### 6.5 Forms
-
-- Wrap with `<Form>` from shadcn + `react-hook-form`.
-- Validate with `zod` — schema co-located with the form component.
-- Labels: always present, above the input. No placeholder-as-label.
-- Help text: `text-xs text-muted-foreground` below the input.
-- Error text: `text-xs text-destructive` below the input.
-- Submit buttons reflect loading state (`disabled={mutation.isPending}` +
-  spinner icon).
-
-#### Searchable entity pickers
-
-Use a shadcn `Popover` + `Command` combobox when selecting a project, service,
-environment, or other relationship from a non-trivial set. A native `<select>`
-is reserved for short scalar choices.
-
-- The trigger and every result show the entity identity: favicon or product
-  logo, display name, stable slug/type, and a semantic status dot.
-- Search matches the display name and stable identifier.
-- Keep the current selection visible in the trigger and mark it with `Check`.
-- Use the shared rich picker component for an existing entity type before
-  creating another one-off combobox.
-- Fetch option collections with TanStack Query and keep cached results visible
-  during background refreshes.
-
-### 6.6 Tables
-
-- Wrap in `<div className="overflow-x-auto">`.
-- First column: identifier with link. Last column: actions (right-aligned).
-- Hide secondary columns on small screens: `hidden md:table-cell`.
-- Zebra striping: do **not** use. Rely on row hover (`hover:bg-muted/50`).
-- Empty state uses `EmptyPlaceholder`.
-
-### 6.7 Pagination
-
-Standard footer below a list:
-
-```tsx
-<div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-  <p className="text-xs text-muted-foreground tabular-nums">
-    <span className="hidden sm:inline">Showing {from}–{to} of {total}</span>
-    <span className="sm:hidden">Page {page} / {totalPages}</span>
-  </p>
-  <div className="flex items-center gap-2">
-    <Button variant="outline" size="sm" disabled={page === 1}>Previous</Button>
-    <Button variant="outline" size="sm" disabled={page >= totalPages}>Next</Button>
-  </div>
-</div>
-```
-Hide entirely when `total <= perPage`.
-
-### 6.8 Dialogs & sheets
-- Use `Dialog` for confirmations and short forms.
-- Use `Sheet` (right side) for multi-field edit surfaces that benefit from
-  page context behind them.
-- Title is mandatory; description is mandatory when the action is
-  destructive.
-- Primary action is right-most; destructive uses `variant="destructive"`.
-
-### 6.9 Empty states
-Always use `<EmptyPlaceholder>` with:
-- An icon from lucide
-- Title (what's missing)
-- Description (one sentence, what to do)
-- One primary CTA (optional)
-
-Never ship a blank region.
-
-### 6.10 Loading states
-
-- **Query-driven lists:** skeletons that mirror the final layout
-  (`ProjectCardSkeleton`, `MetricCardSkeleton`). Never a centered spinner for
-  a full page.
-- **Mutations:** button spinner + disabled state. Toast on success/error.
-- **Background refresh:** do not show a loader; let cached data stay.
-
-### 6.11 Copy-to-clipboard
-Always use `<CopyButton>`. Never wire `navigator.clipboard` by hand.
-
-### 6.12 Sidebar navigation
-
-The sidebar is a single column with one active context at a time. Two
-patterns only:
-
-- **Flat list.** Top-level items navigate directly. Use this for the
-  workspace root, settings root, and project root.
-- **Drill-down sub-view.** When a parent has its own dense sub-tree
-  (more than ~3 children, or the children form a coherent surface),
-  clicking the parent **replaces the entire sidebar** with the
-  sub-view: a back arrow + section title at the top, then the
-  sub-items as a flat list. Back returns to the previous view without
-  changing the page route.
-
-**Drill-down items must have icons.** Every sub-item in a drill-down
-view renders a leading lucide icon (`h-4 w-4`) next to its label —
-matching the flat-list nav pattern. Icon-less text lists (e.g.
-"Analytics / Visitors / Pages / Funnels / Session Replays / Uptime /
-Metrics / Request Logs / Traces / Speed") are visually ambiguous and
-force users to read every label to scan. Pick an icon that reflects
-the destination's purpose; reuse the same icon the destination page
-uses in its header when one exists.
-
-**Do not** expand sub-items inline with a chevron / accordion. Inline
-accordions create double-scroll, hide context from the rest of the
-nav, and don't scale past a couple of items. If a section has enough
-functionality to need grouping, it has enough to deserve its own
-sub-view.
-
-The route-driven swap between workspace, settings, and project nav in
-`Sidebar.tsx` is the canonical example.
-
----
-
-## 7. Iconography
-
-- Library: `lucide-react` only.
-- Inline sizes: `h-4 w-4` inside buttons/badges, `h-5 w-5` for page-level
-  icons (empty states, headers).
-- Color: inherit from parent text color. Don't set `text-*` on an icon
-  directly unless it's a status icon.
-- Pair icons with text labels on mobile for primary actions; icon-only is OK
-  on desktop toolbars when the tooltip exists.
-
----
-
-## 8. Motion
-
-- Transitions: `transition-colors` on hoverable surfaces, `transition-opacity`
-  for reveals. Default duration (150ms) is fine — don't override.
-- Never animate layout-shifting properties (width/height/margin) on hover.
-- Dialog/popover motion comes from `tailwindcss-animate`; don't write custom
-  keyframes for standard overlays.
-
----
-
-## 9. Responsive breakpoints
-
-| Prefix | Min width | Use                                       |
-| ------ | --------- | ----------------------------------------- |
-| (none) | 0         | Mobile base                               |
-| `sm`   | 640px     | Phone landscape / small tablet            |
-| `md`   | 768px     | Tablet — activate 2-col grids             |
-| `lg`   | 1024px    | Laptop — sidebar expanded, 3-col safe     |
-| `xl`   | 1280px    | Desktop — up to 4-col dashboards          |
-| `2xl`  | 1536px    | Ultrawide — content still capped at `max-w-7xl` |
-
-### Mobile rules (enforced)
-
-- Tables: `overflow-x-auto`, hide secondary columns with `hidden md:table-cell`.
-- Filter bars: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`. Selects:
-  `w-full sm:w-[Npx]`.
-- Side panels: `flex-col lg:flex-row`, panel uses `w-full lg:w-[Npx]`.
-- Headers: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`.
-- Button labels: `hidden sm:inline` next to icons.
-- Pagination: compact `{page} / {totalPages}` on mobile.
-
----
-
-## 10. Dark mode
-
-- Scheme toggled by `next-themes` on `<html class="dark">`.
-- Every semantic token has a dark variant in `globals.css` — if a component
-  uses tokens, it's automatically correct in both modes.
-- Sanctioned status literals must ship both variants:
-  `text-emerald-600 dark:text-emerald-400`, etc.
-- Test every new surface in both modes before shipping.
-
----
-
-## 11. Copywriting
-
-- **Sentence case** for titles and buttons: "New project", not "New Project".
-- **Short and direct.** "Delete project" beats "Remove this project permanently".
-- **No emoji** in UI text.
-- **Numbers:** `toLocaleString()` for counts over 999. Use `tabular-nums`.
-- **Dates:** relative via `<TimeAgo>`; absolute tooltips only when precision
-  matters.
-- **Status:** "Operational / Degraded / Down / Unknown" — mirror backend
-  enums exactly.
-- **Empty states:** explain the concept, then the action. "No projects yet.
-  Connect a repo to deploy your first one."
-
----
-
-## 12. Anti-patterns (do not ship)
-
-| Don't                                                 | Do instead                                    |
-| ----------------------------------------------------- | --------------------------------------------- |
-| Hardcoded hex / rgb colors                            | Tokens from §3                                |
-| Centered spinner for full-page load                   | Skeleton matching final layout (§6.10)        |
-| Manual clipboard handler                              | `<CopyButton>`                                |
-| Toast AND inline error for the same failure          | Pick one — inline for field errors, toast for global |
-| IIFE inside JSX (`{(() => {...})()}`)                 | Helper function or sub-component              |
-| Hooks after early returns                             | All hooks before any `return`                 |
-| Conditional mounting of stateful dialogs/sheets       | Always mount, use `open` prop                 |
-| Fake data overlaid with "Coming soon"                 | `locked` state with em-dash + chip            |
-| Dropdown when fewer than 5 options                    | Segmented control / radio cards               |
-| Cards inside cards                                    | Flatten or use a section heading              |
-| Custom shadows or radii                               | §5 tokens                                     |
-| Collapsible / accordion sidebar items                 | Drill-down sub-view (§6.12)                   |
-| Icon-less labels in drill-down sidebar sub-views      | Every sub-item gets a lucide icon (§6.12)     |
-
----
-
-## 13. Adding something new
-
-1. **Check this doc first.** 80% of the time the pattern exists.
-2. **Check `src/components/ui/`** for a shadcn primitive.
-3. **Check `src/components/<domain>/`** for an existing domain component.
-4. If none fit, build it using tokens and the rules above. If the new
-   pattern is reusable, add a section to this doc in the same PR.
-5. Flag any token addition (`--color-*`, new radius, new font) in PR
-   description — those require review.
-
----
-
-## 14. Reference surfaces
-
-Canonical examples to pattern-match against:
-
-| Surface          | File                                                    |
-| ---------------- | ------------------------------------------------------- |
-| Page wrapper + header | `src/pages/Dashboard.tsx`                          |
-| Metric card      | `src/components/dashboard/MetricCard.tsx`               |
-| Entity card (link)| `src/components/dashboard/ProjectCard.tsx`             |
-| Sidebar / nav    | `src/components/dashboard/Sidebar.tsx`                  |
-| Top header       | `src/components/dashboard/Header.tsx`                   |
-| Empty state      | `src/components/EmptyPlaceholder.tsx`                   |
-| Tokens           | `src/globals.css`                                       |
-
-When in doubt, copy the closest canonical surface and adapt — don't invent.
+- The page header's create action may remain visible; the empty-state action
+  invokes the same flow. Do not show a disabled administrative action to a
+  user who cannot perform it.
+- Prefer specific nouns: "No teams yet", not "Nothing here".
+- Keep descriptions to one or two short sentences. Never use an error as
+  onboarding copy.
+- Do not add a second border, shadow, dashed inset, oversized illustration,
+  or `min-h-[400px]` to a resource empty state.
+- The component's existing `size="default"` is a legacy large variant, not
+  the resource-list standard. Do not omit `size="compact"`.
+- Do not add new uses of `EmptyPlaceholder` or recreate empty-state markup
+  inline. Migrate existing uses when working on that state.
+
+## 4. Populated tables and lists
+
+Use [Table](web/src/components/ui/table.tsx) for collections whose records
+share comparable fields: users, teams, keys, routes, providers, and similar
+administrative resources. Do not invent a different row component per page.
+
+- Use `TableHeader`, `TableBody`, `TableRow`, `TableHead`, and
+  `TableCell`. Preserve their shared padding and typography.
+- The first meaningful column identifies the resource. Make its name a real
+  router link when a detail page exists. Secondary metadata is muted.
+- Put status in a text-labeled badge; color alone never carries the meaning.
+- Right-align row actions in the last column. Give icon-only actions an
+  accessible name that identifies the resource.
+- Keep links, menus, and selection independently operable. A clickable row
+  must not replace a semantic link or swallow nested control events.
+- Use monospace only for identifiers, hashes, commands, and code. Truncate
+  long values intentionally, with a way to inspect or copy the full value.
+- Sorting uses a real button in the header and exposes its sort state.
+- Selection uses the shared Checkbox, including indeterminate select-all.
+  Bulk actions must state their scope.
+- Keep column alignment stable during loading. Do not use fake records as
+  skeleton content.
+
+The shared Table already owns a horizontal overflow wrapper. On narrow screens,
+scroll the table rather than the entire page. Keep identity and primary actions
+reachable; if columns are hidden, essential information must remain available
+through a detail view or an accessible compact presentation.
+
+Cards are appropriate for discovery surfaces such as the plugin catalog, where
+logos, descriptions, and categories help people choose. They are not a second
+default for administrative lists. Use a responsive grid with consistent card
+anatomy and the same state rules above.
+
+### Pagination
+
+Use [ResponsivePagination](web/src/components/ui/responsive-pagination.tsx),
+not page-local previous/next markup. Pass the actual `page`, `pageSize`,
+`total`, `totalPages`, and `onPageChange`; supply `onPageSizeChange`
+when page size is configurable.
+
+Mobile uses the shared stable Previous / current page / Next row. Desktop
+shows the fuller summary and controls. Reset or clamp the page when filters,
+page size, or record deletion make the current page invalid. Never show a
+negative range or an empty later page as "No records yet".
+
+## 5. Controls and forms
+
+Use existing components from `web/src/components/ui`. Do not replace them
+with native lookalikes or locally styled forks.
+
+- **Buttons:** primary for the main action, outline for secondary actions,
+  ghost for low-emphasis tools, destructive for destructive actions. Prefer
+  shared sizes; do not give each page different control heights.
+- **Checkboxes:** use [Checkbox](web/src/components/ui/checkbox.tsx) for
+  selection and explicit consent. Never hand-author `input type="checkbox"`
+  or pass that type to `Input`. Radix's internal hidden form input is expected.
+  For a simple boolean, use `onCheckedChange={(value) => setValue(value === true)}`.
+  Preserve disabled states, labels, and form names.
+- **Switches:** use the shared Switch for an on/off setting that takes effect
+  immediately, not for consent or selecting table rows.
+- **Labels:** associate every control with visible text using `id` and
+  `htmlFor`, or a correctly wrapping label. A placeholder is not a label.
+- **Forms:** use existing React Hook Form, Zod, and shared form patterns.
+  Put validation next to the field; retain user input after failures.
+- **Async actions:** show progress and prevent duplicate submission. Keep
+  readable contrast while pending; communicate the result and recovery action.
+- **Destructive actions:** require confirmation that identifies the target
+  and consequence. Never style unrelated actions as destructive.
+- **Dialogs and menus:** use the shared primitives for focus management,
+  keyboard behavior, escape, and focus restoration. Avoid custom overlays.
+- **Shortcuts:** use shared create-action conventions where applicable.
+  A shortcut is an accelerator, never the only way to reach a feature.
+
+## 6. Typography, color, and surfaces
+
+Use the fonts and tokens defined in [globals.css](web/src/globals.css).
+Do not load a different font for an individual console page.
+
+- Page title: `text-2xl font-semibold tracking-tight`.
+- Section title: `text-lg font-semibold`.
+- Resource labels and table content: `text-sm`; use medium weight for identity.
+- Supporting copy: `text-sm text-muted-foreground`.
+- Small metadata: `text-xs text-muted-foreground`, never the only place for
+  information needed to complete an action.
+- Use semantic pairs: `bg-background text-foreground`,
+  `bg-card text-card-foreground`, `bg-primary text-primary-foreground`,
+  and `border-border`.
+- No page-local hardcoded white/black backgrounds, arbitrary gray palettes,
+  gradients, or decorative status colors.
+- Reuse existing status variants. Combine a label and, where useful, an icon
+  with the color. Healthy, pending, warning, and failure remain distinguishable
+  without color.
+- Use Lucide for interface icons. Official product/provider logos are the
+  exception; do not substitute random emoji for them.
+- Resource surfaces have a solid border and no large shadow. Elevation belongs
+  to overlays such as dialogs and menus, not every settings section.
+
+Hover, selected, focus, disabled, and pending are different states. Define
+foreground and background together: an outlined control must not retain white
+selected text after its hover background becomes light.
+
+## 7. Responsive, accessible, and functional
+
+- Check at 390px, 768px, and a wide desktop width. Full width means the available
+  content area after the sidebar, not the entire viewport.
+- Verify both light and dark mode, including hover, selected, pending, and
+  disabled controls.
+- No document-level horizontal overflow, clipped actions, or inaccessible
+  fixed-width forms. Let toolbars wrap and long labels break sensibly.
+- Keep visible focus indicators and a logical keyboard order. Test checkbox
+  labels and Space, menus, dialogs, and table links.
+- Preserve heading hierarchy: one page `h1`, then section headings.
+- Honor reduced motion. Use subtle shared transitions, not decorative entrance
+  animations for every row.
+- Every rendered control must work. Links go to real destinations; search and
+  filters change results; retries perform the failed operation again.
+- Use query/mutation state for server interactions. Do not duplicate it with
+  manual loading flags or conditionally remount stateful dialogs on every update.
+- Errors identify what failed and offer a concrete next step. Do not expose
+  raw secrets or credentials in error details, previews, or examples.
+
+## 8. Review checklist
+
+Before handing off a changed screen:
+
+- [ ] Full-width layout, one padding owner, shared page header.
+- [ ] Primary content appears promptly below the heading.
+- [ ] One collection surface; no nested dashed empty panel or decorative shadow.
+- [ ] Compact EmptyState explicitly selected; loading, empty, filtered, error,
+      and unconfigured states are distinguished.
+- [ ] Shared table and pagination, or a justified discovery-card layout.
+- [ ] Shared Checkbox/Switch and properly associated labels; no native lookalikes.
+- [ ] Permission-aware actions, useful failures, and working retry/setup links.
+- [ ] Keyboard, mobile, wide-screen, light, and dark behavior checked.
+- [ ] Regression tests cover the changed behavior and important failure states.
+- [ ] Documentation and shared components agree, or the remaining legacy gap
+      is explicitly identified rather than presented as complete.
+
+Run relevant tests from `web/`: `bun run test`, `bunx tsc --noEmit`,
+and the affected Playwright specs via `bun run e2e`. A documentation-only
+change needs reference and consistency checks; it does not prove that old
+screens have been migrated.
+
+Exceptions require an explicit product decision. Update this document alongside
+the shared implementation rather than creating a competing design guide.
