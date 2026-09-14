@@ -36,7 +36,7 @@ memchr = "2.7"
 htmd = "0.5"
 scraper = "0.27"
 pingora = { version = "0.8.0", features = ["lb"] }
-pingora-core = { version = "0.8.0", features = ["openssl", "connection_filter"] }
+pingora-core = { version = "0.9.0", features = ["openssl", "connection_filter"] }
 pingora-http = "0.8.0"
 pingora-load-balancing = "0.8.0"
 pingora-proxy = "0.8.0"
