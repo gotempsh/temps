@@ -18,14 +18,13 @@ Every sidebar destination uses the available content width, including settings,
 users, teams, API keys, notifications, and their create/edit/detail routes.
 
 - Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
-  `PageContainer` defaults to `width="full"`.
+  `PageContainer` is always full width; it has no width variant.
 - The route layout owns page gutters: `px-4 py-6 sm:px-6 lg:px-8`.
   Do not repeat those gutters inside the page.
 - Settings routes inherit the container from their parent layout. Their root
   should be `w-full min-w-0 space-y-6`, not another `PageContainer`.
 - Do not center sidebar pages inside `container`, `max-w-7xl`, `max-w-3xl`,
-  or `mx-auto`. Existing `wide` and `form` variants are not the default
-  for these routes.
+  or `mx-auto`. Do not reintroduce narrow page-shell variants.
 - Constrain explanatory text where it improves reading, not the entire page,
   form, table, or resource surface.
 - Align the heading, toolbar, collection, and footer to the same content edges.

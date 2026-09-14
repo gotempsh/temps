@@ -280,7 +280,7 @@ function AgentEditForm({
         e.preventDefault()
         handleSubmit()
       }}
-      className="mx-auto max-w-3xl space-y-8 pb-12"
+      className="w-full space-y-8 pb-12"
     >
       {/* Sticky header with primary actions */}
       <div className="sticky top-0 z-10 -mx-4 flex items-center justify-between gap-4 border-b bg-background/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:px-6">

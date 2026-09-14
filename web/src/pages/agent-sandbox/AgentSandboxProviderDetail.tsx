@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -36,13 +36,33 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import type { ProviderCatalogDto, ProviderCatalogResponse } from '@/api/client'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  activateAiProvider,
+  saveAiProviderCredential,
+  verifySavedAiProviderCredential,
+  smokeTestAgent,
+  updateAiProvider,
+  type ProviderCatalogDto,
+  type ProviderCatalogResponse,
+} from '@/api/client'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import {
+  harnessSetupHref,
+  harnessCheckError,
+  harnessSetupStatus,
+  workspaceReturnTo,
+  credentialVerificationMessage,
+} from './harness-onboarding'
 import {
   importLocalAiProviderCredentialMutation,
   refreshAiProviderModelsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail } from '@/lib/api-problem'
-import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import {
+  aiProviderCatalogQueryOptions,
+  publishVerifiedProvider,
+} from '@/lib/ai-provider-catalog-query'
 import {
   isSavedProviderModelUnavailable,
   mergeProviderModelRefresh,
@@ -50,6 +70,8 @@ import {
 
 export function AgentSandboxProviderDetail() {
   const { id } = useParams<{ id: string }>()
+  const [params] = useSearchParams()
+  const returnTo = workspaceReturnTo(params.get('returnTo'))
   usePageTitle(id ? `Provider · ${id}` : 'AI Provider')
   const { data, isPending, isError } = useQuery({
     ...aiProviderCatalogQueryOptions,
@@ -84,7 +106,7 @@ export function AgentSandboxProviderDetail() {
             catalog.
           </p>
           <Button asChild variant="outline" size="sm">
-            <Link to="/agent-sandbox/providers">
+            <Link to={harnessSetupHref(null, returnTo)}>
               <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
               Back to providers
             </Link>
@@ -99,14 +121,19 @@ export function AgentSandboxProviderDetail() {
   return (
     <div className="space-y-4">
       <Link
-        to="/agent-sandbox/providers"
+        to={harnessSetupHref(null, returnTo)}
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="h-3.5 w-3.5" />
         All providers
       </Link>
 
-      <ProviderEditor provider={provider} isActive={isActive} />
+      <ProviderEditor
+        key={provider.id}
+        provider={provider}
+        isActive={isActive}
+        returnTo={returnTo}
+      />
     </div>
   )
 }
@@ -119,25 +146,108 @@ export function AgentSandboxProviderDetail() {
 interface ProviderEditorProps {
   provider: ProviderCatalogDto
   isActive: boolean
+  returnTo?: string
+  embedded?: boolean
+  onVerificationPending?: (pending: boolean) => void
 }
 
-export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
+export function ProviderEditor({
+  provider,
+  isActive,
+  returnTo = '/ai-first',
+  embedded = false,
+  onVerificationPending,
+}: ProviderEditorProps) {
   const queryClient = useQueryClient()
-  const defaultFlavor =
-    provider.auth_flavors.find((f) => f.id === provider.current_auth_type) ??
-    provider.auth_flavors[0]
+  const [connectionParams, setConnectionParams] = useSearchParams()
+  const usesConnectionCards =
+    (provider.id === 'codex_cli' || provider.id === 'claude_cli') &&
+    provider.auth_flavors.length > 0
+  const requestedMethod = connectionParams.get('connectionMethod')
+  const connectionMethod =
+    usesConnectionCards &&
+    (provider.auth_flavors.some((flavor) => flavor.id === requestedMethod) ||
+      (provider.id === 'codex_cli' && requestedMethod === 'local'))
+      ? requestedMethod
+      : null
+  const chooseConnectionMethod = (method: string | null) => {
+    setCredential('')
+    setCredentialError(null)
+    if (method && method !== 'local') setSelectedFlavorId(method)
+    setConnectionParams((current) => {
+      const next = new URLSearchParams(current)
+      if (method) next.set('connectionMethod', method)
+      else next.delete('connectionMethod')
+      return next
+    })
+  }
+  const defaultFlavor = provider.auth_flavors.find(
+    (f) => f.id === provider.current_auth_type
+  ) ??
+    provider.auth_flavors[0] ?? {
+      id: '',
+      label: 'Credential',
+      description: 'No authentication methods are available for this harness.',
+      format: 'api_key',
+      env_var: null,
+    }
 
-  const [selectedFlavorId, setSelectedFlavorId] = useState(defaultFlavor.id)
-  const [credential, setCredential] = useState('')
-  const [saving, setSaving] = useState(false)
+  const [flavorDraft, setSelectedFlavorId] = useState(defaultFlavor.id)
+  const selectedFlavorId =
+    usesConnectionCards && connectionMethod && connectionMethod !== 'local'
+      ? connectionMethod
+      : flavorDraft
+  const [credentialDraft, setCredentialDraft] = useState({
+    method: connectionMethod,
+    value: '',
+  })
+  const credential =
+    credentialDraft.method === connectionMethod ? credentialDraft.value : ''
+  const setCredential = (value: string) =>
+    setCredentialDraft({ method: connectionMethod, value })
+  const [savingCredential, setSaving] = useState(false)
+  const [credentialError, setCredentialError] = useState<string | null>(null)
+  const [verificationModel, setVerificationModel] = useState(
+    provider.default_model ?? ''
+  )
+  const verifySavedMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await verifySavedAiProviderCredential({
+        path: { provider_id: provider.id },
+        body: { verification_model: verificationModel.trim() },
+        throwOnError: true,
+      })
+      return data
+    },
+    onMutate: () => {
+      setCredentialError(null)
+      onVerificationPending?.(true)
+    },
+    onSuccess: async (data) => {
+      if (data.provider)
+        await publishVerifiedProvider(queryClient, data.provider)
+      toast.success(credentialVerificationMessage(data))
+    },
+    onError: (error) => {
+      const detail = problemDetail(
+        error,
+        'Could not verify this model. Choose a model your saved account can access and retry.'
+      )
+      setCredentialError(detail)
+      toast.error('Model verification failed', { description: detail })
+    },
+    onSettled: () => onVerificationPending?.(false),
+  })
+  const saving = savingCredential || verifySavedMutation.isPending
   const [activating, setActivating] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{
     passed: boolean
     environment: string
-    cli_version: string | null
-    auth_info: string | null
-    setup_hint: string | null
+    cli_version?: string | null
+    auth_info?: string | null
+    setup_hint?: string | null
+    detail?: string | null
   } | null>(null)
 
   const initialModel = provider.default_model ?? ''
@@ -149,9 +259,11 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   )
   const [savingModel, setSavingModel] = useState(false)
   const refreshModelsMutation = useMutation(refreshAiProviderModelsMutation())
-  const importLocalCredentialMutation = useMutation(
-    importLocalAiProviderCredentialMutation()
-  )
+  const importLocalCredentialMutation = useMutation({
+    ...importLocalAiProviderCredentialMutation(),
+    // The catch below owns the inline error and its single notification.
+    onError: () => {},
+  })
 
   useEffect(() => {
     const fresh = provider.default_model ?? ''
@@ -232,24 +344,13 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     if (next === serverModel) return
     setSavingModel(true)
     try {
-      const res = await fetch(`/api/settings/ai-providers/${provider.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ default_model: next }),
+      await updateAiProvider({
+        path: { provider_id: provider.id },
+        body: { default_model: next },
+        throwOnError: true,
       })
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} model`, {
-          description: detail.slice(0, 200),
-        })
-        setModelDraft(serverModel)
-        setCustomMode(
-          provider.models.length === 0 ||
-            (serverModel !== '' && !provider.models.includes(serverModel))
-        )
-        return
-      }
       setServerModel(next)
+      setTestResult(null)
       toast.success(
         next === ''
           ? `${provider.name} will use its default model`
@@ -260,7 +361,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} model`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
       setModelDraft(serverModel)
     } finally {
@@ -286,17 +390,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const handleActivate = async () => {
     setActivating(true)
     try {
-      const res = await fetch(
-        `/api/settings/ai-providers/${provider.id}/activate`,
-        { method: 'POST' }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to activate ${provider.name}`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
+      await activateAiProvider({
+        path: { provider_id: provider.id },
+        throwOnError: true,
+      })
       toast.success(`${provider.name} is now the active provider`)
       await Promise.all([
         queryClient.invalidateQueries({
@@ -306,7 +403,10 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       ])
     } catch (e) {
       toast.error(`Failed to activate ${provider.name}`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
     } finally {
       setActivating(false)
@@ -317,34 +417,27 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     setTesting(true)
     setTestResult(null)
     try {
-      const res = await fetch(
-        `/api/projects/0/agents/smoke-test?provider_id=${encodeURIComponent(provider.id)}`,
-        { method: 'POST' }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error('Smoke test failed', { description: detail.slice(0, 200) })
-        return
-      }
-      const data = await res.json()
-      setTestResult({
-        passed: data.passed,
-        environment: data.environment,
-        cli_version: data.cli_version,
-        auth_info: data.auth_info,
-        setup_hint: data.setup_hint,
+      const { data } = await smokeTestAgent({
+        path: { project_id: 0 },
+        query: { provider_id: provider.id },
+        throwOnError: true,
       })
+      setTestResult(data)
       if (data.passed) {
-        toast.success(`${provider.name} is ready`)
+        toast.success(`${provider.name} environment check passed`)
       } else {
         toast.error(`${provider.name} test failed`, {
           description: data.setup_hint ?? 'See card for details',
         })
       }
     } catch (e) {
-      toast.error('Smoke test failed', {
-        description: e instanceof Error ? e.message : 'Network error',
+      const detail = harnessCheckError(e)
+      setTestResult({
+        passed: false,
+        environment: 'unknown',
+        setup_hint: detail,
       })
+      toast.error('Environment check failed', { description: detail })
     } finally {
       setTesting(false)
     }
@@ -353,283 +446,492 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const handleSave = async () => {
     if (!credential.trim()) return
     setSaving(true)
+    setCredentialError(null)
+    onVerificationPending?.(true)
     try {
-      const res = await fetch(
-        `/api/settings/ai-providers/${provider.id}/credential`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            auth_type: selectedFlavor.id,
-            credential: credential.trim(),
-          }),
-        }
-      )
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} credential`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
-      toast.success(`${provider.name} credential encrypted and saved`)
-      setCredential('')
-      await queryClient.invalidateQueries({
-        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      const { data } = await saveAiProviderCredential({
+        path: { provider_id: provider.id },
+        body: {
+          auth_type: selectedFlavor.id,
+          credential: credential.trim(),
+          ...(provider.id === 'opencode' && verificationModel.trim()
+            ? { verification_model: verificationModel.trim() }
+            : {}),
+        },
+        throwOnError: true,
       })
+      setTestResult(null)
+      if (data.provider) {
+        await publishVerifiedProvider(queryClient, data.provider)
+      } else {
+        // Support older servers, but wait for authoritative readiness instead
+        // of treating a successful write as proof that the harness can run.
+        await queryClient.invalidateQueries(
+          {
+            queryKey: aiProviderCatalogQueryOptions.queryKey,
+          },
+          { throwOnError: true }
+        )
+      }
+      toast.success(credentialVerificationMessage(data))
+      setCredential('')
     } catch (e) {
+      const detail = problemDetail(
+        e,
+        'Could not verify and save this credential. Check your connection and try again.'
+      )
+      setCredentialError(detail)
       toast.error(`Failed to save ${provider.name} credential`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: detail,
       })
     } finally {
       setSaving(false)
+      onVerificationPending?.(false)
     }
   }
 
   const handleImportLocalCredential = async () => {
+    setSaving(true)
+    setCredentialError(null)
+    onVerificationPending?.(true)
     try {
       const imported = await importLocalCredentialMutation.mutateAsync({
         path: { provider_id: provider.id },
+        query:
+          provider.id === 'opencode' && verificationModel.trim()
+            ? { verification_model: verificationModel.trim() }
+            : undefined,
       })
+      setTestResult(null)
       setSelectedFlavorId(imported.auth_type)
       setCredential('')
-      await queryClient.invalidateQueries({
-        queryKey: aiProviderCatalogQueryOptions.queryKey,
-      })
+      if (imported.provider) {
+        await publishVerifiedProvider(queryClient, imported.provider)
+      } else {
+        await queryClient.invalidateQueries(
+          {
+            queryKey: aiProviderCatalogQueryOptions.queryKey,
+          },
+          { throwOnError: true }
+        )
+      }
       toast.success(`${provider.name} local login imported`, {
-        description: imported.workspace_ready
-          ? 'The credential is encrypted and this harness is ready for persistent workspaces.'
-          : 'The credential is encrypted and ready for supported host workflows.',
+        description: credentialVerificationMessage(imported),
       })
     } catch (cause) {
+      const detail = problemDetail(
+        cause,
+        'Could not verify the local login. Authenticate the CLI as the user running Temps and try again.'
+      )
+      setCredentialError(detail)
       toast.error(`Could not import ${provider.name} local login`, {
-        description: problemDetail(
-          cause,
-          'Authenticate the CLI as the operating-system user running Temps, then try again.'
-        ),
+        description: detail,
       })
+    } finally {
+      setSaving(false)
+      onVerificationPending?.(false)
     }
   }
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader>
-          <div className="flex items-start justify-between gap-3 flex-wrap">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <AiHarnessLogo providerId={provider.id} size={32} />
+          <div>
+            <h2 className="text-lg font-semibold">{provider.name}</h2>
+            <p className="text-sm text-muted-foreground">
+              {harnessSetupStatus(provider)}
+            </p>
+          </div>
+        </div>
+        {!embedded && (
+          <Button asChild variant="outline" size="sm">
+            <Link to={returnTo}>Back to workspace</Link>
+          </Button>
+        )}
+      </div>
+      <p className="text-sm text-muted-foreground">
+        {embedded
+          ? 'Connect once. Reuse this account across your workspaces.'
+          : 'Setup is saved on this Temps instance. You can leave and return without losing saved credentials or model settings.'}
+      </p>
+
+      <Card
+        className={embedded ? 'border-0 shadow-none rounded-none' : undefined}
+      >
+        <CardHeader className={embedded ? 'p-0 pb-4' : undefined}>
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle className="flex items-center gap-2">
-                {provider.name}
-                {isActive && (
-                  <span className="inline-flex items-center rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-                    Active
-                  </span>
-                )}
-                {provider.credential_saved && !isActive && (
-                  <span className="inline-flex items-center gap-1 text-xs text-green-500">
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    Configured
-                  </span>
-                )}
-                <span
-                  className={
-                    provider.workspace_ready
-                      ? 'inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300'
-                      : 'inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300'
-                  }
-                >
-                  {provider.workspace_ready ? 'Workspace ready' : 'Host only'}
-                </span>
-              </CardTitle>
-              <CardDescription className="mt-1 space-y-0.5">
-                <span className="block">
-                  Install:{' '}
-                  <code className="bg-muted px-1 rounded">
-                    {provider.install_command}
-                  </code>
-                </span>
-                {!provider.workspace_ready &&
-                  provider.workspace_readiness_hint && (
-                    <span className="block text-amber-700 dark:text-amber-300">
-                      {provider.workspace_readiness_hint}
-                    </span>
-                  )}
-                <span className="block">
-                  Auth:{' '}
-                  <code className="bg-muted px-1 rounded">
-                    {provider.auth_command}
-                  </code>
-                </span>
+              {!embedded && (
+                <CardTitle className="text-base">
+                  1. Connect your account
+                </CardTitle>
+              )}
+              <CardDescription>
+                {embedded && provider.id !== 'opencode'
+                  ? 'Your credential is encrypted and saved on this Temps instance.'
+                  : provider.id === 'opencode'
+                    ? 'OpenCode uses a private runtime credential file. Code running as the harness user can access this credential; only use it in workspaces you trust. Refreshed tokens stay in this sandbox; after replacing the sandbox, you may need to import your local login again.'
+                    : 'Encrypted with AES-256-GCM at rest. Workspace-capable providers use it only through a short-lived server relay; the reusable credential is never injected into the sandbox.'}
               </CardDescription>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {provider.credential_saved && (
+            {!usesConnectionCards &&
+              provider.id !== 'claude_cli' &&
+              provider.local_credential && (
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={handleTest}
-                  disabled={testing}
+                  onClick={() => void handleImportLocalCredential()}
+                  disabled={saving || importLocalCredentialMutation.isPending}
                 >
-                  {testing ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                  {importLocalCredentialMutation.isPending ? (
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                   ) : (
-                    <Play className="h-3.5 w-3.5 mr-1.5" />
+                    <Download className="mr-1.5 h-3.5 w-3.5" />
                   )}
-                  Test
+                  {importLocalCredentialMutation.isPending
+                    ? 'Importing…'
+                    : provider.credential_saved
+                      ? 'Replace with local login'
+                      : 'Use local login'}
                 </Button>
               )}
+          </div>
+        </CardHeader>
+        <CardContent className={embedded ? 'space-y-4 p-0' : 'space-y-4'}>
+          {provider.id === 'opencode' && (
+            <div className="space-y-2">
+              <Label htmlFor={`verification-model-${provider.id}`}>
+                Model to verify
+              </Label>
+              <Input
+                id={`verification-model-${provider.id}`}
+                value={verificationModel}
+                onChange={(event) => setVerificationModel(event.target.value)}
+                placeholder="provider/model"
+                list={`verification-models-${provider.id}`}
+                disabled={saving || verifySavedMutation.isPending}
+                autoComplete="off"
+              />
+              <datalist id={`verification-models-${provider.id}`}>
+                {provider.models.map((model) => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+              <p className="text-xs text-muted-foreground">
+                Choose a model your account can access. Verification runs a
+                small request in a temporary sandbox and may use your provider
+                allowance.
+              </p>
               {provider.credential_saved && (
-                <Button
-                  type="button"
-                  variant={isActive ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={handleActivate}
-                  disabled={isActive || activating}
-                >
-                  {activating ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                  ) : null}
-                  {isActive ? 'Active' : 'Use this'}
-                </Button>
+                <>
+                  <p role="status" className="text-sm text-muted-foreground">
+                    {credentialVerificationMessage(provider)}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      saving ||
+                      verifySavedMutation.isPending ||
+                      !verificationModel.trim()
+                    }
+                    onClick={() => verifySavedMutation.mutate()}
+                  >
+                    {verifySavedMutation.isPending && (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    )}
+                    {verifySavedMutation.isPending
+                      ? 'Verifying model…'
+                      : 'Verify saved login'}
+                  </Button>
+                </>
               )}
             </div>
-          </div>
-        </CardHeader>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <CardTitle className="text-base">Credential</CardTitle>
-              <CardDescription>
-                Encrypted with AES-256-GCM at rest. Workspace-capable providers
-                {provider.id === 'opencode'
-                  ? 'use a private runtime credential file for OpenCode. Code running as the harness user can access this credential; only use it in workspaces you trust. Refreshed tokens stay in this sandbox; after replacing the sandbox, you may need to import your local login again.'
-                  : 'use it only through a short-lived server relay; the reusable credential is never injected into the sandbox.'}
-              </CardDescription>
-            </div>
-            {provider.id !== 'claude_cli' && provider.local_credential && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => void handleImportLocalCredential()}
-                disabled={importLocalCredentialMutation.isPending}
-              >
-                {importLocalCredentialMutation.isPending ? (
-                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Download className="mr-1.5 h-3.5 w-3.5" />
-                )}
-                {importLocalCredentialMutation.isPending
-                  ? 'Importing…'
-                  : provider.credential_saved
-                    ? 'Replace with local login'
-                    : 'Use local login'}
-              </Button>
-            )}
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {provider.id === 'claude_cli' && (
-            <p className="text-sm text-muted-foreground">
-              Local-login import is not supported for Claude Code. Paste a token
-              from <code>claude setup-token</code> or an Anthropic API key below.
-            </p>
           )}
-          {provider.id !== 'claude_cli' && provider.local_credential && (
-            <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
-              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>
-                Temps found an authenticated {provider.name} credential in{' '}
-                {provider.local_credential.label.toLowerCase()}. Importing it
-                copies the credential directly into encrypted settings without
-                exposing it to this browser.
-              </span>
-            </div>
-          )}
-          {provider.auth_flavors.length > 1 && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {usesConnectionCards && !connectionMethod && (
+            <div
+              className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
+              aria-label="Connection methods"
+            >
+              {provider.id === 'codex_cli' && (
+                <button
+                  type="button"
+                  className="rounded-lg border p-4 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => chooseConnectionMethod('local')}
+                >
+                  <Download className="mb-3 size-5" />
+                  <p className="font-medium">Use local login</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {provider.local_credential
+                      ? 'Detected on the Temps host. Verify and import it securely.'
+                      : 'Connect using a Codex login on the Temps host.'}
+                  </p>
+                </button>
+              )}
               {provider.auth_flavors.map((flavor) => (
                 <button
                   key={flavor.id}
                   type="button"
-                  onClick={() => setSelectedFlavorId(flavor.id)}
-                  className={`rounded-md border p-2.5 text-left transition-colors ${
-                    selectedFlavorId === flavor.id
-                      ? 'border-primary bg-primary/10'
-                      : 'border-border hover:border-primary/50'
-                  }`}
+                  className="rounded-lg border p-4 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => chooseConnectionMethod(flavor.id)}
                 >
-                  <p className="text-xs font-medium">{flavor.label}</p>
-                  <p className="text-[11px] text-muted-foreground mt-0.5">
-                    {flavor.description}
+                  <AiHarnessLogo providerId={provider.id} size={20} />
+                  <p className="mt-3 font-medium">
+                    {flavor.format === 'api_key'
+                      ? provider.id === 'codex_cli'
+                        ? 'OpenAI API key'
+                        : 'Anthropic API key'
+                      : 'Subscription'}
+                  </p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {flavor.format === 'api_key'
+                      ? 'Connect with a pay-as-you-go API key.'
+                      : provider.id === 'codex_cli'
+                        ? 'Paste your ChatGPT subscription auth.json.'
+                        : 'Paste a token from claude setup-token.'}
                   </p>
                 </button>
               ))}
             </div>
           )}
-
-          <div className="space-y-2">
-            <Label htmlFor={`cred-${provider.id}`}>
-              {selectedFlavor.label} credential
-              {selectedFlavor.env_var && (
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  → injected as {selectedFlavor.env_var}
-                </span>
-              )}
-            </Label>
-            <p className="text-xs text-muted-foreground">
-              {selectedFlavor.description}
-            </p>
-            {selectedFlavor.format === 'config_file' ? (
-              <Textarea
-                id={`cred-${provider.id}`}
-                placeholder={
-                  provider.credential_saved
-                    ? '••••••••••••• (saved — paste a new file body to replace)'
-                    : 'Paste the full file contents here...'
-                }
-                value={credential}
-                onChange={(e) => setCredential(e.target.value)}
-                className="min-h-[140px] font-mono text-xs"
-              />
-            ) : (
-              <Input
-                id={`cred-${provider.id}`}
-                type="password"
-                placeholder={
-                  provider.credential_saved
-                    ? '••••••••••••• (saved — paste a new value to replace)'
-                    : selectedFlavor.format === 'oauth_token'
-                      ? 'Paste OAuth token...'
-                      : 'Paste API key...'
-                }
-                value={credential}
-                onChange={(e) => setCredential(e.target.value)}
-              />
-            )}
-            <div className="flex justify-end">
+          {usesConnectionCards && connectionMethod && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={saving || importLocalCredentialMutation.isPending}
+              onClick={() => chooseConnectionMethod(null)}
+            >
+              Choose another method
+            </Button>
+          )}
+          {usesConnectionCards && connectionMethod === 'local' && (
+            <div className="space-y-3">
+              <h3 className="font-medium">Use local Codex login</h3>
+              <p className="text-sm text-muted-foreground">
+                {provider.local_credential
+                  ? 'A login was detected on the Temps host. Verification imports it without exposing the credential to this browser.'
+                  : 'Run codex login on the Temps host as the user running Temps, then reload to detect it.'}
+              </p>
               <Button
                 type="button"
+                disabled={
+                  !provider.local_credential ||
+                  saving ||
+                  importLocalCredentialMutation.isPending
+                }
+                onClick={() => void handleImportLocalCredential()}
+              >
+                {importLocalCredentialMutation.isPending
+                  ? 'Verifying…'
+                  : provider.credential_saved
+                    ? 'Verify & replace login'
+                    : 'Verify & connect'}
+              </Button>
+              {credentialError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {credentialError}
+                </p>
+              )}
+            </div>
+          )}
+          {(!usesConnectionCards ||
+            (connectionMethod && connectionMethod !== 'local')) && (
+            <>
+              {!embedded && !usesConnectionCards && (
+                <p className="text-sm text-muted-foreground">
+                  Run login commands on the machine hosting Temps, as the
+                  operating-system user running Temps—not in the workspace
+                  terminal. Then import the detected login or paste a credential
+                  below.
+                </p>
+              )}
+              <details
+                open={
+                  !usesConnectionCards &&
+                  !embedded &&
+                  !provider.credential_saved
+                }
+                className={
+                  embedded ? 'text-sm' : 'rounded-md border p-3 text-sm'
+                }
+              >
+                <summary className="cursor-pointer font-medium">
+                  {embedded
+                    ? 'How do I get a credential?'
+                    : 'Login instructions'}
+                </summary>
+                <div className="space-y-2 pt-3">
+                  {embedded && provider.id !== 'claude_cli' && (
+                    <p className="text-muted-foreground">
+                      Run these commands on the Temps host as the user running
+                      Temps, not in the workspace terminal.
+                    </p>
+                  )}
+                  <p className="text-muted-foreground">
+                    Install the CLI if needed:
+                  </p>
+                  <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                    {provider.install_command}
+                  </pre>
+                  <p className="text-muted-foreground">
+                    {provider.id === 'claude_cli'
+                      ? 'Create a Claude token, then paste it below (or use an Anthropic API key):'
+                      : 'Authenticate, then reload this page to detect the local login:'}
+                  </p>
+                  <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                    {provider.id === 'claude_cli'
+                      ? 'claude setup-token'
+                      : provider.auth_command}
+                  </pre>
+                </div>
+              </details>
+              {!embedded &&
+                !usesConnectionCards &&
+                provider.id === 'claude_cli' && (
+                  <p className="text-sm text-muted-foreground">
+                    Local-login import is not supported for Claude Code. Paste a
+                    token from <code>claude setup-token</code> or an Anthropic
+                    API key below.
+                  </p>
+                )}
+              {provider.id !== 'claude_cli' && provider.local_credential && (
+                <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    Temps found a local {provider.name} credential in{' '}
+                    {provider.local_credential.label.toLowerCase()}. Importing
+                    it copies the credential directly into encrypted settings
+                    without exposing it to this browser.
+                  </span>
+                </div>
+              )}
+              <Tabs
+                value={selectedFlavorId}
+                onValueChange={setSelectedFlavorId}
+              >
+                {!usesConnectionCards && provider.auth_flavors.length > 1 && (
+                  <TabsList
+                    aria-label="Authentication method"
+                    className="h-auto flex-wrap justify-start"
+                  >
+                    {provider.auth_flavors.map((flavor) => (
+                      <TabsTrigger
+                        key={flavor.id}
+                        value={flavor.id}
+                        disabled={saving}
+                      >
+                        {flavor.label}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                )}
+
+                <TabsContent
+                  value={selectedFlavorId}
+                  className="space-y-2 mt-4"
+                >
+                  <Label htmlFor={`cred-${provider.id}`}>
+                    {selectedFlavor.id
+                      ? `${selectedFlavor.label} credential`
+                      : 'Credential'}
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    {selectedFlavor.description}
+                  </p>
+                  {selectedFlavor.format === 'config_file' ? (
+                    <Textarea
+                      id={`cred-${provider.id}`}
+                      disabled={saving}
+                      placeholder={
+                        provider.credential_saved
+                          ? '••••••••••••• (saved — paste a new file body to replace)'
+                          : 'Paste the full file contents here...'
+                      }
+                      value={credential}
+                      onChange={(e) => setCredential(e.target.value)}
+                      className="min-h-[140px] font-mono text-xs"
+                    />
+                  ) : (
+                    <Input
+                      id={`cred-${provider.id}`}
+                      disabled={saving}
+                      type="password"
+                      placeholder={
+                        provider.credential_saved
+                          ? '••••••••••••• (saved — paste a new value to replace)'
+                          : selectedFlavor.format === 'oauth_token'
+                            ? 'Paste OAuth token...'
+                            : 'Paste API key...'
+                      }
+                      value={credential}
+                      onChange={(e) => setCredential(e.target.value)}
+                    />
+                  )}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-sm text-muted-foreground">
+                      {saving
+                        ? 'Checking the harness in a temporary sandbox…'
+                        : 'Verification sends a small test request and may use your provider allowance.'}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSave}
+                      disabled={
+                        saving || !credential.trim() || !selectedFlavor.id
+                      }
+                    >
+                      {saving ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                      ) : (
+                        <Save className="h-3.5 w-3.5 mr-1.5" />
+                      )}
+                      {saving ? 'Verifying…' : 'Verify & save'}
+                    </Button>
+                  </div>
+                  {credentialError && (
+                    <p
+                      role="alert"
+                      className="text-sm text-destructive break-words"
+                    >
+                      {credentialError}
+                    </p>
+                  )}
+                </TabsContent>
+              </Tabs>
+            </>
+          )}
+          {!embedded && !usesConnectionCards && (
+            <div className="space-y-2">
+              <p className="text-sm text-muted-foreground">
+                Optional: check the CLI installation and authentication in the
+                configured execution environment. This does not verify a reply
+                in your persistent workspace.
+              </p>
+              <Button
                 variant="outline"
                 size="sm"
-                onClick={handleSave}
-                disabled={saving || !credential.trim()}
+                onClick={() => void handleTest()}
+                disabled={testing || !provider.credential_saved}
               >
-                {saving ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                {testing ? (
+                  <Loader2 className="size-4 animate-spin" />
                 ) : (
-                  <Save className="h-3.5 w-3.5 mr-1.5" />
-                )}
-                Save credential
+                  <Play className="size-4" />
+                )}{' '}
+                {testing ? 'Checking…' : 'Check environment'}
               </Button>
             </div>
-          </div>
-
+          )}
           {testResult && (
             <div
+              role="status"
               className={`rounded-md border p-3 text-xs space-y-1 ${
                 testResult.passed
                   ? 'border-green-500/30 bg-green-500/5'
@@ -642,7 +944,9 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                 ) : (
                   <XCircle className="h-3.5 w-3.5 text-red-500" />
                 )}
-                {testResult.passed ? 'Connected' : 'Test failed'}
+                {testResult.passed
+                  ? 'Environment check passed'
+                  : 'Environment check failed'}
                 <span className="text-muted-foreground font-normal">
                   ({testResult.environment})
                 </span>
@@ -660,6 +964,11 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                   Auth: {testResult.auth_info}
                 </p>
               )}
+              {testResult.detail && (
+                <pre className="whitespace-pre-wrap break-words text-xs">
+                  {testResult.detail}
+                </pre>
+              )}
               {testResult.setup_hint && (
                 <p className="text-muted-foreground">{testResult.setup_hint}</p>
               )}
@@ -668,125 +977,177 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <CardTitle className="text-base">Default model</CardTitle>
-              <CardDescription>
-                {provider.workspace_ready
-                  ? 'Leave blank to let the CLI pick. Refresh checks which models the saved workspace credential can run inside a short-lived isolated sandbox.'
-                  : provider.id === 'opencode'
-                    ? 'OpenCode resolves models from its configured providers. Refresh asks the authenticated CLI on the Temps host for the current list.'
-                    : 'Leave blank to let the CLI pick. Refresh asks the authenticated CLI installed on the Temps host which models this account can run.'}
-              </CardDescription>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {provider.models_refreshed_at
-                  ? `Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()} · ${provider.model_source.replace('_', ' ')}`
-                  : provider.workspace_ready
-                    ? 'Bootstrap catalog — not yet verified with the saved workspace credential.'
-                    : 'Bootstrap catalog — not yet verified against the authenticated host CLI.'}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              {savingModel && (
-                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                  Saving…
-                </span>
-              )}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => void handleRefreshModels()}
-                disabled={refreshModelsMutation.isPending}
-              >
-                <RefreshCw
-                  className={`mr-1.5 h-3.5 w-3.5 ${refreshModelsMutation.isPending ? 'animate-spin' : ''}`}
-                />
-                {refreshModelsMutation.isPending
-                  ? 'Refreshing…'
-                  : 'Refresh models'}
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {savedModelUnavailable && (
-            <div
-              role="alert"
-              className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
-            >
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>
-                The saved model <code>{serverModel}</code> was not reported by
-                the refreshed CLI. Choose an available model or use the provider
-                default before starting another turn.
-              </span>
-            </div>
-          )}
-          {provider.models.length > 0 && !customMode ? (
-            <Select
-              value={modelDraft === '' ? '_default' : modelDraft}
-              onValueChange={(v) => {
-                if (v === '_custom') {
-                  setCustomMode(true)
-                  return
-                }
-                const next = v === '_default' ? '' : v
-                setModelDraft(next)
-                void persistModel(next)
-              }}
-            >
-              <SelectTrigger id={`model-${provider.id}`}>
-                <SelectValue placeholder="Use provider default" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="_default">Use provider default</SelectItem>
-                {provider.models.map((model) => (
-                  <SelectItem key={model} value={model}>
-                    {model}
-                  </SelectItem>
-                ))}
-                <SelectItem value="_custom">Custom model…</SelectItem>
-              </SelectContent>
-            </Select>
-          ) : (
-            <div className="flex gap-2">
-              <Input
-                id={`model-${provider.id}`}
-                placeholder={
-                  provider.id === 'claude_cli'
-                    ? 'e.g. claude-sonnet-4-6'
-                    : provider.id === 'codex_cli'
-                      ? 'e.g. gpt-5-codex'
+      {!embedded && (
+        <>
+          <Card>
+            <CardHeader>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <CardTitle className="text-base">2. Choose a model</CardTitle>
+                  <CardDescription>
+                    {provider.workspace_ready
+                      ? 'Leave blank to let the CLI pick. Refresh checks which models the saved workspace credential can run inside a short-lived isolated sandbox.'
                       : provider.id === 'opencode'
-                        ? 'e.g. anthropic/claude-sonnet-4-6'
-                        : 'Model id'
-                }
-                value={modelDraft}
-                onChange={(e) => setModelDraft(e.target.value)}
-              />
-              {provider.models.length > 0 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setCustomMode(false)
-                    setModelDraft(serverModel)
+                        ? 'OpenCode resolves models from its configured providers. Refresh asks the authenticated CLI on the Temps host for the current list.'
+                        : 'Leave blank to let the CLI pick. Refresh asks the authenticated CLI installed on the Temps host which models this account can run.'}
+                  </CardDescription>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {provider.models_refreshed_at
+                      ? `Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()} · ${provider.model_source.replace('_', ' ')}`
+                      : provider.workspace_ready
+                        ? 'Bootstrap catalog — not yet verified with the saved workspace credential.'
+                        : 'Bootstrap catalog — not yet verified against the authenticated host CLI.'}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {savingModel && (
+                    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Saving…
+                    </span>
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleRefreshModels()}
+                    disabled={refreshModelsMutation.isPending}
+                  >
+                    <RefreshCw
+                      className={`mr-1.5 h-3.5 w-3.5 ${refreshModelsMutation.isPending ? 'animate-spin' : ''}`}
+                    />
+                    {refreshModelsMutation.isPending
+                      ? 'Refreshing…'
+                      : 'Refresh models'}
+                  </Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {savedModelUnavailable && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+                >
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    The saved model <code>{serverModel}</code> was not reported
+                    by the refreshed CLI. Choose an available model or use the
+                    provider default before starting another turn.
+                  </span>
+                </div>
+              )}
+              {provider.models.length > 0 && !customMode ? (
+                <Select
+                  value={modelDraft === '' ? '_default' : modelDraft}
+                  onValueChange={(v) => {
+                    if (v === '_custom') {
+                      setCustomMode(true)
+                      return
+                    }
+                    const next = v === '_default' ? '' : v
+                    setModelDraft(next)
+                    void persistModel(next)
                   }}
                 >
-                  Cancel
-                </Button>
+                  <SelectTrigger id={`model-${provider.id}`}>
+                    <SelectValue placeholder="Use provider default" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="_default">
+                      Use provider default
+                    </SelectItem>
+                    {provider.models.map((model) => (
+                      <SelectItem key={model} value={model}>
+                        {model}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="_custom">Custom model…</SelectItem>
+                  </SelectContent>
+                </Select>
+              ) : (
+                <div className="flex gap-2">
+                  <Input
+                    id={`model-${provider.id}`}
+                    placeholder={
+                      provider.id === 'claude_cli'
+                        ? 'e.g. claude-sonnet-4-6'
+                        : provider.id === 'codex_cli'
+                          ? 'e.g. gpt-5-codex'
+                          : provider.id === 'opencode'
+                            ? 'e.g. anthropic/claude-sonnet-4-6'
+                            : 'Model id'
+                    }
+                    value={modelDraft}
+                    onChange={(e) => setModelDraft(e.target.value)}
+                  />
+                  {provider.models.length > 0 && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setCustomMode(false)
+                        setModelDraft(serverModel)
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
               )}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+            </CardContent>
+          </Card>
 
-      <TurnLimitsCard provider={provider} />
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">
+                3. Verify your first workspace reply
+              </CardTitle>
+              <CardDescription>
+                Return to your workspace, select this harness, and send “Reply
+                with OK. Do not run tools.” A successful reply verifies the
+                selected model and workspace together. This may use your
+                provider allowance.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                For your first task, use Ask each time to review tool approvals.
+                Auto lets the harness run tools without per-command approval
+                inside the workspace; choose it only when you trust the task.
+              </p>
+              <Button asChild variant="outline" size="sm">
+                <Link to={returnTo}>Open workspace to verify</Link>
+              </Button>
+            </CardContent>
+          </Card>
+          <details className="rounded-lg border p-4">
+            <summary className="cursor-pointer text-sm font-medium">
+              Advanced: instance default and autofix limits
+            </summary>
+            <div className="space-y-4 pt-4">
+              <p className="text-sm text-muted-foreground">
+                The instance default affects server-side workflows. It does not
+                change the harness selected in an existing workspace thread.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleActivate()}
+                disabled={isActive || activating}
+              >
+                {activating
+                  ? 'Saving…'
+                  : isActive
+                    ? 'Instance default'
+                    : 'Use as instance default'}
+              </Button>
+              <TurnLimitsCard provider={provider} />
+            </div>
+          </details>
+        </>
+      )}
     </div>
   )
 }
@@ -847,25 +1208,21 @@ function TurnLimitsCard({ provider }: { provider: ProviderCatalogDto }) {
     }
     setSavingTurns(true)
     try {
-      const res = await fetch(`/api/settings/ai-providers/${provider.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      await updateAiProvider({
+        path: { provider_id: provider.id },
+        body,
+        throwOnError: true,
       })
-      if (!res.ok) {
-        const detail = await res.text()
-        toast.error(`Failed to save ${provider.name} turn limits`, {
-          description: detail.slice(0, 200),
-        })
-        return
-      }
       toast.success(`${provider.name} turn limits saved`)
       await queryClient.invalidateQueries({
         queryKey: aiProviderCatalogQueryOptions.queryKey,
       })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} turn limits`, {
-        description: e instanceof Error ? e.message : 'Network error',
+        description: problemDetail(
+          e,
+          'The request failed. Check your connection and permissions, then retry.'
+        ),
       })
     } finally {
       setSavingTurns(false)

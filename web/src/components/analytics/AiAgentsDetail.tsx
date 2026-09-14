@@ -24,6 +24,12 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
+import {
+  nextTableSort,
+  sortTableRows,
+  type TableSort,
+} from '@/lib/client-table-sort'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -60,6 +66,9 @@ interface AiAgentsDetailProps {
   defaultGroupBy?: 'provider' | 'agent'
 }
 
+type AgentSortKey = 'label' | 'uniqueIps' | 'count'
+type PageSortKey = 'path' | 'agentCount' | 'requestCount'
+
 /**
  * AI agent traffic surface. In `overview` mode it shows the timeline chart and
  * the breakdown card grid; in `tables` mode it shows the full ranked, searchable
@@ -83,6 +92,14 @@ export function AiAgentsDetail({
   )
   const [agentSearch, setAgentSearch] = React.useState('')
   const [pageSearch, setPageSearch] = React.useState('')
+  const [agentSort, setAgentSort] = React.useState<TableSort<AgentSortKey>>({
+    key: 'count',
+    direction: 'desc',
+  })
+  const [pageSort, setPageSort] = React.useState<TableSort<PageSortKey>>({
+    key: 'requestCount',
+    direction: 'desc',
+  })
   // Which page row is expanded to show its per-agent breakdown.
   const [expandedPath, setExpandedPath] = React.useState<string | null>(null)
 
@@ -307,6 +324,14 @@ export function AiAgentsDetail({
     )
   }, [agentRows, agentSearch])
 
+  const sortedAgents = React.useMemo(() => {
+    return sortTableRows(
+      filteredAgents,
+      (row) => row[agentSort.key],
+      agentSort.direction
+    )
+  }, [agentSort, filteredAgents])
+
   const pageRows = React.useMemo(() => {
     const items = pagesQuery.data?.items ?? []
     if (items.length === 0) return []
@@ -325,6 +350,14 @@ export function AiAgentsDetail({
     if (!q) return pageRows
     return pageRows.filter((r) => r.path.toLowerCase().includes(q))
   }, [pageRows, pageSearch])
+
+  const sortedPages = React.useMemo(() => {
+    return sortTableRows(
+      filteredPages,
+      (row) => row[pageSort.key],
+      pageSort.direction
+    )
+  }, [filteredPages, pageSort])
 
   const totalAiRequests = React.useMemo(
     () => agentRows.reduce((sum, r) => sum + r.count, 0),
@@ -539,22 +572,48 @@ export function AiAgentsDetail({
                   <Table className="w-full">
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="whitespace-nowrap">
-                          {groupBy === 'agent' ? 'Agent' : 'Provider'}
-                        </TableHead>
+                        <SortableTableHead
+                          label={groupBy === 'agent' ? 'Agent' : 'Provider'}
+                          active={agentSort.key === 'label'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'label')
+                            )
+                          }
+                          className="whitespace-nowrap"
+                        />
                         <TableHead className="hidden whitespace-nowrap sm:table-cell">
                           Share
                         </TableHead>
-                        <TableHead className="whitespace-nowrap text-right">
-                          Unique IPs
-                        </TableHead>
-                        <TableHead className="whitespace-nowrap text-right">
-                          Requests
-                        </TableHead>
+                        <SortableTableHead
+                          label="Unique IPs"
+                          active={agentSort.key === 'uniqueIps'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'uniqueIps')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                        <SortableTableHead
+                          label="Requests"
+                          active={agentSort.key === 'count'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'count')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {filteredAgents.map((row) => (
+                      {sortedAgents.map((row) => (
                         <TableRow
                           key={`${row.provider}-${row.label}`}
                           className="cursor-pointer hover:bg-muted/50"
@@ -646,22 +705,48 @@ export function AiAgentsDetail({
                     <TableHeader>
                       <TableRow>
                         <TableHead className="w-8" />
-                        <TableHead className="whitespace-nowrap">
-                          Path
-                        </TableHead>
+                        <SortableTableHead
+                          label="Path"
+                          active={pageSort.key === 'path'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'path')
+                            )
+                          }
+                          className="whitespace-nowrap"
+                        />
                         <TableHead className="hidden whitespace-nowrap sm:table-cell">
                           Share
                         </TableHead>
-                        <TableHead className="whitespace-nowrap text-right">
-                          Agents
-                        </TableHead>
-                        <TableHead className="whitespace-nowrap text-right">
-                          Requests
-                        </TableHead>
+                        <SortableTableHead
+                          label="Agents"
+                          active={pageSort.key === 'agentCount'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'agentCount')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                        <SortableTableHead
+                          label="Requests"
+                          active={pageSort.key === 'requestCount'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'requestCount')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {filteredPages.map((row) => {
+                      {sortedPages.map((row) => {
                         const isExpanded = expandedPath === row.path
                         return (
                           <React.Fragment key={row.path}>

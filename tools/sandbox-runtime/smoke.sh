@@ -9,6 +9,13 @@ if ! docker info >/dev/null 2>&1; then
   echo 'SKIP: Docker is unavailable; no lifecycle checks ran'
   exit 0
 fi
+if [ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]; then
+  actual_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
+  if [ "$actual_platform" != "$DOCKER_DEFAULT_PLATFORM" ]; then
+    echo "ERROR: expected $DOCKER_DEFAULT_PLATFORM image, found $actual_platform"
+    exit 1
+  fi
+fi
 suffix="$(date +%s)-$$"
 container="temps-runtime-smoke-$suffix"
 volume="temps-runtime-smoke-$suffix"
@@ -24,7 +31,7 @@ docker volume create "$volume" >/dev/null
 created_volume=1
 start_container() {
   docker run -d --name "$container" --network none --read-only \
-    --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m \
+    --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges --pids-limit 128 --memory 512m \
     --tmpfs /tmp:rw,nosuid,nodev,size=32m \
     --tmpfs /home/temps:rw,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700 \
     --tmpfs /run/temps-runtime:rw,nosuid,nodev,size=8m,uid=1000,gid=1000,mode=0700 \
@@ -43,6 +50,13 @@ docker exec "$container" temps-sandbox-runtime check
 rpc '{"version":1,"operation":{"type":"health"}}' | jq -e '.version == 1'
 rpc '{"version":1,"operation":{"type":"health"}}' | jq -e '.capabilities | index("atomic_process_start") != null'
 rpc '{"version":1,"operation":{"type":"health"}}' | jq -e '.capabilities | index("retained_runtime") != null'
+rpc '{"version":1,"operation":{"type":"health"}}' | jq -e '.capabilities | index("recover_harness") != null'
+# Image publication must exercise the same command the host uses before turns.
+# Sandbox-owned code must never be allowed to reclaim host-owned harnesses.
+if docker exec "$container" temps-sandbox-runtime recover-harness 1; then
+  echo 'ERROR: unprivileged harness recovery succeeded'; exit 1
+fi
+docker exec --user 0:0 "$container" temps-sandbox-runtime recover-harness 1
 docker exec "$container" id -u | jq -e '. == 1000'
 docker exec "$container" codex --version
 docker exec "$container" claude --version
@@ -82,4 +96,4 @@ docker rm "$container" >/dev/null
 created_container=0
 start_container
 docker exec "$container" node -e 'if(require("fs").readFileSync("persisted.txt","utf8")!=="survives replacement")process.exit(1)'
-echo 'PASS: retained SDK acquire/reconnect/attach/dispose/not-found, legacy process independence, atomic start replay/conflict, HTTP after client disconnect, logs, restart, stop, version rejection, graceful shutdown, volume-preserving replacement'
+echo 'PASS: root-only harness recovery, retained SDK acquire/reconnect/attach/dispose/not-found, legacy process independence, atomic start replay/conflict, HTTP after client disconnect, logs, restart, stop, version rejection, graceful shutdown, volume-preserving replacement'

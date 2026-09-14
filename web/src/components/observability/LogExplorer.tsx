@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
+import { AnsiLogMessage } from './AnsiLogMessage'
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { GlobalLogLine } from '@/api/client/types.gen'
@@ -17,7 +18,6 @@ import {
 import { Download, WrapText, X, Columns3 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-import { LogVolume } from './LogVolume'
 import { Input } from '@/components/ui/input'
 import {
   DropdownMenu,
@@ -44,7 +44,6 @@ export function LogExplorer({
   toolbar,
   footer,
   status,
-  onRange,
   onInspect,
 }: {
   lines: GlobalLogLine[]
@@ -52,7 +51,6 @@ export function LogExplorer({
   toolbar?: ReactNode
   footer?: ReactNode
   status?: ReactNode
-  onRange: (from: string, to: string) => void
   onInspect?: () => void
 }) {
   const [params, setParams] = useSearchParams()
@@ -160,8 +158,7 @@ export function LogExplorer({
     <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_264px]">
       <section aria-label="Log explorer" className="min-w-0">
         {toolbar}
-        <LogVolume lines={lines} onRange={onRange} />
-        <div className="flex flex-wrap items-center justify-between gap-2 border-y py-2">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-y py-2">
           <span className="text-xs text-muted-foreground">
             {lines.length} loaded {lines.length === 1 ? 'line' : 'lines'} ·
             newest first
@@ -364,7 +361,7 @@ export function LogExplorer({
                             wrap ? 'whitespace-pre-wrap break-all' : 'truncate'
                           )}
                         >
-                          {entry.message}
+                          <AnsiLogMessage message={entry.message} />
                         </button>
                       </TableCell>
                       {columns
@@ -426,7 +423,7 @@ export function LogExplorer({
             {new Date(line.timestamp).toLocaleString()}
           </time>
           <pre className="my-3 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs">
-            {line.message}
+            <AnsiLogMessage message={line.message} />
           </pre>
           <CopyButton
             value={line.message}

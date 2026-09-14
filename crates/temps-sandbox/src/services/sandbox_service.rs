@@ -224,16 +224,16 @@ pub struct ApplicationWorkspaceConfig {
 /// image is NULL.
 pub fn managed_application_workspace_image(runtime: &str) -> Option<&'static str> {
     match runtime {
-        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2"),
-        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2"),
-        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2"),
+        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4"),
+        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4"),
+        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.4"),
         _ => None,
     }
 }
 
 pub fn is_managed_application_workspace_image(image: &str) -> bool {
     ["nodejs", "python", "all"].iter().any(|flavor| {
-        ["0.2.0", "0.3.0", "0.3.1", "0.3.2"]
+        ["0.2.0", "0.3.0", "0.3.1", "0.3.2", "0.3.3", "0.3.4"]
             .iter()
             .any(|version| image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:{version}"))
     }) || image == "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
@@ -296,11 +296,11 @@ fn managed_application_id_from_name(name: &str) -> Option<&str> {
         .filter(|application_id| !application_id.is_empty())
 }
 
-fn application_workspace_row_is_attested(
+fn application_workspace_identity_is_attested(
     row: &sandboxes::Model,
+    user_id: i32,
     application_public_id: &str,
     host_work_dir: &Path,
-    config: &ApplicationWorkspaceConfig,
 ) -> bool {
     let metadata = row.metadata.as_ref().and_then(serde_json::Value::as_object);
     let attested_application = metadata
@@ -309,11 +309,32 @@ fn application_workspace_row_is_attested(
     let attested_work_dir = metadata
         .and_then(|value| value.get("managed_host_work_dir"))
         .and_then(serde_json::Value::as_str);
-    attested_application == Some(application_public_id)
+    row.user_id == Some(user_id)
+        && row.agent_run_id.is_none()
+        && public_id::is_valid(&row.public_id)
+        && row.name == format!("{APPLICATION_WORKSPACE_NAME_PREFIX}{application_public_id}")
+        && attested_application == Some(application_public_id)
         && attested_work_dir == host_work_dir.to_str()
         && row.lifecycle == "workspace"
         && row.work_dir == temps_agents::sandbox::SANDBOX_WORK_DIR
-        && row.image == config.image
+        && row
+            .image
+            .as_deref()
+            .is_some_and(is_managed_application_workspace_image)
+}
+
+fn application_workspace_config_has_drift(
+    row: &sandboxes::Model,
+    config: &ApplicationWorkspaceConfig,
+) -> bool {
+    row.image != config.image
+        || row.timeout_secs != config.idle_timeout_secs as i32
+        || row
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("disk_size_mb"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|disk_size_mb| disk_size_mb != config.disk_limit_mb)
 }
 
 const APPLICATION_WORKSPACE_USAGE_COMMAND: &str = "memory=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true); pids=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || true); cpu=$(sed -n 's/^usage_usec //p' /sys/fs/cgroup/cpu.stat 2>/dev/null || true); disk=$(du -sb /home/temps/workspace 2>/dev/null | awk 'NR==1 {print $1}'); ports=$(if command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://'; else for socket_table in /proc/net/tcp /proc/net/tcp6; do test -r \"$socket_table\" || continue; awk 'NR > 1 && $4 == \"0A\" {split($2, address, \":\"); print address[2]}' \"$socket_table\"; done | while IFS= read -r hex_port; do printf '%d\\n' \"0x$hex_port\"; done; fi | sort -nu | paste -sd, -); printf 'memory=%s\\n' \"$memory\"; printf 'pids=%s\\n' \"$pids\"; printf 'cpu=%s\\n' \"$cpu\"; printf 'disk=%s\\n' \"$disk\"; printf 'ports=%s\\n' \"$ports\"";
@@ -1716,27 +1737,54 @@ impl SandboxService {
         }
 
         let name = format!("{APPLICATION_WORKSPACE_NAME_PREFIX}{application_public_id}");
-        let mut existing = sandboxes::Entity::find()
+        let existing = sandboxes::Entity::find()
             .filter(sandboxes::Column::UserId.eq(Some(user_id)))
             .filter(sandboxes::Column::Name.eq(&name))
             .filter(sandboxes::Column::Status.ne("destroyed"))
             .one(self.db.as_ref())
             .await?;
-        if existing.as_ref().is_some_and(|row| {
-            !application_workspace_row_is_attested(
+        if let Some(row) = existing.as_ref() {
+            if !application_workspace_identity_is_attested(
                 row,
+                user_id,
                 application_public_id,
                 &host_work_dir,
-                &config,
-            )
-        }) {
-            if let Some(untrusted) = existing.take() {
-                tracing::warn!(
-                    sandbox_id = %untrusted.public_id,
+            ) {
+                return Err(SandboxError::InvalidState {
+                    sandbox_id: row.public_id.clone(),
+                    state: "managed workspace identity or host path is not attested".to_string(),
+                    operation: "reuse application workspace".to_string(),
+                });
+            }
+            if !config
+                .image
+                .as_deref()
+                .is_some_and(is_managed_application_workspace_image)
+            {
+                return Err(SandboxError::Validation {
+                    message: format!(
+                        "application workspace '{}' requires a managed runtime image",
+                        row.public_id
+                    ),
+                });
+            }
+            if application_workspace_config_has_drift(row, &config)
+                && config.desired_state == "running"
+            {
+                tracing::info!(
+                    sandbox_id = %row.public_id,
                     application_id = %application_public_id,
-                    "Replacing unattested or configuration-mismatched application workspace compute"
+                    old_image = ?row.image,
+                    requested_image = ?config.image,
+                    "Rebuilding attested application workspace compute while retaining its identity and home volume"
                 );
-                self.destroy_sandbox(&untrusted.public_id, user_id).await?;
+                self.rebuild_application_workspace_locked(
+                    user_id,
+                    &row.public_id,
+                    host_work_dir.clone(),
+                    config.clone(),
+                )
+                .await?;
             }
         }
         let sandbox_public_id = if let Some(mut existing) = existing {
@@ -4186,22 +4234,33 @@ mod tests {
 
     #[test]
     fn application_workspace_runtimes_resolve_to_managed_daemon_images() {
+        // A candidate can pass runtime preflight but fail persistence if its
+        // pinned tag is absent from the database image CHECK constraint.
+        let migration = include_str!("../../../temps-migrations/src/migration/m20260913_000002_managed_daemon_workspace_images_v034.rs");
+        for runtime in ["node", "bun", "python", "rust", "go", "full"] {
+            let image = managed_application_workspace_image(runtime)
+                .expect("managed runtime must resolve to an image");
+            assert!(
+                migration.contains(&format!("'{image}'")),
+                "migration does not allow {image}"
+            );
+        }
         assert_eq!(
             managed_application_workspace_image("node"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4")
         );
         assert_eq!(
             managed_application_workspace_image("bun"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4")
         );
         assert_eq!(
             managed_application_workspace_image("python"),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4")
         );
         for runtime in ["rust", "go", "full"] {
             assert_eq!(
                 managed_application_workspace_image(runtime),
-                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.2")
+                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.4")
             );
         }
         assert_eq!(managed_application_workspace_image("custom"), None);
@@ -4220,6 +4279,12 @@ mod tests {
         ));
         assert!(is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-all:0.3.2"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.3"
+        ));
+        assert!(is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.4"
         ));
         assert!(!is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-nodejs:0.1.0"
@@ -4249,7 +4314,7 @@ mod tests {
         let mapped = ApplicationWorkspaceConfig::from(&row);
         assert_eq!(
             mapped.image.as_deref(),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.2")
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4")
         );
 
         row.image = Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0".to_string());
@@ -4436,19 +4501,45 @@ mod tests {
 
         assert!(config.image.is_some(), "the default image must be attested");
 
-        assert!(application_workspace_row_is_attested(
+        assert!(application_workspace_identity_is_attested(
             &managed,
+            1,
             "app_example",
             &host_work_dir,
-            &config
+        ));
+
+        let old_image = "ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2";
+        managed.image = Some(old_image.to_string());
+        assert!(application_workspace_identity_is_attested(
+            &managed,
+            1,
+            "app_example",
+            &host_work_dir,
+        ));
+        assert!(application_workspace_config_has_drift(&managed, &config));
+
+        managed.user_id = Some(2);
+        assert!(!application_workspace_identity_is_attested(
+            &managed,
+            1,
+            "app_example",
+            &host_work_dir,
+        ));
+        managed.user_id = Some(1);
+        let wrong_path = PathBuf::from("/var/lib/temps/ai-applications/another-app");
+        assert!(!application_workspace_identity_is_attested(
+            &managed,
+            1,
+            "app_example",
+            &wrong_path,
         ));
 
         managed.image = Some("attacker/custom-image:latest".to_string());
-        assert!(!application_workspace_row_is_attested(
+        assert!(!application_workspace_identity_is_attested(
             &managed,
+            1,
             "app_example",
             &host_work_dir,
-            &config
         ));
         assert_eq!(
             managed_application_id_from_name("ai-application:app_example"),
@@ -4966,6 +5057,7 @@ mod storage_cleanup_tests {
         /// `configure_application_network` errors before compute may start.
         fail_network_config: bool,
         destroys: AtomicUsize,
+        destroy_purge_flags: Arc<Mutex<Vec<bool>>>,
         creates: Arc<AtomicUsize>,
         starts: Arc<AtomicUsize>,
         lifecycle_calls: Arc<Mutex<Vec<&'static str>>>,
@@ -4984,6 +5076,7 @@ mod storage_cleanup_tests {
                 fail_start: false,
                 fail_network_config: false,
                 destroys: AtomicUsize::new(0),
+                destroy_purge_flags: Arc::new(Mutex::new(Vec::new())),
                 creates: Arc::new(AtomicUsize::new(0)),
                 starts: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
@@ -5014,9 +5107,9 @@ mod storage_cleanup_tests {
             }
             self.creates.fetch_add(1, Ordering::SeqCst);
             self.alive.store(true, Ordering::SeqCst);
-            Ok(handle_for(
-                config.container_name_override.as_deref().unwrap_or("x"),
-            ))
+            let mut handle = handle_for(config.container_name_override.as_deref().unwrap_or("x"));
+            handle.image = config.image.unwrap_or_default();
+            Ok(handle)
         }
 
         async fn exec(
@@ -5109,9 +5202,13 @@ mod storage_cleanup_tests {
         async fn destroy(
             &self,
             handle: &SandboxHandle,
-            _purge_volumes: bool,
+            purge_volumes: bool,
         ) -> Result<(), AgentError> {
             self.destroys.fetch_add(1, Ordering::SeqCst);
+            self.destroy_purge_flags
+                .lock()
+                .expect("destroy purge flags mutex")
+                .push(purge_volumes);
             if self.fail_destroy {
                 return Err(AgentError::SandboxProviderUnavailable {
                     provider: "fake".into(),
@@ -5314,12 +5411,100 @@ mod storage_cleanup_tests {
             lifecycle: "workspace".to_string(),
             work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             image: ApplicationWorkspaceConfig::default().image,
+            timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
             metadata: Some(serde_json::json!({
                 "managed_application_id": "app_example",
                 "managed_host_work_dir": application_work_dir,
             })),
             ..row(PUBLIC_ID, None)
         }
+    }
+
+    #[tokio::test]
+    async fn untrusted_application_workspace_is_not_destroyed_or_rebuilt() {
+        let data_root = unique_data_root("untrusted-application-workspace");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let host_work_dir = data_root.join("app_example");
+        let mut forged = attested_application_workspace("running", &host_work_dir);
+        forged.metadata = Some(serde_json::json!({
+            "managed_application_id": "app_example",
+            "managed_host_work_dir": data_root.join("another-app"),
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![forged]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let creates = provider.creates.clone();
+        let purge_flags = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .get_or_create_application_workspace_with_config(
+                1,
+                "app_example",
+                None,
+                host_work_dir,
+                ApplicationWorkspaceConfig::default(),
+                &[],
+            )
+            .await
+            .expect_err("forged host path must fail closed");
+        assert!(matches!(error, SandboxError::InvalidState { .. }));
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert!(purge_flags.lock().expect("purge flags").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn managed_image_upgrade_rebuilds_same_workspace_without_purging_home() {
+        let data_root = unique_data_root("managed-image-upgrade");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let host_work_dir = data_root.join("app_example");
+        let mut old = attested_application_workspace("running", &host_work_dir);
+        old.image = Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2".into());
+        let mut rebuilt = old.clone();
+        rebuilt.image = ApplicationWorkspaceConfig::default().image;
+        rebuilt.timeout_secs = ApplicationWorkspaceConfig::default().idle_timeout_secs as i32;
+        rebuilt.metadata = Some(serde_json::json!({
+            "disk_size_mb": ApplicationWorkspaceConfig::default().disk_limit_mb,
+            "managed_application_id": "app_example",
+            "managed_host_work_dir": host_work_dir,
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![old.clone()]])
+            .append_query_results([vec![old]])
+            .append_query_results([vec![rebuilt.clone()]])
+            .append_query_results([vec![rebuilt.clone()]])
+            .append_query_results([vec![rebuilt.clone()]])
+            .append_query_results([Vec::<project_services::Model>::new()])
+            .append_query_results([vec![rebuilt.clone()]])
+            .append_query_results([vec![rebuilt.clone()]])
+            .append_query_results([vec![rebuilt]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let creates = provider.creates.clone();
+        let purge_flags = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let result = service
+            .get_or_create_application_workspace_with_config(
+                1,
+                "app_example",
+                None,
+                host_work_dir,
+                ApplicationWorkspaceConfig::default(),
+                &[],
+            )
+            .await
+            .expect("managed image change should preserve the workspace identity");
+        assert_eq!(result.public_id, PUBLIC_ID);
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(*purge_flags.lock().expect("purge flags"), vec![false]);
+        let _ = std::fs::remove_dir_all(&data_root);
     }
 
     #[tokio::test]
@@ -5422,6 +5607,7 @@ mod storage_cleanup_tests {
             lifecycle: "workspace".to_string(),
             work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
             image: ApplicationWorkspaceConfig::default().image,
+            timeout_secs: ApplicationWorkspaceConfig::default().idle_timeout_secs as i32,
             metadata: Some(serde_json::json!({
                 "managed_application_id": "app_example",
                 "managed_host_work_dir": application_work_dir,

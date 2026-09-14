@@ -9,20 +9,20 @@ import { ReactNode } from 'react'
 export type WizardStepId = 'framework' | 'install' | 'waiting'
 
 interface WizardStep {
-  id: WizardStepId
+  id: string
   label: string
 }
 
 interface SetupWizardShellProps {
   title: string
   description: string
-  currentStep: WizardStepId
+  currentStep: string
   steps: WizardStep[]
   children: ReactNode
   celebrate?: boolean
+  fullWidth?: boolean
+  headerActions?: ReactNode
 }
-
-const STEP_ORDER: WizardStepId[] = ['framework', 'install', 'waiting']
 
 export function SetupWizardShell({
   title,
@@ -31,39 +31,57 @@ export function SetupWizardShell({
   steps,
   children,
   celebrate = false,
+  fullWidth = false,
+  headerActions,
 }: SetupWizardShellProps) {
-  const currentIndex = STEP_ORDER.indexOf(currentStep)
+  const currentIndex = steps.findIndex((step) => step.id === currentStep)
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8 py-4">
+    <div className={cn('w-full', fullWidth ? 'space-y-6' : 'space-y-8 py-4')}>
       <Confetti active={celebrate} duration={2500} particleCount={80} />
 
-      <div className="space-y-2 text-center">
-        <h1 className="text-2xl font-semibold tracking-tight text-balance">
-          {title}
-        </h1>
-        <p className="text-sm text-muted-foreground text-pretty">
-          {description}
-        </p>
+      <div
+        className={cn(fullWidth && 'flex items-start justify-between gap-4')}
+      >
+        <div className={cn('space-y-2', !fullWidth && 'text-center')}>
+          <h1 className="text-2xl font-semibold tracking-tight text-balance">
+            {title}
+          </h1>
+          <p className="text-sm text-muted-foreground text-pretty">
+            {description}
+          </p>
+        </div>
+        {headerActions}
       </div>
 
       <ol
         role="list"
-        className="flex items-center justify-center gap-2 sm:gap-4"
+        aria-label="Setup progress"
+        className={cn(
+          'flex items-center gap-2 sm:gap-4',
+          !fullWidth && 'justify-center'
+        )}
       >
         {steps.map((step, index) => {
-          const stepIndex = STEP_ORDER.indexOf(step.id)
+          const stepIndex = index
           const isDone = stepIndex < currentIndex
           const isActive = step.id === currentStep
           const isLast = index === steps.length - 1
           return (
-            <li key={step.id} className="flex items-center gap-2 sm:gap-4">
+            <li
+              key={step.id}
+              aria-current={isActive ? 'step' : undefined}
+              aria-label={`${step.label}${isDone ? ', completed' : ''}`}
+              className={cn(
+                'flex min-w-0 items-center gap-2 sm:gap-4',
+                fullWidth && !isLast && 'flex-1'
+              )}
+            >
               <div className="flex items-center gap-2">
                 <span
                   className={cn(
                     'flex size-7 shrink-0 items-center justify-center rounded-full border text-xs font-medium tabular-nums transition-colors',
-                    isDone &&
-                      'border-emerald-500 bg-emerald-500 text-white',
+                    isDone && 'border-emerald-500 bg-emerald-500 text-white',
                     isActive &&
                       !isDone &&
                       'border-primary bg-primary text-primary-foreground',
@@ -80,8 +98,9 @@ export function SetupWizardShell({
                 </span>
                 <span
                   className={cn(
-                    'hidden text-sm font-medium sm:inline',
-                    (isDone || isActive)
+                    'hidden text-sm font-medium',
+                    fullWidth ? 'lg:inline' : 'sm:inline',
+                    isDone || isActive
                       ? 'text-foreground'
                       : 'text-muted-foreground'
                   )}
@@ -93,7 +112,8 @@ export function SetupWizardShell({
                 <span
                   aria-hidden
                   className={cn(
-                    'h-px w-8 sm:w-12',
+                    'h-px',
+                    fullWidth ? 'min-w-2 flex-1' : 'w-8 sm:w-12',
                     isDone ? 'bg-emerald-500' : 'bg-border'
                   )}
                 />

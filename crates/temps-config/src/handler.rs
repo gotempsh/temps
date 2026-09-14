@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::disk_status::DiskSpaceCheckResult;
+use crate::service::preserve_provider_credential_proof;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
@@ -167,6 +168,39 @@ impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
     }
 }
 
+/// `FORWARDED_IP_TRUST_UPDATED` — a change to whether Temps trusts
+/// `X-Forwarded-For`/`X-Real-IP` from a loopback reverse proxy.
+///
+/// A separate event from `SETTINGS_UPDATED`, for the same reason as the bulk
+/// activation guard above: this toggle decides which IP address feeds
+/// analytics, proxy logs, and IP-based access-control decisions, so it must
+/// be distinguishable in the audit trail from an unrelated settings save.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ForwardedIpTrustUpdatedAudit {
+    context: AuditContext,
+    previous_enabled: bool,
+    new_enabled: bool,
+}
+
+impl AuditOperation for ForwardedIpTrustUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "FORWARDED_IP_TRUST_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 /// Audit record for a console-triggered platform update. Written before the
 /// process exits, so the trail survives the restart it causes.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -255,6 +289,9 @@ pub struct AppSettingsResponse {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+    /// Database-backed opt-in; this is the sole control surface for every
+    /// proxy process, including a standalone `temps proxy`.
+    pub trust_loopback_forwarded_ip: bool,
 
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
@@ -486,6 +523,7 @@ impl From<AppSettings> for AppSettingsResponse {
         // Resolved before the literal below starts moving fields out of
         // `settings`; absence means "never configured", which reads as default.
         let self_update = settings.self_update();
+        let trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
         Self {
             plugin_installation_reporting_enabled: settings.plugin_installation_reporting_enabled,
             external_url: settings.external_url,
@@ -512,6 +550,7 @@ impl From<AppSettings> for AppSettingsResponse {
             },
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
+            trust_loopback_forwarded_ip,
             docker_registry: DockerRegistrySettingsMasked {
                 enabled: settings.docker_registry.enabled,
                 registry_url: settings.docker_registry.registry_url,
@@ -540,7 +579,13 @@ impl From<AppSettings> for AppSettingsResponse {
                                 auth_type: cfg.auth_type,
                                 credential_saved: cfg.credentials_encrypted.is_some(),
                                 default_model: cfg.default_model,
-                                extra: cfg.extra,
+                                extra: {
+                                    let mut extra = cfg.extra;
+                                    if let Some(object) = extra.as_object_mut() {
+                                        object.remove("credential_verified");
+                                    }
+                                    extra
+                                },
                             },
                         )
                     })
@@ -1791,6 +1836,9 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     if incoming.self_update.is_none() {
         incoming.self_update = current.self_update.clone();
     }
+    if incoming.trust_loopback_forwarded_ip.is_none() {
+        incoming.trust_loopback_forwarded_ip = current.trust_loopback_forwarded_ip;
+    }
 }
 
 fn discard_plugin_reporting_consent(body: &mut serde_json::Value) {
@@ -2406,6 +2454,8 @@ async fn update_settings(
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
+    let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
+
     // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
         if key == "******" {
@@ -2446,8 +2496,8 @@ async fn update_settings(
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
     // so any client round-trip would otherwise wipe them on save. We always
-    // preserve them from the DB unless the incoming payload explicitly sets
-    // them (e.g. a fresh credential save via the AI Providers page).
+    // preserve them from the DB. Provider credentials are only changed through
+    // the dedicated credential endpoint, never through this bulk PUT.
     match app_state.config_service.get_settings().await {
         Ok(current_settings) => {
             // `console_version` is self-recorded state, written only by a starting
@@ -2465,30 +2515,9 @@ async fn update_settings(
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
 
-            // Per-provider credentials: keep existing unless caller supplied a new one
-            for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
-                match settings.agent_sandbox.providers.get_mut(id) {
-                    Some(incoming) => {
-                        // Caller didn't include credentials -> restore from DB
-                        if incoming
-                            .credentials_encrypted
-                            .as_deref()
-                            .map(|s| s.is_empty() || s == "******")
-                            .unwrap_or(true)
-                        {
-                            incoming.credentials_encrypted =
-                                current_cfg.credentials_encrypted.clone();
-                        }
-                    }
-                    None => {
-                        // Caller dropped the provider entry entirely -> put it back
-                        settings
-                            .agent_sandbox
-                            .providers
-                            .insert(id.clone(), current_cfg.clone());
-                    }
-                }
-            }
+            // The dedicated credential endpoint is the only write path for
+            // encrypted provider secrets and native-verification proof.
+            preserve_provider_credential_proof(&mut settings, &current_settings);
             // Legacy flat credential
             if settings
                 .agent_sandbox
@@ -2620,6 +2649,8 @@ async fn update_settings(
 
     normalize_edge_target(&mut settings);
 
+    let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
+
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
             let audit = SettingsUpdatedAudit {
@@ -2664,6 +2695,33 @@ async fn update_settings(
                 if let Err(e) = app_state.audit_service.create_audit_log(&guard_audit).await {
                     error!(
                         "Failed to create the Temps Cloud bulk activation guard audit log: {}",
+                        e
+                    );
+                }
+            }
+
+            if next_trust_loopback_forwarded_ip != previous_trust_loopback_forwarded_ip {
+                info!(
+                    previous_enabled = previous_trust_loopback_forwarded_ip,
+                    new_enabled = next_trust_loopback_forwarded_ip,
+                    "Loopback forwarded-IP trust setting changed"
+                );
+                let forwarded_ip_trust_audit = ForwardedIpTrustUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_enabled: previous_trust_loopback_forwarded_ip,
+                    new_enabled: next_trust_loopback_forwarded_ip,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&forwarded_ip_trust_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the loopback forwarded-IP trust audit log: {}",
                         e
                     );
                 }
@@ -2992,6 +3050,50 @@ mod tests {
         AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
         ProviderConfig,
     };
+
+    #[test]
+    fn general_settings_put_cannot_forge_or_replace_provider_verification() {
+        let mut current = AppSettings::default();
+        current.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "config_file".into(),
+                credentials_encrypted: Some("encrypted-good".into()),
+                extra: serde_json::json!({ "credential_verified": true, "preserved": 1 }),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("encrypted-bad".into()),
+                extra: serde_json::json!({ "credential_verified": false, "user_setting": 2 }),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            ProviderConfig {
+                credentials_encrypted: Some("forged".into()),
+                extra: serde_json::json!({ "credential_verified": true }),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &current);
+        let saved = &incoming.agent_sandbox.providers["opencode"];
+        assert_eq!(
+            saved.credentials_encrypted.as_deref(),
+            Some("encrypted-good")
+        );
+        assert_eq!(saved.auth_type, "config_file");
+        assert_eq!(saved.extra["credential_verified"], true);
+        assert_eq!(saved.extra["user_setting"], 2);
+        let forged = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(forged.credentials_encrypted, None);
+        assert!(forged.extra.get("credential_verified").is_none());
+    }
 
     fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
         let now = chrono::Utc::now();
@@ -3334,6 +3436,37 @@ mod tests {
         assert!(settings.self_update.is_none());
         assert!(settings.self_update().enabled);
         assert_eq!(settings.self_update().channel, None);
+    }
+
+    #[test]
+    fn omitted_forwarded_ip_trust_preserves_admin_choice() {
+        let current = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            ..AppSettings::default()
+        };
+        let mut incoming: AppSettings = serde_json::from_value(serde_json::json!({}))
+            .expect("an older settings client omits the new field");
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        assert!(incoming.trust_loopback_forwarded_ip());
+    }
+
+    #[test]
+    fn explicit_forwarded_ip_trust_false_disables_admin_choice() {
+        let current = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            ..AppSettings::default()
+        };
+        let mut incoming = AppSettings {
+            trust_loopback_forwarded_ip: Some(false),
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        assert!(!incoming.trust_loopback_forwarded_ip());
+        assert!(!AppSettingsResponse::from(incoming).trust_loopback_forwarded_ip);
     }
 
     #[test]

@@ -7,10 +7,30 @@ import {
   patchObservationFilters,
   positiveInteger,
   readObservationWindow,
+  normalizeObservationWindow,
 } from './global-observability'
 
 const now = Date.parse('2026-09-09T12:00:00Z')
 describe('global observability URL state', () => {
+  test('normalizing timestamp format retains the cursor for the same query window', () => {
+    const initial = new URLSearchParams(
+      'from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=next-token'
+    )
+    expect(normalizeObservationWindow(initial, now).get('cursor')).toBe(
+      'next-token'
+    )
+    const frozen = normalizeObservationWindow(new URLSearchParams(), now)
+    frozen.set('cursor', 'next-token')
+    expect(normalizeObservationWindow(frozen, now).get('cursor')).toBe(
+      'next-token'
+    )
+    expect(
+      normalizeObservationWindow(
+        new URLSearchParams('from=invalid&cursor=stale'),
+        now
+      ).has('cursor')
+    ).toBe(false)
+  })
   test('normalizes invalid windows without sending unbounded queries', () => {
     const window = readObservationWindow(
       new URLSearchParams('range=forever&from=invalid&to=invalid'),

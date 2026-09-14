@@ -107,7 +107,7 @@ export default function RequestLogDetail({
 
   if (error) {
     return (
-      <div className="container mx-auto py-6">
+      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
         <Card>
           <CardContent className="pt-6">
             <div className="text-center">
@@ -123,7 +123,7 @@ export default function RequestLogDetail({
   }
 
   return (
-    <div className="container mx-auto py-6 space-y-4">
+    <div className="w-full space-y-4 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-4">
         <Button onClick={handleBack} variant="ghost" size="sm">
           <ArrowLeft className="h-4 w-4 mr-2" />

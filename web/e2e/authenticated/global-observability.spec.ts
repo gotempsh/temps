@@ -505,7 +505,7 @@ test('global log explorer inspects records, exports, and applies API facets', as
   await clearRequest
 })
 
-test('logs reference workspace supports grouping, columns, facets and chart range selection', async ({
+test('logs workspace supports grouping, columns and facets without a page-only volume chart', async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
@@ -535,7 +535,9 @@ test('logs reference workspace supports grouping, columns, facets and chart rang
   await page.goto(
     '/logs?range=custom&from=2026-09-09T11:00:00Z&to=2026-09-09T13:00:00Z'
   )
-  await expect(page.getByText('Volume by level', { exact: true })).toBeVisible()
+  await expect(page.getByText('Volume by level', { exact: true })).toHaveCount(
+    0
+  )
   await expect(
     page.getByRole('columnheader', { name: 'deployment', exact: true })
   ).toBeVisible()
@@ -570,16 +572,7 @@ test('logs reference workspace supports grouping, columns, facets and chart rang
   await expect(page.getByRole('region', { name: 'Level facets' })).toHaveCount(
     0
   )
-  await page.getByRole('button', { name: 'Show volume table' }).click()
-  await page
-    .getByRole('button', { name: /Select time bucket/ })
-    .first()
-    .click()
-  await expect(page).not.toHaveURL(/cursor=/)
-  const params = new URL(page.url()).searchParams
-  expect(Date.parse(params.get('to')!) - Date.parse(params.get('from')!)).toBe(
-    60000
-  )
+  await expect(page.getByRole('region', { name: 'Log volume' })).toHaveCount(0)
 })
 
 test('log key:value autocomplete applies, edits and validates filters', async ({
@@ -671,7 +664,7 @@ test('log autocomplete remains usable on a narrow screen', async ({ page }) => {
 })
 
 for (const theme of ['light', 'dark']) {
-  test(`logs use the shared chart tooltip in ${theme}`, async ({ page }) => {
+  test(`logs render ANSI colors safely in ${theme}`, async ({ page }) => {
     await page.addInitScript(
       (theme) => localStorage.setItem('theme', theme),
       theme
@@ -685,25 +678,22 @@ for (const theme of ['light', 'dark']) {
             ...fixtures.logs.lines[0],
             timestamp: new Date(Date.parse(stamp) + i * 60000).toISOString(),
             line_offset: i,
+            message:
+              '\u001b[31mError <script>unsafe</script>\u001b[0m plain text',
           })),
         },
       })
     )
     await page.goto('/logs')
-    const chart = page.getByRole('region', { name: 'Log volume' })
-    await expect(chart.locator('.recharts-line-curve').first()).toHaveAttribute(
-      'stroke-width',
-      '2'
+    const message = page
+      .getByText('Error <script>unsafe</script>', { exact: true })
+      .first()
+    await expect(message).toBeVisible()
+    await expect(message).toHaveCSS('color', 'rgb(170, 0, 0)')
+    await expect(page.getByRole('region', { name: 'Log volume' })).toHaveCount(
+      0
     )
-    await chart.locator('.recharts-surface').hover()
-    const tooltip = chart.locator('.recharts-tooltip-wrapper')
-    await expect(tooltip).toBeVisible()
-    await expect(tooltip.locator('.rounded-lg')).toBeVisible()
-    await expect(tooltip).toContainText('UTC')
-    await expect(tooltip).not.toContainText('Invalid Date')
     await expect(page.locator('html')).toHaveClass(new RegExp(theme))
-    await chart.screenshot({ path: `/tmp/temps-logs-chart-${theme}.png` })
-    await chart.getByRole('button', { name: 'Show volume table' }).click()
-    await expect(chart.getByRole('table')).toBeVisible()
+    await page.screenshot({ path: `/tmp/temps-logs-ansi-${theme}.png` })
   })
 }

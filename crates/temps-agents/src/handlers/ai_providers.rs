@@ -25,7 +25,7 @@ use axum::{
     routing::{get, patch, post},
     Extension, Json, Router,
 };
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
@@ -87,6 +87,9 @@ pub struct ProviderCatalogDto {
     /// settings JSON. Lets the UI render "Configured" badges without the
     /// frontend having to inspect the encrypted blob.
     pub credential_saved: bool,
+    /// `verified`, `unverified`, or `not_saved`; never implies model access.
+    pub credential_verification_status: String,
+    pub verification_hint: Option<String>,
     /// Currently saved auth flavor id (when `credential_saved` is true).
     /// `None` when no credential is saved yet.
     pub current_auth_type: Option<String>,
@@ -166,13 +169,33 @@ pub struct SaveCredentialRequest {
     /// contents). Encrypted with `EncryptionService` before being persisted
     /// inside the `agent_sandbox.providers` JSON map.
     pub credential: String,
+    /// OpenCode model to test, in `provider/model` form. Omit to use the
+    /// built-in minimal probe model. A successfully verified explicit model
+    /// becomes this provider's workspace default.
+    pub verification_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifySavedCredentialRequest {
+    /// OpenCode model in `provider/model` form, used to verify the saved secret.
+    pub verification_model: String,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ImportLocalCredentialQuery {
+    /// OpenCode model to use for the verification request, in `provider/model` form.
+    pub verification_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SaveCredentialResponse {
     pub saved: bool,
+    pub credential_verification_status: String,
+    pub verification_hint: Option<String>,
     pub provider_id: String,
     pub auth_type: String,
+    pub provider: ProviderCatalogDto,
 }
 
 /// Metadata about a credential that Temps can import from the server process
@@ -188,10 +211,13 @@ pub struct LocalCredentialDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ImportLocalCredentialResponse {
     pub saved: bool,
+    pub credential_verification_status: String,
+    pub verification_hint: Option<String>,
     pub provider_id: String,
     pub auth_type: String,
     pub source: String,
     pub workspace_ready: bool,
+    pub provider: ProviderCatalogDto,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -233,6 +259,33 @@ struct ProviderCredentialSavedAudit {
     provider_id: String,
     auth_type: String,
     source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderSettingsChangedAudit {
+    context: AuditContext,
+    provider_id: String,
+    change: String,
+}
+
+impl AuditOperation for ProviderSettingsChangedAudit {
+    fn operation_type(&self) -> String {
+        "AI_PROVIDER_SETTINGS_CHANGED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            temps_core::anyhow::anyhow!("failed to serialize provider settings audit: {error}")
+        })
+    }
 }
 
 impl AuditOperation for ProviderCredentialSavedAudit {
@@ -342,6 +395,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/settings/ai-providers/{provider_id}/credential/import-local",
             post(import_local_ai_provider_credential),
+        )
+        .route(
+            "/settings/ai-providers/{provider_id}/credential/verify-saved",
+            post(verify_saved_ai_provider_credential),
         )
         .route(
             "/settings/ai-providers/{provider_id}/activate",
@@ -700,7 +757,7 @@ async fn provider_catalog_dto(
             .or(snapshot.capabilities.default_model_id);
         dto.model_source = snapshot.model_source;
         dto.models_refreshed_at = snapshot.models_refreshed_at;
-        if entry.id == "opencode" {
+        if entry.id == "opencode" && dto.workspace_ready {
             dto.workspace_ready = true;
             dto.workspace_readiness_hint = None;
         }
@@ -726,8 +783,24 @@ fn provider_catalog_dto_from_runtime(
     // OpenCode config files require semantic validation and a successful
     // native runtime probe. An encrypted blob alone must never be presented
     // as executable.
-    let workspace_ready =
-        entry.workspace_chat_supported && credential_saved && entry.id != "opencode";
+    let credential_verified = provider_cfg
+        .extra
+        .get("credential_verified")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let verified_opencode = entry.id == "opencode" && credential_verified;
+    let credential_verification_status = if !credential_saved {
+        "not_saved"
+    } else if credential_verified {
+        "verified"
+    } else {
+        "unverified"
+    };
+    let verification_hint = (credential_saved && !credential_verified && entry.id == "opencode")
+        .then(|| "Saved, but Temps could not confirm a model response. Select an available model and verify it before using this workspace harness.".to_string());
+    let workspace_ready = entry.workspace_chat_supported
+        && credential_saved
+        && (entry.id != "opencode" || verified_opencode);
     let workspace_readiness_hint = if workspace_ready {
         None
     } else if !entry.workspace_chat_supported {
@@ -736,7 +809,7 @@ fn provider_catalog_dto_from_runtime(
             entry.name
         ))
     } else if entry.id == "opencode" && credential_saved {
-        Some("The saved OpenCode credential has not completed a successful workspace model refresh. Refresh models to validate its Anthropic or OpenAI API-key/OAuth entries; custom providers remain unsupported.".to_string())
+        verification_hint.clone()
     } else {
         Some(format!(
             "Save a {} credential to run this harness inside a persistent workspace.",
@@ -806,6 +879,8 @@ fn provider_catalog_dto_from_runtime(
         permission_modes,
         default_permission_mode_id: entry.default_permission_mode_id.to_string(),
         credential_saved,
+        credential_verification_status: credential_verification_status.to_string(),
+        verification_hint,
         current_auth_type,
         default_model: provider_cfg.default_model.clone(),
         max_turns_analysis: provider_cfg.max_turns_analysis,
@@ -879,6 +954,22 @@ pub async fn save_ai_provider_credential(
             message: "Credential cannot be empty".into(),
         }));
     }
+    if request.verification_model.is_some() && provider_id != "opencode" {
+        return Err(Problem::from(AgentError::Validation {
+            message: "An explicit verification model is currently supported only for OpenCode"
+                .into(),
+        }));
+    }
+
+    let verification = verify_candidate(
+        &app_state,
+        &auth,
+        &provider_id,
+        &request.auth_type,
+        &request.credential,
+        request.verification_model.as_deref(),
+    )
+    .await?;
 
     let encrypted = app_state
         .encryption_service
@@ -890,14 +981,18 @@ pub async fn save_ai_provider_credential(
         })?;
 
     persist_provider_credential_and_invalidate(
-        app_state.db.as_ref(),
         app_state.platform_config_service.as_ref(),
         &provider_id,
         &request.auth_type,
         encrypted,
+        verification,
+        (verification == CredentialVerification::Verified)
+            .then_some(request.verification_model.as_deref())
+            .flatten(),
+        None,
     )
     .await
-    .map_err(Problem::from)?;
+    .map_err(provider_credential_persist_problem)?;
     if let Some(ai_service) = &app_state.ai_service {
         ai_service
             .invalidate_capabilities_for(Some(&provider_id))
@@ -914,10 +1009,16 @@ pub async fn save_ai_provider_credential(
     )
     .await;
 
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_dto =
+        provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(SaveCredentialResponse {
         saved: true,
+        credential_verification_status: verification.as_str().to_string(),
+        verification_hint: provider_dto.verification_hint.clone(),
         provider_id,
         auth_type: request.auth_type,
+        provider: provider_dto,
     }))
 }
 
@@ -928,7 +1029,7 @@ pub async fn save_ai_provider_credential(
     tag = "Agents",
     post,
     path = "/settings/ai-providers/{provider_id}/credential/import-local",
-    params(("provider_id" = String, Path, description = "AI provider ID")),
+    params(("provider_id" = String, Path, description = "AI provider ID"), ImportLocalCredentialQuery),
     responses(
         (status = 200, body = ImportLocalCredentialResponse),
         (status = 400, description = "Unknown provider or invalid local credential"),
@@ -943,6 +1044,7 @@ pub async fn import_local_ai_provider_credential(
     State(app_state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<String>,
+    Query(query): Query<ImportLocalCredentialQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
     permission_guard!(auth, SystemAdmin);
@@ -952,6 +1054,12 @@ pub async fn import_local_ai_provider_credential(
             message: format!("Unknown AI provider '{provider_id}'"),
         })
     })?;
+    if query.verification_model.is_some() && provider_id != "opencode" {
+        return Err(Problem::from(AgentError::Validation {
+            message: "An explicit verification model is currently supported only for OpenCode"
+                .into(),
+        }));
+    }
     let discovered = discover_local_credential(provider)
         .await
         .map_err(|error| {
@@ -968,6 +1076,16 @@ pub async fn import_local_ai_provider_credential(
                 ))
         })?;
 
+    let verification = verify_candidate(
+        &app_state,
+        &auth,
+        &provider_id,
+        &discovered.auth_type,
+        &discovered.credential,
+        query.verification_model.as_deref(),
+    )
+    .await?;
+
     let encrypted = app_state
         .encryption_service
         .encrypt_string(&discovered.credential)
@@ -979,14 +1097,18 @@ pub async fn import_local_ai_provider_credential(
             })
         })?;
     persist_provider_credential_and_invalidate(
-        app_state.db.as_ref(),
         app_state.platform_config_service.as_ref(),
         &provider_id,
         &discovered.auth_type,
         encrypted,
+        verification,
+        (verification == CredentialVerification::Verified)
+            .then_some(query.verification_model.as_deref())
+            .flatten(),
+        None,
     )
     .await
-    .map_err(Problem::from)?;
+    .map_err(provider_credential_persist_problem)?;
     if let Some(ai_service) = &app_state.ai_service {
         ai_service
             .invalidate_capabilities_for(Some(&provider_id))
@@ -1002,15 +1124,205 @@ pub async fn import_local_ai_provider_credential(
     )
     .await;
 
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_dto =
+        provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(ImportLocalCredentialResponse {
         saved: true,
+        credential_verification_status: verification.as_str().to_string(),
+        verification_hint: provider_dto.verification_hint.clone(),
         provider_id,
         auth_type: discovered.auth_type,
         source: discovered.source.as_str().to_string(),
-        // Import alone cannot promote OpenCode: strict validation and a
-        // successful native runtime model refresh establish readiness.
-        workspace_ready: provider.workspace_chat_supported && provider.id != "opencode",
+        workspace_ready: provider_dto.workspace_ready,
+        provider: provider_dto,
     }))
+}
+
+/// Verify a previously imported OpenCode credential against a user-selected
+/// model without asking the browser to receive or resubmit the secret.
+#[utoipa::path(
+    tag = "Agents",
+    post,
+    path = "/settings/ai-providers/{provider_id}/credential/verify-saved",
+    params(("provider_id" = String, Path, description = "AI provider ID")),
+    request_body = VerifySavedCredentialRequest,
+    responses(
+        (status = 200, body = SaveCredentialResponse),
+        (status = 400, description = "Invalid model or credential rejected"),
+        (status = 404, description = "No saved credential"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn verify_saved_ai_provider_credential(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<VerifySavedCredentialRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    if provider_id != "opencode" {
+        return Err(Problem::from(AgentError::Validation {
+            message: "Saved-credential model verification is currently supported only for OpenCode"
+                .into(),
+        }));
+    }
+    let provider = find_provider(&provider_id).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
+            message: format!("Unknown AI provider '{provider_id}'"),
+        })
+    })?;
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let config = sandbox.provider_config(&provider_id);
+    let encrypted = config.credentials_encrypted.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("No saved AI credential")
+            .with_detail(format!(
+                "Provider '{provider_id}' has no saved credential to verify."
+            ))
+    })?;
+    let credential = app_state
+        .encryption_service
+        .decrypt_string(encrypted)
+        .map_err(|_| {
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Saved credential unavailable")
+                .with_detail(format!(
+                    "Provider '{provider_id}' saved credential could not be decrypted."
+                ))
+        })?;
+    let auth_type = config.auth_type.clone();
+    let verification = verify_candidate(
+        &app_state,
+        &auth,
+        &provider_id,
+        &auth_type,
+        &credential,
+        Some(&request.verification_model),
+    )
+    .await?;
+    persist_provider_credential_and_invalidate(
+        app_state.platform_config_service.as_ref(),
+        &provider_id,
+        &auth_type,
+        encrypted.clone(),
+        verification,
+        (verification == CredentialVerification::Verified)
+            .then_some(request.verification_model.as_str()),
+        Some((&auth_type, encrypted.as_str())),
+    )
+    .await
+    .map_err(provider_credential_persist_problem)?;
+    if let Some(ai_service) = &app_state.ai_service {
+        ai_service
+            .invalidate_capabilities_for(Some(&provider_id))
+            .await;
+    }
+    write_provider_credential_audit(
+        &app_state,
+        &auth,
+        &metadata,
+        &provider_id,
+        &auth_type,
+        "verify-saved",
+    )
+    .await;
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_dto =
+        provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
+    Ok(Json(SaveCredentialResponse {
+        saved: true,
+        credential_verification_status: verification.as_str().to_string(),
+        verification_hint: provider_dto.verification_hint.clone(),
+        provider_id,
+        auth_type,
+        provider: provider_dto,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialVerification {
+    Verified,
+    Unverified,
+}
+
+impl CredentialVerification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+fn opencode_probe_is_inconclusive(provider_id: &str, error: &temps_ai::AiError) -> bool {
+    provider_id == "opencode"
+        && matches!(error,
+            temps_ai::AiError::Provider { purpose, .. }
+                if matches!(purpose.as_str(), "provider.credentials.verify" | "provider.credentials.verify.model" | "provider.credentials.verify.allowance")
+        )
+}
+
+async fn verify_candidate(
+    app_state: &Arc<AppState>,
+    auth: &temps_auth::AuthContext,
+    provider_id: &str,
+    auth_type: &str,
+    credential: &str,
+    verification_model: Option<&str>,
+) -> Result<CredentialVerification, Problem> {
+    ensure_workspace_model_discovery_permission(auth)?;
+    let ai_service = app_state.ai_service.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Credential verification unavailable")
+            .with_detail("The secure AI harness service is not configured on this Temps instance.")
+    })?;
+    match ai_service
+        .verify_candidate_credential_with_model(
+            provider_id,
+            auth_type,
+            credential,
+            auth.user_id(),
+            verification_model,
+        )
+        .await
+    {
+        Ok(()) => Ok(CredentialVerification::Verified),
+        Err(error) if opencode_probe_is_inconclusive(provider_id, &error) => {
+            tracing::warn!(provider_id, auth_type, error_kind = ?std::mem::discriminant(&error), "OpenCode credential saved without model verification");
+            Ok(CredentialVerification::Unverified)
+        }
+        Err(error) => {
+            let (status, title, guidance) = credential_verification_failure(&error);
+            tracing::warn!(provider_id, auth_type, error_kind = ?std::mem::discriminant(&error), "candidate credential verification failed");
+            Err(problemdetails::new(status)
+                .with_title(title)
+                .with_detail(format!("Provider '{provider_id}' ({auth_type}): {guidance} A previously saved credential was not changed.")))
+        }
+    }
+}
+
+fn credential_verification_failure(
+    error: &temps_ai::AiError,
+) -> (StatusCode, &'static str, &'static str) {
+    match error {
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.invalid" => (
+            StatusCode::BAD_REQUEST, "Invalid provider credential", "The credential is malformed or uses an unsupported authentication format. Check its contents and retry.",
+        ),
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.auth" => (
+            StatusCode::BAD_REQUEST, "Credential rejected by provider", "The provider rejected this credential or denied model access. Refresh the login or key and retry.",
+        ),
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.allowance" => (
+            StatusCode::TOO_MANY_REQUESTS, "Provider allowance unavailable", "The account has insufficient allowance or is rate limited. Restore allowance and retry.",
+        ),
+        temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.model" => (
+            StatusCode::BAD_REQUEST, "Harness model request failed", "The harness could not complete a minimal model request with this credential. Check its model access and retry.",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE, "Harness verification unavailable", "Temps could not complete the isolated harness check. Check sandbox/runtime availability and retry.",
+        ),
+    }
 }
 
 async fn write_provider_credential_audit(
@@ -1043,84 +1355,72 @@ async fn write_provider_credential_audit(
     }
 }
 
+async fn write_provider_settings_audit(
+    app_state: &Arc<AppState>,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    provider_id: &str,
+    change: &str,
+) {
+    if let Err(error) = app_state
+        .audit_service
+        .create_audit_log(&ProviderSettingsChangedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            provider_id: provider_id.into(),
+            change: change.into(),
+        })
+        .await
+    {
+        tracing::error!(provider_id, %error, "failed to write AI provider settings audit log");
+    }
+}
+
 /// Persist a provider credential and make the successful write a strict cache
 /// freshness boundary. Keeping both operations in one function prevents a
 /// future handler edit from accidentally restoring the old-token-for-one-turn
 /// behavior.
 async fn persist_provider_credential_and_invalidate(
-    db: &sea_orm::DatabaseConnection,
     platform_config_service: &temps_config::ConfigService,
     provider_id: &str,
     auth_type: &str,
     encrypted: String,
-) -> Result<(), AgentError> {
-    // Read-modify-write the settings.data JSON. We only touch
-    // `agent_sandbox.providers[provider_id]` so unrelated keys are preserved.
-    let record = temps_entities::settings::Entity::find_by_id(1)
-        .one(db)
+    verification: CredentialVerification,
+    verified_default_model: Option<&str>,
+    expected: Option<(&str, &str)>,
+) -> Result<(), temps_config::ConfigServiceError> {
+    platform_config_service
+        .update_agent_provider_credential(
+            provider_id,
+            auth_type,
+            &encrypted,
+            verification == CredentialVerification::Verified,
+            verified_default_model,
+            expected,
+        )
         .await
-        .map_err(AgentError::Database)?;
+}
 
-    let mut settings_data = record
-        .map(|r| r.data)
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let sandbox_value = settings_data
-        .as_object_mut()
-        .and_then(|m| {
-            m.entry("agent_sandbox".to_string())
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-        })
-        .ok_or_else(|| AgentError::Validation {
-            message: "agent_sandbox settings is not a JSON object".into(),
-        })?;
-
-    let providers_value = sandbox_value
-        .entry("providers".to_string())
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| AgentError::Validation {
-            message: "agent_sandbox.providers is not a JSON object".into(),
-        })?;
-
-    // Preserve any fields we don't own (e.g. a previously-saved
-    // `default_model`, or future per-provider extras) by merging on top of
-    // the existing entry instead of replacing it outright.
-    let existing = providers_value
-        .get(provider_id)
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let mut merged = existing.as_object().cloned().unwrap_or_default();
-    merged.insert(
-        "auth_type".into(),
-        serde_json::Value::String(auth_type.to_string()),
-    );
-    merged.insert(
-        "credentials_encrypted".into(),
-        serde_json::Value::String(encrypted),
-    );
-    merged
-        .entry("default_model".to_string())
-        .or_insert(serde_json::Value::Null);
-    merged
-        .entry("extra".to_string())
-        .or_insert(serde_json::Value::Null);
-    providers_value.insert(provider_id.to_string(), serde_json::Value::Object(merged));
-
-    let active = temps_entities::settings::ActiveModel {
-        id: Set(1),
-        data: Set(settings_data),
-        ..Default::default()
-    };
-    active.update(db).await.map_err(AgentError::Database)?;
-
-    // The turn resolver reads through the shared ConfigService cache. Make
-    // the save response a strict freshness boundary: once it returns, the
-    // very next turn must re-read and decrypt this credential even if the
-    // Postgres NOTIFY listener is delayed or reconnecting.
-    platform_config_service.invalidate_settings_cache().await;
-    Ok(())
+fn provider_credential_persist_problem(error: temps_config::ConfigServiceError) -> Problem {
+    match error {
+        temps_config::ConfigServiceError::ProviderCredentialChanged { provider_id } =>
+            problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Saved AI credential changed")
+                .with_detail(format!("Provider '{provider_id}' credential changed while verification ran. Retry against the current saved credential.")),
+        temps_config::ConfigServiceError::InvalidConfiguration { details } =>
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid AI provider settings")
+                .with_detail(details),
+        other => {
+            tracing::error!(error_kind = ?std::mem::discriminant(&other), "AI credential settings update failed");
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("AI credential could not be saved")
+                .with_detail("The settings database could not save this provider credential. Retry or contact your Temps administrator.")
+        },
+    }
 }
 
 /// Activate a provider as the platform-wide default. Refuses to activate a
@@ -1142,6 +1442,7 @@ async fn persist_provider_credential_and_invalidate(
 pub async fn activate_ai_provider(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -1152,64 +1453,12 @@ pub async fn activate_ai_provider(
         }));
     }
 
-    let record = temps_entities::settings::Entity::find_by_id(1)
-        .one(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
-
-    let mut settings_data = record
-        .map(|r| r.data)
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let sandbox_value = settings_data
-        .as_object_mut()
-        .and_then(|m| {
-            m.entry("agent_sandbox".to_string())
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-        })
-        .ok_or_else(|| {
-            Problem::from(AgentError::Validation {
-                message: "agent_sandbox settings is not a JSON object".into(),
-            })
-        })?;
-
-    let has_credential = sandbox_value
-        .get("providers")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get(&provider_id))
-        .and_then(|v| v.get("credentials_encrypted"))
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
-
-    if !has_credential {
-        return Err(Problem::from(AgentError::Validation {
-            message: format!(
-                "Provider '{}' has no saved credential — configure it first before activating",
-                provider_id
-            ),
-        }));
-    }
-
-    sandbox_value.insert(
-        "default_provider".to_string(),
-        serde_json::Value::String(provider_id.clone()),
-    );
-
-    let active = temps_entities::settings::ActiveModel {
-        id: Set(1),
-        data: Set(settings_data),
-        ..Default::default()
-    };
-    active
-        .update(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
-
     app_state
         .platform_config_service
-        .invalidate_settings_cache()
-        .await;
+        .activate_agent_provider(&provider_id)
+        .await
+        .map_err(provider_credential_persist_problem)?;
+    write_provider_settings_audit(&app_state, &auth, &metadata, &provider_id, "activate").await;
 
     Ok(Json(ActivateProviderResponse {
         default_provider: provider_id,
@@ -1236,6 +1485,7 @@ pub async fn activate_ai_provider(
 pub async fn update_ai_provider(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<String>,
     Json(request): Json<UpdateProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1299,97 +1549,22 @@ pub async fn update_ai_provider(
         }
     };
 
-    let record = temps_entities::settings::Entity::find_by_id(1)
-        .one(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
-
-    let mut settings_data = record
-        .map(|r| r.data)
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let sandbox_value = settings_data
-        .as_object_mut()
-        .and_then(|m| {
-            m.entry("agent_sandbox".to_string())
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-        })
-        .ok_or_else(|| {
-            Problem::from(AgentError::Validation {
-                message: "agent_sandbox settings is not a JSON object".into(),
-            })
-        })?;
-
-    let providers_value = sandbox_value
-        .entry("providers".to_string())
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            Problem::from(AgentError::Validation {
-                message: "agent_sandbox.providers is not a JSON object".into(),
-            })
-        })?;
-
-    // Read-modify-write: merge `default_model` on top of the existing
-    // provider entry so we don't clobber `credentials_encrypted` etc.
-    let existing = providers_value
-        .get(&provider_id)
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let mut merged = existing.as_object().cloned().unwrap_or_default();
-    merged.insert(
-        "default_model".to_string(),
-        match &new_model {
-            Some(m) => serde_json::Value::String(m.clone()),
-            None => serde_json::Value::Null,
-        },
-    );
-    // Turn caps: omitted → leave the stored value alone; 0 → clear; n → set.
-    for (key, value) in [
-        ("max_turns_analysis", request.max_turns_analysis),
-        ("max_turns_fix", request.max_turns_fix),
-        ("max_turns_feedback", request.max_turns_feedback),
-    ] {
-        match value {
-            None => {}
-            Some(0) => {
-                merged.insert(key.to_string(), serde_json::Value::Null);
-            }
-            Some(v) => {
-                merged.insert(key.to_string(), serde_json::Value::from(v));
-            }
-        }
-    }
-    // Fill in required fields if this is the first write for the provider.
-    merged
-        .entry("auth_type".to_string())
-        .or_insert_with(|| serde_json::Value::String(provider.default_flavor().id.to_string()));
-    merged
-        .entry("extra".to_string())
-        .or_insert(serde_json::Value::Null);
-    // Capture the effective stored values for the response before handing
-    // the object to the settings blob.
-    let stored_turns = |key: &str| merged.get(key).and_then(|v| v.as_i64()).map(|v| v as i32);
-    let effective_max_turns_analysis = stored_turns("max_turns_analysis");
-    let effective_max_turns_fix = stored_turns("max_turns_fix");
-    let effective_max_turns_feedback = stored_turns("max_turns_feedback");
-    providers_value.insert(provider_id.clone(), serde_json::Value::Object(merged));
-
-    let active = temps_entities::settings::ActiveModel {
-        id: Set(1),
-        data: Set(settings_data),
-        ..Default::default()
-    };
-    active
-        .update(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
-
-    app_state
-        .platform_config_service
-        .invalidate_settings_cache()
-        .await;
+    let [effective_max_turns_analysis, effective_max_turns_fix, effective_max_turns_feedback] =
+        app_state
+            .platform_config_service
+            .update_agent_provider_preferences(
+                &provider_id,
+                provider.default_flavor().id,
+                new_model.as_deref(),
+                [
+                    request.max_turns_analysis,
+                    request.max_turns_fix,
+                    request.max_turns_feedback,
+                ],
+            )
+            .await
+            .map_err(provider_credential_persist_problem)?;
+    write_provider_settings_audit(&app_state, &auth, &metadata, &provider_id, "preferences").await;
 
     Ok(Json(UpdateProviderResponse {
         provider_id,
@@ -1477,6 +1652,145 @@ mod tests {
     use temps_config::ServerConfig;
     use temps_core::{AppSettings, ProviderConfig};
 
+    #[test]
+    fn candidate_verification_errors_are_safe_and_actionable() {
+        let auth = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify.auth".into(),
+            reason: "secret-shaped-provider-response-must-not-be-rendered".into(),
+        };
+        let (status, title, guidance) = credential_verification_failure(&auth);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(title, "Credential rejected by provider");
+        assert!(!guidance.contains("secret-shaped"));
+        let runtime = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify".into(),
+            reason: "sandbox unavailable".into(),
+        };
+        assert_eq!(
+            credential_verification_failure(&runtime).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let quota = temps_ai::AiError::Provider {
+            purpose: "provider.credentials.verify.allowance".into(),
+            reason: "rate limited".into(),
+        };
+        assert_eq!(
+            credential_verification_failure(&quota).0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn activating_without_a_credential_remains_a_bad_request() {
+        let problem = provider_credential_persist_problem(
+            temps_config::ConfigServiceError::InvalidConfiguration {
+                details: "Provider 'opencode' has no saved credential".into(),
+            },
+        );
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn only_opencode_probe_failures_can_be_saved_unverified() {
+        for purpose in [
+            "provider.credentials.verify",
+            "provider.credentials.verify.model",
+            "provider.credentials.verify.allowance",
+        ] {
+            let error = temps_ai::AiError::Provider {
+                purpose: purpose.into(),
+                reason: "secret must stay private".into(),
+            };
+            assert!(
+                opencode_probe_is_inconclusive("opencode", &error),
+                "{purpose}"
+            );
+            assert!(
+                !opencode_probe_is_inconclusive("claude_cli", &error),
+                "{purpose}"
+            );
+            assert!(
+                !opencode_probe_is_inconclusive("codex_cli", &error),
+                "{purpose}"
+            );
+        }
+        for purpose in [
+            "provider.credentials.verify.auth",
+            "provider.credentials.verify.invalid",
+            "provider.credentials.verify.setup",
+            "provider.credentials.verify.cleanup",
+            "chat.application.credentials",
+        ] {
+            let error = temps_ai::AiError::Provider {
+                purpose: purpose.into(),
+                reason: "invalid".into(),
+            };
+            assert!(
+                !opencode_probe_is_inconclusive("opencode", &error),
+                "{purpose}"
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_opencode_is_visible_but_not_workspace_ready() {
+        let opencode = find_provider("opencode").expect("OpenCode catalog entry");
+        let config = ProviderConfig {
+            extra: serde_json::json!({ "credential_verified": false }),
+            ..ProviderConfig::default()
+        };
+        let dto = provider_catalog_dto_from_runtime(
+            opencode,
+            config,
+            true,
+            Some("config_file".into()),
+            false,
+            None,
+            None,
+            None,
+            Vec::new(),
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
+            None,
+        );
+        assert!(dto.credential_saved);
+        assert_eq!(dto.credential_verification_status, "unverified");
+        assert!(!dto.workspace_ready);
+        assert!(dto
+            .verification_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("Select an available model")));
+    }
+
+    #[test]
+    fn local_import_can_request_a_specific_opencode_model_without_a_credential_body() {
+        let query: ImportLocalCredentialQuery = serde_json::from_value(serde_json::json!({
+            "verification_model": "anthropic/claude-sonnet-4-5"
+        }))
+        .expect("model-only import query");
+        assert_eq!(
+            query.verification_model.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        let default_query: ImportLocalCredentialQuery =
+            serde_json::from_value(serde_json::json!({}))
+                .expect("existing bodyless import remains valid");
+        assert!(default_query.verification_model.is_none());
+    }
+
+    #[test]
+    fn verify_saved_request_accepts_only_a_model_not_a_secret() {
+        let request: VerifySavedCredentialRequest = serde_json::from_value(serde_json::json!({
+            "verification_model": "anthropic/claude-sonnet-4-5"
+        }))
+        .expect("model-only verification request");
+        assert_eq!(request.verification_model, "anthropic/claude-sonnet-4-5");
+        assert!(
+            serde_json::from_value::<VerifySavedCredentialRequest>(serde_json::json!({})).is_err()
+        );
+    }
+
     fn provider_settings_row(encrypted: &str) -> temps_entities::settings::Model {
         let mut settings = AppSettings::default();
         settings.agent_sandbox.providers.insert(
@@ -1505,6 +1819,46 @@ mod tests {
             )
             .expect("valid test server config"),
         )
+    }
+
+    #[tokio::test]
+    async fn verify_saved_cannot_restore_a_replaced_credential() {
+        let replacement = provider_settings_row("encrypted-new-token");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[replacement]])
+                .into_connection(),
+        );
+        let service = temps_config::ConfigService::new(provider_test_server_config(), db.clone());
+        let error = persist_provider_credential_and_invalidate(
+            &service,
+            "claude_cli",
+            "subscription",
+            "encrypted-old-token".into(),
+            CredentialVerification::Verified,
+            Some("anthropic/claude-sonnet-4-5"),
+            Some(("subscription", "encrypted-old-token")),
+        )
+        .await
+        .expect_err("concurrent replacement must conflict");
+        assert!(
+            matches!(error, temps_config::ConfigServiceError::ProviderCredentialChanged { provider_id } if provider_id == "claude_cli")
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("release db")
+            .into_transaction_log();
+        let sql = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !sql.contains("UPDATE \"settings\""),
+            "stale verifier must not write the old credential"
+        );
+        assert!(!sql.contains("encrypted-old-token"));
     }
 
     #[test]
@@ -1558,11 +1912,13 @@ mod tests {
         );
 
         persist_provider_credential_and_invalidate(
-            db.as_ref(),
             &config_service,
             "claude_cli",
             "subscription",
             "encrypted-new-token".to_string(),
+            CredentialVerification::Verified,
+            Some("anthropic/claude-sonnet-4-5"),
+            None,
         )
         .await
         .expect("save replacement credential");
@@ -1594,6 +1950,10 @@ mod tests {
         assert!(
             sql.contains("encrypted-new-token"),
             "the persisted settings update must contain the replacement credential"
+        );
+        assert!(
+            sql.contains("anthropic/claude-sonnet-4-5"),
+            "verified model must be persisted as default"
         );
     }
 

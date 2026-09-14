@@ -63,6 +63,12 @@ pub struct AppSettings {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+    /// Allow the proxy to use forwarding headers from a loopback peer for
+    /// client IP attribution. `None` means an older client did not send the
+    /// field; the settings handler preserves the stored decision on PUT.
+    /// This is the sole control surface — there is no CLI/env override.
+    #[serde(default)]
+    pub trust_loopback_forwarded_ip: Option<bool>,
 
     // Docker registry settings
     pub docker_registry: DockerRegistrySettings,
@@ -1581,6 +1587,7 @@ impl Default for AppSettings {
             dns_provider: DnsProviderSettings::default(),
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
+            trust_loopback_forwarded_ip: None,
             docker_registry: DockerRegistrySettings::default(),
             registry_mirror_prefix: None,
             image_retention: ImageRetentionSettings::default(),
@@ -1613,6 +1620,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// The database-backed opt-in, disabled until explicitly set by an admin.
+    pub fn trust_loopback_forwarded_ip(&self) -> bool {
+        self.trust_loopback_forwarded_ip.unwrap_or(false)
+    }
+
     /// Effective self-update settings, treating "never configured" as the
     /// default. Use this everywhere instead of touching the `Option` directly,
     /// so absence and an explicit default behave identically at read time.

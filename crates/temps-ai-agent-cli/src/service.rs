@@ -599,11 +599,159 @@ fn pin_context_usage_model(
 pub type SandboxCredentialResolver = Arc<
     dyn Fn(&str) -> BoxFuture<'static, Result<SandboxHarnessCredentials, AiError>> + Send + Sync,
 >;
+pub type SandboxCandidateCredentialResolver = Arc<
+    dyn Fn(&str, &str, &str) -> BoxFuture<'static, Result<SandboxHarnessCredentials, AiError>>
+        + Send
+        + Sync,
+>;
+
+struct CandidateSandbox {
+    provider: Arc<dyn SandboxProvider>,
+    handle: Option<temps_agents::sandbox::SandboxHandle>,
+    scratch: Arc<tempfile::TempDir>,
+}
+
+struct CandidateCreateGuard {
+    provider: Arc<dyn SandboxProvider>,
+    task: Option<tokio::task::JoinHandle<Result<temps_agents::sandbox::SandboxHandle, AgentError>>>,
+    scratch: Arc<tempfile::TempDir>,
+}
+
+impl Drop for CandidateCreateGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            let provider = self.provider.clone();
+            let scratch = self.scratch.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Ok(Ok(handle)) = task.await {
+                        if let Err(error) = provider.destroy(&handle, true).await {
+                            tracing::error!(sandbox_id = %handle.sandbox_id, %error, "cancelled verification sandbox cleanup failed");
+                        }
+                    }
+                    drop(scratch);
+                });
+            }
+        }
+    }
+}
+
+fn candidate_probe_has_answer(provider: &str, output: &str) -> bool {
+    output.lines().any(|line| {
+        temps_agents::ai_cli::extract_assistant_text(provider, line)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn candidate_probe_runtime_failure(exit_code: i32, stderr: &str) -> bool {
+    if exit_code == 127 {
+        return true;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    [
+        "unknown option",
+        "unrecognized option",
+        "unexpected argument",
+        "command not found",
+        "operation not permitted",
+        "failed to create namespace",
+        "bwrap:",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
+/// Only explicit native authentication failures are conclusive. Model-not-found,
+/// quota, transport, and unknown errors must not be mistaken for a bad secret.
+fn candidate_probe_native_auth_rejected(stdout: &str, stderr: &str) -> bool {
+    fn explicit_auth_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        [
+            "authentication failed",
+            "authenticationerror",
+            "unauthorized",
+            "invalid api key",
+            "invalid token",
+            "invalid credentials",
+            "token refresh failed",
+            "401",
+            "403",
+            "forbidden",
+            "not authenticated",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("error"))
+        .any(|event| {
+            let error = &event["error"];
+            [
+                error["statusCode"].as_i64(),
+                error["status"].as_i64(),
+                error["data"]["statusCode"].as_i64(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|status| matches!(status, 401 | 403))
+                || [
+                    error["name"].as_str(),
+                    error["message"].as_str(),
+                    error["data"]["message"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(explicit_auth_message)
+        })
+        || explicit_auth_message(stderr)
+}
+
+impl CandidateSandbox {
+    async fn destroy(mut self) -> Result<(), AiError> {
+        if let Some(handle) = self.handle.as_ref() {
+            tokio::time::timeout(Duration::from_secs(15), self.provider.destroy(handle, true))
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.credentials.verify.cleanup".into(),
+                    reason:
+                        "verification sandbox cleanup timed out; contact your Temps administrator"
+                            .into(),
+                })?
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.credentials.verify.cleanup".into(),
+                    reason: "verification sandbox cleanup failed; contact your Temps administrator"
+                        .into(),
+                })?;
+            self.handle = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CandidateSandbox {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let provider = self.provider.clone();
+            let scratch = self.scratch.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Err(error) = provider.destroy(&handle, true).await {
+                        tracing::error!(sandbox_id = %handle.sandbox_id, %error, "candidate verification sandbox cleanup failed");
+                    }
+                    drop(scratch);
+                });
+            }
+        }
+    }
+}
 
 async fn mcp_bridge_handler(
     axum::extract::State(state): axum::extract::State<McpBridgeState>,
     headers: axum::http::HeaderMap,
-    axum::Json(request): axum::Json<serde_json::Value>,
+    axum::Json(request): axum::Json<temps_ai::mcp::McpRequest>,
 ) -> Response {
     let authorized = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -617,74 +765,72 @@ async fn mcp_bridge_handler(
     if !authorized {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"error": "unauthorized"})),
+            axum::Json(temps_ai::mcp::McpTransportError {
+                error: "unauthorized",
+            }),
         )
             .into_response();
     }
 
-    let id = request
-        .get("id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    use temps_ai::mcp::{
+        McpCallResult, McpEmptyResult, McpInitializeResult, McpResponse, McpResult,
+        McpToolDefinition, McpToolsResult,
+    };
     // JSON-RPC notifications deliberately have no response. Native MCP
     // clients send `notifications/initialized` immediately after initialize.
-    if request.get("id").is_none() {
+    let Some(id) = request.id else {
         return axum::http::StatusCode::ACCEPTED.into_response();
-    }
-    let response = match method {
-        "initialize" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "temps-chat", "version": "1"}
-            }
-        }),
-        "tools/list" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {"tools": state.tools.iter().map(|tool| serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.parameters
-            })).collect::<Vec<_>>()}
-        }),
-        "ping" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "result": {}
-        }),
+    };
+    let response = match request.method.as_str() {
+        "initialize" => McpResponse::result(
+            id,
+            McpResult::Initialize(McpInitializeResult::new("temps-chat")),
+        ),
+        "tools/list" => McpResponse::result(
+            id,
+            McpResult::Tools(McpToolsResult {
+                tools: state
+                    .tools
+                    .iter()
+                    .map(|tool| McpToolDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.parameters.clone(),
+                    })
+                    .collect(),
+            }),
+        ),
+        "ping" => McpResponse::result(id, McpResult::Empty(McpEmptyResult::default())),
         "tools/call" => {
-            let params = request.get("params").cloned().unwrap_or_default();
-            let name = params
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let params = request.params.unwrap_or_default();
+            let name = params.name.as_deref().unwrap_or_default();
             let known = state.tools.iter().any(|tool| tool.name == name);
             if !known {
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": "Tool is not available for this conversation"}], "isError": true}
-                })
+                McpResponse::result(
+                    id,
+                    McpResult::Call(McpCallResult::text(
+                        "Tool is not available for this conversation",
+                        true,
+                    )),
+                )
             } else {
                 let _tool_permit = match state.tool_slot.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
                         return (
                             axum::http::StatusCode::OK,
-                            axum::Json(serde_json::json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "result": {"content": [{"type": "text", "text": "Another Temps tool call is already running for this turn"}], "isError": true}
-                            })),
+                            axum::Json(McpResponse::result(
+                                id,
+                                McpResult::Call(McpCallResult::text(
+                                    "Another Temps tool call is already running for this turn",
+                                    true,
+                                )),
+                            )),
                         )
                             .into_response();
                     }
                 };
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
                 let call = ToolCall {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: name.to_string(),
@@ -720,16 +866,10 @@ async fn mcp_bridge_handler(
                         result: result.clone(),
                     }))
                     .await;
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": result}], "isError": is_error}
-                })
+                McpResponse::result(id, McpResult::Call(McpCallResult::text(result, is_error)))
             }
         }
-        _ => serde_json::json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": -32601, "message": "Method not found"}
-        }),
+        _ => McpResponse::error(id, -32601, "Method not found"),
     };
     (axum::http::StatusCode::OK, axum::Json(response)).into_response()
 }
@@ -882,6 +1022,7 @@ pub struct AgentCliAiService {
     /// arbitrary server directory by constructing `ChatTurnRequest` directly.
     sandbox_workspace_root: Option<PathBuf>,
     sandbox_credentials: Option<SandboxCredentialResolver>,
+    sandbox_candidate_credentials: Option<SandboxCandidateCredentialResolver>,
     /// Host-side provider relay. The sandbox receives only its short-lived
     /// capability; real provider credentials never cross the boundary.
     sandbox_model_relay: Option<Arc<SandboxModelRelayService>>,
@@ -1248,6 +1389,35 @@ send({
     }
 }
 
+fn selected_opencode_probe_model<'a>(
+    defaults: &[&'static str],
+    requested: Option<&'a str>,
+) -> Result<Option<&'a str>, AiError> {
+    let Some(model) = requested else {
+        return Ok(defaults.first().copied());
+    };
+    let valid = model.split_once('/').is_some_and(|(provider, name)| {
+        !name.is_empty()
+            && !name.contains('/')
+            && model.len() <= 256
+            && model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            && defaults
+                .iter()
+                .any(|available| available.starts_with(&format!("{provider}/")))
+    });
+    if !valid {
+        return Err(AiError::Provider {
+            purpose: "provider.credentials.verify.invalid".into(),
+            reason:
+                "verification model is invalid or its provider is absent from OpenCode credentials"
+                    .into(),
+        });
+    }
+    Ok(Some(model))
+}
+
 impl AgentCliAiService {
     /// Create a new service.
     ///
@@ -1279,6 +1449,7 @@ impl AgentCliAiService {
             sandbox_provider: None,
             sandbox_workspace_root: None,
             sandbox_credentials: None,
+            sandbox_candidate_credentials: None,
             sandbox_model_relay: None,
             sandbox_workspace_resolver: None,
             sandbox_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -1299,12 +1470,14 @@ impl AgentCliAiService {
         sandbox_provider: Arc<dyn SandboxProvider>,
         sandbox_workspace_root: PathBuf,
         sandbox_credentials: SandboxCredentialResolver,
+        sandbox_candidate_credentials: SandboxCandidateCredentialResolver,
         sandbox_model_relay: Arc<SandboxModelRelayService>,
         sandbox_workspace_resolver: SandboxWorkspaceResolverSlot,
     ) -> Self {
         self.sandbox_provider = Some(sandbox_provider);
         self.sandbox_workspace_root = Some(sandbox_workspace_root);
         self.sandbox_credentials = Some(sandbox_credentials);
+        self.sandbox_candidate_credentials = Some(sandbox_candidate_credentials);
         self.sandbox_model_relay = Some(sandbox_model_relay);
         self.sandbox_workspace_resolver = Some(sandbox_workspace_resolver);
         self.sandbox_timeout = Some(Duration::from_secs(15 * 60));
@@ -2213,16 +2386,11 @@ impl AgentCliAiService {
                 purpose: purpose.clone(),
                 reason: format!("invalid retained runtime identity: {error}"),
             })?;
-        let invocation_id = InvocationId::new(
-            request
-                .trace_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        )
-        .map_err(|error| AiError::Provider {
-            purpose: purpose.clone(),
-            reason: format!("invalid retained turn identity: {error}"),
-        })?;
+        // A trace spans the outer chat turn, including tool rounds, salvage,
+        // and a bounded missing-session retry. The SDK invocation instead
+        // identifies one actual provider execution; reusing the trace makes
+        // its duplicate guard reject the next round before the provider runs.
+        let invocation_id = new_retained_invocation_id(&purpose)?;
         let connector = Arc::new(SandboxRuntimeConnector::new(
             sandbox.clone(),
             handle.clone(),
@@ -2234,6 +2402,19 @@ impl AgentCliAiService {
         spec.provider_session_id = request.resume_session_id.clone();
         spec.turn_timeout = timeout;
         let runtime = match client.attach(&runtime_id).await {
+            Ok(_runtime) if request.reset_retained_session => {
+                // The DB is the authority for provider session continuity.
+                // Dispose confirms termination of the stale harness runtime;
+                // managed application processes are separate and untouched.
+                client
+                    .dispose(&runtime_id)
+                    .await
+                    .map_err(|error| retained_ai_error(&purpose, error, &runtime_secrets))?;
+                client
+                    .acquire(spec)
+                    .await
+                    .map_err(|error| retained_ai_error(&purpose, error, &runtime_secrets))?
+            }
             Ok(runtime) => runtime,
             Err(error) if error.kind == RuntimeFailureKind::RuntimeNotFound => client
                 .acquire(spec)
@@ -2867,6 +3048,13 @@ fn runtime_permission_mode(
             reason: "unsupported retained sandbox provider permission contract".into(),
         }),
     }
+}
+
+fn new_retained_invocation_id(purpose: &str) -> Result<InvocationId, AiError> {
+    InvocationId::new(uuid::Uuid::new_v4().to_string()).map_err(|error| AiError::Provider {
+        purpose: purpose.to_string(),
+        reason: format!("invalid retained turn identity: {error}"),
+    })
 }
 
 fn retained_ai_error(
@@ -4251,8 +4439,413 @@ fn check_prompt_size(purpose: &str, prompt: &str) -> Result<(), AiError> {
 // AiService implementation
 // ---------------------------------------------------------------------------
 
+fn candidate_probe_create_config(
+    label: String,
+    host_work_dir: PathBuf,
+) -> Result<SandboxCreateConfig, AiError> {
+    let image =
+        temps_sandbox::services::managed_application_workspace_image("node").ok_or_else(|| {
+            AiError::Provider {
+            purpose: "provider.credentials.verify".into(),
+            reason:
+                "managed node workspace runtime image is unavailable for credential verification"
+                    .into(),
+        }
+        })?;
+    Ok(SandboxCreateConfig {
+        run_id: 0,
+        container_name_override: Some(label),
+        host_work_dir,
+        workspace_volume: None,
+        image: Some(image.to_string()),
+        cpu_limit: Some(1.0),
+        memory_limit_mb: Some(1024),
+        pids_limit: Some(128),
+        disk_size_mb: None,
+        network_mode: Some("restricted".into()),
+        env_vars: HashMap::new(),
+        idle_timeout: Duration::from_secs(120),
+        backend: None,
+        owner_user_id: None,
+    })
+}
+
+impl AgentCliAiService {
+    async fn run_candidate_probe(
+        &self,
+        principal_id: i32,
+        credentials: SandboxHarnessCredentials,
+        verification_model: Option<&str>,
+    ) -> Result<(), AiError> {
+        const PURPOSE: &str = "provider.credentials.verify";
+        let sandbox = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "sandbox provider is unavailable for credential verification".into(),
+            })?;
+        let relay_service = self
+            .sandbox_model_relay
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "model relay is unavailable for credential verification".into(),
+            })?;
+        let scratch =
+            Arc::new(
+                tempfile::tempdir_in(&self.scratch_dir).map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "could not create an isolated verification directory".into(),
+                })?,
+            );
+        let label = format!("credential-verify-{}", uuid::Uuid::new_v4().simple());
+        let create_config = candidate_probe_create_config(label, scratch.path().to_path_buf())?;
+        let create_provider = sandbox.clone();
+        let mut create_guard = CandidateCreateGuard {
+            provider: sandbox.clone(),
+            task: Some(tokio::spawn(async move {
+                create_provider.create(create_config).await
+            })),
+            scratch: scratch.clone(),
+        };
+        let task = create_guard
+            .task
+            .as_mut()
+            .ok_or_else(|| AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "verification sandbox startup task is unavailable".into(),
+            })?;
+        let handle = match tokio::time::timeout(Duration::from_secs(60), task).await {
+            Ok(Ok(Ok(handle))) => {
+                create_guard.task = None;
+                handle
+            }
+            Ok(_) => {
+                return Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "could not start the isolated verification sandbox".into(),
+                })
+            }
+            Err(_) => {
+                return Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "isolated verification sandbox startup timed out".into(),
+                })
+            }
+        };
+        let guard = CandidateSandbox {
+            provider: sandbox.clone(),
+            handle: Some(handle.clone()),
+            scratch,
+        };
+        if handle.backend == SandboxBackend::Local {
+            guard.destroy().await?;
+            return Err(AiError::Provider {
+                purpose: PURPOSE.into(),
+                reason: "credential verification requires an isolated Docker or VM sandbox".into(),
+            });
+        }
+        let probe = async {
+            let relay_base_url = sandbox
+                .model_relay_base_url(&handle, &credentials.internal_api_url)
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "verification sandbox cannot reach the model relay".into(),
+                })?;
+            let opencode_models = match &credentials.provider_credential {
+                crate::model_relay::SandboxProviderCredential::OpenCodeAuthJson {
+                    providers,
+                    ..
+                } => providers
+                    .iter()
+                    .filter_map(|provider| match provider.as_str() {
+                        "anthropic" => Some("anthropic/claude-haiku-4-5"),
+                        "openai" => Some("openai/gpt-5.4"),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let opencode_model =
+                selected_opencode_probe_model(&opencode_models, verification_model)?;
+            let selected_model = match self.provider.name() {
+                "claude_cli" => Some("haiku"),
+                "codex_cli" => Some("gpt-5.6-luna"),
+                "opencode" => opencode_model,
+                _ => None,
+            };
+            let (relay, relay_guard) = relay_service.register(
+                self.provider.name(),
+                principal_id,
+                selected_model,
+                credentials,
+                &relay_base_url,
+                Duration::from_secs(100),
+            )?;
+            let mut command = match self.provider.name() {
+                "claude_cli" => vec![
+                    "claude".into(),
+                    "--print".into(),
+                    "Reply OK.".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                    "--tools".into(),
+                    "".into(),
+                    "--strict-mcp-config".into(),
+                    "--setting-sources=".into(),
+                    "--model".into(),
+                    "haiku".into(),
+                ],
+                "codex_cli" => vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "--strict-config".into(),
+                    "--ignore-user-config".into(),
+                    "--ephemeral".into(),
+                    "--ignore-rules".into(),
+                    "--sandbox".into(),
+                    "read-only".into(),
+                    "--model".into(),
+                    "gpt-5.6-luna".into(),
+                    "Reply OK.".into(),
+                    "--json".into(),
+                    "--skip-git-repo-check".into(),
+                ],
+                "opencode" => vec![
+                    "opencode".into(),
+                    "run".into(),
+                    "--pure".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    opencode_model
+                        .ok_or_else(|| AiError::Provider {
+                            purpose: PURPOSE.into(),
+                            reason: "OpenCode auth has no supported provider".into(),
+                        })?
+                        .into(),
+                    "--".into(),
+                    "Reply OK.".into(),
+                ],
+                _ => {
+                    return Err(AiError::Provider {
+                        purpose: PURPOSE.into(),
+                        reason: "provider has no native verification command".into(),
+                    })
+                }
+            };
+            let mut environment = HashMap::new();
+            let mut files = Vec::new();
+            configure_sandbox_model_relay(
+                self.provider.name(),
+                &mut command,
+                &mut environment,
+                &mut files,
+                &relay,
+            )?;
+            prepare_native_opencode_auth(sandbox.as_ref(), &handle, &relay, PURPOSE).await?;
+            for (path, contents) in &files {
+                sandbox
+                    .write_file(&handle, path, contents, 0o600)
+                    .await
+                    .map_err(|_| AiError::Provider {
+                        purpose: PURPOSE.into(),
+                        reason: "could not stage a temporary relay capability".into(),
+                    })?;
+            }
+            let output = sandbox
+                .exec(&handle, command, environment, None)
+                .await
+                .map_err(|_| AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "native harness verification failed to run".into(),
+                })?;
+            if matches!(relay_guard.inference_status(), Some(401 | 403)) {
+                return Err(AiError::Provider { purpose: "provider.credentials.verify.auth".into(), reason: format!("{} credential was rejected by its model provider (authentication or access denied)", self.provider.name()) });
+            }
+            if matches!(relay_guard.inference_status(), Some(402 | 429)) {
+                return Err(AiError::Provider { purpose: "provider.credentials.verify.allowance".into(), reason: format!("{} credential could not be verified because its account has insufficient allowance or is rate limited", self.provider.name()) });
+            }
+            if candidate_probe_native_auth_rejected(&output.stdout, &output.stderr) {
+                return Err(AiError::Provider {
+                    purpose: "provider.credentials.verify.auth".into(),
+                    reason: format!(
+                        "{} native harness rejected the candidate credential",
+                        self.provider.name()
+                    ),
+                });
+            }
+            if output.exit_code != 0 {
+                let runtime_failure =
+                    candidate_probe_runtime_failure(output.exit_code, &output.stderr);
+                return Err(AiError::Provider {
+                    purpose: if runtime_failure {
+                        PURPOSE.into()
+                    } else {
+                        "provider.credentials.verify.model".into()
+                    },
+                    reason: if runtime_failure {
+                        format!("{} verification runtime is unavailable or incompatible with required safe flags (exit {}); update the sandbox image", self.provider.name(), output.exit_code)
+                    } else {
+                        format!("{} could not complete a minimal model request (exit {}); check model access", self.provider.name(), output.exit_code)
+                    },
+                });
+            }
+            let answered = candidate_probe_has_answer(self.provider.name(), &output.stdout);
+            if !answered
+                || (self.provider.name() != "opencode" && !relay_guard.inference_succeeded())
+            {
+                return Err(AiError::Provider {
+                    purpose: "provider.credentials.verify.model".into(),
+                    reason: format!(
+                        "{} did not confirm an authenticated model response",
+                        self.provider.name()
+                    ),
+                });
+            }
+            for model in opencode_models
+                .iter()
+                .skip(1)
+                .filter(|_| verification_model.is_none())
+            {
+                let mut next_command = vec![
+                    "opencode".into(),
+                    "run".into(),
+                    "--pure".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    (*model).into(),
+                    "--".into(),
+                    "Reply OK.".into(),
+                ];
+                let mut next_environment = HashMap::new();
+                let mut next_files = Vec::new();
+                configure_sandbox_model_relay(
+                    "opencode",
+                    &mut next_command,
+                    &mut next_environment,
+                    &mut next_files,
+                    &relay,
+                )?;
+                let next = sandbox
+                    .exec(&handle, next_command, next_environment, None)
+                    .await
+                    .map_err(|_| AiError::Provider {
+                        purpose: "provider.credentials.verify.model".into(),
+                        reason: "OpenCode could not verify an additional provider entry".into(),
+                    })?;
+                if matches!(relay_guard.inference_status(), Some(401 | 403)) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.auth".into(),
+                        reason: "OpenCode provider explicitly rejected a credential".into(),
+                    });
+                }
+                if matches!(relay_guard.inference_status(), Some(402 | 429)) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.allowance".into(),
+                        reason: "OpenCode provider allowance or rate limit prevented verification"
+                            .into(),
+                    });
+                }
+                if candidate_probe_native_auth_rejected(&next.stdout, &next.stderr) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.auth".into(),
+                        reason: format!(
+                            "OpenCode native harness rejected the credential for '{model}'"
+                        ),
+                    });
+                }
+                if next.exit_code != 0 || !candidate_probe_has_answer("opencode", &next.stdout) {
+                    return Err(AiError::Provider {
+                        purpose: "provider.credentials.verify.model".into(),
+                        reason: format!(
+                            "OpenCode did not complete an authenticated request for '{model}'"
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(100), probe)
+            .await
+            .unwrap_or_else(|_| {
+                Err(AiError::Provider {
+                    purpose: PURPOSE.into(),
+                    reason: "native credential verification timed out".into(),
+                })
+            });
+        if let Err(cleanup_error) = guard.destroy().await {
+            tracing::error!(provider = %self.provider.name(), probe_succeeded = result.is_ok(), "candidate verification sandbox cleanup failed");
+            return Err(cleanup_error);
+        }
+        result
+    }
+}
+
 #[async_trait]
 impl AiService for AgentCliAiService {
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+    ) -> Result<(), AiError> {
+        if provider != self.provider.name() {
+            return Err(AiError::Provider {
+                purpose: "provider.credentials.verify.invalid".into(),
+                reason: format!(
+                    "candidate provider '{provider}' does not match the selected harness"
+                ),
+            });
+        }
+        let resolver =
+            self.sandbox_candidate_credentials
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.credentials.verify.setup".into(),
+                    reason: "candidate credential resolver is unavailable".into(),
+                })?;
+        let candidate = resolver(provider, auth_type, credential).await.map_err(|_| AiError::Provider {
+            purpose: "provider.credentials.verify.invalid".into(),
+            reason: format!("candidate credential for '{provider}' ({auth_type}) is malformed or unsupported"),
+        })?;
+        self.run_candidate_probe(principal_id, candidate, None)
+            .await
+    }
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<(), AiError> {
+        if provider != "opencode" || model.is_none() {
+            return self
+                .verify_candidate_credential(provider, auth_type, credential, principal_id)
+                .await;
+        }
+        let resolver =
+            self.sandbox_candidate_credentials
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.credentials.verify.setup".into(),
+                    reason: "candidate credential resolver is unavailable".into(),
+                })?;
+        let candidate = resolver(provider, auth_type, credential)
+            .await
+            .map_err(|_| AiError::Provider {
+                purpose: "provider.credentials.verify.invalid".into(),
+                reason: "candidate OpenCode credential is malformed or unsupported".into(),
+            })?;
+        self.run_candidate_probe(principal_id, candidate, model)
+            .await
+    }
     /// Returns `true` when the underlying CLI reports both `installed` and
     /// `authenticated`. Callers should gate prompt construction on this check.
     async fn is_available(&self) -> bool {
@@ -5090,6 +5683,12 @@ impl AiService for AgentCliAiService {
 
 #[cfg(test)]
 mod tests {
+    macro_rules! mcp_request {
+        ($($json:tt)*) => {
+            serde_json::from_value::<temps_ai::mcp::McpRequest>(serde_json::json!($($json)*))
+                .expect("valid MCP request fixture")
+        };
+    }
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -5098,6 +5697,35 @@ mod tests {
     use temps_agents::error::AgentError;
     use temps_ai::streaming::ChatTool;
     use temps_ai::AiRequest;
+
+    #[test]
+    fn credential_probe_uses_managed_workspace_runtime_image() {
+        let config = candidate_probe_create_config(
+            "credential-verify-test".to_string(),
+            PathBuf::from("/tmp/credential-verify-test"),
+        )
+        .expect("managed node image is configured");
+        let expected = temps_sandbox::services::managed_application_workspace_image("node")
+            .expect("managed node image");
+        assert_eq!(config.image.as_deref(), Some(expected));
+        assert_eq!(
+            config.container_name_override.as_deref(),
+            Some("credential-verify-test")
+        );
+        assert_eq!(config.network_mode.as_deref(), Some("restricted"));
+    }
+
+    #[test]
+    fn retained_execution_ids_are_distinct_within_one_traced_chat_turn() {
+        let first =
+            new_retained_invocation_id("chat.application.tools").expect("first execution identity");
+        let second = new_retained_invocation_id("chat.application.tools")
+            .expect("second execution identity");
+        assert_ne!(
+            first, second,
+            "each provider execution needs its own SDK id"
+        );
+    }
 
     #[test]
     fn retained_sandbox_mcp_strictness_matches_provider_capability() {
@@ -5242,6 +5870,7 @@ mod tests {
     }
 
     struct RecordingModelDiscoverySandbox {
+        candidate_mode: bool,
         exec_calls: Arc<AtomicUsize>,
         lifecycle_calls: Arc<AtomicUsize>,
         cleanup_calls: Arc<AtomicUsize>,
@@ -5252,9 +5881,20 @@ mod tests {
     impl SandboxProvider for RecordingModelDiscoverySandbox {
         async fn create(
             &self,
-            _config: SandboxCreateConfig,
+            config: SandboxCreateConfig,
         ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
             self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            if self.candidate_mode {
+                assert!(config
+                    .container_name_override
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("credential-verify-")));
+                assert!(config.workspace_volume.is_none());
+                assert!(config.env_vars.is_empty());
+                let mut handle = test_sandbox_handle();
+                handle.backend = SandboxBackend::Docker;
+                return Ok(handle);
+            }
             Err(AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: "unexpected-create".to_string(),
@@ -5270,6 +5910,16 @@ mod tests {
             _on_output: Option<OnEventCallback>,
         ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
             self.exec_calls.fetch_add(1, Ordering::SeqCst);
+            if self.candidate_mode {
+                assert_eq!(command.first().map(String::as_str), Some("claude"));
+                assert!(command.iter().any(|arg| arg == "--tools"));
+                assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
+                return Ok(temps_agents::sandbox::SandboxExecResult {
+                    exit_code: 0,
+                    stdout: r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#.into(),
+                    stderr: String::new(),
+                });
+            }
             if command.first().map(String::as_str) == Some("temps-sandbox-runtime") {
                 let response = self
                     .runtime_responses
@@ -5441,6 +6091,7 @@ mod tests {
         let exec_calls = Arc::new(AtomicUsize::new(0));
         let lifecycle_calls = Arc::new(AtomicUsize::new(0));
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: false,
             exec_calls: exec_calls.clone(),
             lifecycle_calls: lifecycle_calls.clone(),
             cleanup_calls: Arc::new(AtomicUsize::new(0)),
@@ -5468,6 +6119,7 @@ mod tests {
             sandbox,
             workspace_root,
             credentials,
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
             Arc::new(SandboxModelRelayService::new().expect("model relay")),
             resolver,
         );
@@ -5485,6 +6137,153 @@ mod tests {
             0,
             "successful discovery must not create, recover, restart, stop, or destroy managed compute"
         );
+    }
+
+    #[test]
+    fn chosen_opencode_probe_model_requires_saved_provider_and_safe_model_id() {
+        let defaults = ["anthropic/claude-haiku-4-5"];
+        assert_eq!(
+            selected_opencode_probe_model(&defaults, None).unwrap(),
+            Some(defaults[0])
+        );
+        assert_eq!(
+            selected_opencode_probe_model(&defaults, Some("anthropic/claude-sonnet-4-5")).unwrap(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        for model in [
+            "openai/gpt-5",
+            "anthropic/",
+            "anthropic/a/b",
+            "anthropic/evil\nflag",
+        ] {
+            assert!(
+                matches!(selected_opencode_probe_model(&defaults, Some(model)), Err(AiError::Provider { purpose, .. }) if purpose == "provider.credentials.verify.invalid"),
+                "{model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_probe_requires_upstream_inference_and_destroys_isolated_sandbox() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let lifecycle = Arc::new(AtomicUsize::new(0));
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: true,
+            exec_calls: exec_calls.clone(),
+            lifecycle_calls: lifecycle.clone(),
+            cleanup_calls: Arc::new(AtomicUsize::new(0)),
+            runtime_responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            scratch.path().to_path_buf(),
+            Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(SandboxModelRelayService::new().expect("relay")),
+            SandboxWorkspaceResolverSlot::new(),
+        );
+        let result = service
+            .run_candidate_probe(
+                42,
+                SandboxHarnessCredentials::claude_oauth_token(
+                    "candidate-secret",
+                    "http://model-relay.internal",
+                ),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AiError::Provider { reason, .. }) if reason.contains("did not confirm"))
+        );
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lifecycle.load(Ordering::SeqCst),
+            2,
+            "create and destroy must both run"
+        );
+    }
+
+    #[test]
+    fn candidate_probe_accepts_only_substantive_assistant_events() {
+        assert!(candidate_probe_has_answer(
+            "claude_cli",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#,
+        ));
+        assert!(!candidate_probe_has_answer(
+            "claude_cli",
+            r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        ));
+        assert!(!candidate_probe_has_answer(
+            "opencode",
+            r#"{"type":"step_finish","part":{"type":"step_finish"}}"#,
+        ));
+        assert!(candidate_probe_runtime_failure(
+            2,
+            "error: unexpected argument '--pure'"
+        ));
+        assert!(candidate_probe_runtime_failure(127, ""));
+        assert!(!candidate_probe_runtime_failure(1, "authentication failed"));
+    }
+
+    #[test]
+    fn native_probe_auth_errors_are_conclusive_without_relay_traffic() {
+        let rejected = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
+        assert!(candidate_probe_native_auth_rejected(rejected, ""));
+        assert!(candidate_probe_native_auth_rejected(
+            "",
+            "Authentication failed"
+        ));
+        assert!(candidate_probe_native_auth_rejected(
+            r#"{"type":"error","error":{"statusCode":403,"message":"Access denied"}}"#,
+            ""
+        ));
+        assert!(!candidate_probe_native_auth_rejected(
+            r#"{"type":"error","error":{"message":"Model not found"}}"#,
+            ""
+        ));
+        assert!(!candidate_probe_native_auth_rejected(
+            r#"{"type":"text","part":{"text":"401"}}"#,
+            ""
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_candidate_creation_destroys_late_sandbox() {
+        let scratch = Arc::new(tempfile::tempdir().expect("scratch directory"));
+        let lifecycle = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: true,
+            exec_calls: Arc::new(AtomicUsize::new(0)),
+            lifecycle_calls: lifecycle.clone(),
+            cleanup_calls: Arc::new(AtomicUsize::new(0)),
+            runtime_responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        });
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(test_sandbox_handle())
+        });
+        drop(CandidateCreateGuard {
+            provider,
+            task: Some(task),
+            scratch,
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lifecycle.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late sandbox should be destroyed");
     }
 
     #[tokio::test]
@@ -6785,7 +7584,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             axum::http::HeaderMap::new(),
-            axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+            axum::Json(mcp_request!({"id": 1, "method": "initialize"})),
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
@@ -6798,7 +7597,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state.clone()),
                 authorized_headers(),
-                axum::Json(serde_json::json!({"id": 1, "method": "initialize"})),
+                axum::Json(mcp_request!({"id": 1, "method": "initialize"})),
             )
             .await,
         )
@@ -6809,7 +7608,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state.clone()),
                 authorized_headers(),
-                axum::Json(serde_json::json!({"id": 2, "method": "tools/list"})),
+                axum::Json(mcp_request!({"id": 2, "method": "tools/list"})),
             )
             .await,
         )
@@ -6820,7 +7619,7 @@ mod tests {
             mcp_bridge_handler(
                 axum::extract::State(state),
                 authorized_headers(),
-                axum::Json(serde_json::json!({
+                axum::Json(mcp_request!({
                     "id": 3,
                     "method": "tools/call",
                     "params": {"name": "temps", "arguments": {"command": "projects list"}}
@@ -6849,7 +7648,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
             })),
@@ -6875,7 +7674,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 4,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}
@@ -6898,7 +7697,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 5,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}
@@ -6925,6 +7724,60 @@ mod tests {
     // `mcp_bridge_handler` directly, as the tests above do) because
     // `DefaultBodyLimit` is enforced by the extractor via a `tower::Layer`,
     // which only runs when a request actually passes through the router.
+    #[tokio::test]
+    async fn mcp_bridge_router_preserves_null_ids_and_rejects_malformed_requests() {
+        use tower::ServiceExt;
+        let (state, _events) = test_mcp_state();
+        let router = build_bridge_router("/mcp/test", state);
+        for (body, status, expected_id) in [
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                axum::http::StatusCode::ACCEPTED,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+                axum::http::StatusCode::OK,
+                Some(serde_json::Value::Null),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":"rpc-1","method":"ping"}"#,
+                axum::http::StatusCode::OK,
+                Some(serde_json::json!("rpc-1")),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":false}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}"#,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp/test")
+                .header(axum::http::header::AUTHORIZATION, "Bearer one-turn-token")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), status, "{body}");
+            if let Some(id) = expected_id {
+                let json = response_json(response).await;
+                assert_eq!(json["id"], id);
+                assert_eq!(json["result"], serde_json::json!({}));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mcp_bridge_router_rejects_request_over_body_limit() {
         use tower::ServiceExt;
@@ -6993,7 +7846,7 @@ mod tests {
         let response = mcp_bridge_handler(
             axum::extract::State(state),
             authorized_headers(),
-            axum::Json(serde_json::json!({
+            axum::Json(mcp_request!({
                 "id": 6,
                 "method": "tools/call",
                 "params": {"name": "temps", "arguments": {}}
@@ -7564,6 +8417,7 @@ mod tests {
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         (
             Arc::new(RecordingModelDiscoverySandbox {
+                candidate_mode: false,
                 exec_calls: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(AtomicUsize::new(0)),
                 cleanup_calls: cleanup_calls.clone(),
@@ -8116,6 +8970,7 @@ mod tests {
         let exec_calls = Arc::new(AtomicUsize::new(0));
         let lifecycle_calls = Arc::new(AtomicUsize::new(0));
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            candidate_mode: false,
             exec_calls: exec_calls.clone(),
             lifecycle_calls: lifecycle_calls.clone(),
             cleanup_calls: Arc::new(AtomicUsize::new(0)),

@@ -66,7 +66,7 @@ export function PlatformTools() {
     .filter((group) => group.items.length > 0)
 
   return (
-    <PageContainer width="full" innerClassName="space-y-8 pb-6">
+    <PageContainer innerClassName="space-y-8 pb-6">
       <PageHeader
         title="All platform tools"
         description="Every Temps capability remains available here while the main sidebar stays focused on daily work."

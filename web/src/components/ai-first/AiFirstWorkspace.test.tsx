@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ProviderCatalogDto } from '@/api/client'
 import {
   ApplicationStartScreen,
@@ -51,7 +52,8 @@ describe('HarnessPicker', () => {
     const base = {
       auth_command: 'login',
       auth_flavors: [],
-      credential_saved: true,
+    credential_saved: true,
+    credential_verification_status: 'verified',
       current_auth_type: 'subscription',
       default_model: null,
       default_permission_mode_id: 'default',
@@ -209,29 +211,32 @@ describe('WorkspaceStatusIndicator', () => {
 })
 
 describe('ApplicationStartScreen', () => {
-  test('offers bounded blank, files-or-ZIP, and credentialed Git starts', () => {
+  test('asks only for the harness before showing configuration or a prompt', () => {
     const html = renderToStaticMarkup(
       <MemoryRouter>
-        <ApplicationStartScreen
-          harnesses={[
-            {
-              id: 'codex_cli',
-              name: 'Codex',
-              authMethod: 'subscription',
-              models: [],
-            },
-          ]}
-          harnessesLoading={false}
-          onCancel={() => {}}
-          onCreated={() => {}}
-        />
+        <QueryClientProvider client={new QueryClient()}>
+          <ApplicationStartScreen
+            harnesses={[
+              {
+                id: 'codex_cli',
+                name: 'Codex',
+                authMethod: 'subscription',
+                models: [],
+              },
+            ]}
+            harnessesLoading={false}
+            onCancel={() => {}}
+            onCreated={() => {}}
+          />
+        </QueryClientProvider>
       </MemoryRouter>
     )
 
-    expect(html).toContain('Blank project')
-    expect(html).toContain('Files or ZIP')
-    expect(html).toContain('Git repository')
-    expect(html).toContain('Autopack project')
+    expect(html).toContain('Choose your harness')
+    expect(html).not.toContain('workspace-prompt')
+    expect(html).not.toContain('ai-app-name')
+    expect(html).not.toContain('workspace-thinking')
+    expect(html).not.toContain('Start a persistent machine')
   })
 })
 

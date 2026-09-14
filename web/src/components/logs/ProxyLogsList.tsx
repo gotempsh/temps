@@ -23,6 +23,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import {
   Table,
   TableBody,
@@ -77,6 +78,17 @@ export default function ProxyLogsList({
     const limitParam = searchParams.get('limit')
     return limitParam ? parseInt(limitParam) : 25
   })
+  const [sortBy, setSortBy] = useState<
+    'timestamp' | 'status_code' | 'response_time_ms'
+  >(() => {
+    const value = searchParams.get('sort_by')
+    return value === 'status_code' || value === 'response_time_ms'
+      ? value
+      : 'timestamp'
+  })
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
+    searchParams.get('sort_order') === 'asc' ? 'asc' : 'desc'
+  )
   const [method, setMethod] = useState<string>('all')
   const [statusCode, setStatusCode] = useState<string>(() => {
     const statusCode = searchParams.get('status_code')
@@ -183,6 +195,8 @@ export default function ProxyLogsList({
         ai_agent: aiAgent || undefined,
         ai_provider: aiProvider || undefined,
         path: pathFilter || undefined,
+        sort_by: sortBy,
+        sort_order: sortOrder,
       },
     })
   )
@@ -237,6 +251,13 @@ export default function ProxyLogsList({
       newParams.set('limit', limit.toString())
     }
 
+    if (sortBy !== 'timestamp') {
+      newParams.set('sort_by', sortBy)
+    }
+    if (sortOrder !== 'desc') {
+      newParams.set('sort_order', sortOrder)
+    }
+
     setSearchParams(newParams)
   }, [
     timeRange,
@@ -250,6 +271,8 @@ export default function ProxyLogsList({
     showFilters,
     page,
     limit,
+    sortBy,
+    sortOrder,
     setSearchParams,
   ])
 
@@ -275,6 +298,18 @@ export default function ProxyLogsList({
 
   const handleLimitChange = (value: string) => {
     setLimit(parseInt(value))
+    setPage(1)
+  }
+
+  const handleSort = (
+    field: 'timestamp' | 'status_code' | 'response_time_ms'
+  ) => {
+    if (sortBy === field) {
+      setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')
+    } else {
+      setSortBy(field)
+      setSortOrder('desc')
+    }
     setPage(1)
   }
 
@@ -627,15 +662,29 @@ export default function ProxyLogsList({
               <Table className="w-full">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="whitespace-nowrap">
-                      Timestamp
-                    </TableHead>
+                    <SortableTableHead
+                      label="Timestamp"
+                      active={sortBy === 'timestamp'}
+                      direction={sortOrder}
+                      onClick={() => handleSort('timestamp')}
+                      className="whitespace-nowrap"
+                    />
                     <TableHead className="whitespace-nowrap">Method</TableHead>
                     <TableHead className="whitespace-nowrap">URL</TableHead>
-                    <TableHead className="whitespace-nowrap">Status</TableHead>
-                    <TableHead className="whitespace-nowrap">
-                      Duration
-                    </TableHead>
+                    <SortableTableHead
+                      label="Status"
+                      active={sortBy === 'status_code'}
+                      direction={sortOrder}
+                      onClick={() => handleSort('status_code')}
+                      className="whitespace-nowrap"
+                    />
+                    <SortableTableHead
+                      label="Duration"
+                      active={sortBy === 'response_time_ms'}
+                      direction={sortOrder}
+                      onClick={() => handleSort('response_time_ms')}
+                      className="whitespace-nowrap"
+                    />
                     <TableHead className="whitespace-nowrap">
                       User agent
                     </TableHead>

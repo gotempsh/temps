@@ -313,7 +313,7 @@ export function Account() {
   }
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       {verificationDialog}
       <Card>
         <CardHeader>
@@ -791,7 +791,7 @@ export function Account() {
 
 function AccountSkeleton() {
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <Card>
         <CardHeader>
           <Skeleton className="h-8 w-[200px]" />

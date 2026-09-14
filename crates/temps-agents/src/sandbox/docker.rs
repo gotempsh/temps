@@ -6,6 +6,7 @@ use bollard::container::LogOutput;
 use bollard::exec::StartExecResults;
 use bollard::Docker;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +58,23 @@ fn runtime_health_exec_config() -> bollard::models::ExecConfig {
         attach_stderr: Some(true),
         ..Default::default()
     }
+}
+
+#[derive(Deserialize)]
+struct RuntimeHealthResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    capabilities: Vec<String>,
+}
+
+fn has_harness_recovery_capability(output: &str) -> bool {
+    serde_json::from_str::<RuntimeHealthResponse>(output.trim()).is_ok_and(|health| {
+        health.response_type == "health"
+            && health
+                .capabilities
+                .iter()
+                .any(|capability| capability == "recover_harness")
+    })
 }
 
 /// Naming prefix for the named volume backing a sandbox's `/home/temps`.
@@ -1487,6 +1505,18 @@ impl DockerSandboxProvider {
         label: &str,
         config: bollard::models::ExecConfig,
     ) -> Result<i64, AgentError> {
+        self.run_exec_config_captured(container_id, run_id, label, config)
+            .await
+            .map(|(code, _)| code)
+    }
+
+    async fn run_exec_config_captured(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        config: bollard::models::ExecConfig,
+    ) -> Result<(i64, String), AgentError> {
         let exec = self
             .docker
             .create_exec(container_id, config)
@@ -1517,13 +1547,24 @@ impl DockerSandboxProvider {
         // bollard tears the exec down when the stream is dropped, which
         // can race with the underlying command on slow hosts.
         let mut stderr_tail = String::new();
+        let mut stdout = String::new();
         if let StartExecResults::Attached { mut output, .. } = output {
             while let Some(chunk) = output.next().await {
-                if let Ok(LogOutput::StdErr { message }) = chunk {
-                    // A faulty image can print indefinitely; retain only a small diagnostic tail.
-                    let available = 4096usize.saturating_sub(stderr_tail.len());
-                    let text = String::from_utf8_lossy(&message[..message.len().min(available)]);
-                    stderr_tail.push_str(&text);
+                match chunk {
+                    Ok(LogOutput::StdErr { message }) => {
+                        // A faulty image can print indefinitely; retain only a small diagnostic tail.
+                        let available = 4096usize.saturating_sub(stderr_tail.len());
+                        let text =
+                            String::from_utf8_lossy(&message[..message.len().min(available)]);
+                        stderr_tail.push_str(&text);
+                    }
+                    Ok(LogOutput::StdOut { message }) => {
+                        let available = 4096usize.saturating_sub(stdout.len());
+                        let text =
+                            String::from_utf8_lossy(&message[..message.len().min(available)]);
+                        stdout.push_str(&text);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1551,7 +1592,7 @@ impl DockerSandboxProvider {
             );
         }
 
-        Ok(exit_code)
+        Ok((exit_code, stdout))
     }
 
     /// Run the per-container ownership-normalization steps: chown -R
@@ -3181,7 +3222,37 @@ impl SandboxProvider for DockerSandboxProvider {
         )
         .await
         {
-            Ok(Ok(0)) => Ok(RuntimeCompatibility::Compatible),
+            Ok(Ok(0)) => {
+                // The SDK socket can be healthy on an older image that cannot
+                // safely fence orphaned harness turns after a backend restart.
+                let health = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.run_exec_config_captured(
+                        &handle.sandbox_id,
+                        0,
+                        "runtime-health-capabilities",
+                        runtime_health_exec_config(),
+                    ),
+                )
+                .await;
+                match health {
+                    Ok(Ok((0, output))) if has_harness_recovery_capability(&output) => {
+                        Ok(RuntimeCompatibility::Compatible)
+                    }
+                    Ok(Ok((0, _))) => Ok(RuntimeCompatibility::Incompatible {
+                        reason: "runtime health does not advertise recover_harness; update the workspace runtime".into(),
+                    }),
+                    Ok(Ok((code, _))) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: format!("runtime health probe exited {code}"),
+                    }),
+                    Ok(Err(error)) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: format!("runtime health probe failed: {error}"),
+                    }),
+                    Err(_) => Ok(RuntimeCompatibility::Unavailable {
+                        reason: "runtime health probe timed out after 5 seconds".into(),
+                    }),
+                }
+            }
             Ok(Ok(2)) => Ok(RuntimeCompatibility::Unavailable {
                 reason: "retained agent runtime socket is unavailable or probe timed out".into(),
             }),
@@ -5826,6 +5897,21 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_health_requires_harness_recovery_capability() {
+        use super::has_harness_recovery_capability;
+
+        assert!(has_harness_recovery_capability(
+            r#"{"type":"health","version":1,"capabilities":["retained_runtime","recover_harness"]}"#
+        ));
+        assert!(!has_harness_recovery_capability(
+            r#"{"type":"health","version":1,"capabilities":["retained_runtime"]}"#
+        ));
+        assert!(!has_harness_recovery_capability(
+            r#"{"type":"error","capabilities":["recover_harness"]}"#
+        ));
+        assert!(!has_harness_recovery_capability("not json"));
+    }
     #[test]
     fn retained_runtime_connection_is_unprivileged_binary_duplex_not_a_shell() {
         let config = super::agent_runtime_exec_config();

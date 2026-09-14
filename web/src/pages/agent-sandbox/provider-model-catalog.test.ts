@@ -78,6 +78,7 @@ function provider(id: string): ProviderCatalogDto {
     permission_modes: [],
     default_permission_mode_id: 'default',
     credential_saved: true,
+    credential_verification_status: 'verified',
     current_auth_type: null,
     default_model: null,
     max_turns_analysis: null,

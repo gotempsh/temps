@@ -246,6 +246,35 @@ pub trait AiService: Send + Sync {
         self.capabilities_snapshot_for(provider, refresh).await
     }
 
+    /// Verify a candidate credential with a real provider request before it
+    /// replaces the saved credential. Implementations must not use cached
+    /// capabilities or the currently persisted credential for this check.
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        _auth_type: &str,
+        _credential: &str,
+        _principal_id: i32,
+    ) -> Result<(), AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.credentials.verify".to_string(),
+            reason: format!("credential verification is unavailable for '{provider}'"),
+        })
+    }
+
+    /// Verify a candidate against an explicitly selected model when supported.
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        _model: Option<&str>,
+    ) -> Result<(), AiError> {
+        self.verify_candidate_credential(provider, auth_type, credential, principal_id)
+            .await
+    }
+
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
 

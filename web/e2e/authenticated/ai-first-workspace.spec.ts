@@ -26,11 +26,11 @@ test.describe('AI workspace', () => {
       ).toBeVisible()
       await expect(
         page.getByRole('link', { name: /Harnesses/ })
-      ).toHaveAttribute('href', '/agent-sandbox/providers')
+      ).toHaveAttribute('href', '/agent-sandbox/providers?returnTo=%2Fai-first')
 
       await page.getByRole('button', { name: 'New workspace' }).click()
       await expect(
-        page.getByRole('heading', { name: 'Start a persistent machine.' })
+        page.getByRole('heading', { name: 'Choose your harness' })
       ).toBeVisible()
 
       const viewportOverflow = await page.evaluate(

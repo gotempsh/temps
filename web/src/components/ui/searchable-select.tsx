@@ -23,6 +23,8 @@ import {
 export interface SearchableSelectOption {
   value: string
   label: string
+  /** Optional leading icon for this option. */
+  icon?: React.ReactNode
   /** Optional group label — items sharing a group render together under it. */
   group?: string
   groupIcon?: React.ReactNode
@@ -153,6 +155,11 @@ export function SearchableSelect({
                         value === opt.value ? 'opacity-100' : 'opacity-0'
                       )}
                     />
+                    {opt.icon && (
+                      <span aria-hidden="true" className="mr-2 flex shrink-0">
+                        {opt.icon}
+                      </span>
+                    )}
                     <span className="truncate">{opt.label}</span>
                   </CommandItem>
                 ))}

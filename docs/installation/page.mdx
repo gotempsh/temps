@@ -396,6 +396,15 @@ sudo systemctl status temps
 
 If you're running behind nginx:
 
+An admin can enable **Settings → Security → Proxy client IP** to use the
+visitor IP for analytics and IP-based controls. The database-backed setting
+applies to both `temps serve` and standalone `temps proxy` processes within a
+few seconds. Forwarded-IP trust is off by default.
+Enable it only when nginx connects to Temps over loopback and
+overwrites `X-Real-IP` and either overwrites `X-Forwarded-For` with
+`$remote_addr` or appends `$remote_addr` as the final entry, as below.
+Passing client-supplied headers through unchanged lets clients spoof their IP.
+
 ```nginx
 server {
     listen 80;

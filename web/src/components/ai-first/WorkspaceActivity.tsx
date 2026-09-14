@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import type { WorkspaceHarnessActivity } from '@/api/client'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import { cn } from '@/lib/utils'
 import {
   aiHarnessName,
   canonicalHarnessId,
@@ -75,10 +76,12 @@ export function groupHarnessActivity(harnesses: WorkspaceHarnessActivity[]) {
 export function WorkspaceActivity({
   projectCount,
   showThreads = true,
+  className,
   ...activity
 }: {
   projectCount?: number
   showThreads?: boolean
+  className?: string
   harnesses?: WorkspaceHarnessActivity[]
   loading?: boolean
   error?: boolean
@@ -86,7 +89,10 @@ export function WorkspaceActivity({
   return (
     <p
       data-workspace-activity
-      className="mt-1.5 flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-xs tabular-nums sm:text-[0.625rem]"
+      className={cn(
+        'mt-1.5 flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-xs tabular-nums sm:text-[0.625rem]',
+        className
+      )}
     >
       {projectCount !== undefined && (
         <span

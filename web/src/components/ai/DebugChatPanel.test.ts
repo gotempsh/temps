@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 
 import {
   assistantParts,
@@ -12,6 +14,7 @@ import {
   type ChatMessage,
 } from './chat-message-parts'
 import {
+  AssistantBody,
   appendLiveUserTurn,
   applyWireEvent,
   applicationHarnessPermissionNotice,
@@ -422,6 +425,33 @@ describe('live connection state', () => {
     expect(shouldShowAssistantActivityAfterContent(3, true)).toBe(true)
     expect(shouldShowAssistantActivityAfterContent(1, false)).toBe(false)
     expect(shouldShowAssistantActivityAfterContent(0, true)).toBe(false)
+  })
+
+  test('renders looping activity after completed tools until the turn ends', () => {
+    const props = {
+      message: {
+        role: 'assistant' as const,
+        content: '',
+        parts: [{ type: 'tool' as const, tool: completedTool }],
+      },
+      activityLabel: 'Working on your project',
+      conversationPublicId: null,
+      userScoped: true,
+    }
+    const active = renderToStaticMarkup(
+      createElement(AssistantBody, { ...props, streaming: true })
+    )
+    expect(active).toContain('role="status"')
+    expect(active.match(/ai-activity-pixel/g)).toHaveLength(9)
+    expect(active).toContain('animation-delay:270ms')
+    expect(active).toContain('ai-activity-shimmer')
+    expect(active).toContain('Working on your project')
+
+    const completed = renderToStaticMarkup(
+      createElement(AssistantBody, { ...props, streaming: false })
+    )
+    expect(completed).not.toContain('role="status"')
+    expect(completed).not.toContain('ai-activity-pixel')
   })
 
   test('keeps elapsed activity time anchored to the server across remounts', () => {

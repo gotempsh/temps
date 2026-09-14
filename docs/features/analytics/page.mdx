@@ -194,18 +194,25 @@ temps.track('feature_used', {
 ```
 
 ```bash {{ title: 'Server-Side' }}
-# Track events from backend
-curl -X POST https://api.temps.sh/events \
+# Track events from your backend. The API key needs the AnalyticsWrite
+# permission. environment_id and deployment_id attribute the event; both
+# are shown in the console. visitor_id and session_id are the raw values
+# of the _temps_visitor_id and _temps_sid cookies from the user's request,
+# so the event joins the browser session. Omit them for anonymous events.
+curl -X POST https://your-temps-instance.com/api/projects/${PROJECT_ID}/events/ingest \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "project": "my-app",
-    "event": "subscription_renewed",
-    "properties": {
+    "event_name": "subscription_renewed",
+    "event_data": {
       "plan": "pro",
       "amount": 29.99
     },
-    "userId": "user-123"
+    "environment_id": 1,
+    "deployment_id": 42,
+    "visitor_id": "<_temps_visitor_id cookie>",
+    "session_id": "<_temps_sid cookie>",
+    "request_path": "/billing/renew"
   }'
 ```
 </CodeGroup>

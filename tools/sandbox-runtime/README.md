@@ -25,18 +25,25 @@ Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. Python adds
 Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
 The latter are distribution versions, not promises of the latest toolchains.
 
-Application workspaces use the managed `ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.2`
+Application workspaces use the managed `ghcr.io/gotempsh/temps-sandbox-{nodejs,python,all}:0.3.4`
 pins. For local application-workspace testing, build the corresponding managed
 tag with `build-local.sh`; arbitrary custom images are not accepted by this
-surface. These tags must be published before distributing a release that uses
-them. Building locally does not publish an image.
+surface. These stable tags must be published before distributing a release that
+uses them; a main-branch build publishes only `0.3.4-beta`. Until the stable
+release publishes all three `0.3.4` flavors, build those tags locally when
+testing a checkout that selects the new default. Building locally does not
+publish an image.
 
 ## GitHub Actions publication
 
-`daemon-images-check.yml` builds all three flavors for Linux amd64 and arm64
-on pull requests without registry credentials or pushes. `sandbox-images-beta.yml`
+`daemon-images-check.yml` builds and lifecycle-tests all three flavors for Linux
+amd64 and arm64 on pull requests without registry credentials or pushes. `sandbox-images-beta.yml`
 calls `daemon-images.yml` on image-related main changes; `release.yml` calls
-the same workflow after its release validation. Both honor their dry-run input.
+the same workflow after all four platform builds pass. Both honor their dry-run input.
+For each flavor, publication waits for separate amd64 and arm64 lifecycle smoke
+tests. QEMU runs arm64 on the amd64 runner; the smoke test checks the loaded
+image's architecture against the requested platform before starting a container.
+Neither architecture is published if either smoke test fails.
 
 The build reads the image version from the actual managed-workspace image
 mapping and fetches the SDK commit pinned above. Stable release tags publish

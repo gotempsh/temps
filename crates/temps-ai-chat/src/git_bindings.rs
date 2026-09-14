@@ -313,10 +313,8 @@ impl GitBindingService {
             })
             .exec(self.db.as_ref())
             .await
-            .map_err(|source| GitBindingError::Database {
-                operation: "create",
-                application_id: application_id.to_string(),
-                source,
+            .map_err(|source| {
+                map_binding_insert_error(source, application_id, project_id, remote_name)
             })?;
         Ok(ai_application_git_bindings::Model {
             id: inserted.last_insert_id,
@@ -361,6 +359,35 @@ impl GitBindingService {
             })?;
         Ok(binding)
     }
+}
+
+fn map_binding_insert_error(
+    source: sea_orm::DbErr,
+    application_id: &str,
+    project_id: i32,
+    remote_name: &str,
+) -> GitBindingError {
+    if is_remote_unique_violation(source.sql_err()) {
+        GitBindingError::RemoteAlreadyBound {
+            application_id: application_id.to_string(),
+            project_id,
+            remote_name: remote_name.to_string(),
+        }
+    } else {
+        GitBindingError::Database {
+            operation: "create",
+            application_id: application_id.to_string(),
+            source,
+        }
+    }
+}
+
+fn is_remote_unique_violation(error: Option<sea_orm::SqlErr>) -> bool {
+    matches!(
+        error,
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(message))
+            if message.contains("\"uq_ai_git_binding_remote\"")
+    )
 }
 
 fn validate_remote_name(value: &str) -> Result<(), GitBindingError> {
@@ -442,6 +469,43 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
+    #[test]
+    fn concurrent_remote_insert_conflict_is_classified_by_its_unique_constraint() {
+        assert!(is_remote_unique_violation(Some(
+            sea_orm::SqlErr::UniqueConstraintViolation(
+                "duplicate key value violates unique constraint \"uq_ai_git_binding_remote\""
+                    .into(),
+            ),
+        )));
+        assert!(!is_remote_unique_violation(Some(
+            sea_orm::SqlErr::UniqueConstraintViolation(
+                "duplicate key value violates unique constraint \"other_unique_index\"".into(),
+            ),
+        )));
+        assert!(!is_remote_unique_violation(Some(
+            sea_orm::SqlErr::ForeignKeyConstraintViolation("foreign key violation".into()),
+        )));
+        assert!(!is_remote_unique_violation(None));
+    }
+
+    #[test]
+    fn unrelated_insert_database_error_retains_its_source_and_context() {
+        let error = map_binding_insert_error(
+            sea_orm::DbErr::Custom("connection lost".into()),
+            "app_test",
+            7,
+            "origin",
+        );
+        assert!(matches!(
+            error,
+            GitBindingError::Database {
+                operation: "create",
+                application_id,
+                source: sea_orm::DbErr::Custom(message),
+            } if application_id == "app_test" && message == "connection lost"
+        ));
+    }
+
     fn application(owner: i32) -> ai_applications::Model {
         let now = Utc::now();
         ai_applications::Model {
@@ -487,6 +551,94 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn connection() -> git_provider_connections::Model {
+        let now = Utc::now();
+        git_provider_connections::Model {
+            id: 17,
+            provider_id: 3,
+            user_id: Some(7),
+            account_name: "example".into(),
+            account_type: "User".into(),
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
+            refresh_token_expires_at: None,
+            installation_id: Some("installation-test".into()),
+            metadata: None,
+            is_active: true,
+            is_expired: false,
+            syncing: false,
+            last_synced_at: None,
+            synced_repository_count: 0,
+            health_status: "healthy".into(),
+            health_message: None,
+            last_health_check_at: None,
+            consecutive_health_failures: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn repository() -> repositories::Model {
+        let now = Utc::now();
+        repositories::Model {
+            id: 23,
+            git_provider_connection_id: 17,
+            owner: "example".into(),
+            name: "service".into(),
+            full_name: "example/service".into(),
+            description: None,
+            private: false,
+            fork: false,
+            created_at: now,
+            updated_at: now,
+            pushed_at: now,
+            size: 0,
+            stargazers_count: 0,
+            watchers_count: 0,
+            language: None,
+            default_branch: "main".into(),
+            open_issues_count: 0,
+            topics: "[]".into(),
+            repo_object: "{}".into(),
+            installation_id: None,
+            clone_url: Some("https://github.com/example/service.git".into()),
+            ssh_url: None,
+            preset: None,
+        }
+    }
+
+    fn linked_project() -> ai_application_projects::Model {
+        ai_application_projects::Model {
+            id: 1,
+            application_id: 11,
+            project_id: 7,
+            is_primary: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_inserts_after_remote_precheck_finds_no_binding() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![application(7)]])
+                .append_query_results([vec![linked_project()]])
+                .append_query_results([vec![connection()]])
+                .append_query_results([vec![provider()]])
+                .append_query_results([vec![repository()]])
+                .append_query_results([Vec::<ai_application_git_bindings::Model>::new()])
+                .append_query_results([vec![binding()]])
+                .into_connection(),
+        );
+        let inserted = GitBindingService::new(db)
+            .bind(7, "app_test", 7, 17, 23, "origin")
+            .await
+            .expect("unbound remote should be inserted");
+        assert_eq!(inserted.id, 41);
+        assert_eq!(inserted.remote_name, "origin");
     }
 
     #[tokio::test]

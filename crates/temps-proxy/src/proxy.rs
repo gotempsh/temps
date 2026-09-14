@@ -63,6 +63,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
@@ -833,6 +834,7 @@ pub struct LoadBalancer {
     /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
+    trust_loopback_forwarded_ip: Arc<AtomicBool>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
@@ -913,6 +915,7 @@ impl LoadBalancer {
             challenge_service,
             cert_host_cache,
             disable_https_redirect,
+            trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
             on_demand_manager: None,
             on_demand_cert_manager: None,
             route_table: None,
@@ -936,6 +939,12 @@ impl LoadBalancer {
     /// ingest must reach the console from any host).
     pub fn with_admin_gate(mut self, handle: temps_core::admin_gate::AdminGateHandle) -> Self {
         self.admin_gate = Some(handle);
+        self
+    }
+
+    /// Enable forwarded client IPs only for an explicitly configured local proxy.
+    pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.trust_loopback_forwarded_ip = enabled;
         self
     }
 
@@ -2699,18 +2708,23 @@ fn response_body_filter_inner(
     Ok(None)
 }
 
-/// Resolve the client IP for a session from the TCP peer, honoring CDN
-/// client-IP headers only when the peer is a verified edge address.
+/// Resolve the client IP for a session from the TCP peer. CDN client-IP
+/// headers require a verified edge peer; local forwarded headers require an
+/// explicit opt-in and a loopback peer.
 ///
 /// Security invariant: the *peer address* (not any header) determines which
-/// CDN, if any, is trusted. Headers are only consulted for verified peers and
-/// must parse as a bare `IpAddr`; anything else falls back to the peer. This
-/// makes header spoofing from untrusted origins impossible.
+/// CDN, if any, is trusted. The operator must configure an opted-in local
+/// proxy to overwrite or safely append its observed client address. Headers
+/// must parse as a bare `IpAddr`; anything else falls back to the peer.
 ///
 /// Chain:
-/// 1. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
-/// 2. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
-/// 3. All other peers → use peer address directly.
+/// 1. Opted-in loopback peer → honor the rightmost `X-Forwarded-For`, or
+///    `X-Real-IP` when XFF is absent (see `client_ip`). The local proxy must
+///    overwrite or append the connection address; malformed headers fall back
+///    to the peer.
+/// 2. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
+/// 3. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
+/// 4. All other peers → use peer address directly.
 ///
 /// Returns `None` for non-inet peers (unix sockets) so callers keep their own
 /// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
@@ -2729,11 +2743,20 @@ fn response_body_filter_inner(
 /// no-op (one atomic load/compare-exchange) after the first successful
 /// call in the process, so calling it unconditionally here is within the
 /// hot-path budget.
-fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
+fn resolve_session_client_ip(
+    session: &PingoraSession,
+    trust_loopback_forwarded_ip: bool,
+) -> Option<String> {
     let peer = session.client_addr()?.as_inet()?.ip();
     let headers = &session.req_header().headers;
 
     crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
+
+    if let Some(client_ip) =
+        crate::client_ip::resolve_loopback_client_ip(peer, headers, trust_loopback_forwarded_ip)
+    {
+        return Some(client_ip.to_string());
+    }
 
     // --- Cloudflare: check peer first, then header ---
     if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
@@ -3560,7 +3583,11 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Extract client IP address FIRST (needed for TLS fingerprinting)
-        let client_ip = resolve_session_client_ip(session).unwrap_or_else(|| "unknown".to_string());
+        let client_ip = resolve_session_client_ip(
+            session,
+            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
+        )
+        .unwrap_or_else(|| "unknown".to_string());
         ctx.ip_address = Some(client_ip.clone());
 
         // Extract user-agent FIRST (needed for TLS fingerprinting)
@@ -3743,7 +3770,10 @@ impl ProxyHttp for LoadBalancer {
             .unwrap_or_default();
 
         // Extract client IP address early (needed for attack mode checks)
-        if let Some(client_ip) = resolve_session_client_ip(session) {
+        if let Some(client_ip) = resolve_session_client_ip(
+            session,
+            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
+        ) {
             ctx.ip_address = Some(client_ip);
         }
 

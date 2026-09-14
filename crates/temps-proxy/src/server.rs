@@ -21,7 +21,9 @@ use pingora_openssl::ssl::NameType;
 use pingora_openssl::x509::X509;
 use pingora_proxy::ProxyServiceBuilder;
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
@@ -31,6 +33,71 @@ use tracing::{debug, info};
 use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
+
+/// The settings cache has a five-second TTL in proxy processes. Polling every
+/// two seconds bounds the delay after an admin save without querying on traffic.
+const FORWARDED_IP_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `None` means the settings read failed. Keep the last known value until a
+/// successful read, so a transient database outage cannot change IP policy.
+/// Returns the new value only when it changed.
+fn apply_forwarded_ip_trust_refresh(
+    snapshot: &AtomicBool,
+    settings_enabled: Option<bool>,
+) -> Option<bool> {
+    let enabled = settings_enabled?;
+    (snapshot.swap(enabled, Ordering::Relaxed) != enabled).then_some(enabled)
+}
+
+/// The initial IP policy must be known before Pingora accepts a request. A
+/// background refresh alone leaves a window where a persisted admin opt-in is
+/// ignored and loopback is used as the client IP for IP-based controls.
+async fn load_initial_forwarded_ip_trust(
+    config_service: &temps_config::ConfigService,
+) -> Result<bool> {
+    let settings = config_service.get_settings().await.map_err(|error| {
+        anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
+    })?;
+    Ok(settings.trust_loopback_forwarded_ip())
+}
+
+fn start_forwarded_ip_trust_refresh(
+    config_service: Arc<temps_config::ConfigService>,
+) -> Result<Arc<AtomicBool>> {
+    let runtime = security_refresh_runtime()?;
+    // `block_on` on `security_refresh_runtime` from within `create_proxy_service`'s
+    // own caller runtime is a second nested `block_on` alongside the one
+    // `AdminGateService::new` already does at that call site. Both are safe today
+    // (the outer runtime is only driving synchronous setup at this point), but this
+    // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
+    // for — worth knowing before attempting to un-ignore those tests.
+    let initial = runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
+    info!(
+        enabled = initial,
+        "Loaded loopback forwarded-IP trust before proxy startup"
+    );
+    let effective = Arc::new(AtomicBool::new(initial));
+    let snapshot = Arc::downgrade(&effective);
+    runtime.spawn(async move {
+        while let Some(snapshot) = snapshot.upgrade() {
+            let settings_enabled = match config_service.get_settings().await {
+                Ok(settings) => Some(settings.trust_loopback_forwarded_ip()),
+                Err(error) => {
+                    tracing::warn!(%error, "Could not refresh forwarded-IP trust; retaining the last known value");
+                    None
+                }
+            };
+            if let Some(enabled) = apply_forwarded_ip_trust_refresh(&snapshot, settings_enabled) {
+                info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
+            }
+            // Release the task's strong reference before sleeping. If the
+            // LoadBalancer is dropped, the next weak upgrade ends this task.
+            drop(snapshot);
+            tokio::time::sleep(FORWARDED_IP_TRUST_REFRESH_INTERVAL).await;
+        }
+    });
+    Ok(effective)
+}
 
 /// TLS extension data stored in SslDigest via the new Pingora 0.8.0 SslDigestExtension.
 ///
@@ -430,6 +497,7 @@ pub fn setup_proxy_server(
     );
 
     // Create the main load balancer
+    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
     let mut lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -443,7 +511,8 @@ pub fn setup_proxy_server(
         challenge_service,
         cert_host_cache,
         proxy_config.disable_https_redirect,
-    );
+    )
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }
@@ -766,6 +835,7 @@ pub fn create_proxy_service(
         as Arc<dyn ProjectContextResolver>;
 
     // Create the main load balancer
+    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
     let lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -779,7 +849,8 @@ pub fn create_proxy_service(
         challenge_service,
         cert_host_cache,
         proxy_config.disable_https_redirect,
-    );
+    )
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
 
     Ok(lb)
 }
@@ -787,6 +858,122 @@ pub fn create_proxy_service(
 #[cfg(test)]
 mod preflight_bind_tests {
     use super::*;
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use temps_core::AppSettings;
+    use temps_entities::settings;
+
+    fn test_config() -> Arc<ServerConfig> {
+        Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                Some("127.0.0.1:8000".to_string()),
+            )
+            .expect("create test server config"),
+        )
+    }
+
+    #[test]
+    fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
+        let settings = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            ..AppSettings::default()
+        };
+        let row = settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[row]])
+            .into_connection();
+        let service = Arc::new(temps_config::ConfigService::new(
+            test_config(),
+            Arc::new(db),
+        ));
+
+        let snapshot = start_forwarded_ip_trust_refresh(service)
+            .expect("saved admin opt-in must apply at startup");
+        assert!(snapshot.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn initial_forwarded_ip_trust_fails_closed_on_settings_read_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("settings unavailable".to_string())])
+            .into_connection();
+        let service = Arc::new(temps_config::ConfigService::new(
+            test_config(),
+            Arc::new(db),
+        ));
+
+        let error = start_forwarded_ip_trust_refresh(service)
+            .expect_err("proxy must not accept traffic before IP policy is known");
+        assert!(error
+            .to_string()
+            .contains("failed to load forwarded-IP trust setting"));
+        assert!(error.to_string().contains("settings unavailable"));
+    }
+
+    #[test]
+    fn failed_forwarded_ip_trust_refresh_keeps_last_known_admin_choice() {
+        let snapshot = AtomicBool::new(false);
+
+        assert_eq!(
+            apply_forwarded_ip_trust_refresh(&snapshot, Some(true)),
+            Some(true)
+        );
+        assert_eq!(apply_forwarded_ip_trust_refresh(&snapshot, None), None);
+        assert!(snapshot.load(Ordering::Relaxed));
+
+        assert_eq!(
+            apply_forwarded_ip_trust_refresh(&snapshot, Some(false)),
+            Some(false)
+        );
+        assert!(!snapshot.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn forwarded_ip_trust_refresh_task_stops_once_load_balancer_is_dropped() {
+        // The refresh loop's exit condition is `weak.upgrade()` returning `None`
+        // once every strong `Arc<AtomicBool>` (held by the `LoadBalancer`) is
+        // dropped. Exercising the real spawned task would require sleeping past
+        // `FORWARDED_IP_TRUST_REFRESH_INTERVAL` in a test; asserting the upgrade
+        // behavior directly proves the precondition the loop relies on to end,
+        // without a real-time wait.
+        let settings = AppSettings {
+            trust_loopback_forwarded_ip: Some(false),
+            ..AppSettings::default()
+        };
+        let row = settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[row]])
+            .into_connection();
+        let service = Arc::new(temps_config::ConfigService::new(
+            test_config(),
+            Arc::new(db),
+        ));
+
+        let snapshot =
+            start_forwarded_ip_trust_refresh(service).expect("initial settings load succeeds");
+        let weak = Arc::downgrade(&snapshot);
+        assert!(weak.upgrade().is_some(), "still held by this test's Arc");
+
+        drop(snapshot);
+        assert!(
+            weak.upgrade().is_none(),
+            "once the LoadBalancer's Arc is dropped, the next loop iteration's \
+             weak upgrade must fail so the background task exits"
+        );
+    }
 
     #[test]
     fn check_address_bindable_succeeds_on_free_port() {

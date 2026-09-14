@@ -531,8 +531,17 @@ impl ExternalPluginsService {
         Ok(result)
     }
 
-    /// Fetch and authenticate the complete remote catalogue.
+    /// Fetch and authenticate the remote catalogue, then show only plugins
+    /// with a release for this exact server target.
     pub async fn catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
+        let mut registry = self.authenticated_catalog().await?;
+        let platform = platform_target()?;
+        retain_platform_plugins(&mut registry, &platform);
+        Ok(registry)
+    }
+
+    /// Keep the complete signed document for installation and trust checks.
+    async fn authenticated_catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
         let registry_config = self.manager.config().registry.clone();
         let client = RegistryClient::new(registry_config.clone())?;
         let keyset = client.fetch_keyset().await?;
@@ -556,7 +565,7 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        let registry = self.catalog().await?;
+        let registry = self.authenticated_catalog().await?;
         self.select_from_registry(name, registry)
     }
 
@@ -865,6 +874,13 @@ impl ExternalPluginsService {
     }
 }
 
+fn retain_platform_plugins(registry: &mut VerifiedRegistry, platform: &str) {
+    registry
+        .document
+        .plugins
+        .retain(|plugin| plugin.platforms.contains_key(platform));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,6 +1162,81 @@ except Exception:
         .1;
         selected.registry
     }
+
+    #[test]
+    fn catalog_filters_to_exact_os_arch_and_libc_release() {
+        let signing = SigningKey::from_bytes(&[83; 32]);
+        let mut registry = registry_revision(1, 1, &signing);
+        let original = registry.document.plugins[0].clone();
+        let mut gnu_amd64 = original.clone();
+        gnu_amd64.name = "gnu-amd64".to_string();
+        gnu_amd64.platforms = BTreeMap::from([(
+            "linux-amd64-gnu".to_string(),
+            original
+                .platforms
+                .values()
+                .next()
+                .expect("fixture release")
+                .clone(),
+        )]);
+        let mut musl_amd64 = gnu_amd64.clone();
+        musl_amd64.name = "musl-amd64".to_string();
+        musl_amd64.platforms = BTreeMap::from([(
+            "linux-amd64-musl".to_string(),
+            original
+                .platforms
+                .values()
+                .next()
+                .expect("fixture release")
+                .clone(),
+        )]);
+        let mut gnu_arm64 = gnu_amd64.clone();
+        gnu_arm64.name = "gnu-arm64".to_string();
+        gnu_arm64.platforms = BTreeMap::from([(
+            "linux-arm64-gnu".to_string(),
+            original
+                .platforms
+                .values()
+                .next()
+                .expect("fixture release")
+                .clone(),
+        )]);
+        let mut mac_arm64 = gnu_amd64.clone();
+        mac_arm64.name = "mac-arm64".to_string();
+        mac_arm64.platforms = BTreeMap::from([(
+            "darwin-arm64".to_string(),
+            original
+                .platforms
+                .values()
+                .next()
+                .expect("fixture release")
+                .clone(),
+        )]);
+        registry.document.plugins = vec![gnu_amd64, musl_amd64, gnu_arm64, mac_arm64];
+
+        let mut gnu_view = registry.clone();
+        retain_platform_plugins(&mut gnu_view, "linux-amd64-gnu");
+        assert_eq!(gnu_view.document.plugins.len(), 1);
+        assert_eq!(gnu_view.document.plugins[0].name, "gnu-amd64");
+
+        let mut musl_view = registry.clone();
+        retain_platform_plugins(&mut musl_view, "linux-amd64-musl");
+        assert_eq!(musl_view.document.plugins.len(), 1);
+        assert_eq!(musl_view.document.plugins[0].name, "musl-amd64");
+
+        let mut arm_view = registry.clone();
+        retain_platform_plugins(&mut arm_view, "linux-arm64-gnu");
+        assert_eq!(arm_view.document.plugins.len(), 1);
+        assert_eq!(arm_view.document.plugins[0].name, "gnu-arm64");
+
+        retain_platform_plugins(&mut registry, "darwin-amd64");
+        assert!(registry.document.plugins.is_empty());
+
+        let mut empty = registry_revision(2, 1, &signing);
+        empty.document.plugins.clear();
+        retain_platform_plugins(&mut empty, "linux-amd64-gnu");
+        assert!(empty.document.plugins.is_empty());
+    }
     fn service() -> ExternalPluginsService {
         let database = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
@@ -1256,7 +1347,33 @@ except Exception:
     async fn catalog_view_persists_first_trust_state_and_rejects_rollbacks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let signing = SigningKey::from_bytes(&[63; 32]);
-        let registry = registry_revision(7, 2, &signing);
+        let mut registry = registry_revision(7, 2, &signing);
+        let mut unsupported = registry.document.plugins[0].clone();
+        unsupported.name = "other-platform-plugin".to_string();
+        let release = unsupported
+            .platforms
+            .values()
+            .next()
+            .expect("fixture release")
+            .clone();
+        let other_platform =
+            if platform_target().expect("supported test platform") == "darwin-arm64" {
+                "linux-amd64-gnu"
+            } else {
+                "darwin-arm64"
+            };
+        unsupported.platforms = BTreeMap::from([(other_platform.to_string(), release)]);
+        registry.document.plugins.push(unsupported);
+        let payload = serde_json::to_vec(&registry.document).expect("serialize full registry");
+        registry.envelope.payload = base64::engine::general_purpose::STANDARD.encode(&payload);
+        registry.envelope.signature = base64::engine::general_purpose::STANDARD.encode(
+            signing
+                .sign(&crate::trust::signature_message(
+                    crate::trust::CATALOG_SIGNATURE_DOMAIN,
+                    &payload,
+                ))
+                .to_bytes(),
+        );
         let url = serve_json_once(
             serde_json::to_vec(&registry.envelope).expect("serialize catalogue envelope"),
         )
@@ -1280,10 +1397,13 @@ except Exception:
             ),
         );
 
-        service
+        let visible = service
             .catalog()
             .await
             .expect("first catalogue view must persist authenticated trust state");
+        assert_eq!(visible.document.plugins.len(), 1);
+        assert_eq!(visible.document.plugins[0].name, "fixture-plugin");
+        assert_eq!(registry.document.plugins.len(), 2);
         assert!(config.plugins_dir.join("registry-state.json").is_file());
 
         let revision_error = service

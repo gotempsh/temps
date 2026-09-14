@@ -45,6 +45,26 @@ export function readObservationWindow(params: URLSearchParams, now: number) {
 }
 
 /** Cursor tokens are bound to the entire query, including its frozen time window. */
+export function normalizeObservationWindow(
+  current: URLSearchParams,
+  now: number
+) {
+  const window = readObservationWindow(current, now)
+  const next = new URLSearchParams(current)
+  const sameWindow =
+    Date.parse(current.get('from') ?? '') === Date.parse(window.from) &&
+    Date.parse(current.get('to') ?? '') === Date.parse(window.to)
+  if (!sameWindow) {
+    next.delete('cursor')
+    next.delete('page')
+  }
+  next.set('from', window.from)
+  next.set('to', window.to)
+  next.set('range', window.range)
+  return next
+}
+
+/** Explicit filter changes invalidate pagination; canonicalizing timestamps does not. */
 export function patchObservationFilters(
   current: URLSearchParams,
   patch: Record<string, string | undefined>

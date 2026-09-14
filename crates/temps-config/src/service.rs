@@ -28,10 +28,53 @@ pub const SQLITE_DB_NAME: &str = "temps.db";
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
+/// Rebase credential-owned fields onto the row locked by the settings writer.
+/// A bulk settings payload (including one built from an older GET) is never
+/// allowed to create, restore, or verify a provider credential.
+pub(crate) fn preserve_provider_credential_proof(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+) {
+    for (id, current_cfg) in &current.agent_sandbox.providers {
+        match incoming.agent_sandbox.providers.get_mut(id) {
+            Some(candidate) => {
+                candidate.credentials_encrypted = current_cfg.credentials_encrypted.clone();
+                candidate.auth_type = current_cfg.auth_type.clone();
+                if !candidate.extra.is_object() {
+                    candidate.extra = serde_json::json!({});
+                }
+                if let Some(extra) = candidate.extra.as_object_mut() {
+                    extra.remove("credential_verified");
+                    if let Some(proof) = current_cfg.extra.get("credential_verified") {
+                        extra.insert("credential_verified".into(), proof.clone());
+                    }
+                }
+            }
+            None => {
+                incoming
+                    .agent_sandbox
+                    .providers
+                    .insert(id.clone(), current_cfg.clone());
+            }
+        }
+    }
+    for (id, candidate) in &mut incoming.agent_sandbox.providers {
+        if !current.agent_sandbox.providers.contains_key(id) {
+            candidate.credentials_encrypted = None;
+            if let Some(extra) = candidate.extra.as_object_mut() {
+                extra.remove("credential_verified");
+            }
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("AI provider '{provider_id}' credential changed during verification")]
+    ProviderCredentialChanged { provider_id: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -948,11 +991,19 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         true
     }
 
-    async fn replace_settings_cache(&self, settings: AppSettings) {
+    async fn publish_committed_settings_if_current(
+        &self,
+        generation: u64,
+        settings: AppSettings,
+    ) -> bool {
         let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
         cache.generation = cache.generation.wrapping_add(1);
         temps_core::tls::set_insecure_tls(settings.insecure_tls);
         cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
     }
 
     /// Update the application settings
@@ -961,6 +1012,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         mut settings: AppSettings,
     ) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
+        let cache_generation = self.settings_cache.read().await.generation;
 
         // The settings row can drift from the actual TimescaleDB jobs (for
         // example after a manual policy change). Prefer the live, tiny policy
@@ -1003,12 +1055,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         let existing = existing_query.one(&txn).await?;
 
-        // Consent is owned by the SystemAdmin-only plugin endpoint. Read it
-        // under this row lock so a concurrent generic settings save cannot
-        // undo a just-committed consent change using an earlier snapshot.
-        settings.plugin_installation_reporting_enabled = existing.as_ref().is_some_and(|row| {
-            AppSettings::from_json(row.data.clone()).plugin_installation_reporting_enabled
-        });
+        // The handler's earlier snapshot is advisory only. Rebase against the
+        // authoritative row while its write lock is held, before serializing.
+        let locked_settings = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
+        // settings save must not undo a consent update committed before this lock.
+        settings.plugin_installation_reporting_enabled =
+            locked_settings.plugin_installation_reporting_enabled;
+        preserve_provider_credential_proof(&mut settings, &locked_settings);
 
         let previous_compression = existing
             .as_ref()
@@ -1148,11 +1205,15 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         txn.commit().await?;
 
-        // Write-through: refresh the cache with the just-written value so an
-        // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL. Runtime TLS publication happens in
-        // the same generation-checked critical section.
-        self.replace_settings_cache(settings).await;
+        // A dedicated writer may commit and invalidate between our commit and
+        // cache publication. Its generation change prevents this older bulk
+        // snapshot from replacing the authoritative cache.
+        if !self
+            .publish_committed_settings_if_current(cache_generation, settings)
+            .await
+        {
+            self.invalidate_settings_cache().await;
+        }
 
         Ok(())
     }
@@ -1336,6 +1397,252 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // here would then regress the cache out of commit order.
         self.invalidate_settings_cache().await;
         Ok(current)
+    }
+
+    /// Atomically merge one provider credential into the shared settings row.
+    /// `expected` binds a verification result to the exact saved credential
+    /// that was probed; a concurrent replacement is never restored or marked
+    /// verified by an older in-flight request.
+    pub async fn update_agent_provider_credential(
+        &self,
+        provider_id: &str,
+        auth_type: &str,
+        encrypted: &str,
+        verified: bool,
+        verified_default_model: Option<&str>,
+        expected: Option<(&str, &str)>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let providers = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .and_then(|sandbox| {
+                sandbox
+                    .entry("providers")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox.providers is not a JSON object".into(),
+            })?;
+        let mut provider = providers
+            .get(provider_id)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some((expected_auth_type, expected_encrypted)) = expected {
+            if provider
+                .get("auth_type")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_auth_type)
+                || provider
+                    .get("credentials_encrypted")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_encrypted)
+            {
+                return Err(ConfigServiceError::ProviderCredentialChanged {
+                    provider_id: provider_id.into(),
+                });
+            }
+        }
+        provider.insert(
+            "auth_type".into(),
+            serde_json::Value::String(auth_type.into()),
+        );
+        provider.insert(
+            "credentials_encrypted".into(),
+            serde_json::Value::String(encrypted.into()),
+        );
+        if let Some(model) = verified_default_model {
+            provider.insert(
+                "default_model".into(),
+                serde_json::Value::String(model.into()),
+            );
+        }
+        let extra = provider
+            .entry("extra")
+            .or_insert_with(|| serde_json::json!({}));
+        if !extra.is_object() {
+            *extra = serde_json::json!({});
+        }
+        let extra =
+            extra
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: format!(
+                        "AI provider '{provider_id}' extra settings is not a JSON object"
+                    ),
+                })?;
+        extra.insert(
+            "credential_verified".into(),
+            serde_json::Value::Bool(verified),
+        );
+        providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
+    /// Change the active harness without losing concurrent credential updates.
+    pub async fn activate_agent_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let has_credential = sandbox
+                .get("providers")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|providers| providers.get(provider_id))
+                .and_then(|provider| provider.get("credentials_encrypted"))
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            if !has_credential {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: format!("Provider '{provider_id}' has no saved credential"),
+                });
+            }
+            sandbox.insert(
+                "default_provider".into(),
+                serde_json::Value::String(provider_id.into()),
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update provider preferences while retaining its latest credential.
+    pub async fn update_agent_provider_preferences(
+        &self,
+        provider_id: &str,
+        default_auth_type: &str,
+        default_model: Option<&str>,
+        turns: [Option<i32>; 3],
+    ) -> Result<[Option<i32>; 3], ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let providers = sandbox
+                .entry("providers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: "agent_sandbox.providers is not a JSON object".into(),
+                })?;
+            let mut provider = providers
+                .get(provider_id)
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            provider.insert(
+                "default_model".into(),
+                default_model.map_or(serde_json::Value::Null, |model| {
+                    serde_json::Value::String(model.into())
+                }),
+            );
+            let keys = ["max_turns_analysis", "max_turns_fix", "max_turns_feedback"];
+            for (key, value) in keys.into_iter().zip(turns) {
+                if let Some(value) = value {
+                    provider.insert(
+                        key.into(),
+                        if value == 0 {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::from(value)
+                        },
+                    );
+                }
+            }
+            provider
+                .entry("auth_type")
+                .or_insert_with(|| serde_json::Value::String(default_auth_type.into()));
+            provider.entry("extra").or_insert(serde_json::Value::Null);
+            let result = keys.map(|key| {
+                provider
+                    .get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|value| value as i32)
+            });
+            providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn mutate_agent_sandbox_json<T>(
+        &self,
+        mutate: impl FnOnce(
+            &mut serde_json::Map<String, serde_json::Value>,
+        ) -> Result<T, ConfigServiceError>,
+    ) -> Result<T, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let sandbox = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox is not a JSON object".into(),
+            })?;
+        let result = mutate(sandbox)?;
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(result)
     }
 
     /// Persist cluster CA material exactly once and return the material that
@@ -1738,6 +2045,185 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn locked_provider_rebase_rejects_stale_and_forged_credentials() {
+        let mut locked = AppSettings::default();
+        locked.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("new-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.agent_sandbox.providers.insert(
+            "omitted".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("omitted-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("old-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": false, "custom": 1}),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            temps_core::ProviderConfig {
+                credentials_encrypted: Some("forged-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &locked);
+        let replaced = &incoming.agent_sandbox.providers["replaced"];
+        assert_eq!(replaced.auth_type, "subscription");
+        assert_eq!(
+            replaced.credentials_encrypted.as_deref(),
+            Some("new-ciphertext")
+        );
+        assert_eq!(replaced.extra["credential_verified"], true);
+        assert_eq!(replaced.extra["custom"], 1);
+        assert_eq!(
+            incoming.agent_sandbox.providers["omitted"]
+                .credentials_encrypted
+                .as_deref(),
+            Some("omitted-ciphertext")
+        );
+        let new_provider = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(new_provider.credentials_encrypted, None);
+        assert!(new_provider.extra.get("credential_verified").is_none());
+
+        // A credential deleted by the dedicated endpoint must not be restored
+        // by a bulk payload prepared before that deletion.
+        let mut deleted = locked.clone();
+        deleted.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: None,
+                extra: serde_json::json!({}),
+                ..Default::default()
+            },
+        );
+        let mut stale = incoming;
+        stale
+            .agent_sandbox
+            .providers
+            .get_mut("replaced")
+            .expect("provider")
+            .credentials_encrypted = Some("old-ciphertext".into());
+        preserve_provider_credential_proof(&mut stale, &deleted);
+        let after_deletion = &stale.agent_sandbox.providers["replaced"];
+        assert_eq!(after_deletion.credentials_encrypted, None);
+        assert!(after_deletion.extra.get("credential_verified").is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_update_uses_locked_credential_and_publishes_rebased_cache() {
+        let mut locked = settings_row("old.example.com");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.plugin_installation_reporting_enabled = true;
+        locked_settings.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("replacement".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.data = locked_settings.to_json();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked],
+            ])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let svc = ConfigService::new(test_config(), db.clone());
+        let mut incoming = AppSettings {
+            preview_domain: "new.example.com".into(),
+            ..AppSettings::default()
+        };
+        incoming.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("stale".into()),
+                extra: serde_json::json!({"credential_verified": false}),
+                ..Default::default()
+            },
+        );
+        svc.update_settings(incoming).await.expect("bulk update");
+        let cached = svc.get_settings().await.expect("rebased cache");
+        assert_eq!(cached.preview_domain, "new.example.com");
+        assert!(cached.plugin_installation_reporting_enabled);
+        let provider = &cached.agent_sandbox.providers["codex_cli"];
+        assert_eq!(provider.auth_type, "subscription");
+        assert_eq!(
+            provider.credentials_encrypted.as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(provider.extra["credential_verified"], true);
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("replacement"), "{update_sql}");
+        assert!(
+            update_sql.contains("plugin_installation_reporting_enabled"),
+            "{update_sql}"
+        );
+        assert!(!update_sql.contains("stale"), "{update_sql}");
+    }
+
+    #[tokio::test]
+    async fn late_bulk_cache_publish_cannot_restore_snapshot_after_credential_invalidation() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![settings_row("authoritative.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let started_generation = svc.settings_cache.read().await.generation;
+        svc.invalidate_settings_cache().await;
+        let stale = AppSettings {
+            preview_domain: "stale.example.com".into(),
+            ..AppSettings::default()
+        };
+        assert!(
+            !svc.publish_committed_settings_if_current(started_generation, stale)
+                .await
+        );
+        assert_eq!(
+            svc.get_settings()
+                .await
+                .expect("authoritative cache")
+                .preview_domain,
+            "authoritative.example.com"
+        );
     }
 
     fn settings_row_with_cluster_ca(

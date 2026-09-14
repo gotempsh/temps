@@ -802,7 +802,7 @@ export function EmailDomainNew() {
         </Button>
 
         {/* Title + step indicator */}
-        <div className="mx-auto max-w-3xl space-y-8">
+        <div className="w-full space-y-8">
           <div className="space-y-2 text-center">
             <h1 className="text-2xl font-semibold tracking-tight text-balance">
               Add email domain

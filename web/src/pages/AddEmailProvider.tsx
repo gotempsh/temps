@@ -399,7 +399,7 @@ export function AddEmailProvider() {
         )}
 
         {step === 'configure' && selected && (
-          <div className="mx-auto max-w-2xl">
+          <div className="w-full">
             <div className="mb-6">
               <p className="text-sm font-medium text-muted-foreground">
                 Step 2 of 2

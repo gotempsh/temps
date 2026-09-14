@@ -13,7 +13,7 @@ export default function Import() {
   const initialSource = searchParams.get('source') ?? undefined
 
   return (
-    <div className="container mx-auto py-8 px-4 sm:px-6 max-w-screen-2xl">
+    <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
       <ImportWizard
         initialSource={initialSource}
         onCancel={() => navigate('/projects')}

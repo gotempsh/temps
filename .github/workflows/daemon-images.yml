@@ -64,6 +64,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Load amd64 image for lifecycle verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: temps-daemon-release:check
+
+      - name: Install Rust for the typed SDK smoke client
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Verify amd64 daemon lifecycle without provider credentials
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
+        run: |
+          # Local smoke tests may skip without Docker; releases must fail closed.
+          docker info >/dev/null
+          bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check
+
+      - name: Load arm64 image for lifecycle verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: temps-daemon-release:check
+
+      - name: Verify arm64 daemon lifecycle without provider credentials
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/arm64
+        run: |
+          # QEMU executes the arm64 image on this amd64 runner. Do not publish
+          # either architecture if its lifecycle or bundled harnesses fail.
+          docker info >/dev/null
+          bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check
+
       - name: Build and publish daemon image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:

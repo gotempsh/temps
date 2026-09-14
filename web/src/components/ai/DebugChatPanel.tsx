@@ -2204,8 +2204,6 @@ export function isChatTranscriptNearBottom(
 const proseClasses =
   'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-[#0d1117] prose-pre:text-xs prose-pre:border-0 prose-pre:overflow-x-auto prose-pre:rounded-lg prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
 
-const pixelDelays = [90, 180, 270, 0, 90, 180, 90, 180, 270]
-
 /** Calculate display time from the server-owned turn timestamp, never mount time. */
 export function serverElapsedDeciseconds(
   startedAt: string | null | undefined,
@@ -2222,6 +2220,12 @@ export function serverElapsedDeciseconds(
  * a pixel wave and a shimmer rather than a full-screen spinner. It works on
  * either console theme because it only uses semantic foreground tokens.
  */
+const activityPixelDelays = Array.from({ length: 9 }, (_, index) => {
+  const row = Math.floor(index / 3)
+  const column = index % 3
+  return (column + Math.abs(row - 1)) * 90
+})
+
 function ActivityIndicator({
   compact = false,
   label,
@@ -2259,24 +2263,24 @@ function ActivityIndicator({
       aria-label={label}
     >
       <span
-        aria-hidden
+        aria-hidden="true"
         className="grid shrink-0 grid-cols-[repeat(3,4px)] gap-[1.5px]"
       >
-        {pixelDelays.map((delay, index) => (
+        {activityPixelDelays.map((delay, index) => (
           <span
             key={index}
-            className="ai-activity-pixel h-[4px] w-[4px] rounded-[1px] bg-foreground"
-            style={{ animationDelay: `${delay}ms` }}
+            className="ai-activity-pixel size-[4px] rounded-[1px] bg-foreground"
+            style={{ opacity: 0.15, animationDelay: `${delay}ms` }}
           />
         ))}
       </span>
       {!compact && (
-        <span className="ai-activity-shimmer bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground bg-[length:200%_100%] bg-clip-text text-[13px] font-medium text-transparent">
+        <span className="ai-activity-shimmer bg-gradient-to-r from-muted-foreground from-35% via-foreground via-50% to-muted-foreground to-65% bg-[length:200%_100%] bg-clip-text text-[13px] font-medium text-transparent">
           {label}
         </span>
       )}
       {!compact && (
-        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+        <span className="font-mono text-[12px] tabular-nums text-muted-foreground">
           {elapsedLabel}
         </span>
       )}
@@ -2348,7 +2352,7 @@ function MarkdownText({ text }: { text: string }) {
  * prose. The activity indicator remains visible for the full server-owned
  * turn, including while tokens and tool cards stream into the message.
  */
-function AssistantBody({
+export function AssistantBody({
   message,
   streaming,
   activityLabel,
@@ -2406,10 +2410,9 @@ function AssistantBody({
           <MarkdownText key={`text-${idx}`} text={part.text} />
         )
       )}
-      {shouldShowAssistantActivityAfterContent(parts.length, streaming) &&
-        !parts.some((part) => part.type === 'tool') && (
-          <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
-        )}
+      {shouldShowAssistantActivityAfterContent(parts.length, streaming) && (
+        <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+      )}
     </>
   )
 }
@@ -4009,7 +4012,7 @@ export function DebugChatPanel({
         <div
           ref={scrollRef}
           onScroll={handleTranscriptScroll}
-          className="h-full space-y-4 overflow-y-auto pr-1"
+          className="h-full space-y-4 overflow-y-auto pt-4 pr-1"
         >
           {loadingEarlierMessages && (
             <div

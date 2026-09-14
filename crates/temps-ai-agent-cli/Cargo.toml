@@ -14,7 +14,8 @@ description = "Bridge between AiService and AiCliProvider for subscription-backe
 [dependencies]
 temps-ai = { path = "../temps-ai" }
 temps-agents = { path = "../temps-agents" }
-temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "91ef59ba85140bafba6fcd50d91114e7edee99e8" }
+temps-sandbox = { path = "../temps-sandbox" }
+temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "678af3afa3668b395a488568b879fa757ee00912" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }

@@ -160,6 +160,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
+  /** Database-backed proxy forwarded-IP trust opt-in. */
+  trust_loopback_forwarded_ip: boolean
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
@@ -247,6 +249,7 @@ export function buildPlatformSettingsUpdateBody(
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
+    trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
     // The settings endpoint replaces the full AppSettings document. Omitting
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.

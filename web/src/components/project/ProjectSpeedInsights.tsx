@@ -41,10 +41,13 @@ import {
   Table,
   TableBody,
   TableCell,
-  TableHead,
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  SortableTableHead,
+  type SortDirection,
+} from '@/components/ui/sortable-table-head'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
@@ -270,6 +273,8 @@ const BREAKDOWN_ROW_LIMIT = 15
 
 const BREAKDOWN_METRICS: MetricKey[] = ['ttfb', 'fcp', 'lcp', 'inp', 'cls']
 
+type BreakdownSortKey = 'group' | 'events' | MetricKey
+
 /** Segment filters accepted by all performance read endpoints. */
 type SpeedFilters = {
   filter_path?: string
@@ -347,6 +352,8 @@ function SpeedBreakdownCard({
   onFilter,
 }: SpeedBreakdownCardProps) {
   const [dimension, setDimension] = useState<BreakdownDimension>('path')
+  const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
 
   const { data, isLoading, isError } = useQuery({
     ...getGroupedPageMetricsOptions({
@@ -364,10 +371,52 @@ function SpeedBreakdownCard({
     enabled: environmentId !== null,
   })
 
-  const groups = data?.groups ?? []
-  const visibleGroups = groups.slice(0, BREAKDOWN_ROW_LIMIT)
+  const groups = useMemo(() => data?.groups ?? [], [data?.groups])
+  const sortedGroups = useMemo(() => {
+    return groups
+      .map((group, index) => ({ group, index }))
+      .sort((a, b) => {
+        const aValue =
+          sortKey === 'group'
+            ? a.group.group_key
+            : sortKey === 'events'
+              ? a.group.events
+              : a.group[sortKey]
+        const bValue =
+          sortKey === 'group'
+            ? b.group.group_key
+            : sortKey === 'events'
+              ? b.group.events
+              : b.group[sortKey]
+
+        if (aValue == null && bValue == null) return a.index - b.index
+        if (aValue == null) return 1
+        if (bValue == null) return -1
+
+        const comparison =
+          typeof aValue === 'string' && typeof bValue === 'string'
+            ? aValue.localeCompare(bValue, undefined, {
+                numeric: true,
+                sensitivity: 'base',
+              })
+            : Number(aValue) - Number(bValue)
+        const directed = sortDirection === 'asc' ? comparison : -comparison
+        return directed || a.index - b.index
+      })
+      .map(({ group }) => group)
+  }, [groups, sortDirection, sortKey])
+  const visibleGroups = sortedGroups.slice(0, BREAKDOWN_ROW_LIMIT)
   const dimensionMeta = BREAKDOWN_DIMENSIONS.find((d) => d.value === dimension)
   const dimensionLabel = dimensionMeta?.label ?? ''
+
+  const handleSort = (key: BreakdownSortKey) => {
+    if (key === sortKey) {
+      setSortDirection((current) => (current === 'asc' ? 'desc' : 'asc'))
+      return
+    }
+    setSortKey(key)
+    setSortDirection('desc')
+  }
 
   return (
     <Card>
@@ -381,7 +430,11 @@ function SpeedBreakdownCard({
           </div>
           <Tabs
             value={dimension}
-            onValueChange={(v) => setDimension(v as BreakdownDimension)}
+            onValueChange={(v) => {
+              setDimension(v as BreakdownDimension)
+              setSortKey('events')
+              setSortDirection('desc')
+            }}
           >
             <TabsList className="h-8">
               {BREAKDOWN_DIMENSIONS.map((d) => (
@@ -420,12 +473,28 @@ function SpeedBreakdownCard({
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>{dimensionMeta?.column ?? ''}</TableHead>
-                  <TableHead className="text-right">Samples</TableHead>
+                  <SortableTableHead
+                    label={dimensionMeta?.column ?? ''}
+                    active={sortKey === 'group'}
+                    direction={sortDirection}
+                    onClick={() => handleSort('group')}
+                  />
+                  <SortableTableHead
+                    label="Samples"
+                    active={sortKey === 'events'}
+                    direction={sortDirection}
+                    onClick={() => handleSort('events')}
+                    align="right"
+                  />
                   {BREAKDOWN_METRICS.map((m) => (
-                    <TableHead key={m} className="text-right">
-                      {METRIC_THRESHOLDS[m].short}
-                    </TableHead>
+                    <SortableTableHead
+                      key={m}
+                      label={METRIC_THRESHOLDS[m].short}
+                      active={sortKey === m}
+                      direction={sortDirection}
+                      onClick={() => handleSort(m)}
+                      align="right"
+                    />
                   ))}
                 </TableRow>
               </TableHeader>
@@ -556,7 +625,9 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     return metrics.timestamps.map((timestamp: string, i: number) => ({
       timestamp: format(
         new Date(timestamp),
-        (Date.parse(endDate) - Date.parse(startDate)) <= 86400000 ? 'HH:mm' : 'MMM dd'
+        Date.parse(endDate) - Date.parse(startDate) <= 86400000
+          ? 'HH:mm'
+          : 'MMM dd'
       ),
       fcp: metrics.fcp[i],
       lcp: metrics.lcp[i],

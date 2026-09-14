@@ -601,14 +601,17 @@ impl EnvVarService {
     ///
     /// This stays crate-private and is deliberately named after its security
     /// invariant: callers must authorize and durably audit the reveal before
-    /// returning the plaintext outside the process.
+    /// returning the plaintext outside the process. Returns the decrypted
+    /// value alongside the variable's `is_secret` flag so callers can apply
+    /// the stricter `SecretsRead` gate only to variables actually classified
+    /// as secret, instead of every plaintext variable.
     pub(crate) async fn get_environment_variable_value_for_audited_reveal(
         &self,
         project_id: i32,
         key: &str,
         environment_id: Option<i32>,
         var_id: Option<i32>,
-    ) -> Result<String, EnvVarError> {
+    ) -> Result<(String, bool), EnvVarError> {
         let mut query = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
             .filter(env_vars::Column::Key.eq(key));
@@ -645,7 +648,9 @@ impl EnvVarService {
             ))
         })?;
 
-        self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)
+        let is_secret = var.is_secret;
+        let value = self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
+        Ok((value, is_secret))
     }
 }
 
@@ -967,12 +972,13 @@ mod tests {
         );
 
         let service = EnvVarService::new(db, svc);
-        let value = service
+        let (value, is_secret) = service
             .get_environment_variable_value_for_audited_reveal(10, "API_KEY", None, None)
             .await
             .unwrap();
 
         assert_eq!(value, plaintext);
+        assert!(!is_secret);
     }
 
     #[tokio::test]
@@ -996,7 +1002,7 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let value = service
+        let (value, _is_secret) = service
             .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", Some(22), None)
             .await
             .expect("environment-scoped reveal should select the linked row");
@@ -1052,7 +1058,7 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let value = service
+        let (value, _is_secret) = service
             .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", None, Some(4))
             .await
             .expect("row-scoped reveal should return the requested env-var row");
@@ -1080,12 +1086,13 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let value = service
+        let (value, is_secret) = service
             .get_environment_variable_value_for_audited_reveal(10, "WRITE_ONLY_TOKEN", None, None)
             .await
             .expect("an authorized audited endpoint must be able to reveal a secret");
 
         assert_eq!(value, "reveal-on-demand");
+        assert!(is_secret);
     }
 
     /// Building a mock that walks the update transaction: SELECT the row,

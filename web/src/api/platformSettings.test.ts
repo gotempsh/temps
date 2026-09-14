@@ -6,6 +6,14 @@ import { buildPlatformSettingsUpdateBody } from './platformSettings'
 import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
+  test('round-trips the admin proxy trust setting on unrelated saves', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      trust_loopback_forwarded_ip: true,
+    } as PlatformSettings)
+
+    expect(body.trust_loopback_forwarded_ip).toBe(true)
+  })
+
   test('includes Docker registry configuration in the settings request', () => {
     const dockerRegistry = {
       enabled: true,

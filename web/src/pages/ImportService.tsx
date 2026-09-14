@@ -271,7 +271,7 @@ export function ImportService() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6 max-w-4xl mx-auto">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header */}
         <div className="flex items-center gap-3">
           <Link to="/storage">

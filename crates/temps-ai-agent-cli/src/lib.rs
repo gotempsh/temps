@@ -28,7 +28,7 @@ pub use model_relay::{
     sandbox_model_relay_routes, SandboxHarnessCredentials, SandboxModelRelayService,
 };
 pub use service::{
-    AgentCliAiService, ResolvedSandboxWorkspace, SandboxCredentialResolver,
-    SandboxWorkspaceResolver, SandboxWorkspaceResolverSlot, SandboxWorkspaceStopper,
-    ScopedMcpBridge,
+    AgentCliAiService, ResolvedSandboxWorkspace, SandboxCandidateCredentialResolver,
+    SandboxCredentialResolver, SandboxWorkspaceResolver, SandboxWorkspaceResolverSlot,
+    SandboxWorkspaceStopper, ScopedMcpBridge,
 };

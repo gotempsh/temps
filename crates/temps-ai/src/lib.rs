@@ -22,6 +22,7 @@
 //! operation — callers wrap calls in a timeout.
 
 pub mod diagnostics;
+pub mod mcp;
 pub mod provider;
 pub mod schemas;
 pub mod service;

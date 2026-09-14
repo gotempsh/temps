@@ -158,9 +158,16 @@ export function RepositoryCatalog({
             found.
           </p>
           {filtered.length === 0 ? (
-            <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-              No matching plugins. Try another search or category.
-            </p>
+            <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+              {catalog.data?.plugins.length === 0 ? (
+                <>
+                  <p>No catalog plugins support this server’s platform yet.</p>
+                  <p>Compatible plugins will appear here when they are listed.</p>
+                </>
+              ) : (
+                <p>No matching plugins. Try another search or category.</p>
+              )}
+            </div>
           ) : (
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {filtered.slice(0, limit).map((plugin) => (

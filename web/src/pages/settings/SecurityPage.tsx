@@ -4,6 +4,8 @@
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -21,6 +23,7 @@ import type {
 interface SecurityFormData {
   security_headers: SecurityHeadersType
   rate_limiting: RateLimitType
+  trust_loopback_forwarded_ip: boolean
 }
 
 export function SecurityPage() {
@@ -55,20 +58,25 @@ export function SecurityPage() {
         whitelist_ips: [],
         blacklist_ips: [],
       },
+      trust_loopback_forwarded_ip: false,
     },
   })
 
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
+  const trustLoopbackForwardedIp = useWatch({
+    control,
+    name: 'trust_loopback_forwarded_ip',
+  })
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Security Headers' },
+      { label: 'Security' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Security Headers')
+  usePageTitle('Security')
 
   useEffect(() => {
     if (settings) {
@@ -91,6 +99,7 @@ export function SecurityPage() {
           whitelist_ips: [],
           blacklist_ips: [],
         },
+        trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
       })
     }
   }, [settings, reset])
@@ -133,6 +142,36 @@ export function SecurityPage() {
         <AdminGateCard />
       </SettingsSection>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+        <SettingsSection
+          title="Proxy client IP"
+          description="Choose when Temps trusts forwarding headers from a local reverse proxy"
+          icon={LockKeyhole}
+        >
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="trust-loopback-forwarded-ip">
+                Trust forwarded client IP from loopback
+              </Label>
+              <Switch
+                id="trust-loopback-forwarded-ip"
+                checked={trustLoopbackForwardedIp}
+                onCheckedChange={(checked) =>
+                  setValue('trust_loopback_forwarded_ip', checked, {
+                    shouldDirty: true,
+                  })
+                }
+              />
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Enable only when your reverse proxy connects to Temps over
+              loopback and overwrites X-Real-IP and either overwrites
+              X-Forwarded-For with the actual client address or appends it as
+              the final entry. Otherwise, clients may spoof their IP in
+              analytics and IP-based controls. Changes reach proxy processes
+              within a few seconds.
+            </p>
+          </div>
+        </SettingsSection>
         <SecuritySettings
           control={control}
           register={register}

@@ -109,4 +109,19 @@ describe('PluginsPage management permissions', () => {
       markup.indexOf('running-plugins-title')
     )
   })
+
+  test('explains when no catalog plugins support the server platform', () => {
+    role = 'admin'
+
+    const markup = renderPage()
+
+    expect(markup).toContain(
+      'No catalog plugins support this server’s platform yet.'
+    )
+    expect(markup).toContain(
+      'Compatible plugins will appear here when they are listed.'
+    )
+    expect(markup).not.toContain('No matching plugins.')
+    expect(markup).not.toContain('Review and install')
+  })
 })

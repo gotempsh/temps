@@ -11,7 +11,7 @@ publish = false
 [workspace]
 
 [dependencies]
-temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "91ef59ba85140bafba6fcd50d91114e7edee99e8", default-features = false, features = ["claude", "codex", "opencode"] }
+temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "678af3afa3668b395a488568b879fa757ee00912", default-features = false, features = ["claude", "codex", "opencode"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

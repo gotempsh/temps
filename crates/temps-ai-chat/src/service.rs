@@ -584,14 +584,15 @@ fn is_managed_process_echo(name: &str) -> bool {
 
 fn managed_process_call_id(
     bridge_id: &str,
-    rpc_id: &serde_json::Value,
+    rpc_id: &temps_ai::mcp::McpRequestId,
 ) -> Result<String, temps_ai::AiError> {
-    if !rpc_id.is_string() && !rpc_id.is_number() {
+    if matches!(rpc_id, temps_ai::mcp::McpRequestId::Null) {
         return Err(invalid_process_request(
             "the managed process request id is invalid",
         ));
     }
-    let normalized = rpc_id.to_string();
+    let normalized = serde_json::to_string(rpc_id)
+        .map_err(|_| invalid_process_request("the managed process request id cannot be encoded"))?;
     if normalized.len() > 256 {
         return Err(invalid_process_request(
             "the managed process request id exceeds safe limits",
@@ -1151,6 +1152,19 @@ fn provider_resume_session_is_missing(provider: &str, reason: &str) -> bool {
         "opencode" => reason.contains("session not found") || reason.contains("unknown session"),
         _ => false,
     }
+}
+
+fn can_retry_missing_provider_session(
+    provider: &str,
+    reason: &str,
+    has_resume_session: bool,
+    already_retried: bool,
+    execution_had_effect: bool,
+) -> bool {
+    has_resume_session
+        && !already_retried
+        && !execution_had_effect
+        && provider_resume_session_is_missing(provider, reason)
 }
 
 async fn clear_missing_provider_session(
@@ -1935,8 +1949,12 @@ impl ConversationService {
         &self,
         bridge_id: &str,
         bearer: &str,
-        request: serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, HarnessMcpError> {
+        request: temps_ai::mcp::McpRequest,
+    ) -> Result<Option<temps_ai::mcp::McpResponse>, HarnessMcpError> {
+        use temps_ai::mcp::{
+            McpEmptyResult, McpInitializeResult, McpResponse, McpResult, McpToolDefinition,
+            McpToolsResult,
+        };
         let entry = {
             let mut registry = match self.harness_mcp_entries.lock() {
                 Ok(registry) => registry,
@@ -1961,65 +1979,36 @@ impl ConversationService {
         );
 
         // MCP notifications have no response body.
-        let Some(id) = request.get("id").cloned() else {
+        let Some(id) = request.id else {
             return Ok(None);
         };
-        let method = request
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let response = match method {
-            "initialize" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "temps-application", "version": "1"}
-                }
-            }),
-            "tools/list" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {"tools": entry.tools.iter().map(|tool| serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.parameters,
-                })).chain(std::iter::once(serde_json::json!({
-                    "name": "temps_native_permission",
-                    "description": "Internal approval bridge used by the development harness. Do not invoke directly.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["tool_name", "input"],
-                        "properties": {
-                            "tool_name": {"type": "string"},
-                            "input": {"type": "object", "additionalProperties": true}
-                        },
+        let response = match request.method.as_str() {
+            "initialize" => McpResponse::result(id, McpResult::Initialize(McpInitializeResult::new("temps-application"))),
+            "tools/list" => McpResponse::result(id, McpResult::Tools(McpToolsResult {
+                tools: entry.tools.iter().map(|tool| McpToolDefinition {
+                    name: tool.name.clone(), description: tool.description.clone(), input_schema: tool.parameters.clone(),
+                }).chain(std::iter::once(McpToolDefinition {
+                    name: "temps_native_permission".into(),
+                    description: "Internal approval bridge used by the development harness. Do not invoke directly.".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object", "required": ["tool_name", "input"],
+                        "properties": {"tool_name": {"type": "string"}, "input": {"type": "object", "additionalProperties": true}},
                         "additionalProperties": true
-                    }
-                }))).collect::<Vec<_>>()}
-            }),
-            "ping" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                    }),
+                })).collect(),
+            })),
+            "ping" => McpResponse::result(id, McpResult::Empty(McpEmptyResult::default())),
             "tools/call" => {
-                let params = request.get("params").cloned().unwrap_or_default();
-                let name = params
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
+                let params = request.params.unwrap_or_default();
+                let name = params.name.as_deref().unwrap_or_default();
                 if name == "temps_native_permission" {
-                    let arguments = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let tool_name = arguments
-                        .get("tool_name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Unknown tool")
-                        .to_string();
-                    let input = arguments
-                        .get("input")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    let arguments = params.arguments.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let arguments = match serde_json::from_value::<temps_ai::mcp::McpNativePermissionArguments>(arguments) {
+                        Ok(arguments) => arguments,
+                        Err(_) => return Ok(Some(McpResponse::error(id, -32602, "Invalid native permission arguments"))),
+                    };
+                    let tool_name = arguments.tool_name;
+                    let input = arguments.input;
                     let permission = temps_ai::PermissionRequest {
                         id: uuid::Uuid::new_v4().simple().to_string(),
                         kind: temps_ai::PermissionKind::ToolApproval,
@@ -2030,46 +2019,19 @@ impl ConversationService {
                     let decision =
                         tokio::time::timeout(remaining, (entry.interactions)(permission)).await;
                     let payload = match decision {
-                        Ok(Ok(temps_ai::PermissionDecision::AllowTool)) => serde_json::json!({
-                            "behavior": "allow",
-                            "updatedInput": input,
-                        }),
-                        Ok(Ok(temps_ai::PermissionDecision::DenyTool { reason })) => {
-                            serde_json::json!({
-                                "behavior": "deny",
-                                "message": reason.unwrap_or_else(|| "Permission denied".to_string()),
-                            })
-                        }
-                        Ok(Ok(_)) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": "The approval response did not match this tool request",
-                        }),
-                        Ok(Err(error)) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": error.to_string(),
-                        }),
-                        Err(_) => serde_json::json!({
-                            "behavior": "deny",
-                            "message": "Permission request timed out",
-                        }),
+                        Ok(Ok(temps_ai::PermissionDecision::AllowTool)) => temps_ai::mcp::McpPermissionDecision::allow(input),
+                        Ok(Ok(temps_ai::PermissionDecision::DenyTool { reason })) => temps_ai::mcp::McpPermissionDecision::deny(reason.unwrap_or_else(|| "Permission denied".to_string())),
+                        Ok(Ok(_)) => temps_ai::mcp::McpPermissionDecision::deny("The approval response did not match this tool request"),
+                        Ok(Err(error)) => temps_ai::mcp::McpPermissionDecision::deny(error.to_string()),
+                        Err(_) => temps_ai::mcp::McpPermissionDecision::deny("Permission request timed out"),
                     };
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": payload.to_string()}],
-                            "isError": false,
-                        }
-                    })
+                    let payload_text = match serde_json::to_string(&payload) {
+                        Ok(text) => text,
+                        Err(_) => "{\"behavior\":\"deny\",\"message\":\"Permission response could not be encoded\"}".into(),
+                    };
+                    McpResponse::call_text(id, payload_text, false)
                 } else if !entry.tools.iter().any(|tool| tool.name == name) {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": "Tool is not available for this application turn"}],
-                            "isError": true,
-                        }
-                    })
+                    McpResponse::call_text(id, "Tool is not available for this application turn", true)
                 } else {
                     let managed_process = is_managed_process_tool(name);
                     let call_id = if managed_process {
@@ -2077,9 +2039,7 @@ impl ConversationService {
                             Ok(call_id) => call_id,
                             Err(_) => {
                                 let call_id = uuid::Uuid::new_v4().simple().to_string();
-                                let arguments = params
-                                    .get("arguments")
-                                    .cloned()
+                                let arguments = params.arguments.clone()
                                     .unwrap_or_else(|| serde_json::json!({}))
                                     .to_string();
                                 let safe_error = serde_json::json!({
@@ -2101,14 +2061,7 @@ impl ConversationService {
                                     },
                                     result: safe_error.clone(),
                                 });
-                                return Ok(Some(serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "content": [{"type": "text", "text": safe_error}],
-                                        "isError": true,
-                                    }
-                                })));
+                                return Ok(Some(McpResponse::call_text(id, safe_error, true)));
                             }
                         }
                     } else {
@@ -2117,9 +2070,7 @@ impl ConversationService {
                     let call = ToolCall {
                         id: call_id,
                         name: name.to_string(),
-                        arguments: params
-                            .get("arguments")
-                            .cloned()
+                        arguments: params.arguments.clone()
                             .unwrap_or_else(|| serde_json::json!({}))
                             .to_string(),
                     };
@@ -2141,14 +2092,7 @@ impl ConversationService {
                                     result: safe_error.clone(),
                                 });
                             }
-                            return Ok(Some(serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "content": [{"type": "text", "text": safe_error}],
-                                    "isError": true,
-                                }
-                            })));
+                            return Ok(Some(McpResponse::call_text(id, safe_error, true)));
                         }
                     };
                     if managed_process
@@ -2162,10 +2106,7 @@ impl ConversationService {
                             .is_err()
                     {
                         drop(permit);
-                        return Ok(Some(serde_json::json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"content": [{"type":"text","text":"The managed process event queue is busy. Retry shortly."}], "isError": true}
-                        })));
+                        return Ok(Some(McpResponse::call_text(id, "The managed process event queue is busy. Retry shortly.", true)));
                     }
                     // A platform write may be waiting on a human approval. Do
                     // not impose the old 30-second read-tool timeout on that
@@ -2218,21 +2159,10 @@ impl ConversationService {
                             result: safe_text.clone(),
                         });
                     }
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": safe_text}],
-                            "isError": is_error,
-                        }
-                    })
+                    McpResponse::call_text(id, safe_text, is_error)
                 }
             }
-            _ => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32601, "message": "Method not found"},
-            }),
+            _ => McpResponse::error(id, -32601, "Method not found"),
         };
         Ok(Some(response))
     }
@@ -4896,6 +4826,11 @@ impl ConversationService {
             let mut provider_session_id: Option<String> = None;
             let mut provider_session_title: Option<String> = None;
             let mut resume_session_id = resume_session_id;
+            // A new turn with no durable provider session must not attach a
+            // runtime that still carries an older, now-missing session.
+            let mut reset_retained_session =
+                harness_workspace.is_some() && resume_session_id.is_none();
+            let mut missing_session_retry_used = false;
             // Why generation stopped, when it was a bound rather than the model
             // finishing. Reported to the user — a turn that halts for a reason
             // nobody states looks identical to one that simply gave up.
@@ -4961,6 +4896,7 @@ impl ConversationService {
                     thinking_level: ai_thinking_level.clone(),
                     permission_mode: Some(ai_permission_mode.clone()),
                     resume_session_id: resume_session_id.clone(),
+                    reset_retained_session,
                     messages: messages.clone(),
                     sandbox_attachments: sandbox_attachments.clone(),
                     tools: tools.clone(),
@@ -4974,6 +4910,7 @@ impl ConversationService {
                 // inline. An error here (e.g. the model can't do tools) ends the
                 // loop; the salvage below still tries a tool-free reply.
                 let provider_call_started = tokio::time::Instant::now();
+                reset_retained_session = false;
                 let mut stream = match ai
                     .chat_stream_turn_with_services(
                         req,
@@ -5006,15 +4943,23 @@ impl ConversationService {
                         tracing::warn!(
                             "chat_stream_turn failed for conv {conv_id} (round): {reason}"
                         );
-                        if resume_session_id.is_some()
-                            && provider_resume_session_is_missing(&ai_provider, &reason)
-                        {
+                        if can_retry_missing_provider_session(
+                            &ai_provider,
+                            &reason,
+                            resume_session_id.is_some(),
+                            missing_session_retry_used,
+                            false,
+                        ) {
                             tracing::warn!(
                                 conversation_id = conv_id,
                                 provider = %ai_provider,
                                 "provider resume session is missing; rebuilding it from durable conversation history"
                             );
                             resume_session_id = None;
+                            reset_retained_session = true;
+                            missing_session_retry_used = true;
+                            provider_session_id = None;
+                            provider_session_title = None;
                             if let Err(error) = clear_missing_provider_session(
                                 db.as_ref(),
                                 conv_id,
@@ -5049,6 +4994,7 @@ impl ConversationService {
                     );
                 let mut round_text = String::new();
                 let mut round_calls: Vec<ToolCall> = Vec::new();
+                let mut round_had_effect = false;
                 let mut native_tool_ids = std::collections::HashSet::new();
                 let mut pending_managed_process_ids = std::collections::HashSet::new();
                 let mut provider_stream_finished = false;
@@ -5198,6 +5144,7 @@ impl ConversationService {
                             );
                         }
                         Ok(ChatStreamDelta::Text(t)) => {
+                            round_had_effect |= !t.is_empty();
                             // Separate this round's prose from anything already shown
                             // (e.g. a previous round's narration) with a blank line.
                             if round_text.is_empty()
@@ -5240,6 +5187,7 @@ impl ConversationService {
                             }
                         }
                         Ok(ChatStreamDelta::ToolCall(tc)) => {
+                            round_had_effect = true;
                             if authoritative_mcp_event && is_managed_process_tool(&tc.name) {
                                 pending_managed_process_ids.insert(tc.id.clone());
                             }
@@ -5305,6 +5253,7 @@ impl ConversationService {
                             round_calls.push(tc);
                         }
                         Ok(ChatStreamDelta::ToolResult { call, result }) => {
+                            round_had_effect = true;
                             if authoritative_mcp_event && is_managed_process_tool(&call.name) {
                                 pending_managed_process_ids.remove(&call.id);
                             }
@@ -5354,6 +5303,7 @@ impl ConversationService {
                             round_produced_something = true;
                         }
                         Ok(ChatStreamDelta::PermissionRequested(perm)) => {
+                            round_had_effect = true;
                             // The gateway AI path (OpenAI/Anthropic API) never emits
                             // this — it only comes from `run_interactive` on the
                             // interactive CLI path, which has its own streaming channel.
@@ -5418,17 +5368,23 @@ impl ConversationService {
                             tracing::warn!(
                                 "chat_stream_turn item error for conv {conv_id}: {reason}"
                             );
-                            if resume_session_id.is_some()
-                                && round_text.is_empty()
-                                && round_calls.is_empty()
-                                && provider_resume_session_is_missing(&ai_provider, &reason)
-                            {
+                            if can_retry_missing_provider_session(
+                                &ai_provider,
+                                &reason,
+                                resume_session_id.is_some(),
+                                missing_session_retry_used,
+                                round_had_effect,
+                            ) {
                                 tracing::warn!(
                                     conversation_id = conv_id,
                                     provider = %ai_provider,
                                     "provider resume session is missing; rebuilding it from durable conversation history"
                                 );
                                 resume_session_id = None;
+                                reset_retained_session = true;
+                                missing_session_retry_used = true;
+                                provider_session_id = None;
+                                provider_session_title = None;
                                 if let Err(error) = clear_missing_provider_session(
                                     db.as_ref(),
                                     conv_id,
@@ -7160,6 +7116,12 @@ async fn audit_action_transition_failed(
 
 #[cfg(test)]
 mod tests {
+    macro_rules! mcp_request {
+        ($($json:tt)*) => {
+            serde_json::from_value::<temps_ai::mcp::McpRequest>(serde_json::json!($($json)*))
+                .expect("valid MCP request fixture")
+        };
+    }
     use super::*;
 
     #[test]
@@ -7399,6 +7361,207 @@ mod tests {
                 "must preserve unrelated provider failure: {reason}"
             );
         }
+
+        let missing = "Thread not found for id old-session";
+        assert!(can_retry_missing_provider_session(
+            "codex_cli",
+            missing,
+            true,
+            false,
+            false
+        ));
+        assert!(!can_retry_missing_provider_session(
+            "codex_cli",
+            missing,
+            false,
+            false,
+            false
+        ));
+        assert!(!can_retry_missing_provider_session(
+            "codex_cli",
+            missing,
+            true,
+            true,
+            false
+        ));
+        assert!(!can_retry_missing_provider_session(
+            "codex_cli",
+            missing,
+            true,
+            false,
+            true
+        ));
+        assert!(!can_retry_missing_provider_session(
+            "codex_cli",
+            "Token refresh failed: 401",
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_missing_session_reacquires_once_before_answering() {
+        let ai = Arc::new(ScriptedAi::new(vec![
+            Err(AiError::Provider {
+                purpose: "chat.application.tools".to_string(),
+                reason: "Thread not found for id old-session".to_string(),
+            }),
+            Ok(vec![
+                ChatStreamDelta::SessionMetadata {
+                    session_id: Some("new-session".to_string()),
+                    title: None,
+                },
+                ChatStreamDelta::Text("Recovered answer".to_string()),
+            ]),
+        ]));
+        let requests = ai.requests.clone();
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "codex_cli".to_string();
+        conversation.ai_permission_mode = "auto".to_string();
+        conversation.cli_session_id = Some("old-session".to_string());
+        let (service, _tools, auth) =
+            service_with_current_tool_auth_and_session_clear(ai, Some(conversation.clone()));
+        let stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                vec![],
+                &auth,
+                &test_request_metadata(),
+                None,
+                vec![],
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_missing_session".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_missing_session"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .await;
+        let mut stream = stream;
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => output.push(event),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "missing session gets one retry only; output={output:?}, errors={errors:?}"
+        );
+        assert!(
+            output.contains(&ChatStreamEvent::Token("Recovered answer".to_string())),
+            "{output:?}"
+        );
+        assert_eq!(
+            requests[0].resume_session_id.as_deref(),
+            Some("old-session")
+        );
+        assert!(!requests[0].reset_retained_session);
+        assert_eq!(requests[1].resume_session_id, None);
+        assert!(requests[1].reset_retained_session);
+        assert_eq!(requests[0].trace_id, requests[1].trace_id);
+    }
+
+    #[tokio::test]
+    async fn streamed_missing_session_discards_stale_metadata_before_retry() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let ai = Arc::new(MissingSessionStreamAi {
+            requests: requests.clone(),
+        });
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "codex_cli".to_string();
+        conversation.ai_permission_mode = "auto".to_string();
+        conversation.cli_session_id = Some("old-session".to_string());
+        let (service, _tools, auth) =
+            service_with_current_tool_auth_and_session_clear(ai, Some(conversation.clone()));
+        let stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                vec![],
+                &auth,
+                &test_request_metadata(),
+                None,
+                vec![],
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_stream_missing_session".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_stream_missing_session"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .await;
+        let output = drain(stream).await;
+        assert!(
+            output.contains(&ChatStreamEvent::Token("Stream recovered".to_string())),
+            "{output:?}"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].resume_session_id.as_deref(),
+            Some("old-session")
+        );
+        assert!(!requests[0].reset_retained_session);
+        assert_eq!(requests[1].resume_session_id, None);
+        assert!(requests[1].reset_retained_session);
+    }
+
+    #[tokio::test]
+    async fn absent_durable_session_resets_stale_retained_runtime_on_first_round() {
+        let ai = Arc::new(ScriptedAi::new(vec![Ok(vec![ChatStreamDelta::Text(
+            "Fresh session".to_string(),
+        )])]));
+        let requests = ai.requests.clone();
+        let (service, _tools, auth) = service_with_current_tool_auth(ai);
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "codex_cli".to_string();
+        conversation.ai_permission_mode = "auto".to_string();
+        conversation.cli_session_id = None;
+        let stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                vec![],
+                &auth,
+                &test_request_metadata(),
+                None,
+                vec![],
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_absent_session".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_absent_session"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .await;
+        let output = drain(stream).await;
+        assert!(output.contains(&ChatStreamEvent::Token("Fresh session".to_string())));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].resume_session_id, None);
+        assert!(requests[0].reset_retained_session);
     }
 
     #[test]
@@ -7868,6 +8031,7 @@ mod tests {
         /// Counts `chat_stream_turn` invocations (kept named `chat_calls` for the
         /// round-cap assertions).
         chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
         available: bool,
         /// Advance the paused test clock by this much on every model call, so a
         /// deadline can be exercised without a test that actually waits.
@@ -7879,6 +8043,7 @@ mod tests {
             Self {
                 rounds: Mutex::new(rounds.into_iter().collect()),
                 chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
                 available: true,
                 advance_per_round: None,
             }
@@ -7986,8 +8151,9 @@ mod tests {
         }
         async fn chat_stream_turn(
             &self,
-            _request: ChatTurnRequest,
+            request: ChatTurnRequest,
         ) -> Result<ChatTurnStream, AiError> {
+            self.requests.lock().unwrap().push(request);
             self.chat_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(d) = self.advance_per_round {
@@ -9085,6 +9251,13 @@ mod tests {
     fn service_with_current_tool_auth(
         ai: Arc<dyn AiService>,
     ) -> (ConversationService, Vec<ChatTool>, AuthContext) {
+        service_with_current_tool_auth_and_session_clear(ai, None)
+    }
+
+    fn service_with_current_tool_auth_and_session_clear(
+        ai: Arc<dyn AiService>,
+        missing_session_conversation: Option<ai_conversations::Model>,
+    ) -> (ConversationService, Vec<ChatTool>, AuthContext) {
         let now = Utc::now();
         let user = test_auth().user.expect("test user");
         let key = temps_entities::api_keys::Model {
@@ -9112,10 +9285,21 @@ mod tests {
         let mut db = MockDatabase::new(DatabaseBackend::Postgres);
         // Match the production turn backstop so long-running loop tests never
         // fall through to an unauthenticated fixture halfway through a turn.
-        for _ in 0..500 {
+        for index in 0..500 {
             db = db
                 .append_query_results([[key.clone()]])
                 .append_query_results([[user.clone()]]);
+            if index == 0 {
+                if let Some(conversation) = missing_session_conversation.as_ref() {
+                    db = db.append_query_results([[conversation.clone()]]);
+                }
+            }
+        }
+        if missing_session_conversation.is_some() {
+            db = db.append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }]);
         }
         let db = db
             .append_query_results([[assistant_msg_model()]])
@@ -9137,6 +9321,55 @@ mod tests {
     }
 
     struct StreamErrorAi;
+
+    struct MissingSessionStreamAi {
+        requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
+    }
+
+    #[async_trait]
+    impl AiService for MissingSessionStreamAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            let first = requests.len() == 1;
+            drop(requests);
+            if first {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(ChatStreamDelta::SessionMetadata {
+                        session_id: Some("old-session".to_string()),
+                        title: Some("Stale title".to_string()),
+                    }),
+                    Err(AiError::Provider {
+                        purpose: "chat.application.tools".to_string(),
+                        reason: "Thread not found for id old-session".to_string(),
+                    }),
+                ])))
+            } else {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(ChatStreamDelta::SessionMetadata {
+                        session_id: Some("new-session".to_string()),
+                        title: None,
+                    }),
+                    Ok(ChatStreamDelta::Text("Stream recovered".to_string())),
+                ])))
+            }
+        }
+    }
 
     struct PendingStreamAi {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -11607,16 +11840,48 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 "wrong-token",
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             )
             .await;
         assert_eq!(unauthorized, Err(HarnessMcpError::Unauthorized));
+
+        let notification = svc
+            .handle_harness_mcp_request(
+                bridge_id,
+                &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await
+            .expect("authorized notification");
+        assert!(notification.is_none());
+        let ping = svc
+            .handle_harness_mcp_request(
+                bridge_id,
+                &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","id":null,"method":"ping"}),
+            )
+            .await
+            .expect("authorized ping")
+            .expect("null id still receives response");
+        assert_eq!(ping.id, temps_ai::mcp::McpRequestId::Null);
+        assert!(matches!(
+            ping.result,
+            Some(temps_ai::mcp::McpResult::Empty(_))
+        ));
+        let invalid_permission = svc
+            .handle_harness_mcp_request(bridge_id, &server.authorization_token,
+                mcp_request!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temps_native_permission","arguments":{}}}))
+            .await.expect("authorized capability").expect("invalid params response");
+        assert_eq!(
+            invalid_permission.error.expect("JSON-RPC error").code,
+            -32602
+        );
 
         let response = svc
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
@@ -11626,6 +11891,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(response["result"]["isError"], false);
         assert!(response["result"]["content"][0]["text"]
@@ -11637,7 +11903,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
             )
             .await;
         assert_eq!(after_turn, Err(HarnessMcpError::NotFound));
@@ -11672,7 +11938,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                mcp_request!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             )
             .await;
         assert_eq!(result, Err(HarnessMcpError::Expired));
@@ -11710,7 +11976,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 9,
                     "method": "tools/call",
@@ -11726,6 +11992,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
 
         let permission = seen
             .lock()
@@ -11777,7 +12044,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc": "2.0",
                     "id": 10,
                     "method": "tools/call",
@@ -11793,6 +12060,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("request response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
 
         let payload: serde_json::Value = serde_json::from_str(
             response["result"]["content"][0]["text"]
@@ -11852,7 +12120,7 @@ mod tests {
 
     #[test]
     fn managed_process_rpc_ids_are_stable_bounded_and_capability_scoped() {
-        let rpc_id = serde_json::json!("request-42");
+        let rpc_id = temps_ai::mcp::McpRequestId::String("request-42".into());
         let first = managed_process_call_id("bridge-a", &rpc_id).expect("valid rpc id");
         let retry = managed_process_call_id("bridge-a", &rpc_id).expect("stable retry id");
         let other_capability =
@@ -11860,8 +12128,12 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, other_capability);
         assert!(first.starts_with("tmcp_"));
-        assert!(managed_process_call_id("bridge-a", &serde_json::json!({"bad": true})).is_err());
-        assert!(managed_process_call_id("bridge-a", &serde_json::json!("x".repeat(257))).is_err());
+        assert!(managed_process_call_id("bridge-a", &temps_ai::mcp::McpRequestId::Null).is_err());
+        assert!(managed_process_call_id(
+            "bridge-a",
+            &temps_ai::mcp::McpRequestId::String("x".repeat(257))
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -11902,7 +12174,7 @@ mod tests {
             .nth(1)
             .and_then(|suffix| suffix.split('/').next())
             .expect("bridge id in scoped URL");
-        let request = serde_json::json!({
+        let request = mcp_request!({
             "jsonrpc":"2.0", "id":"stable-request", "method":"tools/call",
             "params":{"name":PROCESS_STATUS_TOOL,"arguments":{"process_id":"proc_1"}}
         });
@@ -11937,6 +12209,7 @@ mod tests {
             .expect("request task")
             .expect("authorized process request")
             .expect("process response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(response["result"]["isError"], false);
         assert!(!response.to_string().contains("must-redact"));
     }
@@ -12075,7 +12348,7 @@ mod tests {
             .handle_harness_mcp_request(
                 bridge_id,
                 &server.authorization_token,
-                serde_json::json!({
+                mcp_request!({
                     "jsonrpc":"2.0", "id":8, "method":"tools/call",
                     "params":{"name":PROCESS_STATUS_TOOL,"arguments":{"process_id":"proc_1"}}
                 }),
@@ -12083,6 +12356,7 @@ mod tests {
             .await
             .expect("authorized capability")
             .expect("queue error response");
+        let response = serde_json::to_value(response).expect("MCP response JSON");
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

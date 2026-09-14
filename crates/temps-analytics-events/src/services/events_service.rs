@@ -1597,6 +1597,47 @@ WHERE project_id = $1
                     if is_crawler && !v.is_crawler {
                         active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
                     }
+                    // Backfill first-touch attribution left NULL by a writer
+                    // that didn't have it -- specifically `session-replay/init`'s
+                    // lookup-miss upsert (issue #980), which only knows
+                    // visitor id/project/environment/user-agent and leaves
+                    // referrer/channel/UTM empty. Only ever fills a NULL,
+                    // never overwrites a value a previous writer already
+                    // recorded, matching "first_*" (first-touch) semantics.
+                    if v.first_referrer.is_none() {
+                        if let Some(ref r) = referrer {
+                            active_visitor.first_referrer =
+                                sea_orm::ActiveValue::Set(Some(r.clone()));
+                        }
+                    }
+                    if v.first_referrer_hostname.is_none() {
+                        if let Some(ref rh) = referrer_hostname {
+                            active_visitor.first_referrer_hostname =
+                                sea_orm::ActiveValue::Set(Some(rh.clone()));
+                        }
+                    }
+                    if v.first_channel.is_none() {
+                        active_visitor.first_channel =
+                            sea_orm::ActiveValue::Set(Some(channel.to_string()));
+                    }
+                    if v.first_utm_source.is_none() {
+                        if let Some(ref s) = utm_source {
+                            active_visitor.first_utm_source =
+                                sea_orm::ActiveValue::Set(Some(s.clone()));
+                        }
+                    }
+                    if v.first_utm_medium.is_none() {
+                        if let Some(ref m) = utm_medium {
+                            active_visitor.first_utm_medium =
+                                sea_orm::ActiveValue::Set(Some(m.clone()));
+                        }
+                    }
+                    if v.first_utm_campaign.is_none() {
+                        if let Some(ref c) = utm_campaign {
+                            active_visitor.first_utm_campaign =
+                                sea_orm::ActiveValue::Set(Some(c.clone()));
+                        }
+                    }
                     let _ = active_visitor.update(self.db.as_ref()).await;
 
                     Some(v.id)
@@ -3757,6 +3798,209 @@ mod tests {
         assert_eq!(second_event.visitor_id, event.visitor_id);
 
         println!("✅ record_event visitor-race regression test passed!");
+    }
+
+    /// Regression: `session-replay/init`'s own lookup-miss upsert (issue
+    /// #980, `SessionReplayService::upsert_visitor_on_miss`) can now win the
+    /// race and create the canonical `visitor` row before `/event` ever
+    /// arrives -- but it only knows visitor id/project/environment/user
+    /// agent, so it leaves `first_referrer`/`first_channel`/UTM columns
+    /// NULL. When the real event lands afterward, `record_event` must fill
+    /// those in rather than leaving attribution permanently empty for any
+    /// visitor whose replay session happened to initialize first.
+    #[tokio::test]
+    async fn test_record_event_backfills_attribution_on_existing_null_visitor() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("attribution-backfill-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("attribution-backfill-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod-attribution-backfill".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // Simulate the row session-replay/init would have created: real
+        // visitor id/project/environment, but no attribution at all.
+        let visitor_uuid = uuid::Uuid::new_v4().to_string();
+        visitor::ActiveModel {
+            visitor_id: Set(visitor_uuid.clone()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert placeholder visitor");
+
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                None,
+                Some("backfill-session".to_string()),
+                Some(visitor_uuid.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "?utm_source=newsletter&utm_medium=email&utm_campaign=launch",
+                None, // site_hostname
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Mozilla/5.0".to_string()),
+                Some("https://example-referrer.test/".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record event for the placeholder visitor");
+
+        let visitor_row = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(visitor_uuid.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query visitor")
+            .expect("visitor row must still exist");
+
+        assert!(
+            visitor_row.has_activity,
+            "the pre-existing backfill target's `has_activity` must still flip to true"
+        );
+        assert_eq!(
+            visitor_row.first_referrer,
+            Some("https://example-referrer.test/".to_string()),
+            "referrer must be backfilled onto the placeholder row"
+        );
+        assert_eq!(
+            visitor_row.first_referrer_hostname,
+            Some("example-referrer.test".to_string())
+        );
+        assert_eq!(visitor_row.first_utm_source, Some("newsletter".to_string()));
+        assert_eq!(visitor_row.first_utm_medium, Some("email".to_string()));
+        assert_eq!(visitor_row.first_utm_campaign, Some("launch".to_string()));
+        assert!(
+            visitor_row.first_channel.is_some(),
+            "channel is always computed, so it must be backfilled too"
+        );
+
+        // A second event with *different* attribution must not clobber the
+        // first-touch values just backfilled above.
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                None,
+                Some("backfill-session-2".to_string()),
+                Some(visitor_uuid.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/pricing",
+                "?utm_source=twitter&utm_medium=social&utm_campaign=other",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Mozilla/5.0".to_string()),
+                Some("https://example.com/other-referrer".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record second event");
+
+        let visitor_row_after_second_event = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(visitor_uuid))
+            .one(db.as_ref())
+            .await
+            .expect("query visitor")
+            .expect("visitor row must still exist");
+
+        assert_eq!(
+            visitor_row_after_second_event.first_referrer,
+            Some("https://example-referrer.test/".to_string()),
+            "first-touch attribution must not be overwritten by a later event"
+        );
+        assert_eq!(
+            visitor_row_after_second_event.first_utm_source,
+            Some("newsletter".to_string())
+        );
     }
 
     /// Security regression test: on the keyed ingest path, `visitor_id` is a

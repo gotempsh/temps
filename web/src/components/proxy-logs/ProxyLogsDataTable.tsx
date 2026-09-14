@@ -626,9 +626,9 @@ export function ProxyLogsDataTable({
       { key: 'device_type', label: 'Device', sortable: true },
       { key: 'browser', label: 'Browser', sortable: true },
       { key: 'is_bot', label: 'Bot', sortable: true },
-      { key: 'bot_name', label: 'Bot Name', sortable: true },
-      { key: 'cache_status', label: 'Cache', sortable: true },
-      { key: 'upstream_host', label: 'Upstream', sortable: true },
+      { key: 'bot_name', label: 'Bot Name' },
+      { key: 'cache_status', label: 'Cache' },
+      { key: 'upstream_host', label: 'Upstream' },
     ]
 
   const aiAgentActive =

@@ -380,6 +380,13 @@ impl From<SessionReplayError> for Problem {
         let (status, message) = match &error {
             SessionReplayError::VisitorNotFound(_) => (StatusCode::NOT_FOUND, "Visitor not found"),
             SessionReplayError::SessionNotFound(_) => (StatusCode::NOT_FOUND, "Session not found"),
+            SessionReplayError::InvalidVisitorId { .. } => {
+                (StatusCode::BAD_REQUEST, "Invalid visitor id")
+            }
+            SessionReplayError::VisitorCreationRateLimited { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Visitor creation rate limit exceeded",
+            ),
             // Cross-project access attempts are surfaced as 404 to avoid
             // disclosing the existence of sessions belonging to other tenants.
             SessionReplayError::CrossProjectAccess { .. } => {
@@ -928,6 +935,7 @@ pub async fn init_session_replay(
             project_id,
             environment_id,
             deployment_id,
+            &metadata.ip_address,
         )
         .await
     {
@@ -1234,11 +1242,12 @@ mod tests {
         .expect("Failed to insert test project")
     }
 
-    /// `initialize_session` resolves the visitor row by its GUID and 404s when
-    /// it is absent — pre-existing behaviour, independent of ADR-040: the
-    /// browser SDK sends the `page_view` event (which upserts the visitor)
-    /// before it starts a replay. Seed one so these tests exercise the
-    /// resolution branch under test rather than that lookup.
+    /// `initialize_session` upserts the visitor row on a lookup miss (issue
+    /// #980), so seeding one is no longer required for `/init` to succeed —
+    /// but most tests here still do it up front so they exercise only the
+    /// scope-resolution branch under test rather than also touching the
+    /// upsert path (covered separately by
+    /// `session_replay_init_upserts_visitor_on_lookup_miss`).
     async fn insert_db_visitor(
         db: &sea_orm::DatabaseConnection,
         project_id: i32,
@@ -1389,6 +1398,15 @@ mod tests {
             .all(db)
             .await
             .expect("Failed to query session replay sessions")
+    }
+
+    async fn stored_visitors(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<temps_entities::visitor::Model> {
+        temps_entities::visitor::Entity::find()
+            .all(db)
+            .await
+            .expect("Failed to query visitors")
     }
 
     #[tokio::test]
@@ -1744,6 +1762,487 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression for issue #980: the browser SDK fires `/event` and
+    /// `session-replay/init` in the same page load with no ordering between
+    /// them, so a first-time visitor's `init` commonly arrives before
+    /// `/event` has created the `visitor` row. `init` must upsert that row
+    /// itself instead of 404ing — deliberately not calling
+    /// `insert_db_visitor` here, so this test only passes if the lookup-miss
+    /// path creates the row.
+    #[tokio::test]
+    async fn session_replay_init_upserts_visitor_on_lookup_miss() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        assert!(
+            stored_visitors(db.as_ref()).await.is_empty(),
+            "test must start with no visitor row for the race to be exercised"
+        );
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.test")
+                    .header(TEST_VISITOR_ID_COOKIE_HEADER, "client-generated-visitor")
+                    .header("content-type", "application/json")
+                    .body(Body::from(init_payload("session-k").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "init must upsert the missing visitor instead of 404ing"
+        );
+
+        let sessions = stored_sessions(db.as_ref()).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, project.id);
+
+        let visitors = stored_visitors(db.as_ref()).await;
+        assert_eq!(visitors.len(), 1);
+        assert_eq!(visitors[0].visitor_id, "client-generated-visitor");
+        assert_eq!(visitors[0].project_id, project.id);
+        assert_eq!(sessions[0].visitor_id, visitors[0].id);
+
+        test_db.cleanup().await;
+    }
+
+    /// Security regression: `session-replay/init` is unauthenticated, and its
+    /// lookup-miss path (added for issue #980, above) now creates a `visitor`
+    /// row per distinct `visitorId`. Without a cap, a client that keeps
+    /// inventing fresh ids could grow the `visitor` table without bound.
+    /// Calls the service directly (not through HTTP) to drive the cap to
+    /// exhaustion quickly, mirroring
+    /// `EventsService`'s `test_record_event_caps_new_visitor_creation_per_project`.
+    #[tokio::test]
+    async fn session_replay_init_caps_new_visitor_creation_per_project() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        // Drive the cap to exhaustion with distinct client-supplied visitor
+        // ids from distinct IPs, each a genuine lookup miss -- distinct IPs
+        // so this exercises the project-wide cap in isolation, never the
+        // per-IP sub-limit (see `session_replay_init_ip_sublimit_trips_before_project_cap`
+        // for that one).
+        for i in 0..120 {
+            state
+                .session_replay_service
+                .initialize_session(
+                    &format!("cap-test-session-{i}"),
+                    SessionMetadata {
+                        visitor_id: format!("cap-test-visitor-{i}"),
+                        user_agent: "Mozilla/5.0".to_string(),
+                        language: "en-US".to_string(),
+                        timezone: "UTC".to_string(),
+                        screen: Screen {
+                            width: 1920,
+                            height: 1080,
+                            color_depth: 24,
+                        },
+                        viewport: Viewport {
+                            width: 1280,
+                            height: 720,
+                        },
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        url: "/".to_string(),
+                    },
+                    project.id,
+                    None,
+                    None,
+                    &format!("203.0.113.{i}"),
+                )
+                .await
+                .expect("initialize_session must succeed while under the cap");
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 120);
+
+        // One more distinct visitor id from a fresh IP, now over budget:
+        // must not create another row, and must surface as a retryable 429
+        // rather than a silent no-op.
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "cap-test-session-over-budget",
+                SessionMetadata {
+                    visitor_id: "cap-test-visitor-over-budget".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                "203.0.113.200",
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "expected VisitorCreationRateLimited once the per-project cap is exhausted, got: {result:?}"
+        );
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            120,
+            "the over-cap request must not have created a 121st row"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// Security regression: the project-wide visitor-creation cap tested
+    /// above is a *shared* budget with no per-caller limit, so one
+    /// unauthenticated IP sending fresh `visitorId`s could otherwise exhaust
+    /// it alone and deny legitimate first-time visitors from other IPs. The
+    /// per-(project, ip) sub-limit must trip well before the 120-per-project
+    /// cap when every request comes from the same IP.
+    #[tokio::test]
+    async fn session_replay_init_ip_sublimit_trips_before_project_cap() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let attacker_ip = "198.51.100.7";
+
+        for i in 0..20 {
+            state
+                .session_replay_service
+                .initialize_session(
+                    &format!("ip-cap-test-session-{i}"),
+                    SessionMetadata {
+                        visitor_id: format!("ip-cap-test-visitor-{i}"),
+                        user_agent: "Mozilla/5.0".to_string(),
+                        language: "en-US".to_string(),
+                        timezone: "UTC".to_string(),
+                        screen: Screen {
+                            width: 1920,
+                            height: 1080,
+                            color_depth: 24,
+                        },
+                        viewport: Viewport {
+                            width: 1280,
+                            height: 720,
+                        },
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        url: "/".to_string(),
+                    },
+                    project.id,
+                    None,
+                    None,
+                    attacker_ip,
+                )
+                .await
+                .expect("initialize_session must succeed while under the per-IP cap");
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 20);
+
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "ip-cap-test-session-over-budget",
+                SessionMetadata {
+                    visitor_id: "ip-cap-test-visitor-over-budget".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                attacker_ip,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "expected VisitorCreationRateLimited once this IP's sub-cap is exhausted, got: {result:?}"
+        );
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            20,
+            "the over-cap request must not have created a 21st row"
+        );
+
+        // A different IP for the same project is unaffected -- the
+        // sub-limit is per-(project, ip), not a project-wide lockout.
+        let other_ip_result = state
+            .session_replay_service
+            .initialize_session(
+                "ip-cap-test-session-other-ip",
+                SessionMetadata {
+                    visitor_id: "ip-cap-test-visitor-other-ip".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                "198.51.100.8",
+            )
+            .await;
+        assert!(
+            other_ip_result.is_ok(),
+            "a different IP must not be blocked by another IP's exhausted sub-cap: {other_ip_result:?}"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    fn cap_test_metadata(visitor_id: String) -> SessionMetadata {
+        SessionMetadata {
+            visitor_id,
+            user_agent: "Mozilla/5.0".to_string(),
+            language: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            screen: Screen {
+                width: 1920,
+                height: 1080,
+                color_depth: 24,
+            },
+            viewport: Viewport {
+                width: 1280,
+                height: 720,
+            },
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            url: "/".to_string(),
+        }
+    }
+
+    /// Security regression: the per-IP sub-limit must be checked *before*
+    /// the shared project-wide budget is consumed, not after. Each rate
+    /// limiter's `check()` both tests and consumes a slot in the same call,
+    /// so if the project-wide check ran first, an attacker IP already over
+    /// its own sub-cap could keep sending requests that get rejected by the
+    /// IP check afterward -- but each one would have already burned a slot
+    /// from the *shared* project budget for nothing, letting one blocked
+    /// caller drain capacity meant for other IPs. Proves the fix
+    /// behaviorally: after one IP is driven past its own sub-cap (spending
+    /// some rejected requests along the way), exactly
+    /// `120 - (that IP's successes)` more distinct-IP requests must still
+    /// fit under the project cap -- not fewer.
+    #[tokio::test]
+    async fn session_replay_init_rejected_ip_requests_do_not_consume_project_budget() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let attacker_ip = "198.51.100.9";
+
+        // Drive the attacker's own per-IP sub-cap (20) to exhaustion, then
+        // keep hammering from the same IP well past it -- every one of
+        // these extra calls must be rejected by the IP check without ever
+        // reaching (and consuming) the shared project-wide budget.
+        for i in 0..25 {
+            let result = state
+                .session_replay_service
+                .initialize_session(
+                    &format!("budget-test-attacker-session-{i}"),
+                    cap_test_metadata(format!("budget-test-attacker-visitor-{i}")),
+                    project.id,
+                    None,
+                    None,
+                    attacker_ip,
+                )
+                .await;
+            if i < 20 {
+                assert!(result.is_ok(), "call {i} must succeed (under the IP cap)");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(SessionReplayError::VisitorCreationRateLimited { .. })
+                    ),
+                    "call {i} must be rejected by the IP cap, got: {result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            stored_visitors(db.as_ref()).await.len(),
+            20,
+            "only the attacker's first 20 calls should have created a row"
+        );
+
+        // The shared project budget is 120; the attacker legitimately used
+        // 20 of it. If the fix holds, exactly 100 more requests from fresh,
+        // distinct IPs must still succeed -- the attacker's 5 rejected
+        // retries above must not have silently eaten into this budget too.
+        for i in 0..100 {
+            let result = state
+                .session_replay_service
+                .initialize_session(
+                    &format!("budget-test-legit-session-{i}"),
+                    cap_test_metadata(format!("budget-test-legit-visitor-{i}")),
+                    project.id,
+                    None,
+                    None,
+                    &format!("203.0.113.{i}"),
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "legitimate request {i} from a fresh IP must fit in the remaining project budget: {result:?}"
+            );
+        }
+        assert_eq!(stored_visitors(db.as_ref()).await.len(), 120);
+
+        // The 101st fresh-IP request is the true 121st project-wide upsert
+        // attempt (20 + 100 + 1) and must now hit the project cap.
+        let over_budget = state
+            .session_replay_service
+            .initialize_session(
+                "budget-test-legit-session-over",
+                cap_test_metadata("budget-test-legit-visitor-over".to_string()),
+                project.id,
+                None,
+                None,
+                "203.0.113.250",
+            )
+            .await;
+        assert!(
+            matches!(
+                over_budget,
+                Err(SessionReplayError::VisitorCreationRateLimited { .. })
+            ),
+            "the project cap must trip at exactly 120, proving the attacker's rejected \
+             retries consumed none of the shared budget: {over_budget:?}"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// Security regression: an oversized `visitorId` on the lookup-miss path
+    /// would otherwise reach an `INSERT` into `visitor`, which is uniquely
+    /// indexed on `(visitor_id, project_id)` -- Postgres' btree tuple limit
+    /// (~2704 bytes) would turn a sufficiently long id into a 500 instead of
+    /// a clean 400. Must be rejected before it reaches the database, and
+    /// before it consumes the per-project rate-limit budget tested above.
+    #[tokio::test]
+    async fn session_replay_init_rejects_oversized_visitor_id() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let result = state
+            .session_replay_service
+            .initialize_session(
+                "session-oversized",
+                SessionMetadata {
+                    visitor_id: "v".repeat(129),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    language: "en-US".to_string(),
+                    timezone: "UTC".to_string(),
+                    screen: Screen {
+                        width: 1920,
+                        height: 1080,
+                        color_depth: 24,
+                    },
+                    viewport: Viewport {
+                        width: 1280,
+                        height: 720,
+                    },
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    url: "/".to_string(),
+                },
+                project.id,
+                None,
+                None,
+                "203.0.113.1",
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(SessionReplayError::InvalidVisitorId { .. })),
+            "expected InvalidVisitorId for a 129-char visitorId, got: {result:?}"
+        );
+        assert!(stored_visitors(db.as_ref()).await.is_empty());
 
         test_db.cleanup().await;
     }

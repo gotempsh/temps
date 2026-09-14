@@ -116,6 +116,7 @@ export interface RateLimitSettings {
 export interface SecuritySettingsFormData {
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
+  trust_loopback_forwarded_ip: boolean
 }
 
 interface SecuritySettingsProps {

@@ -509,6 +509,29 @@ impl TempsPlugin for AiGatewayPlugin {
                     })
                 })
             };
+            let sandbox_candidate_credentials: temps_ai_agent_cli::SandboxCandidateCredentialResolver = {
+                let config_service = config_service.clone();
+                Arc::new(move |provider_id, auth_type, credential| {
+                    let config_service = config_service.clone();
+                    let provider_id = provider_id.to_string();
+                    let auth_type = auth_type.to_string();
+                    let credential = credential.to_string();
+                    Box::pin(async move {
+                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
+                            .ok_or_else(|| temps_ai::AiError::Provider {
+                                purpose: "provider.credentials.verify".to_string(),
+                                reason: format!("unknown development harness '{provider_id}'"),
+                            })?;
+                        let flavor = provider.flavor(&auth_type)
+                            .ok_or_else(|| temps_ai::AiError::Provider {
+                                purpose: "provider.credentials.verify".to_string(),
+                                reason: format!("authentication type '{auth_type}' is invalid for '{provider_id}'"),
+                            })?;
+                        let internal_api_url = config_service.resolve_internal_url().await;
+                        sandbox_harness_credentials(&provider_id, flavor.format, credential, internal_api_url)
+                    })
+                })
+            };
             if let Err(e) = tokio::fs::create_dir_all(&ai_cli_scratch_dir).await {
                 tracing::error!(
                     scratch_dir = %ai_cli_scratch_dir.display(),
@@ -537,6 +560,7 @@ impl TempsPlugin for AiGatewayPlugin {
                             sandbox_provider.clone(),
                             application_workspace_root.clone(),
                             sandbox_credentials.clone(),
+                            sandbox_candidate_credentials.clone(),
                             sandbox_model_relay.clone(),
                             sandbox_workspace_resolver.as_ref().clone(),
                         );

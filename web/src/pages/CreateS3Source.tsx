@@ -127,7 +127,7 @@ export function CreateS3Source() {
     Boolean(formData.secret_key?.trim())
 
   return (
-    <div className="container mx-auto max-w-4xl py-6">
+    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-6">
         <div className="flex items-center gap-2 mb-2">
           <Link

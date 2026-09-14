@@ -43,6 +43,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { cn } from '@/lib/utils'
 import {
   Table,
@@ -58,11 +59,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
-  ArrowDown,
   ArrowLeft,
   ArrowRight,
-  ArrowUp,
-  ArrowUpDown,
   Bot,
   Check,
   ChevronLeft,
@@ -708,43 +706,6 @@ OTEL_SERVICE_NAME=${project.name}`
   )
 }
 
-// A right-aligned, clickable column header that drives server-side sort.
-// Shows a neutral up/down glyph when inactive, and the active direction arrow
-// when this column is the sort key.
-function SortHeader({
-  label,
-  active,
-  order,
-  onClick,
-}: {
-  label: string
-  active: boolean
-  order: 'asc' | 'desc'
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-sort={
-        active ? (order === 'asc' ? 'ascending' : 'descending') : 'none'
-      }
-      className="ml-auto inline-flex items-center gap-1 hover:text-foreground transition-colors"
-    >
-      {label}
-      {active ? (
-        order === 'asc' ? (
-          <ArrowUp className="h-3.5 w-3.5" />
-        ) : (
-          <ArrowDown className="h-3.5 w-3.5" />
-        )
-      ) : (
-        <ArrowUpDown className="h-3.5 w-3.5 opacity-40" />
-      )}
-    </button>
-  )
-}
-
 // ── Main Component ──────────────────────────────────────────────────
 
 export default function TracesList({ project }: TracesListProps) {
@@ -791,8 +752,8 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
-  // Server-side sort. Three states per column: desc → asc → unsorted (`null`),
-  // where unsorted reverts to the backend default (newest traces first).
+  // Server-side sort. Old `sort=none` links still resolve to the backend's
+  // default order, while header clicks use the standard two-direction cycle.
   const [sortBy, setSortBy] = useState<'start_time' | 'duration' | null>(() => {
     const s = searchParams.get('sort')
     return s === 'duration' ? 'duration' : s === 'none' ? null : 'start_time'
@@ -894,18 +855,12 @@ export default function TracesList({ project }: TracesListProps) {
     setSearchParams,
   ])
 
-  // Cycle sort on a column header through three states: clicking a new column
-  // selects it descending; clicking the active column goes desc → asc → unsorted
-  // (removing the sort reverts to the backend default, newest-first).
+  // Clicking a new column selects it descending; subsequent clicks toggle the
+  // direction. Sorting resets pagination so the first row is the true extreme.
   const handleSort = useCallback(
     (field: 'start_time' | 'duration') => {
       if (sortBy === field) {
-        if (sortOrder === 'desc') {
-          setSortOrder('asc')
-        } else {
-          setSortBy(null)
-          setSortOrder('desc')
-        }
+        setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')
       } else {
         setSortBy(field)
         setSortOrder('desc')
@@ -1343,25 +1298,24 @@ export default function TracesList({ project }: TracesListProps) {
                         Kind
                       </TableHead>
                       <TableHead>Status</TableHead>
-                      <TableHead className="text-right">
-                        <SortHeader
-                          label="Duration"
-                          active={sortBy === 'duration'}
-                          order={sortOrder}
-                          onClick={() => handleSort('duration')}
-                        />
-                      </TableHead>
+                      <SortableTableHead
+                        label="Duration"
+                        active={sortBy === 'duration'}
+                        direction={sortOrder}
+                        onClick={() => handleSort('duration')}
+                        align="right"
+                      />
                       <TableHead className="hidden md:table-cell text-right">
                         Spans
                       </TableHead>
-                      <TableHead className="hidden md:table-cell text-right">
-                        <SortHeader
-                          label="Timestamp"
-                          active={sortBy === 'start_time'}
-                          order={sortOrder}
-                          onClick={() => handleSort('start_time')}
-                        />
-                      </TableHead>
+                      <SortableTableHead
+                        label="Timestamp"
+                        active={sortBy === 'start_time'}
+                        direction={sortOrder}
+                        onClick={() => handleSort('start_time')}
+                        align="right"
+                        className="hidden md:table-cell"
+                      />
                     </TableRow>
                   </TableHeader>
                   <TableBody>

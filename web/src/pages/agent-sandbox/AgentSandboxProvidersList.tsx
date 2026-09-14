@@ -1,145 +1,144 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import {
-  ArrowRight,
-  CheckCircle2,
-  Loader2,
-  Sparkles,
-  XCircle,
-} from 'lucide-react'
-
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { ArrowRight, KeyRound, Monitor, ShieldCheck } from 'lucide-react'
+import type { ProviderCatalogDto } from '@/api/client'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import {
+  harnessSetupHref,
+  harnessSetupStatus,
+  workspaceReturnTo,
+} from './harness-onboarding'
 
-// One row per provider. Configured providers collapse to a single line of
-// status; unconfigured ones get a "Configure" CTA. Keeping this list dense
-// because the user mostly just wants to see which provider is active.
 export function AgentSandboxProvidersList() {
-  usePageTitle('AI Providers')
-  const { data, isPending, isError } = useQuery({
+  usePageTitle('Harnesses')
+  const [params] = useSearchParams()
+  const returnTo = workspaceReturnTo(params.get('returnTo'))
+  const { data, isPending, isError, refetch } = useQuery({
     ...aiProviderCatalogQueryOptions,
-    staleTime: 60 * 1000,
+    staleTime: 60_000,
   })
-
-  if (isPending) {
-    return (
-      <div className="flex justify-center py-12">
-        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-      </div>
-    )
-  }
-
-  if (isError || !data) {
-    return (
-      <Card>
-        <CardContent className="py-8 text-sm text-destructive">
-          Failed to load AI provider catalog. Refresh the page to retry.
-        </CardContent>
-      </Card>
-    )
-  }
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Sparkles className="h-4 w-4" />
-            AI Providers
-          </CardTitle>
-          <CardDescription>
-            Configure each CLI independently. “Workspace ready” means Temps can
-            broker that credential through a short-lived sandbox relay; “Host
-            only” means it is currently limited to server-side workflows.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="divide-y">
-          {data.providers.map((p) => {
-            const isActive = p.id === data.default_provider
-            return (
-              <div
-                key={p.id}
-                className="flex flex-col sm:flex-row sm:items-center gap-3 py-3 first:pt-0 last:pb-0"
-              >
-                <div className="flex items-center gap-3 min-w-0 flex-1">
-                  <AiHarnessLogo providerId={p.id} size={34} />
-                  {p.workspace_ready ? (
-                    <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
-                  ) : (
-                    <XCircle className="h-4 w-4 text-muted-foreground shrink-0" />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <p className="text-sm font-medium">{p.name}</p>
-                      {isActive && (
-                        <span className="inline-flex items-center rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
-                          Active
-                        </span>
-                      )}
-                      {p.credential_saved && (
-                        <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-                          {p.current_auth_type === 'subscription'
-                            ? 'OAuth token'
-                            : p.current_auth_type === 'config_file'
-                              ? 'Config file'
-                              : 'API key'}
-                        </span>
-                      )}
-                      <span
-                        className={
-                          p.workspace_ready
-                            ? 'inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300'
-                            : 'inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300'
-                        }
-                      >
-                        {p.workspace_ready ? 'Workspace ready' : 'Host only'}
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground truncate">
-                      {p.workspace_ready
-                        ? p.default_model
-                          ? `Workspace model: ${p.default_model}`
-                          : 'Workspace model: provider default'
-                        : (p.workspace_readiness_hint ??
-                          (p.credential_saved
-                            ? 'Credential saved for host workflows'
-                            : 'No credential saved'))}
-                    </p>
-                  </div>
-                </div>
-                <Button
-                  asChild
-                  variant="outline"
-                  size="sm"
-                  className="shrink-0"
-                >
-                  <Link to={`/agent-sandbox/providers/${p.id}`}>
-                    {p.credential_saved ? 'Manage' : 'Configure'}
-                    <ArrowRight className="h-3.5 w-3.5 ml-1.5" />
-                  </Link>
-                </Button>
-              </div>
-            )
-          })}
-        </CardContent>
-      </Card>
-
-      <p className="text-xs text-muted-foreground">
-        Adding a new provider requires a Rust catalog entry on the server side —
-        no UI configuration needed once the binary supports it.
-      </p>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm text-muted-foreground">
+          Choose a harness, save its credential, then verify your first
+          workspace reply. You only need one to start.
+        </p>
+        <Button asChild variant="outline" size="sm">
+          <Link to={returnTo}>
+            Back to workspace <ArrowRight className="size-4" />
+          </Link>
+        </Button>
+      </div>
+      {isError && (
+        <div role="alert" className="rounded-lg border p-4 text-sm">
+          Could not load harness configuration.{' '}
+          <Button variant="outline" size="sm" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 2xl:grid-cols-3">
+        {isPending
+          ? [0, 1, 2].map((id) => (
+              <Card key={id} aria-label="Loading harness">
+                <CardContent className="space-y-3 p-4">
+                  <Skeleton className="h-8 w-40" />
+                  <Skeleton className="h-20 w-full" />
+                </CardContent>
+              </Card>
+            ))
+          : data?.providers.map((provider) => (
+              <HarnessSetupCard
+                key={provider.id}
+                provider={provider}
+                returnTo={returnTo}
+              />
+            ))}
+      </div>
+      <div className="flex items-start gap-2 rounded-lg border p-4 text-sm text-muted-foreground">
+        <ShieldCheck className="size-4 shrink-0" aria-hidden="true" />
+        <p>
+          Credentials are configured on this Temps instance, not in your
+          browser. A host CLI login is separate from a saved workspace
+          credential. A saved credential is not proof that a model can answer:
+          verify it in your workspace before starting a larger task.
+        </p>
+      </div>
     </div>
+  )
+}
+
+export function HarnessSetupCard({
+  provider,
+  returnTo,
+}: {
+  provider: ProviderCatalogDto
+  returnTo: string
+}) {
+  return (
+    <Card className="min-w-0 shadow-none">
+      <CardContent className="space-y-4 p-4">
+        <div className="flex items-center gap-3">
+          <AiHarnessLogo providerId={provider.id} size={28} />
+          <div className="min-w-0 space-y-1">
+            <h2 className="font-semibold">{provider.name}</h2>
+            <Badge variant="secondary">{harnessSetupStatus(provider)}</Badge>
+          </div>
+        </div>
+        <dl className="space-y-2 text-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <dt className="flex items-center gap-2 text-muted-foreground">
+              <Monitor className="size-4" />
+              Host CLI
+            </dt>
+            <dd>
+              {provider.host_version
+                ? 'Installed · ' + provider.host_version
+                : 'Not detected'}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <dt className="flex items-center gap-2 text-muted-foreground">
+              <KeyRound className="size-4" />
+              Host login
+            </dt>
+            <dd>
+              {provider.host_authenticated
+                ? 'Authenticated'
+                : 'Not authenticated'}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <dt className="text-muted-foreground">Workspace credential</dt>
+            <dd>{provider.credential_saved ? 'Saved' : 'Not saved'}</dd>
+          </div>
+        </dl>
+        <p className="text-xs text-muted-foreground">
+          {provider.workspace_ready
+            ? 'Configured for workspace use. Verify with a first reply.'
+            : provider.workspace_readiness_hint ||
+              'Connect an account to start chatting and building in a workspace.'}
+        </p>
+        <Button asChild variant="outline" size="sm">
+          <Link to={harnessSetupHref(provider.id, returnTo)}>
+            {provider.credential_saved
+              ? 'Manage connection'
+              : 'Connect harness'}{' '}
+            <ArrowRight className="size-4" />
+          </Link>
+        </Button>
+      </CardContent>
+    </Card>
   )
 }

@@ -98,6 +98,24 @@ fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<
     Ok(())
 }
 
+/// Gate for revealing a single, already-identified environment variable.
+/// Only variables explicitly classified as secret need the extra,
+/// separately-audited SecretsRead permission. A regular plaintext variable
+/// is already visible to (and overwritable by) anyone with
+/// EnvironmentsRead/EnvironmentsWrite, so gating its reveal behind
+/// SecretsRead too just breaks the edit flow for non-admin roles without
+/// adding real protection.
+fn require_environment_variable_reveal(
+    auth: &temps_auth::AuthContext,
+    is_secret: bool,
+) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    if is_secret {
+        permission_guard!(auth, SecretsRead);
+    }
+    Ok(())
+}
+
 impl From<crate::services::secret_service::SecretError> for Problem {
     fn from(err: crate::services::secret_service::SecretError) -> Self {
         use crate::services::secret_service::SecretError;
@@ -694,7 +712,7 @@ pub async fn get_resolved_environment_variable_value(
             )
             .await
         {
-            Ok(value) => {
+            Ok((value, _is_secret)) => {
                 audit_environment_variable_reveal(
                     state.audit_service.as_ref(),
                     reveal_audit_context(&auth, &metadata),
@@ -1004,7 +1022,7 @@ pub async fn get_environment_variable_value(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    require_plaintext_environment_read(&auth)?;
+    permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -1016,7 +1034,7 @@ pub async fn get_environment_variable_value(
         "env_var.reveal"
     );
 
-    let value = state
+    let (value, is_secret) = state
         .env_var_service
         .get_environment_variable_value_for_audited_reveal(
             project_id,
@@ -1025,6 +1043,8 @@ pub async fn get_environment_variable_value(
             params.var_id,
         )
         .await?;
+
+    require_environment_variable_reveal(&auth, is_secret)?;
 
     audit_environment_variable_reveal(
         state.audit_service.as_ref(),
@@ -2434,6 +2454,31 @@ mod tests {
     fn admin_can_reveal_plaintext_environment_values() {
         require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Admin))
             .expect("admin should be allowed to reveal plaintext environment values");
+    }
+
+    #[test]
+    fn user_can_reveal_a_non_secret_environment_variable() {
+        // Role::User has EnvironmentsRead/EnvironmentsWrite but not
+        // SecretsRead. A regular (non-secret) variable must still be
+        // revealable, otherwise editing it loses the ability to see the
+        // value it's about to overwrite.
+        require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), false)
+            .expect("a non-admin who can edit a plain variable must be able to reveal it");
+    }
+
+    #[test]
+    fn user_cannot_reveal_a_secret_environment_variable() {
+        let problem =
+            require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), true)
+                .expect_err("a variable classified as secret still requires SecretsRead");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_reveal_a_secret_environment_variable() {
+        require_environment_variable_reveal(&test_auth_context(temps_auth::Role::Admin), true)
+            .expect("admin holds SecretsRead and can reveal a secret variable");
     }
 
     #[tokio::test]

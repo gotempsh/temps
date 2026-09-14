@@ -20,6 +20,11 @@ import {
   Square,
   Timer,
   Trash2,
+  ArrowRight,
+  FolderOpen,
+  Database,
+  HardDrive,
+  Cpu,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -53,6 +58,7 @@ import {
   getApplicationWorkspaceOptions,
   getGlobalAiWorkspaceOptions,
   listApplicationsOptions,
+  getWorkspaceActivityOptions,
   listSandboxesOptions,
   pauseSandboxMutation,
   restartSandboxMutation,
@@ -62,7 +68,13 @@ import {
 import type {
   ApplicationResponse,
   ApplicationWorkspaceResponse,
+  WorkspaceHarnessActivity,
+  WorkspaceActivitySummary,
 } from '@/api/client'
+import {
+  WorkspaceActivity,
+  WorkspaceRunningIndicator,
+} from '@/components/ai-first/WorkspaceActivity'
 import {
   toSandboxView,
   isSandboxExpired,
@@ -181,6 +193,20 @@ export default function Sandboxes({
     refetchInterval: 15_000,
   })
   const applications = applicationsQuery.data ?? []
+  const activityQuery = useQuery({
+    ...getWorkspaceActivityOptions({
+      query: {
+        application_public_ids:
+          applications
+            .map((app) => app.public_id)
+            .sort()
+            .join(',') || undefined,
+      },
+    }),
+    enabled: loadWorkspaces && applicationsQuery.isSuccess,
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
+  })
   const applicationWorkspaceQueries = useQueries({
     queries: (loadWorkspaces ? applications : []).map((application) => ({
       ...getApplicationWorkspaceOptions({
@@ -217,6 +243,7 @@ export default function Sandboxes({
     if (loadWorkspaces) {
       void applicationsQuery.refetch()
       void globalWorkspaceQuery.refetch()
+      void activityQuery.refetch()
       for (const query of applicationWorkspaceQueries) void query.refetch()
     }
   }
@@ -346,6 +373,9 @@ export default function Sandboxes({
           globalWorkspace={globalWorkspaceQuery.data ?? null}
           loading={managedWorkspacesLoading}
           computeOnly={!workspacesOnly}
+          activity={activityQuery.data?.workspaces}
+          activityLoading={activityQuery.isLoading}
+          activityError={activityQuery.isError}
         />
       )}
 
@@ -519,12 +549,18 @@ export function ManagedApplicationWorkspaces({
   loading,
   error,
   computeOnly = false,
+  activity,
+  activityLoading = false,
+  activityError = false,
 }: {
   entries: ManagedWorkspaceEntry[]
   globalWorkspace: ApplicationWorkspaceResponse | null
   loading: boolean
   error: boolean
   computeOnly?: boolean
+  activity?: WorkspaceActivitySummary[]
+  activityLoading?: boolean
+  activityError?: boolean
 }) {
   const visibleEntries = computeOnly
     ? entries.filter(({ workspace }) => workspace?.sandbox_public_id)
@@ -534,29 +570,31 @@ export function ManagedApplicationWorkspaces({
 
   return (
     <section
-      aria-labelledby="application-workspaces-title"
+      aria-label={computeOnly ? 'Workspace-owned sandboxes' : 'Workspaces'}
       className="space-y-3"
     >
-      <div className="flex items-end justify-between gap-3">
-        <div className="space-y-1">
-          <h2
-            className="text-base font-semibold tracking-tight"
-            id="application-workspaces-title"
-          >
-            {computeOnly ? 'Workspace-owned sandboxes' : 'Working contexts'}
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            {computeOnly
-              ? 'Compute attached to a workspace. Manage its lifecycle from the owning workspace.'
-              : 'Projects and persistent context, with optional compute and AI threads.'}
-          </p>
+      {computeOnly && (
+        <div className="flex items-end justify-between gap-3">
+          <div className="space-y-1">
+            <h2
+              className="text-base font-semibold tracking-tight"
+              id="application-workspaces-title"
+            >
+              Workspace-owned sandboxes
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              {computeOnly
+                ? 'Compute attached to a workspace. Manage its lifecycle from the owning workspace.'
+                : 'Projects and persistent context, with optional compute and AI threads.'}
+            </p>
+          </div>
+          {entries.length > 0 && (
+            <Badge variant="secondary" className="shrink-0 tabular-nums">
+              {visibleEntries.length + (visibleGlobal ? 1 : 0)}
+            </Badge>
+          )}
         </div>
-        {entries.length > 0 && (
-          <Badge variant="secondary" className="shrink-0 tabular-nums">
-            {visibleEntries.length + (visibleGlobal ? 1 : 0)}
-          </Badge>
-        )}
-      </div>
+      )}
 
       {loading && entries.length === 0 ? (
         <div className="space-y-3" aria-label="Loading application workspaces">
@@ -570,15 +608,30 @@ export function ManagedApplicationWorkspaces({
           ))}
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="grid grid-cols-1 items-start gap-3 xl:grid-cols-2 2xl:grid-cols-3">
           {visibleGlobal && (
-            <ManagedGlobalWorkspaceRow workspace={visibleGlobal} />
+            <ManagedGlobalWorkspaceRow
+              workspace={visibleGlobal}
+              harnesses={
+                activity?.find((item) => item.application_public_id === null)
+                  ?.harnesses
+              }
+              activityLoading={activityLoading}
+              activityError={activityError}
+            />
           )}
           {visibleEntries.map(({ application, workspace }) => (
             <ManagedApplicationWorkspaceRow
               application={application}
               key={application.public_id}
               workspace={workspace}
+              harnesses={
+                activity?.find(
+                  (item) => item.application_public_id === application.public_id
+                )?.harnesses
+              }
+              activityLoading={activityLoading}
+              activityError={activityError}
             />
           ))}
         </div>
@@ -605,30 +658,41 @@ export function ManagedApplicationWorkspaces({
 export function ManagedApplicationWorkspaceRow({
   application,
   workspace,
-}: ManagedWorkspaceEntry) {
+  ...activity
+}: ManagedWorkspaceEntry & WorkspaceRowActivity) {
   return (
     <ManagedWorkspaceRow
       href={`/workspaces/${encodeURIComponent(application.public_id)}`}
       name={application.name}
       notStartedMessage="No compute attached. Workspace context is retained."
       workspace={workspace}
+      projectCount={application.projects.length}
+      {...activity}
     />
   )
 }
 
 export function ManagedGlobalWorkspaceRow({
   workspace,
+  ...activity
 }: {
   workspace: ApplicationWorkspaceResponse
-}) {
+} & WorkspaceRowActivity) {
   return (
     <ManagedWorkspaceRow
       href="/workspaces/global"
       name="Default workspace"
       notStartedMessage="No compute attached. Workspace context is retained."
       workspace={workspace}
+      {...activity}
     />
   )
+}
+
+type WorkspaceRowActivity = {
+  harnesses?: WorkspaceHarnessActivity[]
+  activityLoading?: boolean
+  activityError?: boolean
 }
 
 function ManagedWorkspaceRow({
@@ -636,12 +700,17 @@ function ManagedWorkspaceRow({
   href,
   notStartedMessage,
   workspace,
+  projectCount,
+  harnesses,
+  activityLoading,
+  activityError,
 }: {
   name: string
   href: string
   notStartedMessage: string
   workspace: ApplicationWorkspaceResponse | null
-}) {
+  projectCount?: number
+} & WorkspaceRowActivity) {
   const state = workspace?.sandbox_public_id
     ? workspace.state
     : workspace
@@ -650,17 +719,22 @@ function ManagedWorkspaceRow({
   const sleeping = state === 'sleeping'
 
   return (
-    <Card>
-      <CardContent className="space-y-3 py-4">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+    <Card className="min-w-0 shadow-none">
+      <CardContent className="space-y-2 p-3">
+        <div className="flex items-start gap-2">
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
+              <FolderOpen
+                aria-hidden="true"
+                className="size-5 shrink-0 text-muted-foreground"
+              />
               <Link
                 className="truncate font-semibold leading-none hover:underline"
                 to={href}
               >
                 {name}
               </Link>
+              <WorkspaceRunningIndicator harnesses={harnesses} />
               <Badge
                 title={
                   sleeping
@@ -671,16 +745,19 @@ function ManagedWorkspaceRow({
               >
                 {sleeping ? 'sleeping · wakes automatically' : state}
               </Badge>
-              <Badge
-                title="Lifecycle, recovery, and persistent storage are controlled by Temps"
-                variant="outline"
-              >
-                Managed by Temps
-              </Badge>
             </div>
-            <p className="truncate font-mono text-xs text-muted-foreground">
-              {workspace?.sandbox_public_id ?? notStartedMessage}
-            </p>
+            {!workspace?.sandbox_public_id && (
+              <p className="text-sm text-muted-foreground">
+                {workspace ? notStartedMessage : 'Loading workspace…'}
+              </p>
+            )}
+            <WorkspaceActivity
+              projectCount={projectCount}
+              harnesses={harnesses}
+              loading={activityLoading}
+              error={activityError}
+              className="flex-wrap gap-x-3 gap-y-2 overflow-visible whitespace-normal text-xs sm:text-xs"
+            />
             {sleeping && (
               <p className="text-xs text-muted-foreground">
                 Files stay persistent. The next AI turn, terminal, file, or
@@ -688,33 +765,47 @@ function ManagedWorkspaceRow({
               </p>
             )}
           </div>
-          <Button asChild className="shrink-0" size="sm" variant="outline">
-            <Link to={href}>Manage workspace</Link>
+          <Button asChild className="shrink-0" size="icon" variant="ghost">
+            <Link
+              to={href}
+              aria-label={`Open workspace ${name}`}
+              title={`Open workspace ${name}`}
+            >
+              <ArrowRight className="size-4 shrink-0" aria-hidden="true" />
+            </Link>
           </Button>
         </div>
 
         {workspace && (
-          <dl className="grid grid-cols-1 gap-2 border-t pt-3 text-sm sm:grid-cols-3">
+          <dl className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <div className="min-w-0">
-              <dt className="text-xs text-muted-foreground">Runtime</dt>
+              <dt className="sr-only">Runtime</dt>
               <dd className="truncate font-mono text-xs">
+                <Cpu className="inline size-3.5 shrink-0" aria-hidden="true" />{' '}
                 {workspace.runtime}
               </dd>
             </div>
             <div className="min-w-0">
-              <dt className="text-xs text-muted-foreground">Databases</dt>
+              <dt className="sr-only">Databases</dt>
               <dd className="text-xs tabular-nums">
-                {workspace.data_network_service_count} connected
+                <Database
+                  className="inline size-3.5 shrink-0"
+                  aria-hidden="true"
+                />{' '}
+                {workspace.data_network_service_count} database
+                {workspace.data_network_service_count === 1 ? '' : 's'}
               </dd>
             </div>
             <div className="min-w-0">
-              <dt className="text-xs text-muted-foreground">
-                Persistent files
-              </dt>
+              <dt className="sr-only">Persistent files</dt>
               <dd className="text-xs">
+                <HardDrive
+                  className="inline size-3.5 shrink-0"
+                  aria-hidden="true"
+                />{' '}
                 {workspace.persistent_volume_healthy
-                  ? 'Healthy'
-                  : 'Needs attention'}
+                  ? 'Files healthy'
+                  : 'Files need attention'}
               </dd>
             </div>
           </dl>

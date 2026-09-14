@@ -612,7 +612,7 @@ export function EmailDetail() {
 
   if (isLoading) {
     return (
-      <div className="container max-w-6xl mx-auto py-6 space-y-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>
             <Link to="/email?tab=emails">
@@ -628,7 +628,7 @@ export function EmailDetail() {
 
   if (error || !email) {
     return (
-      <div className="container max-w-6xl mx-auto py-6 space-y-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>
             <Link to="/email?tab=emails">
@@ -653,7 +653,7 @@ export function EmailDetail() {
   }
 
   return (
-    <div className="container max-w-6xl mx-auto py-6 space-y-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="sm" asChild>
           <Link to="/email?tab=emails">

@@ -25,15 +25,15 @@ describe('ManagedApplicationWorkspaceRow', () => {
       </MemoryRouter>
     )
 
-    expect(html).toContain('Managed by Temps')
+    expect(html).not.toContain('Managed by Temps')
     expect(html).toContain('Workspace topology')
-    expect(html).toContain('sbx_workspace123')
+    expect(html).not.toContain('sbx_workspace123')
     expect(html).toContain('node')
-    expect(html).toContain('2 connected')
+    expect(html).toContain('2 databases')
     expect(html).toContain('Persistent files')
-    expect(html).toContain('Healthy')
+    expect(html).toContain('Files healthy')
     expect(html).toContain('/workspaces/app_workspace-topology-e2e')
-    expect(html).toContain('Manage workspace')
+    expect(html).toContain('Open workspace')
     expect(html).not.toContain('>Stop<')
     expect(html).not.toContain('>Delete<')
     expect(html).not.toContain('Extend:')
@@ -81,9 +81,9 @@ describe('ManagedGlobalWorkspaceRow', () => {
     )
 
     expect(html).toContain('Default workspace')
-    expect(html).toContain('sbx_workspace123')
+    expect(html).not.toContain('sbx_workspace123')
     expect(html).toContain('/workspaces/global')
-    expect(html).toContain('Managed by Temps')
+    expect(html).not.toContain('Managed by Temps')
     expect(html).not.toContain('>Stop<')
     expect(html).not.toContain('>Delete<')
   })
@@ -117,6 +117,62 @@ describe('workspace and operator views', () => {
   test('retains working contexts without compute', () => {
     expect(render(false, false)).toContain('Workspace topology')
     expect(render(false, false)).toContain('No compute attached')
+  })
+  test('workspace list has no duplicate section heading', () => {
+    const html = render(false, true)
+    expect(html).not.toContain('<h2')
+    expect(html).not.toContain('Working contexts')
+    expect(html).toContain('aria-label="Workspaces"')
+    expect(html).toContain('grid-cols-1')
+    expect(html).toContain('xl:grid-cols-2')
+    expect(html).toContain('2xl:grid-cols-3')
+    expect(html).toContain('title="Open workspace')
+  })
+  test('shows real harness logos, project counts, and terminal activity', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ManagedApplicationWorkspaceRow
+          application={application}
+          workspace={workspace}
+          harnesses={[
+            {
+              ai_provider: 'claude_cli',
+              total: 4,
+              running: 1,
+              completed: 1,
+              failed: 1,
+              pending: 1,
+              idle: 0,
+              cancelled: 0,
+            },
+          ]}
+        />
+      </MemoryRouter>
+    )
+    expect(html).toContain('/ai-harnesses/claude-code.svg')
+    expect(html).toContain('aria-label="0 projects"')
+    expect(html).toContain('aria-label="Threads running"')
+    expect(html).toContain('aria-label="1 finished thread"')
+    expect(html).toContain('aria-label="1 failed thread"')
+    expect(html).toContain('aria-label="1 pending thread"')
+    expect(html).toContain('flex-wrap')
+    expect(html).not.toContain('overflow-x-auto')
+  })
+  test('activity loading and failures are not reported as zero threads', () => {
+    const renderActivity = (loading: boolean) =>
+      renderToStaticMarkup(
+        <MemoryRouter>
+          <ManagedApplicationWorkspaceRow
+            application={application}
+            workspace={workspace}
+            activityLoading={loading}
+            activityError={!loading}
+          />
+        </MemoryRouter>
+      )
+    expect(renderActivity(true)).toContain('Loading workspace activity')
+    expect(renderActivity(false)).toContain('Activity unavailable')
+    expect(renderActivity(false)).not.toContain('No threads yet')
   })
   test('operator view includes only attached compute with an owner link', () => {
     expect(render(true, false)).not.toContain('Workspace topology')

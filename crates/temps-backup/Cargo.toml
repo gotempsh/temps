@@ -68,6 +68,7 @@ docker-tests = []
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
+sea-orm-migration = { workspace = true }
 testcontainers = { workspace = true }
 sqlx = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }

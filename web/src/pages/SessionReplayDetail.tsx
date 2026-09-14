@@ -288,7 +288,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   // Loading skeleton
   if (isLoading) {
     return (
-      <div className="container max-w-full py-6">
+      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
         {/* Header skeleton */}
         <div className="mb-4 flex items-center justify-between">
           <Skeleton className="h-9 w-32" />
@@ -399,7 +399,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   }
 
   return (
-    <div className="container max-w-full py-6">
+    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>

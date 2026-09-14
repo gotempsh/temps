@@ -45,7 +45,7 @@ export default function IpGeolocationDetail() {
 
   if (error) {
     return (
-      <div className="container max-w-5xl mx-auto py-6">
+      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
         <div className="flex items-center gap-4 mb-4">
           <Button onClick={handleBack} variant="ghost" size="sm">
             <ArrowLeft className="h-4 w-4 mr-2" />
@@ -66,7 +66,7 @@ export default function IpGeolocationDetail() {
   }
 
   return (
-    <div className="container mx-auto max-w-4xl space-y-4 py-6">
+    <div className="w-full space-y-4 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-4">
         <Button onClick={handleBack} variant="ghost" size="sm">
           <ArrowLeft className="h-4 w-4 mr-2" />

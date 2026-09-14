@@ -20,7 +20,7 @@ sea-orm = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-ed25519-dalek = "2.2.0"
+ed25519-dalek = "3.0.0"
 hex = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }

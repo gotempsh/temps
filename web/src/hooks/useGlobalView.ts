@@ -7,6 +7,7 @@ import {
   patchObservationFilters,
   positiveInteger,
   readObservationWindow,
+  normalizeObservationWindow,
 } from '@/lib/global-observability'
 import {
   quickTimeRange,
@@ -23,17 +24,11 @@ export function useGlobalView() {
   )
   useEffect(() => {
     if (params.get('from') !== window.from || params.get('to') !== window.to) {
-      setParams(
-        (current) =>
-          patchObservationFilters(current, {
-            from: window.from,
-            to: window.to,
-            range: window.range,
-          }),
-        { replace: true }
-      )
+      setParams((current) => normalizeObservationWindow(current, now), {
+        replace: true,
+      })
     }
-  }, [params, setParams, window.from, window.to, window.range])
+  }, [params, setParams, now, window.from, window.to, window.range])
   const patch = (values: Record<string, string | undefined>) =>
     setParams((current) => patchObservationFilters(current, values), {
       replace: true,
@@ -59,7 +54,9 @@ export function useGlobalView() {
       }),
     setCursor: (cursor?: string) =>
       setParams((current) => {
-        const next = new URLSearchParams(current)
+        // Freeze the request window together with its cursor, before the
+        // normalization effect can run on this navigation.
+        const next = normalizeObservationWindow(current, now)
         if (cursor) next.set('cursor', cursor)
         else next.delete('cursor')
         return next

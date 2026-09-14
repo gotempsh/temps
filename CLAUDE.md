@@ -51,7 +51,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Implement pagination (default: 20, max: 100) and sorting (default: `created_at` DESC)
 - Use typed error handling with proper propagation
 - Follow the three-layer architecture pattern
-- Keep tests in the same file as the code they test
+- Keep Rust unit tests in the same file as the code they test. Frontend TypeScript/React tests belong in adjacent `.test.ts` or `.test.tsx` files so test-runner imports are excluded from production modules.
 - Return dates in ISO 8601 format with `Z` suffix
 - Use `permission_guard!` macro for authorization in handlers
 - Add audit logging for all write operations (CREATE, UPDATE, DELETE)
@@ -498,7 +498,7 @@ Tests must verify both success and failure paths. Error-case testing is as impor
 
 ### Test Structure
 
-Tests live in `#[cfg(test)] mod tests` at the bottom of each file:
+Rust tests live in `#[cfg(test)] mod tests` at the bottom of each Rust source file:
 
 ```rust
 #[cfg(test)]
@@ -1020,6 +1020,9 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 ### Stack
 - React + TypeScript, Tanstack Query, shadcn/ui, Tailwind CSS, Rsbuild
 - Package manager: `bun` (not npm/yarn)
+
+### Frontend tests
+- Keep Bun tests beside the TypeScript or TSX source they cover, as `name.test.ts` or `name.test.tsx` in the same directory. The inline `#[cfg(test)]` rule above is Rust-only; do not import `bun:test` into production frontend modules.
 
 ### Console design standard
 - Follow root `DESIGN.md` for all console UI: full-width pages, compact empty states, shared tables and pagination, and existing shadcn/ui controls. The separate prototype app is retired. The `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) points to this standard. Do not introduce the retained `web/packages/ds` package without an explicit product decision.

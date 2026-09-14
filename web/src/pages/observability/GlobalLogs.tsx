@@ -111,17 +111,6 @@ export default function GlobalLogs() {
         onFilter={filter}
         onInspect={() => setAuto(false)}
         status={status}
-        onRange={(from, to) => {
-          setAuto(false)
-          const start = Math.max(Date.parse(view.from), Date.parse(from))
-          const end = Math.min(Date.parse(view.to), Date.parse(to))
-          if (end > start)
-            view.setTimeRange({
-              from: new Date(start).toISOString(),
-              to: new Date(end).toISOString(),
-              preset: 'custom',
-            })
-        }}
         toolbar={
           <div role="region" aria-label="Logs filters" className="space-y-2">
             <LogQueryInput

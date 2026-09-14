@@ -9,7 +9,7 @@
 //! upstream method and path.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -186,6 +186,8 @@ struct RelayEntry {
     remaining_response_bytes: Arc<AtomicU64>,
     request_slot: Arc<tokio::sync::Semaphore>,
     successful_model_catalog_request: Arc<AtomicBool>,
+    successful_inference_request: Arc<AtomicBool>,
+    inference_status: Arc<AtomicU16>,
     revocation: tokio::sync::watch::Sender<bool>,
     expires_at: Instant,
 }
@@ -280,6 +282,8 @@ impl SandboxModelRelayService {
         );
         let (revocation, _) = tokio::sync::watch::channel(false);
         let successful_model_catalog_request = Arc::new(AtomicBool::new(false));
+        let successful_inference_request = Arc::new(AtomicBool::new(false));
+        let inference_status = Arc::new(AtomicU16::new(0));
         let entry = RelayEntry {
             bearer: bearer.clone(),
             credential: credentials.provider_credential,
@@ -291,6 +295,8 @@ impl SandboxModelRelayService {
                 MAX_CONCURRENT_MODEL_REQUESTS_PER_TURN,
             )),
             successful_model_catalog_request: successful_model_catalog_request.clone(),
+            successful_inference_request: successful_inference_request.clone(),
+            inference_status: inference_status.clone(),
             revocation: revocation.clone(),
             expires_at: Instant::now() + lifetime,
         };
@@ -308,6 +314,8 @@ impl SandboxModelRelayService {
             entries: self.entries.clone(),
             relay_id,
             successful_model_catalog_request,
+            successful_inference_request,
+            inference_status,
             revocation,
         };
         Ok((relay, guard))
@@ -333,6 +341,8 @@ impl SandboxModelRelayService {
             remaining_response_bytes,
             request_slot,
             successful_model_catalog_request,
+            successful_inference_request,
+            inference_status,
             mut revocation,
         ) = {
             let mut entries = self
@@ -384,6 +394,8 @@ impl SandboxModelRelayService {
                 entry.remaining_response_bytes.clone(),
                 entry.request_slot.clone(),
                 entry.successful_model_catalog_request.clone(),
+                entry.successful_inference_request.clone(),
+                entry.inference_status.clone(),
                 entry.revocation.subscribe(),
             )
         };
@@ -478,6 +490,15 @@ impl SandboxModelRelayService {
         if matches!(request_kind, RelayRequestKind::CodexModels) && status.is_success() {
             successful_model_catalog_request.store(true, Ordering::Release);
         }
+        if is_successful_inference(request_kind, status) {
+            successful_inference_request.store(true, Ordering::Release);
+        }
+        if matches!(
+            request_kind,
+            RelayRequestKind::Anthropic | RelayRequestKind::CodexResponse
+        ) {
+            inference_status.store(status.as_u16(), Ordering::Release);
+        }
         let response_headers = upstream.headers().clone();
         let upstream_stream: std::pin::Pin<
             Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
@@ -556,6 +577,13 @@ impl SandboxModelRelayService {
             .body(Body::from_stream(stream))
             .map_err(|_| RelayError::ResponseBuild)
     }
+}
+
+fn is_successful_inference(kind: RelayRequestKind, status: reqwest::StatusCode) -> bool {
+    matches!(
+        kind,
+        RelayRequestKind::Anthropic | RelayRequestKind::CodexResponse
+    ) && status.is_success()
 }
 
 fn normalize_model_request(
@@ -821,10 +849,21 @@ pub(crate) struct SandboxModelRelayGuard {
     entries: Arc<Mutex<HashMap<String, RelayEntry>>>,
     relay_id: String,
     successful_model_catalog_request: Arc<AtomicBool>,
+    successful_inference_request: Arc<AtomicBool>,
+    inference_status: Arc<AtomicU16>,
     revocation: tokio::sync::watch::Sender<bool>,
 }
 
 impl SandboxModelRelayGuard {
+    pub(crate) fn inference_succeeded(&self) -> bool {
+        self.successful_inference_request.load(Ordering::Acquire)
+    }
+    pub(crate) fn inference_status(&self) -> Option<u16> {
+        match self.inference_status.load(Ordering::Acquire) {
+            0 => None,
+            status => Some(status),
+        }
+    }
     pub(crate) fn model_catalog_succeeded(&self) -> bool {
         self.successful_model_catalog_request
             .load(Ordering::Acquire)
@@ -937,6 +976,30 @@ pub fn sandbox_model_relay_routes() -> Router<Arc<SandboxModelRelayService>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_successful_inference_proves_candidate_authentication() {
+        assert!(is_successful_inference(
+            RelayRequestKind::Anthropic,
+            StatusCode::OK
+        ));
+        assert!(is_successful_inference(
+            RelayRequestKind::CodexResponse,
+            StatusCode::OK
+        ));
+        assert!(!is_successful_inference(
+            RelayRequestKind::CodexModels,
+            StatusCode::OK
+        ));
+        assert!(!is_successful_inference(
+            RelayRequestKind::Anthropic,
+            StatusCode::UNAUTHORIZED
+        ));
+        assert!(!is_successful_inference(
+            RelayRequestKind::CodexResponse,
+            StatusCode::FORBIDDEN
+        ));
+    }
 
     #[test]
     fn relay_debug_redacts_bearer() {

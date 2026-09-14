@@ -53,13 +53,14 @@ permissions: {}
 
 jobs:
   daemon-images:
-    needs: create-release
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64]
     uses: ./.github/workflows/daemon-images.yml
     permissions:
       contents: read
       packages: write
     with:
-      channel: ${{ needs.create-release.outputs.is_prerelease == 'true' && 'beta' || 'stable' }}
+      # Match Create Release's channel selection without depending on publication.
+      channel: ${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
   validate-release-ref:
@@ -428,7 +429,8 @@ jobs:
 
   create-release:
     name: Create Release
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64]
+    # A failed/cancelled daemon flavor must prevent public release publication.
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, daemon-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write

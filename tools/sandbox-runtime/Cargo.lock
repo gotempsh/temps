@@ -547,7 +547,7 @@ dependencies = [
 [[package]]
 name = "temps-agent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=91ef59ba85140bafba6fcd50d91114e7edee99e8#91ef59ba85140bafba6fcd50d91114e7edee99e8"
+source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=678af3afa3668b395a488568b879fa757ee00912#678af3afa3668b395a488568b879fa757ee00912"
 dependencies = [
  "async-trait",
  "nix",

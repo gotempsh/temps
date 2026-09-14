@@ -4,6 +4,11 @@
 import {
   Archive,
   ArchiveRestore,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  SlidersHorizontal,
+  CheckCircle2,
   Boxes,
   Code2,
   FileArchive,
@@ -28,6 +33,17 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { harnessSetupHref } from '@/pages/agent-sandbox/harness-onboarding'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import {
+  chatHarnessProviderOptions,
+  resolveChatRuntimeSelection,
+  type ChatRuntimeSelection,
+} from '@/components/ai/chat-runtime-options'
+import { WorkspaceHarnessSetup } from './WorkspaceHarnessSetup'
+import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
+import { workspaceFirstTask } from './workspace-first-task'
+import { Textarea } from '@/components/ui/textarea'
 import {
   type InfiniteData,
   useInfiniteQuery,
@@ -40,6 +56,7 @@ import {
   archiveApplication,
   createApplication,
   createApplicationConversation,
+  sendUserMessage,
   createApplicationPreviewLink,
   createGlobalConversation,
   controlApplicationWorkspace,
@@ -82,6 +99,11 @@ import { DebugChatPanel } from '@/components/ai/DebugChatPanel'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Button } from '@/components/ui/button'
 import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -110,7 +132,10 @@ import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
 import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
 import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
-import { WorkspaceActivity, WorkspaceRunningIndicator } from './WorkspaceActivity'
+import {
+  WorkspaceActivity,
+  WorkspaceRunningIndicator,
+} from './WorkspaceActivity'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { WorkspaceFileExplorer } from './WorkspaceFileExplorer'
 import {
@@ -130,7 +155,10 @@ import {
   threadSelectionAfterRemoval,
 } from './thread-selection'
 import { threadDisplayStatus, type ThreadDisplayStatus } from './thread-status'
-import { threadTitleFromLiveEvent, workspacePageTitle } from './thread-title-event'
+import {
+  threadTitleFromLiveEvent,
+  workspacePageTitle,
+} from './thread-title-event'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   batchLocalImportFiles,
@@ -269,7 +297,22 @@ export function AiFirstWorkspace() {
   const [harnesses, setHarnesses] = useState<HarnessOption[]>([])
   const [harnessesLoading, setHarnessesLoading] = useState(true)
   const [activeWorkspaceWaking, setActiveWorkspaceWaking] = useState(false)
-  const [applicationDialogOpen, setApplicationDialogOpen] = useState(false)
+  const applicationDialogOpen = searchParams.get('setup') === 'workspace'
+  const setApplicationDialogOpen = (open: boolean) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      if (open) next.set('setup', 'workspace')
+      else {
+        next.delete('setup')
+        next.delete('setupStep')
+        next.delete('setupPanel')
+        for (const key of [...next.keys()]) {
+          if (key.startsWith('setup')) next.delete(key)
+        }
+      }
+      return next
+    })
+  }
   const [threadDialogOpen, setThreadDialogOpen] = useState(false)
   const [globalStartOpen, setGlobalStartOpen] = useState(false)
   const [rightView, setRightView] = useState<RightView>('generated')
@@ -1314,11 +1357,12 @@ export function AiFirstWorkspace() {
         const next = new URLSearchParams(current)
         next.set('application', application.public_id)
         next.set('thread', conversation.public_id)
+        for (const key of [...next.keys()])
+          if (key.startsWith('setup')) next.delete(key)
         return next
       },
       { replace: true }
     )
-    setApplicationDialogOpen(false)
     setLeftPanelOpen(false)
   }
 
@@ -1335,6 +1379,8 @@ export function AiFirstWorkspace() {
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
+        for (const key of [...next.keys()])
+          if (key.startsWith('setup')) next.delete(key)
         next.set('application', applicationId)
         next.delete('scope')
         next.delete('thread')
@@ -1356,6 +1402,8 @@ export function AiFirstWorkspace() {
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
+        for (const key of [...next.keys()])
+          if (key.startsWith('setup')) next.delete(key)
         next.delete('application')
         next.set('scope', 'global')
         next.set('thread', conversationId)
@@ -1400,6 +1448,8 @@ export function AiFirstWorkspace() {
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
+        for (const key of [...next.keys()])
+          if (key.startsWith('setup')) next.delete(key)
         next.set('thread', conversation.public_id)
         return next
       },
@@ -1433,6 +1483,8 @@ export function AiFirstWorkspace() {
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
+        for (const key of [...next.keys()])
+          if (key.startsWith('setup')) next.delete(key)
         next.delete('application')
         next.set('scope', 'global')
         next.delete('thread')
@@ -1635,7 +1687,10 @@ export function AiFirstWorkspace() {
             workspace={activeWorkspaceStatus}
           />
           <Button asChild variant="ghost" size="sm" aria-label="Harnesses">
-            <Link to="/agent-sandbox/providers" title="Harnesses">
+            <Link
+              to={harnessSetupHref(null, `/ai-first?${searchParams}`)}
+              title="Harnesses"
+            >
               <Terminal className="size-4 sm:mr-1.5" />
               <span className="hidden sm:inline">Harnesses</span>
               <span
@@ -1672,7 +1727,14 @@ export function AiFirstWorkspace() {
         </div>
       </header>
 
-      <div className="grid h-[calc(100dvh-3.5rem)] grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)_420px]">
+      <div
+        className={cn(
+          'grid h-[calc(100dvh-3.5rem)] grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)]',
+          applicationDialogOpen
+            ? 'xl:grid-cols-[240px_minmax(0,1fr)]'
+            : 'xl:grid-cols-[240px_minmax(0,1fr)_420px]'
+        )}
+      >
         {leftPanelOpen && (
           <button
             aria-label="Close workspace navigation"
@@ -1824,7 +1886,8 @@ export function AiFirstWorkspace() {
                     {applicationListMode === 'active' && (
                       <WorkspaceRunningIndicator
                         harnesses={
-                          activityByWorkspace.get(application.public_id)?.harnesses
+                          activityByWorkspace.get(application.public_id)
+                            ?.harnesses
                         }
                       />
                     )}
@@ -2183,7 +2246,12 @@ export function AiFirstWorkspace() {
           )}
         </main>
 
-        <aside className="hidden min-h-0 flex-col border-l border-border bg-card xl:flex">
+        <aside
+          className={cn(
+            'hidden min-h-0 flex-col border-l border-border bg-card',
+            !applicationDialogOpen && 'xl:flex'
+          )}
+        >
           <WorkspaceViewTabs
             activeView={rightView}
             changedFileCount={workspaceChanges?.changes.length ?? 0}
@@ -3006,14 +3074,112 @@ export function ApplicationStartScreen({
   harnessesLoading: boolean
   importLimits?: WorkspaceImportLimits
 }) {
-  const [name, setName] = useState('')
+  const catalog = useQuery(aiProviderCatalogQueryOptions)
+  const [verificationPending, setVerificationPending] = useState(false)
+  const [setupParams, setSetupParams] = useSearchParams()
+  const requestedStep = Number(setupParams.get('setupStep') ?? 0)
+  const step = [0, 1, 4].includes(requestedStep) ? requestedStep : 4
+  const setStep = (nextStep: number) =>
+    setSetupParams((current) => {
+      const next = new URLSearchParams(current)
+      next.set('setup', 'workspace')
+      next.set('setupStep', String(nextStep))
+      if (selectedHarnessId) next.set('setupHarness', selectedHarnessId)
+      next.delete('setupPanel')
+      return next
+    })
+  const setupPanel = setupParams.get('setupPanel')
+  const setSetupPanel = (panel: string | null) =>
+    setSetupParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        if (panel) next.set('setupPanel', panel)
+        else next.delete('setupPanel')
+        return next
+      },
+      { replace: true }
+    )
+  const [prompt, setPrompt] = useState(() => {
+    try {
+      return sessionStorage.getItem('temps.workspace.first-task') ?? ''
+    } catch {
+      return ''
+    }
+  })
+  const updatePrompt = (value: string) => {
+    setPrompt(value)
+    try {
+      sessionStorage.setItem('temps.workspace.first-task', value)
+    } catch {
+      /* The in-memory draft remains usable when storage is blocked. */
+    }
+  }
+  const updateSetupFields = (fields: Record<string, string | null>) =>
+    setSetupParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        for (const [key, value] of Object.entries(fields)) {
+          if (value) next.set(key, value)
+          else next.delete(key)
+        }
+        return next
+      },
+      { replace: true }
+    )
+  const runtimeDraft: ChatRuntimeSelection | null =
+    setupParams.has('setupModel') || setupParams.has('setupPermissions')
+      ? {
+          providerId: setupParams.get('setupHarness') ?? '',
+          modelId: setupParams.get('setupModel'),
+          thinkingOptionId: setupParams.get('setupThinking'),
+          permissionModeId: setupParams.get('setupPermissions'),
+        }
+      : null
+  const setRuntimeDraft = (value: ChatRuntimeSelection | null) =>
+    updateSetupFields({
+      setupModel: value?.modelId ?? null,
+      setupThinking: value?.thinkingOptionId ?? null,
+      setupPermissions: value?.permissionModeId ?? null,
+    })
+  const submissionLock = useRef(false)
+  const firstTask = useRef(workspaceFirstTask())
+  const attemptedApplication = useRef(false)
+  const name = setupParams.get('setupName') ?? ''
+  const setName = (value: string | ((current: string) => string)) =>
+    setSetupParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        const resolved =
+          typeof value === 'function'
+            ? value(current.get('setupName') ?? '')
+            : value
+        if (resolved) next.set('setupName', resolved)
+        else next.delete('setupName')
+        return next
+      },
+      { replace: true }
+    )
   const [provisionedApplication, setProvisionedApplication] =
     useState<ApplicationResponse | null>(null)
   const [importedApplicationId, setImportedApplicationId] = useState<
     string | null
   >(null)
-  const [harnessId, setHarnessId] = useState<string | null>(null)
-  const [sourceMode, setSourceMode] = useState<WorkspaceSourceMode>('blank')
+  const harnessId = setupParams.get('setupHarness')
+  const setHarnessId = (value: string | null) =>
+    updateSetupFields({
+      setupHarness: value,
+      setupModel: null,
+      setupThinking: null,
+      setupPermissions: null,
+    })
+  const sourceMode: WorkspaceSourceMode =
+    setupParams.get('setupSource') === 'git'
+      ? 'git'
+      : setupParams.get('setupSource') === 'local'
+        ? 'local'
+        : 'blank'
+  const setSourceMode = (value: WorkspaceSourceMode) =>
+    updateSetupFields({ setupSource: value })
   const [localImport, setLocalImport] = useState<LocalImportSelection | null>(
     null
   )
@@ -3033,7 +3199,23 @@ export function ApplicationStartScreen({
   const [localImportLoading, setLocalImportLoading] = useState(false)
   const [localImportDragging, setLocalImportDragging] = useState(false)
 
-  const selectedHarnessId = harnessId ?? defaultHarnessId(harnesses)
+  const providers = catalog.data?.providers ?? []
+  const selectedHarnessId =
+    harnessId ?? defaultHarnessId(harnesses) ?? providers[0]?.id ?? null
+  const selectedProvider = providers.find(
+    (provider) => provider.id === selectedHarnessId
+  )
+  const runtimeSelection = resolveChatRuntimeSelection(
+    chatHarnessProviderOptions(selectedProvider ? [selectedProvider] : []),
+    selectedHarnessId ?? '',
+    runtimeDraft?.providerId === selectedHarnessId
+      ? runtimeDraft
+      : {
+          permissionModeId: selectedProvider?.permission_modes.find(
+            (mode) => mode.id === 'auto' || mode.id === 'full-access'
+          )?.id,
+        }
+  )
 
   useEffect(
     () => () => {
@@ -3175,26 +3357,37 @@ export function ApplicationStartScreen({
 
   const submit = async () => {
     if (
-      !name.trim() ||
+      submissionLock.current ||
+      saving ||
+      localImportLoading ||
+      !prompt.trim() ||
+      !selectedProvider?.workspace_ready ||
       !selectedHarnessId ||
       (sourceMode === 'git' && !gitUrl.trim()) ||
       (sourceMode === 'local' && !localImport)
     )
       return
+    submissionLock.current = true
     setSaving(true)
     setSavingStep('Creating workspace…')
     setError(null)
     try {
+      if (attemptedApplication.current && !provisionedApplication) {
+        throw new Error(
+          'Could not confirm whether your workspace was created. Check the workspace list before trying again to avoid creating a duplicate.'
+        )
+      }
+      attemptedApplication.current = true
       const application =
         provisionedApplication ??
         (
           await createApplication({
             body: {
-              name: name.trim(),
+              name: name.trim() || 'Untitled workspace',
               description: null,
               project_ids: [],
               starter_project: {
-                name: name.trim(),
+                name: name.trim() || 'Untitled workspace',
                 preset: 'autopack',
                 exposed_port: 3000,
               },
@@ -3212,52 +3405,66 @@ export function ApplicationStartScreen({
       setSavingStep('Starting first thread…')
       let conversation: ConversationResponse
       try {
-        const { data } = await createApplicationConversation({
-          path: { application_public_id: application.public_id },
-          body: { ai_provider: selectedHarnessId },
-          throwOnError: true,
+        conversation = await firstTask.current.start({
+          prompt,
+          selection: runtimeSelection,
+          turnId: () => crypto.randomUUID(),
+          createThread: async () =>
+            (
+              await createApplicationConversation({
+                path: { application_public_id: application.public_id },
+                body: { ai_provider: selectedHarnessId },
+                throwOnError: true,
+              })
+            ).data,
+          // The creation endpoint has no idempotency key. Never guess a
+          // thread's identity from the workspace list after a lost response.
+          recoverThread: async () => null,
+          send: async (publicId, body) => {
+            setSavingStep('Sending your first task…')
+            await sendUserMessage({
+              path: { public_id: publicId },
+              body,
+              throwOnError: true,
+            })
+          },
         })
-        conversation = data
       } catch (cause) {
         const reason = problemDetail(
           cause,
           'The selected harness could not start a thread.'
         )
         throw new Error(
-          `Application “${application.name}” was created, but its starter thread could not start with the selected harness: ${reason}`,
+          `Workspace “${application.name}” was created, but its first task could not start: ${reason}`,
           { cause }
         )
       }
       onCreated(application, conversation)
-      setName('')
+      updatePrompt('')
       setProvisionedApplication(null)
       setImportedApplicationId(null)
-      setHarnessId(null)
     } catch (cause) {
       setError(problemDetail(cause, 'Could not create workspace.'))
     } finally {
+      submissionLock.current = false
       setSaving(false)
       setSavingStep('')
     }
   }
 
   return (
-    <div className="flex h-full min-h-0 overflow-y-auto bg-[radial-gradient(circle_at_top,theme(colors.muted)_0%,transparent_42%)] px-5 py-8 sm:px-8 lg:px-14">
-      <section className="m-auto w-full max-w-3xl rounded-2xl border border-border bg-card/95 p-5 shadow-sm backdrop-blur sm:p-8">
-        <div className="flex items-start justify-between gap-6 border-b border-border pb-6">
-          <div>
-            <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.22em] text-success">
-              New workspace
-            </p>
-            <h1 className="mt-2 text-2xl font-semibold tracking-tight">
-              Start a persistent machine.
-            </h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-              Name the workspace and choose a local harness. Every thread shares
-              its persistent sandbox and files, while the assistant can operate
-              any Temps resource allowed by your current role.
-            </p>
-          </div>
+    <div className="h-full min-h-0 overflow-y-auto bg-background p-4 sm:p-6">
+      <SetupWizardShell
+        fullWidth
+        title="New workspace"
+        description="Set up once, then build and iterate in chat."
+        currentStep={String(step)}
+        steps={[
+          { id: '0', label: 'Harness' },
+          { id: '1', label: 'Connection' },
+          { id: '4', label: 'First task' },
+        ]}
+        headerActions={
           <Button
             onClick={() => {
               localImportRequestRef.current += 1
@@ -3265,364 +3472,668 @@ export function ApplicationStartScreen({
               onCancel()
             }}
             size="sm"
+            disabled={saving || verificationPending}
             type="button"
             variant="ghost"
           >
             Cancel
           </Button>
-        </div>
-        <div className="mt-6 space-y-5">
-          <div className="space-y-2">
-            <Label htmlFor="ai-app-name">Workspace name</Label>
-            <Input
-              autoFocus
-              id="ai-app-name"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="Product workspace"
-            />
-            <p className="text-xs text-muted-foreground">
-              Temps creates a deployable Autopack project and keeps its files on
-              this machine between threads.
-            </p>
-          </div>
-          <div className="space-y-3">
-            <div>
-              <Label>Start from</Label>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Import code now, or let the assistant build the project from
-                scratch.
-              </p>
-            </div>
-            <div className="grid gap-2 sm:grid-cols-3">
-              {(
-                [
-                  {
-                    id: 'blank',
-                    label: 'Blank project',
-                    detail: 'Build with AI',
-                    icon: Sparkles,
-                  },
-                  {
-                    id: 'local',
-                    label: 'Files or ZIP',
-                    detail: 'Drop or browse',
-                    icon: FolderTree,
-                  },
-                  {
-                    id: 'git',
-                    label: 'Git repository',
-                    detail: 'Public or connected',
-                    icon: GitBranch,
-                  },
-                ] as const
-              ).map((option) => {
-                const Icon = option.icon
-                return (
-                  <button
-                    className={cn(
-                      'flex items-start gap-3 rounded-lg border p-3 text-left transition-colors',
-                      sourceMode === option.id
-                        ? 'border-primary bg-accent text-accent-foreground'
-                        : 'border-border bg-background hover:bg-accent/60'
-                    )}
-                    disabled={Boolean(provisionedApplication)}
-                    key={option.id}
-                    onClick={() => {
-                      if (option.id !== 'local') {
-                        localImportRequestRef.current += 1
-                        localImportAbortRef.current?.abort()
-                        setLocalImportLoading(false)
-                      }
-                      setSourceMode(option.id)
-                      setConnectionsLoading(
-                        option.id === 'git' && connections.length === 0
-                      )
-                      setError(null)
-                    }}
-                    type="button"
-                  >
-                    <Icon className="mt-0.5 size-4 shrink-0" />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium">
-                        {option.label}
-                      </span>
-                      <span className="block text-[11px] text-muted-foreground">
-                        {option.detail}
-                      </span>
-                    </span>
-                  </button>
-                )
-              })}
-            </div>
-
-            {sourceMode === 'local' && (
-              <div
-                aria-busy={localImportLoading}
-                className={cn(
-                  'rounded-lg border border-dashed bg-muted/30 p-4 transition-colors',
-                  localImportDragging &&
-                    'border-primary bg-primary/5 ring-2 ring-primary/15'
-                )}
-                onDragEnter={(event) => {
-                  event.preventDefault()
-                  if (!provisionedApplication && !localImportLoading) {
-                    setLocalImportDragging(true)
-                  }
-                }}
-                onDragLeave={(event) => {
-                  if (
-                    !event.currentTarget.contains(event.relatedTarget as Node)
-                  ) {
-                    setLocalImportDragging(false)
-                  }
-                }}
-                onDragOver={(event) => {
-                  event.preventDefault()
-                  event.dataTransfer.dropEffect = 'copy'
-                }}
-                onDrop={(event) => {
-                  event.preventDefault()
-                  setLocalImportDragging(false)
-                  if (provisionedApplication || localImportLoading) return
-                  const skipped: string[] = []
-                  void selectLocalImport(async (signal) => ({
-                    files: await filesFromDrop(event, {
-                      maxEntries: MAX_LOCAL_IMPORT_FILES,
-                      signal,
-                      shouldSkipPath: (path) =>
-                        isSensitiveLocalImportPath(path),
-                      onSkippedPath: (path) => skipped.push(path),
-                    }),
-                    skipped,
-                  }))
-                }}
-              >
-                <input
-                  className="hidden"
-                  disabled={
-                    Boolean(provisionedApplication) || localImportLoading
-                  }
-                  multiple
-                  onChange={(event) => {
-                    const files = filesFromInput(event.target.files)
-                    void selectLocalImport(async () => ({ files }))
-                    event.target.value = ''
-                  }}
-                  ref={(element) => {
-                    folderInputRef.current = element
-                    element?.setAttribute('webkitdirectory', '')
-                    element?.setAttribute('directory', '')
-                  }}
-                  type="file"
-                />
-                <input
-                  className="hidden"
-                  disabled={
-                    Boolean(provisionedApplication) || localImportLoading
-                  }
-                  multiple
-                  onChange={(event) => {
-                    const files = filesFromInput(event.target.files)
-                    void selectLocalImport(async () => ({ files }))
-                    event.target.value = ''
-                  }}
-                  ref={fileInputRef}
-                  type="file"
-                />
-                <div className="flex items-center gap-3">
-                  <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border bg-background">
-                    {localImportLoading ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : localImport?.sourceKind === 'zip' ? (
-                      <FileArchive className="size-4" />
-                    ) : (
-                      <UploadCloud className="size-4" />
-                    )}
-                  </div>
-                  <div aria-live="polite" className="min-w-0" role="status">
-                    <p className="truncate text-sm font-medium">
-                      {localImportLoading
-                        ? 'Reading selection…'
-                        : (localImport?.sourceLabel ??
-                          'Drop a ZIP, files, or folders')}
-                    </p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">
-                      {localImport
-                        ? `${localImport.accepted.length.toLocaleString()} files · ${(
-                            localImport.totalBytes /
-                            1024 /
-                            1024
-                          ).toFixed(1)} MB${
-                            localImport.skipped.length > 0
-                              ? ` · ${localImport.skipped.length} excluded`
-                              : ''
-                          }`
-                        : 'Relative paths are preserved. Dependencies, Git metadata, and credentials are excluded.'}
-                    </p>
-                  </div>
-                </div>
-                <div className="mt-3 flex flex-wrap gap-2 pl-0 sm:pl-[3.25rem]">
-                  <Button
-                    disabled={
-                      Boolean(provisionedApplication) || localImportLoading
-                    }
-                    onClick={() => fileInputRef.current?.click()}
-                    size="sm"
-                    type="button"
-                    variant="outline"
-                  >
-                    <FileArchive className="mr-1.5 size-3.5" /> Choose files or
-                    ZIP
-                  </Button>
-                  <Button
-                    disabled={
-                      Boolean(provisionedApplication) || localImportLoading
-                    }
-                    onClick={() => folderInputRef.current?.click()}
-                    size="sm"
-                    type="button"
-                    variant="outline"
-                  >
-                    <FolderTree className="mr-1.5 size-3.5" /> Choose folder
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {sourceMode === 'git' && (
-              <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3">
-                <div className="grid gap-3 sm:grid-cols-[1fr_10rem]">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="workspace-git-url">Repository URL</Label>
-                    <Input
-                      disabled={Boolean(provisionedApplication)}
-                      id="workspace-git-url"
-                      onChange={(event) => setGitUrl(event.target.value)}
-                      placeholder="https://github.com/org/repository.git"
-                      value={gitUrl}
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="workspace-git-revision">
-                      Branch or tag
-                    </Label>
-                    <Input
-                      disabled={Boolean(provisionedApplication)}
-                      id="workspace-git-revision"
-                      onChange={(event) => setGitRevision(event.target.value)}
-                      placeholder="Default"
-                      value={gitRevision}
-                    />
-                  </div>
-                </div>
-                <div>
-                  <p className="text-xs font-medium">Access</p>
-                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                    <button
-                      className={cn(
-                        'flex items-center gap-2 rounded-md border p-2 text-left text-xs',
-                        gitConnectionId === null
-                          ? 'border-primary bg-accent'
-                          : 'border-border bg-background hover:bg-accent/60'
-                      )}
-                      disabled={Boolean(provisionedApplication)}
-                      onClick={() => setGitConnectionId(null)}
-                      type="button"
-                    >
-                      <GitBranch className="size-5 shrink-0" />
-                      <span>
-                        <span className="block font-medium">
-                          Public repository
-                        </span>
-                        <span className="text-muted-foreground">
-                          No credential
-                        </span>
-                      </span>
-                    </button>
-                    {connectionsLoading && (
-                      <div className="flex items-center gap-2 rounded-md border border-border bg-background p-2 text-xs text-muted-foreground">
-                        <Loader2 className="size-4 animate-spin" /> Loading
-                        connections…
-                      </div>
-                    )}
-                    {connections.map((connection) => {
-                      const provider = providerForConnection(connection)
-                      const available =
-                        connection.is_active &&
-                        !connection.is_expired &&
-                        connection.has_authenticated_credentials
-                      return (
-                        <button
-                          className={cn(
-                            'flex items-center gap-2 rounded-md border p-2 text-left text-xs',
-                            gitConnectionId === connection.id
-                              ? 'border-primary bg-accent'
-                              : 'border-border bg-background hover:bg-accent/60',
-                            !available && 'opacity-50'
-                          )}
-                          disabled={
-                            Boolean(provisionedApplication) || !available
-                          }
-                          key={connection.id}
-                          onClick={() => setGitConnectionId(connection.id)}
-                          type="button"
-                        >
-                          <ProviderLogo
-                            className="size-5 shrink-0"
-                            providerType={provider?.provider_type}
-                          />
-                          <span className="min-w-0">
-                            <span className="block truncate font-medium">
-                              {connection.account_name}
-                            </span>
-                            <span className="block truncate text-muted-foreground">
-                              {provider?.name ?? 'Git provider'} ·{' '}
-                              {available
-                                ? connection.health_status
-                                : 'unavailable'}
-                            </span>
-                          </span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                  <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
-                    Stored credentials are resolved only for this clone and are
-                    never sent to the browser, chat, or repository URL.
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-          <HarnessPicker
-            harnesses={harnesses}
-            loading={harnessesLoading}
-            selectedId={selectedHarnessId}
-            onSelect={setHarnessId}
-          />
-          {error && <p className="text-sm text-destructive">{error}</p>}
-        </div>
-        <div className="mt-6 flex justify-end gap-3 border-t border-border pt-5">
-          <Button variant="outline" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button
-            disabled={
-              saving ||
-              localImportLoading ||
-              !name.trim() ||
-              !selectedHarnessId ||
-              (sourceMode === 'git' && !gitUrl.trim()) ||
-              (sourceMode === 'local' && !localImport)
-            }
-            onClick={() => void submit()}
+        }
+      >
+        <div
+          className={
+            step === 4
+              ? 'space-y-3'
+              : 'space-y-5 rounded-xl border bg-card p-4 sm:p-5'
+          }
+        >
+          <fieldset
+            disabled={saving || (step !== 4 && Boolean(provisionedApplication))}
+            className="min-w-0 space-y-5"
           >
-            {saving && <Loader2 className="mr-1.5 size-4 animate-spin" />}
-            {saving ? savingStep : 'Start workspace'}
-          </Button>
+            {step === 0 && (
+              <div className="space-y-5">
+                <div className="space-y-2">
+                  <h2 className="text-lg font-semibold">Choose your harness</h2>
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    {providers.map((provider) => (
+                      <button
+                        key={provider.id}
+                        type="button"
+                        aria-pressed={provider.id === selectedHarnessId}
+                        onClick={() => {
+                          setHarnessId(provider.id)
+                        }}
+                        className="group flex min-w-0 items-center gap-3 rounded-lg border p-4 text-left aria-pressed:border-primary aria-pressed:bg-accent/50 hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <AiHarnessLogo providerId={provider.id} size={24} />
+                        <div className="min-w-0 text-base sm:text-sm">
+                          <p className="font-medium">{provider.name}</p>
+                          <p className="text-muted-foreground">
+                            {provider.workspace_ready
+                              ? 'Saved connection'
+                              : 'Set up connection'}
+                          </p>
+                        </div>
+                        {provider.id === selectedHarnessId && (
+                          <CheckCircle2
+                            className="ml-auto size-4 shrink-0"
+                            aria-label="Selected"
+                          />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                  {(catalog.isPending || harnessesLoading) && (
+                    <p role="status">Loading harnesses…</p>
+                  )}
+                </div>
+              </div>
+            )}
+            {step === 1 && selectedProvider && (
+              <WorkspaceHarnessSetup
+                key={selectedProvider.id}
+                provider={selectedProvider}
+                selection={runtimeSelection}
+                onChange={setRuntimeDraft}
+                onVerificationPending={setVerificationPending}
+                mode="connection"
+              />
+            )}
+            {step === 4 && selectedProvider && (
+              <div className="space-y-3">
+                <div className="rounded-xl border bg-background focus-within:ring-2 focus-within:ring-ring/30">
+                  <Textarea
+                    autoFocus
+                    aria-label="Your first task"
+                    disabled={Boolean(provisionedApplication)}
+                    id="workspace-prompt"
+                    name="prompt"
+                    value={prompt}
+                    onChange={(event) => updatePrompt(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === 'Enter' &&
+                        (event.metaKey || event.ctrlKey) &&
+                        !event.nativeEvent.isComposing &&
+                        !event.repeat
+                      ) {
+                        event.preventDefault()
+                        void submit()
+                      }
+                    }}
+                    className="min-h-36 resize-none rounded-xl border-0 p-4 text-base shadow-none focus-visible:ring-0 focus-visible:outline-none"
+                    placeholder="Tell Temps what you want to ship…"
+                  />
+                  <div className="flex items-end gap-2 p-2 sm:p-3">
+                    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+                      <Popover
+                        open={setupPanel === 'workspace'}
+                        onOpenChange={(open) =>
+                          setSetupPanel(open ? 'workspace' : null)
+                        }
+                      >
+                        <PopoverTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            aria-label="Workspace and source"
+                            disabled={Boolean(provisionedApplication)}
+                            className="max-w-56 gap-2 text-muted-foreground"
+                          >
+                            <Plus className="size-4 shrink-0" />
+                            <span className="truncate">
+                              {name || 'Untitled workspace'}
+                            </span>
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent
+                          align="start"
+                          className="max-h-[70dvh] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto p-4"
+                        >
+                          <div className="space-y-5">
+                            <div className="space-y-2">
+                              <Label htmlFor="ai-app-name">
+                                Workspace name (optional)
+                              </Label>
+                              <Input
+                                autoFocus
+                                id="ai-app-name"
+                                name="workspace_name"
+                                value={name}
+                                onChange={(event) =>
+                                  setName(event.target.value)
+                                }
+                                placeholder="Untitled workspace"
+                              />
+                              <p className="text-xs text-muted-foreground">
+                                Temps creates a deployable Autopack project and
+                                keeps its files on this machine between threads.
+                              </p>
+                            </div>
+                            <div className="space-y-3">
+                              <div>
+                                <Label>Start from</Label>
+                                <p className="mt-1 text-xs text-muted-foreground">
+                                  Import code now, or let the assistant build
+                                  the project from scratch.
+                                </p>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-3">
+                                {(
+                                  [
+                                    {
+                                      id: 'blank',
+                                      label: 'Blank project',
+                                      detail: 'Build with AI',
+                                      icon: Sparkles,
+                                    },
+                                    {
+                                      id: 'local',
+                                      label: 'Files or ZIP',
+                                      detail: 'Drop or browse',
+                                      icon: FolderTree,
+                                    },
+                                    {
+                                      id: 'git',
+                                      label: 'Git repository',
+                                      detail: 'Public or connected',
+                                      icon: GitBranch,
+                                    },
+                                  ] as const
+                                ).map((option) => {
+                                  const Icon = option.icon
+                                  return (
+                                    <button
+                                      className={cn(
+                                        'flex items-start gap-3 rounded-lg border p-3 text-left transition-colors',
+                                        sourceMode === option.id
+                                          ? 'border-primary bg-accent text-accent-foreground'
+                                          : 'border-border bg-background hover:bg-accent/60'
+                                      )}
+                                      disabled={Boolean(provisionedApplication)}
+                                      key={option.id}
+                                      onClick={() => {
+                                        if (option.id !== 'local') {
+                                          localImportRequestRef.current += 1
+                                          localImportAbortRef.current?.abort()
+                                          setLocalImportLoading(false)
+                                        }
+                                        setSourceMode(option.id)
+                                        setConnectionsLoading(
+                                          option.id === 'git' &&
+                                            connections.length === 0
+                                        )
+                                        setConnectionsLoading(
+                                          option.id === 'git' &&
+                                            connections.length === 0
+                                        )
+                                        setError(null)
+                                      }}
+                                      type="button"
+                                    >
+                                      <Icon className="mt-0.5 size-4 shrink-0" />
+                                      <span className="min-w-0">
+                                        <span className="block text-sm font-medium">
+                                          {option.label}
+                                        </span>
+                                        <span className="block text-[11px] text-muted-foreground">
+                                          {option.detail}
+                                        </span>
+                                      </span>
+                                    </button>
+                                  )
+                                })}
+                              </div>
+
+                              {sourceMode === 'local' && (
+                                <div
+                                  aria-busy={localImportLoading}
+                                  className={cn(
+                                    'rounded-lg border border-dashed bg-muted/30 p-4 transition-colors',
+                                    localImportDragging &&
+                                      'border-primary bg-primary/5 ring-2 ring-primary/15'
+                                  )}
+                                  onDragEnter={(event) => {
+                                    event.preventDefault()
+                                    if (
+                                      !provisionedApplication &&
+                                      !localImportLoading
+                                    ) {
+                                      setLocalImportDragging(true)
+                                    }
+                                  }}
+                                  onDragLeave={(event) => {
+                                    if (
+                                      !event.currentTarget.contains(
+                                        event.relatedTarget as Node
+                                      )
+                                    ) {
+                                      setLocalImportDragging(false)
+                                    }
+                                  }}
+                                  onDragOver={(event) => {
+                                    event.preventDefault()
+                                    event.dataTransfer.dropEffect = 'copy'
+                                  }}
+                                  onDrop={(event) => {
+                                    event.preventDefault()
+                                    setLocalImportDragging(false)
+                                    if (
+                                      provisionedApplication ||
+                                      localImportLoading
+                                    )
+                                      return
+                                    const skipped: string[] = []
+                                    void selectLocalImport(async (signal) => ({
+                                      files: await filesFromDrop(event, {
+                                        maxEntries: MAX_LOCAL_IMPORT_FILES,
+                                        signal,
+                                        shouldSkipPath: (path) =>
+                                          isSensitiveLocalImportPath(path),
+                                        onSkippedPath: (path) =>
+                                          skipped.push(path),
+                                      }),
+                                      skipped,
+                                    }))
+                                  }}
+                                >
+                                  <input
+                                    className="hidden"
+                                    disabled={
+                                      Boolean(provisionedApplication) ||
+                                      localImportLoading
+                                    }
+                                    multiple
+                                    onChange={(event) => {
+                                      const files = filesFromInput(
+                                        event.target.files
+                                      )
+                                      void selectLocalImport(async () => ({
+                                        files,
+                                      }))
+                                      event.target.value = ''
+                                    }}
+                                    ref={(element) => {
+                                      folderInputRef.current = element
+                                      element?.setAttribute(
+                                        'webkitdirectory',
+                                        ''
+                                      )
+                                      element?.setAttribute('directory', '')
+                                    }}
+                                    type="file"
+                                  />
+                                  <input
+                                    className="hidden"
+                                    disabled={
+                                      Boolean(provisionedApplication) ||
+                                      localImportLoading
+                                    }
+                                    multiple
+                                    onChange={(event) => {
+                                      const files = filesFromInput(
+                                        event.target.files
+                                      )
+                                      void selectLocalImport(async () => ({
+                                        files,
+                                      }))
+                                      event.target.value = ''
+                                    }}
+                                    ref={fileInputRef}
+                                    type="file"
+                                  />
+                                  <div className="flex items-center gap-3">
+                                    <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border bg-background">
+                                      {localImportLoading ? (
+                                        <Loader2 className="size-4 animate-spin" />
+                                      ) : localImport?.sourceKind === 'zip' ? (
+                                        <FileArchive className="size-4" />
+                                      ) : (
+                                        <UploadCloud className="size-4" />
+                                      )}
+                                    </div>
+                                    <div
+                                      aria-live="polite"
+                                      className="min-w-0"
+                                      role="status"
+                                    >
+                                      <p className="truncate text-sm font-medium">
+                                        {localImportLoading
+                                          ? 'Reading selection…'
+                                          : (localImport?.sourceLabel ??
+                                            'Drop a ZIP, files, or folders')}
+                                      </p>
+                                      <p className="mt-0.5 text-xs text-muted-foreground">
+                                        {localImport
+                                          ? `${localImport.accepted.length.toLocaleString()} files · ${(
+                                              localImport.totalBytes /
+                                              1024 /
+                                              1024
+                                            ).toFixed(1)} MB${
+                                              localImport.skipped.length > 0
+                                                ? ` · ${localImport.skipped.length} excluded`
+                                                : ''
+                                            }`
+                                          : 'Relative paths are preserved. Dependencies, Git metadata, and credentials are excluded.'}
+                                      </p>
+                                    </div>
+                                  </div>
+                                  <div className="mt-3 flex flex-wrap gap-2 pl-0 sm:pl-[3.25rem]">
+                                    <Button
+                                      disabled={
+                                        Boolean(provisionedApplication) ||
+                                        localImportLoading
+                                      }
+                                      onClick={() =>
+                                        fileInputRef.current?.click()
+                                      }
+                                      size="sm"
+                                      type="button"
+                                      variant="outline"
+                                    >
+                                      <FileArchive className="mr-1.5 size-3.5" />{' '}
+                                      Choose files or ZIP
+                                    </Button>
+                                    <Button
+                                      disabled={
+                                        Boolean(provisionedApplication) ||
+                                        localImportLoading
+                                      }
+                                      onClick={() =>
+                                        folderInputRef.current?.click()
+                                      }
+                                      size="sm"
+                                      type="button"
+                                      variant="outline"
+                                    >
+                                      <FolderTree className="mr-1.5 size-3.5" />{' '}
+                                      Choose folder
+                                    </Button>
+                                  </div>
+                                </div>
+                              )}
+
+                              {sourceMode === 'git' && (
+                                <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+                                  <div className="grid gap-3 sm:grid-cols-[1fr_10rem]">
+                                    <div className="space-y-1.5">
+                                      <Label htmlFor="workspace-git-url">
+                                        Repository URL
+                                      </Label>
+                                      <Input
+                                        disabled={Boolean(
+                                          provisionedApplication
+                                        )}
+                                        id="workspace-git-url"
+                                        onChange={(event) =>
+                                          setGitUrl(event.target.value)
+                                        }
+                                        placeholder="https://github.com/org/repository.git"
+                                        value={gitUrl}
+                                      />
+                                    </div>
+                                    <div className="space-y-1.5">
+                                      <Label htmlFor="workspace-git-revision">
+                                        Branch or tag
+                                      </Label>
+                                      <Input
+                                        disabled={Boolean(
+                                          provisionedApplication
+                                        )}
+                                        id="workspace-git-revision"
+                                        onChange={(event) =>
+                                          setGitRevision(event.target.value)
+                                        }
+                                        placeholder="Default"
+                                        value={gitRevision}
+                                      />
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <p className="text-xs font-medium">
+                                      Access
+                                    </p>
+                                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                      <button
+                                        className={cn(
+                                          'flex items-center gap-2 rounded-md border p-2 text-left text-xs',
+                                          gitConnectionId === null
+                                            ? 'border-primary bg-accent'
+                                            : 'border-border bg-background hover:bg-accent/60'
+                                        )}
+                                        disabled={Boolean(
+                                          provisionedApplication
+                                        )}
+                                        onClick={() => setGitConnectionId(null)}
+                                        type="button"
+                                      >
+                                        <GitBranch className="size-5 shrink-0" />
+                                        <span>
+                                          <span className="block font-medium">
+                                            Public repository
+                                          </span>
+                                          <span className="text-muted-foreground">
+                                            No credential
+                                          </span>
+                                        </span>
+                                      </button>
+                                      {connectionsLoading && (
+                                        <div className="flex items-center gap-2 rounded-md border border-border bg-background p-2 text-xs text-muted-foreground">
+                                          <Loader2 className="size-4 animate-spin" />{' '}
+                                          Loading connections…
+                                        </div>
+                                      )}
+                                      {connections.map((connection) => {
+                                        const provider =
+                                          providerForConnection(connection)
+                                        const available =
+                                          connection.is_active &&
+                                          !connection.is_expired &&
+                                          connection.has_authenticated_credentials
+                                        return (
+                                          <button
+                                            className={cn(
+                                              'flex items-center gap-2 rounded-md border p-2 text-left text-xs',
+                                              gitConnectionId === connection.id
+                                                ? 'border-primary bg-accent'
+                                                : 'border-border bg-background hover:bg-accent/60',
+                                              !available && 'opacity-50'
+                                            )}
+                                            disabled={
+                                              Boolean(provisionedApplication) ||
+                                              !available
+                                            }
+                                            key={connection.id}
+                                            onClick={() =>
+                                              setGitConnectionId(connection.id)
+                                            }
+                                            type="button"
+                                          >
+                                            <ProviderLogo
+                                              className="size-5 shrink-0"
+                                              providerType={
+                                                provider?.provider_type
+                                              }
+                                            />
+                                            <span className="min-w-0">
+                                              <span className="block truncate font-medium">
+                                                {connection.account_name}
+                                              </span>
+                                              <span className="block truncate text-muted-foreground">
+                                                {provider?.name ??
+                                                  'Git provider'}{' '}
+                                                ·{' '}
+                                                {available
+                                                  ? connection.health_status
+                                                  : 'unavailable'}
+                                              </span>
+                                            </span>
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                    <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+                                      Stored credentials are resolved only for
+                                      this clone and are never sent to the
+                                      browser, chat, or repository URL.
+                                    </p>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </PopoverContent>
+                      </Popover>
+                      <Popover
+                        open={setupPanel === 'model'}
+                        onOpenChange={(open) =>
+                          setSetupPanel(open ? 'model' : null)
+                        }
+                      >
+                        <PopoverTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            aria-label="Model and tool settings"
+                            disabled={Boolean(provisionedApplication)}
+                            className="max-w-80 gap-2 text-muted-foreground"
+                          >
+                            <AiHarnessLogo
+                              providerId={selectedProvider.id}
+                              size={16}
+                            />
+                            <span className="truncate">
+                              {selectedProvider.runtime_models.find(
+                                (model) => model.id === runtimeSelection.modelId
+                              )?.name ?? 'Choose model'}
+                            </span>
+                            <SlidersHorizontal className="size-4 shrink-0" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent
+                          align="start"
+                          className="max-h-[70dvh] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto p-4"
+                        >
+                          <WorkspaceHarnessSetup
+                            provider={selectedProvider}
+                            selection={runtimeSelection}
+                            onChange={setRuntimeDraft}
+                            mode="model"
+                          />
+                        </PopoverContent>
+                      </Popover>
+                    </div>
+                    <Button
+                      type="button"
+                      size="icon"
+                      aria-label={
+                        provisionedApplication
+                          ? 'Retry starting task'
+                          : 'Send and create workspace'
+                      }
+                      title="Send and create workspace (⌘Enter / Ctrl+Enter)"
+                      aria-keyshortcuts="Meta+Enter Control+Enter"
+                      className="size-10 shrink-0"
+                      disabled={
+                        saving ||
+                        localImportLoading ||
+                        !prompt.trim() ||
+                        !selectedProvider.workspace_ready ||
+                        (sourceMode === 'git' && !gitUrl.trim()) ||
+                        (sourceMode === 'local' && !localImport)
+                      }
+                      onClick={() => void submit()}
+                    >
+                      {saving ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <ArrowUp className="size-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+                <p role="status" className="text-sm text-muted-foreground">
+                  {saving
+                    ? savingStep
+                    : 'Sending creates your workspace and first thread using your provider allowance.'}
+                </p>
+              </div>
+            )}
+          </fieldset>
+          {catalog.isError && (
+            <div role="alert" className="space-y-2 text-destructive">
+              <p>
+                Could not load harness connections. Your task has been kept
+                here.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void catalog.refetch()}
+              >
+                Retry connections
+              </Button>
+            </div>
+          )}
+          {error && (
+            <p role="alert" className="text-base sm:text-sm text-destructive">
+              {error}
+            </p>
+          )}
+          {error && (
+            <Button asChild type="button" variant="outline">
+              <a
+                href={
+                  provisionedApplication
+                    ? `/ai-first?application=${provisionedApplication.public_id}`
+                    : '/workspaces'
+                }
+              >
+                {provisionedApplication
+                  ? 'Open created workspace'
+                  : 'Check workspace list'}
+              </a>
+            </Button>
+          )}
+          {step !== 4 && (
+            <div className="flex items-center justify-between gap-3 border-t pt-4">
+              {step === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  You can reuse a saved connection.
+                </p>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={saving || verificationPending}
+                  onClick={() => setStep(0)}
+                >
+                  <ArrowLeft className="size-4" /> Back
+                </Button>
+              )}
+              <Button
+                type="button"
+                disabled={
+                  saving ||
+                  verificationPending ||
+                  !selectedProvider ||
+                  (step === 1 && !selectedProvider.workspace_ready)
+                }
+                onClick={() =>
+                  setStep(
+                    step === 0 && !selectedProvider?.workspace_ready ? 1 : 4
+                  )
+                }
+              >
+                Continue <ArrowRight className="size-4" />
+              </Button>
+            </div>
+          )}
         </div>
-      </section>
+      </SetupWizardShell>
     </div>
   )
 }
@@ -3638,18 +4149,20 @@ export function HarnessPicker({
   selectedId: string | null
   onSelect: (providerId: string) => void
 }) {
+  const [setupParams] = useSearchParams()
+  const setupHref = harnessSetupHref(null, `/ai-first?${setupParams}`)
   return (
     <section className="rounded-lg border border-border bg-muted/40 p-3">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <p className="text-sm font-medium">Detected harnesses</p>
+          <p className="text-sm font-medium">Choose a harness</p>
           <p className="mt-0.5 text-xs text-muted-foreground">
             The selected harness starts the first thread and remains pinned to
             it.
           </p>
         </div>
         <Button asChild size="sm" type="button" variant="ghost">
-          <Link to="/agent-sandbox/providers">
+          <Link to={setupHref}>
             <TerminalSquare className="mr-1.5 size-4" /> Manage
           </Link>
         </Button>
@@ -3688,12 +4201,11 @@ export function HarnessPicker({
       ) : (
         <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
           <p>
-            No harness is ready for persistent workspace execution. Configure
-            Claude Code to start a thread; Codex and OpenCode remain available
-            for host workflows until their secure workspace relays are added.
+            Connect Claude Code, Codex, or OpenCode to start your first thread.
+            Setup explains which credential to use and where to authenticate.
           </p>
           <Button asChild size="sm" type="button" variant="outline">
-            <Link to="/agent-sandbox/providers">Configure harness</Link>
+            <Link to={setupHref}>Connect harness</Link>
           </Button>
         </div>
       )}

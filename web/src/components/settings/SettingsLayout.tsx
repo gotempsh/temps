@@ -8,7 +8,7 @@ import { PageContainer } from '@/components/layout/PageContainer'
 // settings drill-down). This layout is a content-only wrapper.
 export function SettingsLayout() {
   return (
-    <PageContainer width="full">
+    <PageContainer>
       <Outlet />
     </PageContainer>
   )

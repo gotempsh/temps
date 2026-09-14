@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ArrowDown, ArrowUp, ArrowUpDown, Layers } from 'lucide-react'
+import { Layers } from 'lucide-react'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { formatTraceDuration } from '@/lib/trace-presentation'
@@ -24,6 +24,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
 
@@ -33,10 +34,10 @@ export default function GlobalTraces() {
   const sort =
     view.params.get('sort') === 'duration' ? 'duration' : 'start_time'
   const order = view.params.get('order') === 'asc' ? 'asc' : 'desc'
-  const toggleDuration = () =>
+  const toggleSort = (field: 'start_time' | 'duration') =>
     view.patch({
-      sort: 'duration',
-      order: sort === 'duration' && order === 'desc' ? 'asc' : 'desc',
+      sort: field,
+      order: sort === field && order === 'desc' ? 'asc' : 'desc',
     })
   const query = useQuery({
     ...queryGlobalTraceSummariesOptions({
@@ -120,33 +121,20 @@ export default function GlobalTraces() {
                 <TableHead>Trace</TableHead>
                 <TableHead className="hidden md:table-cell">Project</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead
-                  className="text-right"
-                  aria-sort={
-                    sort === 'duration'
-                      ? order === 'desc'
-                        ? 'descending'
-                        : 'ascending'
-                      : 'none'
-                  }
-                >
-                  <button
-                    type="button"
-                    onClick={toggleDuration}
-                    className="inline-flex items-center gap-1 rounded py-2 hover:text-foreground focus-visible:outline focus-visible:outline-ring"
-                    aria-label={`Sort by duration, ${sort === 'duration' && order === 'desc' ? 'fastest' : 'slowest'} first`}
-                  >
-                    Duration
-                    {sort !== 'duration' ? (
-                      <ArrowUpDown className="size-3.5" />
-                    ) : order === 'desc' ? (
-                      <ArrowDown className="size-3.5" />
-                    ) : (
-                      <ArrowUp className="size-3.5" />
-                    )}
-                  </button>
-                </TableHead>
-                <TableHead className="hidden md:table-cell">Started</TableHead>
+                <SortableTableHead
+                  label="Duration"
+                  active={sort === 'duration'}
+                  direction={order}
+                  onClick={() => toggleSort('duration')}
+                  align="right"
+                />
+                <SortableTableHead
+                  label="Started"
+                  active={sort === 'start_time'}
+                  direction={order}
+                  onClick={() => toggleSort('start_time')}
+                  className="hidden md:table-cell"
+                />
               </TableRow>
             </TableHeader>
             <TableBody>

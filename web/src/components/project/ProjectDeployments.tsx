@@ -807,6 +807,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             size="icon"
             className="h-7 w-7"
             onClick={() => refetch()}
+            aria-label="Refresh deployments"
             disabled={isFetching}
           >
             {isFetching ? (
@@ -818,13 +819,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      <Card>
-        <ul className="divide-y divide-border">
-          {deploymentsData.deployments.map((deployment) => (
+      <ul aria-label="Deployments" className="space-y-3">
+        {deploymentsData.deployments.map((deployment) => (
+          <li
+            key={deployment.id}
+            className="overflow-hidden rounded-lg border bg-card"
+          >
             <Link
-              key={deployment.id}
               to={`/projects/${project.slug}/deployments/${deployment.id}`}
-              className="block hover:bg-muted/50 transition-colors"
+              className="block transition-colors hover:bg-muted/50"
             >
               <DeploymentCompactRow
                 deployment={deployment}
@@ -841,9 +844,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 }}
               />
             </Link>
-          ))}
-        </ul>
-      </Card>
+          </li>
+        ))}
+      </ul>
 
       {/* Pagination */}
       {totalPages > 1 && (
@@ -862,6 +865,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Previous"
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
               disabled={currentPage <= 1 || isFetching}
             >
@@ -871,6 +875,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Next"
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >

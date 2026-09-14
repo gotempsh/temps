@@ -203,6 +203,51 @@ impl AiService for AiProviderRegistry {
             .await
     }
 
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+    ) -> Result<(), AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.credentials.verify".to_string(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .verify_candidate_credential(provider, auth_type, credential, principal_id)
+            .await
+    }
+
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<(), AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.credentials.verify.setup".to_string(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .verify_candidate_credential_with_model(
+                provider,
+                auth_type,
+                credential,
+                principal_id,
+                model,
+            )
+            .await
+    }
+
     async fn capabilities_snapshot_for(
         &self,
         provider: Option<&str>,

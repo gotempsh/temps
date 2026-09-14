@@ -465,7 +465,7 @@ export function CreateService() {
   if (!serviceType) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-1">
             <Link to="/storage">
               <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
@@ -530,7 +530,7 @@ export function CreateService() {
   if (isLoadingSchema) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-4">
             <div className="h-8 w-1/3 bg-muted animate-pulse rounded" />
             <div className="space-y-3">
@@ -553,7 +553,7 @@ export function CreateService() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header with provider info */}
         <div className="space-y-4">
           <Link to="/storage">

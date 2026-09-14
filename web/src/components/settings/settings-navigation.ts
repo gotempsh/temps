@@ -106,7 +106,7 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
   {
     label: 'Security',
     items: [
-      { title: 'Security Headers', url: '/settings/security', icon: Shield },
+      { title: 'Security', url: '/settings/security', icon: Shield },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       {
         title: 'Disk Monitoring',

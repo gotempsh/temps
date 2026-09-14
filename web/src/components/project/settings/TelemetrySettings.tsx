@@ -186,7 +186,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   if (isPending) {
     return (
-      <div className="mx-auto w-full max-w-3xl space-y-4 px-4 py-8 sm:px-6">
+      <div className="w-full space-y-4 px-4 py-8 sm:px-6">
         <Skeleton className="h-8 w-64" />
         <Skeleton className="h-48 w-full" />
         <Skeleton className="h-40 w-full" />
@@ -196,7 +196,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   if (isError || !settings) {
     return (
-      <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
+      <div className="w-full px-4 py-8 sm:px-6">
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Telemetry storage settings unavailable</AlertTitle>
@@ -224,7 +224,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   const downgradeBlocked = writeMode === 'cloud' && fidelity === 'metered'
 
   return (
-    <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-8 sm:px-6">
+    <div className="w-full space-y-6 px-4 py-8 sm:px-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">

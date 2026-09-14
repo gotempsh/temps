@@ -241,7 +241,7 @@ export function MajorUpgradeDetail() {
   }
 
   return (
-    <div className="p-6 space-y-6 max-w-5xl mx-auto">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" asChild>

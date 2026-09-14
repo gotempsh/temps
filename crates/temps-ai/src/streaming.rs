@@ -176,6 +176,11 @@ pub struct ChatTurnRequest {
     /// The full `messages` collection is retained as the server-owned recovery
     /// source if native session state is ever unavailable.
     pub resume_session_id: Option<String>,
+    /// Server-owned instruction to discard a stale retained harness runtime
+    /// before this execution attempt. Used only when durable session state is
+    /// absent or a provider explicitly reports the requested session missing.
+    /// It never comes from an HTTP client.
+    pub reset_retained_session: bool,
     /// Explicit, Temps-managed workspace for a development-harness turn.
     ///
     /// This is intentionally absent for API-gateway requests. Harness

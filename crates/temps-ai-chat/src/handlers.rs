@@ -9470,7 +9470,7 @@ async fn sandbox_tools_mcp(
     State(state): State<Arc<AppState>>,
     Path(bridge_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<serde_json::Value>,
+    Json(request): Json<temps_ai::mcp::McpRequest>,
 ) -> Response {
     let bearer = headers
         .get(AUTHORIZATION)
@@ -9488,17 +9488,17 @@ async fn sandbox_tools_mcp(
             // Do not reveal whether a random bridge id exists.
             (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "sandbox tool capability is not authorized"
-                })),
+                Json(temps_ai::mcp::McpTransportError {
+                    error: "sandbox tool capability is not authorized",
+                }),
             )
                 .into_response()
         }
         Err(HarnessMcpError::Expired) => (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "sandbox tool capability has expired"
-            })),
+            Json(temps_ai::mcp::McpTransportError {
+                error: "sandbox tool capability has expired",
+            }),
         )
             .into_response(),
     }
