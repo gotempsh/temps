@@ -39,7 +39,7 @@ pingora = { version = "0.8.0", features = ["lb"] }
 pingora-core = { version = "0.8.0", features = ["openssl", "connection_filter"] }
 pingora-http = "0.8.0"
 pingora-load-balancing = "0.8.0"
-pingora-proxy = "0.8.0"
+pingora-proxy = "0.9.0"
 pingora-openssl = "0.8.0"
 rand = { workspace = true }
 hex = "0.4"
