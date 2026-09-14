@@ -22,14 +22,21 @@ const PASSWORD_FORM_HTML: &str = include_str!("../../password_wall/password_form
 type HmacSha256 = Hmac<Sha256>;
 
 /// Generate the password form HTML for a given redirect path.
+///
+/// `redirect_path` comes back from the client on the wrong-password
+/// re-render, so it is first reduced to a same-origin absolute path
+/// ([`sanitize_redirect_path`]) and then HTML-escaped like every other
+/// substituted value; neither step trusts the caller to have done it.
 pub fn generate_password_form_html(
     redirect_path: &str,
     show_error: bool,
     project_name: &str,
     environment_name: &str,
 ) -> String {
+    let redirect_path = sanitize_redirect_path(redirect_path);
+    // The client-controlled value goes in last: a redirect that spells a
+    // placeholder name must not be rewritten by a later substitution.
     PASSWORD_FORM_HTML
-        .replace("{{REDIRECT_PATH}}", redirect_path)
         .replace("{{PROJECT_NAME}}", &html_escape(project_name))
         .replace("{{ENVIRONMENT_NAME}}", &html_escape(environment_name))
         .replace(
@@ -40,6 +47,15 @@ pub fn generate_password_form_html(
             "{{ERROR_INPUT_CLASS}}",
             if show_error { "input-error" } else { "" },
         )
+        .replace("{{REDIRECT_PATH}}", &html_escape(&redirect_path))
+}
+
+/// Reduce a client-supplied post-login destination to a same-origin
+/// absolute path. Anything else (absolute URLs, scheme-relative `//host`,
+/// backslashes, control characters, relative paths) becomes `/`, so the
+/// value is safe both as a `Location` header and inside the form.
+pub fn sanitize_redirect_path(redirect_path: &str) -> String {
+    temps_core::sanitize_preview_next(redirect_path)
 }
 
 fn html_escape(s: &str) -> String {
@@ -47,6 +63,7 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Create an HMAC-signed cookie value for a given environment ID.
@@ -178,6 +195,49 @@ mod tests {
         let html = generate_password_form_html("/", false, "<script>xss</script>", "test");
         assert!(!html.contains("<script>xss</script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn redirect_path_is_html_escaped_in_the_form() {
+        // A path that closes the value attribute and injects markup must
+        // come back inert: escaped, never as live HTML.
+        let html = generate_password_form_html(
+            "/a\"><script>alert(1)</script>",
+            true,
+            "App",
+            "production",
+        );
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("value=\"/a&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\""));
+    }
+
+    #[test]
+    fn redirect_path_is_reduced_to_a_same_origin_path() {
+        for hostile in [
+            "https://evil.example.com/",
+            "//evil.example.com",
+            "/\\evil.example.com",
+            "javascript:alert(1)",
+            "/safe\r\nLocation: //evil.example.com",
+            "relative",
+            "",
+        ] {
+            assert_eq!(sanitize_redirect_path(hostile), "/", "{hostile:?}");
+            let html = generate_password_form_html(hostile, false, "App", "production");
+            assert!(
+                html.contains("name=\"redirect\" value=\"/\""),
+                "{hostile:?}"
+            );
+        }
+        assert_eq!(sanitize_redirect_path("/docs?q=1&x=2"), "/docs?q=1&x=2");
+        let html = generate_password_form_html("/docs?q=1&x=2", false, "App", "production");
+        assert!(html.contains("value=\"/docs?q=1&amp;x=2\""));
+    }
+
+    #[test]
+    fn redirect_path_naming_a_placeholder_is_not_expanded() {
+        let html = generate_password_form_html("/{{PROJECT_NAME}}", false, "App", "production");
+        assert!(html.contains("value=\"/{{PROJECT_NAME}}\""));
     }
 
     #[test]
