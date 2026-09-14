@@ -60,9 +60,10 @@ pub const PREVIEW_GATEWAY_IMAGE: &str = match temps_core::release_images::PREVIE
 };
 
 fn resolved_gateway_image(configured: &str) -> String {
-    // Only the empty settings value follows the release. A nonempty digest,
-    // including an older default digest, may be an intentional operator pin.
-    if configured.is_empty() {
+    // Only an empty or whitespace-only setting follows the release. A
+    // substantive value, including an older default digest, may be an
+    // intentional operator pin and must remain byte-for-byte unchanged.
+    if configured.trim().is_empty() {
         PREVIEW_GATEWAY_IMAGE.to_string()
     } else {
         configured.to_string()
@@ -1604,6 +1605,7 @@ mod tests {
         assert!(PreviewGatewaySettings::default().image.is_empty());
         assert!(PREVIEW_GATEWAY_IMAGE.contains("@sha256:"));
         assert_eq!(resolved_gateway_image(""), PREVIEW_GATEWAY_IMAGE);
+        assert_eq!(resolved_gateway_image(" \t\n "), PREVIEW_GATEWAY_IMAGE);
         assert_eq!(
             resolved_gateway_image(temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE),
             temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE
@@ -1611,6 +1613,10 @@ mod tests {
         assert_eq!(
             resolved_gateway_image("ghcr.io/operator/custom@sha256:1234"),
             "ghcr.io/operator/custom@sha256:1234"
+        );
+        assert_eq!(
+            resolved_gateway_image(" ghcr.io/operator/custom@sha256:1234 "),
+            " ghcr.io/operator/custom@sha256:1234 "
         );
     }
 
