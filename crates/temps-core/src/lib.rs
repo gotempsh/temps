@@ -32,6 +32,7 @@ pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod registry_prefix;
+pub mod request_policy_gate;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
@@ -106,6 +107,10 @@ pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
+pub use request_policy_gate::{
+    OpenRequestPolicyGate, RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate,
+    RequestPolicyGateSlot,
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,

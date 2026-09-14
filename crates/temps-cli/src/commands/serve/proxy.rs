@@ -127,6 +127,7 @@ pub fn start_proxy_server(
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
     retention_resolver: Arc<dyn temps_core::RetentionResolver>,
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+    request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
@@ -283,6 +284,7 @@ pub fn start_proxy_server(
         admin_gate,
         retention_resolver,
         project_ip_gate,
+        request_policy_gate,
     ) {
         Ok(_) => {
             info!("Proxy server exited");

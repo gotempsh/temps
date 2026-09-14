@@ -387,6 +387,7 @@ pub fn setup_proxy_server(
     // never-claimed slot — see the module doc on `temps_core::project_ip_gate`
     // for why that is an accepted limitation rather than a bug.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+    request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
 ) -> Result<()> {
     // Fail fast and loud if the configured ports are already taken. Without
     // this, a bind conflict is only discovered deep inside Pingora's own
@@ -512,7 +513,8 @@ pub fn setup_proxy_server(
         cert_host_cache,
         proxy_config.disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_request_policy_gate(request_policy_gate);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }

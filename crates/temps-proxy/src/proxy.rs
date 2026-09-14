@@ -828,6 +828,7 @@ pub struct LoadBalancer {
     /// this is a plain required field here rather than an `Option`: a gate
     /// value always exists, whether or not a plugin claimed the slot.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+    request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
     challenge_service: Arc<ChallengeService>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
@@ -912,6 +913,7 @@ impl LoadBalancer {
             config_service,
             ip_access_control_service,
             project_ip_gate,
+            request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
             challenge_service,
             cert_host_cache,
             disable_https_redirect,
@@ -925,6 +927,14 @@ impl LoadBalancer {
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    pub fn with_request_policy_gate(
+        mut self,
+        gate: Arc<dyn temps_core::RequestPolicyGate>,
+    ) -> Self {
+        self.request_policy_gate = gate;
+        self
     }
 
     /// Handle to the hot-path metrics counters, for the background sampler.
@@ -2827,6 +2837,35 @@ fn ip_restriction_denies(
     }
 }
 
+fn legacy_ip_gate_denies(
+    decision: temps_core::RequestPolicyDecision,
+    gate: &dyn temps_core::ProjectIpGate,
+    project_id: i32,
+    environment_id: i32,
+    parsed_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match decision {
+        temps_core::RequestPolicyDecision::Continue => {
+            ip_restriction_denies(gate, project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Allow { .. } => {
+            gate.is_explicitly_denied(project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Deny { .. }
+        | temps_core::RequestPolicyDecision::Unavailable { .. } => false,
+    }
+}
+
+fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        ip => ip,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicAuthority {
     host: String,
@@ -4558,14 +4597,80 @@ impl ProxyHttp for LoadBalancer {
             let parsed_ip = ctx
                 .ip_address
                 .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-            let ip_restricted = ip_restriction_denies(
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(normalize_client_ip);
+            let policy_context = temps_core::RequestPolicyContext {
+                path: &ctx.path,
+                method: session.req_header().method.as_str(),
+                host: &ctx.host,
+                project_id: project_ctx.project.id,
+                environment_id: project_ctx.environment.id,
+                client_ip: parsed_ip,
+            };
+            let decision = self.request_policy_gate.evaluate(&policy_context);
+            if matches!(decision, temps_core::RequestPolicyDecision::Allow { .. })
+                && temps_core::request_policy_gate::ambiguous_policy_path(&ctx.path)
+            {
+                warn!(
+                    project_id = project_ctx.project.id,
+                    environment_id = project_ctx.environment.id,
+                    "Request denied because the path is ambiguous under project policy"
+                );
+                let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                    .await?;
+                ctx.routing_status = "request_policy_ambiguous_path".to_string();
+                return Ok(true);
+            }
+            let ip_restricted = legacy_ip_gate_denies(
+                decision,
                 self.project_ip_gate.as_ref(),
                 project_ctx.project.id,
                 project_ctx.environment.id,
                 parsed_ip,
             );
-            if ip_restricted {
+            if let temps_core::RequestPolicyDecision::Deny {
+                reason,
+                rule_id,
+                revision,
+            } = decision
+            {
+                warn!(
+                    project_id = project_ctx.project.id,
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    rule_id,
+                    revision,
+                    "Request denied by project policy"
+                );
+            }
+            if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
+                warn!(
+                    project_id = project_ctx.project.id,
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    "Project policy unavailable; denying request"
+                );
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                    .await?;
+                ctx.routing_status = "request_policy_unavailable".to_string();
+                return Ok(true);
+            }
+            if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
                 warn!(
                     environment_id = project_ctx.environment.id,
                     project_id = project_ctx.project.id,
@@ -7619,9 +7724,9 @@ mod content_type_tests {
 
 #[cfg(test)]
 mod ip_restriction_fail_closed_tests {
-    use super::ip_restriction_denies;
+    use super::{ip_restriction_denies, legacy_ip_gate_denies, normalize_client_ip};
     use std::net::IpAddr;
-    use temps_core::ProjectIpGate;
+    use temps_core::{ProjectIpGate, RequestPolicyDecision};
 
     /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
     /// project/environment is on a closed/restricted mode: `is_allowed`
@@ -7636,6 +7741,14 @@ mod ip_restriction_fail_closed_tests {
         fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
             true
         }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            _ip: Option<IpAddr>,
+        ) -> bool {
+            false
+        }
     }
 
     /// Stands in for the common case: no restriction configured for this
@@ -7647,6 +7760,21 @@ mod ip_restriction_fail_closed_tests {
             true
         }
         // has_active_policy uses the trait default (`false`).
+    }
+
+    struct ExplicitDenyGate;
+    impl ProjectIpGate for ExplicitDenyGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            ip: Option<IpAddr>,
+        ) -> bool {
+            ip.is_none() || ip == Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)))
+        }
     }
 
     #[test]
@@ -7672,6 +7800,56 @@ mod ip_restriction_fail_closed_tests {
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         assert!(ip_restriction_denies(&RestrictedGate, 1, 1, Some(ip)));
         assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, Some(ip)));
+    }
+
+    #[test]
+    fn policy_continue_keeps_legacy_restrictions_but_allow_owns_access() {
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Continue,
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Deny {
+                reason: "blocked",
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None
+            },
+            &ExplicitDenyGate,
+            1,
+            2,
+            None
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv6_uses_ipv4_identity_for_both_gates() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let ipv4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(normalize_client_ip(mapped), ipv4);
+        assert_eq!(normalize_client_ip(ipv4), ipv4);
     }
 }
 
