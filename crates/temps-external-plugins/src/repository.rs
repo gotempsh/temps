@@ -3,13 +3,15 @@
 
 //! Fetch an exact GitHub commit and compile it in a resource-bounded Bun image.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
 pub(crate) const BUILDER_IMAGE: &str =
@@ -18,6 +20,50 @@ const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+// Source (up to 128 MiB), dependency cache, and a compiled binary (up to
+// 256 MiB) share /work. Leave headroom for Bun and keep total tmpfs below
+// the container's 1536 MiB memory+swap ceiling.
+const BUILD_CONTAINER_ARGS: &[&str] = &[
+    "create",
+    "--network",
+    "bridge",
+    "--cpus",
+    "1",
+    "--memory",
+    "1536m",
+    "--memory-swap",
+    "1536m",
+    "--pids-limit",
+    "128",
+    "--read-only",
+    "--log-driver",
+    "none",
+    "--user",
+    "0:0",
+    "--security-opt",
+    "no-new-privileges",
+    "--cap-drop",
+    "ALL",
+    "--tmpfs",
+    "/tmp:rw,noexec,nosuid,size=128m",
+    "--tmpfs",
+    "/work:rw,nosuid,size=768m",
+    "--env",
+    "HOME=/work/home",
+    "--env",
+    "XDG_CACHE_HOME=/work/cache",
+    "--env",
+    "BUN_INSTALL_CACHE_DIR=/work/cache/bun",
+    "--env",
+    "TMPDIR=/tmp",
+    "--workdir",
+    "/work",
+    "--entrypoint",
+    "/bin/sh",
+    BUILDER_IMAGE,
+    "-c",
+    "sleep 660",
+];
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -669,32 +715,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         }
     }
     let create = Command::new("docker")
-        .args([
-            "create",
-            "--network",
-            "bridge",
-            "--cpus",
-            "1",
-            "--memory",
-            "512m",
-            "--pids-limit",
-            "128",
-            "--user",
-            "0:0",
-            "--security-opt",
-            "no-new-privileges",
-            "--cap-drop",
-            "ALL",
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=128m",
-            "--workdir",
-            "/work",
-            "--entrypoint",
-            "/bin/sh",
-            BUILDER_IMAGE,
-            "-c",
-            "sleep 660",
-        ])
+        .args(BUILD_CONTAINER_ARGS)
         .output()
         .await
         .map_err(|error| run(format!("create container: {error}")))?;
@@ -709,21 +730,6 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         return Err(run("Docker returned an invalid container identifier".into()));
     }
     let result = async {
-        let copy = Command::new("docker")
-            .args([
-                "cp",
-                &format!("{}/.", source.source_dir.display()),
-                &format!("{id}:/work"),
-            ])
-            .output()
-            .await
-            .map_err(|error| run(format!("copy source: {error}")))?;
-        if !copy.status.success() {
-            return Err(run(format!(
-                "copy source: {}",
-                String::from_utf8_lossy(&copy.stderr)
-            )));
-        }
         let start = Command::new("docker")
             .args(["start", &id])
             .output()
@@ -734,6 +740,53 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
                 "start build container: {}",
                 String::from_utf8_lossy(&start.stderr)
             )));
+        }
+        // Docker installs tmpfs mounts only when the container starts. Copying
+        // before this point would place the source in its writable image layer.
+        let dirs = Command::new("docker")
+            .args(["exec", &id, "mkdir", "-p", "/work/home", "/work/cache/bun"])
+            .output()
+            .await
+            .map_err(|error| run(format!("prepare bounded build directories: {error}")))?;
+        if !dirs.status.success() {
+            return Err(run(format!(
+                "prepare bounded build directories: {}",
+                String::from_utf8_lossy(&dirs.stderr)
+            )));
+        }
+        // docker cp refuses a read-only rootfs even when the destination is
+        // tmpfs. Stream a capped archive through docker exec into /work.
+        let mut archive = Command::new("tar")
+            .args(["-C", &source.source_dir.display().to_string(), "-cf", "-", "."])
+            .env("COPYFILE_DISABLE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| run(format!("archive source for bounded staging: {error}")))?;
+        let mut extract = Command::new("docker")
+            .args(["exec", "-i", &id, "tar", "--no-same-owner", "-xf", "-", "-C", "/work"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| run(format!("start bounded source staging: {error}")))?;
+        let archive_stdout = archive.stdout.take().ok_or_else(|| run("source archive stdout unavailable".into()))?;
+        let mut extract_stdin = extract.stdin.take().ok_or_else(|| run("source staging stdin unavailable".into()))?;
+        let copied = tokio::time::timeout(BUILD_TIMEOUT, tokio::io::copy(&mut archive_stdout.take(MAX_ARCHIVE_BYTES as u64 + 1), &mut extract_stdin))
+            .await
+            .map_err(|_| run("bounded source staging exceeded 300 seconds".into()))?
+            .map_err(|error| run(format!("stream source into bounded work tmpfs: {error}")))?;
+        if copied > MAX_ARCHIVE_BYTES as u64 {
+            return Err(run(format!("source staging archive exceeds {MAX_ARCHIVE_BYTES} bytes")));
+        }
+        extract_stdin.shutdown().await.map_err(|error| run(format!("finish bounded source staging: {error}")))?;
+        drop(extract_stdin);
+        let archive_status = tokio::time::timeout(BUILD_TIMEOUT, archive.wait()).await.map_err(|_| run("source archive exceeded 300 seconds".into()))?.map_err(|error| run(format!("archive source: {error}")))?;
+        let extract_status = tokio::time::timeout(BUILD_TIMEOUT, extract.wait()).await.map_err(|_| run("source extraction exceeded 300 seconds".into()))?.map_err(|error| run(format!("extract source in bounded work tmpfs: {error}")))?;
+        if !archive_status.success() || !extract_status.success() {
+            return Err(run(format!("bounded source staging failed (archive {archive_status}, extract {extract_status})")));
         }
         // Package resolution may use the network, but lifecycle scripts are
         // disabled. Disconnect before compiling attacker-controlled source.
@@ -749,6 +802,7 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
                     "--ignore-scripts",
                 ])
                 .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
         )
@@ -756,8 +810,6 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
         .map_err(|_| run("dependency install exceeded 300 seconds".into()))?
         .map_err(|error| run(format!("install dependencies: {error}")))?;
         if !install.status.success() {
-            #[cfg(test)]
-            eprintln!("Bun install diagnostic: {}", String::from_utf8_lossy(&install.stderr));
             return Err(run(format!(
                 "dependency install failed with exit status {}", install.status
             )));
@@ -838,21 +890,35 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
                 crate::install::MAX_BINARY_BYTES
             )));
         }
-        let copy = Command::new("docker")
-            .args([
-                "cp",
-                &format!("{id}:/work/plugin"),
-                &output.display().to_string(),
-            ])
-            .output()
+        // docker cp cannot inspect tmpfs paths under a read-only rootfs.
+        // Stream the output through exec and enforce the same binary cap.
+        let mut export = Command::new("docker")
+            .args(["exec", &id, "cat", "/work/plugin"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| run(format!("export compiled binary: {error}")))?;
+        let export_stdout = export.stdout.take().ok_or_else(|| run("compiled binary stream unavailable".into()))?;
+        let mut destination = tokio::fs::File::create(output)
             .await
-            .map_err(|error| run(format!("copy output: {error}")))?;
-        if !copy.status.success() {
-            return Err(run(format!(
-                "copy output: {}",
-                String::from_utf8_lossy(&copy.stderr)
-            )));
+            .map_err(|error| run(format!("create compiled output {}: {error}", output.display())))?;
+        let exported = tokio::time::timeout(BUILD_TIMEOUT, tokio::io::copy(&mut export_stdout.take(crate::install::MAX_BINARY_BYTES + 1), &mut destination))
+            .await
+            .map_err(|_| run("compiled output export exceeded 300 seconds".into()))?
+            .map_err(|error| run(format!("stream compiled output {}: {error}", output.display())))?;
+        if exported > crate::install::MAX_BINARY_BYTES {
+            return Err(run(format!("compiled binary exceeds {}-byte limit", crate::install::MAX_BINARY_BYTES)));
         }
+        destination.flush().await.map_err(|error| run(format!("flush compiled output {}: {error}", output.display())))?;
+        let export_status = tokio::time::timeout(BUILD_TIMEOUT, export.wait()).await.map_err(|_| run("compiled output export exceeded 300 seconds".into()))?.map_err(|error| run(format!("finish compiled output export: {error}")))?;
+        if !export_status.success() || exported != byte_count {
+            return Err(run(format!("compiled output export failed or size changed (status {export_status}, expected {byte_count}, received {exported})")));
+        }
+        #[cfg(unix)]
+        tokio::fs::set_permissions(output, std::fs::Permissions::from_mode(0o500))
+            .await
+            .map_err(|error| run(format!("mark compiled output {} executable: {error}", output.display())))?;
         Ok(())
     }
     .await;
@@ -866,6 +932,82 @@ pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn builder_writable_paths_are_bounded_when_docker_available() {
+        let available = Command::new("docker")
+            .arg("info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        let image_available = Command::new("docker")
+            .args(["image", "inspect", BUILDER_IMAGE])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if !image_available {
+            return;
+        }
+        eprintln!("Docker builder quota probe running against pinned image");
+        let create = Command::new("docker")
+            .args(BUILD_CONTAINER_ARGS)
+            .output()
+            .await
+            .expect("create bounded builder");
+        assert!(
+            create.status.success(),
+            "{}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+        let id = String::from_utf8_lossy(&create.stdout).trim().to_owned();
+        let start = Command::new("docker")
+            .args(["start", &id])
+            .output()
+            .await
+            .expect("start builder");
+        let probe = if start.status.success() {
+            Some(Command::new("docker")
+                .args([
+                    "exec", &id, "/bin/sh", "-c",
+                    "grep -q ' /work tmpfs ' /proc/mounts && grep -q ' /tmp tmpfs ' /proc/mounts && test \"$HOME\" = /work/home && test \"$XDG_CACHE_HOME\" = /work/cache && test \"$BUN_INSTALL_CACHE_DIR\" = /work/cache/bun && ! touch /root/temps-should-not-write && dd if=/dev/zero of=/work/quota-probe bs=1M count=900 2>/tmp/quota-error; test $? -ne 0 && grep -qi 'no space left' /tmp/quota-error",
+                ])
+                .output()
+                .await
+                .expect("probe root and work quota"))
+        } else {
+            None
+        };
+        let cleanup = Command::new("docker")
+            .args(["rm", "-f", &id])
+            .output()
+            .await
+            .expect("remove builder");
+        assert!(
+            cleanup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cleanup.stderr)
+        );
+        assert!(
+            start.status.success(),
+            "{}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let probe = probe.expect("started builder has probe result");
+        assert!(
+            probe.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        eprintln!("Docker builder quota probe confirmed read-only root and /work ENOSPC");
+    }
 
     #[tokio::test]
     async fn public_template_build_produces_host_binary_when_docker_available() {

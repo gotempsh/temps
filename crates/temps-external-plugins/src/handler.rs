@@ -47,7 +47,7 @@ async fn get_installation_reporting(
             tracing::error!(error = %error, "Cannot read plugin installation reporting setting");
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Plugin Reporting Setting Unavailable")
-                .with_detail(error.to_string())
+                .with_detail("Could not read the plugin reporting setting. Please try again later.")
         })?;
     Ok(Json(InstallationReportingSettings { enabled }))
 }
@@ -72,7 +72,7 @@ async fn put_installation_reporting(
         &state,
         &ExternalPluginWriteAudit {
             context: audit_context(&auth, &metadata),
-            operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string(),
+            operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
             plugin_name: None,
             version: None,
             platform: None,
@@ -83,16 +83,50 @@ async fn put_installation_reporting(
         },
     )
     .await?;
-    state
+    if let Err(error) = state
         .service
         .set_installation_reporting_consent(request.enabled)
         .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "Cannot save plugin installation reporting setting");
+    {
+        tracing::error!(error = %error, "Cannot save plugin installation reporting setting");
+        record_audit(
+            &state,
+            &ExternalPluginWriteAudit {
+                context: audit_context(&auth, &metadata),
+                operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_FAILED".to_string(),
+                plugin_name: None,
+                version: None,
+                platform: None,
+                sha256: None,
+                signer_key_id: None,
+                registry_source: None,
+                failure: Some("Plugin reporting setting could not be saved".to_string()),
+            },
+        )
+        .await;
+        return Err(
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Plugin Reporting Setting Unavailable")
-                .with_detail(error.to_string())
-        })?;
+                .with_detail(
+                    "Could not save the plugin reporting setting. Please try again later.",
+                ),
+        );
+    }
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string(),
+            plugin_name: None,
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        },
+    )
+    .await;
     Ok(Json(request))
 }
 
@@ -1317,8 +1351,80 @@ mod tests {
         assert!(persisted.enabled);
         assert_eq!(
             *audit.operations.lock().expect("audit lock"),
-            vec!["EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string()]
+            vec![
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string(),
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn reporting_consent_db_failure_has_no_success_audit() {
+        const PRIVATE_DIAGNOSTIC: &str = "settings write failed: password=private-db-password";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(PRIVATE_DIAGNOSTIC.to_string())])
+                .into_connection(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, db)),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        let error = put_installation_reporting(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Json(InstallationReportingSettings { enabled: true }),
+        )
+        .await
+        .expect_err("failed persistence must not report success");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let public_body = serde_json::to_string(&error.body).expect("serialize problem body");
+        assert!(!public_body.contains(PRIVATE_DIAGNOSTIC));
+        assert!(!public_body.contains("private-db-password"));
+        assert_eq!(
+            *audit.operations.lock().expect("audit lock"),
+            vec![
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_FAILED".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reporting_consent_read_failure_does_not_expose_database_diagnostic() {
+        const PRIVATE_DIAGNOSTIC: &str = "settings read failed: password=private-db-password";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(PRIVATE_DIAGNOSTIC.to_string())])
+                .into_connection(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, db)),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        let error = get_installation_reporting(user_auth(Role::PlatformAdmin), State(state))
+            .await
+            .expect_err("failed read must not expose database diagnostic");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let public_body = serde_json::to_string(&error.body).expect("serialize problem body");
+        assert!(!public_body.contains(PRIVATE_DIAGNOSTIC));
+        assert!(!public_body.contains("private-db-password"));
     }
 
     #[tokio::test]
