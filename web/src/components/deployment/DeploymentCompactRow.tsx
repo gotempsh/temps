@@ -91,23 +91,25 @@ export default function DeploymentCompactRow({
   }, [deployment.status, pollDeployment])
 
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2 px-3 py-2.5 sm:grid-cols-[250px_minmax(0,1fr)_140px_32px] sm:items-center">
+    <div className="grid grid-cols-[minmax(0,1fr)_28px] items-start gap-x-3 gap-y-2 p-4 sm:grid-cols-[minmax(0,1fr)_auto_28px]">
       {/* Primary line: id + status + env + current */}
       <div className="min-w-0">
-        <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:hidden">
-          Deployment
-        </span>
-        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="font-medium text-sm">#{deployment.id}</span>
           <DeploymentStatusBadge
             deployment={deployment}
-            className="text-[10px] px-1.5 py-0 h-5"
+            className="text-xs px-2 py-0 h-6"
           />
-          <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-5">
-            {deployment.environment.name}
+          <Badge
+            variant="secondary"
+            className="min-w-0 max-w-full text-xs px-2 py-0 h-6"
+          >
+            <span className="truncate" title={deployment.environment.name}>
+              {deployment.environment.name}
+            </span>
           </Badge>
           {deployment.is_current && (
-            <Badge className="bg-green-600 hover:bg-green-700 flex items-center gap-0.5 text-[10px] px-1.5 py-0 h-5">
+            <Badge className="bg-green-600 hover:bg-green-700 flex shrink-0 items-center gap-1 text-xs px-2 py-0 h-6">
               <CheckCircle2 className="h-2.5 w-2.5" />
               Current
             </Badge>
@@ -116,17 +118,17 @@ export default function DeploymentCompactRow({
       </div>
 
       {/* Meta line: source info — takes remaining space, truncates */}
-      <div className="min-w-0 text-xs text-muted-foreground">
-        <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide sm:hidden">
-          Source
-        </span>
-        <div className="flex min-w-0 items-center gap-3">
+      <div className="col-start-1 row-start-2 min-w-0 text-xs text-muted-foreground">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           {source.kind === 'git' ? (
             <>
               {source.branch && (
                 <div className="flex shrink-0 items-center gap-1">
                   <GitBranch className="h-3 w-3" />
-                  <span className="max-w-[100px] truncate">
+                  <span
+                    className="max-w-[160px] truncate"
+                    title={source.branch}
+                  >
                     {source.branch}
                   </span>
                 </div>
@@ -138,7 +140,9 @@ export default function DeploymentCompactRow({
                 </div>
               )}
               {source.message && (
-                <span className="min-w-0 truncate">{source.message}</span>
+                <span className="min-w-0 truncate" title={source.message}>
+                  {source.message}
+                </span>
               )}
             </>
           ) : (
@@ -167,7 +171,7 @@ export default function DeploymentCompactRow({
       </div>
 
       {/* Created by + time */}
-      <div className="flex min-w-0 items-center justify-end gap-2 sm:justify-start">
+      <div className="col-start-1 row-start-3 flex min-w-0 items-center gap-2 sm:col-start-2 sm:row-start-1 sm:self-center">
         {deployment.commit_author && (
           <Avatar className="h-5 w-5 shrink-0">
             <AvatarImage
@@ -180,16 +184,13 @@ export default function DeploymentCompactRow({
           </Avatar>
         )}
         <div className="min-w-0">
-          <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:hidden">
-            Created
-          </span>
           <span className="text-xs text-muted-foreground whitespace-nowrap">
             <TimeAgo date={deployment.created_at} />
           </span>
         </div>
       </div>
 
-      <div className="col-start-2 row-start-1 flex justify-end sm:col-start-4 sm:row-start-auto">
+      <div className="col-start-2 row-start-1 flex justify-end sm:col-start-3 sm:row-span-2 sm:self-center">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button

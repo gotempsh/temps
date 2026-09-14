@@ -807,6 +807,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             size="icon"
             className="h-7 w-7"
             onClick={() => refetch()}
+            aria-label="Refresh deployments"
             disabled={isFetching}
           >
             {isFetching ? (
@@ -818,39 +819,34 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      <Card>
-        <div className="hidden grid-cols-[250px_minmax(0,1fr)_140px_32px] items-center gap-3 border-b bg-muted/30 px-3 py-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:grid">
-          <span>Deployment</span>
-          <span>Source</span>
-          <span>Created</span>
-          <span className="sr-only">Actions</span>
-        </div>
-        <ul className="divide-y divide-border">
-          {deploymentsData.deployments.map((deployment) => (
-            <li key={deployment.id}>
-              <Link
-                to={`/projects/${project.slug}/deployments/${deployment.id}`}
-                className="block transition-colors hover:bg-muted/50"
-              >
-                <DeploymentCompactRow
-                  deployment={deployment}
-                  projectSourceType={project.source_type}
-                  onRedeploy={() => {
-                    setSelectedDeployment(deployment.id)
-                    setIsRedeployModalOpen(true)
-                  }}
-                  onCancel={() => handleCancelDeployment(deployment.id)}
-                  onRollback={() => handleRollbackDeployment(deployment.id)}
-                  onPromote={() => {
-                    setPromoteDeploymentId(deployment.id)
-                    setPromoteTargetEnv('')
-                  }}
-                />
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </Card>
+      <ul aria-label="Deployments" className="space-y-3">
+        {deploymentsData.deployments.map((deployment) => (
+          <li
+            key={deployment.id}
+            className="overflow-hidden rounded-lg border bg-card"
+          >
+            <Link
+              to={`/projects/${project.slug}/deployments/${deployment.id}`}
+              className="block transition-colors hover:bg-muted/50"
+            >
+              <DeploymentCompactRow
+                deployment={deployment}
+                projectSourceType={project.source_type}
+                onRedeploy={() => {
+                  setSelectedDeployment(deployment.id)
+                  setIsRedeployModalOpen(true)
+                }}
+                onCancel={() => handleCancelDeployment(deployment.id)}
+                onRollback={() => handleRollbackDeployment(deployment.id)}
+                onPromote={() => {
+                  setPromoteDeploymentId(deployment.id)
+                  setPromoteTargetEnv('')
+                }}
+              />
+            </Link>
+          </li>
+        ))}
+      </ul>
 
       {/* Pagination */}
       {totalPages > 1 && (
@@ -869,6 +865,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Previous"
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
               disabled={currentPage <= 1 || isFetching}
             >
@@ -878,6 +875,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Next"
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
