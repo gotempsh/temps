@@ -60,12 +60,9 @@ pub const PREVIEW_GATEWAY_IMAGE: &str = match temps_core::release_images::PREVIE
 };
 
 fn resolved_gateway_image(configured: &str) -> String {
-    // Existing installations persisted the former compiled default. Treat
-    // that exact value as the default, not as an operator-supplied override.
-    if configured.trim().is_empty()
-        || (temps_core::release_images::PREVIEW_GATEWAY.is_some()
-            && configured == temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE)
-    {
+    // Only the empty settings value follows the release. A nonempty digest,
+    // including an older default digest, may be an intentional operator pin.
+    if configured.is_empty() {
         PREVIEW_GATEWAY_IMAGE.to_string()
     } else {
         configured.to_string()
@@ -1604,15 +1601,12 @@ mod tests {
 
     #[test]
     fn default_gateway_image_is_immutable() {
-        assert_eq!(
-            PREVIEW_GATEWAY_IMAGE,
-            PreviewGatewaySettings::default().image
-        );
+        assert!(PreviewGatewaySettings::default().image.is_empty());
         assert!(PREVIEW_GATEWAY_IMAGE.contains("@sha256:"));
         assert_eq!(resolved_gateway_image(""), PREVIEW_GATEWAY_IMAGE);
         assert_eq!(
             resolved_gateway_image(temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE),
-            PREVIEW_GATEWAY_IMAGE
+            temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE
         );
         assert_eq!(
             resolved_gateway_image("ghcr.io/operator/custom@sha256:1234"),

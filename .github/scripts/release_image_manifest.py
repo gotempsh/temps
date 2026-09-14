@@ -76,6 +76,26 @@ def promotion_tags(kind, channel, daemon_version, sandbox_version, gateway_versi
     return [f"{REPOSITORIES[kind]}:{suffix}" for suffix in suffixes]
 
 
+def promote_images(manifest, channel, daemon_version, sandbox_version, gateway_version):
+    # Validate the complete plan before the first registry write. Python's
+    # legacy and daemon images share a repository but must never share an alias.
+    plan = []
+    owners = {}
+    for kind, reference in manifest["images"].items():
+        tags = promotion_tags(kind, channel, daemon_version, sandbox_version, gateway_version)
+        for tag in tags:
+            if tag in owners:
+                raise ValueError(f"Image alias collision: {tag} belongs to both {owners[tag]} and {kind}; use distinct daemon and sandbox versions")
+            owners[tag] = kind
+        plan.append((tags, reference))
+    verify_registry(manifest)
+    for tags, reference in plan:
+        command = ["docker", "buildx", "imagetools", "create"]
+        for tag in tags:
+            command.extend(["--tag", tag])
+        subprocess.run([*command, reference], check=True, timeout=120)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -98,14 +118,8 @@ def main():
     args = parser.parse_args()
     if args.command == "promote":
         manifest = assemble([json.loads(args.manifest.read_text())], args.revision)
-        verify_registry(manifest)
-        for kind, reference in manifest["images"].items():
-            tags = promotion_tags(kind, args.channel, args.daemon_version,
-                                  args.sandbox_version, args.gateway_version)
-            command = ["docker", "buildx", "imagetools", "create"]
-            for tag in tags:
-                command.extend(["--tag", tag])
-            subprocess.run([*command, reference], check=True, timeout=120)
+        promote_images(manifest, args.channel, args.daemon_version,
+                       args.sandbox_version, args.gateway_version)
         return
     if args.command == "record":
         manifest = record(args.kind, args.digest, args.revision)

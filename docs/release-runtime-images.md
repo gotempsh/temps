@@ -33,9 +33,17 @@ The manifest supplies defaults for managed application workspaces and isolated
 credential checks, legacy preset sandboxes, and the preview gateway. Its values
 are embedded at compile time; the manifest file is not required on the server.
 Changing a runtime environment variable cannot switch these embedded defaults.
-Explicit operator image overrides/pins remain operator choices. The exact
-historical preview gateway default is recognized as a default and upgraded;
-other custom gateway images are preserved.
+Explicit operator image overrides/pins remain operator choices, including the
+historical preview gateway digest. An empty gateway image means follow the
+release default; Reset to default clears the override when settings are saved.
+Existing nonempty settings remain pinned because historical defaults cannot be
+distinguished safely from explicit operator choices.
+
+Alias promotion validates the complete plan before any registry operation.
+Equal daemon and legacy sandbox versions are rejected because their Python
+images share a repository and would otherwise overwrite each other's aliases.
+Rebuilding immutable images locally is rejected before removing any image;
+update the release or choose a mutable development image for local rebuilds.
 
 Local source builds without a manifest retain development defaults. They do not
 claim release consistency: use published release artifacts or supply a complete

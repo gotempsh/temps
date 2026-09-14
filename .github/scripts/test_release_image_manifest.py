@@ -6,7 +6,7 @@ import json
 import subprocess
 from unittest.mock import patch
 
-from release_image_manifest import REPOSITORIES, assemble, record, verify_platforms, verify_registry, promotion_tags
+from release_image_manifest import REPOSITORIES, assemble, record, verify_platforms, verify_registry, promotion_tags, promote_images
 
 
 class ReleaseImageManifestTests(unittest.TestCase):
@@ -87,6 +87,27 @@ class ReleaseImageManifestTests(unittest.TestCase):
                 {"platform": {"os": "linux", "architecture": "amd64"}}]})
             with self.assertRaises(ValueError):
                 verify_registry(manifest)
+
+    def test_alias_collisions_fail_before_any_registry_operation(self):
+        manifest = assemble(self.records(), "a" * 40)
+        for channel in ("stable", "beta"):
+            with self.subTest(channel=channel), patch("release_image_manifest.subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "Image alias collision.*daemon_python.*sandbox_python"):
+                    promote_images(manifest, channel, "0.3.4", "0.3.4", "0.1.0")
+                run.assert_not_called()
+
+    def test_valid_promotion_checks_registry_before_writing_exact_digests(self):
+        manifest = assemble(self.records(), "a" * 40)
+        index = {"manifests": [{"platform": {"os": "linux", "architecture": arch}}
+                               for arch in ("amd64", "arm64")]}
+        with patch("release_image_manifest.subprocess.run") as run, patch("builtins.print"):
+            run.return_value.stdout = json.dumps(index)
+            promote_images(manifest, "stable", "0.3.4", "0.1.0", "0.1.0")
+            self.assertEqual(run.call_count, 20)
+            self.assertTrue(all(call.args[0][3] == "inspect" for call in run.call_args_list[:10]))
+            for call, reference in zip(run.call_args_list[10:], manifest["images"].values()):
+                self.assertEqual(call.args[0][:4], ["docker", "buildx", "imagetools", "create"])
+                self.assertEqual(call.args[0][-1], reference)
 
 
 if __name__ == "__main__":

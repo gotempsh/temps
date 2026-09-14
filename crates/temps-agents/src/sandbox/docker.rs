@@ -1420,6 +1420,15 @@ impl DockerSandboxConfig {
     }
 }
 
+fn ensure_mutable_rebuild_target(image: &str) -> Result<(), AgentError> {
+    if image.contains("@sha256:") || image.starts_with("sha256:") {
+        return Err(AgentError::ImmutableSandboxImageRebuild {
+            image: image.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Docker-based sandbox provider. Each agent run gets its own container with
 /// bind-mounted work directory, resource limits, and security hardening.
 pub struct DockerSandboxProvider {
@@ -4769,6 +4778,7 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn rebuild_image(&self) -> Result<String, AgentError> {
         let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
 
         // Remove existing image (force, in case containers reference it)
         if self.docker.inspect_image(&image_name).await.is_ok() {
@@ -4795,6 +4805,7 @@ impl SandboxProvider for DockerSandboxProvider {
         on_progress: tokio::sync::mpsc::Sender<String>,
     ) -> Result<String, AgentError> {
         let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
 
         // Remove existing image
         if self.docker.inspect_image(&image_name).await.is_ok() {
@@ -6709,6 +6720,20 @@ mod tests {
             image_name_for_runtime_in_channel("custom", SandboxChannel::Stable),
             format!("ghcr.io/gotempsh/temps-sandbox-custom:{SANDBOX_IMAGE_VERSION}")
         );
+    }
+
+    #[test]
+    fn immutable_digest_rebuild_is_rejected_before_any_docker_action() {
+        for image in [
+            "ghcr.io/gotempsh/temps-sandbox-node@sha256:aaaaaaaa",
+            "sha256:aaaaaaaa",
+        ] {
+            assert!(matches!(
+                ensure_mutable_rebuild_target(image),
+                Err(AgentError::ImmutableSandboxImageRebuild { image: rejected }) if rejected == image
+            ));
+        }
+        assert!(ensure_mutable_rebuild_target("ghcr.io/gotempsh/temps-sandbox-node:dev").is_ok());
     }
 
     #[test]

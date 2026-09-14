@@ -222,7 +222,7 @@ pub async fn upgrade_preview_gateway(
     permission_guard!(auth, SettingsWrite);
 
     let new_image = if body.image.trim().is_empty() {
-        PREVIEW_GATEWAY_IMAGE.to_string()
+        String::new()
     } else {
         body.image.trim().to_string()
     };
@@ -340,6 +340,22 @@ mod tests {
     use axum::{body::to_bytes, http::header::CONTENT_TYPE, response::IntoResponse};
 
     use super::*;
+
+    #[test]
+    fn settings_response_exposes_empty_default_without_turning_it_into_a_pin() {
+        let settings = PreviewGatewaySettings::default();
+        assert!(settings.image.is_empty());
+        let response = PreviewGatewaySettingsResponse::from(settings);
+        assert!(response.image.is_empty());
+        assert_eq!(response.default_image, PREVIEW_GATEWAY_IMAGE);
+
+        let explicit = PreviewGatewaySettings {
+            image: "ghcr.io/operator/gateway@sha256:old-digest".into(),
+            ..PreviewGatewaySettings::default()
+        };
+        let response = PreviewGatewaySettingsResponse::from(explicit);
+        assert_eq!(response.image, "ghcr.io/operator/gateway@sha256:old-digest");
+    }
 
     #[tokio::test]
     async fn internal_anyhow_problem_preserves_complete_error_chain() {

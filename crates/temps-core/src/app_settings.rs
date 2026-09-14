@@ -1317,8 +1317,8 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Pinned by digest per Temps release.
-    /// Operators can override this to test a custom build.
+    /// Docker image reference for the gateway. Empty follows this Temps
+    /// release's digest; any nonempty value is an explicit operator pin.
     #[schema(
         example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
@@ -1371,9 +1371,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: crate::release_images::PREVIEW_GATEWAY
-                .unwrap_or(crate::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE)
-                .to_string(),
+            image: String::new(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
             auto_upgrade: true,
@@ -1925,6 +1923,17 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_default_serializes_as_unpinned_across_releases() {
+        let settings = PreviewGatewaySettings::default();
+        assert_eq!(settings.image, "");
+        let serialized = serde_json::to_value(&settings).expect("serialize gateway settings");
+        assert_eq!(serialized["image"], "");
+        let restored: PreviewGatewaySettings = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize historical settings without image");
+        assert!(restored.image.is_empty());
+    }
 
     // ── ADR-042 §3: the bulk-activation throttle ──────────────────────
 

@@ -218,7 +218,7 @@ export function PreviewGatewayCard() {
     try {
       await patchPreviewGatewaySettings({
         body: {
-          image: imageInput.trim() || undefined,
+          image: imageInput.trim(),
           host_port: hostPort,
           auto_upgrade: autoUpgrade,
         },
@@ -243,7 +243,7 @@ export function PreviewGatewayCard() {
 
   const handleResetImage = () => {
     if (settings) {
-      setImageInput(settings.default_image)
+      setImageInput('')
       setIsDirty(true)
     }
   }
@@ -437,7 +437,7 @@ export function PreviewGatewayCard() {
               Pull & apply
             </Button>
           </div>
-          {settings && imageInput !== settings.default_image && (
+          {settings && imageInput.trim() !== '' && (
             <button
               onClick={handleResetImage}
               className="text-xs text-muted-foreground underline hover:text-foreground"
