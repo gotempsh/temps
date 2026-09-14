@@ -7,6 +7,9 @@ import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { resolveTimeRange, serializeTimeRange } from '@/lib/time-range-filter'
 import {
   Select,
   SelectContent,
@@ -18,12 +21,12 @@ import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { Bot, ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
-import { useMemo } from 'react'
+import { Bot, ExternalLink, RefreshCw } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 const ALL = '__all__'
-const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const
+const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
 const DEFAULT_PAGE_SIZE = 50
 
 /** Color a status-code pill the way the rest of the app does. */
@@ -59,6 +62,11 @@ export function AiCrawlerActivityFeed({
 }: AiCrawlerActivityFeedProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
+  const range = searchParams.get('range') || '24h'
+  const [now, setNow] = useState(Date.now)
+  // Freeze the window while paging so new requests cannot shift page boundaries.
+  const timeRange = useMemo(() => resolveTimeRange(range, now), [range, now])
+
   const provider = searchParams.get('ai_provider') || ''
   const agent = searchParams.get('ai_agent') || ''
   const path = searchParams.get('path') || ''
@@ -92,12 +100,14 @@ export function AiCrawlerActivityFeed({
     setSearchParams(next, { replace: true })
   }
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: projectId || null,
         environment_id: environmentId || null,
         is_ai_agent: true,
+        start_date: timeRange.from,
+        end_date: timeRange.to,
         ai_provider: provider || null,
         ai_agent: agent || null,
         path: path || null,
@@ -118,6 +128,32 @@ export function AiCrawlerActivityFeed({
 
   return (
     <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <DateTimeRange
+          value={timeRange}
+          maxRangeDays={projectId ? 30 : 7}
+          onChange={(value) => {
+            setParam('range', serializeTimeRange(value))
+          }}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          aria-label="Refresh AI crawler activity"
+          onClick={() => {
+            setNow(Date.now())
+            setParam('page', null)
+            if (timeRange.preset === 'custom' && page === 1) void refetch()
+          }}
+        >
+          <RefreshCw className="h-4 w-4" />
+          Refresh
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {format(new Date(timeRange.from), 'PPpp')} –{' '}
+        {format(new Date(timeRange.to), 'PPpp')} (local time)
+      </p>
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
         <Select
@@ -180,9 +216,10 @@ export function AiCrawlerActivityFeed({
         )}
 
         <div className="text-sm text-muted-foreground sm:ml-auto">
-          {!isLoading && total > 0 && (
+          {!isLoading && !error && (
             <span>
-              {total.toLocaleString()} request{total === 1 ? '' : 's'}
+              {total.toLocaleString()} request{total === 1 ? '' : 's'} in
+              selected range
             </span>
           )}
         </div>
@@ -207,57 +244,15 @@ export function AiCrawlerActivityFeed({
 
       {/* Pagination + configurable page size (shown whenever there are rows) */}
       {!isLoading && !error && logs.length > 0 && (
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span>Per page</span>
-            <Select
-              value={String(pageSize)}
-              onValueChange={(v) => {
-                const next = new URLSearchParams(searchParams)
-                next.set('page_size', v)
-                // Resizing changes which rows fall on page 1, so reset.
-                next.delete('page')
-                setSearchParams(next, { replace: true })
-              }}
-            >
-              <SelectTrigger className="h-8 w-[80px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {PAGE_SIZE_OPTIONS.map((size) => (
-                  <SelectItem key={size} value={String(size)}>
-                    {size}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">
-              <span className="hidden sm:inline">Page </span>
-              {page} / {Math.max(totalPages, 1)}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={page <= 1}
-              onClick={() => setParam('page', String(page - 1))}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline">Previous</span>
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={page >= totalPages}
-              onClick={() => setParam('page', String(page + 1))}
-            >
-              <span className="hidden sm:inline">Next</span>
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
+        <ResponsivePagination
+          page={page}
+          pageSize={data?.page_size ?? pageSize}
+          total={total}
+          totalPages={Math.max(totalPages, 1)}
+          pageSizeOptions={PAGE_SIZE_OPTIONS}
+          onPageChange={(next) => setParam('page', String(next))}
+          onPageSizeChange={(size) => setParam('page_size', String(size))}
+        />
       )}
     </div>
   )
@@ -337,11 +332,13 @@ function EmptyState({ hasActiveFilters }: { hasActiveFilters: boolean }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed py-12 text-center">
       <Bot className="h-8 w-8 text-muted-foreground" />
-      <p className="text-sm font-medium">No AI crawler activity yet</p>
+      <p className="text-sm font-medium">
+        No AI crawler activity in this range
+      </p>
       <p className="max-w-md text-xs text-muted-foreground">
         {hasActiveFilters
-          ? 'No requests match these filters in the current window. Try clearing them.'
-          : 'AI crawlers (ChatGPT, Claude, Perplexity, …) appear here as they fetch your sites. Requests logged before AI-agent detection was enabled are not reclassified retroactively.'}
+          ? 'No requests match these filters in the current window. Try a wider time range or clear the filters.'
+          : 'Try a wider time range to find older crawler requests. Requests logged before AI-agent detection was enabled are not reclassified retroactively.'}
       </p>
     </div>
   )
