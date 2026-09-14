@@ -24,8 +24,8 @@ info:
     name: MIT
 
 servers:
-  - url: https://api.temps.sh
-    description: Production server
+  - url: https://your-temps-instance.com
+    description: Your Temps instance
   - url: http://localhost:3000
     description: Development server
 

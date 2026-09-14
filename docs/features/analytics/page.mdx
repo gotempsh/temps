@@ -195,7 +195,7 @@ temps.track('feature_used', {
 
 ```bash {{ title: 'Server-Side' }}
 # Track events from backend
-curl -X POST https://api.temps.sh/events \
+curl -X POST https://your-temps-instance.com/api/_temps/events \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{

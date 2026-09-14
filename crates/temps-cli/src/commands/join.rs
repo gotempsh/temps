@@ -4,8 +4,9 @@
 //! `temps join` subcommand — joins a worker node to an existing cluster.
 //!
 //! Supports two modes:
-//! - **Relay mode** (default): Uses `api.temps.sh` relay for WireGuard key exchange
-//! - **Direct mode** (`--private-address`): Skips relay, uses user-managed networking
+//! - **Direct mode** (`--private-address`): registers over user-managed networking
+//! - **Relay mode** (`--relay-url`): uses an operator-run relay for WireGuard key
+//!   exchange. There is no public relay at the moment, so the URL must be given.
 //!
 //! After registration, saves the agent config to `~/.temps/agent.json` and exits.
 //! Run `temps agent` separately to start the worker.
@@ -38,9 +39,10 @@ pub struct JoinCommand {
     #[arg(long, default_value = "127.0.0.1:3100")]
     pub agent_address: String,
 
-    /// Relay URL for WireGuard key exchange
-    #[arg(long, default_value = "https://api.temps.sh", env = "TEMPS_RELAY_URL")]
-    pub relay_url: String,
+    /// Relay URL for WireGuard key exchange (relay mode). Required when
+    /// --private-address is not given; there is no public relay to default to.
+    #[arg(long, env = "TEMPS_RELAY_URL")]
+    pub relay_url: Option<String>,
 
     /// Labels for node scheduling (key=value pairs)
     #[arg(long, value_delimiter = ',')]
@@ -289,9 +291,16 @@ impl JoinCommand {
         if let Some(private_addr) = self.private_address.clone() {
             self.join_direct(&node_name, &private_addr, &labels, platform.as_deref())
                 .await?;
-        } else {
-            self.join_via_relay(&node_name, &labels, platform.as_deref())
+        } else if let Some(relay_url) = self.relay_url.clone() {
+            self.join_via_relay(&relay_url, &node_name, &labels, platform.as_deref())
                 .await?;
+        } else {
+            anyhow::bail!(
+                "No join mode selected. Pass --private-address <ip> to register over \
+                 your own network (direct mode), or --relay-url <url> (or TEMPS_RELAY_URL) \
+                 pointing at a relay you run for WireGuard key exchange. \
+                 There is no public relay at the moment."
+            );
         }
 
         Ok(())
@@ -447,14 +456,16 @@ impl JoinCommand {
         Ok(())
     }
 
-    /// Relay mode: use Temps Cloud relay for WireGuard key exchange.
+    /// Relay mode: use an operator-run relay for WireGuard key exchange.
     async fn join_via_relay(
         &self,
+        relay_url: &str,
         node_name: &str,
         labels: &serde_json::Value,
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
-        println!("Using relay mode via {}...", self.relay_url);
+        let relay_url = relay_url.trim_end_matches('/');
+        println!("Using relay mode via {}...", relay_url);
 
         // Step 1: Check if WireGuard is available
         let wg_manager = temps_wireguard::WireGuardManager::default_config()?;
@@ -474,7 +485,7 @@ impl JoinCommand {
         // Step 3: Contact relay to join cluster
         let client = reqwest::Client::new();
 
-        let join_url = format!("{}/api/relay/clusters/{}/join", self.relay_url, self.target);
+        let join_url = format!("{}/api/relay/clusters/{}/join", relay_url, self.target);
 
         // Detect our public endpoint (for WireGuard)
         let public_endpoint = detect_public_endpoint(wg_manager.listen_port()).await;

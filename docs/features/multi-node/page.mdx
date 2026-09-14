@@ -137,16 +137,20 @@ The agent reads its config from `~/.temps/agent.json` and begins sending heartbe
 
 ## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
 
-WireGuard mode creates an encrypted tunnel between the worker and the control plane. Use this when nodes are on different networks without direct connectivity.
+WireGuard mode creates an encrypted tunnel between the worker and the control plane. Use this when nodes are on different networks without direct connectivity. It needs a relay that brokers the WireGuard key exchange, and you point the worker at it with `--relay-url` (or `TEMPS_RELAY_URL`).
+
+<Note>
+There is no public relay at the moment. Without `--relay-url`, `temps join` refuses to start and tells you to choose direct mode or supply a relay you run. Direct mode is the supported path for most setups.
+</Note>
 
 ```bash
-temps join <control-plane-url> <join-token>
+temps join <cluster-id> <join-token> --relay-url https://relay.example.com
 ```
 
-Without `--private-address`, the join command:
+With `--relay-url`, the join command:
 
 1. Generates a WireGuard keypair
-2. Contacts the relay at `api.temps.sh` for key exchange
+2. Contacts your relay for key exchange
 3. Sets up a WireGuard tunnel (`wg0` interface) with a `10.100.0.x` address
 4. Registers with the control plane using the WireGuard address
 5. Saves the agent config to `~/.temps/agent.json`
