@@ -29,7 +29,7 @@ pingora = { workspace = true }
 pingora-core = { workspace = true }
 pingora-openssl = "0.8.0"
 pingora-proxy = { workspace = true }
-pingora-http = "0.8.0"
+pingora-http = "0.9.0"
 reqwest = { workspace = true }
 rustls-pemfile = { workspace = true }
 sea-orm = { workspace = true }
