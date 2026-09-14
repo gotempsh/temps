@@ -22,6 +22,7 @@ pub use job_tracker::{Job, JobLogEvent, JobState, JobStatus, JobTracker};
 pub use preview_urls::PreviewUrlParts;
 pub use registry::StandaloneSandboxRegistry;
 pub use sandbox_service::{
+    is_managed_application_workspace_image, managed_application_workspace_image,
     ApplicationWorkspaceConfig, ApplicationWorkspaceSandbox, ApplicationWorkspaceUsage,
     CreateSandboxRequest, SandboxService, SandboxSource, SandboxSummary,
 };

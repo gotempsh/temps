@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
@@ -711,9 +712,14 @@ export function AuditLogItemRow({
                     {key}
                   </span>
                   <pre className="flex-1 whitespace-pre-wrap break-all font-mono text-xs">
-                    {typeof value === 'object'
-                      ? JSON.stringify(value, null, 2)
-                      : String(value)}
+                    <HighlightedCode
+                      code={
+                        typeof value === 'object'
+                          ? JSON.stringify(value, null, 2)
+                          : String(value)
+                      }
+                      language={'json'}
+                    />
                   </pre>
                 </div>
               ))}

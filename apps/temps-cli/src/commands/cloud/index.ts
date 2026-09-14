@@ -28,8 +28,10 @@ import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
 import {
   disconnectCloud as disconnectInstance,
   enrollCloud as enrollInstance,
+  ensureCloudBackupSchedule,
   getCloudStatus as getInstanceCloudStatus,
 } from '../../api/sdk.gen.js'
+import type { ManagedBackupSetup } from '../../api/types.gen.js'
 
 interface DeviceCodeResponse {
   device_code: string
@@ -258,6 +260,64 @@ async function instanceStatus(options: { json?: boolean }): Promise<void> {
   keyValue('Buffered spans', result.spooled_spans)
   info(result.status_message)
   if (result.health !== 'healthy') info(result.health_message)
+  if (result.managed_backup_setup) {
+    printManagedBackupSetup(result.managed_backup_setup)
+  }
+  newline()
+}
+
+function printManagedBackupSetup(setup: ManagedBackupSetup): void {
+  keyValue('Backup destination', setup.status.replaceAll('_', ' '))
+  if (!setup.ready) {
+    info(setup.message)
+    return
+  }
+  if (setup.schedule) {
+    keyValue(
+      'Backup schedule',
+      `${setup.schedule.name} (${setup.schedule.schedule_expression}, ` +
+        `${setup.schedule.retention_period}d retention` +
+        `${setup.schedule.enabled ? '' : ', paused'})`,
+    )
+  } else {
+    keyValue('Backup schedule', 'none')
+    info(
+      'No schedule writes to Temps Cloud yet. Run "temps cloud backup-schedule ensure" ' +
+        'to create the nightly default, or point an existing schedule at the destination.',
+    )
+  }
+  if (setup.archive_conflicts.length > 0) {
+    keyValue('Archive conflicts', String(setup.archive_conflicts.length))
+    for (const conflict of setup.archive_conflicts) {
+      info(
+        `${conflict.service_name} (${conflict.service_type}, id ${conflict.service_id}) ` +
+          `archives to "${conflict.pinned_s3_source_name}" and fails under the Cloud schedule. ` +
+          `Move it with: temps services repoint-continuous-archive-source ` +
+          `--id ${conflict.service_id} --s3-source ${setup.managed_s3_source_id ?? '<managed source id>'}`,
+      )
+    }
+  }
+}
+
+async function ensureBackupSchedule(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+  const result = await withSpinner(
+    'Ensuring the Temps Cloud backup schedule...',
+    async () => {
+      const { data, error } = await ensureCloudBackupSchedule({ client })
+      if (error) throw new Error(getErrorMessage(error))
+      return data
+    },
+  )
+  if (!result) return
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+    return
+  }
+  newline()
+  header(`${icons.globe} Temps Cloud backup schedule`)
+  printManagedBackupSetup(result)
   newline()
 }
 
@@ -381,6 +441,14 @@ export function registerCloudCommands(program: Command): void {
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(disconnectCurrentInstance)
+
+  cloud
+    .command('backup-schedule')
+    .description('The backup schedule that writes to the Temps Cloud destination')
+    .command('ensure')
+    .description('Create the nightly default schedule unless one already targets Temps Cloud')
+    .option('--json', 'Output JSON')
+    .action(ensureBackupSchedule)
 
   registerCloudVpsCommands(cloud)
   registerCloudBillingCommands(cloud)

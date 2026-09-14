@@ -209,7 +209,7 @@ export default function ApiKeyCreate() {
 
   if (newKeySecret) {
     return (
-      <div className="container max-w-2xl mx-auto py-6 space-y-6">
+      <div className="w-full space-y-6">
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
@@ -293,7 +293,7 @@ export default function ApiKeyCreate() {
   }
 
   return (
-    <div className="container max-w-4xl mx-auto py-6 space-y-6">
+    <div className="w-full space-y-6">
       {verificationDialog}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">

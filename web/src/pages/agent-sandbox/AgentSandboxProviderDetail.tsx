@@ -504,11 +504,12 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
               <CardTitle className="text-base">Credential</CardTitle>
               <CardDescription>
                 Encrypted with AES-256-GCM at rest. Workspace-capable providers
-                use it only through a short-lived server relay; the reusable
-                credential is never injected into the sandbox.
+                {provider.id === 'opencode'
+                  ? 'use a private runtime credential file for OpenCode. Code running as the harness user can access this credential; only use it in workspaces you trust. Refreshed tokens stay in this sandbox; after replacing the sandbox, you may need to import your local login again.'
+                  : 'use it only through a short-lived server relay; the reusable credential is never injected into the sandbox.'}
               </CardDescription>
             </div>
-            {provider.local_credential && (
+            {provider.id !== 'claude_cli' && provider.local_credential && (
               <Button
                 type="button"
                 variant="outline"
@@ -531,7 +532,13 @@ export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          {provider.local_credential && (
+          {provider.id === 'claude_cli' && (
+            <p className="text-sm text-muted-foreground">
+              Local-login import is not supported for Claude Code. Paste a token
+              from <code>claude setup-token</code> or an Anthropic API key below.
+            </p>
+          )}
+          {provider.id !== 'claude_cli' && provider.local_credential && (
             <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
               <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>

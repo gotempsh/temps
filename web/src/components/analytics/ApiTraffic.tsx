@@ -51,6 +51,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { Link } from 'react-router'
 import {
   getDateRangeFromFilter,
@@ -61,9 +62,6 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
-  ArrowDown,
-  ArrowUp,
-  ArrowUpDown,
   ChevronLeft,
   ChevronRight,
   Loader2,
@@ -1243,23 +1241,14 @@ function SortableTrafficHead({
   className?: string
 }) {
   return (
-    <TableHead className={`text-right ${className ?? ''}`}>
-      <button
-        type="button"
-        className={`ml-auto flex items-center gap-1 ${active.metric === metric ? 'text-foreground' : ''}`}
-        onClick={() => onSort(metric)}
-        aria-label={`Sort by ${label} ${active.metric === metric && active.direction === 'desc' ? 'ascending' : 'descending'}`}
-      >
-        {label}
-        {active.metric !== metric ? (
-          <ArrowUpDown className="h-3 w-3" />
-        ) : active.direction === 'asc' ? (
-          <ArrowUp className="h-3 w-3" />
-        ) : (
-          <ArrowDown className="h-3 w-3" />
-        )}
-      </button>
-    </TableHead>
+    <SortableTableHead
+      label={label}
+      active={active.metric === metric}
+      direction={active.direction}
+      onClick={() => onSort(metric)}
+      align="right"
+      className={className}
+    />
   )
 }
 

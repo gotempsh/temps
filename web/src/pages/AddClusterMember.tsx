@@ -208,7 +208,7 @@ export function AddClusterMember() {
   const isDone = member?.provisioning_step === 'done'
 
   return (
-    <div className="container max-w-3xl mx-auto py-6 space-y-4">
+    <div className="w-full space-y-4 px-4 py-6 sm:px-6 lg:px-8">
       <div>
         <Button
           variant="ghost"

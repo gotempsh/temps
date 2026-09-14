@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 /**
  * Postgres WAL health surface on the service detail page.
@@ -172,9 +173,11 @@ function WarningRow({ warning }: { warning: WalWarning }) {
       {body ? <p className="text-xs opacity-80">{body}</p> : null}
       {fix ? (
         <div className="flex items-center gap-2">
-          <code className="block flex-1 truncate rounded bg-background/60 px-2 py-1 font-mono text-[11px]">
-            {fix}
-          </code>
+          <HighlightedCode
+            className="block flex-1 truncate rounded bg-background/60 px-2 py-1 font-mono text-[11px]"
+            code={fix}
+            language="bash"
+          />
           <CopyButton value={fix} />
         </div>
       ) : null}

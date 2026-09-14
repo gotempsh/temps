@@ -485,6 +485,9 @@ pub trait AiCliProvider: Send + Sync {
     fn extract_native_tool_events(&self, _line: &str) -> Vec<NativeToolEvent> {
         Vec::new()
     }
+    fn extract_context_window_usage(&self, _line: &str) -> Option<temps_ai::ContextWindowUsage> {
+        None
+    }
     fn dropped_tool_use_name(&self, _line: &str) -> Option<String> {
         None
     }

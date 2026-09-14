@@ -32,14 +32,18 @@ import {
   Hash,
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
-import { CopyButton } from '@/components/ui/copy-button'
+import {
+  AiPromptCodeBlock,
+  CopyAiPromptButton,
+} from '@/components/ui/ai-prompt-code-block'
+import { HighlightedCode, type CodeLanguage } from '@/components/ui/code-block'
 import { Link } from 'react-router'
 
 interface KvServiceProps {
   project: ProjectResponse
 }
 
-export function KvService({ project: _project }: KvServiceProps) {
+export function KvService({ project }: KvServiceProps) {
   const { setBreadcrumbs } = useBreadcrumbs()
 
   const { data: status, isLoading } = useQuery({
@@ -97,26 +101,32 @@ export function KvService({ project: _project }: KvServiceProps) {
           <div className="min-w-0">
             <h1 className="text-xl font-semibold sm:text-2xl">KV Store</h1>
             <p className="text-muted-foreground text-sm">
-              Serverless key-value store backed by Redis — no infrastructure to manage
+              Serverless key-value store backed by Redis — no infrastructure to
+              manage
             </p>
           </div>
         </div>
-        <Badge
-          variant={isEnabled ? 'default' : 'secondary'}
-          className="h-7 px-3 self-start sm:self-auto shrink-0"
-        >
-          {isEnabled ? (
-            <>
-              <CheckCircle2 className="h-3.5 w-3.5 mr-1.5" />
-              Enabled
-            </>
-          ) : (
-            <>
-              <XCircle className="h-3.5 w-3.5 mr-1.5" />
-              Disabled
-            </>
-          )}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <CopyAiPromptButton
+            prompt={`Add @temps-sdk/kv to project ${project.slug}. Inspect the existing framework and package manager, install the SDK, and implement a small server-side KV read/write/delete integration following the app's conventions. The SDK reads TEMPS_API_URL and TEMPS_TOKEN, plus TEMPS_PROJECT_ID when using an API key. Use environment variables and never expose credentials in browser code or commit secrets. Verify KV is enabled on Temps; explain required setup if it is not. Add appropriate error handling and verify the integration.`}
+          />
+          <Badge
+            variant={isEnabled ? 'default' : 'secondary'}
+            className="h-7 px-3 self-start sm:self-auto shrink-0"
+          >
+            {isEnabled ? (
+              <>
+                <CheckCircle2 className="h-3.5 w-3.5 mr-1.5" />
+                Enabled
+              </>
+            ) : (
+              <>
+                <XCircle className="h-3.5 w-3.5 mr-1.5" />
+                Disabled
+              </>
+            )}
+          </Badge>
+        </div>
       </div>
 
       <Tabs defaultValue="overview" className="space-y-6">
@@ -140,7 +150,8 @@ export function KvService({ project: _project }: KvServiceProps) {
             <CardHeader>
               <CardTitle>Service Status</CardTitle>
               <CardDescription>
-                Cluster-wide status of the KV service. Once enabled, every project on this instance can use it through the SDK below.
+                Cluster-wide status of the KV service. Once enabled, every
+                project on this instance can use it through the SDK below.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -149,7 +160,9 @@ export function KvService({ project: _project }: KvServiceProps) {
                   <div className="grid gap-4 sm:grid-cols-3">
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
-                      <p className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}>
+                      <p
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                      >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />
                         ) : (
@@ -160,12 +173,19 @@ export function KvService({ project: _project }: KvServiceProps) {
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Engine</p>
-                      <p className="font-medium mt-1">Redis {status?.version || 'unknown'}</p>
+                      <p className="font-medium mt-1">
+                        Redis{' '}
+                        {status?.version
+                          ? status.version.replace(/^redis\s*/i, '')
+                          : 'version not reported'}
+                      </p>
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
-                      <p className="text-sm text-muted-foreground">Docker Image</p>
+                      <p className="text-sm text-muted-foreground">
+                        Docker Image
+                      </p>
                       <p className="font-medium mt-1 font-mono text-xs break-all">
-                        {status?.docker_image || 'Unknown'}
+                        {status?.docker_image || 'Not reported'}
                       </p>
                     </div>
                   </div>
@@ -182,7 +202,10 @@ export function KvService({ project: _project }: KvServiceProps) {
                     <Info className="h-4 w-4" />
                     <AlertTitle>KV Store is not enabled</AlertTitle>
                     <AlertDescription>
-                      An administrator must enable the KV service from <strong>Storage Settings → Platform Services</strong>. Once enabled, the SDK on the Documentation tab works out of the box — no further per-project setup needed.
+                      An administrator must enable the KV service from{' '}
+                      <strong>Storage Settings → Platform Services</strong>.
+                      Once enabled, the SDK on the Documentation tab works out
+                      of the box — no further per-project setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
@@ -225,27 +248,34 @@ export function KvService({ project: _project }: KvServiceProps) {
             <CardHeader>
               <CardTitle>TypeScript SDK</CardTitle>
               <CardDescription>
-                The <code className="bg-muted px-1.5 py-0.5 rounded text-xs">@temps-sdk/kv</code> package
-                gives you a typed client for KV operations from any Node.js or Bun runtime.
+                The{' '}
+                <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                  @temps-sdk/kv
+                </code>{' '}
+                package gives you a typed client for KV operations from any
+                Node.js or Bun runtime.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               <div className="space-y-3">
                 <h3 className="font-medium">Installation</h3>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                  <CodeBlock code="npm install @temps-sdk/kv" />
-                  <CodeBlock code="bun add @temps-sdk/kv" />
-                  <CodeBlock code="pnpm add @temps-sdk/kv" />
-                  <CodeBlock code="yarn add @temps-sdk/kv" />
+                  <CodeBlock code="npm install @temps-sdk/kv" language="bash" />
+                  <CodeBlock code="bun add @temps-sdk/kv" language="bash" />
+                  <CodeBlock code="pnpm add @temps-sdk/kv" language="bash" />
+                  <CodeBlock code="yarn add @temps-sdk/kv" language="bash" />
                 </div>
               </div>
 
               <div className="space-y-3">
                 <h3 className="font-medium">Quick start</h3>
                 <p className="text-sm text-muted-foreground">
-                  The default <code className="bg-muted px-1.5 py-0.5 rounded text-xs">kv</code> singleton
-                  reads its config from environment variables — no extra wiring required when running
-                  on Temps.
+                  The default{' '}
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    kv
+                  </code>{' '}
+                  singleton reads its config from environment variables — no
+                  extra wiring required when running on Temps.
                 </p>
                 <CodeBlock
                   code={`import { kv } from '@temps-sdk/kv'
@@ -263,8 +293,9 @@ await kv.del('user:123')`}
               <div className="space-y-3">
                 <h3 className="font-medium">Configuration</h3>
                 <p className="text-sm text-muted-foreground">
-                  These environment variables are injected automatically into deployments running on
-                  this instance. Set them yourself only when running locally or outside of Temps.
+                  These environment variables are injected automatically into
+                  deployments running on this instance. Set them yourself only
+                  when running locally or outside of Temps.
                 </p>
                 <CodeBlock
                   code={`# Required
@@ -276,8 +307,12 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts, testing)? Use{' '}
-                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">createClient</code>:
+                  Need an isolated client (multiple projects, custom timeouts,
+                  testing)? Use{' '}
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    createClient
+                  </code>
+                  :
                 </p>
                 <CodeBlock
                   code={`import { createClient } from '@temps-sdk/kv'
@@ -389,8 +424,10 @@ if (remaining === -2) {
                 <h3 className="font-medium">Error handling</h3>
                 <p className="text-sm text-muted-foreground">
                   Every error thrown by the SDK is an instance of{' '}
-                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">KVError</code> with
-                  structured fields you can branch on.
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    KVError
+                  </code>{' '}
+                  with structured fields you can branch on.
                 </p>
                 <CodeBlock
                   code={`import { kv, KVError } from '@temps-sdk/kv'
@@ -576,17 +613,19 @@ function FeatureCard({
   )
 }
 
-function CodeBlock({ code, language: _language = 'bash' }: { code: string; language?: string }) {
+function CodeBlock({
+  code,
+  language = 'bash',
+}: {
+  code: string
+  language?: CodeLanguage
+}) {
   return (
-    <div className="relative">
-      <pre className="bg-muted rounded-lg p-3 text-sm font-mono overflow-x-auto">
-        <code>{code}</code>
-      </pre>
-      <CopyButton
-        value={code}
-        className="absolute top-1.5 right-1.5 h-7 w-7 p-0 hover:bg-accent hover:text-accent-foreground rounded-md"
-      />
-    </div>
+    <AiPromptCodeBlock
+      code={code}
+      language={language}
+      prompt={`Integrate this Temps KV example into my existing application using @temps-sdk/kv. Inspect the project first, follow its conventions, and adapt the example rather than pasting it unchanged. Use TEMPS_API_URL, TEMPS_TOKEN, and TEMPS_PROJECT_ID from server-side environment variables; never expose credentials to the browser or commit them. Reuse the existing package manager, handle errors, and verify the integration. Explain any required configuration.\n\nExample (${language}):\n${code}`}
+    />
   )
 }
 
@@ -611,9 +650,11 @@ function ApiMethod({
       </div>
       <div>
         <p className="text-xs text-muted-foreground mb-1">Signature</p>
-        <pre className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-          {signature}
-        </pre>
+        <HighlightedCode
+          code={signature}
+          language="typescript"
+          className="rounded bg-muted px-2 py-1 text-xs"
+        />
       </div>
       <CodeBlock code={example} language="typescript" />
     </div>

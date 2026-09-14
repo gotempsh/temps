@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 export const MONITORING_SECTIONS = [
+  { id: 'server', label: 'Server' },
   { id: 'alerts', label: 'Alerts' },
   { id: 'rules', label: 'Alert rules' },
   { id: 'alarms', label: 'Alarms' },

@@ -280,7 +280,7 @@ function ClusterMemberConfig({
 }
 
 export function CreateService() {
-  usePageTitle('Create Service')
+  usePageTitle('Create database')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
@@ -362,7 +362,7 @@ export function CreateService() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
-      { label: 'Create Service', href: '/storage/create' },
+      { label: 'Create database', href: '/storage/create' },
     ])
   }, [setBreadcrumbs])
 
@@ -465,7 +465,7 @@ export function CreateService() {
   if (!serviceType) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-1">
             <Link to="/storage">
               <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
@@ -473,7 +473,7 @@ export function CreateService() {
                 Back to Databases
               </Button>
             </Link>
-            <h1 className="text-2xl font-semibold">Create Service</h1>
+            <h1 className="text-2xl font-semibold">Create database</h1>
             <p className="text-muted-foreground">
               Choose a service type to get started.
             </p>
@@ -530,7 +530,7 @@ export function CreateService() {
   if (isLoadingSchema) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-4">
             <div className="h-8 w-1/3 bg-muted animate-pulse rounded" />
             <div className="space-y-3">
@@ -553,7 +553,7 @@ export function CreateService() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header with provider info */}
         <div className="space-y-4">
           <Link to="/storage">
@@ -754,7 +754,7 @@ export function CreateService() {
           submitText={
             serviceName.trim()
               ? `Create ${serviceName.trim()}`
-              : 'Create Service'
+              : 'Create database'
           }
           submitDisabled={!serviceName.trim()}
           isSubmitting={createServiceMut.isPending}

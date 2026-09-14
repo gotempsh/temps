@@ -111,7 +111,7 @@ console.log(response.choices[0].message.content);`,
   ]
 
   return (
-    <div className="container mx-auto px-4 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
+    <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
       <div>
         <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway Setup</h1>
         <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">

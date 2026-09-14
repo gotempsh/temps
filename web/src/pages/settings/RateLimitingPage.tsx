@@ -131,8 +131,8 @@ export function RateLimitingPage() {
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+        <CardHeader className="border-b px-5 py-4">
+          <CardTitle className="flex items-center gap-2 text-base">
             <Shield className="h-5 w-5" />
             Rate Limiting
           </CardTitle>
@@ -140,7 +140,7 @@ export function RateLimitingPage() {
             Configure rate limiting to prevent abuse
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-4 p-5">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">

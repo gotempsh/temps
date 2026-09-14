@@ -65,7 +65,7 @@ export function AutofixRedirect({ project }: AutofixRedirectProps) {
 
   // latestRunForSource returns 404 when no run exists — show the run config.
   return (
-    <div className="max-w-2xl mx-auto">
+    <div className="w-full">
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">

@@ -88,6 +88,7 @@ import {
 } from '@/lib/project-environment-variables'
 import {
   templateRuntimeDefaults,
+  createTemplateRuntimeDefaultsSchema,
   templateRuntimeDefaultsSchema,
   templateRuntimeOverrides,
   type TemplateRuntimeDefaults,
@@ -259,6 +260,7 @@ export function TemplateConfigurator({
 
   // State
   const [showSecrets, setShowSecrets] = useState<Record<number, boolean>>({})
+  const [runtimeOpen, setRuntimeOpen] = useState(false)
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
     useState(false)
   const [selectedServiceType, setSelectedServiceType] =
@@ -339,8 +341,15 @@ export function TemplateConfigurator({
 
   // Initialize form with template defaults, running any default_generator on
   // mount so required fields like NEXTAUTH_URL / NEXTAUTH_SECRET start filled.
+  const schema = useMemo(
+    () =>
+      formSchema.extend({
+        runtime: createTemplateRuntimeDefaultsSchema(template.kind).optional(),
+      }),
+    [template.kind]
+  )
   const form = useForm<FormValues>({
-    resolver: zodResolver(formSchema),
+    resolver: zodResolver(schema),
     mode: 'onSubmit',
     defaultValues: {
       projectName: template.name,
@@ -577,7 +586,7 @@ export function TemplateConfigurator({
   )
 
   // Form submission
-  const handleSubmit = async (data: FormValues) => {
+  const handleSubmit = (data: FormValues) => {
     if (isLoadingServices) {
       toast.error('Wait for the database list to finish loading.')
       return
@@ -629,7 +638,7 @@ export function TemplateConfigurator({
         ? templateRuntimeOverrides(data.runtime)
         : undefined
 
-    await createFromTemplateMutation.mutateAsync({
+    createFromTemplateMutation.mutate({
       body: {
         template_slug: template.slug,
         project_name: data.projectName,
@@ -789,7 +798,15 @@ export function TemplateConfigurator({
       </Card>
 
       <Form {...form}>
-        <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+        <form
+          onSubmit={form.handleSubmit(handleSubmit, (errors) => {
+            if (errors.runtime) setRuntimeOpen(true)
+            toast.error(
+              'Review the highlighted fields before creating your project.'
+            )
+          })}
+          className="space-y-6"
+        >
           {/* Project Configuration */}
           <Card>
             <CardHeader>
@@ -815,7 +832,11 @@ export function TemplateConfigurator({
                   Git source/connection needed, so the whole source picker is
                   replaced by an expandable runtime-defaults card. */}
               {isImageTemplate && (
-                <Collapsible className="overflow-hidden rounded-lg border border-primary/25 bg-primary/[0.035]">
+                <Collapsible
+                  open={runtimeOpen}
+                  onOpenChange={setRuntimeOpen}
+                  className="overflow-hidden rounded-lg border border-primary/25 bg-primary/[0.035]"
+                >
                   <CollapsibleTrigger asChild>
                     <button
                       type="button"

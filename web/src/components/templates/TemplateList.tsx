@@ -23,6 +23,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { TemplateCatalogEmptyState } from './TemplateCatalogEmptyState'
 
 interface TemplateListProps {
   onTemplateSelect: (template: TemplateResponse) => void
@@ -30,6 +31,8 @@ interface TemplateListProps {
   showFeaturedFirst?: boolean
   kind?: 'starter' | 'service'
   showTagFilter?: boolean
+  onUseGitUrl?: () => void
+  onBrowseRepositories?: () => void
 }
 
 export function TemplateList({
@@ -38,6 +41,8 @@ export function TemplateList({
   showFeaturedFirst = true,
   kind = 'starter',
   showTagFilter = true,
+  onUseGitUrl,
+  onBrowseRepositories,
 }: TemplateListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
@@ -198,12 +203,18 @@ export function TemplateList({
 
       {/* Templates grid/list */}
       {filteredTemplates.length === 0 ? (
-        <div className="text-center py-12 text-muted-foreground">
-          <p>No templates found</p>
-          {searchQuery && (
+        searchQuery || selectedTag || showFeaturedOnly ? (
+          <div className="text-center py-12 text-muted-foreground">
+            <p>No templates found</p>
             <p className="text-sm mt-1">Try adjusting your search or filters</p>
-          )}
-        </div>
+          </div>
+        ) : (
+          <TemplateCatalogEmptyState
+            kind={kind}
+            onUseGitUrl={onUseGitUrl}
+            onBrowseRepositories={onBrowseRepositories}
+          />
+        )
       ) : (
         <div
           className={cn(

@@ -458,7 +458,7 @@ export function ServiceRestore() {
 
   if (!Number.isFinite(serviceId)) {
     return (
-      <div className="container mx-auto py-8">
+      <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>Invalid service id.</AlertDescription>
@@ -469,7 +469,7 @@ export function ServiceRestore() {
 
   if (serviceLoading || !service) {
     return (
-      <div className="container mx-auto py-12 flex items-center justify-center">
+      <div className="w-full flex items-center justify-center px-4 py-12 sm:px-6 lg:px-8">
         <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
       </div>
     )
@@ -478,7 +478,7 @@ export function ServiceRestore() {
   // Running view — takes over the whole page once a run is in flight.
   if (runningRunId != null) {
     return (
-      <div className="container mx-auto py-8 max-w-3xl">
+      <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
         <PageHeader service={service} />
         <RunProgress run={runRow} />
         <div className="mt-6 flex gap-2">
@@ -505,7 +505,7 @@ export function ServiceRestore() {
 
   // Configure view
   return (
-    <div className="container mx-auto py-6 max-w-5xl space-y-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <PageHeader service={service} />
 
       {/* Step 1: S3 source */}

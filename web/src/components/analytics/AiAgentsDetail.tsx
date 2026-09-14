@@ -24,6 +24,12 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
+import {
+  nextTableSort,
+  sortTableRows,
+  type TableSort,
+} from '@/lib/client-table-sort'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -60,6 +66,9 @@ interface AiAgentsDetailProps {
   defaultGroupBy?: 'provider' | 'agent'
 }
 
+type AgentSortKey = 'label' | 'uniqueIps' | 'count'
+type PageSortKey = 'path' | 'agentCount' | 'requestCount'
+
 /**
  * AI agent traffic surface. In `overview` mode it shows the timeline chart and
  * the breakdown card grid; in `tables` mode it shows the full ranked, searchable
@@ -78,10 +87,19 @@ export function AiAgentsDetail({
   defaultGroupBy = 'agent',
 }: AiAgentsDetailProps) {
   const navigate = useNavigate()
-  const [groupBy, setGroupBy] =
-    React.useState<'provider' | 'agent'>(defaultGroupBy)
+  const [groupBy, setGroupBy] = React.useState<'provider' | 'agent'>(
+    defaultGroupBy
+  )
   const [agentSearch, setAgentSearch] = React.useState('')
   const [pageSearch, setPageSearch] = React.useState('')
+  const [agentSort, setAgentSort] = React.useState<TableSort<AgentSortKey>>({
+    key: 'count',
+    direction: 'desc',
+  })
+  const [pageSort, setPageSort] = React.useState<TableSort<PageSortKey>>({
+    key: 'requestCount',
+    direction: 'desc',
+  })
   // Which page row is expanded to show its per-agent breakdown.
   const [expandedPath, setExpandedPath] = React.useState<string | null>(null)
 
@@ -151,7 +169,10 @@ export function AiAgentsDetail({
     const total = items.reduce((s, r) => s + r.request_count, 0)
     const byProvider = new Map<string, number>()
     for (const r of items) {
-      byProvider.set(r.provider, (byProvider.get(r.provider) ?? 0) + r.request_count)
+      byProvider.set(
+        r.provider,
+        (byProvider.get(r.provider) ?? 0) + r.request_count
+      )
     }
     return Array.from(byProvider.entries())
       .sort((a, b) => b[1] - a[1])
@@ -176,7 +197,8 @@ export function AiAgentsDetail({
         user_fetch: 'User-triggered fetch',
         seo: 'SEO crawler',
         mixed: 'Mixed / general',
-      })[p] ?? (p || 'Unknown')
+      })[p] ??
+      (p || 'Unknown')
     const byPurpose = new Map<string, number>()
     for (const r of items) {
       const key = r.purpose || 'unknown'
@@ -302,6 +324,14 @@ export function AiAgentsDetail({
     )
   }, [agentRows, agentSearch])
 
+  const sortedAgents = React.useMemo(() => {
+    return sortTableRows(
+      filteredAgents,
+      (row) => row[agentSort.key],
+      agentSort.direction
+    )
+  }, [agentSort, filteredAgents])
+
   const pageRows = React.useMemo(() => {
     const items = pagesQuery.data?.items ?? []
     if (items.length === 0) return []
@@ -320,6 +350,14 @@ export function AiAgentsDetail({
     if (!q) return pageRows
     return pageRows.filter((r) => r.path.toLowerCase().includes(q))
   }, [pageRows, pageSearch])
+
+  const sortedPages = React.useMemo(() => {
+    return sortTableRows(
+      filteredPages,
+      (row) => row[pageSort.key],
+      pageSort.direction
+    )
+  }, [filteredPages, pageSort])
 
   const totalAiRequests = React.useMemo(
     () => agentRows.reduce((sum, r) => sum + r.count, 0),
@@ -376,7 +414,7 @@ export function AiAgentsDetail({
           <div>
             <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
               <Bot className="h-5 w-5" />
-              AI Agents
+              AI Crawlers
             </h2>
             <p className="text-sm text-muted-foreground">{dateLabel}</p>
           </div>
@@ -420,7 +458,9 @@ export function AiAgentsDetail({
               isLoading={agentsQuery.isLoading}
               error={agentsQuery.isError}
               footer={`Showing top ${topAgentCards.length} agents by requests`}
-              action={onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined}
+              action={
+                onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined
+              }
             />
             <AiBreakdownCard
               title="Top Providers"
@@ -441,7 +481,7 @@ export function AiAgentsDetail({
               rows={purposeCards}
               isLoading={agentsQuery.isLoading}
               error={agentsQuery.isError}
-              footer="Classified from the AI agent taxonomy"
+              footer="Classified from the AI crawler taxonomy"
             />
             <AiBreakdownCard
               title="Response status"
@@ -453,12 +493,14 @@ export function AiAgentsDetail({
             />
             <AiBreakdownCard
               title="Top Pages crawled"
-              description="Which content AI agents request most"
+              description="Which content AI crawlers request most"
               rows={topPageCards}
               isLoading={pagesQuery.isLoading}
               error={pagesQuery.isError}
               footer={`Showing top ${topPageCards.length} pages · badge = distinct agents`}
-              action={onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined}
+              action={
+                onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined
+              }
             />
           </div>
         </>
@@ -466,255 +508,312 @@ export function AiAgentsDetail({
 
       {/* Full ranked tables with search + per-page drill-down. */}
       {view === 'tables' && (
-      <Tabs defaultValue="agents">
-        <TabsList>
-          <TabsTrigger value="agents">Agents</TabsTrigger>
-          <TabsTrigger value="pages">Pages crawled</TabsTrigger>
-        </TabsList>
+        <Tabs defaultValue="agents">
+          <TabsList>
+            <TabsTrigger value="agents">Agents</TabsTrigger>
+            <TabsTrigger value="pages">Pages crawled</TabsTrigger>
+          </TabsList>
 
-        {/* ─── Agents ─────────────────────────────────────────────── */}
-        <TabsContent value="agents" className="mt-4 space-y-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-sm text-muted-foreground">
-              Every AI crawler that hit your site, ranked by requests.
-            </p>
-            <div className="flex items-center gap-2">
-              <div className="relative w-full sm:w-[220px]">
-                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={agentSearch}
-                  onChange={(e) => setAgentSearch(e.target.value)}
-                  placeholder="Filter agents..."
-                  className="pl-8"
-                  aria-label="Filter agents"
-                />
-              </div>
-              <div className="flex items-center gap-1 rounded-md border p-0.5">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={groupBy === 'agent' ? 'default' : 'ghost'}
-                  className="h-7 px-2 text-xs"
-                  onClick={() => setGroupBy('agent')}
-                >
-                  By agent
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={groupBy === 'provider' ? 'default' : 'ghost'}
-                  className="h-7 px-2 text-xs"
-                  onClick={() => setGroupBy('provider')}
-                >
-                  By provider
-                </Button>
-              </div>
-            </div>
-          </div>
-
-          {agentsQuery.isLoading ? (
-            <ListSkeleton />
-          ) : agentsQuery.error ? (
-            <ErrorState label="AI agents" />
-          ) : !filteredAgents.length ? (
-            <EmptyState
-              primary={
-                agentRows.length === 0
-                  ? 'No AI crawlers hit your site in this period'
-                  : `No agents match "${agentSearch}"`
-              }
-            />
-          ) : (
-            <div className="-mx-4 overflow-x-auto whitespace-nowrap sm:mx-0">
-              <div className="inline-block min-w-full px-4 align-middle sm:px-0">
-                <Table className="w-full">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="whitespace-nowrap">
-                        {groupBy === 'agent' ? 'Agent' : 'Provider'}
-                      </TableHead>
-                      <TableHead className="hidden whitespace-nowrap sm:table-cell">
-                        Share
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap text-right">
-                        Unique IPs
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap text-right">
-                        Requests
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {filteredAgents.map((row) => (
-                      <TableRow
-                        key={`${row.provider}-${row.label}`}
-                        className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => onAgentClick(row.provider, row.agent)}
-                      >
-                        <TableCell>
-                          <div className="flex items-center gap-3">
-                            <AiAgentLogo
-                              provider={row.provider}
-                              agent={row.agent}
-                              size={20}
-                            />
-                            <span className="text-sm font-medium">
-                              {row.label}
-                            </span>
-                            {groupBy === 'agent' && (
-                              <Badge
-                                variant="outline"
-                                className="h-4 px-1 py-0 text-xs"
-                              >
-                                {row.provider}
-                              </Badge>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell className="hidden w-[40%] sm:table-cell">
-                          <div className="flex items-center gap-2">
-                            <div className="relative h-1.5 w-full max-w-[200px] overflow-hidden rounded-full bg-muted">
-                              <div
-                                className="absolute inset-y-0 left-0 rounded-full bg-primary"
-                                style={{ width: `${row.percentage}%` }}
-                              />
-                            </div>
-                            <span className="text-xs text-muted-foreground tabular-nums">
-                              {row.percentage.toFixed(0)}%
-                            </span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-right text-sm text-muted-foreground tabular-nums">
-                          {row.uniqueIps.toLocaleString()}
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {row.count.toLocaleString()}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+          {/* ─── Agents ─────────────────────────────────────────────── */}
+          <TabsContent value="agents" className="mt-4 space-y-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-muted-foreground">
+                Every AI crawler that hit your site, ranked by requests.
+              </p>
+              <div className="flex items-center gap-2">
+                <div className="relative w-full sm:w-[220px]">
+                  <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={agentSearch}
+                    onChange={(e) => setAgentSearch(e.target.value)}
+                    placeholder="Filter agents..."
+                    className="pl-8"
+                    aria-label="Filter agents"
+                  />
+                </div>
+                <div className="flex items-center gap-1 rounded-md border p-0.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={groupBy === 'agent' ? 'default' : 'ghost'}
+                    className="h-7 px-2 text-xs"
+                    onClick={() => setGroupBy('agent')}
+                  >
+                    By agent
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={groupBy === 'provider' ? 'default' : 'ghost'}
+                    className="h-7 px-2 text-xs"
+                    onClick={() => setGroupBy('provider')}
+                  >
+                    By provider
+                  </Button>
+                </div>
               </div>
             </div>
-          )}
-        </TabsContent>
 
-        {/* ─── Pages crawled ──────────────────────────────────────── */}
-        <TabsContent value="pages" className="mt-4 space-y-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-sm text-muted-foreground">
-              Which content AI agents request most. Expand a page for the
-              per-agent counts.
-            </p>
-            <div className="relative w-full sm:w-[220px]">
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={pageSearch}
-                onChange={(e) => setPageSearch(e.target.value)}
-                placeholder="Filter pages..."
-                className="pl-8"
-                aria-label="Filter pages"
+            {agentsQuery.isLoading ? (
+              <ListSkeleton />
+            ) : agentsQuery.error ? (
+              <ErrorState label="AI crawlers" />
+            ) : !filteredAgents.length ? (
+              <EmptyState
+                primary={
+                  agentRows.length === 0
+                    ? 'No AI crawlers hit your site in this period'
+                    : `No agents match "${agentSearch}"`
+                }
               />
-            </div>
-          </div>
-
-          {pagesQuery.isLoading ? (
-            <ListSkeleton />
-          ) : pagesQuery.error ? (
-            <ErrorState label="crawled pages" />
-          ) : !filteredPages.length ? (
-            <EmptyState
-              primary={
-                pageRows.length === 0
-                  ? 'No AI crawler page hits in this period'
-                  : `No pages match "${pageSearch}"`
-              }
-            />
-          ) : (
-            <div className="-mx-4 overflow-x-auto sm:mx-0">
-              <div className="inline-block min-w-full px-4 align-middle sm:px-0">
-                <Table className="w-full">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-8" />
-                      <TableHead className="whitespace-nowrap">Path</TableHead>
-                      <TableHead className="hidden whitespace-nowrap sm:table-cell">
-                        Share
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap text-right">
-                        Agents
-                      </TableHead>
-                      <TableHead className="whitespace-nowrap text-right">
-                        Requests
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {filteredPages.map((row) => {
-                      const isExpanded = expandedPath === row.path
-                      return (
-                        <React.Fragment key={row.path}>
-                          <TableRow
-                            className="cursor-pointer hover:bg-muted/50"
-                            onClick={() =>
-                              setExpandedPath(isExpanded ? null : row.path)
-                            }
-                          >
-                            <TableCell className="w-8 pr-0">
-                              <ChevronRight
-                                className={`size-4 text-muted-foreground transition-transform ${
-                                  isExpanded ? 'rotate-90' : ''
-                                }`}
+            ) : (
+              <div className="-mx-4 overflow-x-auto whitespace-nowrap sm:mx-0">
+                <div className="inline-block min-w-full px-4 align-middle sm:px-0">
+                  <Table className="w-full">
+                    <TableHeader>
+                      <TableRow>
+                        <SortableTableHead
+                          label={groupBy === 'agent' ? 'Agent' : 'Provider'}
+                          active={agentSort.key === 'label'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'label')
+                            )
+                          }
+                          className="whitespace-nowrap"
+                        />
+                        <TableHead className="hidden whitespace-nowrap sm:table-cell">
+                          Share
+                        </TableHead>
+                        <SortableTableHead
+                          label="Unique IPs"
+                          active={agentSort.key === 'uniqueIps'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'uniqueIps')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                        <SortableTableHead
+                          label="Requests"
+                          active={agentSort.key === 'count'}
+                          direction={agentSort.direction}
+                          onClick={() =>
+                            setAgentSort((current) =>
+                              nextTableSort(current, 'count')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {sortedAgents.map((row) => (
+                        <TableRow
+                          key={`${row.provider}-${row.label}`}
+                          className="cursor-pointer hover:bg-muted/50"
+                          onClick={() => onAgentClick(row.provider, row.agent)}
+                        >
+                          <TableCell>
+                            <div className="flex items-center gap-3">
+                              <AiAgentLogo
+                                provider={row.provider}
+                                agent={row.agent}
+                                size={20}
                               />
-                            </TableCell>
-                            <TableCell className="max-w-[520px] truncate font-mono text-xs">
-                              <span title={row.path}>{row.path}</span>
-                            </TableCell>
-                            <TableCell className="hidden w-[30%] sm:table-cell">
-                              <div className="relative h-1.5 w-full max-w-[260px] overflow-hidden rounded-full bg-muted">
+                              <span className="text-sm font-medium">
+                                {row.label}
+                              </span>
+                              {groupBy === 'agent' && (
+                                <Badge
+                                  variant="outline"
+                                  className="h-4 px-1 py-0 text-xs"
+                                >
+                                  {row.provider}
+                                </Badge>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell className="hidden w-[40%] sm:table-cell">
+                            <div className="flex items-center gap-2">
+                              <div className="relative h-1.5 w-full max-w-[200px] overflow-hidden rounded-full bg-muted">
                                 <div
-                                  className="absolute inset-y-0 left-0 rounded-full bg-primary/70"
+                                  className="absolute inset-y-0 left-0 rounded-full bg-primary"
                                   style={{ width: `${row.percentage}%` }}
                                 />
                               </div>
-                            </TableCell>
-                            <TableCell className="text-right">
-                              <Badge variant="secondary" className="font-mono">
-                                {row.agentCount}
-                              </Badge>
-                            </TableCell>
-                            <TableCell className="text-right font-mono text-sm text-muted-foreground tabular-nums">
-                              {row.requestCount.toLocaleString()}
-                            </TableCell>
-                          </TableRow>
-                          {isExpanded && (
-                            <TableRow className="bg-muted/20 hover:bg-muted/20">
-                              <TableCell colSpan={5} className="p-0">
-                                <PageAgentBreakdown
-                                  project={project}
-                                  path={row.path}
-                                  startDate={startDate}
-                                  endDate={endDate}
-                                  environment={environment}
-                                  totalRequests={row.requestCount}
-                                  onAgentClick={(agent) =>
-                                    onPageLogs(row.path, agent)
-                                  }
-                                  onViewAll={() => onPageLogs(row.path)}
-                                />
-                              </TableCell>
-                            </TableRow>
-                          )}
-                        </React.Fragment>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
+                              <span className="text-xs text-muted-foreground tabular-nums">
+                                {row.percentage.toFixed(0)}%
+                              </span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-right text-sm text-muted-foreground tabular-nums">
+                            {row.uniqueIps.toLocaleString()}
+                          </TableCell>
+                          <TableCell className="text-right font-mono text-sm tabular-nums">
+                            {row.count.toLocaleString()}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+          </TabsContent>
+
+          {/* ─── Pages crawled ──────────────────────────────────────── */}
+          <TabsContent value="pages" className="mt-4 space-y-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-muted-foreground">
+                Which content AI crawlers request most. Expand a page for the
+                per-agent counts.
+              </p>
+              <div className="relative w-full sm:w-[220px]">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={pageSearch}
+                  onChange={(e) => setPageSearch(e.target.value)}
+                  placeholder="Filter pages..."
+                  className="pl-8"
+                  aria-label="Filter pages"
+                />
               </div>
             </div>
-          )}
-        </TabsContent>
-      </Tabs>
+
+            {pagesQuery.isLoading ? (
+              <ListSkeleton />
+            ) : pagesQuery.error ? (
+              <ErrorState label="crawled pages" />
+            ) : !filteredPages.length ? (
+              <EmptyState
+                primary={
+                  pageRows.length === 0
+                    ? 'No AI crawler page hits in this period'
+                    : `No pages match "${pageSearch}"`
+                }
+              />
+            ) : (
+              <div className="-mx-4 overflow-x-auto sm:mx-0">
+                <div className="inline-block min-w-full px-4 align-middle sm:px-0">
+                  <Table className="w-full">
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-8" />
+                        <SortableTableHead
+                          label="Path"
+                          active={pageSort.key === 'path'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'path')
+                            )
+                          }
+                          className="whitespace-nowrap"
+                        />
+                        <TableHead className="hidden whitespace-nowrap sm:table-cell">
+                          Share
+                        </TableHead>
+                        <SortableTableHead
+                          label="Agents"
+                          active={pageSort.key === 'agentCount'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'agentCount')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                        <SortableTableHead
+                          label="Requests"
+                          active={pageSort.key === 'requestCount'}
+                          direction={pageSort.direction}
+                          onClick={() =>
+                            setPageSort((current) =>
+                              nextTableSort(current, 'requestCount')
+                            )
+                          }
+                          align="right"
+                          className="whitespace-nowrap"
+                        />
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {sortedPages.map((row) => {
+                        const isExpanded = expandedPath === row.path
+                        return (
+                          <React.Fragment key={row.path}>
+                            <TableRow
+                              className="cursor-pointer hover:bg-muted/50"
+                              onClick={() =>
+                                setExpandedPath(isExpanded ? null : row.path)
+                              }
+                            >
+                              <TableCell className="w-8 pr-0">
+                                <ChevronRight
+                                  className={`size-4 text-muted-foreground transition-transform ${
+                                    isExpanded ? 'rotate-90' : ''
+                                  }`}
+                                />
+                              </TableCell>
+                              <TableCell className="max-w-[520px] truncate font-mono text-xs">
+                                <span title={row.path}>{row.path}</span>
+                              </TableCell>
+                              <TableCell className="hidden w-[30%] sm:table-cell">
+                                <div className="relative h-1.5 w-full max-w-[260px] overflow-hidden rounded-full bg-muted">
+                                  <div
+                                    className="absolute inset-y-0 left-0 rounded-full bg-primary/70"
+                                    style={{ width: `${row.percentage}%` }}
+                                  />
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-right">
+                                <Badge
+                                  variant="secondary"
+                                  className="font-mono"
+                                >
+                                  {row.agentCount}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="text-right font-mono text-sm text-muted-foreground tabular-nums">
+                                {row.requestCount.toLocaleString()}
+                              </TableCell>
+                            </TableRow>
+                            {isExpanded && (
+                              <TableRow className="bg-muted/20 hover:bg-muted/20">
+                                <TableCell colSpan={5} className="p-0">
+                                  <PageAgentBreakdown
+                                    project={project}
+                                    path={row.path}
+                                    startDate={startDate}
+                                    endDate={endDate}
+                                    environment={environment}
+                                    totalRequests={row.requestCount}
+                                    onAgentClick={(agent) =>
+                                      onPageLogs(row.path, agent)
+                                    }
+                                    onViewAll={() => onPageLogs(row.path)}
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            )}
+                          </React.Fragment>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
       )}
     </div>
   )
@@ -753,10 +852,7 @@ function ListSkeleton() {
   return (
     <div className="space-y-3 py-2">
       {[...Array(8)].map((_, i) => (
-        <div
-          key={`skel-${i}`}
-          className="flex items-center justify-between"
-        >
+        <div key={`skel-${i}`} className="flex items-center justify-between">
           <div className="h-4 w-[180px] bg-muted animate-pulse rounded" />
           <div className="h-4 w-[80px] bg-muted animate-pulse rounded" />
         </div>
@@ -860,9 +956,7 @@ function PageAgentBreakdown({
         <div className="space-y-1.5">
           {rows.map((r) => {
             const share =
-              totalRequests > 0
-                ? (r.request_count / totalRequests) * 100
-                : 0
+              totalRequests > 0 ? (r.request_count / totalRequests) * 100 : 0
             return (
               <button
                 type="button"

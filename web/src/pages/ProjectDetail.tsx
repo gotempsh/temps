@@ -19,7 +19,7 @@ import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
 import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
-import { ProjectToolsPage } from '@/components/project/ProjectToolsPage'
+import { ProjectSectionLayout } from '@/components/project/ProjectSectionLayout'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
@@ -436,217 +436,227 @@ export function ProjectDetail() {
             </Alert>
           )}
           <ProjectTour />
-          <Routes>
-            <Route index element={<Navigate to="project" replace />} />
-            <Route
-              path="project"
-              element={
-                <ProjectOverview
-                  project={project}
-                  lastDeployment={lastDeployment}
-                />
-              }
-            />
-            <Route
-              path="tools"
-              element={<ProjectToolsPage project={project} />}
-            />
-            <Route path="setup" element={<ProjectSetup project={project} />} />
-            <Route
-              path="deployments"
-              element={<ProjectDeployments project={project} />}
-            />
-            <Route
-              path="deployments/:deploymentId"
-              element={<DeploymentDetails project={project} />}
-            />
-            <Route path="drop" element={<ProjectDrop project={project} />} />
-            <Route
-              path="environment-variables"
-              element={<EnvironmentVariablesSettings project={project} />}
-            />
-            <Route
-              path="flags"
-              element={<ProjectFeatureFlags project={project} />}
-            />
-            <Route
-              path="domains"
-              element={<DomainsSettings project={project} />}
-            />
-            <Route
-              path="git"
-              element={<GitSettings project={project} refetch={refetch} />}
-            />
-            <Route
-              path="build"
-              element={
-                <BuildDeploySettings project={project} refetch={refetch} />
-              }
-            />
-            <Route
-              path="git/change-repository"
-              element={
-                <Navigate
-                  to={`/projects/${project.slug}/connect-repository`}
-                  replace
-                />
-              }
-            />
-            <Route
-              path="connect-repository"
-              element={
-                <ChangeRepositoryPage project={project} refetch={refetch} />
-              }
-            />
-            <Route
-              path="connect-repository/connections/:connectionId"
-              element={
-                <ChangeRepositoryPage project={project} refetch={refetch} />
-              }
-            />
-            <Route
-              path="connect-repository/connections/:connectionId/repositories/:repositoryId"
-              element={
-                <ChangeRepositoryPage project={project} refetch={refetch} />
-              }
-            />
-            <Route
-              path="analytics/*"
-              element={<ProjectAnalytics project={project} />}
-            />
-            <Route
-              path="storage"
-              element={<ProjectStorage project={project} />}
-            />
-            <Route
-              path="databases"
-              element={
-                <Navigate
-                  to={legacyDatabasesRedirectPath(project.slug)}
-                  replace
-                />
-              }
-            />
-            <Route
-              path="services/*"
-              element={<ProjectServices project={project} />}
-            />
-            <Route
-              path="runtime"
-              element={<ProjectRuntime project={project} />}
-            />
-            <Route path="observe" element={<Observe project={project} />} />
-            <Route
-              path="settings/*"
-              element={<ProjectSettings project={project} refetch={refetch} />}
-            />
-            <Route
-              path="speed"
-              element={<ProjectSpeedInsights project={project} />}
-            />
-            <Route path="logs/*" element={<RequestLogs project={project} />} />
-            <Route
-              path="request-logs/*"
-              element={<RequestLogs project={project} />}
-            />
-            <Route
-              path="ai-crawlers"
-              element={<ProjectAiCrawlers project={project} />}
-            />
-            <Route
-              path="monitors"
-              element={<ProjectMonitors project={project} />}
-            />
-            <Route
-              path="monitors/:monitorId"
-              element={<MonitorDetail project={project} />}
-            />
-            <Route path="traces/*" element={<Traces project={project} />} />
-            <Route
-              path="telemetry-logs"
-              element={<LogsList project={project} />}
-            />
-            <Route path="metrics/*" element={<Metrics project={project} />} />
-            {/* Dashboards moved under the unified Metrics surface; redirect
+          <ProjectSectionLayout project={project}>
+            <Routes>
+              <Route index element={<Navigate to="project" replace />} />
+              <Route
+                path="project"
+                element={
+                  <ProjectOverview
+                    project={project}
+                    lastDeployment={lastDeployment}
+                  />
+                }
+              />
+              <Route
+                path="tools"
+                element={<Navigate to="../settings/general" replace />}
+              />
+              <Route
+                path="setup"
+                element={<ProjectSetup project={project} />}
+              />
+              <Route
+                path="deployments"
+                element={<ProjectDeployments project={project} />}
+              />
+              <Route
+                path="deployments/:deploymentId"
+                element={<DeploymentDetails project={project} />}
+              />
+              <Route path="drop" element={<ProjectDrop project={project} />} />
+              <Route
+                path="environment-variables"
+                element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="flags"
+                element={<ProjectFeatureFlags project={project} />}
+              />
+              <Route
+                path="domains"
+                element={<DomainsSettings project={project} />}
+              />
+              <Route
+                path="git"
+                element={<GitSettings project={project} refetch={refetch} />}
+              />
+              <Route
+                path="build"
+                element={
+                  <BuildDeploySettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="git/change-repository"
+                element={
+                  <Navigate
+                    to={`/projects/${project.slug}/connect-repository`}
+                    replace
+                  />
+                }
+              />
+              <Route
+                path="connect-repository"
+                element={
+                  <ChangeRepositoryPage project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="connect-repository/connections/:connectionId"
+                element={
+                  <ChangeRepositoryPage project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="connect-repository/connections/:connectionId/repositories/:repositoryId"
+                element={
+                  <ChangeRepositoryPage project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="storage"
+                element={<ProjectStorage project={project} />}
+              />
+              <Route
+                path="databases"
+                element={
+                  <Navigate
+                    to={legacyDatabasesRedirectPath(project.slug)}
+                    replace
+                  />
+                }
+              />
+              <Route
+                path="services/*"
+                element={<ProjectServices project={project} />}
+              />
+              <Route
+                path="runtime"
+                element={<ProjectRuntime project={project} />}
+              />
+              <Route path="observe" element={<Observe project={project} />} />
+              <Route
+                path="settings/*"
+                element={
+                  <ProjectSettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="logs/*"
+                element={<RequestLogs project={project} />}
+              />
+              <Route
+                path="request-logs/*"
+                element={<RequestLogs project={project} />}
+              />
+              <Route
+                path="ai-crawlers"
+                element={<ProjectAiCrawlers project={project} />}
+              />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="telemetry-logs"
+                element={<LogsList project={project} />}
+              />
+              <Route path="metrics/*" element={<Metrics project={project} />} />
+              {/* Dashboards moved under the unified Metrics surface; redirect
                   any lingering /dashboards links. */}
-            <Route
-              path="dashboards/*"
-              element={<Navigate to="../metrics/dashboards" replace />}
-            />
-            <Route
-              path="ai-gateway"
-              element={<ProjectAgentActivity projectId={project.id} />}
-            />
-            <Route
-              path="revenue"
-              element={<ProjectRevenue project={project} />}
-            />
-            <Route
-              path="agents"
-              element={<AutopilotPage project={project} />}
-            />
-            <Route
-              path="agents/detail/:agentSlug"
-              element={<AgentDetailPage project={project} />}
-            />
-            <Route
-              path="agents/detail/:agentSlug/edit"
-              element={<AgentEditPage project={project} />}
-            />
-            <Route
-              path="agents/:runId"
-              element={<AutopilotRunDetail project={project} />}
-            />
-            <Route
-              path="autofixer"
-              element={<AutofixerPage project={project} />}
-            />
-            <Route
-              path="errors"
-              element={<ErrorTracking project={project} />}
-            />
-            <Route
-              path="errors/setup"
-              element={<ErrorTrackingSetup project={project} />}
-            />
-            <Route
-              path="errors/alert-rules"
-              element={<AlertRulesManagement projectId={project.id} />}
-            />
-            <Route
-              path="errors/alert-rules/new"
-              element={<AlertRuleForm projectId={project.id} />}
-            />
-            <Route
-              path="errors/alert-rules/:ruleId/edit"
-              element={<AlertRuleForm projectId={project.id} />}
-            />
-            <Route
-              path="errors/:errorGroupId"
-              element={<ErrorGroupDetail project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId/autofix"
-              element={<AutofixRedirect project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId/event/:eventId"
-              element={<ErrorEventDetail project={project} />}
-            />
-            <Route
-              path="security"
-              element={<SecurityOverview project={project} />}
-            />
-            <Route path="security/scans/:scanId" element={<ScanDetail />} />
-            <Route
-              path="security/scans/:scanId/vulnerabilities/:vulnId"
-              element={<VulnerabilityDetailPage />}
-            />
-            <Route
-              path="environments/*"
-              element={<EnvironmentsTabsView project={project} />}
-            />
-          </Routes>
+              <Route
+                path="dashboards/*"
+                element={<Navigate to="../metrics/dashboards" replace />}
+              />
+              <Route
+                path="ai-gateway"
+                element={<ProjectAgentActivity projectId={project.id} />}
+              />
+              <Route
+                path="revenue"
+                element={<ProjectRevenue project={project} />}
+              />
+              <Route
+                path="agents"
+                element={<AutopilotPage project={project} />}
+              />
+              <Route
+                path="agents/detail/:agentSlug"
+                element={<AgentDetailPage project={project} />}
+              />
+              <Route
+                path="agents/detail/:agentSlug/edit"
+                element={<AgentEditPage project={project} />}
+              />
+              <Route
+                path="agents/:runId"
+                element={<AutopilotRunDetail project={project} />}
+              />
+              <Route
+                path="autofixer"
+                element={<AutofixerPage project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/setup"
+                element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/alert-rules"
+                element={<AlertRulesManagement projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/new"
+                element={<AlertRuleForm projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/:ruleId/edit"
+                element={<AlertRuleForm projectId={project.id} />}
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/autofix"
+                element={<AutofixRedirect project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route
+                path="security"
+                element={<SecurityOverview project={project} />}
+              />
+              <Route path="security/scans/:scanId" element={<ScanDetail />} />
+              <Route
+                path="security/scans/:scanId/vulnerabilities/:vulnId"
+                element={<VulnerabilityDetailPage />}
+              />
+              <Route
+                path="environments/*"
+                element={<EnvironmentsTabsView project={project} />}
+              />
+            </Routes>
+          </ProjectSectionLayout>
         </div>
       </div>
     </div>

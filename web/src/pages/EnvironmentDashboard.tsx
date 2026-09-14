@@ -10,6 +10,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
+import { EnvironmentNavigation } from '@/components/environments/EnvironmentNavigation'
 import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
 import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -82,25 +83,7 @@ export function EnvironmentDashboard({
   }
 
   if (isEnvironmentLoading) {
-    return (
-      <div className="flex flex-col h-full">
-        <div className="p-6 border-b bg-background">
-          <div className="flex items-center justify-between">
-            <div>
-              <Skeleton className="h-8 w-48 mb-2" />
-              <Skeleton className="h-4 w-64" />
-            </div>
-            <div className="flex items-center gap-3">
-              <Skeleton className="h-6 w-24" />
-              <Skeleton className="h-9 w-24" />
-            </div>
-          </div>
-        </div>
-        <div className="flex-1 p-6">
-          <Skeleton className="h-96 w-full" />
-        </div>
-      </div>
-    )
+    return <EnvironmentDashboardSkeleton />
   }
 
   if (!environment) {
@@ -118,17 +101,17 @@ export function EnvironmentDashboard({
   const isStatic = project?.source_type === 'static_files'
 
   return (
-    <div className="flex flex-col h-full bg-white dark:bg-neutral-950">
-      <EnvironmentHeaderBar
+    <div className="grid min-w-0 flex-1 content-start bg-background lg:content-stretch lg:grid-cols-[200px_minmax(0,1fr)]">
+      <EnvironmentNavigation
         environment={environment}
-        project={project}
         activeView={activeView}
         onViewChange={handleViewChange}
         environments={environments}
         onEnvironmentChange={onEnvironmentChange}
         onCreateEnvironment={onCreateEnvironment}
       />
-      <div className="flex-1 overflow-auto">
+      <div className="min-w-0">
+        <EnvironmentHeaderBar environment={environment} project={project} />
         <div className="w-full px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
           {activeView === 'settings' ? (
             <EnvironmentSettingsContent
@@ -157,6 +140,33 @@ export function EnvironmentDashboard({
               environmentId={environmentId.toString()}
             />
           )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function EnvironmentDashboardSkeleton() {
+  return (
+    <div
+      className="grid min-w-0 flex-1 content-start lg:grid-cols-[200px_minmax(0,1fr)] lg:content-stretch"
+      aria-label="Loading environment"
+    >
+      <div className="border-b p-4 lg:border-b-0 lg:border-r lg:px-3 lg:py-5">
+        <Skeleton className="h-16 w-full" />
+        <div className="mt-5 hidden space-y-2 lg:block">
+          {[0, 1, 2].map((item) => (
+            <Skeleton key={item} className="h-9 w-full" />
+          ))}
+        </div>
+      </div>
+      <div className="min-w-0">
+        <div className="space-y-3 border-b px-4 py-5 sm:px-6 lg:px-8">
+          <Skeleton className="h-7 w-48" />
+          <Skeleton className="h-4 w-56" />
+        </div>
+        <div className="px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+          <Skeleton className="h-24 w-full" />
         </div>
       </div>
     </div>

@@ -75,8 +75,9 @@ pub struct GlobalLogSearchResponse {
     /// Newest first, ordered by timestamp, chunk ID and line offset.
     pub lines: Vec<GlobalLogLine>,
     pub next_cursor: Option<String>,
-    /// True means no complete ordered page could be established within the
-    /// scan budget. Lines are empty; narrow the search rather than skipping logs.
+    /// True means the scan budget was exhausted. Lines contain the newest
+    /// matches found so far, but unread chunks may contain newer lines.
+    /// No cursor is returned because the partial results cannot be paginated safely.
     pub scan_limit_reached: bool,
     pub scanned_chunks: usize,
     pub scanned_bytes: usize,
@@ -303,7 +304,12 @@ impl LogSearchService {
         }
         if !complete {
             return Ok(GlobalLogSearchResponse {
-                lines: vec![],
+                lines: matches
+                    .into_iter()
+                    .rev()
+                    .take(cap)
+                    .map(|(_, line)| line)
+                    .collect(),
                 next_cursor: None,
                 scan_limit_reached: true,
                 scanned_chunks,
@@ -426,11 +432,109 @@ mod tests {
         services::LogMetadataService,
         storage::{FilesystemStorage, LogStorage},
     };
-    use sea_orm::{ConnectOptions, Database};
-    use std::{collections::HashSet, sync::Arc};
+    use sea_orm::{ConnectOptions, Database, DatabaseBackend, MockDatabase};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::Arc,
+    };
 
     fn request() -> GlobalLogSearchRequest {
         serde_json::from_value(serde_json::json!({"start_time":"2026-01-01T00:00:00Z", "end_time":"2026-01-02T00:00:00Z", "page_size":17})).unwrap()
+    }
+
+    fn mock_candidate(id: u128, key: &str, size: i32) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert("id".into(), Uuid::from_u128(id).into());
+        row.insert("project_id".into(), 1.into());
+        row.insert("external_service_id".into(), Option::<i32>::None.into());
+        row.insert("owner".into(), "Project".into());
+        row.insert("env".into(), "production".into());
+        row.insert(
+            "ended_at".into(),
+            "2026-01-01T12:00:01Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+                .into(),
+        );
+        row.insert("storage_key".into(), key.into());
+        row.insert("compressed_size_bytes".into(), size.into());
+        row
+    }
+
+    async fn mock_search(lines: &[(&str, &str)], text: Option<&str>) -> GlobalLogSearchResponse {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FilesystemStorage::new(dir.path().into()).unwrap());
+        let mut content = Vec::new();
+        for (timestamp, message) in lines {
+            content.extend(
+                serde_json::to_vec(&serde_json::json!({
+                    "ts": timestamp, "level": "ERROR", "msg": message,
+                    "stream": "stderr", "container_id": "container-1", "service": "app",
+                    "env": "production", "project_id": 1
+                }))
+                .unwrap(),
+            );
+            content.push(b'\n');
+        }
+        let compressed = zstd::encode_all(content.as_slice(), 1).unwrap();
+        storage.write_chunk("valid.zst", &compressed).await.unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![
+                    mock_candidate(2, "valid.zst", compressed.len() as i32),
+                    mock_candidate(1, "oversized.zst", MAX_CHUNK_BYTES as i32 + 1),
+                ]])
+                .into_connection(),
+        );
+        let service = LogSearchService::new(storage, Arc::new(LogMetadataService::new(db)));
+        let mut q = request();
+        q.page_size = Some(2);
+        q.text = text.map(str::to_owned);
+        service
+            .search_global(
+                &q,
+                &GlobalLogAccess {
+                    hidden_projects: vec![],
+                    bound_project: None,
+                    unrestricted_services: true,
+                    user_id: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_keeps_newest_collected_lines_without_cursor() {
+        let result = mock_search(
+            &[
+                ("2026-01-01T12:00:00Z", "oldest"),
+                ("2026-01-01T12:00:03Z", "newest"),
+                ("2026-01-01T12:00:02Z", "middle"),
+            ],
+            None,
+        )
+        .await;
+        assert!(result.scan_limit_reached);
+        assert_eq!(result.scanned_chunks, 1);
+        assert!(result.scanned_bytes > 0);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(
+            result
+                .lines
+                .iter()
+                .map(|line| line.line.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "middle"]
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_without_matches_returns_empty_lines() {
+        let result = mock_search(&[("2026-01-01T12:00:00Z", "unrelated")], Some("absent")).await;
+        assert!(result.scan_limit_reached);
+        assert!(result.lines.is_empty());
+        assert!(result.next_cursor.is_none());
     }
 
     #[test]
@@ -576,6 +680,7 @@ mod tests {
             .lines
             .is_empty());
         q.text = None;
+        q.projects.clear();
         db.execute_unprepared(
             "UPDATE log_chunks SET compressed_size_bytes=99999999 WHERE project_id=105",
         )
@@ -583,7 +688,7 @@ mod tests {
         .unwrap();
         let limited = service.search_global(&q, &unrestricted).await.unwrap();
         assert!(limited.scan_limit_reached);
-        assert!(limited.lines.is_empty());
+        assert_eq!(limited.lines.len(), 16); // 8 newer chunks before project 105
         assert!(limited.next_cursor.is_none());
     }
 }

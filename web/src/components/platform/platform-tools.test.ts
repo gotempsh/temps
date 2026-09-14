@@ -5,6 +5,11 @@ import { describe, expect, test } from 'bun:test'
 import { platformToolGroups } from './platform-tools'
 
 describe('platform tools AI discovery', () => {
+  test('separates persistent contexts from standalone compute', () => {
+    const items = platformToolGroups.flatMap((group) => group.items)
+    expect(items.find((item) => item.title === 'Workspaces')?.url).toBe('/workspaces')
+    expect(items.find((item) => item.title === 'Sandboxes')?.url).toBe('/sandboxes')
+  })
   test('keeps harness setup discoverable without conflating built-in AI', () => {
     const automate = platformToolGroups.find(
       (group) => group.label === 'Automate'
@@ -17,4 +22,11 @@ describe('platform tools AI discovery', () => {
       automate?.items.find((item) => item.title === 'Built-in AI')?.url
     ).toBe('/ai-gateway')
   })
+})
+
+test('global observability is discoverable from platform tools', () => {
+  const observe = platformToolGroups.find((group) => group.label === 'Observe')
+  for (const path of ['/analytics', '/traces', '/logs', '/errors']) {
+    expect(observe?.items.some((item) => item.url === path)).toBe(true)
+  }
 })

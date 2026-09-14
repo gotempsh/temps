@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Push backup lifecycle events (started/completed/failed) to Cloud as they
-//! happen, instead of waiting for [`crate::backup_mirror`]'s next poll to
-//! notice. That sweep remains the source of truth for what actually
+//! Push backup lifecycle events (started/completed/failed/deleted) to Cloud
+//! as they happen, instead of waiting for [`crate::backup_mirror`]'s next
+//! poll to notice. That sweep remains the source of truth for what actually
 //! happened -- a dropped or failed push here costs Cloud a stale
 //! "processing" indicator until the next sweep tick, never an incorrect or
-//! lost backup record.
+//! lost backup record. `deleted` is the one stage the sweep cannot replay
+//! (the row is gone); Cloud's own presence check covers a lost push.
 
 use std::sync::{Arc, LazyLock};
 
@@ -54,6 +55,7 @@ pub async fn run(service: Arc<CloudService>, queue: Arc<dyn JobQueue>) {
                     s3_location: stage_job.s3_location,
                     size_bytes: stage_job.size_bytes,
                     error_message: stage_job.error_message,
+                    backup_uuid: stage_job.backup_uuid,
                 };
 
                 match service.link().notify_backup_lifecycle(&event).await {
@@ -91,6 +93,7 @@ struct LifecycleJob {
     s3_location: Option<String>,
     size_bytes: Option<i64>,
     error_message: Option<String>,
+    backup_uuid: Option<String>,
 }
 
 fn to_lifecycle_job(job: &Job) -> Option<LifecycleJob> {
@@ -102,6 +105,7 @@ fn to_lifecycle_job(job: &Job) -> Option<LifecycleJob> {
             s3_location: None,
             size_bytes: None,
             error_message: None,
+            backup_uuid: None,
         }),
         Job::BackupCompleted(j) => Some(LifecycleJob {
             backup_id: j.backup_id,
@@ -110,6 +114,7 @@ fn to_lifecycle_job(job: &Job) -> Option<LifecycleJob> {
             s3_location: Some(j.s3_location.clone()),
             size_bytes: j.size_bytes,
             error_message: None,
+            backup_uuid: None,
         }),
         Job::BackupFailed(j) => Some(LifecycleJob {
             backup_id: j.backup_id,
@@ -118,6 +123,16 @@ fn to_lifecycle_job(job: &Job) -> Option<LifecycleJob> {
             s3_location: None,
             size_bytes: None,
             error_message: Some(bound_error_message(&redact_credentials(&j.error_message))),
+            backup_uuid: None,
+        }),
+        Job::BackupDeleted(j) => Some(LifecycleJob {
+            backup_id: j.backup_id,
+            engine: j.engine.clone(),
+            stage: BackupLifecycleStage::Deleted,
+            s3_location: Some(j.s3_location.clone()),
+            size_bytes: None,
+            error_message: None,
+            backup_uuid: Some(j.backup_uuid.clone()),
         }),
         _ => None,
     }
@@ -185,6 +200,32 @@ fn redact_credentials(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_backup_becomes_a_deleted_stage_with_its_uuid() {
+        let job = Job::BackupDeleted(temps_core::BackupDeletedJob {
+            backup_id: 7,
+            backup_uuid: "2e0a9d61-6a7c-4a1a-9a2b-0f6f2d0e1c11".into(),
+            engine: "postgres_walg".into(),
+            s3_location: "s3://bucket/t/managed-backups/external_services/postgres/main/walg"
+                .into(),
+        });
+        let lifecycle = to_lifecycle_job(&job).expect("deleted maps to a lifecycle stage");
+        assert_eq!(lifecycle.stage, BackupLifecycleStage::Deleted);
+        assert_eq!(
+            lifecycle.backup_uuid.as_deref(),
+            Some("2e0a9d61-6a7c-4a1a-9a2b-0f6f2d0e1c11")
+        );
+        assert_eq!(lifecycle.backup_id, 7);
+        // Only the deletion carries the uuid; Cloud keys the other stages
+        // on (instance_id, backup_id).
+        let started = to_lifecycle_job(&Job::BackupStarted(temps_core::BackupStartedJob {
+            backup_id: 7,
+            engine: "postgres_walg".into(),
+        }))
+        .expect("started maps");
+        assert!(started.backup_uuid.is_none());
+    }
 
     #[test]
     fn redact_postgres_connection_string_password() {

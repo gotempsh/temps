@@ -1709,6 +1709,16 @@ impl HealthProbeResult {
     }
 }
 
+/// Join database scope components without adding a trailing separator when a
+/// project-wide or custom link intentionally has no environment component.
+pub(crate) fn scoped_resource_name(project_scope: &str, environment_scope: &str) -> String {
+    if environment_scope.is_empty() {
+        project_scope.to_string()
+    } else {
+        format!("{project_scope}_{environment_scope}")
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait ExternalService: Send + Sync {
@@ -2109,6 +2119,16 @@ pub trait ExternalService: Send + Sync {
 #[cfg(test)]
 mod resource_limits_tests {
     use super::*;
+
+    #[test]
+    fn scoped_database_names_omit_empty_environment_separator() {
+        assert_eq!(
+            scoped_resource_name("storefront", "production"),
+            "storefront_production"
+        );
+        assert_eq!(scoped_resource_name("storefront", ""), "storefront");
+        assert_eq!(scoped_resource_name("shared_catalog", ""), "shared_catalog");
+    }
 
     #[test]
     fn default_is_unlimited() {

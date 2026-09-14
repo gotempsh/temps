@@ -12,7 +12,8 @@ use async_trait::async_trait;
 
 use temps_ai::{
     AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    ProviderCapabilities, RefreshPolicy, TokenStream, ToolExecutor, TurnServices,
+    NativeSessionExport, NativeSessionExportRequest, ProviderCapabilities, RefreshPolicy,
+    RuntimeProcessRequest, RuntimeProcessResponse, TokenStream, ToolExecutor, TurnServices,
 };
 
 /// Read seam for instance-wide server-authored summary defaults.
@@ -226,6 +227,36 @@ impl AiService for AiProviderRegistry {
         }
     }
 
+    async fn export_native_session(
+        &self,
+        request: NativeSessionExportRequest,
+    ) -> Result<Option<NativeSessionExport>, AiError> {
+        let provider = request.provider.clone();
+        let service = self
+            .routed(Some(&provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "chat.application.session_export".to_string(),
+                reason: format!("pinned provider '{provider}' is unavailable"),
+            })?;
+        service.export_native_session(request).await
+    }
+
+    async fn runtime_process(
+        &self,
+        request: RuntimeProcessRequest,
+    ) -> Result<RuntimeProcessResponse, AiError> {
+        let provider = request.provider.clone();
+        let service = self
+            .routed(Some(&provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "chat.application.process".to_string(),
+                reason: format!("pinned provider '{provider}' is unavailable"),
+            })?;
+        service.runtime_process(request).await
+    }
+
     async fn complete(&self, mut request: AiRequest) -> Result<AiResponse, AiError> {
         self.apply_summary_defaults(&mut request).await?;
         let service = self
@@ -358,6 +389,35 @@ mod tests {
                 model: "test-model".into(),
             })
         }
+        async fn export_native_session(
+            &self,
+            request: NativeSessionExportRequest,
+        ) -> Result<Option<NativeSessionExport>, AiError> {
+            Ok(Some(NativeSessionExport {
+                provider: self.tag.to_string(),
+                session_id: request.session_id,
+                format: "test".to_string(),
+                json: "{}".to_string(),
+                truncated: false,
+            }))
+        }
+        async fn runtime_process(
+            &self,
+            _request: RuntimeProcessRequest,
+        ) -> Result<RuntimeProcessResponse, AiError> {
+            Ok(RuntimeProcessResponse::Process {
+                process: temps_ai::RuntimeProcessSnapshot {
+                    id: self.tag.to_string(),
+                    name: "test".to_string(),
+                    status: "running".to_string(),
+                    detail: "ready".to_string(),
+                    pid: Some(1),
+                    restart_count: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            })
+        }
         async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
             let s = futures::stream::once(async { Ok::<String, AiError>("chunk".into()) });
             Ok(Box::pin(s))
@@ -432,6 +492,62 @@ mod tests {
 
         let chunk = stream.next().await.unwrap().unwrap();
         assert_eq!(chunk, "chunk");
+    }
+
+    #[tokio::test]
+    async fn native_session_export_routes_to_the_explicit_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("opencode".to_string(), tagged_service("opencode"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+        let export = registry
+            .export_native_session(NativeSessionExportRequest {
+                principal_id: 7,
+                provider: "opencode".to_string(),
+                session_id: "ses_test".to_string(),
+                harness_workspace: temps_ai::HarnessWorkspace {
+                    sandbox_label: "sandbox-test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/managed/test"),
+                },
+            })
+            .await
+            .expect("registered native provider should receive export")
+            .expect("test provider returns native export");
+
+        assert_eq!(export.provider, "opencode");
+        assert_eq!(export.session_id, "ses_test");
+    }
+
+    #[tokio::test]
+    async fn runtime_process_routes_to_the_explicit_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("opencode".to_string(), tagged_service("opencode"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+        let response = registry
+            .runtime_process(RuntimeProcessRequest {
+                principal_id: 7,
+                provider: "opencode".to_string(),
+                harness_workspace: temps_ai::HarnessWorkspace {
+                    sandbox_label: "sandbox-test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/managed/test"),
+                },
+                operation: temps_ai::RuntimeProcessOperation::Status {
+                    process_id: "process-1-1".to_string(),
+                },
+            })
+            .await
+            .expect("registered native provider should receive process request");
+        assert!(matches!(
+            response,
+            RuntimeProcessResponse::Process { process } if process.id == "opencode"
+        ));
     }
 
     // -----------------------------------------------------------------------

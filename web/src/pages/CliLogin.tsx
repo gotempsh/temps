@@ -91,18 +91,18 @@ export function CliLogin() {
   // No code in the URL — show a small entry form.
   if (!userCode) {
     return (
-      <div className="flex min-h-[60vh] items-center justify-center p-4">
-        <Card className="w-full max-w-sm">
-          <CardHeader>
-            <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-md bg-muted">
-              <Terminal className="h-5 w-5" />
+      <div className="fixed inset-0 z-50 flex min-h-dvh items-center justify-center overflow-y-auto bg-background p-4 sm:p-8">
+        <Card className="w-full max-w-lg shadow-lg">
+          <CardHeader className="space-y-4 pb-5 text-center">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border bg-muted/50">
+              <Terminal className="h-6 w-6" />
             </div>
-            <CardTitle>Authorize CLI</CardTitle>
+            <CardTitle className="text-2xl">Authorize CLI</CardTitle>
             <CardDescription>
               Enter the code shown in your terminal.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-2">
             <form
               onSubmit={(e) => {
                 e.preventDefault()
@@ -120,7 +120,7 @@ export function CliLogin() {
                 value={pastedCode}
                 onChange={(e) => setPastedCode(e.target.value)}
                 placeholder="ABCD-1234"
-                className="w-full rounded-md border bg-background px-3 py-2 font-mono text-center text-lg tracking-widest uppercase outline-none focus:ring-2 focus:ring-ring"
+                className="h-12 w-full rounded-md border bg-background px-3 font-mono text-center text-xl tracking-[0.2em] uppercase outline-none focus:ring-2 focus:ring-ring"
                 aria-label="Device code"
               />
             </form>
@@ -154,26 +154,26 @@ export function CliLogin() {
   const lookupErrorKind = cliDeviceLookupErrorKind(lookup.error)
 
   return (
-    <div className="flex min-h-[60vh] items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex min-h-dvh items-center justify-center overflow-y-auto bg-background p-4 sm:p-8">
       {verificationDialog}
-      <Card className="w-full max-w-md">
-        <CardHeader>
-          <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-md bg-muted">
-            <Terminal className="h-5 w-5" />
+      <Card className="w-full max-w-lg shadow-lg">
+        <CardHeader className="space-y-4 pb-5 text-center">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border bg-muted/50">
+            <Terminal className="h-6 w-6" />
           </div>
-          <CardTitle>Authorize the Temps CLI?</CardTitle>
+          <CardTitle className="text-2xl">Authorize the Temps CLI?</CardTitle>
           <CardDescription>
             A device is requesting access to your account. Verify the details
             below match what is shown in your terminal.
           </CardDescription>
         </CardHeader>
 
-        <CardContent className="space-y-4">
-          <div className="rounded-md border bg-muted/30 p-3 text-center">
+        <CardContent className="space-y-5">
+          <div className="rounded-lg border bg-muted/30 px-4 py-5 text-center">
             <div className="text-xs uppercase tracking-wider text-muted-foreground">
               Code
             </div>
-            <div className="font-mono text-2xl font-semibold tracking-widest">
+            <div className="mt-1 font-mono text-3xl font-semibold tracking-[0.18em]">
               {userCode}
             </div>
           </div>
@@ -207,7 +207,7 @@ export function CliLogin() {
               detail="The CLI login request was denied."
             />
           ) : (
-            <dl className="grid grid-cols-1 gap-2 text-sm">
+            <dl className="grid grid-cols-1 gap-3 rounded-lg border p-4 text-sm">
               <Row label="Account" value={user?.email ?? '—'} mono />
               <Row label="Device" value={clientName ?? 'unknown'} mono />
               <Row label="From IP" value={requestedIp ?? 'unknown'} mono />

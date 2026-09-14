@@ -3,6 +3,7 @@
 
 import { useState } from 'react'
 import { useActivationSignals } from './useActivationSignals'
+import { useManualHarnessCompletion } from './useManualHarnessCompletion'
 
 const DISMISSED_KEY = 'temps_getting_started_dismissed'
 
@@ -21,6 +22,7 @@ export function useGettingStarted() {
   )
 
   const signals = useActivationSignals()
+  const manualHarness = useManualHarnessCompletion()
 
   const items: GettingStartedItem[] = [
     {
@@ -28,7 +30,7 @@ export function useGettingStarted() {
       label: 'Connect your AI harness',
       description:
         'Create a dedicated admin key, install the Temps skill, and verify access from your harness.',
-      done: signals.aiHarnessConfigured,
+      done: signals.aiHarnessConfigured || manualHarness.completed,
       href: '/setup/ai',
       cta: 'Connect harness',
     },
@@ -130,5 +132,6 @@ export function useGettingStarted() {
     dismiss,
     visible,
     isLoaded: signals.isLoaded,
+    markHarnessCompleted: manualHarness.markCompleted,
   }
 }

@@ -937,7 +937,7 @@ impl ParameterStrategy for MinioParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
+                JsonValue::String("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
             );
         }
 
@@ -1018,7 +1018,7 @@ impl ParameterStrategy for MinioParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+                    "default": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
                 }
             },
             "readonly": ["access_key", "secret_key"]

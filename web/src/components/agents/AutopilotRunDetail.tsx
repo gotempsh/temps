@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
+import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -20,17 +22,9 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  isValidElement,
-  useEffect,
-  useRef,
-  useState,
-  type ComponentProps,
-  type ReactNode,
-} from 'react'
+import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { CodeBlock } from '@/components/ui/code-block'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -129,73 +123,6 @@ function logLevelColor(level: string): string {
   }
 }
 
-type CodeBlockLanguage = NonNullable<
-  ComponentProps<typeof CodeBlock>['language']
->
-
-/** Map common markdown fence hints onto the languages the shared CodeBlock
- *  highlights. Unknown/absent hints fall back to 'text' (no highlighting). */
-const fenceLanguageMap: Record<string, CodeBlockLanguage> = {
-  bash: 'bash',
-  sh: 'shell',
-  shell: 'shell',
-  zsh: 'shell',
-  console: 'shell',
-  yaml: 'yaml',
-  yml: 'yaml',
-  json: 'json',
-  jsonc: 'json',
-  javascript: 'javascript',
-  js: 'javascript',
-  jsx: 'javascript',
-  typescript: 'typescript',
-  ts: 'typescript',
-  tsx: 'typescript',
-  python: 'python',
-  py: 'python',
-  go: 'go',
-  golang: 'go',
-  text: 'text',
-  txt: 'text',
-  plaintext: 'text',
-}
-
-function fenceLanguage(className: string | undefined): CodeBlockLanguage {
-  const match = /language-([\w-]+)/.exec(className ?? '')
-  return (match && fenceLanguageMap[match[1].toLowerCase()]) || 'text'
-}
-
-/** Flatten a react-markdown code element's children to the raw code string. */
-function extractText(node: ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') return String(node)
-  if (Array.isArray(node)) return node.map(extractText).join('')
-  if (isValidElement(node)) {
-    return extractText((node.props as { children?: ReactNode }).children)
-  }
-  return ''
-}
-
-/** Fenced code blocks render through the shared CodeBlock (same component as
- *  the AI Gateway page): syntax colors, line numbers, copy button, and a wrap
- *  toggle. Long lines scroll horizontally instead of stretching the layout. */
-function MarkdownPre({ children }: { children?: ReactNode }) {
-  if (isValidElement(children)) {
-    const codeProps = children.props as {
-      className?: string
-      children?: ReactNode
-    }
-    return (
-      <CodeBlock
-        code={extractText(codeProps.children).replace(/\n$/, '')}
-        language={fenceLanguage(codeProps.className)}
-        className="not-prose my-3 text-left"
-        defaultShowLineNumbers
-      />
-    )
-  }
-  return <pre>{children}</pre>
-}
-
 /** Render markdown content using prose styles. Fenced code blocks are routed
  *  to the shared CodeBlock via the `pre` component override; inline code keeps
  *  the prose styling (react-markdown only wraps fences in `<pre>`).
@@ -212,7 +139,7 @@ function Markdown({ children }: { children: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          pre: MarkdownPre,
+          pre: MarkdownCodeBlock,
           ...untrustedMarkdownImage,
           ...untrustedMarkdownLink,
         }}
@@ -1010,9 +937,14 @@ function ConversationViewer({
                     raw
                   </p>
                   <pre className="text-[11px] font-mono bg-background border border-border rounded p-3 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
-                    {typeof selected.raw === 'string'
-                      ? selected.raw
-                      : JSON.stringify(selected.raw, null, 2)}
+                    <HighlightedCode
+                      code={
+                        typeof selected.raw === 'string'
+                          ? selected.raw
+                          : JSON.stringify(selected.raw, null, 2)
+                      }
+                      language={'json'}
+                    />
                   </pre>
                 </>
               )}
@@ -1659,7 +1591,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                     </DialogDescription>
                   </DialogHeader>
                   <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[60vh] whitespace-pre-wrap break-all">
-                    {run.ephemeral_yaml}
+                    <HighlightedCode
+                      code={run.ephemeral_yaml}
+                      language={'yaml'}
+                    />
                   </pre>
                 </DialogContent>
               </Dialog>
@@ -1684,13 +1619,20 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           {run.user_context && (
             <CardContent className="pt-0">
               <pre className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto">
-                {(() => {
-                  try {
-                    return JSON.stringify(JSON.parse(run.user_context), null, 2)
-                  } catch {
-                    return run.user_context
-                  }
-                })()}
+                <HighlightedCode
+                  code={(() => {
+                    try {
+                      return JSON.stringify(
+                        JSON.parse(run.user_context),
+                        null,
+                        2
+                      )
+                    } catch {
+                      return run.user_context
+                    }
+                  })()}
+                  language={'json'}
+                />
               </pre>
             </CardContent>
           )}
@@ -1720,7 +1662,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                     </DialogDescription>
                   </DialogHeader>
                   <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words">
-                    {run.prompt_text}
+                    <HighlightedCode
+                      code={run.prompt_text}
+                      language={'markdown'}
+                    />
                   </pre>
                 </DialogContent>
               </Dialog>
@@ -1728,9 +1673,14 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           </CardHeader>
           <CardContent className="pt-0">
             <pre className="whitespace-pre-wrap text-xs font-mono bg-muted p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto">
-              {run.prompt_text.length > 1200
-                ? run.prompt_text.slice(0, 1200) + '\n\n… (truncated)'
-                : run.prompt_text}
+              <HighlightedCode
+                code={
+                  run.prompt_text.length > 1200
+                    ? run.prompt_text.slice(0, 1200) + '\n\n… (truncated)'
+                    : run.prompt_text
+                }
+                language={'markdown'}
+              />
             </pre>
           </CardContent>
         </Card>

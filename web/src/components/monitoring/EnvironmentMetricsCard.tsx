@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import { useMemo, useState } from 'react'
 import { useInfiniteQuery, useQueries, useQuery } from '@tanstack/react-query'
 import {
@@ -40,13 +42,7 @@ const CHART_COLORS = [
   'var(--chart-5)',
 ]
 
-const RANGES = [
-  { value: '1h', label: 'Last hour' },
-  { value: '6h', label: 'Last 6 hours' },
-  { value: '24h', label: 'Last 24 hours' },
-  { value: '7d', label: 'Last 7 days' },
-] as const
-type RangeValue = (typeof RANGES)[number]['value']
+type RangeValue = '1h' | '6h' | '24h' | '7d'
 
 const LIMITS = [10, 20, 50, 100] as const
 const ALL_DEPLOYMENTS = 'all'
@@ -470,21 +466,11 @@ export function EnvironmentMetricsCharts({
                 ))}
               </SelectContent>
             </Select>
-            <Select
+            <TimeRangeFilter
               value={range}
-              onValueChange={(v) => setRange(v as RangeValue)}
-            >
-              <SelectTrigger className="w-[160px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {RANGES.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>
-                    {r.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              onChange={(next) => setRange(next as RangeValue)}
+              allowCustom={false}
+            />
           </div>
         </div>
       </div>
@@ -552,7 +538,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-cpu_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      cpuData.filter((point) =>
+                        Number.isFinite(point[`cpu_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />
@@ -628,7 +620,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-mem_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      memData.filter((point) =>
+                        Number.isFinite(point[`mem_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />
@@ -704,7 +702,13 @@ export function EnvironmentMetricsCharts({
                     type="monotone"
                     stroke={`var(--color-rx_${series.key})`}
                     strokeWidth={2}
-                    dot={false}
+                    dot={
+                      netData.filter((point) =>
+                        Number.isFinite(point[`rx_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />,
@@ -716,7 +720,13 @@ export function EnvironmentMetricsCharts({
                     stroke={`var(--color-tx_${series.key})`}
                     strokeWidth={2}
                     strokeDasharray="4 3"
-                    dot={false}
+                    dot={
+                      netData.filter((point) =>
+                        Number.isFinite(point[`tx_${series.key}`])
+                      ).length === 1
+                        ? { r: 3 }
+                        : false
+                    }
                     activeDot={{ r: 4 }}
                     connectNulls
                   />,

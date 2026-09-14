@@ -251,6 +251,7 @@ mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
 mod m20260903_000004_repair_application_primary_projects;
 // This branch and main each shipped a migration with the same date and
 // sequence stamp. Preserve that upgrade history rather than renumbering.
+mod m20260901_000001_add_database_provisioning_to_project_services;
 mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
@@ -258,6 +259,11 @@ mod m20260904_000003_add_continuous_archive_source_to_external_services;
 mod m20260907_000001_add_mfa_pending_origin_to_sessions;
 mod m20260908_000001_reconcile_legacy_status_monitors;
 mod m20260909_000001_index_global_log_chunks;
+mod m20260910_000001_managed_daemon_workspace_images;
+mod m20260911_000001_create_ai_application_git_bindings;
+mod m20260912_000001_expand_managed_daemon_workspace_images;
+mod m20260912_000002_managed_daemon_workspace_images_v031;
+mod m20260912_000003_managed_daemon_workspace_images_v032;
 
 pub struct Migrator;
 
@@ -570,6 +576,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20260903_000004_repair_application_primary_projects::Migration),
             Box::new(m20260908_000001_reconcile_legacy_status_monitors::Migration),
             Box::new(m20260909_000001_index_global_log_chunks::Migration),
+            Box::new(
+                m20260901_000001_add_database_provisioning_to_project_services::Migration,
+            ),
+            Box::new(m20260910_000001_managed_daemon_workspace_images::Migration),
+            Box::new(m20260911_000001_create_ai_application_git_bindings::Migration),
+            Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
+            Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
+            Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
             Box::new(m20260713_000002_add_dns_ownership::Migration),
             Box::new(m20260714_000001_create_domain_delivery::Migration),
         ]
@@ -595,6 +609,14 @@ mod registry_tests {
         );
 
         for (shipped, added) in [
+            (
+                "m20260912_000003_managed_daemon_workspace_images_v032",
+                "m20260713_000002_add_dns_ownership",
+            ),
+            (
+                "m20260713_000002_add_dns_ownership",
+                "m20260714_000001_create_domain_delivery",
+            ),
             (
                 "m20260810_000001_create_sandbox_snapshots",
                 "m20260810_000001_add_cli_session_id_to_ai_conversations",

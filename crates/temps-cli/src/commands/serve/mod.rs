@@ -207,6 +207,8 @@ impl ServeCommand {
             );
         }
 
+        let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
+
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
             self.database_url.clone(),
@@ -738,6 +740,7 @@ impl ServeCommand {
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
+            external_plugin_registry,
         };
 
         if self.role == ServeRole::Console {

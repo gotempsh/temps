@@ -60,112 +60,119 @@ function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).length
 }
 
-export const templateRuntimeDefaultsSchema = z
-  .object({
-    image: z
-      .string()
-      .trim()
-      .min(1, 'Image reference is required')
-      .refine(
-        (value) => utf8ByteLength(value) <= 512,
-        'Image reference cannot exceed 512 bytes'
-      )
-      .regex(
-        /^.+@sha256:[0-9a-f]{64}$/i,
-        'Image reference must use an immutable SHA-256 digest'
-      )
-      .refine(
-        (value) =>
-          !Array.from(value).some((character) => /\s/.test(character)) &&
-          !hasControlCharacters(value),
-        'Image reference cannot contain whitespace or control characters'
-      ),
-    command: z.string().superRefine((value, context) => {
-      const argumentsList = value
-        .split('\n')
-        .map((argument) => argument.trim())
-        .filter(Boolean)
-      if (argumentsList.length > 64) {
-        context.addIssue({
-          code: 'custom',
-          message: 'Container command supports at most 64 arguments',
-        })
-      }
-      if (
-        argumentsList.some(
-          (argument) =>
-            utf8ByteLength(argument) > 1_024 || hasControlCharacters(argument)
+export const createTemplateRuntimeDefaultsSchema = (
+  kind: 'starter' | 'service'
+) =>
+  z
+    .object({
+      image: z
+        .string()
+        .trim()
+        .min(1, 'Image reference is required')
+        .refine(
+          (value) => utf8ByteLength(value) <= 512,
+          'Image reference cannot exceed 512 bytes'
         )
+        .refine(
+          (value) =>
+            kind !== 'service' || /^.+@sha256:[0-9a-fA-F]{64}$/.test(value),
+          'Image reference must use an immutable SHA-256 digest'
+        )
+        .refine(
+          (value) =>
+            !Array.from(value).some((character) => /\s/.test(character)) &&
+            !hasControlCharacters(value),
+          'Image reference cannot contain whitespace or control characters'
+        ),
+      command: z.string().superRefine((value, context) => {
+        const argumentsList = value
+          .split('\n')
+          .map((argument) => argument.trim())
+          .filter(Boolean)
+        if (argumentsList.length > 64) {
+          context.addIssue({
+            code: 'custom',
+            message: 'Container command supports at most 64 arguments',
+          })
+        }
+        if (
+          argumentsList.some(
+            (argument) =>
+              utf8ByteLength(argument) > 1_024 || hasControlCharacters(argument)
+          )
+        ) {
+          context.addIssue({
+            code: 'custom',
+            message:
+              'Each command argument must be at most 1024 bytes and contain no control characters',
+          })
+        }
+      }),
+      cpuRequest: optionalNumber('CPU request', { min: 0.01 }),
+      cpuLimit: optionalNumber('CPU limit', { min: 0.01, allowZero: true }),
+      memoryRequest: optionalNumber('Memory request', { min: 1 }),
+      memoryLimit: optionalNumber('Memory limit', { min: 1, allowZero: true }),
+      exposedPort: z
+        .string()
+        .refine(
+          (value) =>
+            value.trim() === '' ||
+            (Number.isInteger(Number(value)) &&
+              Number(value) >= 1 &&
+              Number(value) <= 65_535),
+          'Port must be between 1 and 65535'
+        ),
+      healthCheckPath: z
+        .string()
+        .trim()
+        .min(1, 'Health-check path is required')
+        .refine(
+          (value) => utf8ByteLength(value) <= 2_048,
+          'Health-check path cannot exceed 2048 bytes'
+        )
+        .refine(
+          (value) =>
+            value.startsWith('/') &&
+            !value.includes('://') &&
+            !value.includes('@') &&
+            !hasControlCharacters(value),
+          "Use a relative HTTP path starting with '/'"
+        ),
+    })
+    .superRefine((runtime, context) => {
+      const cpuRequest = optionalNumericValue(runtime.cpuRequest)
+      const cpuLimit = optionalNumericValue(runtime.cpuLimit)
+      if (
+        cpuRequest != null &&
+        cpuLimit != null &&
+        cpuLimit !== 0 &&
+        cpuRequest > cpuLimit
       ) {
         context.addIssue({
           code: 'custom',
-          message:
-            'Each command argument must be at most 1024 bytes and contain no control characters',
+          path: ['cpuLimit'],
+          message: 'CPU limit must be greater than or equal to the request',
         })
       }
-    }),
-    cpuRequest: optionalNumber('CPU request', { min: 0.01 }),
-    cpuLimit: optionalNumber('CPU limit', { min: 0.01, allowZero: true }),
-    memoryRequest: optionalNumber('Memory request', { min: 1 }),
-    memoryLimit: optionalNumber('Memory limit', { min: 1, allowZero: true }),
-    exposedPort: z
-      .string()
-      .refine(
-        (value) =>
-          value.trim() === '' ||
-          (Number.isInteger(Number(value)) &&
-            Number(value) >= 1 &&
-            Number(value) <= 65_535),
-        'Port must be between 1 and 65535'
-      ),
-    healthCheckPath: z
-      .string()
-      .trim()
-      .min(1, 'Health-check path is required')
-      .refine(
-        (value) => utf8ByteLength(value) <= 2_048,
-        'Health-check path cannot exceed 2048 bytes'
-      )
-      .refine(
-        (value) =>
-          value.startsWith('/') &&
-          !value.includes('://') &&
-          !value.includes('@') &&
-          !hasControlCharacters(value),
-        "Use a relative HTTP path starting with '/'"
-      ),
-  })
-  .superRefine((runtime, context) => {
-    const cpuRequest = optionalNumericValue(runtime.cpuRequest)
-    const cpuLimit = optionalNumericValue(runtime.cpuLimit)
-    if (
-      cpuRequest != null &&
-      cpuLimit != null &&
-      cpuLimit !== 0 &&
-      cpuRequest > cpuLimit
-    ) {
-      context.addIssue({
-        code: 'custom',
-        path: ['cpuLimit'],
-        message: 'CPU limit must be greater than or equal to the request',
-      })
-    }
 
-    const memoryRequest = optionalNumericValue(runtime.memoryRequest)
-    const memoryLimit = optionalNumericValue(runtime.memoryLimit)
-    if (
-      memoryRequest != null &&
-      memoryLimit != null &&
-      memoryLimit !== 0 &&
-      memoryRequest > memoryLimit
-    ) {
-      context.addIssue({
-        code: 'custom',
-        path: ['memoryLimit'],
-        message: 'Memory limit must be greater than or equal to the request',
-      })
-    }
-  })
+      const memoryRequest = optionalNumericValue(runtime.memoryRequest)
+      const memoryLimit = optionalNumericValue(runtime.memoryLimit)
+      if (
+        memoryRequest != null &&
+        memoryLimit != null &&
+        memoryLimit !== 0 &&
+        memoryRequest > memoryLimit
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['memoryLimit'],
+          message: 'Memory limit must be greater than or equal to the request',
+        })
+      }
+    })
+
+export const templateRuntimeDefaultsSchema =
+  createTemplateRuntimeDefaultsSchema('service')
 
 export type TemplateRuntimeDefaults = z.infer<
   typeof templateRuntimeDefaultsSchema

@@ -12,7 +12,7 @@ name: Dependency & Container Scan
 #   Advisory Database.
 # - `web-audit` scans web/ (bun) dependencies against the same class of
 #   advisory data via `bun audit`.
-# - `container-scan` (best-effort, schedule/dispatch only) scans the latest
+# - `container-scan` (schedule/dispatch only) scans the latest
 #   published release image with Trivy. It intentionally does not run on
 #   pull_request: a PR has no fresh image to scan (release.yml only builds
 #   images for pushed `v*.*.*` tags), so scanning the last published
@@ -188,13 +188,11 @@ jobs:
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install web dependencies
         run: |
           cd web
-          bun install
+          bun install --frozen-lockfile
 
       # Fails the job if any high or critical severity advisory is found in
       # web/'s dependency tree. `bun audit` exits non-zero when findings meet
@@ -211,7 +209,7 @@ jobs:
           bun audit --audit-level=high
 
   container-scan:
-    name: Container Image Scan (Trivy, best-effort)
+    name: Container Image Scan (Trivy)
     # Only meaningful on a schedule/manual run: PRs don't produce a fresh
     # published image to scan (release.yml only builds+pushes on `v*.*.*`
     # tags). This job scans whatever is currently published as `:latest`.
@@ -238,29 +236,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run Trivy vulnerability scanner on published image
+      - name: Pin published image digest
+        id: published_image
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/temps:latest"
+          digest="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve a valid digest for $image" >&2
+            exit 1
+          fi
+          printf 'ref=%s@%s\n' "${image%:latest}" "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Trivy SARIF for published image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          # Matches the tag naming release.yml publishes for stable releases
-          # (ghcr.io/${{ github.repository_owner }}/temps:<channel_tag>) --
-          # dynamic owner so this also resolves correctly if run from a fork
-          # that publishes its own images under the same convention.
-          image-ref: ghcr.io/${{ github.repository_owner }}/temps:latest
+          # Both scans use the same immutable digest if :latest moves mid-job.
+          image-ref: ${{ steps.published_image.outputs.ref }}
           format: sarif
           output: trivy-results.sarif
-          severity: "CRITICAL,HIGH"
-          # Report all findings in the SARIF/table output, but only fail the
-          # job (exit-code 1) on CRITICAL/HIGH -- matches the fail threshold
-          # used for cargo-audit/bun audit above.
-          exit-code: "1"
+          # SARIF deliberately includes all severities for code scanning.
+          # trivy-action clears the severity filter in SARIF mode by default,
+          # so a separate table scan below enforces the HIGH/CRITICAL gate.
+          exit-code: "0"
           ignore-unfixed: true
 
       # Best-effort: only succeeds if the repo has GitHub code scanning
       # (Advanced Security / public repo) enabled. Non-fatal if not, so it
-      # never masks or replaces the pass/fail signal from the step above.
+      # never masks or replaces the pass/fail signal from the gate below.
       - name: Upload Trivy results to GitHub code scanning
-        if: always()
+        if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
         with:
           sarif_file: trivy-results.sarif
+
+      - name: Fail on fixable high or critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.published_image.outputs.ref }}
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true

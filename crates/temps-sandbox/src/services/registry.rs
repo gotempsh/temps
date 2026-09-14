@@ -25,17 +25,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::{
-    user::SANDBOX_CHOWN, SandboxCreateConfig, SandboxHandle, SandboxProvider,
+    user::SANDBOX_CHOWN, RuntimeCompatibility, SandboxCreateConfig, SandboxHandle, SandboxProvider,
 };
 
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
+    runtime_compatibility: Mutex<HashMap<i32, (String, Instant, RuntimeCompatibility)>>,
     /// Sandboxes whose live provider handle was adopted in this server
     /// generation. Their previous Temps process may have died while a harness
     /// exec was active, so the first managed workspace operation must fence
@@ -48,12 +49,14 @@ pub struct StandaloneSandboxRegistry {
 }
 
 const STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_COMPATIBILITY_TTL: Duration = Duration::from_secs(30);
 
 impl StandaloneSandboxRegistry {
     pub fn new(provider: Arc<dyn SandboxProvider>) -> Self {
         Self {
             provider,
             handles: RwLock::new(HashMap::new()),
+            runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
         }
@@ -65,6 +68,29 @@ impl StandaloneSandboxRegistry {
 
     pub fn provider_arc(&self) -> Arc<dyn SandboxProvider> {
         self.provider.clone()
+    }
+
+    pub async fn runtime_compatibility(
+        &self,
+        id: i32,
+        public_id: &str,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        let handle = self.get(id, public_id).await?;
+        if let Some((container_id, checked_at, status)) =
+            self.runtime_compatibility.lock().await.get(&id)
+        {
+            if container_id == &handle.sandbox_id
+                && checked_at.elapsed() < RUNTIME_COMPATIBILITY_TTL
+            {
+                return Ok(status.clone());
+            }
+        }
+        let status = self.provider.check_agent_runtime(&handle).await?;
+        self.runtime_compatibility
+            .lock()
+            .await
+            .insert(id, (handle.sandbox_id, Instant::now(), status.clone()));
+        Ok(status)
     }
 
     /// Create and register a new sandbox for the given internal ID.
@@ -121,6 +147,44 @@ impl StandaloneSandboxRegistry {
         self.handles.write().await.insert(id, handle.clone());
         self.recovered_in_this_generation.write().await.remove(&id);
         Ok(handle)
+    }
+
+    /// Switch compute after the caller has independently verified the new image.
+    /// A failed replacement recreates the previous image against the same
+    /// persistent volumes before the error is returned.
+    pub async fn replace_with_rollback(
+        &self,
+        id: i32,
+        public_id: &str,
+        replacement: SandboxCreateConfig,
+        previous: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let old = self.get_or_recover(id, public_id).await?;
+        self.provider.destroy(&old, false).await?;
+        self.handles.write().await.remove(&id);
+        match self.provider.create(replacement).await {
+            Ok(handle) => {
+                self.handles.write().await.insert(id, handle.clone());
+                self.recovered_in_this_generation.write().await.remove(&id);
+                Ok(handle)
+            }
+            Err(replacement_error) => {
+                match self.provider.create(previous).await {
+                    Ok(handle) => {
+                        self.handles.write().await.insert(id, handle);
+                        self.recovered_in_this_generation.write().await.remove(&id);
+                        Err(replacement_error)
+                    }
+                    Err(rollback_error) => Err(AgentError::SandboxCreationFailed {
+                        run_id: id,
+                        provider: self.provider.name().to_string(),
+                        reason: format!(
+                            "runtime update for sandbox {public_id} failed: {replacement_error}; rollback also failed: {rollback_error}"
+                        ),
+                    }),
+                }
+            }
+        }
     }
 
     pub async fn restore(
@@ -427,6 +491,7 @@ mod tests {
         stops: AtomicUsize,
         restarts: AtomicUsize,
         destroys: AtomicUsize,
+        create_failures_remaining: AtomicUsize,
         fence_patterns: std::sync::Mutex<Vec<Vec<String>>>,
         fence_attempts: AtomicUsize,
         fence_failures_remaining: AtomicUsize,
@@ -442,6 +507,7 @@ mod tests {
                 stops: AtomicUsize::new(0),
                 restarts: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
+                create_failures_remaining: AtomicUsize::new(0),
                 fence_patterns: std::sync::Mutex::new(Vec::new()),
                 fence_attempts: AtomicUsize::new(0),
                 fence_failures_remaining: AtomicUsize::new(0),
@@ -461,6 +527,12 @@ mod tests {
             self
         }
 
+        fn with_create_failures(self, failures: usize) -> Self {
+            self.create_failures_remaining
+                .store(failures, Ordering::SeqCst);
+            self
+        }
+
         fn with_fence_failures(self, failures: usize) -> Self {
             self.fence_failures_remaining
                 .store(failures, Ordering::SeqCst);
@@ -476,6 +548,19 @@ mod tests {
     #[async_trait]
     impl SandboxProvider for FakeProvider {
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            if self
+                .create_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "fake".to_string(),
+                    reason: "injected create failure".to_string(),
+                });
+            }
             Ok(SandboxHandle {
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
@@ -903,6 +988,41 @@ mod tests {
             .expect("second fence task")
             .expect("shared fence result");
         assert_eq!(provider.fence_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_recreates_previous_compute() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_create_failures(1),
+        );
+        let registry = StandaloneSandboxRegistry::new(provider.clone());
+        let config = |image: &str| SandboxCreateConfig {
+            run_id: 42,
+            container_name_override: Some("abc123".to_string()),
+            host_work_dir: PathBuf::from("/workspace"),
+            workspace_volume: None,
+            image: Some(image.to_string()),
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+            owner_user_id: Some(7),
+        };
+        let result = registry
+            .replace_with_rollback(42, "sbx_abc123", config("new"), config("old"))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(
+            registry.get(42, "sbx_abc123").await.is_ok(),
+            "previous compute must be registered after replacement failure"
+        );
     }
 
     #[tokio::test]

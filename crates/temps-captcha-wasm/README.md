@@ -10,6 +10,22 @@ This module provides a fast proof-of-work challenge solver that runs in the brow
 
 ## Building
 
+To regenerate the committed package, run from the repository root:
+
+```bash
+bash scripts/rebuild-captcha-wasm.sh
+```
+
+This uses the Dockerfile's pinned toolchain on **Linux/AMD64**, including on
+Apple Silicon. The compiler host architecture affects the generated WASM bytes;
+a native ARM64 or macOS rebuild is not the canonical artifact. Commit the updated
+`pkg/` files after regenerating. CI rebuilds the package from source before
+building the application; it does not require byte equality with the committed
+package. `bash scripts/verify-captcha-wasm.sh` remains available as an optional
+local comparison.
+
+For local development (output may differ from the committed package):
+
 ```bash
 # Install wasm-pack if not already installed
 cargo install wasm-pack --version 0.15.0 --locked

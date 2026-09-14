@@ -308,12 +308,16 @@ impl TempsPlugin for AiChatPlugin {
         });
         let model_relay = context.require_service::<temps_ai_agent_cli::SandboxModelRelayService>();
         let router = handlers::configure_routes()
+            .merge(crate::git_bindings_handlers::configure_routes())
             .with_state(app_state)
             .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<AiChatApiDoc as OpenApiTrait>::openapi())
+        let mut document = <AiChatApiDoc as OpenApiTrait>::openapi();
+        document
+            .merge(<crate::git_bindings_handlers::GitBindingsApiDoc as OpenApiTrait>::openapi());
+        Some(document)
     }
 }

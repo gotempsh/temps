@@ -46,7 +46,8 @@ import {
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { KeyRound, Loader2, Pencil, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { EmptyState } from '@/components/ui/empty-state'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   deleteSecretMutation,
@@ -105,18 +106,24 @@ export function AgentSecrets() {
               Secrets
             </CardTitle>
             <CardDescription>
-              Encrypted secrets injected into all agent sandboxes as environment variables or files.
-              Reference in config with <code className="bg-muted px-1 rounded text-xs">{'${TEMPS_SECRET:name}'}</code>.
+              Encrypted secrets injected into all agent sandboxes as environment
+              variables or files. Reference in config with{' '}
+              <code className="bg-muted px-1 rounded text-xs">
+                {'${TEMPS_SECRET:name}'}
+              </code>
+              .
             </CardDescription>
           </div>
-          <CreateActionButton
-            size="sm"
-            onClick={() => {
-              setEditingSecret(null)
-              setDialogOpen(true)
-            }}
-            label="Add Secret"
-          />
+          {secrets.length > 0 && (
+            <CreateActionButton
+              size="sm"
+              onClick={() => {
+                setEditingSecret(null)
+                setDialogOpen(true)
+              }}
+              label="Add Secret"
+            />
+          )}
         </div>
       </CardHeader>
       <CardContent>
@@ -125,9 +132,22 @@ export function AgentSecrets() {
             <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
           </div>
         ) : secrets.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-6">
-            No secrets configured. Add secrets to inject API keys, tokens, or config files into agent sandboxes.
-          </p>
+          <EmptyState
+            size="compact"
+            icon={KeyRound}
+            title="No secrets yet"
+            description="Add an encrypted API key, token, or config file for your agent sandboxes."
+            action={
+              <Button
+                onClick={() => {
+                  setEditingSecret(null)
+                  setDialogOpen(true)
+                }}
+              >
+                Add your first secret
+              </Button>
+            }
+          />
         ) : (
           <div className="overflow-x-auto">
             <Table>
@@ -135,15 +155,21 @@ export function AgentSecrets() {
                 <TableRow>
                   <TableHead>Name</TableHead>
                   <TableHead className="hidden sm:table-cell">Type</TableHead>
-                  <TableHead className="hidden md:table-cell">Description</TableHead>
-                  <TableHead className="hidden md:table-cell">Updated</TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Description
+                  </TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Updated
+                  </TableHead>
                   <TableHead className="w-[96px]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {secrets.map((secret: AgentSecret) => (
                   <TableRow key={secret.id}>
-                    <TableCell className="font-mono text-sm">{secret.name}</TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {secret.name}
+                    </TableCell>
                     <TableCell className="hidden sm:table-cell">
                       <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs">
                         {secret.secret_type === 'env' ? 'Env Var' : 'File'}
@@ -195,6 +221,7 @@ export function AgentSecrets() {
       </CardContent>
 
       <SecretDialog
+        key={`${dialogOpen ? 'open' : 'closed'}-${editingSecret?.id ?? 'new'}`}
         open={dialogOpen}
         onOpenChange={(open) => {
           setDialogOpen(open)
@@ -264,31 +291,13 @@ function SecretDialog({
   isPending: boolean
 }) {
   const isEdit = secret !== null
-  const [name, setName] = useState('')
-  const [secretType, setSecretType] = useState<'env' | 'file'>('env')
+  const [name, setName] = useState(secret?.name ?? '')
+  const [secretType, setSecretType] = useState<'env' | 'file'>(
+    secret?.secret_type === 'file' ? 'file' : 'env'
+  )
   const [value, setValue] = useState('')
-  const [mountPath, setMountPath] = useState('')
-  const [description, setDescription] = useState('')
-
-  // Sync form state when the dialog opens with a secret (edit) or empty (create).
-  // Value field always starts empty in edit mode — the API only returns a masked
-  // placeholder, and leaving it blank means "don't change the value".
-  useEffect(() => {
-    if (!open) return
-    if (secret) {
-      setName(secret.name)
-      setSecretType(secret.secret_type === 'file' ? 'file' : 'env')
-      setValue('')
-      setMountPath(secret.mount_path ?? '')
-      setDescription(secret.description ?? '')
-    } else {
-      setName('')
-      setSecretType('env')
-      setValue('')
-      setMountPath('')
-      setDescription('')
-    }
-  }, [open, secret])
+  const [mountPath, setMountPath] = useState(secret?.mount_path ?? '')
+  const [description, setDescription] = useState(secret?.description ?? '')
 
   const handleSubmit = () => {
     if (!name.trim()) {
@@ -310,7 +319,9 @@ function SecretDialog({
     // string and the backend will overwrite the encrypted value with that mask.
     // To preserve the existing value, we require the user to enter a new one.
     if (isEdit && !value.trim()) {
-      toast.error('Enter a new value, or delete and recreate the secret to keep it unchanged')
+      toast.error(
+        'Enter a new value, or delete and recreate the secret to keep it unchanged'
+      )
       return
     }
 
@@ -329,27 +340,47 @@ function SecretDialog({
         <DialogHeader>
           <DialogTitle>{isEdit ? 'Edit Secret' : 'Add Secret'}</DialogTitle>
         </DialogHeader>
-        <form onSubmit={(e) => { e.preventDefault(); handleSubmit() }} className="space-y-4 py-2">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault()
+            handleSubmit()
+          }}
+          className="space-y-4 py-2"
+        >
           <div className="space-y-1.5">
             <Label htmlFor="secret-name">Name</Label>
             <Input
               id="secret-name"
               value={name}
-              onChange={(e) => setName(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '_'))}
+              onChange={(e) =>
+                setName(
+                  e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+                )
+              }
               placeholder="ANTHROPIC_API_KEY"
               className="font-mono"
               disabled={isEdit}
             />
             <p className="text-xs text-muted-foreground">
-              {isEdit
-                ? 'Name cannot be changed. Delete and recreate to rename.'
-                : (<>Use in config as <code className="bg-muted px-1 rounded">{'${TEMPS_SECRET:' + (name || 'NAME') + '}'}</code></>)}
+              {isEdit ? (
+                'Name cannot be changed. Delete and recreate to rename.'
+              ) : (
+                <>
+                  Use in config as{' '}
+                  <code className="bg-muted px-1 rounded">
+                    {'${TEMPS_SECRET:' + (name || 'NAME') + '}'}
+                  </code>
+                </>
+              )}
             </p>
           </div>
 
           <div className="space-y-1.5">
             <Label>Type</Label>
-            <Select value={secretType} onValueChange={(v) => setSecretType(v as 'env' | 'file')}>
+            <Select
+              value={secretType}
+              onValueChange={(v) => setSecretType(v as 'env' | 'file')}
+            >
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
@@ -406,11 +437,19 @@ function SecretDialog({
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
               Cancel
             </Button>
             <Button type="submit" disabled={isPending}>
-              {isPending ? 'Saving...' : isEdit ? 'Save Changes' : 'Save Secret'}
+              {isPending
+                ? 'Saving...'
+                : isEdit
+                  ? 'Save Changes'
+                  : 'Save Secret'}
             </Button>
           </DialogFooter>
         </form>

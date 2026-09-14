@@ -2,20 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
-import type { EnvironmentView } from '@/lib/environment-navigation'
 import {
   sleepEnvironmentMutation,
   wakeEnvironmentMutation,
   getDeploymentOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import {
   Tooltip,
   TooltipContent,
@@ -25,18 +17,12 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
-  Boxes,
-  Check,
-  ChevronsUpDown,
   Clock,
   ExternalLink,
   GitBranch,
-  LineChart,
   Loader2,
   Moon,
   Play,
-  Plus,
-  Settings2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
@@ -45,21 +31,11 @@ import { toast } from 'sonner'
 interface EnvironmentHeaderBarProps {
   environment: EnvironmentResponse
   project: ProjectResponse
-  activeView: EnvironmentView
-  onViewChange: (view: EnvironmentView) => void
-  environments?: EnvironmentResponse[]
-  onEnvironmentChange?: (id: number) => void
-  onCreateEnvironment?: () => void
 }
 
 export function EnvironmentHeaderBar({
   environment,
   project,
-  activeView,
-  onViewChange,
-  environments,
-  onEnvironmentChange,
-  onCreateEnvironment,
 }: EnvironmentHeaderBarProps) {
   const queryClient = useQueryClient()
   const isOnDemand = environment.deployment_config?.onDemand ?? false
@@ -127,97 +103,38 @@ export function EnvironmentHeaderBar({
 
   const statusTone = isSleeping
     ? 'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-500/10 dark:text-amber-400 dark:ring-amber-500/30'
-    : 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/30'
-
-  const hasMultipleEnvs = (environments?.length ?? 0) > 1
-  const canSwitchEnvs = !!environments && environments.length > 0
+    : environment.current_deployment_id
+      ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/30'
+      : 'bg-muted text-muted-foreground ring-border'
 
   return (
-    <div className="sticky top-0 z-10 bg-white/95 backdrop-blur dark:bg-neutral-950/95">
+    <div className="border-b bg-background">
       <div className="w-full px-4 sm:px-6 lg:px-8">
         {/* Primary row */}
         <div className="flex flex-col gap-4 py-5 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2.5">
-              {canSwitchEnvs && hasMultipleEnvs ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      className="group inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-2xl font-semibold tracking-tight text-neutral-950 hover:bg-neutral-100 dark:text-white dark:hover:bg-white/5"
-                    >
-                      <span className="truncate">{environment.name}</span>
-                      <ChevronsUpDown
-                        className="size-4 text-neutral-400 group-hover:text-neutral-600 dark:group-hover:text-neutral-300"
-                        aria-hidden="true"
-                      />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-64">
-                    {environments!.map((env) => (
-                      <DropdownMenuItem
-                        key={env.id}
-                        onSelect={() => onEnvironmentChange?.(env.id)}
-                        className="flex items-start gap-2"
-                      >
-                        <Check
-                          className={`size-4 mt-0.5 shrink-0 ${
-                            env.id === environment.id
-                              ? 'opacity-100'
-                              : 'opacity-0'
-                          }`}
-                          aria-hidden="true"
-                        />
-                        <div className="flex flex-col min-w-0">
-                          <span className="font-medium truncate">
-                            {env.name}
-                          </span>
-                          {env.branch && (
-                            <span className="text-xs text-neutral-500 dark:text-neutral-400 font-mono truncate">
-                              {env.branch}
-                            </span>
-                          )}
-                        </div>
-                      </DropdownMenuItem>
-                    ))}
-                    {onCreateEnvironment && (
-                      <>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem onSelect={onCreateEnvironment}>
-                          <Plus className="size-4 mr-2" aria-hidden="true" />
-                          New environment
-                        </DropdownMenuItem>
-                      </>
-                    )}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              ) : (
-                <>
-                  <h1 className="truncate text-2xl font-semibold tracking-tight text-neutral-950 dark:text-white">
-                    {environment.name}
-                  </h1>
-                  {onCreateEnvironment && (
-                    <button
-                      type="button"
-                      onClick={onCreateEnvironment}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-sm text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-neutral-200"
-                    >
-                      <Plus className="size-3.5" aria-hidden="true" />
-                      New environment
-                    </button>
-                  )}
-                </>
-              )}
+              <h1 className="truncate text-xl font-semibold tracking-tight text-foreground">
+                {environment.name}
+              </h1>
               <span
                 className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${statusTone}`}
               >
                 <span
                   className={`size-1.5 rounded-full ${
-                    isSleeping ? 'bg-amber-500' : 'bg-emerald-500'
+                    isSleeping
+                      ? 'bg-amber-500'
+                      : environment.current_deployment_id
+                        ? 'bg-emerald-500'
+                        : 'bg-muted-foreground'
                   }`}
                   aria-hidden="true"
                 />
-                {isSleeping ? 'Sleeping' : 'Running'}
+                {isSleeping
+                  ? 'Sleeping'
+                  : environment.current_deployment_id
+                    ? 'Running'
+                    : 'Not deployed'}
               </span>
               {environment.slug === 'production' && (
                 <span className="inline-flex items-center rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-700 ring-1 ring-inset ring-neutral-950/10 dark:bg-white/5 dark:text-neutral-300 dark:ring-white/10">
@@ -328,60 +245,6 @@ export function EnvironmentHeaderBar({
               ))}
           </div>
         </div>
-
-        <nav
-          aria-label={`${environment.name} environment views`}
-          className="flex items-center gap-1 border-t border-neutral-950/10 pt-2 dark:border-white/10"
-        >
-          <button
-            type="button"
-            onClick={() => onViewChange('containers')}
-            aria-current={activeView === 'containers' ? 'page' : undefined}
-            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
-              activeView === 'containers'
-                ? 'text-neutral-950 dark:text-white'
-                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
-            }`}
-          >
-            <Boxes className="size-4" aria-hidden="true" />
-            Containers
-            {activeView === 'containers' && (
-              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => onViewChange('metrics')}
-            aria-current={activeView === 'metrics' ? 'page' : undefined}
-            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
-              activeView === 'metrics'
-                ? 'text-neutral-950 dark:text-white'
-                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
-            }`}
-          >
-            <LineChart className="size-4" aria-hidden="true" />
-            Metrics
-            {activeView === 'metrics' && (
-              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => onViewChange('settings')}
-            aria-current={activeView === 'settings' ? 'page' : undefined}
-            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
-              activeView === 'settings'
-                ? 'text-neutral-950 dark:text-white'
-                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
-            }`}
-          >
-            <Settings2 className="size-4" aria-hidden="true" />
-            Environment settings
-            {activeView === 'settings' && (
-              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
-            )}
-          </button>
-        </nav>
       </div>
     </div>
   )

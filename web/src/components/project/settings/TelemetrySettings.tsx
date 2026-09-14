@@ -38,11 +38,11 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -136,6 +136,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   useEffect(() => {
     if (!settings) return
+    // The query may refresh after a save or external change; reset both draft controls.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setWriteMode(settings.write_mode)
     setFidelity(settings.fidelity)
   }, [settings])
@@ -184,7 +186,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   if (isPending) {
     return (
-      <div className="mx-auto w-full max-w-3xl space-y-4 px-4 py-8 sm:px-6">
+      <div className="w-full space-y-4 px-4 py-8 sm:px-6">
         <Skeleton className="h-8 w-64" />
         <Skeleton className="h-48 w-full" />
         <Skeleton className="h-40 w-full" />
@@ -194,7 +196,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
 
   if (isError || !settings) {
     return (
-      <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
+      <div className="w-full px-4 py-8 sm:px-6">
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Telemetry storage settings unavailable</AlertTitle>
@@ -222,7 +224,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   const downgradeBlocked = writeMode === 'cloud' && fidelity === 'metered'
 
   return (
-    <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-8 sm:px-6">
+    <div className="w-full space-y-6 px-4 py-8 sm:px-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">
@@ -292,15 +294,12 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       )}
 
       {/* ── Write mode ─────────────────────────────────────────────── */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Where spans are stored</CardTitle>
-          <CardDescription>
-            This decides whether this project’s spans exist on this machine at
-            all.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Where spans are stored"
+        description="Choose whether this project's spans are stored locally or in Temps Cloud"
+        icon={HardDrive}
+      >
+        <div className="space-y-4">
           <RadioGroup
             value={writeMode}
             onValueChange={(value) =>
@@ -376,21 +375,16 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               </AlertDescription>
             </Alert>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* ── Fidelity ───────────────────────────────────────────────── */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">
-            How much of each span leaves this instance
-          </CardTitle>
-          <CardDescription>
-            Applies to spans sent to Temps Cloud, whether as a mirror or as this
-            project’s primary store.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Span fidelity"
+        description="Control how much of each span leaves this instance for Temps Cloud"
+        icon={CloudUpload}
+      >
+        <div className="space-y-4">
           <RadioGroup
             value={fidelity}
             onValueChange={(value) =>
@@ -454,8 +448,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               </AlertDescription>
             </Alert>
           )}
-        </CardContent>
-        <CardFooter className="justify-end gap-2">
+        </div>
+        <div className="mt-6 flex justify-end gap-2">
           {dirty && (
             <Button
               variant="ghost"
@@ -479,8 +473,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
           >
             {save.isPending ? 'Saving…' : 'Save changes'}
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* ── History ────────────────────────────────────────────────── */}
       {(settings.intervals.length > 0 || settings.gap_windows.length > 0) && (

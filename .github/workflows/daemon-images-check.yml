@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Agent runtime image checks
+
+on:
+  pull_request:
+    paths:
+      - 'tools/sandbox-runtime/**'
+      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - '.github/workflows/daemon-images*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [nodejs, python, all]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check build contracts
+        run: python3 tools/sandbox-runtime/test_build_inputs.py
+      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        with:
+          cache-image: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
+      - name: Build without credentials or publication
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+      - name: Load native image for lifecycle verification
+        if: matrix.flavor == 'nodejs'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: nodejs
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: temps-daemon-ci:check
+      - name: Install Rust for the typed SDK smoke client
+        if: matrix.flavor == 'nodejs'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Verify daemon lifecycle without provider credentials
+        if: matrix.flavor == 'nodejs'
+        run: bash tools/sandbox-runtime/smoke.sh temps-daemon-ci:check

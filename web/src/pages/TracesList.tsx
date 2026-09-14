@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import {
   EnvironmentResponse,
   ProjectResponse,
@@ -39,6 +43,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { cn } from '@/lib/utils'
 import {
   Table,
@@ -54,16 +59,12 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
-  ArrowDown,
   ArrowLeft,
   ArrowRight,
-  ArrowUp,
-  ArrowUpDown,
   Bot,
   Check,
   ChevronLeft,
   ChevronRight,
-  Clock,
   FileCode,
   Gauge,
   Loader2,
@@ -74,13 +75,7 @@ import {
   Terminal,
   Workflow,
 } from 'lucide-react'
-import {
-  ReactElement,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react'
+import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
@@ -409,7 +404,8 @@ function OtelSetupSection({
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
   const [celebrate, setCelebrate] = useState(false)
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
-  const [selectedFrameworkId, setSelectedFrameworkId] = useState<string>('nextjs')
+  const [selectedFrameworkId, setSelectedFrameworkId] =
+    useState<string>('nextjs')
 
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -439,7 +435,9 @@ function OtelSetupSection({
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
     frameworkPresets[0]
 
-  const setupCode = preset.setupCode.split('__SERVICE_NAME__').join(project.name)
+  const setupCode = preset.setupCode
+    .split('__SERVICE_NAME__')
+    .join(project.name)
 
   const envVarsCode = `# Auto-injected on Temps deployments.
 # Set these manually when running on Vercel, Fly, AWS, bare metal, etc.
@@ -597,8 +595,8 @@ OTEL_SERVICE_NAME=${project.name}`
                 </h4>
               </div>
               <p className="text-xs text-muted-foreground">
-                Skip this if you deploy on Temps. Required when running the
-                app on Vercel, Fly, AWS, bare metal, etc.
+                Skip this if you deploy on Temps. Required when running the app
+                on Vercel, Fly, AWS, bare metal, etc.
               </p>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-muted-foreground shrink-0">
@@ -619,14 +617,17 @@ OTEL_SERVICE_NAME=${project.name}`
               </div>
               <CodeBlock code={envVarsCode} language="bash" title=".env" />
               <p className="text-xs text-muted-foreground">
-                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key
-                (<code>tk_...</code>) from{' '}
+                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
+                <code>tk_...</code>) from{' '}
                 <strong>Settings &rarr; API Keys</strong>.
               </p>
             </div>
 
             <div className="flex items-center justify-between gap-3">
-              <Button variant="ghost" onClick={() => setWizardStep('framework')}>
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('framework')}
+              >
                 <ArrowLeft className="mr-2 size-4" />
                 Back
               </Button>
@@ -670,8 +671,8 @@ OTEL_SERVICE_NAME=${project.name}`
                       Waiting for your first trace…
                     </h3>
                     <p className="text-sm text-muted-foreground">
-                      Deploy or run your app and trigger a request. We'll
-                      pick it up as soon as it arrives.
+                      Deploy or run your app and trigger a request. We'll pick
+                      it up as soon as it arrives.
                     </p>
                   </div>
                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -705,41 +706,6 @@ OTEL_SERVICE_NAME=${project.name}`
   )
 }
 
-// A right-aligned, clickable column header that drives server-side sort.
-// Shows a neutral up/down glyph when inactive, and the active direction arrow
-// when this column is the sort key.
-function SortHeader({
-  label,
-  active,
-  order,
-  onClick,
-}: {
-  label: string
-  active: boolean
-  order: 'asc' | 'desc'
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-sort={active ? (order === 'asc' ? 'ascending' : 'descending') : 'none'}
-      className="ml-auto inline-flex items-center gap-1 hover:text-foreground transition-colors"
-    >
-      {label}
-      {active ? (
-        order === 'asc' ? (
-          <ArrowUp className="h-3.5 w-3.5" />
-        ) : (
-          <ArrowDown className="h-3.5 w-3.5" />
-        )
-      ) : (
-        <ArrowUpDown className="h-3.5 w-3.5 opacity-40" />
-      )}
-    </button>
-  )
-}
-
 // ── Main Component ──────────────────────────────────────────────────
 
 export default function TracesList({ project }: TracesListProps) {
@@ -758,9 +724,7 @@ export default function TracesList({ project }: TracesListProps) {
   const [status, setStatus] = useState(
     () => searchParams.get('status') || 'all'
   )
-  const [search, setSearch] = useState(
-    () => searchParams.get('q') || ''
-  )
+  const [search, setSearch] = useState(() => searchParams.get('q') || '')
   const [namePattern, setNamePattern] = useState(
     () => searchParams.get('name') || ''
   )
@@ -788,14 +752,14 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
-  // Server-side sort. Three states per column: desc → asc → unsorted (`null`),
-  // where unsorted reverts to the backend default (newest traces first).
+  // Server-side sort. Old `sort=none` links still resolve to the backend's
+  // default order, while header clicks use the standard two-direction cycle.
   const [sortBy, setSortBy] = useState<'start_time' | 'duration' | null>(() => {
     const s = searchParams.get('sort')
     return s === 'duration' ? 'duration' : s === 'none' ? null : 'start_time'
   })
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
-    searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
+    searchParams.get('dir') === 'asc' ? 'asc' : 'desc'
   )
   const [showSetup, setShowSetup] = useState(false)
   // Bumped by Refresh so relative ranges recompute against "now". Without
@@ -807,7 +771,7 @@ export default function TracesList({ project }: TracesListProps) {
   // Compute time window (refreshKey forces a fresh "now" on Refresh)
   const { startTime, endTime } = useMemo(
     () => computeTracesTimeWindow(timeRange),
-    [timeRange, refreshKey],
+    [timeRange, refreshKey]
   )
 
   // Fetch environments for the filter dropdown
@@ -868,33 +832,42 @@ export default function TracesList({ project }: TracesListProps) {
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (attrKey) params.set('attr_key', attrKey)
-    if (attrKey && debouncedAttrValue) params.set('attr_value', debouncedAttrValue)
+    if (attrKey && debouncedAttrValue)
+      params.set('attr_value', debouncedAttrValue)
     if (page > 1) params.set('page', page.toString())
     if (sortBy === null) params.set('sort', 'none')
     else if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, attrKey, debouncedAttrValue, page, sortBy, sortOrder, setSearchParams])
+  }, [
+    timeRange,
+    serviceName,
+    status,
+    debouncedSearch,
+    debouncedNamePattern,
+    environmentId,
+    deploymentId,
+    attrKey,
+    debouncedAttrValue,
+    page,
+    sortBy,
+    sortOrder,
+    setSearchParams,
+  ])
 
-  // Cycle sort on a column header through three states: clicking a new column
-  // selects it descending; clicking the active column goes desc → asc → unsorted
-  // (removing the sort reverts to the backend default, newest-first).
+  // Clicking a new column selects it descending; subsequent clicks toggle the
+  // direction. Sorting resets pagination so the first row is the true extreme.
   const handleSort = useCallback(
     (field: 'start_time' | 'duration') => {
       if (sortBy === field) {
-        if (sortOrder === 'desc') {
-          setSortOrder('asc')
-        } else {
-          setSortBy(null)
-          setSortOrder('desc')
-        }
+        setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')
       } else {
         setSortBy(field)
         setSortOrder('desc')
       }
       setPage(1)
     },
-    [sortBy, sortOrder],
+    [sortBy, sortOrder]
   )
 
   // Breadcrumbs
@@ -959,17 +932,14 @@ export default function TracesList({ project }: TracesListProps) {
   // GROUPs BY trace_id over the project's entire retention window — this was
   // the single most expensive query on this page (measured at ~10s on an
   // 860M-span project) before has-traces made it an O(1) index lookup.
-  const {
-    data: hasTracesData,
-    isLoading: isProbeLoading,
-    refetch: refetchProbe,
-  } = useQuery({
+  const { data: hasTracesData, refetch: refetchProbe } = useQuery({
     ...hasTracesOptions({
       path: { project_id: project.id },
     }),
     enabled: !!project.id,
   })
   const hasEverReceivedTraces = !!hasTracesData?.has_traces
+  const needsOnboarding = hasTracesData?.has_traces === false
 
   const hasActiveFilters =
     !!search ||
@@ -1001,42 +971,27 @@ export default function TracesList({ project }: TracesListProps) {
     return Array.from(names).sort()
   }, [traces])
 
-  const handleTimeRangeChange = useCallback(
-    (v: string) => {
-      setTimeRange(v as TracesTimeRange)
-      setPage(1)
-    },
-    []
-  )
-  const handleStatusChange = useCallback(
-    (v: string) => {
-      setStatus(v)
-      setPage(1)
-    },
-    []
-  )
-  const handleServiceChange = useCallback(
-    (v: string) => {
-      setServiceName(v === '__all__' ? '' : v)
-      setPage(1)
-    },
-    []
-  )
-  const handleEnvironmentChange = useCallback(
-    (v: string) => {
-      setEnvironmentId(v)
-      setDeploymentId('all') // Reset deployment when environment changes
-      setPage(1)
-    },
-    []
-  )
-  const handleDeploymentChange = useCallback(
-    (v: string) => {
-      setDeploymentId(v)
-      setPage(1)
-    },
-    []
-  )
+  const handleTimeRangeChange = useCallback((v: string) => {
+    setTimeRange(v as TracesTimeRange)
+    setPage(1)
+  }, [])
+  const handleStatusChange = useCallback((v: string) => {
+    setStatus(v)
+    setPage(1)
+  }, [])
+  const handleServiceChange = useCallback((v: string) => {
+    setServiceName(v === '__all__' ? '' : v)
+    setPage(1)
+  }, [])
+  const handleEnvironmentChange = useCallback((v: string) => {
+    setEnvironmentId(v)
+    setDeploymentId('all') // Reset deployment when environment changes
+    setPage(1)
+  }, [])
+  const handleDeploymentChange = useCallback((v: string) => {
+    setDeploymentId(v)
+    setPage(1)
+  }, [])
   const handleAttrKeyChange = useCallback((v: string) => {
     setAttrKey(v === '__none__' ? '' : v)
     setAttrValue('')
@@ -1044,77 +999,76 @@ export default function TracesList({ project }: TracesListProps) {
   }, [])
 
   return (
-    <div className="space-y-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Traces</h2>
-          <p className="text-sm text-muted-foreground">
-            Distributed traces from your application via OpenTelemetry
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => {
-              // Advance the relative window so list queries recompute against
-              // "now". Trace-id searches omit the window, so their query key
-              // does not change — refetch those explicitly. Also re-check the
-              // unwindowed "ever received a trace" probe.
-              setRefreshKey((k) => k + 1)
-              if (debouncedSearch) void refetch()
-              void refetchProbe()
-            }}
-            disabled={isFetching}
-          >
-            <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            onClick={() =>
-              navigate(`/projects/${project.slug}/traces/operations`)
-            }
-          >
-            <Gauge className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Operations</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            onClick={() =>
-              navigate(`/projects/${project.slug}/ai-gateway?tab=activity`)
-            }
-          >
-            <Bot className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">AI Traces</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            onClick={() => {
-              setShowSetup((v) => !v)
-              requestAnimationFrame(() => {
-                document
-                  .getElementById('traces-setup')
-                  ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-              })
-            }}
-          >
-            <Settings2 className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Setup</span>
-          </Button>
-          {totalCount > 0 && (
-            <span className="text-sm text-muted-foreground">
-              {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
-            </span>
-          )}
-        </div>
-      </div>
+    <div className="space-y-6">
+      <PageHeader
+        title="Traces"
+        description="Distributed traces from your application via OpenTelemetry"
+        actions={
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => {
+                // Advance the relative window so list queries recompute against
+                // "now". Trace-id searches omit the window, so their query key
+                // does not change — refetch those explicitly. Also re-check the
+                // unwindowed "ever received a trace" probe.
+                setRefreshKey((k) => k + 1)
+                if (debouncedSearch) void refetch()
+                void refetchProbe()
+              }}
+              disabled={isFetching}
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+              />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              onClick={() =>
+                navigate(`/projects/${project.slug}/traces/operations`)
+              }
+            >
+              <Gauge className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Operations</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              onClick={() =>
+                navigate(`/projects/${project.slug}/ai-gateway?tab=activity`)
+              }
+            >
+              <Bot className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">AI Traces</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              onClick={() => {
+                setShowSetup((v) => !v)
+                requestAnimationFrame(() => {
+                  document
+                    .getElementById('traces-setup')
+                    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                })
+              }}
+            >
+              <Settings2 className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Setup</span>
+            </Button>
+            {totalCount > 0 && (
+              <span className="text-sm text-muted-foreground">
+                {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
+              </span>
+            )}
+          </>
+        }
+      />
 
       {/* Cloud-primary honesty: an outbox backlog looks exactly like an app
           that stopped emitting spans, and a gap window looks exactly like a
@@ -1132,7 +1086,7 @@ export default function TracesList({ project }: TracesListProps) {
           on the windowed `totalCount`: an empty time range is "no results
           here", not "never set up", and must not resurface the setup wizard for
           a project with existing traces (see hasEverReceivedTraces probe). */}
-      {((!isProbeLoading && !hasEverReceivedTraces) || showSetup) && (
+      {(needsOnboarding || showSetup) && (
         <OtelSetupSection
           project={project}
           onVerified={() => {
@@ -1142,331 +1096,352 @@ export default function TracesList({ project }: TracesListProps) {
         />
       )}
 
-      {/* Filters */}
-      <Card>
-        <CardContent className="p-3">
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
-            <Select value={timeRange} onValueChange={handleTimeRangeChange}>
-              <SelectTrigger className="w-full sm:w-[140px]">
-                <Clock className="mr-2 h-3.5 w-3.5" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1h">Last 1 hour</SelectItem>
-                <SelectItem value="6h">Last 6 hours</SelectItem>
-                <SelectItem value="24h">Last 24 hours</SelectItem>
-                <SelectItem value="7d">Last 7 days</SelectItem>
-                <SelectItem value="30d">Last 30 days</SelectItem>
-              </SelectContent>
-            </Select>
+      {!needsOnboarding && (
+        <>
+          {/* Filters */}
+          <Card>
+            <CardContent className="p-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                <TimeRangeFilter
+                  value={timeRange}
+                  onChange={handleTimeRangeChange}
+                />
 
-            <Select value={status} onValueChange={handleStatusChange}>
-              <SelectTrigger className="w-full sm:w-[120px]">
-                <SelectValue placeholder="Status" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All Status</SelectItem>
-                <SelectItem value="OK">OK</SelectItem>
-                <SelectItem value="ERROR">Error</SelectItem>
-              </SelectContent>
-            </Select>
-
-            {environments && environments.length > 0 && (
-              <Select
-                value={environmentId}
-                onValueChange={handleEnvironmentChange}
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Environment" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Environments</SelectItem>
-                  {environments.map((env: EnvironmentResponse) => (
-                    <SelectItem key={env.id} value={String(env.id)}>
-                      {env.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-
-            {deployments && deployments.length > 0 && (
-              <Select
-                value={deploymentId}
-                onValueChange={handleDeploymentChange}
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Deployment" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Deployments</SelectItem>
-                  {deployments.map((d) => (
-                    <SelectItem key={d.id} value={String(d.id)}>
-                      #{d.id}
-                      {d.commit_hash ? ` (${d.commit_hash.slice(0, 7)})` : ''}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-
-            {serviceNames.length > 0 && (
-              <Select
-                value={serviceName || '__all__'}
-                onValueChange={handleServiceChange}
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Service" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__all__">All Services</SelectItem>
-                  {serviceNames.map((name) => (
-                    <SelectItem key={name} value={name}>
-                      {name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-
-            <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
-              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                placeholder="Search by trace ID..."
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value)
-                  setPage(1)
-                }}
-                className="pl-8 h-9"
-              />
-            </div>
-
-            <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
-              <Input
-                placeholder="Filter by span name…"
-                value={namePattern}
-                onChange={(e) => {
-                  setNamePattern(e.target.value)
-                  setPage(1)
-                }}
-                className="h-9"
-              />
-            </div>
-
-            {facets.length > 0 && (
-              <>
-                <Select
-                  value={attrKey || '__none__'}
-                  onValueChange={handleAttrKeyChange}
-                >
-                  <SelectTrigger className="h-9 w-full sm:w-[200px]">
-                    <Tag className="mr-2 h-3.5 w-3.5" />
-                    <SelectValue placeholder="Attribute" />
+                <Select value={status} onValueChange={handleStatusChange}>
+                  <SelectTrigger className="w-full sm:w-[120px]">
+                    <SelectValue placeholder="Status" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__none__">No attribute filter</SelectItem>
-                    {facets.map((f) => (
-                      <SelectItem key={f.attribute_key} value={f.attribute_key}>
-                        {f.attribute_key}
-                      </SelectItem>
-                    ))}
+                    <SelectItem value="all">All Status</SelectItem>
+                    <SelectItem value="OK">OK</SelectItem>
+                    <SelectItem value="ERROR">Error</SelectItem>
                   </SelectContent>
                 </Select>
 
-                {attrKey && (
-                  <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
-                    <Input
-                      placeholder={`Value for ${attrKey}…`}
-                      value={attrValue}
-                      onChange={(e) => {
-                        setAttrValue(e.target.value)
-                        setPage(1)
-                      }}
-                      className="h-9"
-                    />
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Table */}
-      {isLoading ? (
-        <div className="space-y-2">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <Skeleton key={`skel-${i}`} className="h-12 w-full" />
-          ))}
-        </div>
-      ) : traces.length === 0 ? (
-        <EmptyState
-          icon={Workflow}
-          title="No traces found"
-          description={emptyStateDescription}
-          action={
-            // Only nudge toward setup for a project that has never sent a
-            // trace — never when it just has nothing in the current window.
-            !hasActiveFilters && !hasEverReceivedTraces ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-2"
-                onClick={() => {
-                  document
-                    .getElementById('traces-setup')
-                    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                }}
-              >
-                <Settings2 className="h-3.5 w-3.5" />
-                Jump to setup
-              </Button>
-            ) : undefined
-          }
-        />
-      ) : (
-        <>
-          <div className="rounded-md border overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="min-w-[200px] md:w-[300px]">Trace</TableHead>
-                  <TableHead>Service</TableHead>
-                  {environmentId === 'all' && <TableHead className="hidden lg:table-cell">Environment</TableHead>}
-                  <TableHead className="hidden md:table-cell">Kind</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">
-                    <SortHeader
-                      label="Duration"
-                      active={sortBy === 'duration'}
-                      order={sortOrder}
-                      onClick={() => handleSort('duration')}
-                    />
-                  </TableHead>
-                  <TableHead className="hidden md:table-cell text-right">Spans</TableHead>
-                  <TableHead className="hidden md:table-cell text-right">
-                    <SortHeader
-                      label="Timestamp"
-                      active={sortBy === 'start_time'}
-                      order={sortOrder}
-                      onClick={() => handleSort('start_time')}
-                    />
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {traces.map((trace) => (
-                  <TableRow
-                    key={trace.trace_id}
-                    className="cursor-pointer hover:bg-muted/50"
-                    onClick={() => navigate(trace.trace_id)}
+                {environments && environments.length > 0 && (
+                  <Select
+                    value={environmentId}
+                    onValueChange={handleEnvironmentChange}
                   >
-                    <TableCell>
-                      <div className="flex flex-col gap-0.5">
-                        <span className="font-medium truncate max-w-[200px] md:max-w-[280px]">
-                          {trace.root_span_name || (
-                            <span className="text-muted-foreground italic">
-                              (unnamed)
-                            </span>
-                          )}
-                        </span>
-                        <span className="text-xs text-muted-foreground font-mono truncate max-w-[200px] md:max-w-[280px]">
-                          {trace.trace_id.slice(0, 16)}...
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-sm">
-                        {trace.service_name || (
-                          <span className="text-muted-foreground italic">
-                            unknown
-                          </span>
-                        )}
-                      </span>
-                    </TableCell>
-                    {environmentId === 'all' && (
-                      <TableCell className="hidden lg:table-cell">
-                        {trace.deployment_environment ? (
-                          <Badge variant="secondary" className="font-normal">
-                            {trace.deployment_environment}
-                          </Badge>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                    )}
-                    <TableCell className="hidden md:table-cell">{kindBadge(trace.kind)}</TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1.5">
-                        {trace.error_count > 0
-                          ? statusBadge('ERROR')
-                          : statusBadge('OK')}
-                        {trace.error_count > 0 && (
-                          <span className="flex items-center text-xs text-destructive">
-                            <AlertTriangle className="mr-0.5 h-3 w-3" />
-                            {trace.error_count}
-                          </span>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <span
-                        className={`font-mono text-sm ${durationColor(trace.duration_ms)}`}
-                      >
-                        {formatDuration(trace.duration_ms)}
-                      </span>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-right">
-                      <Badge variant="outline" className="font-mono">
-                        {trace.span_count}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-right text-sm text-muted-foreground">
-                      {format(
-                        new Date(trace.start_time),
-                        'MMM d, HH:mm:ss.SSS'
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue placeholder="Environment" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Environments</SelectItem>
+                      {environments.map((env: EnvironmentResponse) => (
+                        <SelectItem key={env.id} value={String(env.id)}>
+                          {env.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
 
-          {/* Pagination */}
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-sm text-muted-foreground text-center sm:text-left">
-              <span className="hidden sm:inline">
-                Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, totalCount)} of{' '}
-                {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
-              </span>
-              <span className="sm:hidden">
-                {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
-              </span>
+                {deployments && deployments.length > 0 && (
+                  <Select
+                    value={deploymentId}
+                    onValueChange={handleDeploymentChange}
+                  >
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue placeholder="Deployment" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Deployments</SelectItem>
+                      {deployments.map((d) => (
+                        <SelectItem key={d.id} value={String(d.id)}>
+                          #{d.id}
+                          {d.commit_hash
+                            ? ` (${d.commit_hash.slice(0, 7)})`
+                            : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+
+                {serviceNames.length > 0 && (
+                  <Select
+                    value={serviceName || '__all__'}
+                    onValueChange={handleServiceChange}
+                  >
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue placeholder="Service" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__all__">All Services</SelectItem>
+                      {serviceNames.map((name) => (
+                        <SelectItem key={name} value={name}>
+                          {name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+
+                <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
+                  <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="Search by trace ID..."
+                    value={search}
+                    onChange={(e) => {
+                      setSearch(e.target.value)
+                      setPage(1)
+                    }}
+                    className="pl-8 h-9"
+                  />
+                </div>
+
+                <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
+                  <Input
+                    placeholder="Filter by span name…"
+                    value={namePattern}
+                    onChange={(e) => {
+                      setNamePattern(e.target.value)
+                      setPage(1)
+                    }}
+                    className="h-9"
+                  />
+                </div>
+
+                {facets.length > 0 && (
+                  <>
+                    <Select
+                      value={attrKey || '__none__'}
+                      onValueChange={handleAttrKeyChange}
+                    >
+                      <SelectTrigger className="h-9 w-full sm:w-[200px]">
+                        <Tag className="mr-2 h-3.5 w-3.5" />
+                        <SelectValue placeholder="Attribute" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">
+                          No attribute filter
+                        </SelectItem>
+                        {facets.map((f) => (
+                          <SelectItem
+                            key={f.attribute_key}
+                            value={f.attribute_key}
+                          >
+                            {f.attribute_key}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+
+                    {attrKey && (
+                      <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
+                        <Input
+                          placeholder={`Value for ${attrKey}…`}
+                          value={attrValue}
+                          onChange={(e) => {
+                            setAttrValue(e.target.value)
+                            setPage(1)
+                          }}
+                          className="h-9"
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Table */}
+          {isLoading ? (
+            <div className="space-y-2">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <Skeleton key={`skel-${i}`} className="h-12 w-full" />
+              ))}
             </div>
-            <div className="flex items-center justify-center gap-1">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={page === 1}
-              >
-                <ChevronLeft className="h-4 w-4" />
-              </Button>
-              <span className="px-3 text-sm text-muted-foreground">
-                {page} / {totalPages}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => p + 1)}
-                disabled={page >= totalPages}
-              >
-                <ChevronRight className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
+          ) : traces.length === 0 ? (
+            <EmptyState
+              icon={Workflow}
+              title="No traces found"
+              description={emptyStateDescription}
+              action={
+                // Only nudge toward setup for a project that has never sent a
+                // trace — never when it just has nothing in the current window.
+                !hasActiveFilters && !hasEverReceivedTraces ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={() => {
+                      document
+                        .getElementById('traces-setup')
+                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                    }}
+                  >
+                    <Settings2 className="h-3.5 w-3.5" />
+                    Jump to setup
+                  </Button>
+                ) : undefined
+              }
+            />
+          ) : (
+            <>
+              <div className="rounded-md border overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="min-w-[200px] md:w-[300px]">
+                        Trace
+                      </TableHead>
+                      <TableHead>Service</TableHead>
+                      {environmentId === 'all' && (
+                        <TableHead className="hidden lg:table-cell">
+                          Environment
+                        </TableHead>
+                      )}
+                      <TableHead className="hidden md:table-cell">
+                        Kind
+                      </TableHead>
+                      <TableHead>Status</TableHead>
+                      <SortableTableHead
+                        label="Duration"
+                        active={sortBy === 'duration'}
+                        direction={sortOrder}
+                        onClick={() => handleSort('duration')}
+                        align="right"
+                      />
+                      <TableHead className="hidden md:table-cell text-right">
+                        Spans
+                      </TableHead>
+                      <SortableTableHead
+                        label="Timestamp"
+                        active={sortBy === 'start_time'}
+                        direction={sortOrder}
+                        onClick={() => handleSort('start_time')}
+                        align="right"
+                        className="hidden md:table-cell"
+                      />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {traces.map((trace) => (
+                      <TableRow
+                        key={trace.trace_id}
+                        className="cursor-pointer hover:bg-muted/50"
+                        onClick={() => navigate(trace.trace_id)}
+                      >
+                        <TableCell>
+                          <div className="flex flex-col gap-0.5">
+                            <span className="font-medium truncate max-w-[200px] md:max-w-[280px]">
+                              {trace.root_span_name || (
+                                <span className="text-muted-foreground italic">
+                                  (unnamed)
+                                </span>
+                              )}
+                            </span>
+                            <span className="text-xs text-muted-foreground font-mono truncate max-w-[200px] md:max-w-[280px]">
+                              {trace.trace_id.slice(0, 16)}...
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <span className="text-sm">
+                            {trace.service_name || (
+                              <span className="text-muted-foreground italic">
+                                unknown
+                              </span>
+                            )}
+                          </span>
+                        </TableCell>
+                        {environmentId === 'all' && (
+                          <TableCell className="hidden lg:table-cell">
+                            {trace.deployment_environment ? (
+                              <Badge
+                                variant="secondary"
+                                className="font-normal"
+                              >
+                                {trace.deployment_environment}
+                              </Badge>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">
+                                —
+                              </span>
+                            )}
+                          </TableCell>
+                        )}
+                        <TableCell className="hidden md:table-cell">
+                          {kindBadge(trace.kind)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-1.5">
+                            {trace.error_count > 0
+                              ? statusBadge('ERROR')
+                              : statusBadge('OK')}
+                            {trace.error_count > 0 && (
+                              <span className="flex items-center text-xs text-destructive">
+                                <AlertTriangle className="mr-0.5 h-3 w-3" />
+                                {trace.error_count}
+                              </span>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <span
+                            className={`font-mono text-sm ${durationColor(trace.duration_ms)}`}
+                          >
+                            {formatDuration(trace.duration_ms)}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell text-right">
+                          <Badge variant="outline" className="font-mono">
+                            {trace.span_count}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell text-right text-sm text-muted-foreground">
+                          {format(
+                            new Date(trace.start_time),
+                            'MMM d, HH:mm:ss.SSS'
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {/* Pagination */}
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-sm text-muted-foreground text-center sm:text-left">
+                  <span className="hidden sm:inline">
+                    Showing {(page - 1) * PAGE_SIZE + 1}–
+                    {Math.min(page * PAGE_SIZE, totalCount)} of{' '}
+                    {totalCount.toLocaleString()} trace
+                    {totalCount !== 1 ? 's' : ''}
+                  </span>
+                  <span className="sm:hidden">
+                    {totalCount.toLocaleString()} trace
+                    {totalCount !== 1 ? 's' : ''}
+                  </span>
+                </div>
+                <div className="flex items-center justify-center gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={page === 1}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <span className="px-3 text-sm text-muted-foreground">
+                    {page} / {totalPages}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage((p) => p + 1)}
+                    disabled={page >= totalPages}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
         </>
       )}
     </div>

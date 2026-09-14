@@ -447,7 +447,7 @@ export function FunnelForm({
   }, [formData.name, formData.description, formData.steps, project.id])
 
   return (
-    <div className="w-full max-w-7xl mx-auto space-y-6 p-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">{title}</h1>

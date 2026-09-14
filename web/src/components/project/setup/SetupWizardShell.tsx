@@ -35,7 +35,7 @@ export function SetupWizardShell({
   const currentIndex = STEP_ORDER.indexOf(currentStep)
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8 py-4">
+    <div className="w-full space-y-8 py-4">
       <Confetti active={celebrate} duration={2500} particleCount={80} />
 
       <div className="space-y-2 text-center">

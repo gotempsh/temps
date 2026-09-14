@@ -18,14 +18,25 @@ temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = "2.2.0"
+hex = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = "0.30"
 tower = { workspace = true }
@@ -38,3 +49,4 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

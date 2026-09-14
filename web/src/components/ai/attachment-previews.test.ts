@@ -2,7 +2,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, it } from 'bun:test'
-import { createPendingAttachment } from './attachment-previews'
+import {
+  attachmentSelectionError,
+  createPendingAttachment,
+} from './attachment-previews'
+
+describe('attachmentSelectionError', () => {
+  const file = { name: 'notes.txt', size: 20 * 1024 * 1024 }
+  it('allows images and files up to the exact size and count limits', () => {
+    expect(attachmentSelectionError([file], 7)).toBeNull()
+  })
+  it('rejects excess selections instead of silently truncating them', () => {
+    expect(attachmentSelectionError([file, file], 7)).toContain('8 files')
+  })
+  it('identifies an oversized file before uploading the selection', () => {
+    expect(
+      attachmentSelectionError([{ ...file, size: file.size + 1 }], 0)
+    ).toContain('notes.txt')
+  })
+})
 
 describe('createPendingAttachment', () => {
   it('does not retain or leak a preview when an upload resolves after unmount', () => {

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 /**
  * ServiceQueryPerformance — dedicated Query Performance page for Postgres
@@ -665,7 +666,7 @@ function QueryDetailSheet({
                 Query
               </p>
               <pre className="overflow-x-auto rounded-lg border bg-muted/50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
-                {row.query}
+                <HighlightedCode code={row.query} language="sql" />
               </pre>
             </div>
 

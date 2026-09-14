@@ -9,7 +9,7 @@ import { PageContainer, PageHeader } from './PageContainer'
 describe('PageContainer', () => {
   test('owns responsive page gutters and renders one consistent page title', () => {
     const markup = renderToStaticMarkup(
-      <PageContainer width="wide">
+      <PageContainer>
         <PageHeader
           title="Backups"
           description="Manage backup storage"
@@ -19,7 +19,8 @@ describe('PageContainer', () => {
     )
 
     expect(markup).toContain('px-4 py-6 sm:px-6 lg:px-8')
-    expect(markup).toContain('max-w-7xl mx-auto')
+    expect(markup).toContain('w-full min-w-0 space-y-6')
+    expect(markup).not.toContain('max-w-')
     expect(markup).toContain(
       '<h1 class="text-2xl font-semibold tracking-tight">Backups</h1>'
     )

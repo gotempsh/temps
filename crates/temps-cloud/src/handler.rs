@@ -161,6 +161,10 @@ fn problem(error: CloudServiceError) -> Problem {
         CloudServiceError::Client(temps_cloud_client::CloudError::FeatureDisabled { .. }) => {
             StatusCode::CONFLICT
         }
+        // The reason is the operator's to act on ("Cloud did not answer the
+        // plan's retention", "backup plugin not enabled"), so it is returned
+        // rather than hidden behind a 500.
+        CloudServiceError::ManagedBackupSchedule(_) => StatusCode::CONFLICT,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
@@ -548,6 +552,46 @@ async fn reconcile_cloud_backup_source(
     Ok(Json(result))
 }
 
+/// Create the nightly schedule for the Temps Cloud destination unless one
+/// already targets it (ADR-044). Answers the same shape as the reconcile so
+/// the console can swap it into the status it already holds.
+#[utoipa::path(
+    post,
+    path = "/cloud/backups/schedule/ensure",
+    tag = "Cloud",
+    responses(
+        (status = 200, description = "The managed destination's setup with the schedule that targets it, created when none did", body = ManagedBackupSetup),
+        (status = 401, description = "Authentication required", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 409, description = "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)", body = temps_core::ProblemDetails),
+        (status = 500, description = "Database or link state failure", body = temps_core::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn ensure_cloud_backup_schedule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<CloudState>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Json<ManagedBackupSetup>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, BackupsWrite);
+    let result = state
+        .service
+        .ensure_managed_backup_schedule()
+        .await
+        .map_err(problem)?;
+    audit(
+        &state,
+        &auth,
+        &metadata,
+        "CLOUD_BACKUP_SCHEDULE_ENSURED",
+        None,
+        None,
+    )
+    .await;
+    Ok(Json(result))
+}
+
 #[utoipa::path(delete, path = "/cloud", tag = "Cloud", responses((status = 200, body = CloudStatus)), security(("bearer_auth" = [])))]
 async fn disconnect_cloud(
     RequireAuth(auth): RequireAuth,
@@ -624,6 +668,10 @@ pub fn cloud_routes(
             "/cloud/backups/source/reconcile",
             post(reconcile_cloud_backup_source),
         )
+        .route(
+            "/cloud/backups/schedule/ensure",
+            post(ensure_cloud_backup_schedule),
+        )
         .route("/cloud/enroll", post(enroll_cloud))
         .route("/cloud", delete(disconnect_cloud))
         .with_state(CloudState {
@@ -641,6 +689,7 @@ pub fn cloud_routes(
         get_cloud_ai_capability,
         update_cloud_features,
         reconcile_cloud_backup_source,
+        ensure_cloud_backup_schedule,
         enroll_cloud,
         disconnect_cloud
     ),
@@ -649,6 +698,8 @@ pub fn cloud_routes(
         CloudCapability,
         CloudStatus,
         ManagedBackupSetup,
+        temps_core::ManagedBackupSchedule,
+        temps_core::ManagedBackupArchiveConflict,
         ManagedBackupSetupAction,
         ManagedBackupSetupStatus,
         CloudFeatureSwitchesRequest,

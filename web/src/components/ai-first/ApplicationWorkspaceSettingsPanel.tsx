@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   Activity,
@@ -24,6 +25,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -46,15 +48,31 @@ import {
   sandboxShellCommand,
 } from './harness-upgrade-commands'
 import { problemDetail } from './problem-detail'
+import { RuntimeUpdateControl } from './RuntimeUpdateControl'
 
 type Props = {
+  layout?: 'panel' | 'page'
   applicationPublicId: string
   initialWorkspace?: ApplicationWorkspaceResponse | null
   onWorkspaceChange?: (workspace: ApplicationWorkspaceResponse) => void
   waking?: boolean
 }
 
+export function workspaceResourceFingerprint(
+  workspace: ApplicationWorkspaceResponse
+) {
+  return JSON.stringify([
+    workspace.runtime,
+    workspace.cpu_limit,
+    workspace.memory_limit_mb,
+    workspace.pids_limit,
+    workspace.disk_limit_mb,
+    workspace.idle_timeout_secs,
+  ])
+}
+
 export function ApplicationWorkspaceSettingsPanel({
+  layout = 'panel',
   applicationPublicId,
   initialWorkspace = null,
   onWorkspaceChange,
@@ -66,6 +84,7 @@ export function ApplicationWorkspaceSettingsPanel({
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [snapshotId, setSnapshotId] = useState('')
+  const lastResourceFingerprint = useRef<string | null>(null)
   const [form, setForm] = useState({
     runtime: 'node',
     cpu_limit: '2',
@@ -79,14 +98,18 @@ export function ApplicationWorkspaceSettingsPanel({
     (next: ApplicationWorkspaceResponse, notifyParent = true) => {
       setWorkspace(next)
       if (notifyParent) onWorkspaceChange?.(next)
-      setForm({
-        runtime: next.runtime,
-        cpu_limit: String(next.cpu_limit),
-        memory_limit_mb: String(next.memory_limit_mb),
-        pids_limit: String(next.pids_limit),
-        disk_limit_mb: String(next.disk_limit_mb),
-        idle_timeout_secs: String(next.idle_timeout_secs),
-      })
+      const fingerprint = workspaceResourceFingerprint(next)
+      // Status polls must not erase a flavor/resource edit awaiting confirmation.
+      if (notifyParent || lastResourceFingerprint.current !== fingerprint)
+        setForm({
+          runtime: next.runtime,
+          cpu_limit: String(next.cpu_limit),
+          memory_limit_mb: String(next.memory_limit_mb),
+          pids_limit: String(next.pids_limit),
+          disk_limit_mb: String(next.disk_limit_mb),
+          idle_timeout_secs: String(next.idle_timeout_secs),
+        })
+      lastResourceFingerprint.current = fingerprint
       if (next.snapshot_id) setSnapshotId(next.snapshot_id)
     },
     [onWorkspaceChange]
@@ -176,7 +199,13 @@ export function ApplicationWorkspaceSettingsPanel({
   const diagnostic = error ?? workspace?.last_error
 
   return (
-    <div className="space-y-5">
+    <div
+      className={
+        layout === 'page'
+          ? 'grid items-start gap-6 lg:grid-cols-2 [&>div]:lg:col-span-2 [&>section:first-of-type]:lg:col-span-2 [&_section]:rounded-lg [&_section]:bg-card [&_section]:p-5 [&_p]:text-sm [&_label]:text-sm'
+          : 'space-y-5'
+      }
+    >
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-sm font-semibold">Persistent workspace</p>
@@ -318,8 +347,19 @@ export function ApplicationWorkspaceSettingsPanel({
             </div>
           </section>
 
+          <RuntimeUpdateControl
+            applicationPublicId={applicationPublicId}
+            workspace={workspace}
+            runtime={form.runtime}
+            disabled={busy !== null}
+            onUpdated={acceptWorkspace}
+          />
           <section className="space-y-3 rounded-xl border border-border p-3">
             <p className="text-xs font-medium">Lifecycle</p>
+            <p className="text-xs text-muted-foreground">
+              Restart reuses the current image. Use Update runtime above to
+              change runtime versions.
+            </p>
             <div className="grid grid-cols-2 gap-2">
               <ActionButton
                 action="restart"
@@ -395,9 +435,9 @@ export function ApplicationWorkspaceSettingsPanel({
                   <Link
                     rel="noopener noreferrer"
                     target="_blank"
-                    to={`/sandboxes/${encodeURIComponent(workspace.sandbox_public_id)}`}
+                    to={`/workspaces/${encodeURIComponent(applicationPublicId)}`}
                   >
-                    <ExternalLink className="mr-1 size-3.5" /> Web console
+                    <ExternalLink className="mr-1 size-3.5" /> Workspace details
                   </Link>
                 </Button>
               </div>
@@ -414,9 +454,11 @@ export function ApplicationWorkspaceSettingsPanel({
                     value={sandboxShellCommand(workspace.sandbox_public_id)}
                   />
                 </div>
-                <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-                  {sandboxShellCommand(workspace.sandbox_public_id)}
-                </code>
+                <HighlightedCode
+                  className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                  code={sandboxShellCommand(workspace.sandbox_public_id)}
+                  language="bash"
+                />
                 <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
                   Run from an authenticated Temps CLI. Detach with Ctrl-P,
                   Ctrl-Q and reattach with the same command.
@@ -445,17 +487,21 @@ export function ApplicationWorkspaceSettingsPanel({
                           value={upgrade.command}
                         />
                       </div>
-                      <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-                        {upgrade.command}
-                      </code>
+                      <HighlightedCode
+                        className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                        code={upgrade.command}
+                        language="bash"
+                      />
                       <details className="mt-2 text-[10px] text-muted-foreground">
                         <summary className="cursor-pointer select-none">
                           Run as a one-shot CLI command
                         </summary>
                         <div className="mt-1.5 flex items-start gap-1.5 rounded bg-background p-2">
-                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
-                            {upgrade.cliCommand}
-                          </code>
+                          <HighlightedCode
+                            className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap"
+                            code={upgrade.cliCommand}
+                            language="bash"
+                          />
                           <CopyButton
                             className="size-6 shrink-0 rounded"
                             label={`Copy ${upgrade.name} Temps CLI command`}
@@ -552,7 +598,7 @@ export function ApplicationWorkspaceSettingsPanel({
             </p>
             <Button
               className="w-full"
-              disabled={busy !== null}
+              disabled={busy !== null || form.runtime !== workspace.runtime}
               onClick={() => void save()}
               size="sm"
             >
@@ -563,6 +609,12 @@ export function ApplicationWorkspaceSettingsPanel({
               )}
               Save and apply
             </Button>
+            {form.runtime !== workspace.runtime && (
+              <p className="text-xs text-muted-foreground">
+                Use Update runtime above to confirm the flavor change, then save
+                resource changes separately.
+              </p>
+            )}
           </section>
         </>
       )}

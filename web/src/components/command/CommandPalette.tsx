@@ -60,6 +60,7 @@ import {
   Flag,
   Folder,
   FolderPlus,
+  Cpu,
   Gauge,
   GitBranch,
   Globe,
@@ -240,6 +241,12 @@ const mainNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Workspaces',
+    url: '/workspaces',
+    icon: Folder,
+    keywords: ['workspace', 'context', 'persistent'],
+  },
+  {
     title: 'Create New Project',
     url: '/projects/new',
     icon: FolderPlus,
@@ -256,6 +263,12 @@ const mainNavItems: NavigationItem[] = [
     url: '/projects/import-wizard',
     icon: Upload,
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
+  },
+  {
+    title: 'Server',
+    url: '/monitoring/server',
+    icon: Cpu,
+    keywords: ['cpu', 'memory', 'disk', 'docker', 'network', 'host', 'server'],
   },
   {
     title: 'Monitoring',
@@ -957,7 +970,7 @@ const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Observe',
+    title: 'Activity',
     url: 'observe',
     icon: Activity,
     keywords: [

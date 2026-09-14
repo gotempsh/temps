@@ -93,8 +93,8 @@ export function BuildLimitsPage() {
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
       <Card>
-        <CardHeader>
-          <CardTitle>Build limits</CardTitle>
+        <CardHeader className="border-b px-5 py-4">
+          <CardTitle className="text-base">Build limits</CardTitle>
           <CardDescription>
             Cap how many `docker build` operations run at the same time on the
             control plane and how much CPU/memory each is allowed to use.
@@ -102,7 +102,7 @@ export function BuildLimitsPage() {
             are not affected by these settings.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-6">
+        <CardContent className="space-y-6 p-5">
           <div className="grid gap-6 sm:grid-cols-3">
             <div className="space-y-2">
               <Label htmlFor="max_concurrent">Max concurrent builds</Label>
@@ -167,8 +167,8 @@ export function BuildLimitsPage() {
               />
               <p className="text-xs text-muted-foreground">
                 Hard cap — builds that exceed this OOM-kill. 0 = use legacy
-                50%-of-host default. Note: Docker BuildKit caps memory at ~2
-                GB (i32 max bytes); higher values are silently truncated.
+                50%-of-host default. Note: Docker BuildKit caps memory at ~2 GB
+                (i32 max bytes); higher values are silently truncated.
               </p>
               {errors.build_limits?.memory_limit_mb && (
                 <p className="text-xs text-destructive">
@@ -184,8 +184,8 @@ export function BuildLimitsPage() {
             <AlertDescription>
               Concurrency takes effect on the next plugin restart (i.e. next
               <code className="mx-1 rounded bg-muted px-1">temps serve</code>
-              start). Per-build CPU/memory caps apply to the very next build
-              — no restart needed.
+              start). Per-build CPU/memory caps apply to the very next build —
+              no restart needed.
             </AlertDescription>
           </Alert>
         </CardContent>

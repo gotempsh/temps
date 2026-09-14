@@ -30,8 +30,7 @@ export {
  * A lightweight, dependency-free guided tour for new projects. It walks the user
  * through the "sites of interest" by navigating to each page — Overview,
  * Analytics, Traces, Error tracking, Logs, Metrics — while a coachmark card and
- * highlight ring point at either the direct destination or the grouped project
- * tools menu. Auto-runs once per browser on the first project visit; re-launch by
+ * highlight ring point at Overview or the Observe section. Auto-runs once per browser on the first project visit; re-launch by
  * dispatching a `temps:project-tour` event.
  */
 
@@ -53,31 +52,31 @@ const STEPS: TourStep[] = [
   },
   {
     route: 'analytics',
-    anchor: 'all-tools',
+    anchor: 'observe',
     title: 'Analytics',
     body: 'Pageviews, visitors, funnels and session replays from your app.',
   },
   {
     route: 'traces',
-    anchor: 'all-tools',
+    anchor: 'observe',
     title: 'Traces',
     body: 'Distributed OpenTelemetry traces — every request, span by span.',
   },
   {
     route: 'errors',
-    anchor: 'errors',
+    anchor: 'observe',
     title: 'Error tracking',
     body: 'Exceptions with stack traces, grouped and alertable.',
   },
   {
     route: 'metrics',
-    anchor: 'all-tools',
+    anchor: 'observe',
     title: 'Metrics',
     body: 'Counters, histograms and gauges — with anomaly alerts.',
   },
   {
     route: 'runtime',
-    anchor: 'runtime',
+    anchor: 'observe',
     title: 'Runtime logs',
     body: 'Live logs streamed straight from your running containers.',
   },

@@ -819,28 +819,35 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       </div>
 
       <Card>
+        <div className="hidden grid-cols-[250px_minmax(0,1fr)_140px_32px] items-center gap-3 border-b bg-muted/30 px-3 py-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:grid">
+          <span>Deployment</span>
+          <span>Source</span>
+          <span>Created</span>
+          <span className="sr-only">Actions</span>
+        </div>
         <ul className="divide-y divide-border">
           {deploymentsData.deployments.map((deployment) => (
-            <Link
-              key={deployment.id}
-              to={`/projects/${project.slug}/deployments/${deployment.id}`}
-              className="block hover:bg-muted/50 transition-colors"
-            >
-              <DeploymentCompactRow
-                deployment={deployment}
-                projectSourceType={project.source_type}
-                onRedeploy={() => {
-                  setSelectedDeployment(deployment.id)
-                  setIsRedeployModalOpen(true)
-                }}
-                onCancel={() => handleCancelDeployment(deployment.id)}
-                onRollback={() => handleRollbackDeployment(deployment.id)}
-                onPromote={() => {
-                  setPromoteDeploymentId(deployment.id)
-                  setPromoteTargetEnv('')
-                }}
-              />
-            </Link>
+            <li key={deployment.id}>
+              <Link
+                to={`/projects/${project.slug}/deployments/${deployment.id}`}
+                className="block transition-colors hover:bg-muted/50"
+              >
+                <DeploymentCompactRow
+                  deployment={deployment}
+                  projectSourceType={project.source_type}
+                  onRedeploy={() => {
+                    setSelectedDeployment(deployment.id)
+                    setIsRedeployModalOpen(true)
+                  }}
+                  onCancel={() => handleCancelDeployment(deployment.id)}
+                  onRollback={() => handleRollbackDeployment(deployment.id)}
+                  onPromote={() => {
+                    setPromoteDeploymentId(deployment.id)
+                    setPromoteTargetEnv('')
+                  }}
+                />
+              </Link>
+            </li>
           ))}
         </ul>
       </Card>

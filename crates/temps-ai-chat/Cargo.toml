@@ -54,6 +54,7 @@ walkdir = { workspace = true }
 zip = { workspace = true }
 unicode-normalization = "0.1"
 unicode-casefold = "0.2"
+url = { workspace = true }
 
 [dev-dependencies]
 # `test-util` gives the paused clock used to exercise the turn deadline without

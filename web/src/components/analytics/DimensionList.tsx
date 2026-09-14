@@ -24,6 +24,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  SortableTableHead,
+  type SortDirection,
+} from '@/components/ui/sortable-table-head'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
@@ -212,6 +216,8 @@ interface Row {
   percentage: number
 }
 
+type DimensionSortKey = 'value' | 'count'
+
 export function DimensionList({
   project,
   dimension,
@@ -224,6 +230,9 @@ export function DimensionList({
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const [search, setSearch] = React.useState('')
+  const [sortKey, setSortKey] = React.useState<DimensionSortKey>('count')
+  const [sortDirection, setSortDirection] =
+    React.useState<SortDirection>('desc')
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   /**
@@ -314,6 +323,32 @@ export function DimensionList({
     if (!q) return rows
     return rows.filter((row) => row.value.toLowerCase().includes(q))
   }, [rows, search])
+
+  const sortedRows = React.useMemo(() => {
+    return filteredRows
+      .map((row, index) => ({ row, index }))
+      .sort((a, b) => {
+        const comparison =
+          sortKey === 'value'
+            ? a.row.value.localeCompare(b.row.value, undefined, {
+                numeric: true,
+                sensitivity: 'base',
+              })
+            : a.row.count - b.row.count
+        const directed = sortDirection === 'asc' ? comparison : -comparison
+        return directed || a.index - b.index
+      })
+      .map(({ row }) => row)
+  }, [filteredRows, sortDirection, sortKey])
+
+  const handleSort = (key: DimensionSortKey) => {
+    if (key === sortKey) {
+      setSortDirection((current) => (current === 'asc' ? 'desc' : 'asc'))
+      return
+    }
+    setSortKey(key)
+    setSortDirection('desc')
+  }
 
   const reachedCap = rows.length >= MAX_ROWS
 
@@ -432,14 +467,25 @@ export function DimensionList({
                 <TableHeader>
                   <TableRow>
                     <TableHead className="w-[60px] text-right">#</TableHead>
-                    <TableHead>{capitalize(config.singular)}</TableHead>
-                    <TableHead className="text-right">Visitors</TableHead>
+                    <SortableTableHead
+                      label={capitalize(config.singular)}
+                      active={sortKey === 'value'}
+                      direction={sortDirection}
+                      onClick={() => handleSort('value')}
+                    />
+                    <SortableTableHead
+                      label="Visitors"
+                      active={sortKey === 'count'}
+                      direction={sortDirection}
+                      onClick={() => handleSort('count')}
+                      align="right"
+                    />
                     <TableHead className="text-right">Share</TableHead>
                     <TableHead className="hidden md:table-cell w-[200px]" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredRows.map((row, idx) => {
+                  {sortedRows.map((row, idx) => {
                     const rank =
                       rows.findIndex((r) => r.value === row.value) + 1
                     const href = getRowHref(row.value)

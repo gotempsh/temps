@@ -10,6 +10,33 @@ import type { ProviderCatalogDto } from '@/api/client'
 import { ProviderEditor } from './AgentSandboxProviderDetail'
 
 describe('ProviderEditor local credential onboarding', () => {
+  test('discloses native OpenCode credential access instead of promising relay isolation', () => {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ProviderEditor provider={{ ...provider, id: 'opencode', name: 'OpenCode' }} isActive={false} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('private runtime credential file')
+    expect(html).toContain('only use it in workspaces you trust')
+    expect(html).toContain('after replacing the sandbox, you may need to import your local login again')
+    expect(html).not.toContain('credential is never injected into the sandbox')
+  })
+  test.each([false, true])('never offers Claude local import even with stale discovery metadata (saved=%s)', (saved) => {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ProviderEditor provider={{ ...provider, id: 'claude_cli', name: 'Claude Code', credential_saved: saved }} isActive={false} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).not.toContain('Use local login')
+    expect(html).not.toContain('Replace with local login')
+    expect(html).not.toContain('Temps found an authenticated')
+    expect(html).toContain('claude setup-token')
+    expect(html).toContain('Anthropic API key')
+  })
   test('offers one-click import without rendering credential material', () => {
     const html = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
@@ -20,7 +47,7 @@ describe('ProviderEditor local credential onboarding', () => {
     )
 
     expect(html).toContain('Use local login')
-    expect(html).toContain('authenticated Claude Code credential')
+    expect(html).toContain('authenticated Codex credential')
     expect(html).toContain('without exposing it to this browser')
     expect(html).not.toContain('oauth-secret')
     expect(html).not.toContain('.credentials.json')
@@ -43,8 +70,8 @@ describe('ProviderEditor local credential onboarding', () => {
 })
 
 const provider: ProviderCatalogDto = {
-  id: 'claude_cli',
-  name: 'Claude Code',
+  id: 'codex_cli',
+  name: 'Codex',
   install_command: 'install claude',
   auth_command: 'claude setup-token',
   auth_flavors: [

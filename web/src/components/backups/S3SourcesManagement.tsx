@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   deleteS3SourceMutation,
   runBackupForSourceMutation,
@@ -341,21 +343,19 @@ export function S3SourcesManagement() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">S3 sources</h2>
-          <p className="text-sm text-muted-foreground">
-            Configure S3 storage for backups
-          </p>
-        </div>
-        {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
-          <CreateActionButton
-            to="/backups/s3-sources/new"
-            label="Add S3 Source"
-            className="w-full sm:w-auto"
-          />
-        ) : null}
-      </div>
+      <PageHeader
+        title="Backups"
+        description="Configure where backups and WAL archives are stored"
+        actions={
+          shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+            <CreateActionButton
+              to="/backups/s3-sources/new"
+              label="Add S3 Source"
+              className="w-full sm:w-auto"
+            />
+          ) : null
+        }
+      />
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>

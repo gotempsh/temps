@@ -1,17 +1,11 @@
+import { SettingsSection } from '@/components/ui/settings-section'
+import { Activity } from 'lucide-react'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
 import { updateProjectDeploymentConfigMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
 import {
   Form,
   FormControl,
@@ -87,15 +81,8 @@ export function MonitoringCard({
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSave)}>
-        <Card className="bg-background text-foreground">
-          <CardHeader>
-            <CardTitle>Monitoring</CardTitle>
-            <CardDescription>
-              What this project&apos;s deployments collect about themselves at
-              runtime.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
+        <SettingsSection title="Monitoring" icon={Activity}>
+          <div className="space-y-4">
             <FormField
               control={form.control}
               name="performanceMetricsEnabled"
@@ -142,13 +129,13 @@ export function MonitoringCard({
                 </FormItem>
               )}
             />
-          </CardContent>
-          <CardFooter>
+          </div>
+          <div className="pt-4">
             <Button type="submit" disabled={updateDeploymentConfig.isPending}>
               Save Monitoring
             </Button>
-          </CardFooter>
-        </Card>
+          </div>
+        </SettingsSection>
       </form>
     </Form>
   )

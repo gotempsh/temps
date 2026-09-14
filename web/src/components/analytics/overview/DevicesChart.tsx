@@ -14,17 +14,11 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import type { LucideIcon } from 'lucide-react'
-import { BarChart3, Monitor, Smartphone, Tablet } from 'lucide-react'
+import { BarChart3 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { DeviceIcon } from './TechnologyIcon'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
-
-const DEVICE_ICONS: Record<string, LucideIcon> = {
-  Desktop: Monitor,
-  Mobile: Smartphone,
-  Tablet: Tablet,
-}
 
 const DEVICE_COLORS: Record<string, string> = {
   Desktop: 'var(--chart-1)',
@@ -145,13 +139,12 @@ export function DevicesChart({
             {/* Visual bars */}
             <div className="space-y-3">
               {sortedDevices.map((device) => {
-                const Icon = DEVICE_ICONS[device.device] || Monitor
                 const color = DEVICE_COLORS[device.device]
                 return (
                   <div key={device.device} className="space-y-2">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
-                        <Icon className="h-5 w-5 text-muted-foreground" />
+                        <DeviceIcon device={device.device} />
                         <span className="text-sm font-medium">
                           {device.device}
                         </span>

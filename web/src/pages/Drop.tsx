@@ -411,7 +411,6 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
 
     return (
       <PageContainer
-        width="wide"
         innerClassName="min-h-[calc(100vh-8rem)] flex items-center"
       >
         {completedContent}
@@ -631,7 +630,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   if (embedded) return <div className="space-y-6">{content}</div>
 
   return (
-    <PageContainer width="wide" innerClassName="space-y-8">
+    <PageContainer innerClassName="space-y-8">
       {content}
     </PageContainer>
   )

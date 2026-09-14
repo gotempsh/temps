@@ -3578,8 +3578,8 @@ mod tests {
 
         let mut stream = docker.create_image(
             Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some("minio/minio".to_string()),
-                tag: Some("latest".to_string()),
+                from_image: Some("quay.io/minio/minio".to_string()),
+                tag: Some("RELEASE.2025-09-07T16-13-09Z".to_string()),
                 ..Default::default()
             }),
             None,
@@ -3599,7 +3599,7 @@ mod tests {
         let name = format!("temps-test-restore-loc-minio-{}", uuid::Uuid::new_v4());
 
         let config = bollard::models::ContainerCreateBody {
-            image: Some("minio/minio:latest".to_string()),
+            image: Some("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
             cmd: Some(vec!["server".to_string(), "/data".to_string()]),
             env: Some(vec![
                 format!("MINIO_ROOT_USER={LOCATION_TEST_MINIO_ACCESS_KEY}"),

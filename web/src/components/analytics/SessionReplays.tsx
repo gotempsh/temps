@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getProjectSessionReplaysOptions } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse, SessionReplayWithVisitorDto } from '@/api/client/types.gen'
+import {
+  ProjectResponse,
+  SessionReplayWithVisitorDto,
+} from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -36,7 +39,8 @@ import {
   User,
   Video,
 } from 'lucide-react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
+import { EmptyState } from '@/components/ui/empty-state'
 import { TimeAgo } from '../utils/TimeAgo'
 
 function formatLocation(replay: SessionReplayWithVisitorDto): string | null {
@@ -167,129 +171,173 @@ export function SessionReplays({
               </div>
             </div>
           ) : !replaysData?.sessions || replaysData.sessions.length === 0 ? (
-            <div className="p-8">
-              <div className="flex flex-col items-center justify-center text-center">
-                <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
-                  <Video className="h-6 w-6 text-muted-foreground" />
-                </div>
-                <p className="text-sm font-medium">No session replays yet</p>
-                <p className="text-sm text-muted-foreground mt-1">
-                  Session replays will appear once users visit your application
-                </p>
-              </div>
-            </div>
+            <EmptyState
+              size="compact"
+              icon={Video}
+              title="No session replays yet"
+              description="Add the session replay integration to capture and play back real user sessions."
+              action={
+                <Button asChild size="sm">
+                  <Link to={`/projects/${project.slug}/analytics/setup`}>
+                    Set up session replay
+                  </Link>
+                </Button>
+              }
+            />
           ) : (
             <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Visitor</TableHead>
-                  <TableHead className="hidden md:table-cell">Browser / OS</TableHead>
-                  <TableHead className="hidden sm:table-cell">Location</TableHead>
-                  <TableHead>Duration</TableHead>
-                  <TableHead className="hidden lg:table-cell">Viewport</TableHead>
-                  <TableHead className="hidden sm:table-cell">Created</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {replaysData.sessions.map((replay) => (
-                  <TableRow key={replay.id}>
-                    <TableCell>
-                      <div className="flex items-center gap-1.5">
-                        <User className="h-3 w-3 text-muted-foreground shrink-0" />
-                        <span className="text-sm font-medium">{replay.visitor_id}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell">
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <div className="flex flex-col gap-0.5">
-                            {formatBrowserInfo(replay) ? (
-                              <>
-                                <span className="text-sm">{formatBrowserInfo(replay)}</span>
-                                {formatOsInfo(replay) && (
-                                  <span className="text-xs text-muted-foreground">{formatOsInfo(replay)}</span>
-                                )}
-                              </>
-                            ) : (
-                              <span className="text-xs text-muted-foreground">-</span>
-                            )}
-                          </div>
-                        </TooltipTrigger>
-                        {(replay.browser || replay.operating_system || replay.device_type) && (
-                          <TooltipContent>
-                            <div className="text-xs space-y-0.5">
-                              {replay.browser && <div>Browser: {replay.browser} {replay.browser_version}</div>}
-                              {replay.operating_system && <div>OS: {replay.operating_system} {replay.operating_system_version}</div>}
-                              {replay.device_type && <div>Device: {replay.device_type}</div>}
-                            </div>
-                          </TooltipContent>
-                        )}
-                      </Tooltip>
-                    </TableCell>
-                    <TableCell className="hidden sm:table-cell">
-                      {formatLocation(replay) ? (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Visitor</TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Browser / OS
+                    </TableHead>
+                    <TableHead className="hidden sm:table-cell">
+                      Location
+                    </TableHead>
+                    <TableHead>Duration</TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Viewport
+                    </TableHead>
+                    <TableHead className="hidden sm:table-cell">
+                      Created
+                    </TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {replaysData.sessions.map((replay) => (
+                    <TableRow key={replay.id}>
+                      <TableCell>
+                        <div className="flex items-center gap-1.5">
+                          <User className="h-3 w-3 text-muted-foreground shrink-0" />
+                          <span className="text-sm font-medium">
+                            {replay.visitor_id}
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden md:table-cell">
                         <Tooltip>
                           <TooltipTrigger asChild>
-                            <div className="flex items-center gap-1.5">
-                              <Globe className="h-3 w-3 text-muted-foreground shrink-0" />
-                              <span className="text-sm">{formatLocation(replay)}</span>
+                            <div className="flex flex-col gap-0.5">
+                              {formatBrowserInfo(replay) ? (
+                                <>
+                                  <span className="text-sm">
+                                    {formatBrowserInfo(replay)}
+                                  </span>
+                                  {formatOsInfo(replay) && (
+                                    <span className="text-xs text-muted-foreground">
+                                      {formatOsInfo(replay)}
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">
+                                  -
+                                </span>
+                              )}
                             </div>
                           </TooltipTrigger>
-                          <TooltipContent>
-                            <div className="text-xs space-y-0.5">
-                              {replay.visitor_city && <div>City: {replay.visitor_city}</div>}
-                              {replay.visitor_region && <div>Region: {replay.visitor_region}</div>}
-                              {replay.visitor_country && <div>Country: {replay.visitor_country}</div>}
-                            </div>
-                          </TooltipContent>
+                          {(replay.browser ||
+                            replay.operating_system ||
+                            replay.device_type) && (
+                            <TooltipContent>
+                              <div className="text-xs space-y-0.5">
+                                {replay.browser && (
+                                  <div>
+                                    Browser: {replay.browser}{' '}
+                                    {replay.browser_version}
+                                  </div>
+                                )}
+                                {replay.operating_system && (
+                                  <div>
+                                    OS: {replay.operating_system}{' '}
+                                    {replay.operating_system_version}
+                                  </div>
+                                )}
+                                {replay.device_type && (
+                                  <div>Device: {replay.device_type}</div>
+                                )}
+                              </div>
+                            </TooltipContent>
+                          )}
                         </Tooltip>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">-</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1">
-                        <Clock className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-sm">{formatDuration(replay.duration || 0)}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="hidden lg:table-cell">
-                      <div className="flex items-center gap-1">
-                        <Monitor className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-xs text-muted-foreground">
-                          {replay.viewport_width}x{replay.viewport_height}
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="hidden sm:table-cell">
-                      <div className="flex items-center gap-1">
-                        <Calendar className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-xs text-muted-foreground">
-                          <TimeAgo date={replay.created_at || ''} />
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        size="sm"
-                        onClick={() =>
-                          handlePlayReplay(
-                            replay.id.toString(),
-                            replay.visitor_id
-                          )
-                        }
-                        className="gap-1.5"
-                      >
-                        <Play className="h-3 w-3" />
-                        <span className="hidden sm:inline">Watch</span>
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                      </TableCell>
+                      <TableCell className="hidden sm:table-cell">
+                        {formatLocation(replay) ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div className="flex items-center gap-1.5">
+                                <Globe className="h-3 w-3 text-muted-foreground shrink-0" />
+                                <span className="text-sm">
+                                  {formatLocation(replay)}
+                                </span>
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <div className="text-xs space-y-0.5">
+                                {replay.visitor_city && (
+                                  <div>City: {replay.visitor_city}</div>
+                                )}
+                                {replay.visitor_region && (
+                                  <div>Region: {replay.visitor_region}</div>
+                                )}
+                                {replay.visitor_country && (
+                                  <div>Country: {replay.visitor_country}</div>
+                                )}
+                              </div>
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">
+                            -
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Clock className="h-3 w-3 text-muted-foreground" />
+                          <span className="text-sm">
+                            {formatDuration(replay.duration || 0)}
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden lg:table-cell">
+                        <div className="flex items-center gap-1">
+                          <Monitor className="h-3 w-3 text-muted-foreground" />
+                          <span className="text-xs text-muted-foreground">
+                            {replay.viewport_width}x{replay.viewport_height}
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden sm:table-cell">
+                        <div className="flex items-center gap-1">
+                          <Calendar className="h-3 w-3 text-muted-foreground" />
+                          <span className="text-xs text-muted-foreground">
+                            <TimeAgo date={replay.created_at || ''} />
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          size="sm"
+                          onClick={() =>
+                            handlePlayReplay(
+                              replay.id.toString(),
+                              replay.visitor_id
+                            )
+                          }
+                          className="gap-1.5"
+                        >
+                          <Play className="h-3 w-3" />
+                          <span className="hidden sm:inline">Watch</span>
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
           )}
         </CardContent>

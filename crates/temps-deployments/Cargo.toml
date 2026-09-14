@@ -60,6 +60,9 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
+# Raw `GET /system/df` over the Docker Unix socket (see services/docker_disk_usage.rs)
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
 cron = "0.17"
 flate2 = { workspace = true }
 zip = { workspace = true }

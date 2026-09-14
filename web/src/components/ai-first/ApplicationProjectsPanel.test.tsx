@@ -45,6 +45,7 @@ describe('ApplicationProjectsPanel', () => {
       [
         {
           id: 12,
+          database_provisioning_mode: 'project_environment',
           project: {
             id: 7,
             slug: 'web',

@@ -125,7 +125,7 @@ services:
       - "8025:8025"
 
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     # `backup-restore-scenario` needs a real S3-compatible target so the
     # backup engine's actual upload (and the restore's actual download) get
     # exercised, not just the API's bookkeeping rows -- same reasoning as

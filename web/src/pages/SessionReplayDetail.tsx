@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse, SessionEventDto } from '@/api/client'
 import {
@@ -287,7 +288,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   // Loading skeleton
   if (isLoading) {
     return (
-      <div className="container max-w-full py-6">
+      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
         {/* Header skeleton */}
         <div className="mb-4 flex items-center justify-between">
           <Skeleton className="h-9 w-32" />
@@ -398,7 +399,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   }
 
   return (
-    <div className="container max-w-full py-6">
+    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>
@@ -540,7 +541,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                           {isSelected && firstEventData && (
                             <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
                               <pre className="text-xs overflow-x-auto">
-                                {formatEventData(firstEventData)}
+                                <HighlightedCode
+                                  code={formatEventData(firstEventData)}
+                                  language="json"
+                                />
                               </pre>
                             </div>
                           )}

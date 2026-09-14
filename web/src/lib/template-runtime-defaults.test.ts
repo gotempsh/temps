@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  createTemplateRuntimeDefaultsSchema,
   historicalImageRuntime,
   serviceTemplateDeployOverrides,
   serviceTemplateRuntimeDefaults,
@@ -74,6 +75,32 @@ const template = {
 }
 
 describe('template runtime defaults', () => {
+  test('starter images accept tags while service images require immutable digests', () => {
+    const values = templateRuntimeDefaults({
+      image: 'ghcr.io/gotempsh/observability-starter:latest',
+    })
+    expect(
+      createTemplateRuntimeDefaultsSchema('starter').safeParse(values).success
+    ).toBe(true)
+    expect(
+      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+    ).toBe(false)
+    values.image = `ghcr.io/gotempsh/observability-starter@sha256:${'a'.repeat(64)}`
+    expect(
+      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+    ).toBe(true)
+    for (const image of [
+      '',
+      'registry.test/image with spaces',
+      'registry.test/image\n:latest',
+    ]) {
+      values.image = image
+      expect(
+        createTemplateRuntimeDefaultsSchema('starter').safeParse(values).success
+      ).toBe(false)
+    }
+  })
+
   test('presents curated runtime values in user-facing units', () => {
     expect(templateRuntimeDefaults(template)).toEqual({
       image: 'registry.example.test/identity:26.7.2',

@@ -3,13 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -180,266 +174,240 @@ export function Settings() {
         title="Settings"
         description="Configure this Temps instance"
       />
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Link className="h-5 w-5" />
-            External URL
-          </CardTitle>
-          <CardDescription>
-            Set the external URL for your platform
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <Label htmlFor="external-url">External URL</Label>
-            <Input
-              id="external-url"
-              type="url"
-              placeholder="https://your-domain.com"
-              {...register('external_url', {
-                validate: (value) => {
-                  if (!value) return true // optional
-                  const trimmed = value.trim()
-                  if (!trimmed) return true
-                  if (
-                    !trimmed.startsWith('http://') &&
-                    !trimmed.startsWith('https://')
-                  )
-                    return 'Must start with http:// or https://'
-                  if (trimmed.includes('#') || trimmed.includes('?'))
-                    return 'Must not contain # or ? characters'
-                  try {
-                    new URL(trimmed)
-                  } catch {
-                    return 'Must be a valid URL'
-                  }
-                  return true
-                },
-              })}
-            />
-            {errors.external_url && (
-              <p className="text-sm text-destructive">
-                {errors.external_url.message}
-              </p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              Used for OAuth callbacks, webhooks, and external integrations
-            </p>
-          </div>
-
-          <div className="space-y-2 pt-4">
-            <Label htmlFor="console-force-https">
-              Redirect console to HTTPS
-            </Label>
-            <Select
-              value={consoleForceHttpsValue}
-              onValueChange={(value) =>
-                setValue(
-                  'console_force_https',
-                  value === 'auto' ? null : value === 'always',
-                  { shouldDirty: true }
+      <SettingsSection
+        title="External URL"
+        description="Set the external URL for your platform"
+        icon={Link}
+        hasError={Boolean(errors.external_url || errors.internal_url)}
+      >
+        <div className="space-y-2">
+          <Label htmlFor="external-url">External URL</Label>
+          <Input
+            id="external-url"
+            type="url"
+            placeholder="https://your-domain.com"
+            {...register('external_url', {
+              validate: (value) => {
+                if (!value) return true // optional
+                const trimmed = value.trim()
+                if (!trimmed) return true
+                if (
+                  !trimmed.startsWith('http://') &&
+                  !trimmed.startsWith('https://')
                 )
-              }
+                  return 'Must start with http:// or https://'
+                if (trimmed.includes('#') || trimmed.includes('?'))
+                  return 'Must not contain # or ? characters'
+                try {
+                  new URL(trimmed)
+                } catch {
+                  return 'Must be a valid URL'
+                }
+                return true
+              },
+            })}
+          />
+          {errors.external_url && (
+            <p className="text-sm text-destructive">
+              {errors.external_url.message}
+            </p>
+          )}
+          <p className="text-sm text-muted-foreground">
+            Used for OAuth callbacks, webhooks, and external integrations
+          </p>
+        </div>
+
+        <div className="space-y-2 pt-4">
+          <Label htmlFor="console-force-https">Redirect console to HTTPS</Label>
+          <Select
+            value={consoleForceHttpsValue}
+            onValueChange={(value) =>
+              setValue(
+                'console_force_https',
+                value === 'auto' ? null : value === 'always',
+                { shouldDirty: true }
+              )
+            }
+          >
+            <SelectTrigger
+              id="console-force-https"
+              className="w-full sm:w-[280px]"
             >
-              <SelectTrigger
-                id="console-force-https"
-                className="w-full sm:w-[280px]"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">
-                  Automatic — once a certificate exists
-                </SelectItem>
-                <SelectItem value="always">Always redirect</SelectItem>
-                <SelectItem value="never">Never redirect</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
-              Applies to plain-HTTP requests for the host above.{' '}
-              <strong>Automatic</strong> redirects only once that hostname has a
-              certificate issued through Temps, so HTTP-only installs keep
-              working. Choose <strong>Always</strong> only if Temps itself
-              terminates TLS — if a CDN or reverse proxy in front of Temps does,
-              it will loop, because Temps sees a plain-HTTP connection and
-              redirects it straight back.
-            </p>
-          </div>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">
+                Automatic — once a certificate exists
+              </SelectItem>
+              <SelectItem value="always">Always redirect</SelectItem>
+              <SelectItem value="never">Never redirect</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-sm text-muted-foreground">
+            Applies to plain-HTTP requests for the host above.{' '}
+            <strong>Automatic</strong> redirects only once that hostname has a
+            certificate issued through Temps, so HTTP-only installs keep
+            working. Choose <strong>Always</strong> only if Temps itself
+            terminates TLS — if a CDN or reverse proxy in front of Temps does,
+            it will loop, because Temps sees a plain-HTTP connection and
+            redirects it straight back.
+          </p>
+        </div>
 
-          <div className="space-y-2 pt-4">
-            <Label htmlFor="internal-url">Internal URL</Label>
-            <Input
-              id="internal-url"
-              type="url"
-              placeholder="http://host.docker.internal:8080"
-              {...register('internal_url', {
-                validate: (value) => {
-                  if (!value) return true // optional — falls back to default
-                  const trimmed = value.trim()
-                  if (!trimmed) return true
-                  if (
-                    !trimmed.startsWith('http://') &&
-                    !trimmed.startsWith('https://')
-                  )
-                    return 'Must start with http:// or https://'
-                  if (trimmed.includes('#') || trimmed.includes('?'))
-                    return 'Must not contain # or ? characters'
-                  try {
-                    new URL(trimmed)
-                  } catch {
-                    return 'Must be a valid URL'
-                  }
-                  return true
-                },
-              })}
-            />
-            {errors.internal_url && (
-              <p className="text-sm text-destructive">
-                {errors.internal_url.message}
-              </p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              How service containers reach the Temps API from inside the Docker
-              network (OTLP metrics ingest, agent callbacks). Leave blank to use{' '}
-              <code className="font-mono text-xs">
-                http://host.docker.internal:&lt;proxy-port&gt;
-              </code>
-              .
+        <div className="space-y-2 pt-4">
+          <Label htmlFor="internal-url">Internal URL</Label>
+          <Input
+            id="internal-url"
+            type="url"
+            placeholder="http://host.docker.internal:8080"
+            {...register('internal_url', {
+              validate: (value) => {
+                if (!value) return true // optional — falls back to default
+                const trimmed = value.trim()
+                if (!trimmed) return true
+                if (
+                  !trimmed.startsWith('http://') &&
+                  !trimmed.startsWith('https://')
+                )
+                  return 'Must start with http:// or https://'
+                if (trimmed.includes('#') || trimmed.includes('?'))
+                  return 'Must not contain # or ? characters'
+                try {
+                  new URL(trimmed)
+                } catch {
+                  return 'Must be a valid URL'
+                }
+                return true
+              },
+            })}
+          />
+          {errors.internal_url && (
+            <p className="text-sm text-destructive">
+              {errors.internal_url.message}
             </p>
-          </div>
-        </CardContent>
-      </Card>
+          )}
+          <p className="text-sm text-muted-foreground">
+            How service containers reach the Temps API from inside the Docker
+            network (OTLP metrics ingest, agent callbacks). Leave blank to use{' '}
+            <code className="font-mono text-xs">
+              http://host.docker.internal:&lt;proxy-port&gt;
+            </code>
+            .
+          </p>
+        </div>
+      </SettingsSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Globe className="h-5 w-5" />
-            Preview Domain
-          </CardTitle>
-          <CardDescription>
-            Configure the domain used for deployment previews
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <Label htmlFor="preview-domain">Preview Domain</Label>
-            <Input
-              id="preview-domain"
-              type="text"
-              placeholder="localho.st"
-              {...register('preview_domain')}
-            />
-            <p className="text-sm text-muted-foreground">
-              Deployments will be accessible at subdomain.
-              {settings?.preview_domain || 'localho.st'}
+      <SettingsSection
+        title="Preview Domain"
+        description="Configure the domain used for deployment previews"
+        icon={Globe}
+      >
+        <div className="space-y-2">
+          <Label htmlFor="preview-domain">Preview Domain</Label>
+          <Input
+            id="preview-domain"
+            type="text"
+            placeholder="localho.st"
+            {...register('preview_domain')}
+          />
+          <p className="text-sm text-muted-foreground">
+            Deployments will be accessible at subdomain.
+            {settings?.preview_domain || 'localho.st'}
+          </p>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title="Let's Encrypt"
+        description="Contact email for automatic TLS certificate issuance and renewal"
+        icon={ShieldCheck}
+        hasError={Boolean(errors.letsencrypt?.email)}
+      >
+        <div className="space-y-2">
+          <Label htmlFor="letsencrypt-email">Contact Email</Label>
+          <Input
+            id="letsencrypt-email"
+            type="email"
+            placeholder="ops@your-domain.com"
+            {...register('letsencrypt.email', {
+              validate: (value) => {
+                if (!value) return true // optional, but renewals will fail without it
+                const trimmed = value.trim()
+                if (!trimmed) return true
+                if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
+                  return 'Must be a valid email address'
+                return true
+              },
+            })}
+          />
+          {errors.letsencrypt?.email && (
+            <p className="text-sm text-destructive">
+              {errors.letsencrypt.email.message}
             </p>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5" />
-            Let&apos;s Encrypt
-          </CardTitle>
-          <CardDescription>
-            Contact email for automatic TLS certificate issuance and renewal
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <Label htmlFor="letsencrypt-email">Contact Email</Label>
-            <Input
-              id="letsencrypt-email"
-              type="email"
-              placeholder="ops@your-domain.com"
-              {...register('letsencrypt.email', {
-                validate: (value) => {
-                  if (!value) return true // optional, but renewals will fail without it
-                  const trimmed = value.trim()
-                  if (!trimmed) return true
-                  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
-                    return 'Must be a valid email address'
-                  return true
-                },
-              })}
-            />
-            {errors.letsencrypt?.email && (
-              <p className="text-sm text-destructive">
-                {errors.letsencrypt.email.message}
-              </p>
-            )}
-            {!settings?.letsencrypt?.email && (
-              <p className="text-sm text-amber-600 dark:text-amber-500">
-                No contact email configured — certificate issuance and automatic
-                renewal will fail until this is set.
-              </p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              Let&apos;s Encrypt requires a real contact email to register an
-              ACME account. Used for all certificate provisioning and background
-              auto-renewal (HTTP-01 and DNS-01).
+          )}
+          {!settings?.letsencrypt?.email && (
+            <p className="text-sm text-amber-600 dark:text-amber-500">
+              No contact email configured — certificate issuance and automatic
+              renewal will fail until this is set.
             </p>
-          </div>
+          )}
+          <p className="text-sm text-muted-foreground">
+            Let&apos;s Encrypt requires a real contact email to register an ACME
+            account. Used for all certificate provisioning and background
+            auto-renewal (HTTP-01 and DNS-01).
+          </p>
+        </div>
 
-          <div className="space-y-2 pt-4">
-            <Label htmlFor="letsencrypt-environment">Environment</Label>
-            <Select
-              value={letsencryptEnvironment}
-              onValueChange={(value: 'production' | 'staging') =>
-                setValue('letsencrypt.environment', value, {
-                  shouldDirty: true,
-                })
-              }
-            >
-              <SelectTrigger id="letsencrypt-environment">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="production">Production</SelectItem>
-                <SelectItem value="staging">
-                  Staging (testing, avoids rate limits)
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
-              Staging certificates are not trusted by browsers — use only for
-              testing to avoid Let&apos;s Encrypt&apos;s production rate limits.
-            </p>
-          </div>
+        <div className="space-y-2 pt-4">
+          <Label htmlFor="letsencrypt-environment">Environment</Label>
+          <Select
+            value={letsencryptEnvironment}
+            onValueChange={(value: 'production' | 'staging') =>
+              setValue('letsencrypt.environment', value, {
+                shouldDirty: true,
+              })
+            }
+          >
+            <SelectTrigger id="letsencrypt-environment">
+              <SelectValue placeholder="Select environment" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="production">Production</SelectItem>
+              <SelectItem value="staging">
+                Staging (testing, avoids rate limits)
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-sm text-muted-foreground">
+            Staging certificates are not trusted by browsers — use only for
+            testing to avoid Let&apos;s Encrypt&apos;s production rate limits.
+          </p>
+        </div>
 
-          <div className="space-y-2 pt-4">
-            <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
-            <Input
-              id="edge-target"
-              type="text"
-              placeholder="203.0.113.10 or edge.example.com"
-              {...register('edge_target')}
-            />
-            <p className="text-sm text-muted-foreground">
-              Public address that generated DNS records point at when a managed
-              domain opts into record sync. An IP creates A/AAAA records; a
-              hostname creates CNAME records. Leave blank to disable DNS sync.
-              The Standard vs Flat hostname layout is configured per managed
-              domain under DNS providers.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+        <div className="space-y-2 pt-4">
+          <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
+          <Input
+            id="edge-target"
+            type="text"
+            placeholder="203.0.113.10 or edge.example.com"
+            {...register('edge_target')}
+          />
+          <p className="text-sm text-muted-foreground">
+            Public address that generated DNS records point at when a managed
+            domain opts into record sync. An IP creates A/AAAA records; a
+            hostname creates CNAME records. Leave blank to disable DNS sync. The
+            Standard vs Flat hostname layout is configured per managed domain
+            under DNS providers.
+          </p>
+        </div>
+      </SettingsSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Image className="h-5 w-5" />
-            Screenshots
-          </CardTitle>
-          <CardDescription>
-            Configure screenshot generation for deployments
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Screenshots"
+        description="Configure screenshot generation for deployments"
+        icon={Image}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="screenshots-enabled">Enable Screenshots</Label>
@@ -504,59 +472,50 @@ export function Settings() {
               )}
             </>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <RefreshCw className="h-5 w-5" />
-            Route Table
-          </CardTitle>
-          <CardDescription>
-            Manually refresh the proxy route table from the database. Use this
-            if routes appear out of sync after deployments or configuration
-            changes.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={isRefreshingRoutes}
-            onClick={async () => {
-              setIsRefreshingRoutes(true)
-              try {
-                const response = await client.post({
-                  url: '/settings/routes/refresh',
-                  security: [{ scheme: 'bearer', type: 'http' }],
-                })
-                const data = response.data as
-                  { route_count: number; message: string } | undefined
-                toast.success(
-                  data?.message || 'Route table refreshed successfully'
-                )
-              } catch {
-                toast.error('Failed to refresh route table')
-              } finally {
-                setIsRefreshingRoutes(false)
-              }
-            }}
-          >
-            {isRefreshingRoutes ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Refreshing...
-              </>
-            ) : (
-              <>
-                <RefreshCw className="mr-2 h-4 w-4" />
-                Refresh Routes
-              </>
-            )}
-          </Button>
-        </CardContent>
-      </Card>
+      <SettingsSection
+        title="Route Table"
+        description="Manually refresh proxy routes from the database when deployments or configuration changes appear out of sync."
+        icon={RefreshCw}
+      >
+        <Button
+          type="button"
+          variant="outline"
+          disabled={isRefreshingRoutes}
+          onClick={async () => {
+            setIsRefreshingRoutes(true)
+            try {
+              const response = await client.post({
+                url: '/settings/routes/refresh',
+                security: [{ scheme: 'bearer', type: 'http' }],
+              })
+              const data = response.data as
+                { route_count: number; message: string } | undefined
+              toast.success(
+                data?.message || 'Route table refreshed successfully'
+              )
+            } catch {
+              toast.error('Failed to refresh route table')
+            } finally {
+              setIsRefreshingRoutes(false)
+            }
+          }}
+        >
+          {isRefreshingRoutes ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Refreshing...
+            </>
+          ) : (
+            <>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh Routes
+            </>
+          )}
+        </Button>
+      </SettingsSection>
 
       {isDirty && (
         <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">

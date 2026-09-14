@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+
 /**
  * ProxyMetrics — charts for proxy hot-path traffic.
  *
@@ -35,7 +37,6 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { DateRangePicker } from '@/components/ui/date-range-picker'
 import {
   Select,
   SelectContent,
@@ -59,7 +60,6 @@ import {
   formatProxyTimeLabel,
   PROXY_MAX_WINDOW_DAYS,
   PROXY_MAX_WINDOW_DAYS_SCOPED,
-  PROXY_RANGE_PRESETS,
   proxyWindowTooWide,
   resolveProxyWindow,
   type ProxyRangeValue,
@@ -1305,33 +1305,21 @@ export default function ProxyMetrics() {
           actions={
             <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
               <FilterBar filter={filter} onChange={setFilter} />
-              <div className="flex items-center gap-1">
-                {PROXY_RANGE_PRESETS.map((opt) => (
-                  <Button
-                    key={opt.value}
-                    variant={range === opt.value ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => setRange(opt.value)}
-                  >
-                    {opt.label}
-                  </Button>
-                ))}
-                <Button
-                  variant={range === 'custom' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setRange('custom')}
-                >
-                  Custom
-                </Button>
-              </div>
-              {range === 'custom' && (
-                <DateRangePicker
-                  date={customRange}
-                  onDateChange={setCustomRange}
-                  showTime
-                  className="w-full sm:w-[300px]"
-                />
-              )}
+              <DateTimeRange
+                value={{
+                  from: resolved.startIso,
+                  to: resolved.endIso,
+                  preset: range === '24h' ? '1d' : range,
+                }}
+                maxRangeDays={maxDays}
+                onChange={(next) => {
+                  setRange(next.preset === '1d' ? '24h' : next.preset)
+                  setCustomRange({
+                    from: new Date(next.from),
+                    to: new Date(next.to),
+                  })
+                }}
+              />
             </div>
           }
         />

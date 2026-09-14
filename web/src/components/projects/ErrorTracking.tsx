@@ -60,7 +60,12 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Tabs,
+  TabsContent,
+  ScrollableTabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -87,6 +92,7 @@ import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { CopyButton } from '../ui/copy-button'
 import { SourceMaps } from '../error-tracking/SourceMaps'
+import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -154,6 +160,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'
   >('unresolved')
+  const [groupSort, setGroupSort] = useState('last_seen:desc')
   const [page, setPage] = useState(1)
   const pageSize = 25
 
@@ -180,7 +187,11 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // change the query key, refire the fetch, and loop forever.
   const { startDate, endDate } = useMemo(
     () => getDateRangeFromFilter(dateFilter),
-    [dateFilter.quickFilter, dateFilter.dateRange?.from, dateFilter.dateRange?.to]
+    [
+      dateFilter.quickFilter,
+      dateFilter.dateRange?.from,
+      dateFilter.dateRange?.to,
+    ]
   )
   const timeRange = {
     startTime: (startDate ?? new Date()).toISOString(),
@@ -245,6 +256,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     setPage(1)
   }, [
     statusFilter,
+    groupSort,
     environmentFilter,
     dateFilter.quickFilter,
     dateFilter.dateRange?.from,
@@ -262,6 +274,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         start_date: timeRange.startTime,
         end_date: timeRange.endTime,
         environment_id: environmentFilter,
+        ...errorGroupSortQuery(groupSort),
       },
     }),
     enabled: hasErrors,
@@ -814,21 +827,48 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           isRefreshing={isRefreshing}
           leftActions={
             selectedTab === 'errors' ? (
-              <Select
-                value={statusFilter}
-                onValueChange={(v) =>
-                  setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
-                }
-              >
-                <SelectTrigger className="w-[130px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="unresolved">Unresolved</SelectItem>
-                  <SelectItem value="resolved">Resolved</SelectItem>
-                  <SelectItem value="all">All</SelectItem>
-                </SelectContent>
-              </Select>
+              <div className="flex gap-2">
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) =>
+                    setStatusFilter(v as 'unresolved' | 'resolved' | 'all')
+                  }
+                >
+                  <SelectTrigger className="w-[130px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unresolved">Unresolved</SelectItem>
+                    <SelectItem value="resolved">Resolved</SelectItem>
+                    <SelectItem value="all">All</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select value={groupSort} onValueChange={setGroupSort}>
+                  <SelectTrigger
+                    className="w-[170px]"
+                    aria-label="Sort error groups"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="last_seen:desc">
+                      Recently seen
+                    </SelectItem>
+                    <SelectItem value="first_seen:desc">
+                      Newest issues
+                    </SelectItem>
+                    <SelectItem value="first_seen:asc">
+                      Oldest issues
+                    </SelectItem>
+                    <SelectItem value={EVENT_COUNT_SORT.most}>
+                      Most events
+                    </SelectItem>
+                    <SelectItem value={EVENT_COUNT_SORT.fewest}>
+                      Fewest events
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             ) : undefined
           }
         />
@@ -852,7 +892,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           setSelectedTab(v as 'errors' | 'analytics' | 'sourcemaps' | 'setup')
         }
       >
-        <TabsList className="grid w-full grid-cols-4 max-w-[700px]">
+        <ScrollableTabsList aria-label="Error tracking sections">
           <TabsTrigger value="errors">
             Error Groups
             {hasErrors && (
@@ -871,7 +911,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
               </Badge>
             )}
           </TabsTrigger>
-        </TabsList>
+        </ScrollableTabsList>
 
         <TabsContent value="errors" className="mt-5 space-y-3">
           {hasErrors ? (
@@ -1110,12 +1150,12 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
                 <CollapsibleContent>
                   <CardContent className="space-y-6">
                     <Tabs defaultValue="javascript" className="w-full">
-                      <TabsList className="grid w-full grid-cols-4">
+                      <ScrollableTabsList aria-label="SDK examples">
                         <TabsTrigger value="javascript">JavaScript</TabsTrigger>
                         <TabsTrigger value="react">React</TabsTrigger>
                         <TabsTrigger value="nodejs">Node.js</TabsTrigger>
                         <TabsTrigger value="python">Python</TabsTrigger>
-                      </TabsList>
+                      </ScrollableTabsList>
 
                       {/* JavaScript */}
                       <TabsContent value="javascript" className="space-y-4">

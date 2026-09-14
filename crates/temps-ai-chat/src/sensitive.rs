@@ -203,6 +203,51 @@ pub(crate) fn redact_text(value: &str) -> String {
     })
 }
 
+/// Defense in depth for a retained-runtime diagnostic whose exact turn
+/// secrets were already removed by the adapter. Other provider errors must
+/// never use this display path.
+pub(crate) fn redact_retained_diagnostic(value: &str) -> String {
+    static URL: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static PATH: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static EMAIL: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static BEARER: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let mut safe = redact_text(value);
+    for (pattern, replacement) in [
+        (
+            BEARER.get_or_init(|| regex::Regex::new(r"(?i)\bbearer\s+[^\s,;]+").ok()),
+            "[credential redacted]"),
+        (
+            URL.get_or_init(|| regex::Regex::new(r"(?i)\b[a-z][a-z0-9+.-]*://\S+").ok()),
+            "[url redacted]"),
+        (
+            PATH.get_or_init(|| regex::Regex::new(r#"(?:/[^\s/:;,'"{}]+){2,}"#).ok()),
+            "[path redacted]"),
+        (
+            EMAIL.get_or_init(|| regex::Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").ok()),
+            "[address redacted]"),
+        (
+            SECRET.get_or_init(|| regex::Regex::new(r"(?i)\b(?:authorization|password|secret|token|api[_-]?key|access[_-]?key)\s*[:=]\s*[^\s,;]+").ok()),
+            "[credential redacted]"),
+    ] {
+        if let Some(pattern) = pattern {
+            safe = pattern.replace_all(&safe, replacement).into_owned();
+        }
+    }
+    safe.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(400)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Redact unified diff content without destroying its line shape. Ordinary
 /// assignment scrubbing runs first; any remaining provider-prefixed,
 /// connection-string, private-key, AWS, GitHub, or high-entropy credential

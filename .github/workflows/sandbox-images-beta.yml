@@ -50,6 +50,9 @@ on:
       - 'crates/temps-git-credential/**'
       - 'crates/temps-preview-gateway/**'
       - 'scripts/build-sandbox-images.sh'
+      - 'tools/sandbox-runtime/**'
+      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - '.github/workflows/daemon-images.yml'
       - '.github/workflows/sandbox-images-beta.yml'
   # Manual fire for testing the workflow itself or rebuilding without a
   # code change. Same dry-run knob as release.yml.
@@ -69,6 +72,15 @@ permissions:
   contents: read
 
 jobs:
+  daemon-images:
+    uses: ./.github/workflows/daemon-images.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      channel: beta
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   # ─────────────────────────────────────────────────────────────────────
   # Compile helpers + render every per-runtime Dockerfile + materialise
   # the shared bundle, ONCE. The matrix jobs below download the artifact

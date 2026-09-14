@@ -1,3 +1,5 @@
+import { AnalyticsBreakdownRow } from './AnalyticsBreakdownRow'
+import { AnalyticsDimensionIcon } from './AnalyticsDimensionIdentity'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -15,7 +17,7 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { ChevronLeft, ChevronRight, MapPin } from 'lucide-react'
+import { ChevronLeft, ChevronRight } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
@@ -225,39 +227,23 @@ export function LocationsChart({
         ) : (
           <div className="space-y-4">
             {chartData.map((location) => (
-              <button
-                type="button"
+              <AnalyticsBreakdownRow
                 key={location.location}
-                className={`flex items-center w-full text-left ${canDrillDown && location.location !== 'Unknown' ? 'cursor-pointer hover:bg-muted/50 rounded-lg p-1 -mx-1' : ''}`}
-                onClick={() => handleClick(location.location)}
-                disabled={!canDrillDown || location.location === 'Unknown'}
-              >
-                <div className="w-full">
-                  <div className="flex items-center justify-between mb-1">
-                    <div className="flex items-center gap-2">
-                      <MapPin className="h-3 w-3 text-muted-foreground" />
-                      <span className="text-sm font-medium">
-                        {location.location}
-                      </span>
-                      {canDrillDown && location.location !== 'Unknown' && (
-                        <ChevronRight className="h-3 w-3 text-muted-foreground" />
-                      )}
-                    </div>
-                    <span className="text-sm text-muted-foreground">
-                      {location.visitors.toLocaleString()} (
-                      {location.percentage}%)
-                    </span>
-                  </div>
-                  <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-primary transition-all rounded-full"
-                      style={{
-                        width: `${location.percentage}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-              </button>
+                label={location.location}
+                icon={
+                  <AnalyticsDimensionIcon
+                    dimension={drill.level}
+                    value={location.location}
+                  />
+                }
+                count={location.visitors}
+                percentage={Number(location.percentage)}
+                onClick={
+                  canDrillDown && location.location !== 'Unknown'
+                    ? () => handleClick(location.location)
+                    : undefined
+                }
+              />
             ))}
           </div>
         )}

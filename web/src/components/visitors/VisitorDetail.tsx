@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   enrichVisitorMutation,
@@ -191,7 +192,9 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const [limit, setLimit] = React.useState(25)
   const [isEnrichDialogOpen, setIsEnrichDialogOpen] = React.useState(false)
   const [enrichJsonValue, setEnrichJsonValue] = React.useState('')
-  const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(null)
+  const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(
+    null
+  )
 
   // Get the active tab from URL or default to 'journey'
   const activeTab = searchParams.get('tab') || 'journey'
@@ -276,7 +279,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   // Handle opening the enrich dialog
   const handleOpenEnrichDialog = () => {
     // Pre-populate with existing custom_data if available
-    if (visitorDetails?.custom_data && Object.keys(visitorDetails.custom_data).length > 0) {
+    if (
+      visitorDetails?.custom_data &&
+      Object.keys(visitorDetails.custom_data).length > 0
+    ) {
       setEnrichJsonValue(JSON.stringify(visitorDetails.custom_data, null, 2))
     } else {
       setEnrichJsonValue('{\n  \n}')
@@ -289,8 +295,14 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const handleEnrichSubmit = () => {
     try {
       const parsedData = JSON.parse(enrichJsonValue)
-      if (typeof parsedData !== 'object' || parsedData === null || Array.isArray(parsedData)) {
-        setEnrichJsonError('Custom data must be a JSON object (not an array or primitive)')
+      if (
+        typeof parsedData !== 'object' ||
+        parsedData === null ||
+        Array.isArray(parsedData)
+      ) {
+        setEnrichJsonError(
+          'Custom data must be a JSON object (not an array or primitive)'
+        )
         return
       }
       setEnrichJsonError(null)
@@ -370,11 +382,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <p className="text-muted-foreground">ID: {visitorId}</p>
         </div>
         {visitorDetails && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleOpenEnrichDialog}
-          >
+          <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
             <Pencil className="h-4 w-4 mr-2" />
             Enrich Visitor
           </Button>
@@ -566,7 +574,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                         <div className="flex-1 text-sm">
                           {typeof value === 'object' && value !== null ? (
                             <pre className="bg-muted rounded p-2 overflow-x-auto">
-                              {JSON.stringify(value, null, 2)}
+                              <HighlightedCode
+                                code={JSON.stringify(value, null, 2)}
+                                language="json"
+                              />
                             </pre>
                           ) : (
                             <span className="break-words">{String(value)}</span>
@@ -967,8 +978,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               Enrich Visitor Data
             </DialogTitle>
             <DialogDescription>
-              Add or update custom data for this visitor. The data will be merged with existing custom data.
-              Enter valid JSON object format.
+              Add or update custom data for this visitor. The data will be
+              merged with existing custom data. Enter valid JSON object format.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -991,9 +1002,15 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             <div className="text-sm text-muted-foreground">
               <p className="font-medium mb-1">Examples:</p>
               <ul className="list-disc list-inside space-y-1">
-                <li><code className="bg-muted px-1 rounded">{`{"email": "user@example.com"}`}</code></li>
-                <li><code className="bg-muted px-1 rounded">{`{"company": "Acme Inc", "role": "admin"}`}</code></li>
-                <li><code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code></li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"email": "user@example.com"}`}</code>
+                </li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"company": "Acme Inc", "role": "admin"}`}</code>
+                </li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code>
+                </li>
               </ul>
             </div>
           </div>

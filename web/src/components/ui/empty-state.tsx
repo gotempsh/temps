@@ -3,12 +3,14 @@
 
 import { LucideIcon } from 'lucide-react'
 import { ReactNode } from 'react'
+import { cn } from '@/lib/utils'
 
 interface EmptyStateProps {
   icon: LucideIcon
   title: string
   description: ReactNode | string
   action?: ReactNode
+  size?: 'default' | 'compact'
 }
 
 export function EmptyState({
@@ -16,14 +18,37 @@ export function EmptyState({
   title,
   description,
   action,
+  size = 'default',
 }: EmptyStateProps) {
   return (
-    <div className="flex min-h-[400px] flex-col items-center justify-center gap-4 rounded-lg p-8 text-center animate-in fade-in-50">
-      <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
-        <Icon className="h-10 w-10 text-muted-foreground" />
+    <div
+      className={cn(
+        'flex flex-col items-center justify-center rounded-lg text-center animate-in fade-in-50',
+        size === 'compact' ? 'min-h-60 gap-3 p-6' : 'min-h-[400px] gap-4 p-8'
+      )}
+    >
+      <div
+        className={cn(
+          'flex items-center justify-center rounded-full bg-muted',
+          size === 'compact' ? 'size-14' : 'size-20'
+        )}
+      >
+        <Icon
+          className={cn(
+            'text-muted-foreground',
+            size === 'compact' ? 'size-7' : 'size-10'
+          )}
+        />
       </div>
       <div className="max-w-md space-y-2">
-        <h3 className="text-lg font-semibold">{title}</h3>
+        <h3
+          className={cn(
+            'font-semibold',
+            size === 'compact' ? 'text-base' : 'text-lg'
+          )}
+        >
+          {title}
+        </h3>
         {typeof description === 'string' ? (
           <p className="text-sm text-muted-foreground">{description}</p>
         ) : (

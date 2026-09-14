@@ -7,6 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { checkProviderDeletionSafety } from '@/api/client/sdk.gen'
 import { ProviderResponse } from '@/api/client/types.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -175,30 +176,28 @@ export function GitSources() {
   return (
     <div className="flex-1 overflow-auto">
       <div className="space-y-6 p-4 sm:p-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <h1 className="text-xl font-bold sm:text-2xl">Git Providers</h1>
-            <p className="text-sm text-muted-foreground sm:text-base">
-              Manage your Git providers for repository access and deployments
-            </p>
-          </div>
-          <div className="flex items-center gap-2 self-start sm:self-auto">
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => refetch()}
-              aria-label="Refresh"
-              title="Refresh"
-            >
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-            <CreateActionButton
-              size="sm"
-              onClick={() => navigate('/git-providers/add')}
-              label="Add Git Provider"
-            />
-          </div>
-        </div>
+        <PageHeader
+          title="Git Providers"
+          description="Manage your Git providers for repository access and deployments"
+          actions={
+            <>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => refetch()}
+                aria-label="Refresh"
+                title="Refresh"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+              <CreateActionButton
+                size="sm"
+                onClick={() => navigate('/git-providers/add')}
+                label="Add Git Provider"
+              />
+            </>
+          }
+        />
 
         <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
 
@@ -239,8 +238,7 @@ export function GitSources() {
           </EmptyPlaceholder>
         ) : (
           (() => {
-            const goToDetail = (id: number) =>
-              navigate(`/git-providers/${id}`)
+            const goToDetail = (id: number) => navigate(`/git-providers/${id}`)
 
             const ProviderIcon = ({
               provider,
@@ -248,13 +246,18 @@ export function GitSources() {
             }: {
               provider: ProviderResponse
               className?: string
-            }) =>
+            }) => (
               <ProviderLogo
                 providerType={provider.provider_type}
                 className={className}
               />
+            )
 
-            const ActionsMenu = ({ provider }: { provider: ProviderResponse }) => (
+            const ActionsMenu = ({
+              provider,
+            }: {
+              provider: ProviderResponse
+            }) => (
               <div
                 className="flex shrink-0 items-center gap-1 sm:gap-2"
                 onClick={(e) => e.stopPropagation()}
@@ -337,7 +340,10 @@ export function GitSources() {
                           <p className="truncate text-sm font-medium">
                             {provider.name}
                           </p>
-                          <Badge variant="secondary" className="font-mono text-xs">
+                          <Badge
+                            variant="secondary"
+                            className="font-mono text-xs"
+                          >
                             {provider.provider_type}
                           </Badge>
                           {!provider.is_active && (

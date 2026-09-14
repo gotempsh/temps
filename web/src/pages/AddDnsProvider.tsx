@@ -39,7 +39,13 @@ import {
   Loader2,
   Search,
 } from 'lucide-react'
-import { useEffect, useMemo, useState, type ComponentType, type SVGProps } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentType,
+  type SVGProps,
+} from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -55,12 +61,7 @@ import {
 } from '@/components/icons/DnsProviderIcons'
 
 type DnsProviderType =
-  | 'cloudflare'
-  | 'namecheap'
-  | 'route53'
-  | 'digitalocean'
-  | 'gcp'
-  | 'azure'
+  'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure'
 
 // Extended credentials type until API client is regenerated
 type ExtendedDnsProviderCredentials =
@@ -238,25 +239,27 @@ function ProviderCard({
 }) {
   const Icon = provider.icon
   return (
-    <div
+    <button
+      type="button"
       className={cn(
-        'cursor-pointer rounded-lg border p-4 transition-all hover:border-primary/50 hover:bg-accent/50',
+        'w-full rounded-lg border p-5 text-left transition-all hover:border-primary/50 hover:bg-accent/50',
         selected
           ? 'border-primary bg-primary/10 ring-1 ring-primary'
           : 'border-border bg-card'
       )}
       onClick={onClick}
+      aria-pressed={selected}
     >
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-4">
         <div
           className={cn(
-            'flex h-10 w-10 items-center justify-center rounded-lg',
+            'flex h-12 w-12 shrink-0 items-center justify-center rounded-lg',
             selected
               ? 'bg-primary text-primary-foreground'
               : 'bg-muted text-muted-foreground'
           )}
         >
-          <Icon className="h-5 w-5" />
+          <Icon className="h-6 w-6" />
         </div>
         <div>
           <h3 className="font-medium">{provider.name}</h3>
@@ -265,7 +268,7 @@ function ProviderCard({
           </p>
         </div>
       </div>
-    </div>
+    </button>
   )
 }
 
@@ -307,7 +310,9 @@ function StepIndicator({
               <span
                 className={cn(
                   'mt-1 text-xs',
-                  isCurrent ? 'text-foreground font-medium' : 'text-muted-foreground'
+                  isCurrent
+                    ? 'text-foreground font-medium'
+                    : 'text-muted-foreground'
                 )}
               >
                 {step.label}
@@ -1263,7 +1268,10 @@ export function AddDnsProvider() {
                   <FormItem>
                     <FormLabel>Client IP (optional)</FormLabel>
                     <FormControl>
-                      <Input placeholder="Your whitelisted IP address" {...field} />
+                      <Input
+                        placeholder="Your whitelisted IP address"
+                        {...field}
+                      />
                     </FormControl>
                     <FormDescription>
                       The IP address whitelisted for API access
@@ -1304,7 +1312,13 @@ export function AddDnsProvider() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-6 max-w-3xl mx-auto" onKeyDown={handleEnterSubmit}>
+      <div
+        className={cn(
+          'mx-auto space-y-6 p-4 sm:p-6',
+          currentStep === 'provider' ? 'max-w-5xl' : 'max-w-3xl'
+        )}
+        onKeyDown={handleEnterSubmit}
+      >
         {/* Header */}
         <div className="flex items-center gap-4">
           <Button
@@ -1347,7 +1361,7 @@ export function AddDnsProvider() {
               </div>
 
               {/* Provider grid */}
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {filteredProviders.map((provider) => (
                   <ProviderCard
                     key={provider.type}
@@ -1377,7 +1391,8 @@ export function AddDnsProvider() {
                 <div>
                   <CardTitle>Basic Information</CardTitle>
                   <CardDescription>
-                    Give your {selectedProvider.name} provider a name to identify it
+                    Give your {selectedProvider.name} provider a name to
+                    identify it
                   </CardDescription>
                 </div>
               </div>
@@ -1418,9 +1433,15 @@ export function AddDnsProvider() {
           <Button
             type="button"
             variant="outline"
-            onClick={currentStep === 'provider' ? () => navigate('/dns-providers') : handleBack}
+            onClick={
+              currentStep === 'provider'
+                ? () => navigate('/dns-providers')
+                : handleBack
+            }
           >
-            {currentStep === 'provider' ? 'Cancel' : (
+            {currentStep === 'provider' ? (
+              'Cancel'
+            ) : (
               <>
                 <ArrowLeft className="mr-2 h-4 w-4" />
                 Back

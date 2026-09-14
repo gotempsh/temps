@@ -104,7 +104,8 @@ function statusBadge(status: string) {
 
 function isSilenced(alarm: AlarmResponse): boolean {
   return (
-    !!alarm.silenced_until && new Date(alarm.silenced_until).getTime() > Date.now()
+    !!alarm.silenced_until &&
+    new Date(alarm.silenced_until).getTime() > Date.now()
   )
 }
 
@@ -246,11 +247,12 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
   })
 
-  const items = data?.items ?? []
+  const items = useMemo(() => data?.items ?? [], [data])
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
-  const isMutating = acknowledge.isPending || resolve.isPending || silence.isPending
+  const isMutating =
+    acknowledge.isPending || resolve.isPending || silence.isPending
 
   // Once the deep-linked alarm's row is on the page, scroll it into view. The
   // row itself keeps a persistent highlight (below) while the param is present.
@@ -342,66 +344,68 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
         ))}
       </div>
 
-      {/* Filter bar */}
-      <Card>
-        <CardContent className="p-3">
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <Select value={status} onValueChange={selectStatus}>
-              <SelectTrigger className="w-full sm:w-[180px]">
-                <SelectValue placeholder="Status" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>All statuses</SelectItem>
-                <SelectItem value="firing">Firing</SelectItem>
-                <SelectItem value="acknowledged">Acknowledged</SelectItem>
-                <SelectItem value="resolved">Resolved</SelectItem>
-              </SelectContent>
-            </Select>
+      {/* Filters become useful once there are alarms, or while narrowing results. */}
+      {(alarmsLoading || items.length > 0 || hasFilters) && (
+        <Card>
+          <CardContent className="p-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+              <Select value={status} onValueChange={selectStatus}>
+                <SelectTrigger className="w-full sm:w-[180px]">
+                  <SelectValue placeholder="Status" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL}>All statuses</SelectItem>
+                  <SelectItem value="firing">Firing</SelectItem>
+                  <SelectItem value="acknowledged">Acknowledged</SelectItem>
+                  <SelectItem value="resolved">Resolved</SelectItem>
+                </SelectContent>
+              </Select>
 
-            <Select value={severity} onValueChange={selectSeverity}>
-              <SelectTrigger className="w-full sm:w-[180px]">
-                <SelectValue placeholder="Severity" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>All severities</SelectItem>
-                <SelectItem value="critical">Critical</SelectItem>
-                <SelectItem value="warning">Warning</SelectItem>
-                <SelectItem value="info">Info</SelectItem>
-              </SelectContent>
-            </Select>
+              <Select value={severity} onValueChange={selectSeverity}>
+                <SelectTrigger className="w-full sm:w-[180px]">
+                  <SelectValue placeholder="Severity" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL}>All severities</SelectItem>
+                  <SelectItem value="critical">Critical</SelectItem>
+                  <SelectItem value="warning">Warning</SelectItem>
+                  <SelectItem value="info">Info</SelectItem>
+                </SelectContent>
+              </Select>
 
-            <Select
-              value={alarmType}
-              onValueChange={selectAlarmType}
-              disabled={typeOptions.length === 0}
-            >
-              <SelectTrigger className="w-full sm:w-[200px]">
-                <SelectValue placeholder="Type" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>All types</SelectItem>
-                {typeOptions.map((t) => (
-                  <SelectItem key={t} value={t}>
-                    {humanizeType(t)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            {hasFilters && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={resetFilters}
-                className="ml-auto"
+              <Select
+                value={alarmType}
+                onValueChange={selectAlarmType}
+                disabled={typeOptions.length === 0}
               >
-                <X className="mr-1 h-4 w-4" />
-                Clear
-              </Button>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+                <SelectTrigger className="w-full sm:w-[200px]">
+                  <SelectValue placeholder="Type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL}>All types</SelectItem>
+                  {typeOptions.map((t) => (
+                    <SelectItem key={t} value={t}>
+                      {humanizeType(t)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              {hasFilters && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={resetFilters}
+                  className="ml-auto"
+                >
+                  <X className="mr-1 h-4 w-4" />
+                  Clear
+                </Button>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Table */}
       <Card>
@@ -424,6 +428,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={6} className="p-0">
                     <EmptyState
+                      size="compact"
                       icon={AlarmClock}
                       title="No project selected"
                       description="Select a project to view its alarm history."
@@ -457,6 +462,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={6} className="p-0">
                     <EmptyState
+                      size="compact"
                       icon={AlarmClock}
                       title="No alarms found"
                       description={

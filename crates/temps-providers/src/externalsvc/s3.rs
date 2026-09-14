@@ -62,7 +62,7 @@ pub struct S3InputConfig {
     #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
-    /// Docker image to use for MinIO (e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)
+    /// Docker image to use for MinIO (e.g., quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z)
     #[serde(default = "default_image")]
     #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
@@ -95,6 +95,30 @@ pub struct S3Config {
     pub container_name: Option<String>,
 }
 
+/// Rewrites a bare (unqualified, i.e. Docker-Hub-resolved) `minio/minio` or
+/// `minio/mc` reference to its `quay.io` equivalent, preserving the tag.
+///
+/// Docker Hub stopped serving these repositories entirely in 2026 ("pull
+/// access denied ... repository does not exist"), so any service whose
+/// `docker_image` was persisted before this fix — created back when
+/// `default_image()`/`MC_IMAGE` still pointed at Docker Hub — would otherwise
+/// keep retrying that dead reference on every `init()`/container recreation
+/// forever, since `create_container_once` always re-pulls before checking
+/// whether the container already exists. Only the exact former built-in
+/// defaults are rewritten; an already-qualified reference (`quay.io/...`,
+/// a private mirror, `ghcr.io/...`) is left untouched since it reflects an
+/// explicit operator choice, not our old default.
+fn normalize_minio_registry(image: String) -> String {
+    for repo in ["minio/minio", "minio/mc"] {
+        if let Some(rest) = image.strip_prefix(repo) {
+            if rest.is_empty() || rest.starts_with(':') || rest.starts_with('@') {
+                return format!("quay.io/{repo}{rest}");
+            }
+        }
+    }
+    image
+}
+
 impl From<S3InputConfig> for S3Config {
     fn from(input: S3InputConfig) -> Self {
         Self {
@@ -107,7 +131,7 @@ impl From<S3InputConfig> for S3Config {
             secret_key: input.secret_key.unwrap_or_else(default_secret_key),
             host: input.host,
             region: input.region,
-            docker_image: input.docker_image,
+            docker_image: normalize_minio_registry(input.docker_image),
             container_name: input.container_name,
         }
     }
@@ -185,11 +209,11 @@ fn example_region() -> &'static str {
 }
 
 fn default_image() -> String {
-    "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
 }
 
 fn example_image() -> &'static str {
-    "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+    "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 }
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
@@ -208,7 +232,7 @@ impl S3Service {
     /// MinIO Client (mc) utility image - used for temporary operations like migration and copy.
     /// Pinned to an immutable release tag — never use `:latest` here to prevent
     /// supply-chain / MITM attacks on floating tags.
-    const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
+    const MC_IMAGE: &'static str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
 
     /// Shell script executed inside a disposable mc container by `restore_in_place`.
     ///
@@ -2646,7 +2670,7 @@ impl ExternalService for S3Service {
         // Return (image_name, version)
         // Default MinIO image and release version
         (
-            "minio/minio".to_string(),
+            "quay.io/minio/minio".to_string(),
             "RELEASE.2025-09-07T16-13-09Z".to_string(),
         )
     }
@@ -2978,8 +3002,8 @@ mod tests {
         let service = S3Service::new("test-image".to_string(), docker, encryption_service);
         let (image_name, version) = service.get_default_docker_image();
         assert_eq!(
-            image_name, "minio/minio",
-            "Default image should be minio/minio"
+            image_name, "quay.io/minio/minio",
+            "Default image should be quay.io/minio/minio"
         );
         assert!(
             version.starts_with("RELEASE."),
@@ -2989,25 +3013,80 @@ mod tests {
 
     #[test]
     fn test_image_field_in_configuration() {
-        // Test S3 configuration with docker_image field
+        // Test S3 configuration with an already-qualified docker_image field
         let input_config = S3InputConfig {
             port: Some("9000".to_string()),
             access_key: Some("minioadmin".to_string()),
             secret_key: Some("minioadmin".to_string()),
             host: "localhost".to_string(),
             region: "us-east-1".to_string(),
-            docker_image: "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+            docker_image: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
             container_name: None,
         };
 
         // Convert to runtime config
         let runtime_config: S3Config = input_config.into();
 
-        // Verify docker_image is preserved
+        // Verify an already-qualified docker_image is preserved as-is
         assert_eq!(
             runtime_config.docker_image,
-            "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+            "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
         );
+    }
+
+    #[test]
+    fn test_legacy_docker_hub_minio_image_is_normalized_to_quay_io() {
+        // Services created before the Docker Hub -> quay.io migration have
+        // this bare reference persisted in the database. It must be rewritten
+        // on load, since `create_container_once` always re-pulls the image
+        // (even when the container already exists) and Docker Hub now
+        // denies these repositories outright.
+        for (persisted, expected) in [
+            (
+                "minio/minio:RELEASE.2025-09-07T16-13-09Z",
+                "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+            ),
+            ("minio/minio:latest", "quay.io/minio/minio:latest"),
+            ("minio/mc:latest", "quay.io/minio/mc:latest"),
+        ] {
+            let input_config = S3InputConfig {
+                port: Some("9000".to_string()),
+                access_key: Some("minioadmin".to_string()),
+                secret_key: Some("minioadmin".to_string()),
+                host: "localhost".to_string(),
+                region: "us-east-1".to_string(),
+                docker_image: persisted.to_string(),
+                container_name: None,
+            };
+
+            let runtime_config: S3Config = input_config.into();
+            assert_eq!(runtime_config.docker_image, expected, "for {persisted}");
+        }
+    }
+
+    #[test]
+    fn test_custom_registry_minio_image_is_not_rewritten() {
+        // An operator-configured mirror or fork must never be silently
+        // redirected to quay.io -- only the exact former bare Docker Hub
+        // defaults are normalized.
+        for custom in [
+            "registry.internal:5000/minio/minio:latest",
+            "ghcr.io/acme/minio:latest",
+            "minio-fork/minio:latest",
+        ] {
+            let input_config = S3InputConfig {
+                port: Some("9000".to_string()),
+                access_key: Some("minioadmin".to_string()),
+                secret_key: Some("minioadmin".to_string()),
+                host: "localhost".to_string(),
+                region: "us-east-1".to_string(),
+                docker_image: custom.to_string(),
+                container_name: None,
+            };
+
+            let runtime_config: S3Config = input_config.into();
+            assert_eq!(runtime_config.docker_image, custom);
+        }
     }
 
     #[test]
@@ -3320,7 +3399,7 @@ mod tests {
             "access_key": source_minio.access_key.clone(),
             "secret_key": source_minio.secret_key.clone(),
             "region": "us-east-1",
-            "docker_image": "minio/minio:latest",
+            "docker_image": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
         });
 
         let s3_config = ServiceConfig {

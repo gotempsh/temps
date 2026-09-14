@@ -14,7 +14,8 @@
 //! junction table for multi-environment membership, transactional writes).
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +37,9 @@ pub enum SecretError {
     #[error("Secret {secret_id} not found in project {project_id}")]
     NotFound { secret_id: i32, project_id: i32 },
 
-    #[error("Secret with key '{key}' already exists in project {project_id}")]
+    #[error(
+        "Secret with key '{key}' already applies to one or more requested environments in project {project_id}"
+    )]
     KeyAlreadyExists { project_id: i32, key: String },
 
     #[error("Secret value for key '{key}' is {size} bytes, exceeds limit of {limit} bytes")]
@@ -49,8 +52,11 @@ pub enum SecretError {
     #[error("Invalid secret key '{key}': {reason}")]
     InvalidKey { key: String, reason: String },
 
-    #[error("Environment {environment_id} not found")]
-    EnvironmentNotFound { environment_id: i32 },
+    #[error("Environment {environment_id} was not found in project {project_id}")]
+    EnvironmentNotFound {
+        environment_id: i32,
+        project_id: i32,
+    },
 
     #[error("Failed to encrypt secret '{key}': {reason}")]
     EncryptionFailed { key: String, reason: String },
@@ -98,7 +104,12 @@ fn validate_secret_key(key: &str) -> Result<(), SecretError> {
         });
     }
     let mut chars = key.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return Err(SecretError::InvalidKey {
+            key: key.to_string(),
+            reason: "key cannot be empty".to_string(),
+        });
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(SecretError::InvalidKey {
             key: key.to_string(),
@@ -171,6 +182,19 @@ fn normalize_compose_services(services: Vec<String>) -> Result<Vec<String>, Secr
     Ok(out)
 }
 
+fn secret_scope_overlaps(
+    requested_environment_ids: &[i32],
+    existing_environment_ids: &[i32],
+) -> bool {
+    let requested_is_global = requested_environment_ids.is_empty();
+    let existing_is_global = existing_environment_ids.is_empty();
+    requested_is_global
+        || existing_is_global
+        || existing_environment_ids
+            .iter()
+            .any(|id| requested_environment_ids.contains(id))
+}
+
 #[derive(Clone)]
 pub struct SecretService {
     db: Arc<temps_database::DbConnection>,
@@ -210,6 +234,94 @@ impl SecretService {
                 key: key.to_string(),
                 reason: e.to_string(),
             })
+    }
+
+    /// Resolve requested environments inside the project that owns the secret.
+    /// IDs are de-duplicated so repeated input cannot trip the junction
+    /// table's unique constraint.
+    async fn environments_in_project(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        environment_ids: &[i32],
+    ) -> Result<Vec<environments::Model>, SecretError> {
+        let unique_ids = environment_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let models = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(unique_ids.iter().copied()))
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            // Environment deletion updates this row, so FOR SHARE keeps every
+            // validated environment active until the secret transaction has
+            // inserted its bindings and committed. Lock in a stable order so
+            // concurrent multi-environment writes cannot deadlock each other.
+            .order_by_asc(environments::Column::Id)
+            .lock_shared()
+            .all(txn)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|environment| (environment.id, environment))
+            .collect::<HashMap<_, _>>();
+
+        unique_ids
+            .into_iter()
+            .map(|environment_id| {
+                by_id
+                    .remove(&environment_id)
+                    .ok_or(SecretError::EnvironmentNotFound {
+                        environment_id,
+                        project_id,
+                    })
+            })
+            .collect()
+    }
+
+    /// Serialize and validate one key's scope. Empty bindings mean project-wide,
+    /// so they overlap every scoped secret with the same key.
+    async fn claim_key_scope(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        key: &str,
+        environment_ids: &[i32],
+        excluded_secret_id: Option<i32>,
+    ) -> Result<(), SecretError> {
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            [project_id.into(), key.to_string().into()],
+        ))
+        .await?;
+
+        let mut query = secrets::Entity::find()
+            .filter(secrets::Column::ProjectId.eq(project_id))
+            .filter(secrets::Column::Key.eq(key));
+        if let Some(secret_id) = excluded_secret_id {
+            query = query.filter(secrets::Column::Id.ne(secret_id));
+        }
+        let existing = query
+            .find_with_related(secret_environments::Entity)
+            .all(txn)
+            .await?;
+        let overlaps = existing.iter().any(|(_, bindings)| {
+            let existing_environment_ids = bindings
+                .iter()
+                .map(|binding| binding.environment_id)
+                .collect::<Vec<_>>();
+            secret_scope_overlaps(environment_ids, &existing_environment_ids)
+        });
+        if overlaps {
+            return Err(SecretError::KeyAlreadyExists {
+                project_id,
+                key: key.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Lists secrets visible to a project, optionally filtered to a specific
@@ -324,18 +436,6 @@ impl SecretService {
             });
         }
 
-        let duplicate = secrets::Entity::find()
-            .filter(secrets::Column::ProjectId.eq(project_id))
-            .filter(secrets::Column::Key.eq(&key))
-            .one(self.db.as_ref())
-            .await?;
-        if duplicate.is_some() {
-            return Err(SecretError::KeyAlreadyExists {
-                project_id,
-                key: key.clone(),
-            });
-        }
-
         let encrypted = self.encrypt_value(&key, &value)?;
 
         let result = self
@@ -346,6 +446,14 @@ impl SecretService {
                 let environment_ids = environment_ids.clone();
                 let compose_services = compose_services.clone();
                 Box::pin(async move {
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    let environment_ids = scoped_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    Self::claim_key_scope(txn, project_id, &key, &environment_ids, None).await?;
+
                     let new_row = secrets::ActiveModel {
                         project_id: Set(project_id),
                         environment_id: Set(None),
@@ -359,14 +467,7 @@ impl SecretService {
                     let row = new_row.insert(txn).await?;
 
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
-                        let env = environments::Entity::find_by_id(*env_id)
-                            .one(txn)
-                            .await?
-                            .ok_or(SecretError::EnvironmentNotFound {
-                                environment_id: *env_id,
-                            })?;
-
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let junction = secret_environments::ActiveModel {
                             secret_id: Set(row.id),
                             environment_id: Set(*env_id),
@@ -467,12 +568,27 @@ impl SecretService {
                 Box::pin(async move {
                     let row = secrets::Entity::find_by_id(secret_id)
                         .filter(secrets::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
                         .one(txn)
                         .await?
                         .ok_or(SecretError::NotFound {
                             secret_id,
                             project_id,
                         })?;
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    let environment_ids = scoped_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    Self::claim_key_scope(
+                        txn,
+                        project_id,
+                        &row.key,
+                        &environment_ids,
+                        Some(secret_id),
+                    )
+                    .await?;
 
                     let mut active: secrets::ActiveModel = row.into();
                     if let Some(v) = encrypted_new {
@@ -488,14 +604,7 @@ impl SecretService {
                         .await?;
 
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
-                        let env = environments::Entity::find_by_id(*env_id)
-                            .one(txn)
-                            .await?
-                            .ok_or(SecretError::EnvironmentNotFound {
-                                environment_id: *env_id,
-                            })?;
-
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let junction = secret_environments::ActiveModel {
                             secret_id: Set(row.id),
                             environment_id: Set(*env_id),
@@ -547,32 +656,30 @@ impl SecretService {
     }
 
     pub async fn delete(&self, project_id: i32, secret_id: i32) -> Result<(), SecretError> {
-        let affected = self
-            .db
-            .transaction::<_, u64, SecretError>(|txn| {
+        self.db
+            .transaction::<_, (), SecretError>(|txn| {
                 Box::pin(async move {
+                    let secret = secrets::Entity::find_by_id(secret_id)
+                        .filter(secrets::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or(SecretError::NotFound {
+                            secret_id,
+                            project_id,
+                        })?;
+
                     secret_environments::Entity::delete_many()
                         .filter(secret_environments::Column::SecretId.eq(secret_id))
                         .exec(txn)
                         .await?;
 
-                    let res = secrets::Entity::delete_many()
-                        .filter(secrets::Column::Id.eq(secret_id))
-                        .filter(secrets::Column::ProjectId.eq(project_id))
-                        .exec(txn)
-                        .await?;
-
-                    Ok(res.rows_affected)
+                    let active: secrets::ActiveModel = secret.into();
+                    active.delete(txn).await?;
+                    Ok(())
                 })
             })
             .await?;
-
-        if affected == 0 {
-            return Err(SecretError::NotFound {
-                secret_id,
-                project_id,
-            });
-        }
         Ok(())
     }
 
@@ -613,7 +720,6 @@ impl SecretService {
                 .or_default()
                 .push(j.environment_id);
         }
-
         let mut out = HashMap::new();
         for row in rows {
             let applies = match (environment_id, bindings.get(&row.id)) {
@@ -699,6 +805,22 @@ mod tests {
     }
 
     #[test]
+    fn test_secret_scope_allows_same_key_in_disjoint_environments() {
+        assert!(!secret_scope_overlaps(&[2], &[1]));
+    }
+
+    #[test]
+    fn test_secret_scope_rejects_shared_environment() {
+        assert!(secret_scope_overlaps(&[1, 2], &[2, 3]));
+    }
+
+    #[test]
+    fn test_secret_scope_rejects_global_overlap_in_both_directions() {
+        assert!(secret_scope_overlaps(&[], &[1]));
+        assert!(secret_scope_overlaps(&[1], &[]));
+    }
+
+    #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let svc = make_encryption_service();
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
@@ -772,7 +894,14 @@ mod tests {
         let existing = make_secret_model(1, 10, "API_KEY", "cipher");
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![existing]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![(
+                    existing,
+                    Option::<secret_environments::Model>::None,
+                )]])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
@@ -789,6 +918,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretError::KeyAlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_propagates_key_scope_lock_database_error() {
+        let svc = make_encryption_service();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(
+                    "advisory lock unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = SecretService::new(db, svc);
+
+        let err = service
+            .create(
+                10,
+                vec![],
+                "API_KEY".to_string(),
+                "value".to_string(),
+                false,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SecretError::Database(_)));
     }
 
     #[tokio::test]
@@ -926,16 +1082,7 @@ mod tests {
         let svc = make_encryption_service();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // First delete (junction): 0 rows is fine
-                .append_exec_results(vec![MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
-                // Second delete (secrets): 0 rows -> triggers NotFound
-                .append_exec_results(vec![MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
+                .append_query_results(vec![Vec::<secrets::Model>::new()])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
@@ -947,5 +1094,574 @@ mod tests {
                 project_id: 10
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use chrono::Utc;
+    use std::time::Duration;
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+
+    const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    async fn test_database() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!(
+                    "Docker unavailable, skipping secret scoping integration test: {error:#}"
+                );
+                None
+            }
+            Err(error) => panic!("secret scoping test database setup failed: {error:#}"),
+        }
+    }
+
+    fn secret_service(test_db: &TestDatabase) -> SecretService {
+        let encryption = EncryptionService::new(ENCRYPTION_KEY)
+            .expect("the test encryption key should be valid");
+        SecretService::new(test_db.connection_arc(), Arc::new(encryption))
+    }
+
+    async fn create_project(test_db: &TestDatabase, suffix: &str) -> projects::Model {
+        projects::ActiveModel {
+            name: Set(format!("Secret scoping {suffix}")),
+            repo_name: Set(format!("repo-{suffix}")),
+            repo_owner: Set("temps-tests".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("secret-scoping-{suffix}")),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("project fixture should insert")
+    }
+
+    async fn create_environment(
+        test_db: &TestDatabase,
+        project_id: i32,
+        suffix: &str,
+    ) -> environments::Model {
+        environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set(format!("Environment {suffix}")),
+            slug: Set(suffix.to_string()),
+            host: Set(format!("{suffix}.example.test")),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set(format!("secret-scoping-{suffix}.example.test")),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("environment fixture should insert")
+    }
+
+    async fn create_secret(
+        service: &SecretService,
+        project_id: i32,
+        environment_ids: Vec<i32>,
+        key: &str,
+        value: &str,
+    ) -> Result<SecretWithEnvironments, SecretError> {
+        service
+            .create(
+                project_id,
+                environment_ids,
+                key.to_string(),
+                value.to_string(),
+                false,
+                Vec::new(),
+            )
+            .await
+    }
+
+    async fn hold_key_scope_lock(
+        test_db: &TestDatabase,
+        project_id: i32,
+        key: &str,
+    ) -> DatabaseTransaction {
+        let txn = test_db
+            .connection()
+            .begin()
+            .await
+            .expect("lock transaction should begin");
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            [project_id.into(), key.to_string().into()],
+        ))
+        .await
+        .expect("advisory lock should be acquired");
+        txn
+    }
+
+    async fn wait_for_key_scope_waiter(test_db: &TestDatabase, project_id: i32, key: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let row = test_db.connection().query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $1::oid AND objid = hashtext($2)::oid AND NOT granted) AS waiting",
+                    [project_id.into(), key.to_string().into()],
+                )).await.expect("waiter query should succeed").expect("waiter query should return a row");
+                if row.try_get::<bool>("", "waiting").expect("waiting should be boolean") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("secret write should wait after locking environments");
+    }
+
+    async fn soft_delete_environment(db: Arc<temps_database::DbConnection>, environment_id: i32) {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE environments SET deleted_at = NOW() WHERE id = $1",
+            [environment_id.into()],
+        ))
+        .await
+        .expect("environment soft deletion should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_create_same_key_in_distinct_environments_returns_own_deploy_values() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "distinct").await;
+        let production = create_environment(&test_db, project.id, "distinct-production").await;
+        let staging = create_environment(&test_db, project.id, "distinct-staging").await;
+        let service = secret_service(&test_db);
+
+        create_secret(
+            &service,
+            project.id,
+            vec![production.id],
+            "DATABASE_URL",
+            "postgres://production",
+        )
+        .await
+        .expect("production-scoped secret should be created");
+        create_secret(
+            &service,
+            project.id,
+            vec![staging.id],
+            "DATABASE_URL",
+            "postgres://staging",
+        )
+        .await
+        .expect("disjoint staging-scoped secret should be created");
+
+        let production_values = service
+            .get_for_deploy(project.id, Some(production.id))
+            .await
+            .expect("production secrets should resolve");
+        let staging_values = service
+            .get_for_deploy(project.id, Some(staging.id))
+            .await
+            .expect("staging secrets should resolve");
+
+        assert_eq!(
+            production_values.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://production")
+        );
+        assert_eq!(production_values.len(), 1);
+        assert_eq!(
+            staging_values.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://staging")
+        );
+        assert_eq!(staging_values.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_overlapping_same_environment_and_global_scopes_rejects_collisions() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "collisions").await;
+        let production = create_environment(&test_db, project.id, "collisions-production").await;
+        let staging = create_environment(&test_db, project.id, "collisions-staging").await;
+        let service = secret_service(&test_db);
+
+        create_secret(&service, project.id, vec![production.id], "TOKEN", "one")
+            .await
+            .expect("first environment-scoped secret should be created");
+        let same_environment =
+            create_secret(&service, project.id, vec![production.id], "TOKEN", "two")
+                .await
+                .expect_err("the same key and environment should overlap");
+        let global_after_scoped =
+            create_secret(&service, project.id, Vec::new(), "TOKEN", "global")
+                .await
+                .expect_err("a global secret should overlap an environment-scoped secret");
+
+        create_secret(&service, project.id, Vec::new(), "GLOBAL_TOKEN", "global")
+            .await
+            .expect("first global secret should be created");
+        let scoped_after_global = create_secret(
+            &service,
+            project.id,
+            vec![staging.id],
+            "GLOBAL_TOKEN",
+            "staging",
+        )
+        .await
+        .expect_err("an environment-scoped secret should overlap a global secret");
+
+        for error in [same_environment, global_after_scoped, scoped_after_global] {
+            assert!(matches!(
+                error,
+                SecretError::KeyAlreadyExists { project_id, .. } if project_id == project.id
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_to_overlapping_environment_rejects_and_rolls_back_original() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "update-rollback").await;
+        let production = create_environment(&test_db, project.id, "update-production").await;
+        let staging = create_environment(&test_db, project.id, "update-staging").await;
+        let service = secret_service(&test_db);
+        let original = create_secret(
+            &service,
+            project.id,
+            vec![production.id],
+            "SHARED_KEY",
+            "original-production",
+        )
+        .await
+        .expect("production secret should be created");
+        create_secret(
+            &service,
+            project.id,
+            vec![staging.id],
+            "SHARED_KEY",
+            "original-staging",
+        )
+        .await
+        .expect("staging secret should be created");
+
+        let error = service
+            .update(
+                project.id,
+                original.id,
+                Some("replacement".to_string()),
+                vec![staging.id],
+                true,
+                vec!["web".to_string()],
+            )
+            .await
+            .expect_err("moving onto an occupied key scope should fail");
+
+        assert!(matches!(error, SecretError::KeyAlreadyExists { .. }));
+        let production_values = service
+            .get_for_deploy(project.id, Some(production.id))
+            .await
+            .expect("the original production scope should remain readable");
+        let staging_values = service
+            .get_for_deploy(project.id, Some(staging.id))
+            .await
+            .expect("the original staging scope should remain readable");
+        assert_eq!(
+            production_values.get("SHARED_KEY").map(String::as_str),
+            Some("original-production")
+        );
+        assert_eq!(
+            staging_values.get("SHARED_KEY").map(String::as_str),
+            Some("original-staging")
+        );
+        let unchanged = service
+            .list(project.id, Some(production.id))
+            .await
+            .expect("the original metadata should remain readable");
+        assert_eq!(unchanged.len(), 1);
+        assert!(!unchanged[0].include_in_preview);
+        assert!(unchanged[0].compose_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_with_foreign_project_environment_rejects_without_inserting_secret() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let owner = create_project(&test_db, "foreign-owner").await;
+        let foreign = create_project(&test_db, "foreign-project").await;
+        let foreign_environment =
+            create_environment(&test_db, foreign.id, "foreign-project-environment").await;
+        let service = secret_service(&test_db);
+
+        let error = create_secret(
+            &service,
+            owner.id,
+            vec![foreign_environment.id],
+            "FOREIGN_SCOPE",
+            "must-not-persist",
+        )
+        .await
+        .expect_err("an environment owned by another project should be rejected");
+
+        assert!(matches!(
+            error,
+            SecretError::EnvironmentNotFound {
+                environment_id,
+                project_id,
+            } if environment_id == foreign_environment.id && project_id == owner.id
+        ));
+        assert!(service
+            .list(owner.id, None)
+            .await
+            .expect("owner secrets should list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_create_with_overlapping_scope_allows_exactly_one() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "concurrent").await;
+        let environment = create_environment(&test_db, project.id, "concurrent-environment").await;
+        let service = secret_service(&test_db);
+
+        let first_service = service.clone();
+        let second_service = service.clone();
+        let first = tokio::spawn(async move {
+            create_secret(
+                &first_service,
+                project.id,
+                vec![environment.id],
+                "RACING_KEY",
+                "first",
+            )
+            .await
+        });
+        let second = tokio::spawn(async move {
+            create_secret(
+                &second_service,
+                project.id,
+                vec![environment.id],
+                "RACING_KEY",
+                "second",
+            )
+            .await
+        });
+
+        let first_result = first.await.expect("first create task should complete");
+        let second_result = second.await.expect("second create task should complete");
+        let results = [first_result, second_result];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(SecretError::KeyAlreadyExists { .. })))
+                .count(),
+            1
+        );
+
+        let visible = service
+            .get_for_deploy(project.id, Some(environment.id))
+            .await
+            .expect("the winning secret should resolve");
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(
+            visible.get("RACING_KEY").map(String::as_str),
+            Some("first" | "second")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_holds_environment_share_lock_until_binding_commits() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "create-delete-race").await;
+        let environment = create_environment(&test_db, project.id, "create-delete-race").await;
+        let blocker = hold_key_scope_lock(&test_db, project.id, "LOCKED_CREATE").await;
+        let service = secret_service(&test_db);
+        let project_id = project.id;
+        let environment_id = environment.id;
+        let create = tokio::spawn(async move {
+            create_secret(
+                &service,
+                project_id,
+                vec![environment_id],
+                "LOCKED_CREATE",
+                "value",
+            )
+            .await
+        });
+        wait_for_key_scope_waiter(&test_db, project_id, "LOCKED_CREATE").await;
+        let delete = tokio::spawn(soft_delete_environment(
+            test_db.connection_arc(),
+            environment_id,
+        ));
+        let mut delete = Box::pin(delete);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err()
+        );
+        blocker
+            .commit()
+            .await
+            .expect("advisory blocker should commit");
+        create
+            .await
+            .expect("create task should complete")
+            .expect("create should win");
+        delete.await.expect("deletion task should complete");
+    }
+
+    #[tokio::test]
+    async fn update_holds_environment_share_lock_until_binding_commits() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "update-delete-race").await;
+        let source = create_environment(&test_db, project.id, "update-delete-source").await;
+        let target = create_environment(&test_db, project.id, "update-delete-target").await;
+        let service = secret_service(&test_db);
+        let secret = create_secret(
+            &service,
+            project.id,
+            vec![source.id],
+            "LOCKED_UPDATE",
+            "old",
+        )
+        .await
+        .expect("secret fixture should insert");
+        let blocker = hold_key_scope_lock(&test_db, project.id, "LOCKED_UPDATE").await;
+        let update_service = service.clone();
+        let project_id = project.id;
+        let target_id = target.id;
+        let update = tokio::spawn(async move {
+            update_service
+                .update(
+                    project_id,
+                    secret.id,
+                    None,
+                    vec![target_id],
+                    false,
+                    Vec::new(),
+                )
+                .await
+        });
+        wait_for_key_scope_waiter(&test_db, project_id, "LOCKED_UPDATE").await;
+        let delete = tokio::spawn(soft_delete_environment(test_db.connection_arc(), target_id));
+        let mut delete = Box::pin(delete);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err()
+        );
+        blocker
+            .commit()
+            .await
+            .expect("advisory blocker should commit");
+        update
+            .await
+            .expect("update task should complete")
+            .expect("update should win");
+        delete.await.expect("deletion task should complete");
+    }
+
+    #[tokio::test]
+    async fn deletion_committing_first_makes_create_reject_environment() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "delete-create-race").await;
+        let environment = create_environment(&test_db, project.id, "delete-create-race").await;
+        let deletion = test_db
+            .connection()
+            .begin()
+            .await
+            .expect("deletion transaction should begin");
+        deletion
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE environments SET deleted_at = NOW() WHERE id = $1",
+                [environment.id.into()],
+            ))
+            .await
+            .expect("environment should be fenced");
+        let service = secret_service(&test_db);
+        let project_id = project.id;
+        let environment_id = environment.id;
+        let create = tokio::spawn(async move {
+            create_secret(
+                &service,
+                project_id,
+                vec![environment_id],
+                "DELETE_FIRST",
+                "value",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        deletion.commit().await.expect("deletion should commit");
+        assert!(matches!(create.await.expect("create task should complete"),
+            Err(SecretError::EnvironmentNotFound { environment_id: id, .. }) if id == environment_id));
+    }
+
+    #[tokio::test]
+    async fn deletion_committing_first_makes_update_reject_environment() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "delete-update-race").await;
+        let source = create_environment(&test_db, project.id, "delete-update-source").await;
+        let target = create_environment(&test_db, project.id, "delete-update-target").await;
+        let service = secret_service(&test_db);
+        let secret = create_secret(
+            &service,
+            project.id,
+            vec![source.id],
+            "DELETE_UPDATE",
+            "value",
+        )
+        .await
+        .expect("secret fixture should insert");
+        let deletion = test_db
+            .connection()
+            .begin()
+            .await
+            .expect("deletion transaction should begin");
+        deletion
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE environments SET deleted_at = NOW() WHERE id = $1",
+                [target.id.into()],
+            ))
+            .await
+            .expect("environment should be fenced");
+        let project_id = project.id;
+        let target_id = target.id;
+        let update = tokio::spawn(async move {
+            service
+                .update(
+                    project_id,
+                    secret.id,
+                    None,
+                    vec![target_id],
+                    false,
+                    Vec::new(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        deletion.commit().await.expect("deletion should commit");
+        assert!(matches!(update.await.expect("update task should complete"),
+            Err(SecretError::EnvironmentNotFound { environment_id: id, .. }) if id == target_id));
     }
 }

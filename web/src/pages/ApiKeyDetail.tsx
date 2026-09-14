@@ -155,7 +155,7 @@ export default function ApiKeyDetail() {
 
   if (isLoading) {
     return (
-      <div className="container max-w-4xl mx-auto py-6">
+      <div className="w-full">
         <div className="text-center py-8">Loading API key details...</div>
       </div>
     )
@@ -167,7 +167,7 @@ export default function ApiKeyDetail() {
 
   if (!apiKey && apiKeyError && !isNotFound) {
     return (
-      <div className="container max-w-4xl mx-auto py-6">
+      <div className="w-full">
         <div className="flex flex-col items-center justify-center gap-4 py-8 text-center">
           <AlertCircle className="h-8 w-8 text-destructive" />
           <div>
@@ -195,7 +195,7 @@ export default function ApiKeyDetail() {
 
   if (!apiKey) {
     return (
-      <div className="container max-w-4xl mx-auto py-6">
+      <div className="w-full">
         <div className="text-center py-8">
           <p>API key not found</p>
           <Button onClick={() => navigate('/settings/keys')} className="mt-4">
@@ -207,7 +207,7 @@ export default function ApiKeyDetail() {
   }
 
   return (
-    <div className="container max-w-4xl mx-auto px-4 py-6 space-y-6 sm:px-6">
+    <div className="w-full space-y-6">
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">

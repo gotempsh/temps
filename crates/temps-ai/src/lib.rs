@@ -32,10 +32,15 @@ pub use provider::{
     ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
     ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,
 };
-pub use service::{AiError, AiRequest, AiResponse, AiService};
+pub use service::{
+    AiError, AiRequest, AiResponse, AiService, NativeSessionExport, NativeSessionExportRequest,
+    RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest, RuntimeProcessResponse,
+    RuntimeProcessSnapshot,
+};
 pub use streaming::{
     ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    HarnessMcpServer, HarnessWorkspace, InteractionExecutor, PermissionDecision, PermissionKind,
-    PermissionRequest, SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
+    ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
+    InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, SandboxAttachment,
+    SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
 pub use typed::{complete_text, complete_typed, extract_json_block};

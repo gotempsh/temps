@@ -238,7 +238,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
 
   if (isEditing && ruleLoading) {
     return (
-      <div className="mx-auto w-full max-w-5xl space-y-6">
+      <div className="w-full space-y-6">
         <div className="flex items-center gap-4">
           <Skeleton className="h-9 w-9" />
           <Skeleton className="h-8 w-48" />
@@ -249,7 +249,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
   }
 
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-6">
+    <div className="w-full space-y-6">
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="h-4 w-4" />

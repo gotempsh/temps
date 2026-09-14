@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — getDashboardOptions is generated from the new
 // GET /otel/dashboards/{id} endpoint (operationId get_dashboard). Not present
@@ -8,30 +11,16 @@ import { ProjectResponse } from '@/api/client'
 // always use the generated SDK, never hand-roll fetch).
 import { getDashboardOptions } from '@/api/client/@tanstack/react-query.gen'
 import { MetricTile } from '@/components/metrics/MetricTile'
-import {
-  rollupStatus,
-  useAlertStatus,
-} from '@/components/metrics/alert-status'
+import { rollupStatus, useAlertStatus } from '@/components/metrics/alert-status'
 import {
   dashboardTiles,
   DashboardStatusBadge,
   FiringCount,
 } from '@/components/metrics/dashboard-status'
-import {
-  RANGE_BUCKET,
-  TIME_RANGES,
-  type TimeRange,
-  timeRangeToFrom,
-} from '@/components/metrics/time-range'
+
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
@@ -47,21 +36,25 @@ export default function DashboardView({ project }: DashboardViewProps) {
   const navigate = useNavigate()
   const { dashboardId } = useParams()
   const id = Number(dashboardId)
-  const [timeRange, setTimeRange] = useState<TimeRange>('24h')
+  const [timeRange, setTimeRange] = useState<string>('24h')
 
   // Memoize both time bounds so the per-tile query keys stay STABLE across
   // renders — an inline `new Date()` would change every render and spin React
   // Query into an infinite refetch loop (the bug fixed in MetricsExplorer).
-  const fromIso = useMemo(
-    () => timeRangeToFrom(timeRange, Date.now()).toISOString(),
-    [timeRange],
-  )
-  const toIso = useMemo(
-    () => new Date().toISOString(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [timeRange],
-  )
-  const bucketInterval = RANGE_BUCKET[timeRange]
+  const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
+  const fromIso = window.from
+  const toIso = window.to
+  const hours = (Date.parse(toIso) - Date.parse(fromIso)) / 3600000
+  const bucketInterval =
+    hours <= 1
+      ? '1 minute'
+      : hours <= 6
+        ? '5 minutes'
+        : hours <= 24
+          ? '15 minutes'
+          : hours <= 168
+            ? '1 hour'
+            : '1 day'
 
   const dashboardQuery = useQuery({
     ...getDashboardOptions({ path: { id }, query: { project_id: project.id } }),
@@ -69,9 +62,7 @@ export default function DashboardView({ project }: DashboardViewProps) {
   })
 
   const dashboard = dashboardQuery.data
-  usePageTitle(
-    dashboard ? `${dashboard.name} · Dashboards` : 'Dashboard',
-  )
+  usePageTitle(dashboard ? `${dashboard.name} · Dashboards` : 'Dashboard')
 
   const sections = dashboard?.layout?.sections ?? []
 
@@ -105,24 +96,12 @@ export default function DashboardView({ project }: DashboardViewProps) {
                 (dashboard?.name ?? 'Dashboard')
               )}
             </h1>
-            {!dashboardQuery.isPending && <DashboardStatusBadge rollup={rollup} />}
+            {!dashboardQuery.isPending && (
+              <DashboardStatusBadge rollup={rollup} />
+            )}
           </div>
           <div className="flex items-center gap-2 self-start">
-            <Select
-              value={timeRange}
-              onValueChange={(v) => setTimeRange(v as TimeRange)}
-            >
-              <SelectTrigger className="w-full sm:w-[160px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TIME_RANGES.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>
-                    {r.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
             <Button
               variant="outline"
               size="sm"
@@ -150,7 +129,11 @@ export default function DashboardView({ project }: DashboardViewProps) {
             title="Dashboard not found"
             description="This dashboard could not be loaded. It may have been deleted."
             action={
-              <Button size="sm" variant="outline" onClick={() => navigate('..')}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => navigate('..')}
+              >
                 Back to dashboards
               </Button>
             }
@@ -179,37 +162,37 @@ export default function DashboardView({ project }: DashboardViewProps) {
           {sections.map((section) => {
             const sectionRollup = rollupStatus(
               dashboardTiles([section]),
-              statusModel.rulesFor,
+              statusModel.rulesFor
             )
             return (
-            <section key={section.id} className="flex flex-col gap-3">
-              <h2 className="flex items-center gap-2 text-sm font-semibold tracking-tight">
-                {section.title || 'Untitled section'}
-                <FiringCount rollup={sectionRollup} className="text-xs" />
-              </h2>
-              {(section.tiles?.length ?? 0) === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No tiles in this section.
-                </p>
-              ) : (
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
-                  {section.tiles.map((tile) => (
-                    <MetricTile
-                      key={tile.id}
-                      project={project}
-                      metricName={tile.metric_name}
-                      aggregation={tile.aggregation}
-                      title={tile.title}
-                      labelFilters={tile.label_filters}
-                      groupBy={tile.group_by}
-                      fromIso={fromIso}
-                      toIso={toIso}
-                      bucketInterval={bucketInterval}
-                    />
-                  ))}
-                </div>
-              )}
-            </section>
+              <section key={section.id} className="flex flex-col gap-3">
+                <h2 className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+                  {section.title || 'Untitled section'}
+                  <FiringCount rollup={sectionRollup} className="text-xs" />
+                </h2>
+                {(section.tiles?.length ?? 0) === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No tiles in this section.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
+                    {section.tiles.map((tile) => (
+                      <MetricTile
+                        key={tile.id}
+                        project={project}
+                        metricName={tile.metric_name}
+                        aggregation={tile.aggregation}
+                        title={tile.title}
+                        labelFilters={tile.label_filters}
+                        groupBy={tile.group_by}
+                        fromIso={fromIso}
+                        toIso={toIso}
+                        bucketInterval={bucketInterval}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
             )
           })}
         </div>

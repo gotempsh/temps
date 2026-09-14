@@ -867,7 +867,7 @@ export function NodeDetailPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="w-full space-y-6">
       <NodeDetail nodeId={id} onBack={() => navigate('/settings/nodes')} />
     </div>
   )

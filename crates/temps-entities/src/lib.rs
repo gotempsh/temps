@@ -3,6 +3,7 @@
 
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_application_git_bindings;
 pub mod ai_application_projects;
 pub mod ai_application_workspaces;
 pub mod ai_applications;

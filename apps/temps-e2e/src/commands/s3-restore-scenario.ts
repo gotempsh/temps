@@ -92,7 +92,7 @@ async function runMc(args: string[], envVars: string[]): Promise<{ code: number;
     '--network',
     'host',
     ...envVars.flatMap((e) => ['-e', e]),
-    'minio/mc:latest',
+    'quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z',
     ...args,
   ]
   const proc = Bun.spawn(['docker', ...dockerArgs], { stdout: 'pipe', stderr: 'pipe' })

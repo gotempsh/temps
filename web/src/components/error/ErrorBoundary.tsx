@@ -84,12 +84,12 @@ export class ErrorBoundary extends Component<
   }
 
   render() {
-    if (this.state.hasError && this.state.error && this.state.errorInfo) {
+    if (this.state.hasError && this.state.error) {
       // Custom fallback provided
       if (this.props.fallback) {
         return this.props.fallback(
           this.state.error,
-          this.state.errorInfo,
+          this.state.errorInfo ?? { componentStack: '' },
           this.resetError
         )
       }

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import type { ProjectResponse, SourceMapResponse } from '@/api/client'
 import {
@@ -44,7 +45,7 @@ async function uploadSourceMapFile(
   release: string,
   file: File,
   filePath: string,
-  dist?: string,
+  dist?: string
 ): Promise<SourceMapResponse> {
   const formData = new FormData()
   formData.append('file', file)
@@ -57,7 +58,7 @@ async function uploadSourceMapFile(
       method: 'POST',
       body: formData,
       credentials: 'include',
-    },
+    }
   )
 
   if (!response.ok) {
@@ -99,10 +100,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
   const releasesQueryOpts = listReleasesOptions({
     path: { project_id: project.id },
   })
-  const {
-    data: releasesData,
-    isLoading: isLoadingReleases,
-  } = useQuery({
+  const { data: releasesData, isLoading: isLoadingReleases } = useQuery({
     ...releasesQueryOpts,
   })
 
@@ -110,10 +108,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
   const mapsQueryOpts = listSourceMapsOptions({
     path: { project_id: project.id, release: selectedRelease ?? '' },
   })
-  const {
-    data: mapsData,
-    isLoading: isLoadingMaps,
-  } = useQuery({
+  const { data: mapsData, isLoading: isLoadingMaps } = useQuery({
     ...mapsQueryOpts,
     enabled: !!selectedRelease,
   })
@@ -123,7 +118,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
     ...deleteReleaseSourceMapsMutation(),
     onSuccess: (data, variables) => {
       toast.success(
-        `Deleted ${data.deleted} source map(s) for release "${variables.path.release}"`,
+        `Deleted ${data.deleted} source map(s) for release "${variables.path.release}"`
       )
       queryClient.invalidateQueries({
         queryKey: releasesQueryOpts.queryKey,
@@ -197,20 +192,23 @@ export function SourceMaps({ project }: SourceMapsProps) {
       {/* CLI instructions */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm">
-            Upload via sentry-cli
-          </CardTitle>
+          <CardTitle className="text-sm">Upload via sentry-cli</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="space-y-2">
             <p className="text-sm text-muted-foreground">
-              You can use the standard <code className="text-xs bg-muted px-1 py-0.5 rounded">sentry-cli</code> to upload source maps.
-              Use your DSN public key as the auth token:
+              You can use the standard{' '}
+              <code className="text-xs bg-muted px-1 py-0.5 rounded">
+                sentry-cli
+              </code>{' '}
+              to upload source maps. Use your DSN public key as the auth token:
             </p>
             <div className="flex items-center gap-2">
-              <code className="text-xs bg-muted px-3 py-2 rounded font-mono flex-1 block">
-                SENTRY_URL={window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_DSN_KEY --org temps --project {project.slug} ./dist
-              </code>
+              <HighlightedCode
+                language="bash"
+                code={`SENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_DSN_KEY --org temps --project ${project.slug} ./dist`}
+                className="text-xs bg-muted px-3 py-2 rounded font-mono flex-1 block"
+              />
               <CopyButton
                 value={`SENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_DSN_KEY --org temps --project ${project.slug} ./dist`}
                 className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
@@ -241,19 +239,13 @@ export function SourceMaps({ project }: SourceMapsProps) {
               release={release}
               isSelected={selectedRelease === release}
               onSelect={() =>
-                setSelectedRelease(
-                  selectedRelease === release ? null : release,
-                )
+                setSelectedRelease(selectedRelease === release ? null : release)
               }
-              onDelete={() =>
-                setDeleteConfirm({ type: 'release', release })
-              }
+              onDelete={() => setDeleteConfirm({ type: 'release', release })}
               maps={
                 selectedRelease === release ? mapsData?.source_maps : undefined
               }
-              isLoadingMaps={
-                selectedRelease === release && isLoadingMaps
-              }
+              isLoadingMaps={selectedRelease === release && isLoadingMaps}
               onDeleteFile={(id, name) =>
                 setDeleteConfirm({
                   type: 'file',
@@ -290,7 +282,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Source Map{deleteConfirm?.type === 'release' ? 's' : ''}</DialogTitle>
+            <DialogTitle>
+              Delete Source Map{deleteConfirm?.type === 'release' ? 's' : ''}
+            </DialogTitle>
             <DialogDescription>
               {deleteConfirm?.type === 'release'
                 ? `This will delete all source maps for release "${deleteConfirm.release}". This action cannot be undone.`
@@ -310,8 +304,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
               variant="destructive"
               onClick={handleConfirmDelete}
               disabled={
-                deleteReleaseMutation.isPending ||
-                deleteFileMutation.isPending
+                deleteReleaseMutation.isPending || deleteFileMutation.isPending
               }
             >
               {deleteReleaseMutation.isPending ||
@@ -495,7 +488,13 @@ function UploadDialog({
       if (!selectedFile || !release || !filePath) {
         throw new Error('Missing required fields')
       }
-      return uploadSourceMapFile(projectId, release, selectedFile, filePath, dist || undefined)
+      return uploadSourceMapFile(
+        projectId,
+        release,
+        selectedFile,
+        filePath,
+        dist || undefined
+      )
     },
     onSuccess: () => {
       toast.success('Source map uploaded successfully')
@@ -525,9 +524,7 @@ function UploadDialog({
       // Auto-fill file path from filename if empty
       if (!filePath) {
         const name = file.name
-        const jsName = name.endsWith('.map')
-          ? name.slice(0, -4)
-          : name
+        const jsName = name.endsWith('.map') ? name.slice(0, -4) : name
         setFilePath(`~/${jsName}`)
       }
     }

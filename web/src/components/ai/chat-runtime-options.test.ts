@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   chatHarnessProviderOptions,
   chatModelLabel,
+  chatModelProviderLabel,
   chatPermissionLabel,
   providerCatalogNeedsRefresh,
   chatProviderLabel,
@@ -55,6 +56,36 @@ const providers: ChatProviderOption[] = [
     default_permission_mode_id: 'auto',
   },
 ]
+
+describe('chatModelProviderLabel', () => {
+  test('groups mixed OpenCode models by provider, not harness or display name', () => {
+    const harness = { id: 'opencode', name: 'OpenCode' }
+    expect(chatModelProviderLabel(harness, { id: 'openai/model-a' })).toBe(
+      'OpenAI'
+    )
+    expect(chatModelProviderLabel(harness, { id: 'anthropic/model-b' })).toBe(
+      'Anthropic'
+    )
+    expect(
+      chatModelProviderLabel(harness, { id: 'custom-vendor/model-c' })
+    ).toBe('custom-vendor')
+    expect(chatModelProviderLabel(harness, { id: 'default' })).toBe('OpenCode')
+  })
+  test('uses known single-provider harnesses for unqualified IDs', () => {
+    expect(
+      chatModelProviderLabel(
+        { id: 'codex_cli', name: 'Codex' },
+        { id: 'default' }
+      )
+    ).toBe('OpenAI')
+    expect(
+      chatModelProviderLabel(
+        { id: 'claude_cli', name: 'Claude Code' },
+        { id: 'sonnet' }
+      )
+    ).toBe('Anthropic')
+  })
+})
 
 describe('usesHarnessCatalog', () => {
   test('uses host harness capabilities for application and global threads', () => {

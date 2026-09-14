@@ -36,12 +36,32 @@
 //! | `node.process_open_fds` | Gauge | This process's own open file descriptor count (`/proc/self/fd`) |
 //! | `node.process_fd_limit` | Gauge | This process's soft `RLIMIT_NOFILE` |
 //! | `node.process_fd_percent` | Gauge | open / limit × 100 — this process hitting its own ceiling, independent of the system-wide one |
+//! | `node.disk_read_bytes_total` | Gauge (cumulative) | Bytes read from physical block devices since boot (`/proc/diskstats`) |
+//! | `node.disk_write_bytes_total` | Gauge (cumulative) | Bytes written to physical block devices since boot (`/proc/diskstats`) |
+//! | `node.network_rx_bytes_total` | Gauge (cumulative) | Bytes received on non-virtual interfaces since boot (`/proc/net/dev`) |
+//! | `node.network_tx_bytes_total` | Gauge (cumulative) | Bytes transmitted on non-virtual interfaces since boot (`/proc/net/dev`) |
+//!
+//! ## Cumulative I/O counters
+//!
+//! The four `*_bytes_total` series are stored as the raw cumulative kernel
+//! counter, exactly like OTLP counters on the ingest path. They are emitted
+//! as `MetricKind::Gauge` because this collector bypasses the scraper's
+//! in-memory delta computation (`NodeMetricsSampler` writes straight to the
+//! store). The `_total` suffix makes [`crate::is_monotonic_counter`] true on
+//! the read path, so `query_range` returns the per-bucket *increase* (LAG
+//! over the bucketed max, floored at 0 across reboots) — callers divide by
+//! the bucket width to get a throughput.
 //!
 //! ## Non-Linux behaviour
 //!
 //! When `/proc` is absent (macOS, FreeBSD, Windows) every `/proc` read
 //! degrades gracefully: the collector returns whatever metrics it could collect
 //! and silently skips the rest.  No error is propagated.
+//!
+//! On non-Linux targets CPU, memory, block I/O and network I/O fall back to
+//! the cross-platform `sysinfo` crate so a developer box still renders a
+//! populated server-monitoring page. The file-descriptor and load-average
+//! series stay Linux-only.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -69,12 +89,19 @@ struct CpuSnapshot {
 pub struct NodeMetricsCollector {
     /// Previous CPU tick snapshot; `None` before the first scrape.
     prev_cpu: Mutex<Option<CpuSnapshot>>,
+    /// Cross-platform fallback state (non-Linux only). `sysinfo` computes CPU
+    /// usage as the delta since the previous refresh, so the `System` handle
+    /// must outlive a single scrape — same reason `prev_cpu` exists above.
+    #[cfg(not(target_os = "linux"))]
+    fallback: Mutex<fallback::FallbackState>,
 }
 
 impl NodeMetricsCollector {
     pub fn new() -> Self {
         Self {
             prev_cpu: Mutex::new(None),
+            #[cfg(not(target_os = "linux"))]
+            fallback: Mutex::new(fallback::FallbackState::new()),
         }
     }
 }
@@ -119,6 +146,14 @@ impl Collector for NodeMetricsCollector {
         // File descriptors — synchronous /proc reads + getrlimit(2).
         points.extend(collect_system_fds(source_id, config, now));
         points.extend(collect_process_fds(source_id, config, now));
+
+        // Block + network I/O — cumulative kernel counters.
+        points.extend(collect_disk_io(source_id, config, now).await);
+        points.extend(collect_network_io(source_id, config, now).await);
+
+        // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
+        #[cfg(not(target_os = "linux"))]
+        points.extend(self.collect_fallback(source_id, config, now));
 
         debug!(
             source_id,
@@ -334,7 +369,16 @@ fn collect_disk(
             return Vec::new();
         }
 
-        let bsize = buf.f_bsize as u64;
+        // POSIX: `f_blocks` / `f_bavail` are counted in units of `f_frsize`
+        // (the fragment size), not `f_bsize` (the preferred I/O size). They
+        // are equal on Linux ext4/xfs, but on macOS APFS `f_bsize` is 1 MiB
+        // while `f_frsize` is 4 KiB — using `f_bsize` there reports a 4 TB
+        // disk as ~860 TB. Fall back to `f_bsize` only if `f_frsize` is 0.
+        let bsize = if buf.f_frsize > 0 {
+            buf.f_frsize as u64
+        } else {
+            buf.f_bsize as u64
+        };
         let total_bytes = buf.f_blocks as u64 * bsize;
         let avail_bytes = buf.f_bavail as u64 * bsize;
         let used_bytes = total_bytes.saturating_sub(avail_bytes);
@@ -497,6 +541,461 @@ fn read_nofile_soft_limit() -> Option<f64> {
         return None;
     }
     Some(limit.rlim_cur as f64)
+}
+
+// ── Block I/O (/proc/diskstats) ───────────────────────────────────────────────
+
+/// Sector size used by `/proc/diskstats`. The kernel always reports sectors
+/// in 512-byte units here regardless of the device's physical sector size.
+const DISKSTATS_SECTOR_BYTES: u64 = 512;
+
+/// Cumulative bytes read / written across physical block devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DiskIoTotals {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+/// Whether a `/proc/diskstats` device name is a virtual / layered device whose
+/// traffic is already counted on the physical device underneath it (or is not
+/// a disk at all). Summing these would double-count.
+fn is_virtual_block_device(name: &str) -> bool {
+    const PREFIXES: [&str; 8] = ["loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Whether `name` is a partition of one of `devices`, following the kernel's
+/// naming grammar rather than a bare prefix test: a partition is its parent's
+/// name plus a partition number (`sda` → `sda1`), with a `p` separator when
+/// the parent already ends in a digit (`nvme0n1` → `nvme0n1p1`, `mmcblk0` →
+/// `mmcblk0p2`). A prefix test would call `sdaa` (the 27th disk) a partition
+/// of `sda` and drop it from the totals.
+fn is_partition_of(name: &str, devices: &[&str]) -> bool {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.len() == name.len() || stem.is_empty() {
+        // No partition number at all: a whole disk.
+        return false;
+    }
+    let candidates: [&str; 2] = if let Some(base) = stem.strip_suffix('p') {
+        [stem, base]
+    } else {
+        [stem, stem]
+    };
+    for parent in candidates {
+        let parent_ends_in_digit = parent.ends_with(|c: char| c.is_ascii_digit());
+        // `sda1`'s parent is `sda` (no `p`); `nvme0n1p1`'s parent is `nvme0n1`
+        // (the `p` is required because the parent ends in a digit).
+        let valid_form = if parent == stem {
+            !parent_ends_in_digit
+        } else {
+            parent_ends_in_digit
+        };
+        if valid_form && devices.iter().any(|d| *d == parent && *d != name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse `/proc/diskstats` and sum sectors read/written over whole physical
+/// devices only.
+///
+/// Partitions are excluded because their I/O is already included in the
+/// parent device's counters; see [`is_partition_of`] for what counts as one.
+fn parse_diskstats(content: &str) -> Option<DiskIoTotals> {
+    // (name, sectors_read, sectors_written)
+    let mut devices: Vec<(&str, u64, u64)> = Vec::new();
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Layout (man 5 proc, "diskstats"): major minor name reads_completed
+        // reads_merged sectors_read ms_reading writes_completed writes_merged
+        // sectors_written ...
+        if fields.len() < 10 {
+            continue;
+        }
+        let name = fields[2];
+        if is_virtual_block_device(name) {
+            continue;
+        }
+        let sectors_read: u64 = fields[5].parse().ok()?;
+        let sectors_written: u64 = fields[9].parse().ok()?;
+        devices.push((name, sectors_read, sectors_written));
+    }
+    if devices.is_empty() {
+        return None;
+    }
+
+    let names: Vec<&str> = devices.iter().map(|(n, _, _)| *n).collect();
+    let mut totals = DiskIoTotals::default();
+    for (name, sectors_read, sectors_written) in &devices {
+        if is_partition_of(name, &names) {
+            continue;
+        }
+        totals.read_bytes = totals
+            .read_bytes
+            .saturating_add(sectors_read.saturating_mul(DISKSTATS_SECTOR_BYTES));
+        totals.write_bytes = totals
+            .write_bytes
+            .saturating_add(sectors_written.saturating_mul(DISKSTATS_SECTOR_BYTES));
+    }
+    Some(totals)
+}
+
+async fn collect_disk_io(
+    source_id: i32,
+    config: &CollectorConfig,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    let content = match tokio::fs::read_to_string("/proc/diskstats").await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let totals = match parse_diskstats(&content) {
+        Some(t) => t,
+        None => {
+            debug!(
+                source_id,
+                "no physical block devices found in /proc/diskstats"
+            );
+            return Vec::new();
+        }
+    };
+    disk_io_points(source_id, config, totals, now)
+}
+
+fn disk_io_points(
+    source_id: i32,
+    config: &CollectorConfig,
+    totals: DiskIoTotals,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    vec![
+        gauge(
+            source_id,
+            config,
+            "node.disk_read_bytes_total",
+            totals.read_bytes as f64,
+            now,
+        ),
+        gauge(
+            source_id,
+            config,
+            "node.disk_write_bytes_total",
+            totals.write_bytes as f64,
+            now,
+        ),
+    ]
+}
+
+// ── Network I/O (/proc/net/dev) ───────────────────────────────────────────────
+
+/// Cumulative bytes received / transmitted across non-virtual interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NetworkIoTotals {
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+/// Name-based fallback for [`is_physical_interface`]: the loopback, container
+/// links, bridges and the tunnels/overlays Temps and common orchestrators
+/// create. Traffic on these is either purely local or is the same bytes that
+/// already crossed the physical uplink underneath (a VXLAN or WireGuard packet
+/// is counted once on `vxlan-temps0` / `wg0` and again on `eth0`), so summing
+/// them would double-count what the operator thinks of as "the server's
+/// network I/O". Used only where `/sys/class/net` cannot be consulted.
+fn is_virtual_interface(name: &str) -> bool {
+    const PREFIXES: [&str; 16] = [
+        "veth",
+        "docker",
+        "br-",
+        "virbr",
+        "vxlan",
+        "wg",
+        "temps-wg",
+        "tun",
+        "tap",
+        "tailscale",
+        "flannel",
+        "cni",
+        "kube",
+        "weave",
+        "nerdctl",
+        "podman",
+    ];
+    name == "lo" || name.starts_with("temps") || PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Whether an interface is backed by hardware: on Linux, a physical NIC has a
+/// `/sys/class/net/<name>/device` link to its PCI/USB device and a virtual
+/// one (bridge, veth, VXLAN, WireGuard, VLAN, bond, tun) does not. This is
+/// the kernel's own classification, so new overlay types need no allow-list.
+/// Falls back to [`is_virtual_interface`] when sysfs is not available.
+fn is_physical_interface(name: &str) -> bool {
+    let sys = std::path::Path::new("/sys/class/net");
+    if sys.is_dir() {
+        return sys.join(name).join("device").exists();
+    }
+    !is_virtual_interface(name)
+}
+
+/// Parse `/proc/net/dev` and sum rx/tx bytes over physical interfaces, using
+/// the name-based filter alone (what production falls back to without sysfs).
+#[cfg(test)]
+fn parse_net_dev(content: &str) -> Option<NetworkIoTotals> {
+    parse_net_dev_with(content, |name| !is_virtual_interface(name))
+}
+
+/// [`parse_net_dev`] with a caller-supplied physical-interface test.
+fn parse_net_dev_with(
+    content: &str,
+    is_physical: impl Fn(&str) -> bool,
+) -> Option<NetworkIoTotals> {
+    let mut totals = NetworkIoTotals::default();
+    let mut seen_any = false;
+    // First two lines are headers. Data lines: `  eth0: <rx_bytes> <rx_packets>
+    // <rx_errs> <rx_drop> <rx_fifo> <rx_frame> <rx_compressed> <rx_multicast>
+    // <tx_bytes> ...`
+    for line in content.lines().skip(2) {
+        let (name, rest) = match line.split_once(':') {
+            Some(v) => v,
+            None => continue,
+        };
+        let name = name.trim();
+        if !is_physical(name) {
+            continue;
+        }
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 9 {
+            continue;
+        }
+        let rx: u64 = fields[0].parse().ok()?;
+        let tx: u64 = fields[8].parse().ok()?;
+        totals.rx_bytes = totals.rx_bytes.saturating_add(rx);
+        totals.tx_bytes = totals.tx_bytes.saturating_add(tx);
+        seen_any = true;
+    }
+    seen_any.then_some(totals)
+}
+
+async fn collect_network_io(
+    source_id: i32,
+    config: &CollectorConfig,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    let content = match tokio::fs::read_to_string("/proc/net/dev").await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let totals = match parse_net_dev_with(&content, is_physical_interface) {
+        Some(t) => t,
+        None => {
+            debug!(
+                source_id,
+                "no physical network interfaces found in /proc/net/dev"
+            );
+            return Vec::new();
+        }
+    };
+    network_io_points(source_id, config, totals, now)
+}
+
+fn network_io_points(
+    source_id: i32,
+    config: &CollectorConfig,
+    totals: NetworkIoTotals,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    vec![
+        gauge(
+            source_id,
+            config,
+            "node.network_rx_bytes_total",
+            totals.rx_bytes as f64,
+            now,
+        ),
+        gauge(
+            source_id,
+            config,
+            "node.network_tx_bytes_total",
+            totals.tx_bytes as f64,
+            now,
+        ),
+    ]
+}
+
+// ── Non-Linux fallback (sysinfo) ──────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
+mod fallback {
+    //! `sysinfo`-backed collection for hosts without `/proc`.
+    //!
+    //! Only the series the `/proc` readers above cannot produce off-Linux are
+    //! filled in here: CPU %, memory, block I/O and network I/O. Disk space
+    //! already works through `statvfs(2)`, and the fd / load-average series
+    //! are deliberately left absent so the UI can say "Linux only" honestly.
+
+    use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
+
+    pub struct FallbackState {
+        system: System,
+        networks: Networks,
+        disks: Disks,
+        /// `sysinfo` reports 0% CPU on the very first refresh (no baseline);
+        /// mirror the `/proc/stat` path and skip that sample.
+        cpu_primed: bool,
+    }
+
+    impl FallbackState {
+        pub fn new() -> Self {
+            let system = System::new_with_specifics(
+                RefreshKind::nothing()
+                    .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_memory(MemoryRefreshKind::nothing().with_ram()),
+            );
+            Self {
+                system,
+                networks: Networks::new_with_refreshed_list(),
+                disks: Disks::new_with_refreshed_list(),
+                cpu_primed: false,
+            }
+        }
+
+        /// Refresh and return `(cpu_percent, memory_used, memory_total)`.
+        /// `cpu_percent` is `None` on the first call.
+        pub fn sample_cpu_memory(&mut self) -> (Option<f64>, u64, u64) {
+            self.system.refresh_cpu_usage();
+            self.system
+                .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+            let cpu = if self.cpu_primed {
+                Some(f64::from(self.system.global_cpu_usage()).clamp(0.0, 100.0))
+            } else {
+                self.cpu_primed = true;
+                None
+            };
+            (cpu, self.system.used_memory(), self.system.total_memory())
+        }
+
+        /// Cumulative (rx, tx) bytes over non-virtual interfaces.
+        pub fn sample_network(&mut self) -> Option<(u64, u64)> {
+            self.networks.refresh(true);
+            let mut rx = 0u64;
+            let mut tx = 0u64;
+            let mut seen = false;
+            for (name, data) in self.networks.iter() {
+                if super::is_virtual_interface(name)
+                    // macOS names: loopback is `lo0`, Docker Desktop/colima
+                    // bridges show up as `bridge*`/`utun*`/`vmenet*`.
+                    || name.starts_with("lo")
+                    || name.starts_with("bridge")
+                    || name.starts_with("utun")
+                    || name.starts_with("vmenet")
+                    || name.starts_with("llw")
+                    || name.starts_with("awdl")
+                {
+                    continue;
+                }
+                rx = rx.saturating_add(data.total_received());
+                tx = tx.saturating_add(data.total_transmitted());
+                seen = true;
+            }
+            seen.then_some((rx, tx))
+        }
+
+        /// Cumulative (read, write) bytes over listed disks.
+        ///
+        /// macOS mounts one APFS container several times (`/`,
+        /// `/System/Volumes/Data`, …) and every mount reports the same
+        /// physical counters, so volumes are de-duplicated by
+        /// `(name, total_space)` — a stand-in for "same physical device".
+        pub fn sample_disk_io(&mut self) -> Option<(u64, u64)> {
+            self.disks.refresh(true);
+            let mut read = 0u64;
+            let mut write = 0u64;
+            let mut seen_devices: Vec<(std::ffi::OsString, u64)> = Vec::new();
+            for disk in self.disks.list() {
+                let key = (disk.name().to_os_string(), disk.total_space());
+                if seen_devices.contains(&key) {
+                    continue;
+                }
+                seen_devices.push(key);
+                let usage = disk.usage();
+                read = read.saturating_add(usage.total_read_bytes);
+                write = write.saturating_add(usage.total_written_bytes);
+            }
+            (!seen_devices.is_empty()).then_some((read, write))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NodeMetricsCollector {
+    fn collect_fallback(
+        &self,
+        source_id: i32,
+        config: &CollectorConfig,
+        now: DateTime<Utc>,
+    ) -> Vec<MetricPoint> {
+        let mut state = match self.fallback.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(source_id, "sysinfo fallback mutex poisoned: {e}");
+                return Vec::new();
+            }
+        };
+        let mut points = Vec::new();
+
+        let (cpu, mem_used, mem_total) = state.sample_cpu_memory();
+        if let Some(cpu) = cpu {
+            points.push(gauge(source_id, config, "node.cpu_percent", cpu, now));
+        }
+        if mem_total > 0 {
+            let percent = (mem_used as f64 / mem_total as f64) * 100.0;
+            points.push(gauge(
+                source_id,
+                config,
+                "node.memory_used_bytes",
+                mem_used as f64,
+                now,
+            ));
+            points.push(gauge(
+                source_id,
+                config,
+                "node.memory_total_bytes",
+                mem_total as f64,
+                now,
+            ));
+            points.push(gauge(
+                source_id,
+                config,
+                "node.memory_percent",
+                percent,
+                now,
+            ));
+        }
+        if let Some((rx, tx)) = state.sample_network() {
+            points.extend(network_io_points(
+                source_id,
+                config,
+                NetworkIoTotals {
+                    rx_bytes: rx,
+                    tx_bytes: tx,
+                },
+                now,
+            ));
+        }
+        if let Some((read, write)) = state.sample_disk_io() {
+            points.extend(disk_io_points(
+                source_id,
+                config,
+                DiskIoTotals {
+                    read_bytes: read,
+                    write_bytes: write,
+                },
+                now,
+            ));
+        }
+        points
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -768,5 +1267,177 @@ mod tests {
             );
             assert_eq!(p.source_id, 5);
         }
+    }
+    // ── parse_diskstats ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_diskstats_sums_whole_devices_and_skips_partitions_and_virtual() {
+        // sda: 1000 sectors read, 2000 written; sda1 is a partition of sda
+        // (must be skipped); nvme0n1 + nvme0n1p1 likewise; loop0 and dm-0
+        // are virtual.
+        let content = "\
+   8       0 sda 100 0 1000 0 200 0 2000 0 0 0 0 0 0 0 0 0 0
+   8       1 sda1 90 0 900 0 190 0 1900 0 0 0 0 0 0 0 0 0 0
+ 259       0 nvme0n1 10 0 10 0 20 0 20 0 0 0 0 0 0 0 0 0 0
+ 259       1 nvme0n1p1 9 0 9 0 19 0 19 0 0 0 0 0 0 0 0 0 0
+   7       0 loop0 5 0 50000 0 5 0 50000 0 0 0 0 0 0 0 0 0 0
+ 253       0 dm-0 5 0 50000 0 5 0 50000 0 0 0 0 0 0 0 0 0 0
+";
+        let totals = parse_diskstats(content).expect("should parse");
+        assert_eq!(totals.read_bytes, (1000 + 10) * 512);
+        assert_eq!(totals.write_bytes, (2000 + 20) * 512);
+    }
+
+    #[test]
+    fn test_is_partition_of_follows_kernel_naming() {
+        let devs = [
+            "sda",
+            "sda1",
+            "sdaa",
+            "sdaa1",
+            "nvme0n1",
+            "nvme0n1p1",
+            "mmcblk0",
+            "mmcblk0p2",
+            "vdb",
+        ];
+        assert!(is_partition_of("sda1", &devs));
+        assert!(is_partition_of("sdaa1", &devs));
+        assert!(is_partition_of("nvme0n1p1", &devs));
+        assert!(is_partition_of("mmcblk0p2", &devs));
+        // The 27th disk is not a partition of the first.
+        assert!(!is_partition_of("sdaa", &devs));
+        assert!(!is_partition_of("sda", &devs));
+        assert!(!is_partition_of("vdb", &devs));
+        // A whole NVMe namespace ends in a digit but has no listed parent.
+        assert!(!is_partition_of("nvme0n1", &devs));
+        assert!(!is_partition_of("mmcblk0", &devs));
+        // `sda1` is only a partition when `sda` is actually listed.
+        assert!(!is_partition_of("sdb1", &devs));
+    }
+
+    #[test]
+    fn test_parse_diskstats_counts_sdaa_as_a_whole_disk() {
+        let content = "\
+   8       0 sda 100 0 2048 0 50 0 1024 0 0 0 0
+   8       1 sda1 100 0 2048 0 50 0 1024 0 0 0 0
+  65     160 sdaa 10 0 4096 0 5 0 512 0 0 0 0
+  65     161 sdaa1 10 0 4096 0 5 0 512 0 0 0 0
+";
+        let t = parse_diskstats(content).expect("totals");
+        assert_eq!(t.read_bytes, (2048 + 4096) * 512);
+        assert_eq!(t.write_bytes, (1024 + 512) * 512);
+    }
+
+    #[test]
+    fn test_parse_net_dev_skips_overlay_and_tunnel_interfaces() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0
+vxlan-temps0: 500 1 0 0 0 0 0 0 600 1 0 0 0 0 0 0
+   wg0: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0
+ temps0: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0
+ tailscale0: 7 1 0 0 0 0 0 0 8 1 0 0 0 0 0 0
+";
+        let t = parse_net_dev(content).expect("totals");
+        assert_eq!(t.rx_bytes, 1000);
+        assert_eq!(t.tx_bytes, 2000);
+    }
+
+    #[test]
+    fn test_parse_net_dev_with_custom_physical_test() {
+        let content = "\
+h1
+h2
+  eth0: 1 0 0 0 0 0 0 0 10 0 0 0 0 0 0 0
+  eth1: 2 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0
+";
+        let t = parse_net_dev_with(content, |n| n == "eth1").expect("totals");
+        assert_eq!((t.rx_bytes, t.tx_bytes), (2, 20));
+        assert!(parse_net_dev_with(content, |_| false).is_none());
+    }
+
+    #[test]
+    fn test_parse_diskstats_only_virtual_devices_is_none() {
+        let content = "   7       0 loop0 5 0 50000 0 5 0 50000 0 0 0 0 0 0 0 0 0 0\n";
+        assert!(parse_diskstats(content).is_none());
+    }
+
+    #[test]
+    fn test_parse_diskstats_short_lines_ignored() {
+        assert!(parse_diskstats("garbage\n\n").is_none());
+    }
+
+    // ── parse_net_dev ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_net_dev_sums_physical_interfaces_only() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 999999 100 0 0 0 0 0 0 999999 100 0 0 0 0 0 0
+  eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0
+ veth1a2b: 555 5 0 0 0 0 0 0 666 6 0 0 0 0 0 0
+docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
+  wlan0: 30 3 0 0 0 0 0 0 40 4 0 0 0 0 0 0
+";
+        let totals = parse_net_dev(content).expect("should parse");
+        assert_eq!(totals.rx_bytes, 1000 + 30);
+        assert_eq!(totals.tx_bytes, 2000 + 40);
+    }
+
+    #[test]
+    fn test_parse_net_dev_only_loopback_is_none() {
+        let content = "h1\nh2\n    lo: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n";
+        assert!(parse_net_dev(content).is_none());
+    }
+
+    #[test]
+    fn test_io_metric_names_are_monotonic_counters() {
+        // The read path keys the LAG-based "increase per bucket" query off
+        // the `_total` suffix; a rename here would silently turn the I/O
+        // charts into cumulative-since-boot lines.
+        for name in [
+            "node.disk_read_bytes_total",
+            "node.disk_write_bytes_total",
+            "node.network_rx_bytes_total",
+            "node.network_tx_bytes_total",
+        ] {
+            assert!(crate::is_monotonic_counter(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_io_metrics_present_on_linux() {
+        let collector = NodeMetricsCollector::new();
+        let config = make_config(1, "/tmp");
+        let points = collector.collect(&config).await.unwrap();
+        let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
+        if std::path::Path::new("/proc/net/dev").exists() {
+            assert!(names.contains(&"node.network_rx_bytes_total"), "{names:?}");
+            assert!(names.contains(&"node.network_tx_bytes_total"), "{names:?}");
+        }
+        // Block devices may legitimately be absent inside some sandboxes, so
+        // only assert the invariant that both or neither are emitted.
+        assert_eq!(
+            names.contains(&"node.disk_read_bytes_total"),
+            names.contains(&"node.disk_write_bytes_total")
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn test_fallback_fills_memory_and_cpu_off_linux() {
+        let collector = NodeMetricsCollector::new();
+        let config = make_config(1, "/tmp");
+        // First scrape primes the CPU baseline; second carries cpu_percent.
+        let _ = collector.collect(&config).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let points = collector.collect(&config).await.unwrap();
+        let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"node.memory_used_bytes"), "{names:?}");
+        assert!(names.contains(&"node.memory_total_bytes"), "{names:?}");
+        assert!(names.contains(&"node.cpu_percent"), "{names:?}");
     }
 }

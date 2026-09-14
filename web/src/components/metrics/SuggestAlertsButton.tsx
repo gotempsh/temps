@@ -48,6 +48,7 @@ interface SuggestAlertsButtonProps {
    * on?" survey.
    */
   focusMetric?: string
+  disabled?: boolean
 }
 
 /**
@@ -69,6 +70,7 @@ export function SuggestAlertsButton({
   projectName,
   variant = 'outline',
   focusMetric,
+  disabled = false,
 }: SuggestAlertsButtonProps) {
   const { open } = useAiAssistant()
   const [setupOpen, setSetupOpen] = useState(false)
@@ -123,6 +125,10 @@ export function SuggestAlertsButton({
         variant={variant}
         className="gap-1.5"
         onClick={() => (needsSetup ? setSetupOpen(true) : openChat())}
+        disabled={disabled}
+        title={
+          disabled ? 'Connect metrics before creating alert rules' : undefined
+        }
       >
         <Sparkles className="size-4 text-primary" />
         Suggest alerts with AI

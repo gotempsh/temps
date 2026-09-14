@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 // Toggle UI primitive doesn't exist in this project — we render kind
@@ -13,12 +15,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import {
-  AlertOctagon,
-  CircleDollarSign,
-  Network,
-  Workflow,
-} from 'lucide-react'
+import { AlertOctagon, CircleDollarSign, Network, Workflow } from 'lucide-react'
 import { ALL_KINDS, type EventKind } from './types'
 
 const KIND_META: Record<
@@ -39,7 +36,7 @@ export const TIME_RANGES = [
   { value: '30d', label: 'Last 30 days' },
 ] as const
 
-export type TimeRange = (typeof TIME_RANGES)[number]['value']
+export type TimeRange = string
 
 export interface ObserveFilters {
   kinds: EventKind[]
@@ -88,7 +85,7 @@ export function ObserveFilterBar({
               aria-label={`Toggle ${label}`}
               className={cn(
                 'h-8 gap-1.5 text-xs',
-                active && 'border border-primary/30',
+                active && 'border border-primary/30'
               )}
             >
               <Icon className="h-3.5 w-3.5" />
@@ -99,28 +96,19 @@ export function ObserveFilterBar({
       </div>
 
       {/* Time range */}
-      <Select
+      <TimeRangeFilter
         value={filters.timeRange}
-        onValueChange={(v) =>
-          onChange({ ...filters, timeRange: v as TimeRange })
-        }
-      >
-        <SelectTrigger className="w-full sm:w-[160px]">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {TIME_RANGES.map((r) => (
-            <SelectItem key={r.value} value={r.value}>
-              {r.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+        onChange={(timeRange) => onChange({ ...filters, timeRange })}
+      />
 
       {/* Environment */}
       {environmentOptions && environmentOptions.length > 0 && (
         <Select
-          value={filters.environmentId == null ? 'all' : String(filters.environmentId)}
+          value={
+            filters.environmentId == null
+              ? 'all'
+              : String(filters.environmentId)
+          }
           onValueChange={(v) =>
             onChange({
               ...filters,

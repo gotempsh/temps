@@ -115,6 +115,7 @@ abort "release workflow must deny token permissions by default" unless
 read_contents = {"contents" => "read"}
 publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
+  "daemon-images" => publish_packages,
   "validate-release-ref" => read_contents,
   "build-web-assets" => read_contents,
   "build-linux-amd64" => read_contents,
@@ -158,6 +159,7 @@ abort "release workflow uses an unpinned wasm-pack version" unless
   wasm_pack_installs == ["cargo install wasm-pack --version 0.15.0 --locked"]
 
 expected_sandbox_permissions = {
+  "daemon-images" => publish_packages,
   "prepare-context" => read_contents,
   "build-and-push-sandbox-images" => publish_packages,
   "build-and-push-preview-gateway" => publish_packages,

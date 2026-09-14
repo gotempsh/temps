@@ -7,7 +7,7 @@ import { CronJobDetail } from './settings/CronJobDetail'
 import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
-import { GeneralSettings } from './settings/GeneralSettings'
+import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
 import { GitSettings } from './settings/GitSettings'
 import { BuildDeploySettings } from './settings/BuildDeploySettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
@@ -20,7 +20,6 @@ import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
-import { ProjectSettingsOverview } from './settings/ProjectSettingsOverview'
 import { DeploymentTokensSettings } from './settings/DeploymentTokensSettings'
 
 interface ProjectSettingsProps {
@@ -32,10 +31,31 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
   return (
     <div>
       <Routes>
-        <Route index element={<ProjectSettingsOverview project={project} />} />
+        {(['delivery', 'variables', 'automation', 'integrations'] as const).map(
+          (page) => (
+            <Route
+              key={page}
+              path={page}
+              element={
+                <CombinedProjectSettings
+                  page={page}
+                  project={project}
+                  refetch={refetch}
+                />
+              }
+            />
+          )
+        )}
+        <Route index element={<Navigate to="general" replace />} />
         <Route
           path="general"
-          element={<GeneralSettings project={project} refetch={refetch} />}
+          element={
+            <CombinedProjectSettings
+              page="general"
+              project={project}
+              refetch={refetch}
+            />
+          }
         />
         <Route path="domains" element={<DomainsSettings project={project} />} />
         <Route

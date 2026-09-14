@@ -58,7 +58,7 @@ import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
 import { toast } from 'sonner'
 
 function providerIcon(
-  template?: string,
+  template?: string
 ): ComponentType<SVGProps<SVGSVGElement>> {
   switch (template) {
     case 'keycloak':
@@ -91,7 +91,7 @@ export function AuthSettingsPage() {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
   const [deleteTarget, setDeleteTarget] = useState<OidcProviderResponse | null>(
-    null,
+    null
   )
 
   const providersQuery = useQuery(listOidcProvidersOptions())
@@ -138,7 +138,10 @@ export function AuthSettingsPage() {
 
   const providers = providersQuery.data ?? []
   const error = providersQuery.error
-    ? problemMessage(providersQuery.error, 'Failed to load authentication settings')
+    ? problemMessage(
+        providersQuery.error,
+        'Failed to load authentication settings'
+      )
     : null
 
   const handleToggle = (provider: OidcProviderResponse, enabled: boolean) => {
@@ -158,16 +161,19 @@ export function AuthSettingsPage() {
           </h1>
           <p className="text-sm text-muted-foreground">
             OIDC provider configuration. Add as many providers as you need —
-            each one shows up as its own button on the login screen when enabled.
+            each one shows up as its own button on the login screen when
+            enabled.
           </p>
         </div>
-        <Button asChild>
-          <Link to="/settings/auth/new">
-            <Plus className="mr-2 h-4 w-4" />
-            <span className="hidden sm:inline">Add SSO Provider</span>
-            <span className="sm:hidden">Add</span>
-          </Link>
-        </Button>
+        {!providersQuery.isLoading && providers.length > 0 && (
+          <Button asChild>
+            <Link to="/settings/auth/new">
+              <Plus className="mr-2 h-4 w-4" />
+              <span className="hidden sm:inline">Add SSO Provider</span>
+              <span className="sm:hidden">Add</span>
+            </Link>
+          </Button>
+        )}
       </div>
 
       {error && (

@@ -18,6 +18,7 @@
 
 pub mod dispatch;
 pub mod model_relay;
+mod runtime_transport;
 pub mod service;
 
 pub use dispatch::{

@@ -8,14 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -27,7 +20,14 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { InfoIcon, MessageSquare, Shield } from 'lucide-react'
+import {
+  Bot,
+  InfoIcon,
+  ScanSearch,
+  Shield,
+  ShieldCheck,
+  TrafficCone,
+} from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -90,7 +90,6 @@ export function ProjectSecuritySettings({
     register,
     handleSubmit,
     setValue,
-    watch,
     reset,
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
@@ -195,6 +194,19 @@ export function ProjectSecuritySettings({
   }, [project, reset])
 
   const securityConfig = useWatch({ control, name: 'security' })
+  const attackMode = useWatch({ control, name: 'attack_mode' })
+  const aiAlertSummariesEnabled = useWatch({
+    control,
+    name: 'ai_alert_summaries_enabled',
+  })
+  const aiApiTrafficSummaryEnabled = useWatch({
+    control,
+    name: 'ai_api_traffic_summary_enabled',
+  })
+  const vulnerabilityScanningEnabled = useWatch({
+    control,
+    name: 'vulnerability_scanning_enabled',
+  })
 
   const onSubmit = async (data: FormData) => {
     if (!project?.id) return
@@ -329,18 +341,12 @@ export function ProjectSecuritySettings({
       </Alert>
 
       {/* Attack Mode Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Attack Mode
-          </CardTitle>
-          <CardDescription>
-            Enable CAPTCHA protection to defend against DDoS attacks and bot
-            traffic
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Attack Mode"
+        description="Enable CAPTCHA protection to defend against DDoS attacks and bot traffic"
+        icon={Shield}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="attack-mode">Enable Attack Mode</Label>
@@ -350,13 +356,13 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="attack-mode"
-              checked={watch('attack_mode') ?? false}
+              checked={attackMode ?? false}
               onCheckedChange={(checked) =>
                 setValue('attack_mode', checked, { shouldDirty: true })
               }
             />
           </div>
-          {watch('attack_mode') && (
+          {attackMode && (
             <>
               <Separator />
               <Alert>
@@ -370,8 +376,8 @@ export function ProjectSecuritySettings({
               </Alert>
             </>
           )}
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button
             type="submit"
             disabled={
@@ -380,24 +386,16 @@ export function ProjectSecuritySettings({
           >
             Save Attack Mode Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* AI Assistance Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <MessageSquare className="h-5 w-5" />
-            AI Assistance
-          </CardTitle>
-          <CardDescription>
-            AI features powered by your configured AI provider, using your own
-            provider key and budget. Chat access follows the user&apos;s project
-            permissions. Tool changes follow the chat permission mode; alert
-            summaries remain opt-in.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="AI Assistance"
+        description="Configure AI summaries and assistance for this project"
+        icon={Bot}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="ai-alert-summaries">AI alert summaries</Label>
@@ -408,7 +406,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="ai-alert-summaries"
-              checked={watch('ai_alert_summaries_enabled') ?? false}
+              checked={aiAlertSummariesEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('ai_alert_summaries_enabled', checked, {
                   shouldDirty: true,
@@ -430,7 +428,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="ai-api-traffic-summary"
-              checked={watch('ai_api_traffic_summary_enabled') ?? false}
+              checked={aiApiTrafficSummaryEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('ai_api_traffic_summary_enabled', checked, {
                   shouldDirty: true,
@@ -438,27 +436,21 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save AI Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Vulnerability Scanning Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Vulnerability Scanning
-          </CardTitle>
-          <CardDescription>
-            Automatically scan deployed Docker images for known vulnerabilities
-            using Trivy, after every deployment and daily
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Vulnerability Scanning"
+        description="Automatically scan deployed images for known vulnerabilities after every deployment and daily"
+        icon={ScanSearch}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="vulnerability-scanning">
@@ -472,7 +464,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="vulnerability-scanning"
-              checked={watch('vulnerability_scanning_enabled') ?? false}
+              checked={vulnerabilityScanningEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('vulnerability_scanning_enabled', checked, {
                   shouldDirty: true,
@@ -480,27 +472,21 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save Vulnerability Scanning Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Security Headers Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Security Headers
-          </CardTitle>
-          <CardDescription>
-            Configure HTTP security headers for this project. Overrides global
-            settings.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Security Headers"
+        description="Configure project HTTP security headers that override global settings"
+        icon={ShieldCheck}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="security-enabled">Enable Security Headers</Label>
@@ -605,8 +591,8 @@ export function ProjectSecuritySettings({
               )}
             </>
           )}
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button
             type="submit"
             disabled={
@@ -615,21 +601,16 @@ export function ProjectSecuritySettings({
           >
             Save Security Configuration
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Rate Limiting Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Rate Limiting
-          </CardTitle>
-          <CardDescription>
-            Configure rate limiting for this project. Overrides global settings.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Rate Limiting"
+        description="Configure project rate limits that override global settings"
+        icon={TrafficCone}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
@@ -770,8 +751,8 @@ export function ProjectSecuritySettings({
               </div>
             </>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
     </form>
   )
 }

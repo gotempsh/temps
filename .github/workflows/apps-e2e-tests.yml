@@ -110,7 +110,7 @@ jobs:
           docker run -d --name temps-e2e-registry -p 5111:5000 registry:2
           docker compose -p temps-e2e -f apps/temps-e2e/docker-compose.e2e.yml up -d
           timeout 90 bash -c 'until nc -z localhost 14000 && nc -z localhost 8056 && nc -z localhost 1025 && nc -z localhost 8025 && nc -z localhost 9092; do sleep 2; done'
-          docker run --rm --network temps-e2e_default --entrypoint /bin/sh minio/mc \
+          docker run --rm --network temps-e2e_default --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
             -c 'until mc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb --ignore-existing backup/temps-e2e-backups'
 
       - name: Build immutable MariaDB WAL-G recovery image

@@ -11,6 +11,7 @@ import type {
 import {
   ManagedApplicationWorkspaceRow,
   ManagedGlobalWorkspaceRow,
+  ManagedApplicationWorkspaces,
 } from './Sandboxes'
 
 describe('ManagedApplicationWorkspaceRow', () => {
@@ -31,7 +32,7 @@ describe('ManagedApplicationWorkspaceRow', () => {
     expect(html).toContain('2 connected')
     expect(html).toContain('Persistent files')
     expect(html).toContain('Healthy')
-    expect(html).toContain('/ai-first?application=app_workspace-topology-e2e')
+    expect(html).toContain('/workspaces/app_workspace-topology-e2e')
     expect(html).toContain('Manage workspace')
     expect(html).not.toContain('>Stop<')
     expect(html).not.toContain('>Delete<')
@@ -65,7 +66,9 @@ describe('ManagedApplicationWorkspaceRow', () => {
     )
 
     expect(html).toContain('not started')
-    expect(html).toContain('Sandbox starts on the first application turn')
+    expect(html).toContain(
+      'No compute attached. Workspace context is retained.'
+    )
   })
 })
 
@@ -77,12 +80,59 @@ describe('ManagedGlobalWorkspaceRow', () => {
       </MemoryRouter>
     )
 
-    expect(html).toContain('Global AI workspace')
+    expect(html).toContain('Default workspace')
     expect(html).toContain('sbx_workspace123')
-    expect(html).toContain('/ai-first?scope=global')
+    expect(html).toContain('/workspaces/global')
     expect(html).toContain('Managed by Temps')
     expect(html).not.toContain('>Stop<')
     expect(html).not.toContain('>Delete<')
+  })
+})
+
+describe('workspace and operator views', () => {
+  function render(computeOnly: boolean, attached: boolean, error = false) {
+    return renderToStaticMarkup(
+      <MemoryRouter>
+        <ManagedApplicationWorkspaces
+          entries={[
+            {
+              application,
+              workspace: {
+                ...workspace,
+                sandbox_public_id: attached
+                  ? workspace.sandbox_public_id
+                  : null,
+              },
+            },
+          ]}
+          globalWorkspace={null}
+          loading={false}
+          error={error}
+          computeOnly={computeOnly}
+        />
+      </MemoryRouter>
+    )
+  }
+
+  test('retains working contexts without compute', () => {
+    expect(render(false, false)).toContain('Workspace topology')
+    expect(render(false, false)).toContain('No compute attached')
+  })
+  test('operator view includes only attached compute with an owner link', () => {
+    expect(render(true, false)).not.toContain('Workspace topology')
+    expect(render(true, false)).toContain(
+      'No workspace-owned compute is attached'
+    )
+    expect(render(true, true)).toContain('Workspace-owned sandboxes')
+    expect(render(true, true)).toContain(
+      '/workspaces/app_workspace-topology-e2e'
+    )
+  })
+  test('failed ownership lookups are not presented as an empty operator inventory', () => {
+    expect(render(true, false, true)).toContain('could not be loaded')
+    expect(render(true, false, true)).not.toContain(
+      'No workspace-owned compute is attached'
+    )
   })
 })
 
@@ -114,6 +164,7 @@ const workspace: ApplicationWorkspaceResponse = {
   pids_limit: 1024,
   pids_used: 4,
   runtime: 'node',
+  runtime_update_available: false,
   sandbox_public_id: 'sbx_workspace123',
   snapshot_id: null,
   state: 'running',

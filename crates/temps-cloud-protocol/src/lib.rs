@@ -33,15 +33,16 @@ pub mod messages;
 
 pub use messages::{
     BackupCompression, BackupEngine, BackupFormat, BackupLifecycleEventAccepted,
-    BackupLifecycleEventRequest, BackupLifecycleStage, EnrollRequest, EnrollResponse, Envelope,
-    Heartbeat, HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation,
-    ManagedAiEvidence, ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
-    ManagedNotificationRequest, ManagedNotificationSeverity, NativeSnapshot,
-    NativeSnapshotIdentity, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
-    NativeSnapshotRequest, SpanRecord, TelemetryBatch, WalGObjectCompleted, WalGObjectDeclaration,
-    WalGObjectKind, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot, WalGSnapshotCompleted,
-    WalGSnapshotRequest,
+    BackupLifecycleEventRequest, BackupLifecycleStage, BackupManifest, BackupManifestObjects,
+    EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck, IngestAck,
+    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability, ManagedAiChatRequest,
+    ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence, ManagedAiTask,
+    ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
+    ManagedNotificationSeverity, NativeSnapshot, NativeSnapshotIdentity,
+    NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind, NativeSnapshotRequest, SpanRecord,
+    TelemetryBatch, WalGObjectCompleted, WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget,
+    WalGObjectTargetRequest, WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
+    BACKUP_MANIFEST_VERSION, MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES,
 };
 
 use serde::{Deserialize, Serialize};

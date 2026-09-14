@@ -31,6 +31,7 @@ import { Link, useSearchParams } from 'react-router'
 import {
   type InfiniteData,
   useInfiniteQuery,
+  useQueries,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
@@ -75,6 +76,7 @@ import {
   listAllConversationsOptions,
   listApplicationConversationsOptions,
   listThreadArtifactsOptions,
+  getWorkspaceActivityOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DebugChatPanel } from '@/components/ai/DebugChatPanel'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
@@ -108,6 +110,7 @@ import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
 import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
 import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
+import { WorkspaceActivity, WorkspaceRunningIndicator } from './WorkspaceActivity'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { WorkspaceFileExplorer } from './WorkspaceFileExplorer'
 import {
@@ -127,7 +130,8 @@ import {
   threadSelectionAfterRemoval,
 } from './thread-selection'
 import { threadDisplayStatus, type ThreadDisplayStatus } from './thread-status'
-import { threadTitleFromLiveEvent } from './thread-title-event'
+import { threadTitleFromLiveEvent, workspacePageTitle } from './thread-title-event'
+import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   batchLocalImportFiles,
   fileToBase64,
@@ -427,6 +431,41 @@ export function AiFirstWorkspace() {
     () => archivedApplicationsQuery.data?.pages.flat() ?? [],
     [archivedApplicationsQuery.data]
   )
+  // Bounded batches cover every visible workspace, including threads beyond
+  // the thread switcher's first page. No per-workspace polling or message loads.
+  const activityBatches = useMemo(() => {
+    const ids = applications.map((application) => application.public_id).sort()
+    const batches: string[] = []
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      batches.push(ids.slice(offset, offset + 100).join(','))
+    }
+    return batches.length ? batches : ['']
+  }, [applications])
+  const activityQueries = useQueries({
+    queries: activityBatches.map((ids) => ({
+      ...getWorkspaceActivityOptions({
+        query: { application_public_ids: ids || undefined },
+      }),
+      enabled: applicationListMode === 'active',
+      refetchInterval: 5_000,
+      refetchIntervalInBackground: false,
+    })),
+  })
+  const activityByWorkspace = new Map(
+    activityQueries.flatMap((query) =>
+      (query.data?.workspaces ?? []).map(
+        (workspace) => [workspace.application_public_id, workspace] as const
+      )
+    )
+  )
+  const activityQueryFor = (applicationId: string | null) =>
+    activityQueries[
+      applicationId
+        ? activityBatches.findIndex((batch) =>
+            batch.split(',').includes(applicationId)
+          )
+        : 0
+    ]
   const conversations = useMemo(
     () =>
       mergeConversationPages(
@@ -526,6 +565,15 @@ export function AiFirstWorkspace() {
       ? archivedGlobalConversations
       : globalConversations
   ).find((conversation) => conversation.public_id === activeConversationId)
+
+  usePageTitle(
+    workspacePageTitle(
+      activeApplicationId ? activeApplication?.name : 'Default workspace',
+      activeApplicationId
+        ? activeConversation?.title
+        : activeGlobalConversation?.title
+    )
+  )
 
   const {
     fetchNextPage: fetchNextApplications,
@@ -833,6 +881,9 @@ export function AiFirstWorkspace() {
   }, [loadArchivedConversations, threadListMode])
 
   const refreshVisibleConversations = useCallback(async () => {
+    void queryClient.invalidateQueries({
+      queryKey: getWorkspaceActivityOptions().queryKey,
+    })
     try {
       if (activeApplicationId) {
         await refetchApplicationConversations()
@@ -844,6 +895,7 @@ export function AiFirstWorkspace() {
       // sidebar-only refresh failure must not interrupt the open conversation.
     }
   }, [
+    queryClient,
     activeApplicationId,
     refetchApplicationConversations,
     refetchGlobalConversations,
@@ -1188,6 +1240,9 @@ export function AiFirstWorkspace() {
         }
       }
       if (turnStatus && activeConversationId) {
+        void queryClient.invalidateQueries({
+          queryKey: getWorkspaceActivityOptions().queryKey,
+        })
         queryClient.setQueryData<ConversationResponse[]>(
           applicationConversationsOptions.queryKey,
           (current = []) =>
@@ -1700,6 +1755,20 @@ export function AiFirstWorkspace() {
             </span>
           </div>
           <div className="space-y-1 p-2">
+            {applicationListMode === 'active' &&
+              activityQueries.some((query) => query.isError) && (
+                <button
+                  type="button"
+                  className="w-full rounded border border-destructive/30 px-3 py-2 text-left text-[10px] text-destructive"
+                  onClick={() => {
+                    void queryClient.invalidateQueries({
+                      queryKey: getWorkspaceActivityOptions().queryKey,
+                    })
+                  }}
+                >
+                  Could not load workspace activity. Retry
+                </button>
+              )}
             {applicationListMode === 'active' && (
               <button
                 type="button"
@@ -1711,11 +1780,18 @@ export function AiFirstWorkspace() {
                     : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
                 )}
               >
-                <p className="truncate text-sm">Default workspace</p>
-                <p className="mt-0.5 text-[10px]">
-                  {globalConversations.length} thread
-                  {globalConversations.length === 1 ? '' : 's'} · persistent
+                <p className="flex min-w-0 items-center gap-2 text-sm">
+                  <span className="truncate">Default workspace</span>
+                  <WorkspaceRunningIndicator
+                    harnesses={activityByWorkspace.get(null)?.harnesses}
+                  />
                 </p>
+                <p className="mt-0.5 text-[10px]">Persistent workspace</p>
+                <WorkspaceActivity
+                  harnesses={activityByWorkspace.get(null)?.harnesses}
+                  loading={activityQueryFor(null)?.isPending}
+                  error={activityQueryFor(null)?.isError}
+                />
               </button>
             )}
             {applicationActionError && (
@@ -1743,11 +1819,25 @@ export function AiFirstWorkspace() {
                   onClick={() => selectApplication(application.public_id)}
                   className="min-w-0 flex-1 px-3 py-2 text-left disabled:cursor-default"
                 >
-                  <p className="truncate text-sm">{application.name}</p>
-                  <p className="mt-0.5 text-[10px]">
-                    {application.projects.length} project
-                    {application.projects.length === 1 ? '' : 's'}
+                  <p className="flex min-w-0 items-center gap-2 text-sm">
+                    <span className="truncate">{application.name}</span>
+                    {applicationListMode === 'active' && (
+                      <WorkspaceRunningIndicator
+                        harnesses={
+                          activityByWorkspace.get(application.public_id)?.harnesses
+                        }
+                      />
+                    )}
                   </p>
+                  <WorkspaceActivity
+                    projectCount={application.projects.length}
+                    showThreads={applicationListMode === 'active'}
+                    harnesses={
+                      activityByWorkspace.get(application.public_id)?.harnesses
+                    }
+                    loading={activityQueryFor(application.public_id)?.isPending}
+                    error={activityQueryFor(application.public_id)?.isError}
+                  />
                 </button>
                 <button
                   type="button"
@@ -2061,6 +2151,9 @@ export function AiFirstWorkspace() {
                   userScoped
                   contextType="application"
                   contextId={activeConversation.context_id}
+                  runtimeUpdateRequired={
+                    activeWorkspaceStatus?.runtime_compatible === false
+                  }
                   emptyHint="Describe what you want to build or operate from this workspace."
                   placeholder="Tell Temps what you want to ship…"
                   onLiveEvent={handleChatLiveEvent}
@@ -2068,6 +2161,24 @@ export function AiFirstWorkspace() {
                   readOnly={threadListMode === 'archived'}
                 />
               </div>
+              {activeWorkspaceStatus?.runtime_compatible === false && (
+                <div
+                  role="alert"
+                  className="shrink-0 border-t border-amber-500/30 bg-amber-500/5 px-5 py-3 text-sm"
+                >
+                  Runtime update required. Your messages and workspace files are
+                  preserved.
+                  <Button
+                    variant="link"
+                    onClick={() => {
+                      setRightView('workspace')
+                      if (window.innerWidth < 1280) setRightPanelOpen(true)
+                    }}
+                  >
+                    Open Workspace settings
+                  </Button>
+                </div>
+              )}
             </div>
           )}
         </main>
@@ -2793,8 +2904,10 @@ function ApplicationBoundary({
           <KeyRound className="size-4 stroke-success" /> Credential boundary
         </div>
         <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-          The model can request capabilities and receive opaque references. It
-          can never read secret values or host login tokens.
+          Temps platform tools use opaque credential references. OpenCode local
+          login uses a private runtime credential file accessible to code
+          running as the harness user. Use imported login credentials only in
+          trusted workspaces.
         </p>
       </section>
       <ApplicationPreview application={application} />
@@ -3106,10 +3219,10 @@ export function ApplicationStartScreen({
         })
         conversation = data
       } catch (cause) {
-        const reason =
-          cause instanceof Error
-            ? cause.message
-            : 'The selected harness could not start a thread.'
+        const reason = problemDetail(
+          cause,
+          'The selected harness could not start a thread.'
+        )
         throw new Error(
           `Application “${application.name}” was created, but its starter thread could not start with the selected harness: ${reason}`,
           { cause }
@@ -3121,9 +3234,7 @@ export function ApplicationStartScreen({
       setImportedApplicationId(null)
       setHarnessId(null)
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : 'Could not create workspace.'
-      )
+      setError(problemDetail(cause, 'Could not create workspace.'))
     } finally {
       setSaving(false)
       setSavingStep('')
@@ -3661,9 +3772,10 @@ function CreateThreadDialog({
           />
           <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
             The harness chooses its own model and runs inside a persistent Temps
-            sandbox mounted on this workspace. It can change project files but
-            never receives host login tokens or secret values. Platform actions
-            remain explicitly approval-gated.
+            sandbox mounted on this workspace. It can change project files.
+            OpenCode local login uses a private runtime credential file that
+            harness-user code can access; use it only in trusted workspaces.
+            Platform actions remain explicitly approval-gated.
           </p>
           {harnesses.length === 0 && (
             <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600">

@@ -253,7 +253,7 @@ impl ErrorCRUDService {
             error_groups::Entity::find().filter(error_groups::Column::ProjectId.eq(project_id));
 
         // Apply filters
-        if let Some(status) = status_filter {
+        if let Some(status) = status_filter.as_deref() {
             query = query.filter(error_groups::Column::Status.eq(status));
         }
 
@@ -286,7 +286,7 @@ impl ErrorCRUDService {
                     _ => query.order_by_desc(error_groups::Column::FirstSeen),
                 };
             }
-            Some("total_count") => {
+            Some("total_count" | "events_in_range") => {
                 query = match sort_order.as_deref() {
                     Some("asc") => query.order_by_asc(error_groups::Column::TotalCount),
                     _ => query.order_by_desc(error_groups::Column::TotalCount),
@@ -298,9 +298,41 @@ impl ErrorCRUDService {
             }
         }
 
-        let paginator = query.paginate(self.db.as_ref(), page_size);
+        let paginator = query.clone().paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let groups = paginator.fetch_page(page - 1).await?;
+        let groups = if let (Some((start, end)), Some("events_in_range")) =
+            (date_range, sort_by.as_deref())
+        {
+            let ids = self
+                .get_range_sorted_group_ids(
+                    project_id,
+                    start,
+                    end,
+                    environment_id,
+                    status_filter.as_deref(),
+                    sort_order.as_deref(),
+                    page,
+                    page_size,
+                )
+                .await?;
+            if ids.is_empty() {
+                vec![]
+            } else {
+                let positions: HashMap<i32, usize> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| (*id, index))
+                    .collect();
+                let mut rows = query
+                    .filter(error_groups::Column::Id.is_in(ids))
+                    .all(self.db.as_ref())
+                    .await?;
+                rows.sort_by_key(|row| positions.get(&row.id).copied().unwrap_or(usize::MAX));
+                rows
+            }
+        } else {
+            paginator.fetch_page(page.saturating_sub(1)).await?
+        };
 
         let mut domain_groups: Vec<ErrorGroupDomain> = groups
             .into_iter()
@@ -440,6 +472,70 @@ impl ErrorCRUDService {
         };
 
         Ok(rows.into_iter().map(|r| r.error_group_id).collect())
+    }
+
+    /// Page error groups by the same time-bounded event count returned to the UI.
+    /// This must run in SQL before pagination; sorting just the fetched page is incorrect.
+    #[allow(clippy::too_many_arguments)]
+    async fn get_range_sorted_group_ids(
+        &self,
+        project_id: i32,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        environment_id: Option<i32>,
+        status: Option<&str>,
+        sort_order: Option<&str>,
+        page: u64,
+        page_size: u64,
+    ) -> Result<Vec<i32>, ErrorTrackingError> {
+        #[derive(FromQueryResult)]
+        struct ErrorGroupIdRow {
+            id: i32,
+        }
+
+        let mut values: Vec<sea_orm::Value> = vec![project_id.into(), start.into(), end.into()];
+        let mut event_env = String::new();
+        let mut group_env = String::new();
+        if let Some(env_id) = environment_id {
+            values.push(env_id.into());
+            let placeholder = values.len();
+            event_env = format!(" AND e.environment_id = ${placeholder}");
+            group_env = format!(" AND g.environment_id = ${placeholder}");
+        }
+        let mut group_status = String::new();
+        if let Some(status) = status {
+            values.push(status.to_owned().into());
+            group_status = format!(" AND g.status = ${}", values.len());
+        }
+        values.push((page_size as i64).into());
+        let limit_placeholder = values.len();
+        let offset =
+            i64::try_from(page.saturating_sub(1).saturating_mul(page_size)).unwrap_or(i64::MAX);
+        values.push(offset.into());
+        let offset_placeholder = values.len();
+        let direction = if sort_order == Some("asc") {
+            "ASC"
+        } else {
+            "DESC"
+        };
+        let sql = format!(
+            "SELECT g.id FROM error_groups g \
+             JOIN (SELECT e.error_group_id, COUNT(*) AS event_count \
+                   FROM error_events e \
+                   WHERE e.project_id = $1 AND e.timestamp >= $2 AND e.timestamp <= $3{event_env} \
+                   GROUP BY e.error_group_id) counts ON counts.error_group_id = g.id \
+             WHERE g.project_id = $1{group_env}{group_status} \
+             ORDER BY counts.event_count {direction}, g.id ASC \
+             LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"
+        );
+        let rows = ErrorGroupIdRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
     }
 
     /// Compute `events_in_range` and `affected_users` for a specific set of group IDs within
@@ -1028,6 +1124,84 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(total, 2);
         assert!(groups.iter().all(|g| g.status == "unresolved"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_range_event_sort_uses_displayed_counts_before_pagination() {
+        use sea_orm::ConnectionTrait;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping range sort database test: {error}");
+                return;
+            }
+            Err(error) => panic!("Range sort test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let service = ErrorCRUDService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+        let high_all_time = create_test_error_group(&db, project_id, "unresolved").await;
+        let high_in_range = create_test_error_group(&db, project_id, "unresolved").await;
+        let mut group: error_groups::ActiveModel = error_groups::Entity::find_by_id(high_all_time)
+            .one(db.as_ref())
+            .await
+            .expect("read group")
+            .expect("group exists")
+            .into();
+        group.total_count = Set(100);
+        group
+            .update(db.as_ref())
+            .await
+            .expect("update all-time count");
+
+        let start = Utc::now() - chrono::Duration::hours(1);
+        for (group_id, count) in [(high_all_time, 1), (high_in_range, 3)] {
+            for index in 0..count {
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO error_events (error_group_id, project_id, timestamp, fingerprint_hash, exception_type, source) VALUES ($1, $2, NOW(), $3, 'TypeError', 'test')",
+                    vec![group_id.into(), project_id.into(), format!("range-{group_id}-{index}").into()],
+                ))
+                .await
+                .expect("insert event");
+            }
+        }
+        let end = Utc::now() + chrono::Duration::seconds(1);
+
+        for (direction, expected_ids) in [
+            ("desc", [high_in_range, high_all_time]),
+            ("asc", [high_all_time, high_in_range]),
+        ] {
+            for (index, expected_id) in expected_ids.into_iter().enumerate() {
+                let (groups, total) = service
+                    .list_error_groups(
+                        project_id,
+                        Some(index as u64 + 1),
+                        Some(1),
+                        Some("unresolved".to_string()),
+                        None,
+                        Some("events_in_range".to_string()),
+                        Some(direction.to_string()),
+                        Some(start),
+                        Some(end),
+                    )
+                    .await
+                    .expect("range-sorted group page");
+                assert_eq!(total, 2);
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].id, expected_id);
+                assert_eq!(
+                    groups[0].events_in_range,
+                    Some(if expected_id == high_in_range { 3 } else { 1 })
+                );
+            }
+        }
     }
 
     #[tokio::test]

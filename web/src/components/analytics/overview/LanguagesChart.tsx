@@ -1,3 +1,5 @@
+import { AnalyticsBreakdownRow } from './AnalyticsBreakdownRow'
+import { getLanguageName } from '@/lib/analytics-language'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -18,75 +20,6 @@ import { Languages } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
-
-// Map common language codes to human-readable names
-const LANGUAGE_NAMES: Record<string, string> = {
-  en: 'English',
-  'en-US': 'English (US)',
-  'en-GB': 'English (UK)',
-  'en-AU': 'English (Australia)',
-  'en-CA': 'English (Canada)',
-  es: 'Spanish',
-  'es-ES': 'Spanish (Spain)',
-  'es-MX': 'Spanish (Mexico)',
-  'es-AR': 'Spanish (Argentina)',
-  fr: 'French',
-  'fr-FR': 'French (France)',
-  'fr-CA': 'French (Canada)',
-  de: 'German',
-  'de-DE': 'German (Germany)',
-  'de-AT': 'German (Austria)',
-  it: 'Italian',
-  pt: 'Portuguese',
-  'pt-BR': 'Portuguese (Brazil)',
-  'pt-PT': 'Portuguese (Portugal)',
-  nl: 'Dutch',
-  ru: 'Russian',
-  ja: 'Japanese',
-  ko: 'Korean',
-  zh: 'Chinese',
-  'zh-CN': 'Chinese (Simplified)',
-  'zh-TW': 'Chinese (Traditional)',
-  ar: 'Arabic',
-  hi: 'Hindi',
-  tr: 'Turkish',
-  pl: 'Polish',
-  sv: 'Swedish',
-  da: 'Danish',
-  fi: 'Finnish',
-  no: 'Norwegian',
-  nb: 'Norwegian',
-  cs: 'Czech',
-  el: 'Greek',
-  he: 'Hebrew',
-  th: 'Thai',
-  vi: 'Vietnamese',
-  id: 'Indonesian',
-  ms: 'Malay',
-  uk: 'Ukrainian',
-  ro: 'Romanian',
-  hu: 'Hungarian',
-  bg: 'Bulgarian',
-  hr: 'Croatian',
-  sk: 'Slovak',
-  sl: 'Slovenian',
-  lt: 'Lithuanian',
-  lv: 'Latvian',
-  et: 'Estonian',
-  ca: 'Catalan',
-  eu: 'Basque',
-  gl: 'Galician',
-}
-
-function getLanguageName(code: string): string {
-  if (!code) return 'Unknown'
-  // Try exact match first
-  if (LANGUAGE_NAMES[code]) return LANGUAGE_NAMES[code]
-  // Try base language code (e.g., "en" from "en-US")
-  const base = code.split('-')[0]
-  if (LANGUAGE_NAMES[base]) return `${LANGUAGE_NAMES[base]} (${code})`
-  return code
-}
 
 interface LanguagesChartProps {
   project: ProjectResponse
@@ -198,35 +131,14 @@ export function LanguagesChart({
         ) : (
           <div className="space-y-3">
             {sortedLanguages.map((lang) => (
-              <div key={lang.code} className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <Languages className="h-4 w-4 text-muted-foreground" />
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium">{lang.name}</span>
-                      {lang.code !== lang.name && (
-                        <span className="text-xs text-muted-foreground">
-                          {lang.code}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-muted-foreground">
-                      {lang.percentage}%
-                    </span>
-                    <span className="text-sm font-mono text-muted-foreground">
-                      {lang.count.toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-                <div className="relative h-2 bg-muted rounded-full overflow-hidden">
-                  <div
-                    className="absolute inset-y-0 left-0 bg-primary rounded-full transition-all duration-500"
-                    style={{ width: `${lang.percentage}%` }}
-                  />
-                </div>
-              </div>
+              <AnalyticsBreakdownRow
+                key={lang.code}
+                label={lang.name}
+                icon={<Languages className="size-4 text-muted-foreground" />}
+                count={lang.count}
+                percentage={Number(lang.percentage)}
+                subtitle={lang.code !== lang.name ? lang.code : undefined}
+              />
             ))}
           </div>
         )}

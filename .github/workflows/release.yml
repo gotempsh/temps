@@ -52,6 +52,16 @@ env:
 permissions: {}
 
 jobs:
+  daemon-images:
+    needs: create-release
+    uses: ./.github/workflows/daemon-images.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      channel: ${{ needs.create-release.outputs.is_prerelease == 'true' && 'beta' || 'stable' }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   validate-release-ref:
     name: Validate Release Ref
     runs-on: ubuntu-latest
@@ -101,13 +111,11 @@ jobs:
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install web dependencies
         run: |
           cd web
-          bun install
+          bun install --frozen-lockfile
 
       - name: Install wasm-pack and Build WASM
         run: |

@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
+import { toast } from 'sonner'
 import {
   firstIncompleteGettingStartedIndex,
   onboardingStepPosition,
@@ -38,7 +39,8 @@ const STEP_ICONS: Record<string, LucideIcon> = {
 }
 
 export function OnboardingNextStepCard() {
-  const { items, totalCount, visible } = useGettingStarted()
+  const { items, totalCount, visible, markHarnessCompleted } =
+    useGettingStarted()
   const [selectedStepKey, setSelectedStepKey] = useState<string | null>(null)
   const firstIncompleteIndex = firstIncompleteGettingStartedIndex(items)
   const selectedIndex = selectedStepKey
@@ -91,6 +93,30 @@ export function OnboardingNextStepCard() {
         </div>
 
         <div className="flex w-full shrink-0 flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end">
+          {selectedStep.key === 'ai' && !selectedStep.done && (
+            <Button
+              variant="link"
+              size="sm"
+              title="Save this checklist acknowledgment for your account in this browser"
+              onClick={() => {
+                try {
+                  markHarnessCompleted()
+                  setSelectedStepKey(null)
+                  toast.success(
+                    'Harness setup marked as completed in this browser.'
+                  )
+                } catch (error) {
+                  toast.error(
+                    error instanceof Error
+                      ? error.message
+                      : 'Could not save checklist progress.'
+                  )
+                }
+              }}
+            >
+              Mark as completed
+            </Button>
+          )}
           <Button asChild size="sm" className="w-full sm:w-auto">
             <Link to={selectedStep.href}>
               <span className="truncate">{selectedStep.cta}</span>

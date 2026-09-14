@@ -768,19 +768,20 @@ mod tests {
         }
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
-        let container = match GenericImage::new("minio/minio", "latest")
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .start()
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                println!("Failed to start MinIO container ({}), skipping", e);
-                return;
-            }
-        };
+        let container =
+            match GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+                .start()
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("Failed to start MinIO container ({}), skipping", e);
+                    return;
+                }
+            };
 
         let port = container
             .get_host_port_ipv4(9000)

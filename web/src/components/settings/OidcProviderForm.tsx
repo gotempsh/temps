@@ -70,12 +70,12 @@ export function OidcProviderForm({
 
   const placeholders = useMemo(
     () => getOidcTemplatePlaceholders(value.template),
-    [value.template],
+    [value.template]
   )
 
   const update = <K extends keyof OidcProviderFormValues>(
     key: K,
-    next: OidcProviderFormValues[K],
+    next: OidcProviderFormValues[K]
   ) => {
     onChange({ ...value, [key]: next })
   }
@@ -87,8 +87,8 @@ export function OidcProviderForm({
           ...value,
           template,
         },
-        template,
-      ),
+        template
+      )
     )
   }
 
@@ -108,7 +108,7 @@ export function OidcProviderForm({
     >
       <section className="space-y-4">
         <div>
-          <h2 className="text-base font-semibold">Basics</h2>
+          <h2 className="text-base font-semibold">1. Provider</h2>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2 sm:col-span-2">
@@ -174,7 +174,7 @@ export function OidcProviderForm({
 
       <section className="space-y-4">
         <div>
-          <h2 className="text-base font-semibold">OIDC</h2>
+          <h2 className="text-base font-semibold">2. Connection</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Issuer URL is required; the rest of the metadata is fetched via{' '}
             <code className="rounded bg-muted px-1 py-0.5 text-xs">
@@ -208,7 +208,11 @@ export function OidcProviderForm({
               type="password"
               value={value.client_secret}
               onChange={(event) => update('client_secret', event.target.value)}
-              placeholder={mode === 'edit' ? 'Leave blank to keep current secret' : undefined}
+              placeholder={
+                mode === 'edit'
+                  ? 'Leave blank to keep current secret'
+                  : undefined
+              }
               autoComplete="new-password"
             />
           </div>
@@ -288,7 +292,7 @@ export function OidcProviderForm({
 
       <section className="space-y-4">
         <div>
-          <h2 className="text-base font-semibold">First-login policy</h2>
+          <h2 className="text-base font-semibold">3. User access</h2>
         </div>
         <div className="flex items-center justify-between rounded-lg border p-4">
           <div className="space-y-0.5 pr-4">
@@ -315,9 +319,8 @@ export function OidcProviderForm({
             <p className="text-xs text-muted-foreground">
               Enable only for corporate IdPs where an admin controls user
               provisioning — e.g. Okta Org Authorization Server, Azure AD,
-              internal SSO. <strong>Do not enable</strong> for public IdPs
-              that allow self-signup (Auth0 social logins, Google consumer
-              accounts).
+              internal SSO. <strong>Do not enable</strong> for public IdPs that
+              allow self-signup (Auth0 social logins, Google consumer accounts).
             </p>
             <p className="text-xs text-amber-700 dark:text-amber-300">
               Security risk: if an attacker can register{' '}

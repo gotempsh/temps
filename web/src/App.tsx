@@ -35,6 +35,7 @@ import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
+import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
 import { AiAssistantProvider } from './components/ai/AiAssistantContext'
@@ -71,6 +72,7 @@ const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
+const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
@@ -270,6 +272,12 @@ const RequiredPasswordChange = lazy(() =>
     default: m.RequiredPasswordChange,
   }))
 )
+const GlobalAnalytics = lazy(
+  () => import('./pages/observability/GlobalAnalytics')
+)
+const GlobalTraces = lazy(() => import('./pages/observability/GlobalTraces'))
+const GlobalLogs = lazy(() => import('./pages/observability/GlobalLogs'))
+const GlobalErrors = lazy(() => import('./pages/observability/GlobalErrors'))
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
@@ -592,7 +600,9 @@ const FullAppRoutes = () => {
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
-                    <Route path="/sandboxes" element={<Sandboxes />} />
+              <Route path="/sandboxes" element={<Sandboxes />} />
+              <Route path="/workspaces" element={<Sandboxes key="workspaces" workspacesOnly />} />
+              <Route path="/workspaces/:workspaceId" element={<WorkspaceDetail />} />
                     <Route
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}
@@ -620,6 +630,11 @@ const FullAppRoutes = () => {
                       element={<Navigate to="/monitoring/alarms" replace />}
                     />
                     {/* Observe section */}
+                    <Route path="/analytics" element={<GlobalAnalytics />} />
+                    <Route path="/traces" element={<GlobalTraces />} />
+                    <Route path="/logs" element={<GlobalLogs />} />
+                    <Route path="/errors" element={<GlobalErrors />} />
+
                     {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
                     <Route
                       path="/traces/global/:traceId"
@@ -1006,6 +1021,10 @@ const AppContent = () => {
                 />
 
                 {/* Protected routes - layout determined by demo mode */}
+                <Route
+                  path="/sandbox-preview"
+                  element={<SandboxPreviewAccess />}
+                />
                 <Route
                   path="/*"
                   element={

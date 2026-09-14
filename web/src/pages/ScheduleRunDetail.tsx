@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   getBackupScheduleOptions,
   getS3SourceOptions,
@@ -72,7 +74,7 @@ import { toast } from 'sonner'
 // ── Local helpers ────────────────────────────────────────────────────────────
 
 function stateBadgeVariant(
-  state: string,
+  state: string
 ): 'default' | 'secondary' | 'destructive' | 'outline' {
   switch (state) {
     case 'completed':
@@ -155,7 +157,7 @@ export function ScheduleRunDetail() {
   // ── Page meta ────────────────────────────────────────────────────────────
 
   usePageTitle(
-    schedule ? `Run #${runIdNum} • ${schedule.name}` : `Run #${runIdNum}`,
+    schedule ? `Run #${runIdNum} • ${schedule.name}` : `Run #${runIdNum}`
   )
 
   useEffect(() => {
@@ -254,7 +256,7 @@ export function ScheduleRunDetail() {
   const startedAt = jobs?.length
     ? jobs.reduce(
         (min, j) => (j.started_at < min ? j.started_at : min),
-        jobs[0].started_at,
+        jobs[0].started_at
       )
     : undefined
 
@@ -297,14 +299,18 @@ export function ScheduleRunDetail() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <div className="min-w-0">
-              <h1 className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xl font-semibold tracking-tight sm:text-2xl">
-                <span>Run #{runIdNum}</span>
-                {jobs && (
-                  <Badge variant={stateBadgeVariant(aggregateState)}>
-                    {aggregateState}
-                  </Badge>
-                )}
-              </h1>
+              <PageHeader
+                title={
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span>Run #{runIdNum}</span>
+                    {jobs && (
+                      <Badge variant={stateBadgeVariant(aggregateState)}>
+                        {aggregateState}
+                      </Badge>
+                    )}
+                  </span>
+                }
+              />
               {isSchedulePending ? (
                 <Skeleton className="mt-1 h-4 w-48" />
               ) : schedule ? (
@@ -372,241 +378,254 @@ export function ScheduleRunDetail() {
           </div>
         </div>
 
-        {/* ── Summary stats ──────────────────────────────────────────── */}
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          <SummaryStat
-            label="Started"
-            value={
-              startedAt
-                ? format(new Date(startedAt), 'MMM d, yyyy HH:mm:ss')
-                : '—'
-            }
-            mono
-          />
-          <SummaryStat
-            label="Finished"
-            value={
-              finishedAt
-                ? format(new Date(finishedAt), 'MMM d, yyyy HH:mm:ss')
-                : aggregateState === 'running'
-                  ? 'Running…'
-                  : '—'
-            }
-            mono
-          />
-          <SummaryStat
-            label="Duration"
-            value={durationMs !== null ? formatDuration(durationMs) : '—'}
-          />
-          <SummaryStat
-            label="Jobs"
-            value={
-              failed > 0 ? (
-                <span>
-                  {completed} / {total}{' '}
-                  <span className="text-destructive">({failed} failed)</span>
-                </span>
-              ) : (
-                <span>
-                  {completed} / {total}
-                </span>
-              )
-            }
-          />
-        </div>
+        <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <div className="min-w-0">
+            {' '}
+            {/* ── Jobs table ─────────────────────────────────────────────── */}
+            <Card className="overflow-hidden shadow-none">
+              <CardHeader className="border-b px-5 py-4">
+                <CardTitle className="text-base font-semibold">
+                  Backup jobs
+                </CardTitle>
+                <CardDescription>
+                  One row per backup in this scheduler tick (control plane +
+                  each external service).
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="px-0">
+                {isJobsPending ? (
+                  <div className="space-y-2 px-4 pb-6 sm:px-6">
+                    {[...Array(4)].map((_, i) => (
+                      <Skeleton key={i} className="h-10 w-full" />
+                    ))}
+                  </div>
+                ) : isJobsError ? (
+                  <div className="px-4 pb-6 text-base text-destructive sm:px-6 sm:text-sm">
+                    Failed to load jobs:{' '}
+                    {jobsError instanceof Error
+                      ? jobsError.message
+                      : 'Unknown error'}
+                  </div>
+                ) : !jobs || jobs.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center px-4 py-12 text-center text-base text-muted-foreground sm:px-6 sm:text-sm">
+                    <DatabaseBackup className="mb-3 h-8 w-8 opacity-40" />
+                    No child jobs recorded for this run.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <Table className="min-w-[560px]">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Service</TableHead>
+                          <TableHead className="hidden sm:table-cell">
+                            Engine
+                          </TableHead>
+                          <TableHead>State</TableHead>
+                          <TableHead className="hidden md:table-cell">
+                            Started
+                          </TableHead>
+                          <TableHead className="hidden lg:table-cell">
+                            Duration
+                          </TableHead>
+                          <TableHead className="hidden sm:table-cell">
+                            Size
+                          </TableHead>
+                          <TableHead className="hidden xl:table-cell">
+                            Error
+                          </TableHead>
+                          <TableHead className="w-10" />
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {jobs.map((job) => {
+                          const jobDurationMs =
+                            job.started_at && job.finished_at
+                              ? new Date(job.finished_at).getTime() -
+                                new Date(job.started_at).getTime()
+                              : null
 
-        {/* ── Jobs table ─────────────────────────────────────────────── */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Backup jobs</CardTitle>
-            <CardDescription>
-              One row per backup in this scheduler tick (control plane + each
-              external service).
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="px-0">
-            {isJobsPending ? (
-              <div className="space-y-2 px-4 pb-6 sm:px-6">
-                {[...Array(4)].map((_, i) => (
-                  <Skeleton key={i} className="h-10 w-full" />
-                ))}
-              </div>
-            ) : isJobsError ? (
-              <div className="px-4 pb-6 text-base text-destructive sm:px-6 sm:text-sm">
-                Failed to load jobs:{' '}
-                {jobsError instanceof Error
-                  ? jobsError.message
-                  : 'Unknown error'}
-              </div>
-            ) : !jobs || jobs.length === 0 ? (
-              <div className="flex flex-col items-center justify-center px-4 py-12 text-center text-base text-muted-foreground sm:px-6 sm:text-sm">
-                <DatabaseBackup className="mb-3 h-8 w-8 opacity-40" />
-                No child jobs recorded for this run.
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <Table className="min-w-[560px]">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Service</TableHead>
-                      <TableHead className="hidden sm:table-cell">
-                        Engine
-                      </TableHead>
-                      <TableHead>State</TableHead>
-                      <TableHead className="hidden md:table-cell">
-                        Started
-                      </TableHead>
-                      <TableHead className="hidden lg:table-cell">
-                        Duration
-                      </TableHead>
-                      <TableHead className="hidden sm:table-cell">
-                        Size
-                      </TableHead>
-                      <TableHead className="hidden xl:table-cell">
-                        Error
-                      </TableHead>
-                      <TableHead className="w-10" />
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {jobs.map((job) => {
-                      const jobDurationMs =
-                        job.started_at && job.finished_at
-                          ? new Date(job.finished_at).getTime() -
-                            new Date(job.started_at).getTime()
-                          : null
+                          const detailUrl = `/backups/s3-sources/${job.s3_source_id}/backups/${job.backup_uuid}`
 
-                      const detailUrl = `/backups/s3-sources/${job.s3_source_id}/backups/${job.backup_uuid}`
-
-                      return (
-                        <TableRow
-                          key={job.backup_id}
-                          className="hover:bg-muted/50"
-                        >
-                          <TableCell className="font-medium">
-                            <Link
-                              to={detailUrl}
-                              className="block min-w-0 max-w-[200px] truncate hover:underline sm:max-w-none"
-                              title={job.service_name}
+                          return (
+                            <TableRow
+                              key={job.backup_id}
+                              className="hover:bg-muted/50"
                             >
-                              {job.service_name}
-                            </Link>
-                            {/* Mobile-only inline meta so users see something
+                              <TableCell className="font-medium">
+                                <Link
+                                  to={detailUrl}
+                                  className="block min-w-0 max-w-[200px] truncate hover:underline sm:max-w-none"
+                                  title={job.service_name}
+                                >
+                                  {job.service_name}
+                                </Link>
+                                {/* Mobile-only inline meta so users see something
                                 useful below the service name when the columns
                                 are hidden. */}
-                            <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-muted-foreground sm:hidden">
-                              <span className="font-mono">{job.engine}</span>
-                              {job.size_bytes != null && (
-                                <>
-                                  <span>·</span>
-                                  <span>{formatBytes(job.size_bytes)}</span>
-                                </>
-                              )}
-                            </div>
-                          </TableCell>
-                          <TableCell className="hidden font-mono text-xs text-muted-foreground sm:table-cell">
-                            {job.engine}
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant={stateBadgeVariant(job.state)}>
-                              {job.state === 'running' ||
-                              job.state === 'pending' ? (
-                                <span className="flex items-center gap-1">
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                  {job.state}
-                                </span>
-                              ) : (
-                                job.state
-                              )}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="hidden font-mono text-xs text-muted-foreground md:table-cell">
-                            {format(
-                              new Date(job.started_at),
-                              'MMM d HH:mm:ss',
-                            )}
-                          </TableCell>
-                          <TableCell className="hidden text-sm text-muted-foreground lg:table-cell">
-                            {jobDurationMs !== null
-                              ? formatDuration(jobDurationMs)
-                              : job.state === 'running' ||
-                                  job.state === 'pending'
-                                ? '…'
-                                : '—'}
-                          </TableCell>
-                          <TableCell className="hidden text-sm sm:table-cell">
-                            {job.size_bytes != null
-                              ? formatBytes(job.size_bytes)
-                              : '—'}
-                          </TableCell>
-                          <TableCell className="hidden max-w-[280px] xl:table-cell">
-                            {job.error_message ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="block truncate text-xs text-destructive">
-                                    {job.error_message}
+                                <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-muted-foreground sm:hidden">
+                                  <span className="font-mono">
+                                    {job.engine}
                                   </span>
-                                </TooltipTrigger>
-                                <TooltipContent
-                                  side="top"
-                                  className="max-w-md whitespace-pre-wrap break-words"
-                                >
-                                  {job.error_message}
-                                </TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <span className="text-xs text-muted-foreground">
-                                —
-                              </span>
-                            )}
-                          </TableCell>
-                          <TableCell className="w-10 p-0 align-middle">
-                            {/* Kebab menu — only when the job is still
+                                  {job.size_bytes != null && (
+                                    <>
+                                      <span>·</span>
+                                      <span>{formatBytes(job.size_bytes)}</span>
+                                    </>
+                                  )}
+                                </div>
+                              </TableCell>
+                              <TableCell className="hidden font-mono text-xs text-muted-foreground sm:table-cell">
+                                {job.engine}
+                              </TableCell>
+                              <TableCell>
+                                <Badge variant={stateBadgeVariant(job.state)}>
+                                  {job.state === 'running' ||
+                                  job.state === 'pending' ? (
+                                    <span className="flex items-center gap-1">
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                      {job.state}
+                                    </span>
+                                  ) : (
+                                    job.state
+                                  )}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="hidden font-mono text-xs text-muted-foreground md:table-cell">
+                                {format(
+                                  new Date(job.started_at),
+                                  'MMM d HH:mm:ss'
+                                )}
+                              </TableCell>
+                              <TableCell className="hidden text-sm text-muted-foreground lg:table-cell">
+                                {jobDurationMs !== null
+                                  ? formatDuration(jobDurationMs)
+                                  : job.state === 'running' ||
+                                      job.state === 'pending'
+                                    ? '…'
+                                    : '—'}
+                              </TableCell>
+                              <TableCell className="hidden text-sm sm:table-cell">
+                                {job.size_bytes != null
+                                  ? formatBytes(job.size_bytes)
+                                  : '—'}
+                              </TableCell>
+                              <TableCell className="hidden max-w-[280px] xl:table-cell">
+                                {job.error_message ? (
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="block truncate text-xs text-destructive">
+                                        {job.error_message}
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent
+                                      side="top"
+                                      className="max-w-md whitespace-pre-wrap break-words"
+                                    >
+                                      {job.error_message}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                ) : (
+                                  <span className="text-xs text-muted-foreground">
+                                    —
+                                  </span>
+                                )}
+                              </TableCell>
+                              <TableCell className="w-10 p-0 align-middle">
+                                {/* Kebab menu — only when the job is still
                                 live. Terminal jobs have no actionable verbs
                                 today, so the column shows blank rather
                                 than a disabled menu. */}
-                            {(job.state === 'running' ||
-                              job.state === 'pending') && (
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-8 w-8"
-                                    aria-label={`Actions for ${job.service_name}`}
-                                  >
-                                    <MoreHorizontal className="h-4 w-4" />
-                                  </Button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end">
-                                  <DropdownMenuItem
-                                    onSelect={(e) => {
-                                      // Prevent the menu from auto-closing
-                                      // before the AlertDialog mounts.
-                                      e.preventDefault()
-                                      setJobToCancel({
-                                        backup_id: job.backup_id,
-                                        service_name: job.service_name,
-                                      })
-                                    }}
-                                    className="text-destructive focus:text-destructive"
-                                  >
-                                    <Ban className="mr-2 h-4 w-4" />
-                                    Cancel
-                                  </DropdownMenuItem>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+                                {(job.state === 'running' ||
+                                  job.state === 'pending') && (
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="h-8 w-8"
+                                        aria-label={`Actions for ${job.service_name}`}
+                                      >
+                                        <MoreHorizontal className="h-4 w-4" />
+                                      </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end">
+                                      <DropdownMenuItem
+                                        onSelect={(e) => {
+                                          // Prevent the menu from auto-closing
+                                          // before the AlertDialog mounts.
+                                          e.preventDefault()
+                                          setJobToCancel({
+                                            backup_id: job.backup_id,
+                                            service_name: job.service_name,
+                                          })
+                                        }}
+                                        className="text-destructive focus:text-destructive"
+                                      >
+                                        <Ban className="mr-2 h-4 w-4" />
+                                        Cancel
+                                      </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+          <aside className="min-w-0">
+            {' '}
+            {/* ── Summary stats ──────────────────────────────────────────── */}
+            <div className="grid gap-3">
+              <SummaryStat
+                label="Started"
+                value={
+                  startedAt
+                    ? format(new Date(startedAt), 'MMM d, yyyy HH:mm:ss')
+                    : '—'
+                }
+                mono
+              />
+              <SummaryStat
+                label="Finished"
+                value={
+                  finishedAt
+                    ? format(new Date(finishedAt), 'MMM d, yyyy HH:mm:ss')
+                    : aggregateState === 'running'
+                      ? 'Running…'
+                      : '—'
+                }
+                mono
+              />
+              <SummaryStat
+                label="Duration"
+                value={durationMs !== null ? formatDuration(durationMs) : '—'}
+              />
+              <SummaryStat
+                label="Jobs"
+                value={
+                  failed > 0 ? (
+                    <span>
+                      {completed} / {total}{' '}
+                      <span className="text-destructive">
+                        ({failed} failed)
+                      </span>
+                    </span>
+                  ) : (
+                    <span>
+                      {completed} / {total}
+                    </span>
+                  )
+                }
+              />
+            </div>
+          </aside>
+        </div>
       </div>
 
       {/* Cancel-the-whole-run confirmation. Open via the header button. */}
@@ -625,9 +644,9 @@ export function ScheduleRunDetail() {
             <AlertDialogTitle>Cancel this run?</AlertDialogTitle>
             <AlertDialogDescription>
               Every pending and running backup in this scheduler tick will be
-              flipped to <strong>failed</strong>. Engines that are mid-dump
-              will stop cleanly on the next heartbeat tick (within ~5
-              seconds). Already-completed backups stay completed.
+              flipped to <strong>failed</strong>. Engines that are mid-dump will
+              stop cleanly on the next heartbeat tick (within ~5 seconds).
+              Already-completed backups stay completed.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

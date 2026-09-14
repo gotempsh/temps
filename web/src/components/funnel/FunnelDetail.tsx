@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateRangePicker } from '@/components/ui/date-range-picker'
+
 import { ProjectResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,26 +12,17 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Calendar } from '@/components/ui/calendar'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import { getFunnelMetricsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
-import { ArrowLeft, Calendar as CalendarIcon } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import { useGoBack } from '@/hooks/useGoBack'
 import { FunnelVisualization } from './FunnelVisualization'
 import {
   FUNNEL_DEFAULT_RANGE_KEY,
-  FUNNEL_QUICK_RANGES,
-  funnelQuickRange,
   funnelQuickRangeBounds,
 } from './funnel-quick-ranges'
 
@@ -40,31 +33,9 @@ interface FunnelDetailProps {
 
 export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
   const goBack = useGoBack(`/projects/${project.slug}/analytics/funnels`)
-  // Which preset is highlighted, or null once the calendar is used. Tracked
-  // explicitly rather than inferred from the dates, so a custom range that
-  // happens to be 30 days long doesn't light up the "30d" button.
-  const [activeRangeKey, setActiveRangeKey] = React.useState<string | null>(
-    FUNNEL_DEFAULT_RANGE_KEY
-  )
   const [dateRange, setDateRange] = React.useState<DateRange | undefined>(() =>
     funnelQuickRangeBounds(FUNNEL_DEFAULT_RANGE_KEY)
   )
-
-  const selectQuickRange = (key: string) => {
-    // Re-resolved against the current clock, so "24h" is still the last 24
-    // hours on a tab that has been open since yesterday.
-    setDateRange(funnelQuickRangeBounds(key))
-    setActiveRangeKey(key)
-  }
-
-  const selectCustomRange = (range: DateRange | undefined) => {
-    setDateRange(range)
-    setActiveRangeKey(null)
-  }
-
-  const activeRangeDescription = activeRangeKey
-    ? funnelQuickRange(activeRangeKey)?.description
-    : undefined
 
   const {
     data: metrics,
@@ -102,76 +73,7 @@ export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div
-            className="flex items-center gap-0.5 rounded-md bg-muted p-0.5"
-            role="group"
-            aria-label="Funnel time range"
-          >
-            {FUNNEL_QUICK_RANGES.map((range) => {
-              const isActive = activeRangeKey === range.key
-              return (
-                <Button
-                  key={range.key}
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className={cn(
-                    'h-7 px-2.5 text-xs font-medium',
-                    isActive
-                      ? 'bg-background text-foreground shadow-sm hover:bg-background'
-                      : 'text-muted-foreground hover:text-foreground'
-                  )}
-                  aria-pressed={isActive}
-                  title={range.description}
-                  onClick={() => selectQuickRange(range.key)}
-                >
-                  {range.label}
-                  <span className="sr-only"> — {range.description}</span>
-                </Button>
-              )
-            })}
-          </div>
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant={activeRangeKey ? 'ghost' : 'secondary'}
-                size="sm"
-                className={cn(
-                  'h-8 justify-start text-left font-normal',
-                  !dateRange && 'text-muted-foreground'
-                )}
-                title="Pick a custom date range"
-              >
-                <CalendarIcon className="mr-2 h-4 w-4" />
-                {/* While a preset is active its name is the honest label —
-                    "Last 24 hours" beats two identical-looking dates. */}
-                {activeRangeDescription ??
-                  (dateRange?.from ? (
-                    dateRange.to ? (
-                      <>
-                        {format(dateRange.from, 'LLL dd, y')} -{' '}
-                        {format(dateRange.to, 'LLL dd, y')}
-                      </>
-                    ) : (
-                      format(dateRange.from, 'LLL dd, y')
-                    )
-                  ) : (
-                    <span>Pick a date range</span>
-                  ))}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                autoFocus
-                mode="range"
-                defaultMonth={dateRange?.from}
-                selected={dateRange}
-                onSelect={selectCustomRange}
-                numberOfMonths={2}
-                disabled={(date) => date > new Date()}
-              />
-            </PopoverContent>
-          </Popover>
+          <DateRangePicker date={dateRange} onDateChange={setDateRange} />
         </div>
       </div>
 

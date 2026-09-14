@@ -271,7 +271,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
-        workspace_chat_supported: false,
+        workspace_chat_supported: true,
         factory: || Box::new(super::codex::CodexCliProvider),
     },
     ProviderCatalogEntry {
@@ -283,7 +283,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
             id: "config_file",
             label: "Auth Config File",
             description:
-                "Paste the contents of `~/.local/share/opencode/auth.json` from a host where you've already run `opencode auth add`.",
+                "Paste or import an auth.json containing native Anthropic or OpenAI API-key or OAuth entries. Custom providers and authentication endpoints are not supported in sandbox mode.",
             format: CredentialFormat::ConfigFile,
             env_var: "",
             seed_path_rel: ".local/share/opencode/auth.json",
@@ -312,7 +312,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
-        workspace_chat_supported: false,
+        workspace_chat_supported: true,
         factory: || Box::new(super::opencode::OpenCodeCliProvider),
     },
 ];

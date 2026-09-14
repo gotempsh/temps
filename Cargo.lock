@@ -10323,6 +10323,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-agent-runtime"
+version = "0.1.0"
+source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=91ef59ba85140bafba6fcd50d91114e7edee99e8#91ef59ba85140bafba6fcd50d91114e7edee99e8"
+dependencies = [
+ "async-trait",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "temps-agents"
 version = "0.1.0-beta.56"
 dependencies = [
@@ -10405,12 +10421,15 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
+ "temps-agent-runtime",
  "temps-agents",
  "temps-ai",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "uuid",
@@ -10478,6 +10497,7 @@ dependencies = [
  "tracing",
  "unicode-casefold",
  "unicode-normalization",
+ "url",
  "utoipa",
  "uuid",
  "walkdir",
@@ -10673,6 +10693,7 @@ dependencies = [
  "axum-test",
  "base64 0.23.1",
  "chrono",
+ "dashmap",
  "flate2",
  "sea-orm",
  "serde",
@@ -10767,6 +10788,7 @@ dependencies = [
  "aws-smithy-http-client",
  "axum",
  "bollard",
+ "bytes",
  "chrono",
  "cron",
  "flate2",
@@ -10774,6 +10796,7 @@ dependencies = [
  "hex",
  "pem 4.0.0",
  "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_derive",
  "serde_json",
@@ -11219,6 +11242,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "libc",
  "mockall",
@@ -11653,27 +11678,39 @@ dependencies = [
 name = "temps-external-plugins"
 version = "0.1.0-beta.56"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "chrono",
+ "ed25519-dalek",
+ "flate2",
  "futures",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "reqwest 0.12.28",
  "sea-orm",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tar",
  "tempfile",
  "temps-auth",
  "temps-config",
  "temps-core",
  "temps-entities",
  "temps-presets",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tower",
  "tracing",
+ "tracing-subscriber",
+ "url",
  "utoipa",
  "uuid",
 ]
@@ -12246,6 +12283,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "sysinfo",
  "temps-config",
  "temps-core",
  "temps-entities",

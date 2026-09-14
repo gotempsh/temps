@@ -3174,7 +3174,7 @@ impl ExternalService for PostgresService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let resource_name = format!("{}_{}", project_id, environment);
+        let resource_name = super::scoped_resource_name(project_id, environment);
         let resource_name = Self::normalize_database_name(&resource_name);
 
         // Create the database
@@ -3189,7 +3189,7 @@ impl ExternalService for PostgresService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let resource_name = format!("{}_{}", project_id, environment);
+        let resource_name = super::scoped_resource_name(project_id, environment);
         let resource_name = Self::normalize_database_name(&resource_name);
         // Preview path: skip `create_database` so the UI can show what a
         // deployment would receive without actually provisioning the DB.
@@ -3666,7 +3666,7 @@ impl ExternalService for PostgresService {
     }
 
     async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
-        let resource_name = format!("{}_{}", project_id, environment);
+        let resource_name = super::scoped_resource_name(project_id, environment);
         self.drop_database(&resource_name).await
     }
 

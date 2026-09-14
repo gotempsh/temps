@@ -1978,6 +1978,8 @@ function PublicPortsInline({
                       : detectedHealthPath(row.service)
                         ? `Detected from this service’s Compose healthcheck.`
                         : 'Defaults to / when the Compose service has no HTTP healthcheck.'}
+                    {i === 0 &&
+                      ' Save and redeploy to update the automatic uptime monitor. To change its current path immediately, open Monitors.'}
                   </p>
                 </div>
               </div>

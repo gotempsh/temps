@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ExternalLink, Loader2, Monitor, RefreshCw } from 'lucide-react'
-import { type FormEvent, useCallback, useEffect, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
   createApplicationPreviewLink,
   createGlobalWorkspacePreviewLink,
@@ -10,40 +10,46 @@ import {
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { safePreviewHost } from './application-preview'
+import { showPreviewLoadingPage } from './preview-loading-page'
+import {
+  previewErrorMessage,
+  safePreviewHost,
+  previewRenewalPath,
+  previewCookieErrorMessage,
+} from './application-preview'
 
 async function requestPreviewLink(
   applicationPublicId: string | undefined,
-  port: number
+  port: number,
+  path = '/'
 ): Promise<ApplicationPreviewLinkResponse> {
   const { data } = applicationPublicId
     ? await createApplicationPreviewLink({
         path: { application_public_id: applicationPublicId },
-        body: { port, path: '/' },
+        body: { port, path },
         throwOnError: true,
       })
     : await createGlobalWorkspacePreviewLink({
-        body: { port, path: '/' },
+        body: { port, path },
         throwOnError: true,
       })
   return data
 }
 
-function previewErrorMessage(error: unknown): string {
-  if (error && typeof error === 'object') {
-    const payload = error as {
-      detail?: unknown
-      title?: unknown
-      message?: unknown
-    }
-    for (const candidate of [payload.detail, payload.title, payload.message]) {
-      if (typeof candidate === 'string' && candidate.trim()) return candidate
-    }
-  }
-  return 'Temps could not open this sandbox preview.'
+export function ApplicationPreviewPanel({
+  applicationPublicId,
+}: {
+  applicationPublicId?: string
+}) {
+  return (
+    <PreviewContent
+      key={applicationPublicId ?? 'global'}
+      applicationPublicId={applicationPublicId}
+    />
+  )
 }
 
-export function ApplicationPreviewPanel({
+function PreviewContent({
   applicationPublicId,
 }: {
   applicationPublicId?: string
@@ -54,39 +60,106 @@ export function ApplicationPreviewPanel({
   )
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [cookieBlocked, setCookieBlocked] = useState(false)
+  const iframe = useRef<HTMLIFrameElement>(null)
+  const generation = useRef(0)
+  const lastRenewal = useRef(0)
+  const activePort = useRef(3000)
+  const activePath = useRef('/')
 
   const loadPreviewPort = useCallback(
-    async (port: number) => {
+    async (port: number, path = '/') => {
+      const request = ++generation.current
+      activePort.current = port
+      activePath.current = path
       setLoading(true)
       setError(null)
+      setCookieBlocked(false)
       try {
-        setPreview(await requestPreviewLink(applicationPublicId, port))
+        const next = await requestPreviewLink(applicationPublicId, port, path)
+        if (request === generation.current) setPreview(next)
       } catch (cause) {
-        setPreview(null)
-        setError(previewErrorMessage(cause))
+        if (request === generation.current) {
+          setPreview(null)
+          setError(previewErrorMessage(cause))
+        }
       } finally {
-        setLoading(false)
+        if (request === generation.current) setLoading(false)
       }
     },
     [applicationPublicId]
   )
 
+  const invalidatePendingPreview = useCallback(() => {
+    generation.current++
+  }, [])
+
   useEffect(() => {
-    let cancelled = false
+    const request = ++generation.current
+    // The keyed component already starts in its loading state. Only update
+    // React state when the external authorization request settles.
     void requestPreviewLink(applicationPublicId, 3000)
-      .then((value) => {
-        if (!cancelled) setPreview(value)
+      .then((next) => {
+        if (request === generation.current) setPreview(next)
       })
       .catch((cause: unknown) => {
-        if (!cancelled) setError(previewErrorMessage(cause))
+        if (request === generation.current) setError(previewErrorMessage(cause))
       })
       .finally(() => {
-        if (!cancelled) setLoading(false)
+        if (request === generation.current) setLoading(false)
       })
-    return () => {
-      cancelled = true
+    return invalidatePendingPreview
+  }, [applicationPublicId, invalidatePendingPreview])
+
+  useEffect(() => {
+    if (!preview || cookieBlocked) return
+    const origin = new URL(preview.url).origin
+    const onMessage = (event: MessageEvent) => {
+      if (
+        event.source !== iframe.current?.contentWindow ||
+        event.origin !== origin
+      )
+        return
+      const path = previewRenewalPath(event.data, activePath.current)
+      if (path === null) return
+      activePath.current = path
+      if (Date.now() - lastRenewal.current < 60_000) {
+        setError(previewCookieErrorMessage(preview.url))
+        setCookieBlocked(true)
+        return
+      }
+      lastRenewal.current = Date.now()
+      void loadPreviewPort(activePort.current, path)
     }
-  }, [applicationPublicId])
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [preview, cookieBlocked, loadPreviewPort])
+
+  const openPreview = async () => {
+    const tab = window.open('about:blank', '_blank')
+    if (!tab) {
+      setError('Allow pop-ups to open the preview in a new tab.')
+      return
+    }
+    tab.opener = null
+    const request = generation.current
+    try {
+      showPreviewLoadingPage(tab)
+      const next = await requestPreviewLink(
+        applicationPublicId,
+        activePort.current,
+        activePath.current
+      )
+      if (request !== generation.current) {
+        tab.close()
+        return
+      }
+      tab.location.replace(next.url)
+    } catch (cause) {
+      tab.close()
+      if (request === generation.current) setError(previewErrorMessage(cause))
+    }
+  }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -107,7 +180,7 @@ export function ApplicationPreviewPanel({
         onSubmit={submit}
       >
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <Monitor className="size-3.5 shrink-0 text-success" />
+          <Monitor className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="text-[10px] text-muted-foreground">Port</span>
           <Input
             aria-label="Sandbox preview port"
@@ -136,24 +209,47 @@ export function ApplicationPreviewPanel({
         </Button>
       </form>
 
-      {host && preview ? (
+      {error && preview && !cookieBlocked && (
+        <p role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
+      )}
+      {cookieBlocked ? (
+        <section className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+          <p className="text-xs font-medium">Open this preview in a new tab</p>
+          <p
+            role="alert"
+            className="mt-1 text-xs leading-5 text-muted-foreground"
+          >
+            {error}
+          </p>
+          <Button
+            className="mt-3"
+            onClick={() => void openPreview()}
+            size="sm"
+            variant="outline"
+          >
+            <ExternalLink className="mr-2 size-3.5" />
+            Open preview in new tab
+          </Button>
+        </section>
+      ) : host && preview ? (
         <section className="overflow-hidden rounded-xl border border-border bg-background shadow-sm">
           <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-2.5 py-2">
-            <span className="size-1.5 rounded-full bg-success shadow-[0_0_0_3px_hsl(var(--success)/0.12)]" />
             <span className="min-w-0 flex-1 truncate font-mono text-[9px] text-muted-foreground">
               {host}
             </span>
-            <a
+            <button
               aria-label="Open sandbox preview in a new tab"
               className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              href={preview.url}
-              rel="noreferrer"
-              target="_blank"
+              type="button"
+              onClick={() => void openPreview()}
             >
               <ExternalLink className="size-3.5" />
-            </a>
+            </button>
           </div>
           <iframe
+            ref={iframe}
             className="h-[calc(100dvh-11rem)] min-h-[420px] w-full bg-white"
             referrerPolicy="no-referrer"
             sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
@@ -168,8 +264,8 @@ export function ApplicationPreviewPanel({
             {error}
           </p>
           <p className="mt-2 text-[10px] leading-5 text-muted-foreground">
-            Start a development server that listens on 0.0.0.0, then enter its
-            port above.
+            Check the issue above, then retry. If the app is unreachable, check
+            that its server listens on 0.0.0.0 and the selected port.
           </p>
         </section>
       ) : (

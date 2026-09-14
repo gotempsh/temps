@@ -3,13 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -21,7 +15,14 @@ import type {
   ConnectionLimitSettings,
   TenantResourceCeilings,
 } from '@/api/client/types.gen'
-import { AlertCircle, Gauge, Loader2, Save, ShieldCheck, Timer } from 'lucide-react'
+import {
+  AlertCircle,
+  Gauge,
+  Loader2,
+  Save,
+  ShieldCheck,
+  Timer,
+} from 'lucide-react'
 import { Controller } from 'react-hook-form'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
@@ -135,25 +136,13 @@ export function RequestTimeoutsPage() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Timer className="h-5 w-5" />
-            Request Timeouts
-          </CardTitle>
-          <CardDescription>
-            How long the proxy waits on upstream app traffic before closing the
-            connection. Timeouts are opt-in — 0 means no timeout, and
-            that&apos;s the default for every traffic class, so existing apps
-            are unaffected until you configure one. Server-Sent Events and
-            WebSocket connections get their own idle timeout since they&apos;re
-            long-lived by design — a plain HTTP request uses the regular timeout
-            instead. Projects and environments can set their own override under
-            Deployment Config; the ceiling below only applies once a timeout is
-            actually configured, and never longer than that.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
+      <SettingsSection
+        title="Request Timeouts"
+        description="Configure proxy timeouts for HTTP, Server-Sent Events, and WebSocket traffic"
+        icon={Timer}
+        hasError={Boolean(errors.request_timeouts)}
+      >
+        <div className="space-y-6">
           <div className="space-y-2 max-w-xs">
             <Label htmlFor="max_request_timeout_seconds">
               Hard ceiling (seconds)
@@ -254,82 +243,68 @@ export function RequestTimeoutsPage() {
               )}
             </div>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Gauge className="h-5 w-5" />
-            Concurrent Connection Limit
-          </CardTitle>
-          <CardDescription>
-            Caps how many concurrent in-flight requests the proxy allows to a
-            single project/environment&apos;s upstream, independent of the
-            timeouts above — protects the proxy&apos;s own connection budget
-            from a single stalled or malicious app. 0 = unlimited, and
-            that&apos;s the default, so existing apps are unaffected until you
-            configure a limit. Matters most when multiple apps share one
-            node/instance — a project or environment can override this under
-            Deployment Config.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2 max-w-xs">
-            <Label htmlFor="default_max_concurrent_connections">
-              Max concurrent connections
-            </Label>
-            <Input
-              id="default_max_concurrent_connections"
-              type="number"
-              min={0}
-              {...register(
-                'connection_limits.default_max_concurrent_connections',
-                { valueAsNumber: true, required: true, min: 0 }
-              )}
-            />
-            <p className="text-xs text-muted-foreground">
-              0 = unlimited (default). Requests over the limit get an immediate
-              503 instead of queuing.
-            </p>
-            {errors.connection_limits?.default_max_concurrent_connections && (
-              <p className="text-xs text-destructive">
-                Must be 0 (unlimited) or greater
-              </p>
+      <SettingsSection
+        title="Concurrent Connection Limit"
+        description="Cap concurrent in-flight requests for each project environment"
+        icon={Gauge}
+        hasError={Boolean(errors.connection_limits)}
+      >
+        <div className="space-y-2 max-w-xs">
+          <Label htmlFor="default_max_concurrent_connections">
+            Max concurrent connections
+          </Label>
+          <Input
+            id="default_max_concurrent_connections"
+            type="number"
+            min={0}
+            {...register(
+              'connection_limits.default_max_concurrent_connections',
+              { valueAsNumber: true, required: true, min: 0 }
             )}
-          </div>
-        </CardContent>
-      </Card>
+          />
+          <p className="text-xs text-muted-foreground">
+            0 = unlimited (default). Requests over the limit get an immediate
+            503 instead of queuing.
+          </p>
+          {errors.connection_limits?.default_max_concurrent_connections && (
+            <p className="text-xs text-destructive">
+              Must be 0 (unlimited) or greater
+            </p>
+          )}
+        </div>
+      </SettingsSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5" />
-            Project Override Ceilings
-          </CardTitle>
-          <CardDescription>
-            The two settings above are <em>defaults</em> — anyone who can edit a
-            project or environment&apos;s Deployment Config can override them,
-            including overriding them to unlimited. These ceilings bound those
-            overrides. All three are off by default, so nothing changes until
-            you set one, and holders of the Settings write permission are never
-            blocked by them. An override that breaks a ceiling is rejected with
-            an explanation, never silently reduced.
-            <br />
-            <br />
-            <strong>Applied when a config is saved, not retroactively.</strong>{' '}
-            Setting a ceiling here does not change projects that already exceed
-            it — they keep running as configured until someone next edits them.
-            Note also that the memory ceiling is per container, so a project
-            with several replicas can still total more than the ceiling.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
+      <SettingsSection
+        title="Project Override Ceilings"
+        description="Bound the resource and timeout overrides projects and environments can configure"
+        icon={ShieldCheck}
+        hasError={Boolean(errors.tenant_resource_ceilings)}
+      >
+        <div className="mb-6 text-sm text-muted-foreground">
+          The two settings above are <em>defaults</em> — anyone who can edit a
+          project or environment&apos;s Deployment Config can override them,
+          including overriding them to unlimited. These ceilings bound those
+          overrides. All three are off by default, so nothing changes until you
+          set one, and holders of the Settings write permission are never
+          blocked by them. An override that breaks a ceiling is rejected with an
+          explanation, never silently reduced.
+          <br />
+          <br />
+          <strong>
+            Applied when a config is saved, not retroactively.
+          </strong>{' '}
+          Setting a ceiling here does not change projects that already exceed it
+          — they keep running as configured until someone next edits them. Note
+          also that the memory ceiling is per container, so a project with
+          several replicas can still total more than the ceiling.
+        </div>
+        <div className="space-y-6">
           <div className="grid gap-6 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="max_memory_limit_mb">
-                Max memory limit (MB)
-              </Label>
+              <Label htmlFor="max_memory_limit_mb">Max memory limit (MB)</Label>
               <Input
                 id="max_memory_limit_mb"
                 type="number"
@@ -400,8 +375,8 @@ export function RequestTimeoutsPage() {
               )}
             />
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {isDirty && (
         <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">

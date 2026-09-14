@@ -9,13 +9,18 @@ import {
   getEnvironmentsOptions,
   getCurrentMonitorStatusOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse, MonitorResponse, EnvironmentResponse } from '@/api/client'
+import {
+  ProjectResponse,
+  MonitorResponse,
+  EnvironmentResponse,
+} from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
@@ -98,7 +103,12 @@ interface MonitorCardProps {
   environment?: EnvironmentResponse
 }
 
-function MonitorCard({ monitor, projectSlug, onDelete, environment }: MonitorCardProps) {
+function MonitorCard({
+  monitor,
+  projectSlug,
+  onDelete,
+  environment,
+}: MonitorCardProps) {
   const isOnDemand = environment?.deployment_config?.onDemand === true
   const { startDate, endDate } = useMemo(() => {
     const now = new Date()
@@ -194,10 +204,7 @@ function MonitorCard({ monitor, projectSlug, onDelete, environment }: MonitorCar
                 </div>
                 <div className="flex gap-0.5 h-6 w-48">
                   {Array.from({ length: 48 }).map((_, idx) => (
-                    <div
-                      key={idx}
-                      className="flex-1 rounded-sm bg-muted"
-                    />
+                    <div key={idx} className="flex-1 rounded-sm bg-muted" />
                   ))}
                 </div>
               </>
@@ -207,29 +214,36 @@ function MonitorCard({ monitor, projectSlug, onDelete, environment }: MonitorCar
                   <div className="text-lg font-semibold">
                     {uptimePercentage?.toFixed(0) ?? 'N/A'}%
                   </div>
-                  <div className={`text-xs flex items-center gap-1 ${
-                    currentMonitorStatus?.current_status === 'operational'
-                      ? 'text-green-500'
-                      : currentMonitorStatus?.current_status === 'degraded'
-                        ? 'text-yellow-500'
-                        : currentMonitorStatus?.current_status === 'major_outage'
-                          ? 'text-red-500'
-                          : 'text-muted-foreground'
-                  }`}>
-                    <span className={`inline-block h-1.5 w-1.5 rounded-full ${
+                  <div
+                    className={`text-xs flex items-center gap-1 ${
                       currentMonitorStatus?.current_status === 'operational'
-                        ? 'bg-green-500'
+                        ? 'text-green-500'
                         : currentMonitorStatus?.current_status === 'degraded'
-                          ? 'bg-yellow-500'
-                          : currentMonitorStatus?.current_status === 'major_outage'
-                            ? 'bg-red-500'
-                            : 'bg-gray-400'
-                    }`}></span>
+                          ? 'text-yellow-500'
+                          : currentMonitorStatus?.current_status ===
+                              'major_outage'
+                            ? 'text-red-500'
+                            : 'text-muted-foreground'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-1.5 w-1.5 rounded-full ${
+                        currentMonitorStatus?.current_status === 'operational'
+                          ? 'bg-green-500'
+                          : currentMonitorStatus?.current_status === 'degraded'
+                            ? 'bg-yellow-500'
+                            : currentMonitorStatus?.current_status ===
+                                'major_outage'
+                              ? 'bg-red-500'
+                              : 'bg-gray-400'
+                      }`}
+                    ></span>
                     {currentMonitorStatus?.current_status === 'operational'
                       ? 'Healthy'
                       : currentMonitorStatus?.current_status === 'degraded'
                         ? 'Degraded'
-                        : currentMonitorStatus?.current_status === 'major_outage'
+                        : currentMonitorStatus?.current_status ===
+                            'major_outage'
                           ? 'Major Outage'
                           : 'Unknown'}
                   </div>
@@ -400,10 +414,12 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             Monitor your project&apos;s uptime and performance
           </p>
         </div>
-        <CreateActionButton
-          onClick={() => setIsCreateDialogOpen(true)}
-          label="Create Monitor"
-        />
+        {monitors && monitors.length > 0 && (
+          <CreateActionButton
+            onClick={() => setIsCreateDialogOpen(true)}
+            label="Create Monitor"
+          />
+        )}
         <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
           <DialogContent>
             <DialogHeader>
@@ -565,25 +581,25 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               monitor={monitor}
               projectSlug={project.slug}
               onDelete={() => setMonitorToDelete(monitor.id)}
-              environment={environments?.find((env) => env.id === monitor.environment_id)}
+              environment={environments?.find(
+                (env) => env.id === monitor.environment_id
+              )}
             />
           ))}
         </div>
       ) : (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <Activity className="h-12 w-12 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-semibold mb-2">No monitors yet</h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              Create your first monitor to start tracking uptime and
-              performance.
-            </p>
+        <EmptyState
+          size="compact"
+          icon={Activity}
+          title="No monitors yet"
+          description="Create a monitor to track this project's uptime and response time."
+          action={
             <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Create Monitor
+              <Plus className="mr-2 size-4" />
+              Create monitor
             </Button>
-          </CardContent>
-        </Card>
+          }
+        />
       )}
 
       {/* Delete Confirmation Dialog */}

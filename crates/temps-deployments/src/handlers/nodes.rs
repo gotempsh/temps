@@ -31,6 +31,7 @@ use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
 use crate::services::CONTROL_PLANE_NODE_ID;
+use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
@@ -443,6 +444,7 @@ pub struct ClusterDnsStatusResponse {
         admin_remove_node,
         admin_drain_status,
         cluster_dns_status,
+        node_docker_disk_usage,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -464,6 +466,8 @@ pub struct ClusterDnsStatusResponse {
         DrainStatusResponse,
         NodeDnsStatusEntry,
         ClusterDnsStatusResponse,
+        DockerDiskUsage,
+        DockerDiskUsageCategory,
     )),
     info(
         title = "Node Registration API",
@@ -528,6 +532,10 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        .route(
+            "/nodes/{node_id}/docker-disk-usage",
+            get(node_docker_disk_usage),
+        )
 }
 
 /// SHA-256 hash a token string
@@ -2079,6 +2087,76 @@ async fn cluster_dns_status(
         total_record_count,
         nodes: node_entries,
     }))
+}
+
+/// Docker disk usage (`docker system df`) for the control-plane host.
+///
+/// On-demand rather than sampled: walking every layer, rootfs and volume can
+/// take seconds, so the server monitoring page fetches it when opened or when
+/// the operator presses refresh. Node `0` only for now — a worker's daemon is
+/// only reachable through its agent, which does not relay this yet, and the
+/// error says exactly that instead of 404ing.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/{node_id}/docker-disk-usage",
+    operation_id = "NodeDockerDiskUsageGet",
+    params(
+        ("node_id" = i32, Path, description = "Node ID (0 = control plane)")
+    ),
+    responses(
+        (status = 200, description = "Docker disk usage by category", body = DockerDiskUsage),
+        (status = 400, description = "Node is not the control plane"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 502, description = "Docker daemon answered with an unexpected response"),
+        (status = 503, description = "Docker daemon unreachable"),
+        (status = 504, description = "Docker daemon timed out"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_docker_disk_usage(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let usage = app_state
+        .docker_disk_usage
+        .fetch(node_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(usage))
+}
+
+impl From<DockerDiskUsageError> for Problem {
+    fn from(error: DockerDiskUsageError) -> Self {
+        match error {
+            DockerDiskUsageError::UnsupportedNode { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Docker Disk Usage Not Available For Node")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::Unavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Docker Daemon Unreachable")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::Timeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("Docker Daemon Timed Out")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::UnexpectedStatus { .. } | DockerDiskUsageError::Parse { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Unexpected Docker Daemon Response")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 /// List all containers running on a specific node

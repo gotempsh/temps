@@ -13,6 +13,7 @@ import {
 } from './chat-message-parts'
 import {
   appendLiveUserTurn,
+  applyWireEvent,
   applicationHarnessPermissionNotice,
   chatApiPaths,
   chatFailureFromProblem,
@@ -21,9 +22,11 @@ import {
   clearResolvedPermissionParts,
   conversationSnapshotPollInterval,
   conversationHistoryErrorMessage,
+  conversationFailure,
   ensureRunningAssistant,
   hasRunningServerTurn,
   isChatTranscriptNearBottom,
+  mapConversationDetail,
   needsTrailingActivityRow,
   parseChatFailure,
   permissionModeIsAuto,
@@ -48,6 +51,58 @@ const completedTool = {
   arguments: '{"command":"projects get_projects"}',
   result: '{"status":200}',
 }
+
+describe('terminal conversation tool receipts', () => {
+  const tool = { id: 'unfinished-write', name: 'Write', arguments: '{}' }
+  const messages = [
+    {
+      role: 'assistant',
+      content: '',
+      tools: [tool, completedTool],
+      parts: [{ type: 'tool' as const, tool }],
+    },
+  ]
+
+  test('stops historical spinners after a failed turn without inventing success', () => {
+    const [message] = mapConversationDetail({ messages, turn_status: 'failed' })
+    expect(JSON.parse(message.tools![0].result!)).toMatchObject({
+      status: 'interrupted',
+      is_error: true,
+    })
+    expect(message.tools![1]).toEqual(completedTool)
+    expect(message.parts![0]).toEqual({ type: 'tool', tool: message.tools![0] })
+    expect(tool).not.toHaveProperty('result')
+  })
+
+  test('does not finalize a running or unknown-status snapshot', () => {
+    for (const turn_status of ['running', undefined]) {
+      const [message] = mapConversationDetail({ messages, turn_status })
+      expect(message.tools![0].result).toBeUndefined()
+    }
+  })
+
+  test('keeps a historical unresolved tool terminal after a later successful turn', () => {
+    const [message] = mapConversationDetail({
+      messages,
+      turn_status: 'completed',
+    })
+    expect(JSON.parse(message.tools![0].result!)).toMatchObject({
+      status: 'interrupted',
+      is_error: true,
+    })
+  })
+})
+
+test('keeps redacted retained-runtime source diagnostics visible', () => {
+  const failure = {
+    code: 'harness_failed',
+    title: 'AI harness failed',
+    detail:
+      'Underlying error: remote engine rejected workspace handshake (code E712); [credential redacted]; [path redacted]. Retry the message.',
+    retryable: true,
+  }
+  expect(parseChatFailure(JSON.stringify(failure))).toEqual(failure)
+})
 
 describe('assistantParts', () => {
   test('keeps persisted assistant text visible when parts contain only tools', () => {
@@ -207,7 +262,9 @@ describe('tool card labels', () => {
         }),
         result: 'help text',
       })
-    ).toBe('external-services link_service_to_project --help')
+    ).toBe(
+      'temps-chat · temps_write · external-services link_service_to_project --help'
+    )
   })
 
   test('keeps the raw tool name when command arguments are malformed', () => {
@@ -217,7 +274,7 @@ describe('tool card labels', () => {
         name: 'mcp__temps-chat__temps_write',
         arguments: '{not-json',
       })
-    ).toBe('mcp__temps-chat__temps_write')
+    ).toBe('temps-chat · temps_write')
   })
 
   test('summarizes every command in a multi-command MCP plan', () => {
@@ -233,8 +290,24 @@ describe('tool card labels', () => {
         }),
       })
     ).toBe(
-      '2 commands · external-services create_service --name postgres-18 → external-services link_service_to_project --id service-1'
+      'temps-chat · temps_write · 2 commands · external-services create_service --name postgres-18 → external-services link_service_to_project --id service-1'
     )
+  })
+  test('preserves server and exact function for MCP calls with structured arguments', () => {
+    expect(
+      toolLabel({
+        id: 'mcp-read',
+        name: 'mcp__workspace__list_projects',
+        arguments: JSON.stringify({ limit: 5 }),
+      })
+    ).toBe('workspace · list_projects · {"limit":5}')
+    expect(
+      toolLabel({
+        id: 'mcp-empty',
+        name: 'mcp__workspace__list_projects',
+        arguments: '{}',
+      })
+    ).toBe('workspace · list_projects')
   })
 })
 
@@ -612,6 +685,60 @@ describe('conversation history failures', () => {
 })
 
 describe('public chat failures', () => {
+  test('a result-only wire event creates a visible terminal tool after a user message', () => {
+    let messages = [{ role: 'user', content: 'Check pwd' }] as Parameters<
+      typeof assistantParts
+    >[0][]
+    applyWireEvent(
+      'tool_result',
+      JSON.stringify({
+        id: 'result-only',
+        name: 'bash',
+        content: '/workspace',
+      }),
+      (update) => {
+        messages = typeof update === 'function' ? update(messages) : update
+      },
+      () => {}
+    )
+    expect(messages[1]?.role).toBe('assistant')
+    expect(messages[1]?.tools?.[0].result).toBe('/workspace')
+  })
+  test('restores the failure explanation when a failed thread is reopened', () => {
+    const failure = {
+      code: 'harness_authentication_required',
+      title: 'Authentication required',
+      detail: 'Update the saved credential and retry.',
+      retryable: false,
+    }
+    expect(conversationFailure({ turn_status: 'failed', failure })).toEqual(
+      failure
+    )
+    expect(
+      conversationFailure({ turn_status: 'completed', failure })
+    ).toBeNull()
+    expect(conversationFailure({ turn_status: 'running', failure })).toBeNull()
+  })
+
+  test('explains missing historical failure details without inventing a cause', () => {
+    expect(conversationFailure({ turn_status: 'failed' })?.detail).toContain(
+      'not retained'
+    )
+    expect(conversationFailure({ turn_status: 'idle' })).toBeNull()
+  })
+
+  test('does not restore secret-bearing failure text from history', () => {
+    const failure = conversationFailure({
+      turn_status: 'failed',
+      failure: {
+        code: 'harness_failed',
+        title: 'Failed',
+        detail: 'token=private',
+        retryable: true,
+      },
+    })
+    expect(failure?.detail).not.toContain('token=private')
+  })
   test('renders a structured actionable reason from the live wire', () => {
     expect(
       parseChatFailure(

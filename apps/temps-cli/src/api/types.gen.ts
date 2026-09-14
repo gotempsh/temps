@@ -998,6 +998,8 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
+export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
+
 /**
  * An analytics ingest key as returned by the admin API.
  *
@@ -1041,6 +1043,11 @@ export type AnalyticsIngestKey = {
     rate_limit_per_minute?: number | null;
     revoked_at?: string | null;
     updated_at: string;
+};
+
+export type AnalyticsProjectOption = {
+    project_id: number;
+    project_name: string;
 };
 
 export type AnalyticsSessionEventsResponse = {
@@ -1707,6 +1714,11 @@ export type AppSettingsResponse = {
     tenant_resource_ceilings: TenantResourceCeilings;
 };
 
+export type ApplicationGitConnectionsResponse = {
+    bindings: Array<GitBindingResponse>;
+    eligibleRepositories: Array<EligibleGitRepositoryResponse>;
+};
+
 export type ApplicationPreviewLinkResponse = {
     expires_at: number;
     /**
@@ -1846,6 +1858,10 @@ export type ApplicationWorkspaceResponse = {
     pids_limit: number;
     pids_used?: number | null;
     runtime: string;
+    runtime_compatible?: boolean | null;
+    runtime_update_available: boolean;
+    runtime_update_error?: string | null;
+    runtime_update_image?: string | null;
     sandbox_public_id?: string | null;
     snapshot_id?: string | null;
     state: string;
@@ -2017,6 +2033,12 @@ export type AuthTokenResponse = {
     access_token: string;
     expires_at: number;
     refresh_token: string;
+};
+
+export type AuthorizeWorkspacePreviewRequest = {
+    path?: string | null;
+    port: number;
+    sandbox_public_id: string;
 };
 
 /**
@@ -2315,6 +2337,13 @@ export type BackupScheduleResponse = {
      */
     target_all_services: boolean;
     updated_at: number;
+};
+
+export type BindApplicationGitConnectionRequest = {
+    connectionId: number;
+    projectId: number;
+    remoteName: string;
+    repositoryId: number;
 };
 
 /**
@@ -2858,6 +2887,13 @@ export type ChatCompletionResponse = {
     model: string;
     object: string;
     usage?: null | UsageInfo;
+};
+
+export type ChatFailureResponse = {
+    code: string;
+    detail: string;
+    retryable: boolean;
+    title: string;
 };
 
 export type ChatMessage = {
@@ -4286,6 +4322,15 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ContextWindowUsageResponse = {
+    estimated: boolean;
+    limit_tokens?: number | null;
+    model?: string | null;
+    source: string;
+    updated_at: string;
+    used_tokens: number;
+};
+
 export type ContinuousArchiveSourceResponse = {
     continuous_archive_pinned_at: string;
     continuous_archive_s3_source_id: number;
@@ -4294,10 +4339,18 @@ export type ContinuousArchiveSourceResponse = {
 
 export type ControlApplicationWorkspaceRequest = {
     /**
-     * restart, pause, resume, rebuild, snapshot, or restore
+     * restart, pause, resume, rebuild, snapshot, restore, or update_runtime
      */
     action: string;
+    /**
+     * Must be true for update_runtime because compute is replaced.
+     */
+    confirm?: boolean | null;
     label?: string | null;
+    /**
+     * Optional built-in flavor to select during update_runtime.
+     */
+    runtime?: string | null;
     snapshot_id?: string | null;
 };
 
@@ -4310,6 +4363,51 @@ export type ConversationDetailResponse = ConversationResponse & {
     pending_permission?: null | PermissionRequest;
 };
 
+export type ConversationDiagnosticMessageResponse = {
+    content: string;
+    cost_microcents?: number | null;
+    created_at: string;
+    metadata?: unknown;
+    role: string;
+    tokens_in?: number | null;
+    tokens_out?: number | null;
+    truncated: boolean;
+};
+
+export type ConversationDiagnosticResponse = {
+    conversation: ConversationDiagnosticRuntimeResponse;
+    message_limit: number;
+    messages: Array<ConversationDiagnosticMessageResponse>;
+    native_session?: null | ConversationNativeDiagnosticResponse;
+    pending_permission?: unknown;
+    returned_message_count: number;
+    schema_version: number;
+    source: ConversationDiagnosticSourceResponse;
+    truncated: boolean;
+};
+
+export type ConversationDiagnosticRuntimeResponse = {
+    active_turn_id?: string | null;
+    context_id: string;
+    context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
+    last_turn_id?: string | null;
+    model: string;
+    native_session_id?: string | null;
+    permission_mode: string;
+    provider: string;
+    public_id: string;
+    thinking_level?: string | null;
+    turn_started_at?: string | null;
+    turn_status: string;
+};
+
+export type ConversationDiagnosticSourceResponse = {
+    native_session_note: string;
+    native_session_status: string;
+    normalized_history: boolean;
+};
+
 export type ConversationListScope = 'all' | 'global';
 
 export type ConversationListStatus = 'active' | 'archived';
@@ -4317,6 +4415,14 @@ export type ConversationListStatus = 'active' | 'archived';
 export type ConversationMessagePageResponse = {
     has_more: boolean;
     next_before?: string | null;
+};
+
+export type ConversationNativeDiagnosticResponse = {
+    format: string;
+    json: unknown;
+    provider: string;
+    session_id: string;
+    truncated: boolean;
 };
 
 export type ConversationResponse = {
@@ -4328,7 +4434,9 @@ export type ConversationResponse = {
     application_id?: number | null;
     context_id: string;
     context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
     created_at: string;
+    failure?: null | ChatFailureResponse;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -5882,6 +5990,12 @@ export type DatabaseMetricsRow = {
 };
 
 /**
+ * Controls which logical database a deployment receives through a
+ * project-to-service link.
+ */
+export type DatabaseProvisioningMode = 'project' | 'project_environment' | 'custom';
+
+/**
  * Request to delete keys
  */
 export type DelRequest = {
@@ -7203,6 +7317,54 @@ export type DockerComposePresetConfig = {
     relaxedCapabilityServices?: Array<string>;
 };
 
+/**
+ * Result of `docker system df` for the control-plane host.
+ */
+export type DockerDiskUsage = {
+    /**
+     * Docker API version the daemon answered with, when it reported one
+     * (`Api-Version` header). Useful when a category shows `null`
+     * reclaimable bytes.
+     */
+    api_version?: string | null;
+    build_cache: DockerDiskUsageCategory;
+    /**
+     * When this snapshot was taken (ISO 8601, UTC).
+     */
+    collected_at: string;
+    containers: DockerDiskUsageCategory;
+    images: DockerDiskUsageCategory;
+    /**
+     * Sum of the four category sizes.
+     */
+    total_bytes: number;
+    volumes: DockerDiskUsageCategory;
+};
+
+/**
+ * One slice of the Docker disk-usage donut.
+ */
+export type DockerDiskUsageCategory = {
+    /**
+     * Objects currently in use (images referenced by a container, running
+     * containers, mounted volumes, in-use cache records).
+     */
+    active_count: number;
+    /**
+     * Bytes `docker system prune` could free from this category. `null`
+     * when the daemon is older than API 1.52 and does not report it.
+     */
+    reclaimable_bytes?: number | null;
+    /**
+     * Bytes on disk attributed to this category.
+     */
+    size_bytes: number;
+    /**
+     * Number of objects in this category (all images, all containers, …).
+     */
+    total_count: number;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -7420,6 +7582,15 @@ export type DropPresetCandidate = {
     label: string;
     preset: string;
     reason: string;
+};
+
+export type EligibleGitRepositoryResponse = {
+    accountName: string;
+    connectionId: number;
+    fullName: string;
+    private: boolean;
+    repositoryId: number;
+    repositoryUrl: string;
 };
 
 export type EmailConfig = {
@@ -9987,6 +10158,21 @@ export type GetVisitorSessionsResponse = {
     total_count: number;
 };
 
+export type GitBindingResponse = {
+    connectionId: number;
+    createdAt: string;
+    id: number;
+    projectId: number;
+    remoteName: string;
+    repositoryId: number;
+    repositoryUrl: string;
+    /**
+     * `configured` means the durable authorization exists; it does not claim a live remote.
+     */
+    status: string;
+    updatedAt: string;
+};
+
 /**
  * Git push event information that triggered the deployment
  */
@@ -10074,6 +10260,28 @@ export type GitSourcePlan = {
     repo: string;
 };
 
+export type GlobalAnalyticsResponse = {
+    rows: Array<GlobalAnalyticsRow>;
+    total: number;
+    total_views: number;
+};
+
+export type GlobalAnalyticsRow = {
+    avg_time_seconds?: number | null;
+    bounce_rate?: number | null;
+    cls_p75?: number | null;
+    fcp_p75?: number | null;
+    inp_p75?: number | null;
+    key: string;
+    lcp_p75?: number | null;
+    project_id: number;
+    project_name: string;
+    sessions: number;
+    ttfb_p75?: number | null;
+    views: number;
+    visitors: number;
+};
+
 /**
  * A conversation in the unified cross-project switcher: carries the project it
  * belongs to (name/slug) so the UI can show where the chat was started and
@@ -10086,7 +10294,9 @@ export type GlobalConversationResponse = {
     ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
+    context_usage?: null | ContextWindowUsageResponse;
     created_at: string;
+    failure?: null | ChatFailureResponse;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -10100,6 +10310,38 @@ export type GlobalConversationResponse = {
     turn_status: string;
 };
 
+export type GlobalErrorGroupResponse = {
+    affected_users: number;
+    assigned_to?: string | null;
+    environment_name?: string | null;
+    error_type: string;
+    events_in_range: number;
+    first_seen: string;
+    id: number;
+    last_seen: string;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+    status: string;
+    title: string;
+    total_count: number;
+};
+
+export type GlobalErrorGroupsQuery = {
+    end_date?: string | null;
+    page?: number;
+    page_size?: number;
+    project_id?: number | null;
+    search?: string | null;
+    start_date?: string | null;
+    status?: string | null;
+};
+
+export type GlobalErrorGroupsResponse = {
+    data: Array<GlobalErrorGroupResponse>;
+    pagination: PaginationMeta;
+};
+
 export type GlobalEventStatsResponse = {
     bounce_rate?: number | null;
     bounced: number;
@@ -10110,6 +10352,56 @@ export type GlobalEventStatsResponse = {
     open_rate?: number | null;
     opened: number;
 };
+
+export type GlobalLogLine = LogSearchLine & {
+    env: string;
+    external_service_id?: number | null;
+    owner: string;
+    project_id?: number | null;
+};
+
+export type GlobalLogSearchRequest = {
+    cursor?: string | null;
+    deploy_id?: number | null;
+    end_time: string;
+    envs?: Array<string>;
+    /**
+     * Database/service IDs or names, not container service labels.
+     */
+    external_services?: Array<string>;
+    levels?: Array<LogLevel>;
+    node_ids?: Array<number>;
+    page_size?: number | null;
+    /**
+     * Match project ID, slug or name. Empty selects all authorized projects.
+     */
+    projects?: Array<string>;
+    /**
+     * Explicit resource identities, e.g. application:12 or service:34.
+     */
+    scopes?: Array<string>;
+    source?: GlobalLogSource;
+    start_time: string;
+    text?: string | null;
+};
+
+export type GlobalLogSearchResponse = {
+    /**
+     * Newest first, ordered by timestamp, chunk ID and line offset.
+     */
+    lines: Array<GlobalLogLine>;
+    next_cursor?: string | null;
+    /**
+     * True means the scan budget was exhausted. Lines contain the newest
+     * matches found so far, but unread chunks may contain newer lines.
+     * No cursor is returned because the partial results cannot be paginated safely.
+     */
+    scan_limit_reached: boolean;
+    scanned_bytes: number;
+    scanned_chunks: number;
+};
+
+export type GlobalLogSource = 'collected' | 'application' | 'service';
 
 export type GlobalMrrResponse = {
     /**
@@ -10147,6 +10439,44 @@ export type GlobalRevenueSummaryResponse = {
     refunded_all_time_minor: number;
     refunded_last_30d_minor: number;
     transactions_last_30d: number;
+};
+
+export type GlobalTraceSummariesResponse = {
+    data: Array<GlobalTraceSummary>;
+    projects: Array<TraceProject>;
+    total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
+};
+
+export type GlobalTraceSummary = TraceSummary & {
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+};
+
+/**
+ * A global query can use different stores and effective windows per project.
+ * A non-null clamp explicitly tells clients the pre-cutover range is excluded;
+ * request an earlier window to read the older source (ADR-040/041).
+ */
+export type GlobalTraceWindow = {
+    effective_end_time: string;
+    effective_start_time: string;
+    project_id: number;
+    source: CloudTelemetryWriteMode;
+    window_clamped_at?: string | null;
+};
+
+export type GlobalTracesResponse = {
+    data: Array<SpanRecord>;
+    total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
 };
 
 export type GroupedPageMetric = {
@@ -11039,6 +11369,22 @@ export type InsightsResponse = {
     data: Array<Insight>;
 };
 
+export type InstallPluginRequest = {
+    /**
+     * Validated registry name only. URLs, paths, versions, and hashes are not
+     * accepted from HTTP callers.
+     */
+    name: string;
+};
+
+export type InstallPluginResponse = {
+    message: string;
+    name: string;
+    platform: string;
+    sha256: string;
+    version: string;
+};
+
 export type IntegrationResponse = {
     config?: null | ProviderConfig;
     created_at: string;
@@ -11363,6 +11709,14 @@ export type LinkApplicationProjectRequest = {
 };
 
 export type LinkServiceRequest = {
+    /**
+     * Exact database name used when `database_provisioning_mode` is `custom`.
+     */
+    custom_database_name?: string | null;
+    /**
+     * How deployments linked through this service select a logical database.
+     */
+    database_provisioning_mode?: DatabaseProvisioningMode;
     project_id: number;
 };
 
@@ -11816,10 +12170,55 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+/**
+ * A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is
+ * pinned to a source other than the managed destination. The nightly Cloud
+ * schedule cannot back it up: archiving must not silently move between
+ * sources, so every run of that service fails until the operator repoints
+ * it to Cloud or points its own schedule at the pinned source.
+ */
+export type ManagedBackupArchiveConflict = {
+    pinned_s3_source_id: number;
+    /**
+     * Name of the pinned source, or its id as text when the row is gone.
+     */
+    pinned_s3_source_name: string;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+};
+
+/**
+ * What the Cloud settings page shows about the schedule that targets the
+ * managed destination.
+ */
+export type ManagedBackupSchedule = {
+    enabled: boolean;
+    id: number;
+    name: string;
+    next_run?: string | null;
+    /**
+     * Days each backup is kept before the schedule's retention deletes it.
+     */
+    retention_period: number;
+    schedule_expression: string;
+};
+
 export type ManagedBackupSetup = {
     action: ManagedBackupSetupAction;
+    /**
+     * Services whose continuous archive is pinned elsewhere. Each fails
+     * under the nightly Cloud schedule until repointed (ADR-044).
+     */
+    archive_conflicts: Array<ManagedBackupArchiveConflict>;
+    /**
+     * The `s3_sources` row of the managed destination, when it exists, so a
+     * client can repoint a conflicting service at it.
+     */
+    managed_s3_source_id?: number | null;
     message: string;
     ready: boolean;
+    schedule?: null | ManagedBackupSchedule;
     status: ManagedBackupSetupStatus;
 };
 
@@ -12866,6 +13265,13 @@ export type NotificationRoutePage = {
     page: number;
     page_size: number;
     total: number;
+};
+
+export type NpmRelease = {
+    binary_path: string;
+    integrity: string;
+    name: string;
+    version: string;
 };
 
 /**
@@ -14393,6 +14799,12 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
+export type PlatformRelease = {
+    npm?: null | NpmRelease;
+    sha256: string;
+    url: string;
+};
+
 /**
  * What a plugin is allowed to do with the platform API over the channel.
  *
@@ -14402,6 +14814,13 @@ export type PlatformInfo = {
  * whether it intends to *write* at all, without reading its source.
  */
 export type PluginCapability = 'api_read' | 'api_write';
+
+export type PluginCatalogResponse = {
+    available: boolean;
+    plugins: Array<RegistryPlugin>;
+    reason?: string | null;
+    source: string;
+};
 
 /**
  * The complete plugin manifest — the handshake contract.
@@ -14502,6 +14921,12 @@ export type PluginManifest = {
      * SemVer version string
      */
     version: string;
+};
+
+export type PluginStatusResponse = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
 };
 
 /**
@@ -15218,6 +15643,8 @@ export type ProjectSecretResponse = {
 };
 
 export type ProjectServiceInfo = {
+    custom_database_name?: string | null;
+    database_provisioning_mode: DatabaseProvisioningMode;
     id: number;
     project: ProjectInfo;
     service: ExternalServiceInfo;
@@ -16469,6 +16896,40 @@ export type RegisterRequest = {
 };
 
 /**
+ * The outer envelope signs the decoded bytes in `payload`. Encoding the
+ * payload instead of reserializing a JSON object avoids ambiguous map order,
+ * whitespace, and number representations.
+ */
+export type RegistryEnvelope = {
+    key_id: string;
+    /**
+     * Standard-base64 encoded JSON [`RegistryDocument`].
+     */
+    payload: string;
+    /**
+     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
+     */
+    signature: string;
+};
+
+export type RegistryPlugin = {
+    author: string;
+    category: string;
+    description: string;
+    docs_url?: string | null;
+    keywords?: Array<string>;
+    logo_url?: string | null;
+    name: string;
+    platforms: {
+        [key: string]: PlatformRelease;
+    };
+    repository?: string | null;
+    summary: string;
+    title: string;
+    version: string;
+};
+
+/**
  * Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`
  */
 export type ReinstallWebhookResponse = {
@@ -16514,10 +16975,19 @@ export type ReleaseListResponse = {
     releases: Array<string>;
 };
 
+export type ReloadFailureResponse = {
+    plugin?: string | null;
+    reason: string;
+};
+
 /**
  * Response from the reload endpoint.
  */
 export type ReloadResponse = {
+    /**
+     * Activated installs that could not be verified or started.
+     */
+    failures: Array<ReloadFailureResponse>;
     /**
      * Number of plugins successfully loaded after reload
      */
@@ -20911,6 +21381,12 @@ export type TopModelsQueryParams = {
     user_id?: number | null;
 };
 
+export type TraceProject = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
 /**
  * All projects that contributed spans to a trace, including their sharing flag.
  *
@@ -21468,6 +21944,12 @@ export type UnifiedTrace = {
     truncated_projects: Array<number>;
 };
 
+export type UninstallPluginResponse = {
+    data_preserved: boolean;
+    message: string;
+    name: string;
+};
+
 /**
  * Query parameters for unique counts over time frame
  */
@@ -21624,6 +22106,11 @@ export type UpdateApplicationWorkspaceRequest = {
     cpu_limit?: number | null;
     disk_limit_mb?: number | null;
     idle_timeout_secs?: number | null;
+    /**
+     * Pinned Temps-managed daemon image. Empty string restores the runtime default.
+     * Omit to leave the selected image unchanged. Arbitrary images are rejected.
+     */
+    image?: string | null;
     memory_limit_mb?: number | null;
     pids_limit?: number | null;
     runtime?: string | null;
@@ -22281,6 +22768,10 @@ export type UpdateMetricAlertRequest = {
     name?: string | null;
     severity?: string | null;
     window_secs?: number | null;
+};
+
+export type UpdateMonitorRequest = {
+    check_path: string;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -23668,6 +24159,30 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'cron-job' | 'other';
 
+export type WorkspaceActivityResponse = {
+    workspaces: Array<WorkspaceActivitySummary>;
+};
+
+export type WorkspaceActivitySummary = {
+    /**
+     * Null identifies the user's global workspace.
+     */
+    application_public_id?: string | null;
+    harnesses: Array<WorkspaceHarnessActivity>;
+    total: number;
+};
+
+export type WorkspaceHarnessActivity = {
+    ai_provider: string;
+    cancelled: number;
+    completed: number;
+    failed: number;
+    idle: number;
+    pending: number;
+    running: number;
+    total: number;
+};
+
 export type WriteApplicationWorkspaceFilesRequest = {
     files: Array<ApplicationWorkspaceFileWrite>;
 };
@@ -24706,6 +25221,72 @@ export type CreateThreadArtifactResponses = {
 
 export type CreateThreadArtifactResponse = CreateThreadArtifactResponses[keyof CreateThreadArtifactResponses];
 
+export type ListApplicationGitConnectionsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections';
+};
+
+export type ListApplicationGitConnectionsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListApplicationGitConnectionsResponses = {
+    200: ApplicationGitConnectionsResponse;
+};
+
+export type ListApplicationGitConnectionsResponse = ListApplicationGitConnectionsResponses[keyof ListApplicationGitConnectionsResponses];
+
+export type BindApplicationGitConnectionData = {
+    body: BindApplicationGitConnectionRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections';
+};
+
+export type BindApplicationGitConnectionErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type BindApplicationGitConnectionResponses = {
+    201: GitBindingResponse;
+};
+
+export type BindApplicationGitConnectionResponse = BindApplicationGitConnectionResponses[keyof BindApplicationGitConnectionResponses];
+
+export type DisconnectApplicationGitConnectionData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        binding_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/git-connections/{binding_id}';
+};
+
+export type DisconnectApplicationGitConnectionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type DisconnectApplicationGitConnectionResponses = {
+    204: void;
+};
+
+export type DisconnectApplicationGitConnectionResponse = DisconnectApplicationGitConnectionResponses[keyof DisconnectApplicationGitConnectionResponses];
+
 export type CreateApplicationPreviewLinkData = {
     body: CreateApplicationPreviewLinkRequest;
     path: {
@@ -25329,6 +25910,32 @@ export type GetUserConversationAttachmentResponses = {
 
 export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
 
+export type GetUserConversationDiagnosticsData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Persisted rows to include, newest window first (default/max 25).
+         */
+        limit?: number | null;
+    };
+    url: '/ai/conversations/{public_id}/diagnostics';
+};
+
+export type GetUserConversationDiagnosticsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationDiagnosticsResponses = {
+    200: ConversationDiagnosticResponse;
+};
+
+export type GetUserConversationDiagnosticsResponse = GetUserConversationDiagnosticsResponses[keyof GetUserConversationDiagnosticsResponses];
+
 export type SendUserMessageData = {
     body: SendMessageRequest;
     path: {
@@ -25526,6 +26133,27 @@ export type RejectUserPendingActionResponses = {
 };
 
 export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
+
+export type AuthorizeWorkspacePreviewData = {
+    body: AuthorizeWorkspacePreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/preview/authorize';
+};
+
+export type AuthorizeWorkspacePreviewErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type AuthorizeWorkspacePreviewResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type AuthorizeWorkspacePreviewResponse = AuthorizeWorkspacePreviewResponses[keyof AuthorizeWorkspacePreviewResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -26444,6 +27072,30 @@ export type GetGlobalAiWorkspaceResponses = {
 
 export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
 
+export type GetWorkspaceActivityData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Comma-separated application public IDs (maximum 100). Omit for the global workspace only.
+         */
+        application_public_ids?: string | null;
+    };
+    url: '/ai/workspace-activity';
+};
+
+export type GetWorkspaceActivityErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+};
+
+export type GetWorkspaceActivityResponses = {
+    200: WorkspaceActivityResponse;
+};
+
+export type GetWorkspaceActivityResponse = GetWorkspaceActivityResponses[keyof GetWorkspaceActivityResponses];
+
 export type GetGlobalWorkspaceChangesData = {
     body?: never;
     path?: never;
@@ -26951,6 +27603,65 @@ export type GetGeneralStatsResponses = {
 };
 
 export type GetGeneralStatsResponse = GetGeneralStatsResponses[keyof GetGeneralStatsResponses];
+
+export type GetGlobalAnalyticsData = {
+    body?: never;
+    path?: never;
+    query: {
+        facet?: null | AnalyticsFacet;
+        project_id?: number | null;
+        environment_id?: number | null;
+        start_date: string;
+        end_date: string;
+        search?: string | null;
+        dimension?: string | null;
+        device?: string | null;
+        sort_by?: string | null;
+        sort_order?: string | null;
+        page?: number | null;
+        per_page?: number | null;
+        min_views?: number | null;
+        min_sessions?: number | null;
+    };
+    url: '/analytics/global';
+};
+
+export type GetGlobalAnalyticsErrors = {
+    /**
+     * Invalid analytics filters
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type GetGlobalAnalyticsResponses = {
+    200: GlobalAnalyticsResponse;
+};
+
+export type GetGlobalAnalyticsResponse = GetGlobalAnalyticsResponses[keyof GetGlobalAnalyticsResponses];
+
+export type GetAnalyticsProjectsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/analytics/global/projects';
+};
+
+export type GetAnalyticsProjectsErrors = {
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type GetAnalyticsProjectsResponses = {
+    200: Array<AnalyticsProjectOption>;
+};
+
+export type GetAnalyticsProjectsResponse = GetAnalyticsProjectsResponses[keyof GetAnalyticsProjectsResponses];
 
 export type CheckAnalyticsHasEventsData = {
     body?: never;
@@ -30719,6 +31430,43 @@ export type GetCloudAiCapabilityResponses = {
 
 export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
 
+export type EnsureCloudBackupScheduleData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/backups/schedule/ensure';
+};
+
+export type EnsureCloudBackupScheduleErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)
+     */
+    409: ProblemDetails;
+    /**
+     * Database or link state failure
+     */
+    500: ProblemDetails;
+};
+
+export type EnsureCloudBackupScheduleError = EnsureCloudBackupScheduleErrors[keyof EnsureCloudBackupScheduleErrors];
+
+export type EnsureCloudBackupScheduleResponses = {
+    /**
+     * The managed destination's setup with the schedule that targets it, created when none did
+     */
+    200: ManagedBackupSetup;
+};
+
+export type EnsureCloudBackupScheduleResponse = EnsureCloudBackupScheduleResponses[keyof EnsureCloudBackupScheduleResponses];
+
 export type ReconcileCloudBackupSourceData = {
     body?: never;
     path?: never;
@@ -33691,6 +34439,41 @@ export type GetEmailLinksResponses = {
 
 export type GetEmailLinksResponse = GetEmailLinksResponses[keyof GetEmailLinksResponses];
 
+export type ListGlobalErrorGroupsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number;
+        page_size?: number;
+        project_id?: number | null;
+        status?: string | null;
+        search?: string | null;
+        start_date?: string | null;
+        end_date?: string | null;
+    };
+    url: '/error-groups';
+};
+
+export type ListGlobalErrorGroupsErrors = {
+    /**
+     * Invalid filters
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type ListGlobalErrorGroupsResponses = {
+    /**
+     * Visible errors across projects
+     */
+    200: GlobalErrorGroupsResponse;
+};
+
+export type ListGlobalErrorGroupsResponse = ListGlobalErrorGroupsResponses[keyof ListGlobalErrorGroupsResponses];
+
 export type ListServicesData = {
     body?: never;
     path?: never;
@@ -35051,6 +35834,10 @@ export type LinkServiceToProjectData = {
 };
 
 export type LinkServiceToProjectErrors = {
+    /**
+     * Invalid database provisioning configuration
+     */
+    400: unknown;
     /**
      * Authentication required
      */
@@ -39767,6 +40554,27 @@ export type GetLogContextResponses = {
 
 export type GetLogContextResponse = GetLogContextResponses[keyof GetLogContextResponses];
 
+export type SearchGlobalLogsData = {
+    body: GlobalLogSearchRequest;
+    path?: never;
+    query?: never;
+    url: '/logs/global/search';
+};
+
+export type SearchGlobalLogsErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    429: ProblemDetails;
+};
+
+export type SearchGlobalLogsError = SearchGlobalLogsErrors[keyof SearchGlobalLogsErrors];
+
+export type SearchGlobalLogsResponses = {
+    200: GlobalLogSearchResponse;
+};
+
+export type SearchGlobalLogsResponse = SearchGlobalLogsResponses[keyof SearchGlobalLogsResponses];
+
 export type SearchLogsData = {
     body: SearchLogsRequest;
     path?: never;
@@ -39963,6 +40771,50 @@ export type GetMonitorResponses = {
 };
 
 export type GetMonitorResponse = GetMonitorResponses[keyof GetMonitorResponses];
+
+export type UpdateMonitorData = {
+    body: UpdateMonitorRequest;
+    path: {
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/monitors/{monitor_id}';
+};
+
+export type UpdateMonitorErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Monitor not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMonitorResponses = {
+    /**
+     * Monitor updated successfully
+     */
+    200: MonitorResponse;
+};
+
+export type UpdateMonitorResponse = UpdateMonitorResponses[keyof UpdateMonitorResponses];
 
 export type GetBucketedStatusData = {
     body?: never;
@@ -40277,6 +41129,96 @@ export type NodeMetricsUpdateAlertRuleResponses = {
 };
 
 export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
+export type NodeMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/latest';
+};
+
+export type NodeMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetLatestResponse = NodeMetricsGetLatestResponses[keyof NodeMetricsGetLatestResponses];
+
+export type NodeDockerDiskUsageGetData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/nodes/{node_id}/docker-disk-usage';
+};
+
+export type NodeDockerDiskUsageGetErrors = {
+    /**
+     * Node is not the control plane
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Docker daemon answered with an unexpected response
+     */
+    502: unknown;
+    /**
+     * Docker daemon unreachable
+     */
+    503: unknown;
+    /**
+     * Docker daemon timed out
+     */
+    504: unknown;
+};
+
+export type NodeDockerDiskUsageGetResponses = {
+    /**
+     * Docker disk usage by category
+     */
+    200: DockerDiskUsage;
+};
+
+export type NodeDockerDiskUsageGetResponse = NodeDockerDiskUsageGetResponses[keyof NodeDockerDiskUsageGetResponses];
 
 export type DeletePreferencesData = {
     body?: never;
@@ -42175,6 +43117,104 @@ export type GetGenaiTraceResponses = {
 };
 
 export type GetGenaiTraceResponse = GetGenaiTraceResponses[keyof GetGenaiTraceResponses];
+
+export type QueryGlobalTracesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        project_id?: number | null;
+        trace_id?: string | null;
+        service_name?: string | null;
+        status?: string | null;
+        min_duration_ms?: number | null;
+        start_time?: string | null;
+        end_time?: string | null;
+        environment_id?: number | null;
+        deployment_id?: number | null;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs.
+         * e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string | null;
+        /**
+         * Filter by span name pattern (ILIKE).
+         */
+        name_pattern?: string | null;
+        /**
+         * Sort field for the trace-summaries list: "start_time" (default) or
+         * "duration". Anything else falls back to start_time.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: "asc" or "desc" (default).
+         */
+        sort_order?: string | null;
+        limit?: number | null;
+        offset?: number | null;
+    };
+    url: '/otel/global/spans';
+};
+
+export type QueryGlobalTracesErrors = {
+    403: ProblemDetails;
+};
+
+export type QueryGlobalTracesError = QueryGlobalTracesErrors[keyof QueryGlobalTracesErrors];
+
+export type QueryGlobalTracesResponses = {
+    200: GlobalTracesResponse;
+};
+
+export type QueryGlobalTracesResponse = QueryGlobalTracesResponses[keyof QueryGlobalTracesResponses];
+
+export type QueryGlobalTraceSummariesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        project_id?: number | null;
+        trace_id?: string | null;
+        service_name?: string | null;
+        status?: string | null;
+        min_duration_ms?: number | null;
+        start_time?: string | null;
+        end_time?: string | null;
+        environment_id?: number | null;
+        deployment_id?: number | null;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs.
+         * e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string | null;
+        /**
+         * Filter by span name pattern (ILIKE).
+         */
+        name_pattern?: string | null;
+        /**
+         * Sort field for the trace-summaries list: "start_time" (default) or
+         * "duration". Anything else falls back to start_time.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: "asc" or "desc" (default).
+         */
+        sort_order?: string | null;
+        limit?: number | null;
+        offset?: number | null;
+    };
+    url: '/otel/global/trace-summaries';
+};
+
+export type QueryGlobalTraceSummariesErrors = {
+    403: ProblemDetails;
+};
+
+export type QueryGlobalTraceSummariesError = QueryGlobalTraceSummariesErrors[keyof QueryGlobalTraceSummariesErrors];
+
+export type QueryGlobalTraceSummariesResponses = {
+    200: GlobalTraceSummariesResponse;
+};
+
+export type QueryGlobalTraceSummariesResponse = QueryGlobalTraceSummariesResponses[keyof QueryGlobalTraceSummariesResponses];
 
 export type GetUnifiedTraceData = {
     body?: never;
@@ -60629,6 +61669,100 @@ export type ListExternalPluginsResponses = {
 
 export type ListExternalPluginsResponse = ListExternalPluginsResponses[keyof ListExternalPluginsResponses];
 
+export type ListPluginCatalogData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/catalog';
+};
+
+export type ListPluginCatalogErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListPluginCatalogError = ListPluginCatalogErrors[keyof ListPluginCatalogErrors];
+
+export type ListPluginCatalogResponses = {
+    /**
+     * Signed plugin catalogue, or an unavailable state when registry trust is not configured
+     */
+    200: PluginCatalogResponse;
+};
+
+export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
+
+export type InstallPluginData = {
+    body: InstallPluginRequest;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/install';
+};
+
+export type InstallPluginErrors = {
+    /**
+     * Invalid plugin name or registry release
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Registry rollback refused
+     */
+    409: ProblemDetails;
+    /**
+     * Request body exceeds the configured limit
+     */
+    413: ProblemDetails;
+    /**
+     * Request content type is not application/json
+     */
+    415: ProblemDetails;
+    /**
+     * Request JSON does not match the install schema
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * Local plugin installation failed
+     */
+    500: ProblemDetails;
+    /**
+     * Registry, artifact, or plugin startup verification failed
+     */
+    502: ProblemDetails;
+    /**
+     * Registry trust, plugin service, or security audit unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type InstallPluginError = InstallPluginErrors[keyof InstallPluginErrors];
+
+export type InstallPluginResponses = {
+    /**
+     * Plugin verified, installed, and started
+     */
+    200: InstallPluginResponse;
+};
+
+export type InstallPluginResponse2 = InstallPluginResponses[keyof InstallPluginResponses];
+
 export type ReloadPluginsData = {
     body?: never;
     path?: never;
@@ -60645,16 +61779,112 @@ export type ReloadPluginsErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * No activated plugin could be reloaded
+     */
+    502: ReloadResponse;
 };
+
+export type ReloadPluginsError = ReloadPluginsErrors[keyof ReloadPluginsErrors];
 
 export type ReloadPluginsResponses = {
     /**
-     * Plugins reloaded successfully
+     * All plugins reloaded successfully
      */
     200: ReloadResponse;
+    /**
+     * Some plugins reloaded and some failed
+     */
+    207: ReloadResponse;
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginStatusData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/status';
+};
+
+export type GetPluginStatusErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetPluginStatusError = GetPluginStatusErrors[keyof GetPluginStatusErrors];
+
+export type GetPluginStatusResponses = {
+    /**
+     * Verified active plugin status
+     */
+    200: PluginStatusResponse;
+};
+
+export type GetPluginStatusResponse = GetPluginStatusResponses[keyof GetPluginStatusResponses];
+
+export type UninstallPluginData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/uninstall';
+};
+
+export type UninstallPluginErrors = {
+    /**
+     * Unsafe plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No active installation
+     */
+    404: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * Local deactivation failed
+     */
+    500: ProblemDetails;
+    /**
+     * Audit or plugin service unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type UninstallPluginError = UninstallPluginErrors[keyof UninstallPluginErrors];
+
+export type UninstallPluginResponses = {
+    /**
+     * Plugin deactivated; data and releases preserved
+     */
+    200: UninstallPluginResponse;
+};
+
+export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

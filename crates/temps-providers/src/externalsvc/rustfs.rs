@@ -457,7 +457,7 @@ fn adopted_ports_from_inspect(
 
 impl RustfsService {
     /// MinIO Client (mc) utility image - used for backup/restore operations via mc mirror
-    const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
+    const MC_IMAGE: &'static str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
 
     pub fn new(
         name: String,

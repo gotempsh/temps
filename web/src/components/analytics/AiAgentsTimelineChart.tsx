@@ -175,74 +175,75 @@ export function AiAgentsTimelineChart({
   // Pivot (bucket, key, count) rows into one object per bucket with a numeric
   // field per series key, ranking keys by total volume so the densest series
   // gets the first (most distinct) colour and a stable stack order.
-  const { chartData, seriesKeys, chartConfig, colorBySlug } = React.useMemo(() => {
-    const items = data?.items ?? []
-    if (items.length === 0) {
+  const { chartData, seriesKeys, chartConfig, colorBySlug } =
+    React.useMemo(() => {
+      const items = data?.items ?? []
+      if (items.length === 0) {
+        return {
+          chartData: [] as PivotRow[],
+          seriesKeys: [] as string[],
+          chartConfig: {} as ChartConfig,
+          colorBySlug: {} as Record<string, string>,
+        }
+      }
+
+      // Aggregate by the SLUG so the dataKey, CSS colour var, and config key all
+      // agree; remember the raw display name per slug for the legend/tooltip.
+      // The server returns the full bucket spine (gap-filled), one row per
+      // (bucket, key) for buckets with data plus an empty-key marker row for each
+      // empty bucket so the x-axis stays continuous. Key buckets by epoch ms.
+      const totals = new Map<string, number>()
+      const labelBySlug = new Map<string, string>()
+      const byBucket = new Map<number, PivotRow>()
+      for (const row of items) {
+        const ts = new Date(row.bucket).getTime()
+        let entry = byBucket.get(ts)
+        if (!entry) {
+          entry = { bucket: new Date(ts).toISOString() }
+          byBucket.set(ts, entry)
+        }
+        // Empty-key marker rows only establish the bucket on the x-axis.
+        if (!row.key) continue
+        const slug = slugifyKey(row.key)
+        labelBySlug.set(slug, row.key)
+        totals.set(slug, (totals.get(slug) ?? 0) + row.request_count)
+        entry[slug] = ((entry[slug] as number) ?? 0) + row.request_count
+      }
+
+      const keys = Array.from(totals.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([k]) => k)
+
+      const config: ChartConfig = {}
+      const colors: Record<string, string> = {}
+      keys.forEach((slug, i) => {
+        const color = SERIES_COLORS[i % SERIES_COLORS.length]
+        config[slug] = { label: labelBySlug.get(slug) ?? slug, color }
+        colors[slug] = color
+      })
+
+      // Buckets are already gap-filled and ordered by the server; just zero-fill
+      // any series missing from a given bucket so the stacked bars render cleanly.
+      const rows = Array.from(byBucket.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([, r]) => r)
+      for (const r of rows) {
+        for (const key of keys) if (r[key] === undefined) r[key] = 0
+      }
+
       return {
-        chartData: [] as PivotRow[],
-        seriesKeys: [] as string[],
-        chartConfig: {} as ChartConfig,
-        colorBySlug: {} as Record<string, string>,
+        chartData: rows,
+        seriesKeys: keys,
+        chartConfig: config,
+        colorBySlug: colors,
       }
-    }
-
-    // Aggregate by the SLUG so the dataKey, CSS colour var, and config key all
-    // agree; remember the raw display name per slug for the legend/tooltip.
-    // The server returns the full bucket spine (gap-filled), one row per
-    // (bucket, key) for buckets with data plus an empty-key marker row for each
-    // empty bucket so the x-axis stays continuous. Key buckets by epoch ms.
-    const totals = new Map<string, number>()
-    const labelBySlug = new Map<string, string>()
-    const byBucket = new Map<number, PivotRow>()
-    for (const row of items) {
-      const ts = new Date(row.bucket).getTime()
-      let entry = byBucket.get(ts)
-      if (!entry) {
-        entry = { bucket: new Date(ts).toISOString() }
-        byBucket.set(ts, entry)
-      }
-      // Empty-key marker rows only establish the bucket on the x-axis.
-      if (!row.key) continue
-      const slug = slugifyKey(row.key)
-      labelBySlug.set(slug, row.key)
-      totals.set(slug, (totals.get(slug) ?? 0) + row.request_count)
-      entry[slug] = ((entry[slug] as number) ?? 0) + row.request_count
-    }
-
-    const keys = Array.from(totals.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([k]) => k)
-
-    const config: ChartConfig = {}
-    const colors: Record<string, string> = {}
-    keys.forEach((slug, i) => {
-      const color = SERIES_COLORS[i % SERIES_COLORS.length]
-      config[slug] = { label: labelBySlug.get(slug) ?? slug, color }
-      colors[slug] = color
-    })
-
-    // Buckets are already gap-filled and ordered by the server; just zero-fill
-    // any series missing from a given bucket so the stacked bars render cleanly.
-    const rows = Array.from(byBucket.entries())
-      .sort((a, b) => a[0] - b[0])
-      .map(([, r]) => r)
-    for (const r of rows) {
-      for (const key of keys) if (r[key] === undefined) r[key] = 0
-    }
-
-    return {
-      chartData: rows,
-      seriesKeys: keys,
-      chartConfig: config,
-      colorBySlug: colors,
-    }
-  }, [data])
+    }, [data])
 
   const header = (
     <CardHeader>
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <CardTitle>AI agents over time</CardTitle>
+          <CardTitle>AI crawlers over time</CardTitle>
           <CardDescription>
             {startDate && endDate
               ? `${format(startDate, 'LLL dd, y')} – ${format(endDate, 'LLL dd, y')} · ${bucket} buckets`
@@ -284,7 +285,7 @@ export function AiAgentsTimelineChart({
         ) : error ? (
           <div className="flex h-[280px] w-full items-center justify-center">
             <div className="text-sm text-destructive">
-              Failed to load AI agent timeline
+              Failed to load AI crawler timeline
             </div>
           </div>
         ) : !chartData.length ? (

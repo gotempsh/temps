@@ -1,16 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateRangePicker } from '@/components/ui/date-range-picker'
+
 import { ProjectResponse, FunnelResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
-import { Calendar } from '@/components/ui/calendar'
 import { KbdBadge } from '@/components/ui/kbd-badge'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   AlertDialog,
@@ -27,10 +24,9 @@ import {
   deleteFunnelMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { formatDateForAPI } from '@/lib/date'
-import { cn } from '@/lib/utils'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { format, subDays } from 'date-fns'
-import { BarChart3, Calendar as CalendarIcon, Plus } from 'lucide-react'
+import { subDays } from 'date-fns'
+import { BarChart3, Plus } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import { useNavigate } from 'react-router'
@@ -111,42 +107,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant="outline"
-                className={cn(
-                  'justify-start text-left font-normal text-xs sm:text-sm',
-                  !dateRange && 'text-muted-foreground'
-                )}
-              >
-                <CalendarIcon className="mr-1.5 h-4 w-4 shrink-0" />
-                {dateRange?.from ? (
-                  dateRange.to ? (
-                    <>
-                      {format(dateRange.from, 'LLL dd, y')} -{' '}
-                      {format(dateRange.to, 'LLL dd, y')}
-                    </>
-                  ) : (
-                    format(dateRange.from, 'LLL dd, y')
-                  )
-                ) : (
-                  <span>Pick a date range</span>
-                )}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                autoFocus
-                mode="range"
-                defaultMonth={dateRange?.from}
-                selected={dateRange}
-                onSelect={setDateRange}
-                numberOfMonths={typeof window !== 'undefined' && window.innerWidth < 640 ? 1 : 2}
-                disabled={(date) => date > new Date()}
-              />
-            </PopoverContent>
-          </Popover>
+          <DateRangePicker date={dateRange} onDateChange={setDateRange} />
           <Button
             onClick={() =>
               navigate(`/projects/${project.slug}/analytics/funnels/create`)

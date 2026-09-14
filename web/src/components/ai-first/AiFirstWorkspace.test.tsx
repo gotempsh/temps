@@ -113,6 +113,7 @@ describe('WorkspaceStatusIndicator', () => {
     desired_state: 'running',
     sandbox_public_id: 'sbx_123',
     runtime: 'node',
+    runtime_update_available: false,
     image: null,
     cpu_limit: 4,
     memory_limit_mb: 8192,

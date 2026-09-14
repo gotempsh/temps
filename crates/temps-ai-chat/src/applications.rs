@@ -1874,6 +1874,10 @@ impl ApplicationService {
             application_id: Set(application.id),
             desired_state: Set("running".to_string()),
             runtime: Set("node".to_string()),
+            image: Set(
+                temps_sandbox::services::managed_application_workspace_image("node")
+                    .map(str::to_string),
+            ),
             cpu_limit: Set(4.0),
             memory_limit_mb: Set(8192),
             pids_limit: Set(512),
@@ -2026,10 +2030,26 @@ impl ApplicationService {
         user_id: i32,
         status: Option<&str>,
     ) -> Result<HashMap<i64, ApplicationProjectScope>, ApplicationError> {
+        self.project_scopes_for_listing_bounded(user_id, status, None)
+            .await
+    }
+
+    pub(crate) async fn project_scopes_for_listing_bounded(
+        &self,
+        user_id: i32,
+        status: Option<&str>,
+        public_ids: Option<&[String]>,
+    ) -> Result<HashMap<i64, ApplicationProjectScope>, ApplicationError> {
         let mut query =
             ai_applications::Entity::find().filter(ai_applications::Column::CreatedBy.eq(user_id));
         if let Some(status) = status {
             query = query.filter(ai_applications::Column::Status.eq(status));
+        }
+        if let Some(public_ids) = public_ids {
+            if public_ids.is_empty() {
+                return Ok(HashMap::new());
+            }
+            query = query.filter(ai_applications::Column::PublicId.is_in(public_ids.to_vec()));
         }
         let applications = query.all(self.db.as_ref()).await?;
         let application_ids = applications
@@ -2277,6 +2297,28 @@ impl ApplicationService {
             .ok_or_else(|| ApplicationError::NotFound(format!("workspace:{application_id}")))
     }
 
+    /// Resolve an existing active application binding without preparing or
+    /// waking its sandbox. The caller separately verifies sandbox ownership.
+    pub async fn preview_application_for_sandbox(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        let workspace = ai_application_workspaces::Entity::find()
+            .filter(ai_application_workspaces::Column::SandboxPublicId.eq(sandbox_public_id))
+            .one(self.db.as_ref())
+            .await?;
+        let Some(workspace) = workspace else {
+            return Ok(None);
+        };
+        let application = ai_applications::Entity::find_by_id(workspace.application_id)
+            .filter(ai_applications::Column::CreatedBy.eq(user_id))
+            .filter(ai_applications::Column::Status.eq("active"))
+            .one(self.db.as_ref())
+            .await?;
+        Ok(application.map(|application| application.public_id))
+    }
+
     pub async fn update_workspace(
         &self,
         user_id: i32,
@@ -2291,7 +2333,7 @@ impl ApplicationService {
             .as_ref()
             .map(|image| image.as_deref())
             .unwrap_or(current.image.as_deref());
-        if next_image.is_some() {
+        if next_image.is_some_and(|image| !is_managed_daemon_image(image)) {
             return Err(ApplicationError::InvalidWorkspaceSetting(
                 "custom workspace images are disabled; choose a trusted built-in runtime"
                     .to_string(),
@@ -2845,9 +2887,20 @@ pub struct WorkspaceSettingsUpdate {
     pub idle_timeout_secs: Option<i64>,
 }
 
+// Keep this exact allowlist aligned with the database image constraint.
+// Never accept a registry prefix alone: workspace users cannot choose arbitrary code.
+fn is_managed_daemon_image(image: &str) -> bool {
+    temps_sandbox::services::is_managed_application_workspace_image(image)
+}
+
 impl WorkspaceSettingsUpdate {
     fn validate(&self) -> Result<(), ApplicationError> {
-        if self.image.as_ref().is_some_and(Option::is_some) {
+        if self
+            .image
+            .as_ref()
+            .and_then(|image| image.as_deref())
+            .is_some_and(|image| !is_managed_daemon_image(image))
+        {
             return Err(ApplicationError::InvalidWorkspaceSetting(
                 "custom workspace images are disabled; choose a trusted built-in runtime"
                     .to_string(),
@@ -2970,6 +3023,33 @@ fn is_opaque_credential_reference(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_images_accept_only_pinned_managed_daemons() {
+        for image in [
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:0.2.0",
+            "ghcr.io/gotempsh/temps-sandbox-python:0.2.0",
+            "ghcr.io/gotempsh/temps-sandbox-all:0.2.0",
+        ] {
+            assert!(super::WorkspaceSettingsUpdate {
+                image: Some(Some(image.into())),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        for image in [
+            "attacker/image:latest",
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:latest",
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:0.2.0-evil",
+        ] {
+            assert!(super::WorkspaceSettingsUpdate {
+                image: Some(Some(image.into())),
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+    }
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
@@ -3137,6 +3217,148 @@ mod tests {
             .expect("release mock database")
             .into_transaction_log()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_activity_scope_skips_application_queries() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = ApplicationService::new(db.clone());
+        assert!(service
+            .project_scopes_for_listing_bounded(7, Some("active"), Some(&[]))
+            .await
+            .expect("empty activity scope")
+            .is_empty());
+        drop(service);
+        assert!(Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_binding_hides_missing_unowned_and_archived_applications() {
+        let now = Utc::now();
+        let workspace = ai_application_workspaces::Model {
+            id: 17,
+            application_id: 11,
+            sandbox_public_id: Some("sbx_bound".to_string()),
+            desired_state: "running".to_string(),
+            runtime: "full".to_string(),
+            image: None,
+            cpu_limit: 1.0,
+            memory_limit_mb: 1024,
+            pids_limit: 256,
+            disk_limit_mb: 4096,
+            idle_timeout_secs: 900,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let active = ai_applications::Model {
+            id: 11,
+            public_id: "app_bound".to_string(),
+            name: "Bound".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_by: 7,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_application_workspaces::Model>::new()])
+                .append_query_results([vec![workspace.clone()]])
+                .append_query_results([vec![active.clone()]])
+                .append_query_results([vec![workspace.clone()]])
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .append_query_results([vec![workspace]])
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+        assert_eq!(
+            service
+                .preview_application_for_sandbox(7, "sbx_missing")
+                .await
+                .expect("missing binding"),
+            None
+        );
+        assert_eq!(
+            service
+                .preview_application_for_sandbox(7, "sbx_bound")
+                .await
+                .expect("active binding"),
+            Some("app_bound".to_string())
+        );
+        assert_eq!(
+            service
+                .preview_application_for_sandbox(8, "sbx_bound")
+                .await
+                .expect("unowned binding"),
+            None
+        );
+        assert_eq!(
+            service
+                .preview_application_for_sandbox(7, "sbx_bound")
+                .await
+                .expect("archived binding"),
+            None
+        );
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"sandbox_public_id\" ="));
+        assert!(sql.contains("\"created_by\" ="));
+        assert!(sql.contains("\"status\" ="));
+    }
+
+    #[tokio::test]
+    async fn preview_binding_preserves_database_failure() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("binding read failed".to_string())])
+                .into_connection(),
+        );
+        let error = ApplicationService::new(db)
+            .preview_application_for_sandbox(7, "sbx_bound")
+            .await
+            .expect_err("database failure must not look like an unbound sandbox");
+        assert!(
+            matches!(error, ApplicationError::Database(sea_orm::DbErr::Custom(message)) if message == "binding read failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_activity_scope_filters_by_owner_status_and_public_ids() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+        assert!(service
+            .project_scopes_for_listing_bounded(7, Some("active"), Some(&["app_one".to_string()]))
+            .await
+            .expect("bounded activity scope")
+            .is_empty());
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"created_by\" ="));
+        assert!(sql.contains("\"status\" ="));
+        assert!(sql.contains("\"public_id\" IN"));
     }
 
     #[tokio::test]

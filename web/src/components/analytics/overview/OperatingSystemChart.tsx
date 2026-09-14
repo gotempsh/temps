@@ -15,77 +15,11 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { ChevronLeft, Monitor, Smartphone, Tablet } from 'lucide-react'
+import { ChevronLeft } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { OsIcon } from './TechnologyIcon'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
-
-function OsIcon({ os, size = 20 }: { os: string; size?: number }) {
-  // Use emoji flags for well-known OSes, with lucide fallback
-  const osLower = os.toLowerCase()
-
-  if (osLower.includes('windows')) {
-    return (
-      <span
-        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
-        role="img"
-        aria-label="Windows"
-      >
-        🪟
-      </span>
-    )
-  }
-  if (osLower.includes('mac') || osLower === 'ios') {
-    return (
-      <span
-        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
-        role="img"
-        aria-label="Apple"
-      >
-        🍎
-      </span>
-    )
-  }
-  if (
-    osLower.includes('linux') ||
-    osLower.includes('ubuntu') ||
-    osLower.includes('debian') ||
-    osLower.includes('fedora')
-  ) {
-    return (
-      <span
-        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
-        role="img"
-        aria-label="Linux"
-      >
-        🐧
-      </span>
-    )
-  }
-  if (osLower.includes('android')) {
-    return (
-      <Smartphone
-        className="text-muted-foreground"
-        style={{ width: size, height: size }}
-      />
-    )
-  }
-  if (osLower.includes('chrome')) {
-    return (
-      <Tablet
-        className="text-muted-foreground"
-        style={{ width: size, height: size }}
-      />
-    )
-  }
-
-  return (
-    <Monitor
-      className="text-muted-foreground"
-      style={{ width: size, height: size }}
-    />
-  )
-}
 
 interface OperatingSystemChartProps {
   project: ProjectResponse

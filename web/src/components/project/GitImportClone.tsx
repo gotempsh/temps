@@ -724,6 +724,8 @@ export function GitImportClone({
               selectedTemplate={selectedTemplate}
               showFeaturedFirst={true}
               kind="starter"
+              onUseGitUrl={() => setSelectedSource('git-url')}
+              onBrowseRepositories={() => setSelectedSource('browse')}
             />
           </CardContent>
         </Card>

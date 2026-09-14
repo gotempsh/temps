@@ -2117,6 +2117,17 @@
         ],
         "type": "object"
       },
+      "AnalyticsFacet": {
+        "enum": [
+          "summary",
+          "traffic",
+          "pages",
+          "events",
+          "breakdown",
+          "speed"
+        ],
+        "type": "string"
+      },
       "AnalyticsIngestKey": {
         "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
         "properties": {
@@ -2212,6 +2223,22 @@
           "event_count",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "AnalyticsProjectOption": {
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name"
         ],
         "type": "object"
       },
@@ -3429,6 +3456,27 @@
         ],
         "type": "object"
       },
+      "ApplicationGitConnectionsResponse": {
+        "properties": {
+          "bindings": {
+            "items": {
+              "$ref": "#/components/schemas/GitBindingResponse"
+            },
+            "type": "array"
+          },
+          "eligibleRepositories": {
+            "items": {
+              "$ref": "#/components/schemas/EligibleGitRepositoryResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "bindings",
+          "eligibleRepositories"
+        ],
+        "type": "object"
+      },
       "ApplicationPreviewLinkResponse": {
         "properties": {
           "expires_at": {
@@ -3922,6 +3970,27 @@
           "runtime": {
             "type": "string"
           },
+          "runtime_compatible": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "runtime_update_available": {
+            "type": "boolean"
+          },
+          "runtime_update_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_update_image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sandbox_public_id": {
             "type": [
               "string",
@@ -3942,6 +4011,7 @@
           "state",
           "desired_state",
           "runtime",
+          "runtime_update_available",
           "cpu_limit",
           "memory_limit_mb",
           "pids_limit",
@@ -4295,6 +4365,29 @@
           "access_token",
           "refresh_token",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "AuthorizeWorkspacePreviewRequest": {
+        "properties": {
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sandbox_public_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_public_id",
+          "port"
         ],
         "type": "object"
       },
@@ -4976,6 +5069,32 @@
           "tags",
           "target_all_services",
           "include_control_plane"
+        ],
+        "type": "object"
+      },
+      "BindApplicationGitConnectionRequest": {
+        "properties": {
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "projectId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "remoteName": {
+            "type": "string"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "projectId",
+          "connectionId",
+          "repositoryId",
+          "remoteName"
         ],
         "type": "object"
       },
@@ -6167,6 +6286,29 @@
           "created",
           "model",
           "choices"
+        ],
+        "type": "object"
+      },
+      "ChatFailureResponse": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "title",
+          "detail",
+          "retryable"
         ],
         "type": "object"
       },
@@ -8812,6 +8954,45 @@
         ],
         "type": "object"
       },
+      "ContextWindowUsageResponse": {
+        "properties": {
+          "estimated": {
+            "type": "boolean"
+          },
+          "limit_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "used_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used_tokens",
+          "source",
+          "estimated",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ContinuousArchiveSourceResponse": {
         "properties": {
           "continuous_archive_pinned_at": {
@@ -8834,12 +9015,27 @@
         "type": "object"
       },
       "ControlApplicationWorkspaceRequest": {
+        "additionalProperties": false,
         "properties": {
           "action": {
-            "description": "restart, pause, resume, rebuild, snapshot, or restore",
+            "description": "restart, pause, resume, rebuild, snapshot, restore, or update_runtime",
             "type": "string"
           },
+          "confirm": {
+            "description": "Must be true for update_runtime because compute is replaced.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime": {
+            "description": "Optional built-in flavor to select during update_runtime.",
             "type": [
               "string",
               "null"
@@ -8894,6 +9090,199 @@
           }
         ]
       },
+      "ConversationDiagnosticMessageResponse": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "cost_microcents": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "metadata": {},
+          "role": {
+            "type": "string"
+          },
+          "tokens_in": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tokens_out": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "role",
+          "content",
+          "created_at",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticResponse": {
+        "properties": {
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationDiagnosticRuntimeResponse"
+          },
+          "message_limit": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationDiagnosticMessageResponse"
+            },
+            "type": "array"
+          },
+          "native_session": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConversationNativeDiagnosticResponse"
+              }
+            ]
+          },
+          "pending_permission": {},
+          "returned_message_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ConversationDiagnosticSourceResponse"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "schema_version",
+          "conversation",
+          "source",
+          "messages",
+          "returned_message_count",
+          "message_limit",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticRuntimeResponse": {
+        "properties": {
+          "active_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context_id": {
+            "type": "string"
+          },
+          "context_type": {
+            "type": "string"
+          },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
+          "last_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "native_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_mode": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "public_id": {
+            "type": "string"
+          },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "context_type",
+          "context_id",
+          "provider",
+          "model",
+          "permission_mode",
+          "turn_status"
+        ],
+        "type": "object"
+      },
+      "ConversationDiagnosticSourceResponse": {
+        "properties": {
+          "native_session_note": {
+            "type": "string"
+          },
+          "native_session_status": {
+            "type": "string"
+          },
+          "normalized_history": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "normalized_history",
+          "native_session_status",
+          "native_session_note"
+        ],
+        "type": "object"
+      },
       "ConversationListScope": {
         "enum": [
           "all",
@@ -8922,6 +9311,31 @@
         },
         "required": [
           "has_more"
+        ],
+        "type": "object"
+      },
+      "ConversationNativeDiagnosticResponse": {
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "json": {},
+          "provider": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider",
+          "session_id",
+          "format",
+          "json",
+          "truncated"
         ],
         "type": "object"
       },
@@ -8961,8 +9375,28 @@
           "context_type": {
             "type": "string"
           },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
           "created_at": {
             "type": "string"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatFailureResponse"
+              }
+            ]
           },
           "last_activity_at": {
             "type": "string"
@@ -12259,6 +12693,15 @@
         ],
         "type": "object"
       },
+      "DatabaseProvisioningMode": {
+        "description": "Controls which logical database a deployment receives through a\nproject-to-service link.",
+        "enum": [
+          "project",
+          "project_environment",
+          "custom"
+        ],
+        "type": "string"
+      },
       "DelRequest": {
         "description": "Request to delete keys",
         "properties": {
@@ -15024,6 +15467,82 @@
         },
         "type": "object"
       },
+      "DockerDiskUsage": {
+        "description": "Result of `docker system df` for the control-plane host.",
+        "properties": {
+          "api_version": {
+            "description": "Docker API version the daemon answered with, when it reported one\n(`Api-Version` header). Useful when a category shows `null`\nreclaimable bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_cache": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "collected_at": {
+            "description": "When this snapshot was taken (ISO 8601, UTC).",
+            "type": "string"
+          },
+          "containers": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "images": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          },
+          "total_bytes": {
+            "description": "Sum of the four category sizes.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "volumes": {
+            "$ref": "#/components/schemas/DockerDiskUsageCategory"
+          }
+        },
+        "required": [
+          "images",
+          "containers",
+          "volumes",
+          "build_cache",
+          "total_bytes",
+          "collected_at"
+        ],
+        "type": "object"
+      },
+      "DockerDiskUsageCategory": {
+        "description": "One slice of the Docker disk-usage donut.",
+        "properties": {
+          "active_count": {
+            "description": "Objects currently in use (images referenced by a container, running\ncontainers, mounted volumes, in-use cache records).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "reclaimable_bytes": {
+            "description": "Bytes `docker system prune` could free from this category. `null`\nwhen the daemon is older than API 1.52 and does not report it.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "description": "Bytes on disk attributed to this category.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_count": {
+            "description": "Number of objects in this category (all images, all containers, …).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_count",
+          "active_count",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
       "DockerRegistrySettings": {
         "properties": {
           "ca_certificate": {
@@ -15542,6 +16061,39 @@
           "confidence",
           "reason",
           "isStatic"
+        ],
+        "type": "object"
+      },
+      "EligibleGitRepositoryResponse": {
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "fullName": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "repositoryUrl": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connectionId",
+          "repositoryId",
+          "accountName",
+          "fullName",
+          "repositoryUrl",
+          "private"
         ],
         "type": "object"
       },
@@ -21304,6 +21856,54 @@
         ],
         "type": "object"
       },
+      "GitBindingResponse": {
+        "properties": {
+          "connectionId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "projectId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "remoteName": {
+            "type": "string"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "repositoryUrl": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`configured` means the durable authorization exists; it does not claim a live remote.",
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "projectId",
+          "connectionId",
+          "repositoryId",
+          "repositoryUrl",
+          "remoteName",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
       "GitPushEvent": {
         "description": "Git push event information that triggered the deployment",
         "properties": {
@@ -21416,6 +22016,114 @@
         ],
         "type": "object"
       },
+      "GlobalAnalyticsResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalAnalyticsRow"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_views": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "total",
+          "total_views"
+        ],
+        "type": "object"
+      },
+      "GlobalAnalyticsRow": {
+        "properties": {
+          "avg_time_seconds": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bounce_rate": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cls_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fcp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "lcp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ttfb_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "views": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "visitors": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "project_id",
+          "project_name",
+          "views",
+          "sessions",
+          "visitors"
+        ],
+        "type": "object"
+      },
       "GlobalConversationResponse": {
         "description": "A conversation in the unified cross-project switcher: carries the project it\nbelongs to (name/slug) so the UI can show where the chat was started and\nlink back to the source.",
         "properties": {
@@ -21440,8 +22148,28 @@
           "context_type": {
             "type": "string"
           },
+          "context_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+              }
+            ]
+          },
           "created_at": {
             "type": "string"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatFailureResponse"
+              }
+            ]
           },
           "last_activity_at": {
             "type": "string"
@@ -21493,6 +22221,144 @@
           "ai_model",
           "ai_permission_mode",
           "turn_status"
+        ],
+        "type": "object"
+      },
+      "GlobalErrorGroupResponse": {
+        "properties": {
+          "affected_users": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "assigned_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_type": {
+            "type": "string"
+          },
+          "events_in_range": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "error_type",
+          "status",
+          "project_id",
+          "project_name",
+          "project_slug",
+          "first_seen",
+          "last_seen",
+          "total_count",
+          "events_in_range",
+          "affected_users"
+        ],
+        "type": "object"
+      },
+      "GlobalErrorGroupsQuery": {
+        "properties": {
+          "end_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GlobalErrorGroupsResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalErrorGroupResponse"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMeta"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
         ],
         "type": "object"
       },
@@ -21553,6 +22419,171 @@
           "complained"
         ],
         "type": "object"
+      },
+      "GlobalLogLine": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/LogSearchLine"
+          },
+          {
+            "properties": {
+              "env": {
+                "type": "string"
+              },
+              "external_service_id": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "owner": {
+                "type": "string"
+              },
+              "project_id": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "owner",
+              "env"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GlobalLogSearchRequest": {
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "end_time": {
+            "type": "string"
+          },
+          "envs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "external_services": {
+            "description": "Database/service IDs or names, not container service labels.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LogLevel"
+            },
+            "type": "array"
+          },
+          "node_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "page_size": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "projects": {
+            "description": "Match project ID, slug or name. Empty selects all authorized projects.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scopes": {
+            "description": "Explicit resource identities, e.g. application:12 or service:34.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/GlobalLogSource"
+          },
+          "start_time": {
+            "type": "string"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "start_time",
+          "end_time"
+        ],
+        "type": "object"
+      },
+      "GlobalLogSearchResponse": {
+        "properties": {
+          "lines": {
+            "description": "Newest first, ordered by timestamp, chunk ID and line offset.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalLogLine"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scan_limit_reached": {
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
+            "type": "boolean"
+          },
+          "scanned_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scanned_chunks": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lines",
+          "scan_limit_reached",
+          "scanned_chunks",
+          "scanned_bytes"
+        ],
+        "type": "object"
+      },
+      "GlobalLogSource": {
+        "enum": [
+          "collected",
+          "application",
+          "service"
+        ],
+        "type": "string"
       },
       "GlobalMrrResponse": {
         "properties": {
@@ -21688,6 +22719,130 @@
           "active_subscriptions",
           "active_customers",
           "transactions_last_30d"
+        ],
+        "type": "object"
+      },
+      "GlobalTraceSummariesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceSummary"
+            },
+            "type": "array"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/TraceProject"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "windows": {
+            "description": "Effective per-project windows; totals and rows describe these windows.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceWindow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "projects",
+          "windows"
+        ],
+        "type": "object"
+      },
+      "GlobalTraceSummary": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TraceSummary"
+          },
+          {
+            "properties": {
+              "project_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "project_name": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_id",
+              "project_name",
+              "project_slug"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GlobalTraceWindow": {
+        "description": "A global query can use different stores and effective windows per project.\nA non-null clamp explicitly tells clients the pre-cutover range is excluded;\nrequest an earlier window to read the older source (ADR-040/041).",
+        "properties": {
+          "effective_end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "effective_start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CloudTelemetryWriteMode"
+          },
+          "window_clamped_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "source",
+          "effective_start_time",
+          "effective_end_time"
+        ],
+        "type": "object"
+      },
+      "GlobalTracesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SpanRecord"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "windows": {
+            "description": "Effective per-project windows; totals and rows describe these windows.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceWindow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "windows"
         ],
         "type": "object"
       },
@@ -23561,6 +24716,46 @@
         ],
         "type": "object"
       },
+      "InstallPluginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "InstallPluginResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "platform",
+          "sha256",
+          "message"
+        ],
+        "type": "object"
+      },
       "IntegrationResponse": {
         "properties": {
           "config": {
@@ -24196,6 +25391,17 @@
       },
       "LinkServiceRequest": {
         "properties": {
+          "custom_database_name": {
+            "description": "Exact database name used when `database_provisioning_mode` is `custom`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode",
+            "description": "How deployments linked through this service select a logical database."
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -25446,16 +26652,110 @@
         ],
         "type": "object"
       },
+      "ManagedBackupArchiveConflict": {
+        "description": "A service whose continuous archive (Postgres WAL-G, MariaDB binlogs) is\npinned to a source other than the managed destination. The nightly Cloud\nschedule cannot back it up: archiving must not silently move between\nsources, so every run of that service fails until the operator repoints\nit to Cloud or points its own schedule at the pinned source.",
+        "properties": {
+          "pinned_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pinned_s3_source_name": {
+            "description": "Name of the pinned source, or its id as text when the row is gone.",
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "pinned_s3_source_id",
+          "pinned_s3_source_name"
+        ],
+        "type": "object"
+      },
+      "ManagedBackupSchedule": {
+        "description": "What the Cloud settings page shows about the schedule that targets the\nmanaged destination.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_period": {
+            "description": "Days each backup is kept before the schedule's retention deletes it.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "schedule_expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "schedule_expression",
+          "retention_period",
+          "enabled"
+        ],
+        "type": "object"
+      },
       "ManagedBackupSetup": {
         "properties": {
           "action": {
             "$ref": "#/components/schemas/ManagedBackupSetupAction"
+          },
+          "archive_conflicts": {
+            "description": "Services whose continuous archive is pinned elsewhere. Each fails\nunder the nightly Cloud schedule until repointed (ADR-044).",
+            "items": {
+              "$ref": "#/components/schemas/ManagedBackupArchiveConflict"
+            },
+            "type": "array"
+          },
+          "managed_s3_source_id": {
+            "description": "The `s3_sources` row of the managed destination, when it exists, so a\nclient can repoint a conflicting service at it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "message": {
             "type": "string"
           },
           "ready": {
             "type": "boolean"
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedBackupSchedule",
+                "description": "The schedule that writes to the managed destination, when one does.\n`None` on a ready destination means nothing backs up to Cloud yet:\nthe console offers to create the nightly schedule (ADR-044)."
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/ManagedBackupSetupStatus"
@@ -25465,7 +26765,8 @@
           "status",
           "ready",
           "message",
-          "action"
+          "action",
+          "archive_conflicts"
         ],
         "type": "object"
       },
@@ -27909,6 +29210,29 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NpmRelease": {
+        "properties": {
+          "binary_path": {
+            "type": "string"
+          },
+          "integrity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "integrity",
+          "binary_path"
         ],
         "type": "object"
       },
@@ -31365,6 +32689,31 @@
         ],
         "type": "object"
       },
+      "PlatformRelease": {
+        "properties": {
+          "npm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NpmRelease"
+              }
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "sha256"
+        ],
+        "type": "object"
+      },
       "PluginCapability": {
         "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
         "enum": [
@@ -31372,6 +32721,34 @@
           "api_write"
         ],
         "type": "string"
+      },
+      "PluginCatalogResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryPlugin"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "source",
+          "plugins"
+        ],
+        "type": "object"
       },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
@@ -31457,6 +32834,27 @@
         "required": [
           "name",
           "version"
+        ],
+        "type": "object"
+      },
+      "PluginStatusResponse": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -32729,6 +34127,15 @@
       },
       "ProjectServiceInfo": {
         "properties": {
+          "custom_database_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -32743,7 +34150,8 @@
         "required": [
           "id",
           "project",
-          "service"
+          "service",
+          "database_provisioning_mode"
         ],
         "type": "object"
       },
@@ -35483,6 +36891,97 @@
         ],
         "type": "object"
       },
+      "RegistryEnvelope": {
+        "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
+        "properties": {
+          "key_id": {
+            "type": "string"
+          },
+          "payload": {
+            "description": "Standard-base64 encoded JSON [`RegistryDocument`].",
+            "type": "string"
+          },
+          "signature": {
+            "description": "Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key_id",
+          "payload",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "RegistryPlugin": {
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "docs_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "platforms": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PlatformRelease"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "title",
+          "summary",
+          "description",
+          "author",
+          "category",
+          "version",
+          "platforms"
+        ],
+        "type": "object"
+      },
       "ReinstallWebhookResponse": {
         "description": "Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`",
         "properties": {
@@ -35553,9 +37052,33 @@
         ],
         "type": "object"
       },
+      "ReloadFailureResponse": {
+        "properties": {
+          "plugin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
       "ReloadResponse": {
         "description": "Response from the reload endpoint.",
         "properties": {
+          "failures": {
+            "description": "Activated installs that could not be verified or started.",
+            "items": {
+              "$ref": "#/components/schemas/ReloadFailureResponse"
+            },
+            "type": "array"
+          },
           "loaded": {
             "description": "Number of plugins successfully loaded after reload",
             "minimum": 0,
@@ -35576,6 +37099,7 @@
         "required": [
           "loaded",
           "plugins",
+          "failures",
           "message"
         ],
         "type": "object"
@@ -45067,6 +46591,26 @@
         },
         "type": "object"
       },
+      "TraceProject": {
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
+        "type": "object"
+      },
       "TraceProjectRef": {
         "description": "All projects that contributed spans to a trace, including their sharing flag.\n\nReturned by `CrossProjectTraceService::find_trace_projects`.",
         "properties": {
@@ -46439,6 +47983,25 @@
         ],
         "type": "object"
       },
+      "UninstallPluginResponse": {
+        "properties": {
+          "data_preserved": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "message",
+          "data_preserved"
+        ],
+        "type": "object"
+      },
       "UniqueCountsQuery": {
         "description": "Query parameters for unique counts over time frame",
         "properties": {
@@ -46779,6 +48342,13 @@
             "format": "int64",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Pinned Temps-managed daemon image. Empty string restores the runtime default.\nOmit to leave the selected image unchanged. Arbitrary images are rejected.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -48049,6 +49619,17 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateMonitorRequest": {
+        "properties": {
+          "check_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_path"
+        ],
         "type": "object"
       },
       "UpdateNotificationEmailProviderRequest": {
@@ -51557,6 +53138,100 @@
         ],
         "type": "string"
       },
+      "WorkspaceActivityResponse": {
+        "properties": {
+          "workspaces": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceActivitySummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workspaces"
+        ],
+        "type": "object"
+      },
+      "WorkspaceActivitySummary": {
+        "properties": {
+          "application_public_id": {
+            "description": "Null identifies the user's global workspace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "harnesses": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceHarnessActivity"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "harnesses"
+        ],
+        "type": "object"
+      },
+      "WorkspaceHarnessActivity": {
+        "properties": {
+          "ai_provider": {
+            "type": "string"
+          },
+          "cancelled": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "completed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idle": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "running": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ai_provider",
+          "total",
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "idle"
+        ],
+        "type": "object"
+      },
       "WriteApplicationWorkspaceFilesRequest": {
         "additionalProperties": false,
         "properties": {
@@ -53354,6 +55029,157 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/applications/{application_public_id}/git-connections": {
+      "get": {
+        "operationId": "listApplicationGitConnections",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationGitConnectionsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "bindApplicationGitConnection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindApplicationGitConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitBindingResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{application_public_id}/git-connections/{binding_id}": {
+      "delete": {
+        "operationId": "disconnectApplicationGitConnection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/applications/{application_public_id}/preview-link": {
       "post": {
         "operationId": "create_application_preview_link",
@@ -54916,6 +56742,66 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/conversations/{public_id}/diagnostics": {
+      "get": {
+        "operationId": "getUserConversationDiagnostics",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Persisted rows to include, newest window first (default/max 25).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationDiagnosticResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Export the bounded, server-redacted diagnostic state Temps currently owns.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/conversations/{public_id}/messages": {
       "post": {
         "operationId": "send_user_message",
@@ -55361,6 +57247,58 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/preview/authorize": {
+      "post": {
+        "operationId": "authorize_workspace_preview",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizeWorkspacePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Renew a managed preview only for an already-bound, running workspace. The\nrequested sandbox ID is an object selector, never an authorization grant.",
         "tags": [
           "AI Chat"
         ],
@@ -57163,6 +59101,56 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/workspace-activity": {
+      "get": {
+        "operationId": "get_workspace_activity",
+        "parameters": [
+          {
+            "description": "Comma-separated application public IDs (maximum 100). Omit for the global workspace only.",
+            "in": "query",
+            "name": "application_public_ids",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceActivityResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Aggregate all active threads for the caller's global workspace and up to\n100 requested, visible application workspaces. Thread history is not paged.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/workspace/changes": {
       "get": {
         "operationId": "get_global_workspace_changes",
@@ -58161,6 +60149,236 @@
           }
         ],
         "summary": "Get general statistics across all projects for a time frame",
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/global": {
+      "get": {
+        "operationId": "get_global_analytics",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "facet",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/AnalyticsFacet"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "dimension",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "device",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_views",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_sessions",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalAnalyticsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid analytics filters"
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/global/projects": {
+      "get": {
+        "operationId": "get_analytics_projects",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AnalyticsProjectOption"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Analytics"
         ],
@@ -64494,6 +66712,72 @@
         ]
       }
     },
+    "/cloud/backups/schedule/ensure": {
+      "post": {
+        "operationId": "ensure_cloud_backup_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedBackupSetup"
+                }
+              }
+            },
+            "description": "The managed destination's setup with the schedule that targets it, created when none did"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database or link state failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create the nightly schedule for the Temps Cloud destination unless one\nalready targets it (ADR-044). Answers the same shape as the reconcile so\nthe console can swap it into the status it already holds.",
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
     "/cloud/backups/source/reconcile": {
       "post": {
         "operationId": "reconcile_cloud_backup_source",
@@ -68735,6 +71019,114 @@
         "x-maturity": "beta"
       }
     },
+    "/error-groups": {
+      "get": {
+        "operationId": "list_global_error_groups",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_date",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_date",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalErrorGroupsResponse"
+                }
+              }
+            },
+            "description": "Visible errors across projects"
+          },
+          "400": {
+            "description": "Invalid filters"
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "summary": "List issues across every project visible to the caller.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/external-services": {
       "get": {
         "operationId": "list_services",
@@ -70646,6 +73038,9 @@
               }
             },
             "description": "Service linked to project successfully"
+          },
+          "400": {
+            "description": "Invalid database provisioning configuration"
           },
           "401": {
             "description": "Authentication required"
@@ -77527,6 +79922,71 @@
         ]
       }
     },
+    "/logs/global/search": {
+      "post": {
+        "operationId": "search_global_logs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GlobalLogSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalLogSearchResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/logs/search": {
       "post": {
         "operationId": "search_logs",
@@ -77807,6 +80267,67 @@
           }
         ],
         "summary": "Get a monitor by ID",
+        "tags": [
+          "Status Page"
+        ]
+      },
+      "patch": {
+        "operationId": "update_monitor",
+        "parameters": [
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMonitorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorResponse"
+                }
+              }
+            },
+            "description": "Monitor updated successfully"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Monitor not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a monitor's check path",
         "tags": [
           "Status Page"
         ]
@@ -78277,6 +80798,123 @@
         "summary": "Update a node-scoped monitoring alert rule.",
         "tags": [
           "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/latest": {
+      "get": {
+        "description": "Node `0` is the synthetic control-plane node. This is what the server\nmonitoring page reads for its \"Used: X / Limit: Y\" headlines\n(`node.memory_used_bytes`, `node.disk_total_bytes`, …) and for the\ncumulative `*_bytes_total` I/O counters, without having to fetch a full\nrange for each series.",
+        "operationId": "NodeMetricsGetLatest",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Map of metric name to latest value"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Fetch the most-recent value of every metric on a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{node_id}/docker-disk-usage": {
+      "get": {
+        "description": "On-demand rather than sampled: walking every layer, rootfs and volume can\ntake seconds, so the server monitoring page fetches it when opened or when\nthe operator presses refresh. Node `0` only for now — a worker's daemon is\nonly reachable through its agent, which does not relay this yet, and the\nerror says exactly that instead of 404ing.",
+        "operationId": "NodeDockerDiskUsageGet",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockerDiskUsage"
+                }
+              }
+            },
+            "description": "Docker disk usage by category"
+          },
+          "400": {
+            "description": "Node is not the control plane"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Docker daemon answered with an unexpected response"
+          },
+          "503": {
+            "description": "Docker daemon unreachable"
+          },
+          "504": {
+            "description": "Docker daemon timed out"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Docker disk usage (`docker system df`) for the control-plane host.",
+        "tags": [
+          "Nodes"
         ],
         "x-maturity": "beta"
       }
@@ -81643,6 +84281,436 @@
           "GenAI"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/otel/global/spans": {
+      "get": {
+        "operationId": "query_global_traces",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "trace_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_duration_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs.\ne.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE).",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort field for the trace-summaries list: \"start_time\" (default) or\n\"duration\". Anything else falls back to start_time.",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort direction: \"asc\" or \"desc\" (default).",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalTracesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traces"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/global/trace-summaries": {
+      "get": {
+        "operationId": "query_global_trace_summaries",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "trace_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_duration_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs.\ne.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE).",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort field for the trace-summaries list: \"start_time\" (default) or\n\"duration\". Anything else falls back to start_time.",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort direction: \"asc\" or \"desc\" (default).",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalTraceSummariesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traces"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/global/traces/{trace_id}": {
@@ -111621,6 +114689,196 @@
         ]
       }
     },
+    "/x/plugins/catalog": {
+      "get": {
+        "operationId": "list_plugin_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginCatalogResponse"
+                }
+              }
+            },
+            "description": "Signed plugin catalogue, or an unavailable state when registry trust is not configured"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install": {
+      "post": {
+        "operationId": "install_plugin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin verified, installed, and started"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name or registry release"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry rollback refused"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the configured limit"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request content type is not application/json"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request JSON does not match the install schema"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local plugin installation failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry, artifact, or plugin startup verification failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Registry trust, plugin service, or security audit unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
     "/x/plugins/reload": {
       "post": {
         "description": "Stops all running plugin processes, re-scans the plugins directory,\nstarts any discovered binaries, and hot-swaps the proxy router so new\nand removed plugins take effect immediately without a server restart.\n\nRequires `SystemAdmin` permission.",
@@ -111634,13 +114892,33 @@
                 }
               }
             },
-            "description": "Plugins reloaded successfully"
+            "description": "All plugins reloaded successfully"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "Some plugins reloaded and some failed"
           },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResponse"
+                }
+              }
+            },
+            "description": "No activated plugin could be reloaded"
           }
         },
         "security": [
@@ -111649,6 +114927,177 @@
           }
         ],
         "summary": "Reload all external plugins.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/status": {
+      "get": {
+        "operationId": "get_plugin_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginStatusResponse"
+                }
+              }
+            },
+            "description": "Verified active plugin status"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/uninstall": {
+      "post": {
+        "operationId": "uninstall_plugin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstallPluginResponse"
+                }
+              }
+            },
+            "description": "Plugin deactivated; data and releases preserved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unsafe plugin name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No active installation"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Local deactivation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Audit or plugin service unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop and deactivate a plugin while preserving all installed releases and data.",
         "tags": [
           "External Plugins"
         ]

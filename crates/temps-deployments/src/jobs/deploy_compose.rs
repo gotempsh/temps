@@ -44,6 +44,46 @@ fn route_binding_for_service<'a>(
         .or_else(|| bindings.first())
 }
 
+fn health_check_path_for_public_route(
+    public_ports: &[ComposePublicPort],
+    compose_services: &[temps_entities::preset::ComposeServiceSnapshot],
+) -> Result<String, WorkflowError> {
+    let Some(public_route) = public_ports.first() else {
+        return Ok("/".to_string());
+    };
+
+    if let Some(explicit) = public_route.health_check_path.as_deref() {
+        if !is_safe_health_check_path(explicit) {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "public route health check path for service '{}' must be a secret-free absolute path",
+                public_route.service
+            )));
+        }
+        return Ok(explicit.to_string());
+    }
+
+    let detected = compose_services
+        .iter()
+        .find(|service| service.name == public_route.service)
+        .and_then(|service| service.health_check_path.as_deref());
+    Ok(detected
+        .filter(|path| is_safe_health_check_path(path))
+        .unwrap_or("/")
+        .to_string())
+}
+
+fn is_safe_health_check_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 2048
+        && !path.contains('@')
+        && !path.contains("://")
+        && !path.contains('?')
+        && !path.contains('#')
+        && !path
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n' | '\0' | '\t'))
+}
+
 fn secret_generation_for_attempt(deployment_id: i32, attempt_nonce: &str) -> String {
     format!("deployment-{deployment_id}-{attempt_nonce}")
 }
@@ -681,6 +721,11 @@ impl DeployComposeJob {
                     .collect()
             })
             .unwrap_or_default();
+        // Resolve and validate before Docker or database mutations. Explicit
+        // route configuration is authoritative; unsafe auto-detected paths
+        // fall back to the secret-free deployment root.
+        let health_check_path =
+            health_check_path_for_public_route(&self.public_ports, &compose_services)?;
 
         // Services whose image matches a well-known database/storage engine
         // are running unmanaged inside this compose stack — they won't get
@@ -1386,6 +1431,7 @@ impl DeployComposeJob {
                 .collect::<Vec<_>>(),
         )?;
         context.set_output("deploy_container", "compose_services", &compose_services)?;
+        context.set_output(&self.job_id, "health_check_path", &health_check_path)?;
 
         debug!(
             project = %project_name,
@@ -1910,6 +1956,114 @@ mod tests {
         let selected = route_binding_for_service("gitlab", &bindings, &[]).unwrap();
 
         assert_eq!(selected.container_port, 22);
+    }
+
+    #[test]
+    fn compose_health_path_prefers_explicit_public_route_configuration() {
+        let public_ports = vec![ComposePublicPort {
+            service: "web".to_string(),
+            port: 8080,
+            published: None,
+            health_check_path: Some("/ready".to_string()),
+        }];
+        let services = vec![temps_entities::preset::ComposeServiceSnapshot {
+            name: "web".to_string(),
+            image: None,
+            looks_like_database: false,
+            detected_service_type: None,
+            ports: Vec::new(),
+            health_check_path: Some("/detected".to_string()),
+        }];
+
+        assert_eq!(
+            health_check_path_for_public_route(&public_ports, &services)
+                .expect("explicit path should be valid"),
+            "/ready"
+        );
+
+        let root_route = vec![ComposePublicPort {
+            health_check_path: Some("/".to_string()),
+            ..public_ports[0].clone()
+        }];
+        assert_eq!(
+            health_check_path_for_public_route(&root_route, &services)
+                .expect("root path should be valid"),
+            "/"
+        );
+    }
+
+    #[test]
+    fn compose_health_path_uses_detected_path_for_public_service() {
+        let public_ports = vec![ComposePublicPort {
+            service: "web".to_string(),
+            port: 8080,
+            published: None,
+            health_check_path: None,
+        }];
+        let services = vec![
+            temps_entities::preset::ComposeServiceSnapshot {
+                name: "worker".to_string(),
+                image: None,
+                looks_like_database: false,
+                detected_service_type: None,
+                ports: Vec::new(),
+                health_check_path: Some("/wrong".to_string()),
+            },
+            temps_entities::preset::ComposeServiceSnapshot {
+                name: "web".to_string(),
+                image: None,
+                looks_like_database: false,
+                detected_service_type: None,
+                ports: Vec::new(),
+                health_check_path: Some("/healthz".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            health_check_path_for_public_route(&public_ports, &services)
+                .expect("detected path should be valid"),
+            "/healthz"
+        );
+    }
+
+    #[test]
+    fn compose_health_path_defaults_to_root() {
+        assert_eq!(
+            health_check_path_for_public_route(&[], &[]).expect("missing route should use root"),
+            "/"
+        );
+    }
+
+    #[test]
+    fn compose_health_path_never_persists_query_secrets() {
+        let detected = vec![temps_entities::preset::ComposeServiceSnapshot {
+            name: "web".to_string(),
+            image: None,
+            looks_like_database: false,
+            detected_service_type: None,
+            ports: Vec::new(),
+            health_check_path: Some("/ready?token=do-not-persist".to_string()),
+        }];
+        let public_ports = vec![ComposePublicPort {
+            service: "web".to_string(),
+            port: 8080,
+            published: None,
+            health_check_path: None,
+        }];
+        assert_eq!(
+            health_check_path_for_public_route(&public_ports, &detected)
+                .expect("unsafe detected path should safely fall back"),
+            "/"
+        );
+
+        let explicit = vec![ComposePublicPort {
+            health_check_path: Some("/ready?token=do-not-persist".to_string()),
+            ..public_ports[0].clone()
+        }];
+        let error = health_check_path_for_public_route(&explicit, &detected)
+            .expect_err("unsafe explicit route paths must fail validation")
+            .to_string();
+        assert!(!error.contains("do-not-persist"));
     }
 
     #[test]

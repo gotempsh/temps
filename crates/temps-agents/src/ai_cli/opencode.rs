@@ -6,8 +6,8 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use super::{
-    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult,
+    copy_environment_variable, sanitize_command_environment, scrub_secrets, AiCliProvider,
+    AiCliStatus, AiRunConfig, AiRunResult, NativeToolEvent,
 };
 use crate::error::AgentError;
 
@@ -251,6 +251,14 @@ impl AiCliProvider for OpenCodeCliProvider {
 
     fn extract_assistant_text(&self, line: &str) -> Option<String> {
         extract_assistant_text(line)
+    }
+
+    fn extract_native_tool_events(&self, line: &str) -> Vec<NativeToolEvent> {
+        extract_native_tool_events(line)
+    }
+
+    fn extract_context_window_usage(&self, line: &str) -> Option<temps_ai::ContextWindowUsage> {
+        extract_context_window_usage(line)
     }
 
     fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
@@ -641,6 +649,140 @@ pub fn extract_assistant_text(line: &str) -> Option<String> {
     }
 }
 
+/// Extract already-executed OpenCode tool activity from one `--format json`
+/// line. OpenCode 1.18.23 emits terminal snapshots as `type:"tool_use"`;
+/// older/raw event adapters may expose a running snapshot as `type:"tool"`.
+/// A terminal snapshot repeats the call so reconnecting consumers receive a
+/// self-contained event; timeline consumers deduplicate it by `callID`.
+pub fn extract_native_tool_events(line: &str) -> Vec<NativeToolEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    if !matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("tool" | "tool_use")
+    ) {
+        return Vec::new();
+    }
+    let Some(part) = value.get("part") else {
+        return Vec::new();
+    };
+    let Some(id) = part
+        .get("callID")
+        .or_else(|| part.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(name) = part
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(state) = part.get("state").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let Some(status) = state.get("status").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    if !matches!(status, "running" | "completed" | "error") {
+        return Vec::new();
+    }
+
+    let arguments = serde_json::to_string(state.get("input").unwrap_or(&serde_json::Value::Null))
+        .map(|arguments| scrub_secrets(&arguments))
+        .unwrap_or_else(|_| "null".to_string());
+    let result = match status {
+        "completed" => state
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .map(|output| {
+                let output = scrub_secrets(output);
+                let exit_code = state
+                    .get("metadata")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|metadata| metadata.get("exitCode").or_else(|| metadata.get("exit")))
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|code| *code != 0);
+                match exit_code {
+                    Some(code) => {
+                        format!("{}\n\nProcess exited with code {code}.", output.trim_end())
+                    }
+                    None => output,
+                }
+            })
+            .map(Some),
+        "error" => state
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(|error| scrub_secrets(&serde_json::json!({ "error": error }).to_string()))
+            .map(Some),
+        _ => Some(None),
+    };
+    let Some(result) = result else {
+        return Vec::new();
+    };
+    let mut events = vec![NativeToolEvent::Call {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+    }];
+    if let Some(result) = result {
+        events.push(NativeToolEvent::Result {
+            call_id: id.to_string(),
+            result,
+        });
+    }
+    events
+}
+
+pub fn extract_context_window_usage(line: &str) -> Option<temps_ai::ContextWindowUsage> {
+    let value = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("step_finish") {
+        return None;
+    }
+    let part = value.get("part")?;
+    let tokens = part.get("tokens")?;
+    let input = tokens.get("input").and_then(serde_json::Value::as_u64)?;
+    let output = tokens
+        .get("output")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = tokens
+        .pointer("/cache/read")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let cache_write = tokens
+        .pointer("/cache/write")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let used_tokens = input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    let provider = part.get("providerID").and_then(serde_json::Value::as_str);
+    let model_id = part.get("modelID").and_then(serde_json::Value::as_str);
+    let model = match (provider, model_id) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (_, Some(model)) => Some(model.to_string()),
+        _ => None,
+    };
+    Some(temps_ai::ContextWindowUsage {
+        used_tokens,
+        limit_tokens: None,
+        model,
+        source: temps_ai::ContextUsageSource::ProviderReported,
+        estimated: true,
+    })
+}
+
 /// Name the tool of a `type":"tool"` event, when `line` reports a tool
 /// invocation OpenCode's CLI cannot bridge back to the user in CLI-chat
 /// mode. Returns `None` for text/step events and any other event shape (see
@@ -654,7 +796,10 @@ pub fn dropped_tool_use_name(line: &str) -> Option<String> {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    if value.get("type").and_then(|v| v.as_str()) != Some("tool") {
+    if !matches!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some("tool" | "tool_use")
+    ) {
         return None;
     }
     value
@@ -852,6 +997,143 @@ ollama/qwen3.5:9b
             r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":1}}}"#;
         assert_eq!(extract_assistant_text(step_start), None);
         assert_eq!(extract_assistant_text(step_finish), None);
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_tracks_running_and_completed_snapshots() {
+        let running = r#"{"type":"tool","part":{"id":"part_1","callID":"call_1","tool":"bash","state":{"status":"running","input":{"command":"pwd"}}}}"#;
+        assert_eq!(
+            extract_native_tool_events(running),
+            vec![NativeToolEvent::Call {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }]
+        );
+
+        let completed = r#"{"type":"tool_use","timestamp":1750000000000,"sessionID":"ses_1","part":{"id":"part_1","sessionID":"ses_1","messageID":"msg_1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{"command":"pwd"},"output":"/workspace\n","title":"pwd","metadata":{"exitCode":0},"time":{"start":1749999999000,"end":1750000000000}}}}"#;
+        assert_eq!(
+            extract_native_tool_events(completed),
+            vec![
+                NativeToolEvent::Call {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"pwd"}"#.to_string(),
+                },
+                NativeToolEvent::Result {
+                    call_id: "call_1".to_string(),
+                    result: "/workspace\n".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_tool_receipts_preserve_nonzero_exit_codes() {
+        for metadata in [
+            serde_json::json!({"exitCode":17}),
+            serde_json::json!({"exit":23}),
+        ] {
+            let line = serde_json::json!({"type":"tool_use","part":{
+                "callID":"call_1","tool":"bash","state":{
+                    "status":"completed","input":{"command":"false"},
+                    "output":"failed\n","metadata":metadata
+                }
+            }})
+            .to_string();
+            let events = extract_native_tool_events(&line);
+            let NativeToolEvent::Result { result, .. } = &events[1] else {
+                panic!("missing completed tool result")
+            };
+            assert!(result.starts_with("failed"));
+            assert!(result.contains("Process exited with code"));
+        }
+    }
+
+    #[test]
+    fn zero_exit_and_error_receipts_keep_existing_semantics() {
+        let zero = r#"{"type":"tool_use","part":{"callID":"call_1","tool":"bash","state":{"status":"completed","input":{},"output":"ok\n","metadata":{"exitCode":0}}}}"#;
+        let zero_events = extract_native_tool_events(zero);
+        assert!(matches!(
+            &zero_events[1],
+            NativeToolEvent::Result { result, .. } if result == "ok\n"
+        ));
+
+        let error = r#"{"type":"tool_use","part":{"callID":"call_2","tool":"bash","state":{"status":"error","input":{},"error":"command failed","metadata":{"exitCode":9}}}}"#;
+        let error_events = extract_native_tool_events(error);
+        assert!(matches!(
+            &error_events[1],
+            NativeToolEvent::Result { result, .. }
+                if result.contains("command failed") && !result.contains("Process exited")
+        ));
+    }
+
+    #[test]
+    fn context_usage_is_one_latest_step_snapshot_not_cumulative_billing_usage() {
+        let first = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":100,"output":20,"cache":{"read":400,"write":10}}}}"#;
+        let second = r#"{"type":"step_finish","part":{"type":"step-finish","providerID":"anthropic","modelID":"claude-test","tokens":{"input":200,"output":30,"cache":{"read":800,"write":15}}}}"#;
+        assert_eq!(
+            extract_context_window_usage(first).unwrap().used_tokens,
+            530
+        );
+        let usage = extract_context_window_usage(second).unwrap();
+        assert_eq!(usage.used_tokens, 1_045);
+        assert_eq!(usage.limit_tokens, None);
+        assert_eq!(usage.model.as_deref(), Some("anthropic/claude-test"));
+        assert!(usage.estimated);
+        assert_eq!(usage.source, temps_ai::ContextUsageSource::ProviderReported);
+        assert!(
+            extract_context_window_usage(r#"{"type":"text","part":{"text":"hello"}}"#).is_none()
+        );
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_reports_error_and_redacts_secrets() {
+        let line = r#"{"type":"tool_use","timestamp":1750000000000,"sessionID":"ses_1","part":{"id":"part_error","sessionID":"ses_1","messageID":"msg_1","type":"tool","callID":"call_error","tool":"read","state":{"status":"error","input":{"token":"sk-ant-secret"},"error":"Bearer abc.def rejected","metadata":{},"time":{"start":1749999999000,"end":1750000000000}}}}"#;
+        let events = extract_native_tool_events(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            NativeToolEvent::Call { id, arguments, .. }
+                if id == "call_error" && arguments.contains("[redacted]") && !arguments.contains("sk-ant-secret")
+        ));
+        assert!(matches!(
+            &events[1],
+            NativeToolEvent::Result { call_id, result }
+                if call_id == "call_error" && result.contains("[redacted]") && !result.contains("abc.def")
+        ));
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_uses_stable_fallback_id_for_duplicate_snapshots() {
+        let running = r#"{"type":"tool","part":{"id":"part_stable","tool":"write","state":{"status":"running","input":{"filePath":"a.txt"}}}}"#;
+        let completed = r#"{"type":"tool","part":{"id":"part_stable","tool":"write","state":{"status":"completed","input":{"filePath":"a.txt"},"output":"done"}}}"#;
+        let running_events = extract_native_tool_events(running);
+        let completed_events = extract_native_tool_events(completed);
+        assert!(
+            matches!(&running_events[0], NativeToolEvent::Call { id, .. } if id == "part_stable")
+        );
+        assert!(
+            matches!(&completed_events[0], NativeToolEvent::Call { id, .. } if id == "part_stable")
+        );
+        assert!(
+            matches!(&completed_events[1], NativeToolEvent::Result { call_id, .. } if call_id == "part_stable")
+        );
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_ignores_malformed_and_unknown_states() {
+        for line in [
+            "not json",
+            r#"{"type":"text","part":{"text":"hello"}}"#,
+            r#"{"type":"tool","part":{"tool":"bash","state":{"status":"running"}}}"#,
+            r#"{"type":"tool","part":{"callID":"call_1","state":{"status":"running"}}}"#,
+            r#"{"type":"tool","part":{"callID":"call_1","tool":"bash","state":{"status":"pending"}}}"#,
+            r#"{"type":"tool","part":{"callID":"call_1","tool":"bash","state":{"status":"completed"}}}"#,
+            r#"{"type":"tool","part":{"callID":"call_1","tool":"bash","state":{"status":"error"}}}"#,
+        ] {
+            assert!(extract_native_tool_events(line).is_empty(), "line: {line}");
+        }
     }
 
     #[test]

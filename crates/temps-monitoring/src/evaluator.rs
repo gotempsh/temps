@@ -1733,6 +1733,8 @@ mod tests {
             id: 1,
             project_id: 4,
             service_id: 7,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

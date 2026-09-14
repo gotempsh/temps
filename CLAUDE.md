@@ -498,7 +498,7 @@ Tests must verify both success and failure paths. Error-case testing is as impor
 
 ### Test Structure
 
-Tests live in `#[cfg(test)] mod tests` at the bottom of each file:
+Rust tests live in `#[cfg(test)] mod tests` at the bottom of each Rust source file:
 
 ```rust
 #[cfg(test)]
@@ -1020,6 +1020,9 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 ### Stack
 - React + TypeScript, Tanstack Query, shadcn/ui, Tailwind CSS, Rsbuild
 - Package manager: `bun` (not npm/yarn)
+
+### Frontend tests
+- Keep Bun tests beside the TypeScript or TSX source they cover, as `name.test.ts` or `name.test.tsx` in the same directory. The inline `#[cfg(test)]` rule above is Rust-only; do not import `bun:test` into production frontend modules.
 
 ### Design system (redesign)
 - New screens on the operator design system use `@temps-sdk/ds` (`web/packages/ds`) and follow `design-system/docs/RULES.md`. Use the `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) for the procedure and the scope boundary; the rules below still govern the legacy `web/src` console.

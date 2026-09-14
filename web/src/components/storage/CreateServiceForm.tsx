@@ -511,7 +511,7 @@ export function CreateServiceForm({
             type="submit"
             disabled={createServiceMut.isPending || !form.formState.isValid}
           >
-            {createServiceMut.isPending ? 'Creating...' : 'Create Service'}
+            {createServiceMut.isPending ? 'Creating...' : 'Create database'}
           </Button>
         </div>
       </form>

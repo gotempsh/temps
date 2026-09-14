@@ -166,7 +166,7 @@ export function EditBackupSchedule() {
   // silently re-binding a schedule to a different source's detail page.
   if (schedule && schedule.s3_source_id !== sourceId) {
     return (
-      <div className="space-y-6 max-w-3xl mx-auto p-4 md:p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <Card>
           <CardHeader>
             <CardTitle>Schedule not found</CardTitle>
@@ -250,7 +250,7 @@ export function EditBackupSchedule() {
   }
 
   return (
-    <div className="space-y-6 max-w-3xl mx-auto p-4 md:p-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="sm" asChild>
           <Link to={`/backups/s3-sources/${id}`}>
