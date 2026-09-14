@@ -90,7 +90,7 @@
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^4.12.3",
     "react-router": "^8.3.1",
-    "react-simple-maps": "^3.0.0",
+    "react-simple-maps": "^5.0.3",
     "recharts": "3.10.1",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
