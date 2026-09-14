@@ -61,7 +61,7 @@ prost = "0.14"
 
 # Compression
 flate2 = { workspace = true }
-zstd = "0.13"
+zstd = "0.14"
 
 # S3 for log archival
 aws-sdk-s3 = { workspace = true }
