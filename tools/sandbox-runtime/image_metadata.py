@@ -46,7 +46,11 @@ def metadata(environment, version):
     repository = f"ghcr.io/gotempsh/temps-sandbox-{flavor}"
     # Never overwrite legacy python:latest, python:beta, or python:<sha>.
     tags = [f"{repository}:daemon-{sha}"]
-    tags.append(f"{repository}:{version}" if channel == "stable" else f"{repository}:{version}-beta")
+    revision_only = environment.get("REVISION_ONLY", "false")
+    if revision_only not in ("true", "false"):
+        raise ValueError("REVISION_ONLY must be explicitly true or false")
+    if revision_only == "false":
+        tags.append(f"{repository}:{version}" if channel == "stable" else f"{repository}:{version}-beta")
     return {"publish": str(publish).lower(), "version": version, "tags": ",".join(tags)}
 
 

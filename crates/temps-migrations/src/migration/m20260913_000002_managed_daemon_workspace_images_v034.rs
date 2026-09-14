@@ -6,7 +6,7 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-const UP_SQL: &str = "ALTER TABLE ai_application_workspaces
+pub(super) const UP_SQL: &str = "ALTER TABLE ai_application_workspaces
     DROP CONSTRAINT ai_application_workspaces_image_check,
     ADD CONSTRAINT ai_application_workspaces_image_check CHECK (image IS NULL OR image IN (
         'ghcr.io/gotempsh/temps-sandbox-node:0.1.0',

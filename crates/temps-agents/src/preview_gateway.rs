@@ -54,7 +54,23 @@ use crate::docker_network_isolation::{
 };
 
 /// Immutable multi-platform manifest reference. Bumped per release.
-pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
+pub const PREVIEW_GATEWAY_IMAGE: &str = match temps_core::release_images::PREVIEW_GATEWAY {
+    Some(image) => image,
+    None => temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE,
+};
+
+fn resolved_gateway_image(configured: &str) -> String {
+    // Existing installations persisted the former compiled default. Treat
+    // that exact value as the default, not as an operator-supplied override.
+    if configured.trim().is_empty()
+        || (temps_core::release_images::PREVIEW_GATEWAY.is_some()
+            && configured == temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE)
+    {
+        PREVIEW_GATEWAY_IMAGE.to_string()
+    } else {
+        configured.to_string()
+    }
+}
 
 /// Filename inside `TEMPS_DATA_DIR` that holds the gateway shared secret.
 /// The file is created with 0600 perms on first boot if missing; the same
@@ -271,11 +287,7 @@ impl PreviewGatewaySpec {
     /// constants for any field that hasn't been customised. Does NOT enforce
     /// `auto_upgrade` semantics — that's the caller's job.
     pub fn from_settings(settings: &PreviewGatewaySettings) -> Self {
-        let image = if settings.image.trim().is_empty() {
-            PREVIEW_GATEWAY_IMAGE.to_string()
-        } else {
-            settings.image.clone()
-        };
+        let image = resolved_gateway_image(&settings.image);
         let host_port = if settings.host_port == 0 {
             DEFAULT_PREVIEW_GATEWAY_HOST_PORT
         } else {
@@ -1319,11 +1331,7 @@ pub async fn inspect_status(
     docker: &Docker,
     settings: &PreviewGatewaySettings,
 ) -> Result<GatewayStatus> {
-    let expected_image = if settings.image.trim().is_empty() {
-        PREVIEW_GATEWAY_IMAGE.to_string()
-    } else {
-        settings.image.clone()
-    };
+    let expected_image = resolved_gateway_image(&settings.image);
 
     let name = container_name(settings);
     let inspected = docker
@@ -1601,6 +1609,15 @@ mod tests {
             PreviewGatewaySettings::default().image
         );
         assert!(PREVIEW_GATEWAY_IMAGE.contains("@sha256:"));
+        assert_eq!(resolved_gateway_image(""), PREVIEW_GATEWAY_IMAGE);
+        assert_eq!(
+            resolved_gateway_image(temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE),
+            PREVIEW_GATEWAY_IMAGE
+        );
+        assert_eq!(
+            resolved_gateway_image("ghcr.io/operator/custom@sha256:1234"),
+            "ghcr.io/operator/custom@sha256:1234"
+        );
     }
 
     #[test]

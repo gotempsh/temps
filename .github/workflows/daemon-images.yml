@@ -9,6 +9,10 @@ on:
       channel:
         required: true
         type: string
+      revision_only:
+        required: false
+        type: boolean
+        default: false
       dry_run:
         required: true
         type: boolean
@@ -44,6 +48,7 @@ jobs:
           CHANNEL: ${{ inputs.channel || 'beta' }}
           DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run }}
           FLAVOR: ${{ matrix.flavor }}
+          REVISION_ONLY: ${{ inputs.revision_only || false }}
         run: |
           python3 tools/sandbox-runtime/test_build_inputs.py
           python3 tools/sandbox-runtime/image_metadata.py >> "$GITHUB_OUTPUT"
@@ -107,12 +112,15 @@ jobs:
           bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check
 
       - name: Build and publish daemon image
+        id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: tools/sandbox-runtime
           target: ${{ matrix.flavor }}
           platforms: linux/amd64,linux/arm64
           push: ${{ steps.metadata.outputs.publish == 'true' }}
+          # An explicit OCI exporter gives dry-runs a real digest too.
+          outputs: ${{ steps.metadata.outputs.publish != 'true' && 'type=oci,dest=/tmp/daemon-image.oci.tar' || '' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -121,3 +129,19 @@ jobs:
           # No floating legacy tags or cache writes: python shares a package
           # name with the standalone images, but not its version or channel aliases.
           cache-from: type=gha,scope=daemon-${{ matrix.flavor }}
+
+      - name: Record runtime image digest
+        if: inputs.revision_only
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_KIND: daemon_${{ matrix.flavor }}
+          IMAGE_REVISION: ${{ github.sha }}
+        run: python3 .github/scripts/release_image_manifest.py record --kind "$IMAGE_KIND" --digest "$IMAGE_DIGEST" --revision "$IMAGE_REVISION" --output "$IMAGE_KIND.json"
+
+      - name: Upload runtime image digest
+        if: inputs.revision_only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-image-daemon_${{ matrix.flavor }}
+          path: daemon_${{ matrix.flavor }}.json
+          retention-days: 1

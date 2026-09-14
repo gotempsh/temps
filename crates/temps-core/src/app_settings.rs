@@ -1371,7 +1371,9 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448".to_string(),
+            image: crate::release_images::PREVIEW_GATEWAY
+                .unwrap_or(crate::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE)
+                .to_string(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
             auto_upgrade: true,

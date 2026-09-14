@@ -48,6 +48,11 @@ class BuildInputsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 metadata(self.publication_environment(CHANNEL="stable", GITHUB_REF=ref), "0.3.2")
 
+    def test_release_staging_cannot_move_channel_tags_before_binaries_pass(self):
+        for channel, ref in (("stable", "refs/tags/v1.2.3"), ("beta", "refs/tags/v1.2.3-nightly.1")):
+            result = metadata(self.publication_environment(CHANNEL=channel, GITHUB_REF=ref, REVISION_ONLY="true"), "0.3.4")
+            self.assertEqual(result["tags"], f"ghcr.io/gotempsh/temps-sandbox-python:daemon-{'a' * 40}")
+
     def test_untrusted_refs_and_repositories_cannot_publish(self):
         for overrides in ({"GITHUB_REF": "refs/heads/feature"}, {"GITHUB_REPOSITORY": "someone/fork"}, {"DRY_RUN": ""}, {"CHANNEL": "latest"}, {"FLAVOR": "node"}):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
