@@ -727,6 +727,11 @@ pub struct SourceBackupEntry {
     /// object's LastModified time.
     #[schema(example = "2024-01-15T14:30:00.123Z")]
     pub created_at: String,
+    /// When retention deletes this backup, if it is governed by a schedule.
+    /// `null` for manual backups and S3-scan entries — those are kept until
+    /// someone deletes them.
+    #[schema(example = "2024-02-14T14:30:00.123Z")]
+    pub expires_at: Option<String>,
     /// Size of the backup in bytes, if known.
     #[schema(example = 1024000)]
     pub size_bytes: Option<i64>,
@@ -867,6 +872,8 @@ struct S3BackupEntry {
     backup_type: String,
     created_at: String,
     #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
     size_bytes: Option<i64>,
     #[serde(default)]
     location: String,
@@ -947,6 +954,7 @@ async fn list_source_backups(
                 name: entry.name,
                 backup_type: entry.backup_type,
                 created_at: entry.created_at,
+                expires_at: entry.expires_at,
                 size_bytes: entry.size_bytes,
                 location: entry.location,
                 metadata_location: entry.metadata_location,

@@ -889,6 +889,7 @@ async function listSourceBackupsFn(options: SourceBackupsOptions): Promise<void>
     { header: 'Type', key: 'backup_type' },
     { header: 'Size', accessor: (b) => formatBytes(b.size_bytes) },
     { header: 'Created', accessor: (b) => formatRelativeTime(b.created_at), color: (v) => colors.muted(v) },
+    { header: 'Retained until', accessor: (b) => formatRetainedUntil(b.expires_at), color: (v) => colors.muted(v) },
   ]
 
   printTable(backupEntries, columns, { style: 'minimal' })
@@ -1200,6 +1201,21 @@ export function accumulateCleanupBatch(report: RetentionCleanupReport, result: R
   report.candidate_backup_ids.push(...result.candidate_backup_ids.slice(0, remainingSampleSlots))
   report.candidate_backup_ids_truncated ||=
     result.candidate_backup_ids_truncated || result.candidate_backup_ids.length > remainingSampleSlots
+}
+
+/**
+ * Render a backup's retention deadline for a table cell.
+ *
+ * Backups created by a schedule are deleted once they are older than the
+ * schedule's retention period, and the server records that instant in
+ * `expires_at`. A backup with no deadline (a manual run, or an entry
+ * discovered by scanning S3) is kept until someone deletes it.
+ */
+export function formatRetainedUntil(expiresAt?: string | null): string {
+  if (!expiresAt) return 'until deleted'
+  const date = new Date(expiresAt)
+  if (Number.isNaN(date.getTime())) return 'until deleted'
+  return date.toLocaleDateString()
 }
 
 export function formatBytes(bytes?: number | null): string {

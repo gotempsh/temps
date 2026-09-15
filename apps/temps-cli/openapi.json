@@ -3147,7 +3147,7 @@
               "auto_upgrade": true,
               "container_name": "temps-preview-gateway",
               "host_port": 8090,
-              "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
+              "image": ""
             },
             "oneOf": [
               {
@@ -3254,6 +3254,14 @@
                 "$ref": "#/components/schemas/TenantResourceCeilings",
                 "description": "Ceilings the operator places on what a *tenant* may configure for\ntheir own project/environment. Entirely unenforced by default, so an\nupgrade never changes what an existing config means."
               }
+            ]
+          },
+          "trust_loopback_forwarded_ip": {
+            "default": null,
+            "description": "Allow the proxy to use forwarding headers from a loopback peer for\nclient IP attribution. `None` means an older client did not send the\nfield; the settings handler preserves the stored decision on PUT.\nThis is the sole control surface — there is no CLI/env override.",
+            "type": [
+              "boolean",
+              "null"
             ]
           }
         },
@@ -3426,6 +3434,10 @@
           "tenant_resource_ceilings": {
             "$ref": "#/components/schemas/TenantResourceCeilings",
             "description": "Upper bounds a project/environment override may not exceed. No\nsensitive content — this is operator policy the settings UI edits\ndirectly. Unenforced by default."
+          },
+          "trust_loopback_forwarded_ip": {
+            "description": "Database-backed opt-in; this is the sole control surface for every\nproxy process, including a standalone `temps proxy`.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -3438,6 +3450,7 @@
           "dns_provider",
           "security_headers",
           "rate_limiting",
+          "trust_loopback_forwarded_ip",
           "docker_registry",
           "disk_space_alert",
           "container_logs",
@@ -23784,6 +23797,12 @@
           "auth_type": {
             "type": "string"
           },
+          "credential_verification_status": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderCatalogDto"
+          },
           "provider_id": {
             "type": "string"
           },
@@ -23793,16 +23812,24 @@
           "source": {
             "type": "string"
           },
+          "verification_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "workspace_ready": {
             "type": "boolean"
           }
         },
         "required": [
           "saved",
+          "credential_verification_status",
           "provider_id",
           "auth_type",
           "source",
-          "workspace_ready"
+          "workspace_ready",
+          "provider"
         ],
         "type": "object"
       },
@@ -33248,8 +33275,8 @@
             "type": "integer"
           },
           "image": {
-            "default": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448",
-            "description": "Docker image reference for the gateway. Pinned by digest per Temps release.\nOperators can override this to test a custom build.",
+            "default": "",
+            "description": "Docker image reference for the gateway. Empty follows this Temps\nrelease's digest; any nonempty value is an explicit operator pin.",
             "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448",
             "type": "string"
           },
@@ -34887,6 +34914,10 @@
             "description": "True when a credential is currently saved for this provider in the\nsettings JSON. Lets the UI render \"Configured\" badges without the\nfrontend having to inspect the encrypted blob.",
             "type": "boolean"
           },
+          "credential_verification_status": {
+            "description": "`verified`, `unverified`, or `not_saved`; never implies model access.",
+            "type": "string"
+          },
           "current_auth_type": {
             "description": "Currently saved auth flavor id (when `credential_saved` is true).\n`None` when no credential is saved yet.",
             "type": [
@@ -35016,6 +35047,12 @@
             "description": "True when this provider's CLI supports enforcing a turn cap. False\nfor Codex/OpenCode, which run to completion — the UI labels their\nmax-turns inputs accordingly.",
             "type": "boolean"
           },
+          "verification_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "workspace_readiness_hint": {
             "description": "Actionable explanation when `workspace_ready` is false.",
             "type": [
@@ -35039,6 +35076,7 @@
           "permission_modes",
           "default_permission_mode_id",
           "credential_saved",
+          "credential_verification_status",
           "supports_max_turns",
           "host_authenticated",
           "model_source",
@@ -39627,6 +39665,13 @@
           "credential": {
             "description": "Plaintext credential body (API key, OAuth token, or full config file\ncontents). Encrypted with `EncryptionService` before being persisted\ninside the `agent_sandbox.providers` JSON map.",
             "type": "string"
+          },
+          "verification_model": {
+            "description": "OpenCode model to test, in `provider/model` form. Omit to use the\nbuilt-in minimal probe model. A successfully verified explicit model\nbecomes this provider's workspace default.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -39640,17 +39685,31 @@
           "auth_type": {
             "type": "string"
           },
+          "credential_verification_status": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderCatalogDto"
+          },
           "provider_id": {
             "type": "string"
           },
           "saved": {
             "type": "boolean"
+          },
+          "verification_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "saved",
+          "credential_verification_status",
           "provider_id",
-          "auth_type"
+          "auth_type",
+          "provider"
         ],
         "type": "object"
       },
@@ -43848,6 +43907,14 @@
           "engine": {
             "description": "Engine that produced the backup (\"postgres\", \"redis\", \"mongodb\",\n\"s3\", \"rustfs\"). Used by the UI to mark engine-compat with the\ntarget service.",
             "example": "postgres",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "description": "When retention deletes this backup, if it is governed by a schedule.\n`null` for manual backups and S3-scan entries — those are kept until\nsomeone deletes them.",
+            "example": "2024-02-14T14:30:00.123Z",
             "type": [
               "string",
               "null"
@@ -51786,6 +51853,18 @@
         },
         "required": [
           "code"
+        ],
+        "type": "object"
+      },
+      "VerifySavedCredentialRequest": {
+        "properties": {
+          "verification_model": {
+            "description": "OpenCode model in `provider/model` form, used to verify the saved secret.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verification_model"
         ],
         "type": "object"
       },
@@ -108804,6 +108883,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "OpenCode model to use for the verification request, in `provider/model` form.",
+            "in": "query",
+            "name": "verification_model",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -108836,6 +108924,59 @@
           }
         ],
         "summary": "Import the credential already used by this provider's CLI on the Temps\nhost. Discovery and encryption happen entirely server-side; the plaintext\ncredential is never serialized into the response or browser state.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/credential/verify-saved": {
+      "post": {
+        "operationId": "verify_saved_ai_provider_credential",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifySavedCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveCredentialResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid model or credential rejected"
+          },
+          "404": {
+            "description": "No saved credential"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Verify a previously imported OpenCode credential against a user-selected\nmodel without asking the browser to receive or resubmit the secret.",
         "tags": [
           "Agents"
         ]

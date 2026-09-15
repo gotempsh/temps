@@ -781,6 +781,24 @@ export function S3SourceDetail() {
                                     {formatBytes(backup.size_bytes)}
                                   </span>
                                 ) : null}
+                                {backup.expires_at ? (
+                                  <span
+                                    title={`Retention deletes this backup on ${format(
+                                      new Date(backup.expires_at),
+                                      'PPpp'
+                                    )}`}
+                                  >
+                                    Retained until{' '}
+                                    {format(
+                                      new Date(backup.expires_at),
+                                      'MMM d, yyyy'
+                                    )}
+                                  </span>
+                                ) : (
+                                  <span title="No schedule retention applies to this backup, so it is kept until someone deletes it.">
+                                    Kept until deleted
+                                  </span>
+                                )}
                                 {backup.backup_id ? (
                                   <span className="font-mono">
                                     #{backup.backup_id.slice(0, 8)}

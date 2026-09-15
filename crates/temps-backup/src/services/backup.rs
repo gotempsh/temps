@@ -578,6 +578,28 @@ fn retention_cutoff(days: i32) -> Result<DateTime<Utc>, BackupError> {
         })
 }
 
+/// Retention deadline of a backup created by a schedule.
+///
+/// `run_retention_cleanup` deletes a schedule's backups once
+/// `started_at < now - retention_period days`, so the moment a given backup
+/// becomes eligible for deletion is exactly `started_at + retention_period`.
+/// Storing that on the row (`backups.expires_at`) is what lets the API and
+/// console answer "until when is this backup kept?" without re-deriving the
+/// schedule's retention every time.
+///
+/// Returns `None` when the retention period is not a positive number of days
+/// (retention is disabled, so the backup is kept until deleted) or when the
+/// resulting timestamp would overflow the supported date range.
+fn retention_expiry(
+    started_at: DateTime<Utc>,
+    retention_period_days: i32,
+) -> Option<DateTime<Utc>> {
+    if retention_period_days < 1 {
+        return None;
+    }
+    started_at.checked_add_signed(Duration::days(i64::from(retention_period_days)))
+}
+
 fn json_contains_backup_identity(value: &serde_json::Value, backup_id: &str) -> bool {
     match value {
         serde_json::Value::Object(object) => {
@@ -1014,6 +1036,10 @@ pub struct EnqueuedJob {
 pub struct ScheduleRunContext {
     pub schedule_id: i32,
     pub schedule_run_id: i64,
+    /// The parent schedule's `retention_period`, in days. Used to stamp
+    /// `backups.expires_at` (and the child `external_service_backups` row)
+    /// with the retention deadline at insert time.
+    pub retention_period: i32,
 }
 
 /// Outcome of [`BackupService::enqueue_scheduled_run`].
@@ -1786,6 +1812,29 @@ SELECT cp.id
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
+        // Retention deadline: a backup owned by a schedule is deleted by
+        // `run_retention_cleanup` once it is older than the schedule's
+        // retention period. Read that period up front (before the expensive
+        // dump) so the row can record when it stops being kept. A schedule
+        // that disappears in the meantime is not a reason to fail the
+        // backup — the row is then kept until deleted.
+        let retention_period = match schedule_id {
+            Some(id) => match self.get_backup_schedule(id).await {
+                Ok(schedule) => Some(schedule.retention_period),
+                Err(error) => {
+                    warn!(
+                        schedule_id = id,
+                        error = %error,
+                        "create_backup: could not load schedule to compute the retention deadline; \
+                         backup {} will be recorded without an expiry",
+                        backup_id,
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         // Create S3 client for the portable OSS fallback.
         let s3_client = self.create_s3_client(&s3_source).await?;
 
@@ -1834,6 +1883,7 @@ SELECT cp.id
         };
 
         // Create backup record
+        let started_at = chrono::Utc::now();
         let new_backup = temps_entities::backups::ActiveModel {
             id: sea_orm::NotSet,
             name: sea_orm::Set(format!("Backup {}", backup_id)),
@@ -1842,7 +1892,7 @@ SELECT cp.id
             schedule_run_id: sea_orm::NotSet,
             backup_type: sea_orm::Set(backup_type.to_string()),
             state: sea_orm::Set("completed".to_string()),
-            started_at: sea_orm::Set(chrono::Utc::now()),
+            started_at: sea_orm::Set(started_at),
             finished_at: sea_orm::Set(Some(chrono::Utc::now())),
             s3_source_id: sea_orm::Set(s3_source_id),
             s3_location: sea_orm::Set(s3_location.clone()),
@@ -1852,7 +1902,9 @@ SELECT cp.id
             size_bytes: sea_orm::Set(Some(size_bytes)),
             file_count: sea_orm::Set(None),
             error_message: sea_orm::Set(None),
-            expires_at: sea_orm::Set(None),
+            expires_at: sea_orm::Set(
+                retention_period.and_then(|days| retention_expiry(started_at, days)),
+            ),
             checksum: sea_orm::Set(None),
             metadata: sea_orm::Set(
                 serde_json::json!({
@@ -7153,7 +7205,7 @@ RETURNING id
                 size_bytes: Set(None),
                 file_count: Set(None),
                 error_message: Set(None),
-                expires_at: Set(None),
+                expires_at: Set(retention_expiry(now, schedule.retention_period)),
                 checksum: Set(None),
                 metadata: Set(serde_json::json!({
                     "engine": "control_plane",
@@ -7219,6 +7271,7 @@ RETURNING id
                     Some(ScheduleRunContext {
                         schedule_id: schedule.id,
                         schedule_run_id: run_id,
+                        retention_period: schedule.retention_period,
                     }),
                     &trigger,
                 )
@@ -7473,6 +7526,12 @@ RETURNING id
             );
         }
 
+        // Schedule-created backups are deleted by `run_retention_cleanup`
+        // once they are older than the schedule's retention period; record
+        // that deadline so the API and console can show it. Manual runs
+        // (`schedule_ctx == None`) are kept until deleted.
+        let expires_at = schedule_ctx.and_then(|ctx| retention_expiry(now, ctx.retention_period));
+
         let parent = temps_entities::backups::ActiveModel {
             id: sea_orm::NotSet,
             name: Set(format!("Backup {}", backup_uuid)),
@@ -7491,7 +7550,7 @@ RETURNING id
             size_bytes: Set(None),
             file_count: Set(None),
             error_message: Set(None),
-            expires_at: Set(None),
+            expires_at: Set(expires_at),
             checksum: Set(None),
             metadata: Set(serde_json::Value::Object(backups_metadata).to_string()),
         }
@@ -7513,7 +7572,7 @@ RETURNING id
             checksum: Set(None),
             compression_type: Set(compression_type.to_string()),
             created_by: Set(created_by),
-            expires_at: Set(None),
+            expires_at: Set(expires_at),
             service_name_snapshot: Set(Some(source_service.name)),
             service_type_snapshot: Set(Some(source_service.service_type)),
         }
@@ -8015,6 +8074,10 @@ RETURNING id
                 "name": display_name,
                 "type": backup.backup_type,
                 "created_at": backup.started_at.to_rfc3339(),
+                // Retention deadline recorded on the row. `null` means the
+                // backup has no schedule-driven expiry and is kept until
+                // someone deletes it.
+                "expires_at": backup.expires_at.map(|dt| dt.to_rfc3339()),
                 "size_bytes": backup.size_bytes,
                 "location": backup.s3_location,
                 "metadata_location": metadata_location,
@@ -9069,7 +9132,7 @@ ORDER BY a.opened_at DESC
         id: i32,
         request: UpdateBackupScheduleRequest,
     ) -> Result<temps_entities::backup_schedules::Model, BackupError> {
-        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, IntoActiveModel, Set};
 
         // 1. Load the existing schedule (returns NotFound if absent).
         let existing = self.get_backup_schedule(id).await?;
@@ -9204,6 +9267,31 @@ ORDER BY a.opened_at DESC
         active.updated_at = Set(Utc::now());
 
         let updated = active.update(&txn).await?;
+
+        // Retention drives `run_retention_cleanup`, which deletes a
+        // schedule's backups once `started_at` is older than the retention
+        // period. Changing the period therefore moves the deadline of every
+        // existing backup of this schedule, so recompute the stored
+        // `expires_at` in the same transaction — otherwise the console would
+        // keep showing the deadline that was correct under the old period.
+        if let Some(days) = request.retention_period {
+            if days != existing.retention_period {
+                let recomputed = txn
+                    .execute(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE backups SET expires_at = started_at + ($1 * interval '1 day') \
+                         WHERE schedule_id = $2",
+                        vec![Value::from(i64::from(days)), Value::from(id)],
+                    ))
+                    .await?;
+                info!(
+                    schedule_id = id,
+                    retention_period_days = days,
+                    rows_updated = recomputed.rows_affected(),
+                    "Recomputed backup retention deadlines after a retention_period change",
+                );
+            }
+        }
 
         // Apply the target-mode and explicit selection in the same transaction
         // as the schedule fields. This prevents both no-target scheduler races
@@ -14332,5 +14420,237 @@ mod tests {
             .await;
         // Silence unused warning on the QueryFilter / ColumnTrait imports.
         let _ = temps_entities::backup_schedule_services::Column::ScheduleId.eq(0);
+    }
+    // ── retention deadline (`backups.expires_at`) ───────────────────────────
+
+    /// A one-day retention moves the deadline exactly 24 hours past
+    /// `started_at` — the same instant `run_retention_cleanup` starts
+    /// treating the backup as expired.
+    #[test]
+    fn retention_expiry_adds_one_day() {
+        let started_at = DateTime::parse_from_rfc3339("2026-01-15T14:30:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            retention_expiry(started_at, 1),
+            Some(
+                DateTime::parse_from_rfc3339("2026-01-16T14:30:00Z")
+                    .expect("valid fixture timestamp")
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    /// A long retention (10 years) is still representable and is not
+    /// silently clamped.
+    #[test]
+    fn retention_expiry_handles_large_retention_periods() {
+        let started_at = DateTime::parse_from_rfc3339("2026-01-15T14:30:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&Utc);
+
+        let expiry = retention_expiry(started_at, 3650).expect("10 years is in range");
+        assert_eq!(expiry, started_at + Duration::days(3650));
+    }
+
+    /// Zero and negative retention mean "no schedule-driven expiry": the
+    /// backup is kept until someone deletes it, so there is no deadline to
+    /// show.
+    #[test]
+    fn retention_expiry_is_none_for_non_positive_periods() {
+        let started_at = Utc::now();
+
+        assert_eq!(retention_expiry(started_at, 0), None);
+        assert_eq!(retention_expiry(started_at, -1), None);
+        assert_eq!(retention_expiry(started_at, i32::MIN), None);
+    }
+
+    /// An absurd retention period would overflow the supported date range;
+    /// report no deadline rather than panicking or wrapping.
+    #[test]
+    fn retention_expiry_is_none_on_overflow() {
+        let started_at = Utc::now();
+
+        assert_eq!(retention_expiry(started_at, i32::MAX), None);
+    }
+
+    /// Integration test: changing a schedule's `retention_period` rewrites
+    /// the stored deadline of every backup that schedule owns, and leaves
+    /// backups that belong to no schedule alone (they are kept until
+    /// deleted). Skips gracefully when Docker / test Postgres are absent.
+    #[tokio::test]
+    async fn integration_retention_change_recomputes_backup_expiry() {
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::EntityTrait;
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let s3 = temps_entities::s3_sources::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set("retention-source".to_string()),
+            bucket_name: Set("b".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            region: Set("us-east-1".to_string()),
+            endpoint: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            backing_service_id: Set(None),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert s3 source");
+
+        let schedule = temps_entities::backup_schedules::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set("retention-schedule".to_string()),
+            backup_type: Set("full".to_string()),
+            retention_period: Set(7),
+            s3_source_id: Set(s3.id),
+            schedule_expression: Set("0 0 2 * * *".to_string()),
+            enabled: Set(true),
+            last_run: Set(None),
+            next_run: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            description: Set(None),
+            tags: Set("[]".to_string()),
+            max_runtime_secs: Set(None),
+            target_all_services: Set(true),
+            include_control_plane: Set(true),
+            generated_kind: Set(None),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert schedule");
+
+        // `backups.created_by` is a FK to `users`.
+        let owner = temps_entities::users::ActiveModel {
+            name: Set("Backup Owner".to_string()),
+            email: Set("retention-owner@example.com".to_string()),
+            password_hash: Set(Some("test_hash".to_string())),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert owner user");
+
+        let started_at = DateTime::parse_from_rfc3339("2026-01-15T14:30:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&Utc);
+
+        let make_backup =
+            |name: &str, schedule_id: Option<i32>| temps_entities::backups::ActiveModel {
+                id: sea_orm::NotSet,
+                name: Set(name.to_string()),
+                backup_id: Set(Uuid::new_v4().to_string()),
+                schedule_id: Set(schedule_id),
+                schedule_run_id: Set(None),
+                backup_type: Set("full".to_string()),
+                state: Set("completed".to_string()),
+                started_at: Set(started_at),
+                finished_at: Set(Some(started_at)),
+                size_bytes: Set(None),
+                file_count: Set(None),
+                s3_source_id: Set(s3.id),
+                s3_location: Set(String::new()),
+                error_message: Set(None),
+                metadata: Set("{}".to_string()),
+                checksum: Set(None),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(owner.id),
+                expires_at: Set(retention_expiry(started_at, 7)),
+                tags: Set("[]".to_string()),
+            };
+
+        let scheduled = make_backup("scheduled-backup", Some(schedule.id))
+            .insert(db.as_ref())
+            .await
+            .expect("insert scheduled backup");
+
+        let mut manual = make_backup("manual-backup", None);
+        manual.expires_at = Set(None);
+        let manual = manual
+            .insert(db.as_ref())
+            .await
+            .expect("insert manual backup");
+
+        assert_eq!(
+            scheduled.expires_at,
+            Some(started_at + Duration::days(7)),
+            "precondition: the scheduled backup starts with the 7-day deadline"
+        );
+
+        let svc = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db.clone()),
+            create_mock_alarm_service(),
+            create_mock_config_service(),
+            Arc::new(
+                EncryptionService::new("test_encryption_key_1234567890ab")
+                    .expect("test encryption key"),
+            ),
+        );
+
+        svc.update_backup_schedule(
+            schedule.id,
+            crate::handlers::backup_handler::UpdateBackupScheduleRequest {
+                name: None,
+                description: None,
+                schedule_expression: None,
+                retention_period: Some(30),
+                max_runtime_secs: None,
+                enabled: None,
+                tags: None,
+                target_all_services: None,
+                include_control_plane: None,
+                service_ids: None,
+            },
+        )
+        .await
+        .expect("retention update succeeds");
+
+        let scheduled_after = temps_entities::backups::Entity::find_by_id(scheduled.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload scheduled backup")
+            .expect("scheduled backup still exists");
+        assert_eq!(
+            scheduled_after.expires_at,
+            Some(started_at + Duration::days(30)),
+            "extending retention must move the stored deadline forward"
+        );
+
+        let manual_after = temps_entities::backups::Entity::find_by_id(manual.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload manual backup")
+            .expect("manual backup still exists");
+        assert_eq!(
+            manual_after.expires_at, None,
+            "a backup with no schedule is kept until deleted"
+        );
     }
 }

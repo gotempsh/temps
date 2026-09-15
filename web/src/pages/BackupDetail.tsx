@@ -821,14 +821,20 @@ export function BackupDetail() {
                     {formatTimeoutSecs(backup.max_runtime_secs)}
                   </Detail>
                 ) : null}
-                {backup.expires_at ? (
-                  <Detail label="Expires">
-                    {format(new Date(backup.expires_at), 'PPp')}{' '}
+                <Detail label="Retained until">
+                  {backup.expires_at ? (
+                    <>
+                      {format(new Date(backup.expires_at), 'PPp')}{' '}
+                      <span className="text-muted-foreground">
+                        (<TimeAgo date={backup.expires_at} />)
+                      </span>
+                    </>
+                  ) : (
                     <span className="text-muted-foreground">
-                      (<TimeAgo date={backup.expires_at} />)
+                      Kept until deleted
                     </span>
-                  </Detail>
-                ) : null}
+                  )}
+                </Detail>
                 {backup.schedule_id ? (
                   <Detail label="Schedule">
                     <Link

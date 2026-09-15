@@ -15164,8 +15164,8 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned by digest per Temps release.
-     * Operators can override this to test a custom build.
+     * Docker image reference for the gateway. Empty follows this Temps
+     * release's digest; any nonempty value is an explicit operator pin.
      */
     image?: string;
     /**
@@ -20060,6 +20060,12 @@ export type SourceBackupEntry = {
      * target service.
      */
     engine?: string | null;
+    /**
+     * When retention deletes this backup, if it is governed by a schedule.
+     * `null` for manual backups and S3-scan entries — those are kept until
+     * someone deletes them.
+     */
+    expires_at?: string | null;
     /**
      * Storage format: "walg" for continuous-archive (PITR-capable),
      * "pg_dump" for point-in-time dumps, "" for non-postgres.
