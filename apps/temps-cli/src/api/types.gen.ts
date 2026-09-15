@@ -1574,6 +1574,13 @@ export type AppSettings = {
      * upgrade never changes what an existing config means.
      */
     tenant_resource_ceilings?: TenantResourceCeilings;
+    /**
+     * Allow the proxy to use forwarding headers from a loopback peer for
+     * client IP attribution. `None` means an older client did not send the
+     * field; the settings handler preserves the stored decision on PUT.
+     * This is the sole control surface — there is no CLI/env override.
+     */
+    trust_loopback_forwarded_ip?: boolean | null;
 };
 
 /**
@@ -1721,6 +1728,11 @@ export type AppSettingsResponse = {
      * directly. Unenforced by default.
      */
     tenant_resource_ceilings: TenantResourceCeilings;
+    /**
+     * Database-backed opt-in; this is the sole control surface for every
+     * proxy process, including a standalone `temps proxy`.
+     */
+    trust_loopback_forwarded_ip: boolean;
 };
 
 export type ApplicationGitConnectionsResponse = {
@@ -10527,6 +10539,41 @@ export type GroupedPageMetricsResponse = {
     total_events: number;
 };
 
+export type HarnessCheck = {
+    action?: string | null;
+    detail: string;
+    duration_ms: number;
+    id: string;
+    label: string;
+    status: HarnessCheckStatus;
+};
+
+export type HarnessCheckMode = 'preflight' | 'smoke';
+
+export type HarnessCheckOverall = 'passed' | 'warning' | 'failed';
+
+export type HarnessCheckReport = {
+    checked_at: string;
+    checks: Array<HarnessCheck>;
+    diagnostic_id: string;
+    mode: HarnessCheckMode;
+    overall: HarnessCheckOverall;
+    provider_id: string;
+};
+
+export type HarnessCheckStatus = 'passed' | 'warning' | 'failed' | 'not_tested';
+
+export type HarnessSmokeRequest = {
+    /**
+     * Explicit acknowledgement that this check makes a billable model request.
+     */
+    consent: boolean;
+    /**
+     * Optional catalog model identifier. It is validated by the provider adapter.
+     */
+    model?: string | null;
+};
+
 export type HasAnalyticsEventsResponse = {
     has_events: boolean;
 };
@@ -10937,9 +10984,12 @@ export type ImportExternalServiceRequest = {
 
 export type ImportLocalCredentialResponse = {
     auth_type: string;
+    credential_verification_status: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
     source: string;
+    verification_hint?: string | null;
     workspace_ready: boolean;
 };
 
@@ -15149,8 +15199,8 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned by digest per Temps release.
-     * Operators can override this to test a custom build.
+     * Docker image reference for the gateway. Empty follows this Temps
+     * release's digest; any nonempty value is an explicit operator pin.
      */
     image?: string;
     /**
@@ -16018,6 +16068,10 @@ export type ProviderCatalogDto = {
      */
     credential_saved: boolean;
     /**
+     * `verified`, `unverified`, or `not_saved`; never implies model access.
+     */
+    credential_verification_status: string;
+    /**
      * Currently saved auth flavor id (when `credential_saved` is true).
      * `None` when no credential is saved yet.
      */
@@ -16107,6 +16161,7 @@ export type ProviderCatalogDto = {
      * max-turns inputs accordingly.
      */
     supports_max_turns: boolean;
+    verification_hint?: string | null;
     /**
      * Actionable explanation when `workspace_ready` is false.
      */
@@ -18101,12 +18156,21 @@ export type SaveCredentialRequest = {
      * inside the `agent_sandbox.providers` JSON map.
      */
     credential: string;
+    /**
+     * OpenCode model to test, in `provider/model` form. Omit to use the
+     * built-in minimal probe model. A successfully verified explicit model
+     * becomes this provider's workspace default.
+     */
+    verification_model?: string | null;
 };
 
 export type SaveCredentialResponse = {
     auth_type: string;
+    credential_verification_status: string;
+    provider: ProviderCatalogDto;
     provider_id: string;
     saved: boolean;
+    verification_hint?: string | null;
 };
 
 export type ScalewayCredentialsRequest = {
@@ -23703,6 +23767,13 @@ export type ValidationSummary = {
 
 export type VerifyMfaRequest = {
     code: string;
+};
+
+export type VerifySavedCredentialRequest = {
+    /**
+     * OpenCode model in `provider/model` form, used to verify the saved secret.
+     */
+    verification_model: string;
 };
 
 export type VerifyStepUpRequest = {
@@ -57721,7 +57792,12 @@ export type ImportLocalAiProviderCredentialData = {
          */
         provider_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * OpenCode model to use for the verification request, in `provider/model` form.
+         */
+        verification_model?: string;
+    };
     url: '/settings/ai-providers/{provider_id}/credential/import-local';
 };
 
@@ -57749,6 +57825,35 @@ export type ImportLocalAiProviderCredentialResponses = {
 };
 
 export type ImportLocalAiProviderCredentialResponse = ImportLocalAiProviderCredentialResponses[keyof ImportLocalAiProviderCredentialResponses];
+
+export type VerifySavedAiProviderCredentialData = {
+    body: VerifySavedCredentialRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/credential/verify-saved';
+};
+
+export type VerifySavedAiProviderCredentialErrors = {
+    /**
+     * Invalid model or credential rejected
+     */
+    400: unknown;
+    /**
+     * No saved credential
+     */
+    404: unknown;
+};
+
+export type VerifySavedAiProviderCredentialResponses = {
+    200: SaveCredentialResponse;
+};
+
+export type VerifySavedAiProviderCredentialResponse = VerifySavedAiProviderCredentialResponses[keyof VerifySavedAiProviderCredentialResponses];
 
 export type RefreshAiProviderModelsData = {
     body?: never;
@@ -57786,6 +57891,76 @@ export type RefreshAiProviderModelsResponses = {
 };
 
 export type RefreshAiProviderModelsResponse = RefreshAiProviderModelsResponses[keyof RefreshAiProviderModelsResponses];
+
+export type RunAiProviderPreflightData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/preflight';
+};
+
+export type RunAiProviderPreflightErrors = {
+    /**
+     * Unknown provider
+     */
+    400: unknown;
+    /**
+     * Another diagnostic is running
+     */
+    429: ProblemDetails;
+    /**
+     * Diagnostic unavailable
+     */
+    503: unknown;
+};
+
+export type RunAiProviderPreflightError = RunAiProviderPreflightErrors[keyof RunAiProviderPreflightErrors];
+
+export type RunAiProviderPreflightResponses = {
+    200: HarnessCheckReport;
+};
+
+export type RunAiProviderPreflightResponse = RunAiProviderPreflightResponses[keyof RunAiProviderPreflightResponses];
+
+export type RunAiProviderSmokeData = {
+    body: HarnessSmokeRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/smoke';
+};
+
+export type RunAiProviderSmokeErrors = {
+    /**
+     * Consent required or unknown provider
+     */
+    400: unknown;
+    /**
+     * Another diagnostic is running
+     */
+    429: ProblemDetails;
+    /**
+     * Diagnostic unavailable
+     */
+    503: unknown;
+};
+
+export type RunAiProviderSmokeError = RunAiProviderSmokeErrors[keyof RunAiProviderSmokeErrors];
+
+export type RunAiProviderSmokeResponses = {
+    200: HarnessCheckReport;
+};
+
+export type RunAiProviderSmokeResponse = RunAiProviderSmokeResponses[keyof RunAiProviderSmokeResponses];
 
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;

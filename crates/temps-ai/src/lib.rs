@@ -23,12 +23,16 @@
 
 pub mod diagnostics;
 pub mod mcp;
+pub mod preflight;
 pub mod provider;
 pub mod schemas;
 pub mod service;
 pub mod streaming;
 pub mod typed;
 
+pub use preflight::{
+    HarnessCheck, HarnessCheckMode, HarnessCheckOverall, HarnessCheckReport, HarnessCheckStatus,
+};
 pub use provider::{
     ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
     ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,

@@ -181,6 +181,14 @@ pub struct VerifySavedCredentialRequest {
     pub verification_model: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HarnessSmokeRequest {
+    /// Explicit acknowledgement that this check makes a billable model request.
+    pub consent: bool,
+    /// Optional catalog model identifier. It is validated by the provider adapter.
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ImportLocalCredentialQuery {
@@ -401,6 +409,14 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(verify_saved_ai_provider_credential),
         )
         .route(
+            "/settings/ai-providers/{provider_id}/preflight",
+            post(run_ai_provider_preflight),
+        )
+        .route(
+            "/settings/ai-providers/{provider_id}/smoke",
+            post(run_ai_provider_smoke),
+        )
+        .route(
             "/settings/ai-providers/{provider_id}/activate",
             post(activate_ai_provider),
         )
@@ -408,6 +424,137 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/settings/ai-providers/{provider_id}/models/refresh",
             post(refresh_ai_provider_models),
         )
+}
+
+fn harness_diagnostic_problem(operation: &'static str, error: &temps_ai::AiError) -> Problem {
+    tracing::warn!(operation, error_kind = ?std::mem::discriminant(error), "AI harness diagnostic failed");
+    match error {
+        temps_ai::AiError::Provider { purpose, .. } if purpose.ends_with(".busy") =>
+            problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                .with_title("Harness diagnostic already running")
+                .with_detail("Another harness diagnostic is already using the available slot. Wait for it to finish, then retry."),
+        temps_ai::AiError::Provider { purpose, .. } if purpose.ends_with(".invalid") =>
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid harness diagnostic request")
+                .with_detail("The provider or model selection is invalid for this harness."),
+        _ => problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Harness diagnostic unavailable")
+            .with_detail(format!("Temps could not complete the {operation}. Check the sandbox runtime and retry.")),
+    }
+}
+
+#[utoipa::path(
+    tag = "Agents", post,
+    path = "/settings/ai-providers/{provider_id}/preflight",
+    params(("provider_id" = String, Path, description = "AI provider ID")),
+    responses((status = 200, body = temps_ai::HarnessCheckReport), (status = 400, description = "Unknown provider"), (status = 429, description = "Another diagnostic is running", body = temps_core::problemdetails::ProblemDetails), (status = 503, description = "Diagnostic unavailable")),
+    security(("bearer_auth" = []))
+)]
+pub async fn run_ai_provider_preflight(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(provider_id): Path<String>,
+) -> Result<Json<temps_ai::HarnessCheckReport>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    ensure_workspace_model_discovery_permission(&auth)?;
+    find_provider(&provider_id).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
+            message: format!("Unknown AI provider '{provider_id}'"),
+        })
+    })?;
+    let service = app_state.ai_service.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Harness diagnostic unavailable")
+            .with_detail("The AI harness service is not configured on this Temps instance.")
+    })?;
+    let report = service
+        .harness_preflight(&provider_id, auth.user_id())
+        .await
+        .map_err(|error| harness_diagnostic_problem("harness preflight", &error))?;
+    tracing::info!(provider_id, diagnostic_id = %report.diagnostic_id, overall = ?report.overall, "AI harness preflight completed");
+    Ok(Json(report))
+}
+
+#[utoipa::path(
+    tag = "Agents", post,
+    path = "/settings/ai-providers/{provider_id}/smoke",
+    params(("provider_id" = String, Path, description = "AI provider ID")),
+    request_body = HarnessSmokeRequest,
+    responses((status = 200, body = temps_ai::HarnessCheckReport), (status = 400, description = "Consent required or unknown provider"), (status = 429, description = "Another diagnostic is running", body = temps_core::problemdetails::ProblemDetails), (status = 503, description = "Diagnostic unavailable")),
+    security(("bearer_auth" = []))
+)]
+pub async fn run_ai_provider_smoke(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<HarnessSmokeRequest>,
+) -> Result<Json<temps_ai::HarnessCheckReport>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    ensure_workspace_model_discovery_permission(&auth)?;
+    find_provider(&provider_id).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
+            message: format!("Unknown AI provider '{provider_id}'"),
+        })
+    })?;
+    if !request.consent {
+        return Err(Problem::from(AgentError::Validation {
+            message: "Explicit consent is required because the smoke test makes a potentially billable model request".into(),
+        }));
+    }
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let config = sandbox.provider_config(&provider_id);
+    let Some(encrypted) = config.credentials_encrypted.as_ref() else {
+        let checks = vec![temps_ai::HarnessCheck {
+            id: "credential".into(), label: "Saved credential".into(), status: temps_ai::HarnessCheckStatus::Failed,
+            detail: "No saved credential is configured; infrastructure can still be checked with preflight.".into(),
+            action: Some("Save a credential, then run the paid smoke test again.".into()), duration_ms: 0,
+        }];
+        return Ok(Json(temps_ai::HarnessCheckReport {
+            provider_id,
+            mode: temps_ai::HarnessCheckMode::Smoke,
+            overall: temps_ai::HarnessCheckOverall::Failed,
+            checked_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            diagnostic_id: format!("harness-{}", chrono::Utc::now().timestamp_micros()),
+            checks,
+        }));
+    };
+    let credential = app_state
+        .encryption_service
+        .decrypt_string(encrypted)
+        .map_err(|_| {
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Saved credential unavailable")
+                .with_detail(format!(
+                    "Provider '{provider_id}' saved credential could not be decrypted."
+                ))
+        })?;
+    let service = app_state.ai_service.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Harness diagnostic unavailable")
+            .with_detail("The AI harness service is not configured on this Temps instance.")
+    })?;
+    let selected_model = request.model.as_deref().or(config.default_model.as_deref());
+    let report = service
+        .run_saved_credential_smoke(
+            &provider_id,
+            &config.auth_type,
+            &credential,
+            auth.user_id(),
+            selected_model,
+        )
+        .await
+        .map_err(|error| harness_diagnostic_problem("paid harness smoke test", &error))?;
+    write_provider_settings_audit(
+        &app_state,
+        &auth,
+        &metadata,
+        &provider_id,
+        &format!("paid-harness-smoke:{}", report.diagnostic_id),
+    )
+    .await;
+    tracing::info!(provider_id, diagnostic_id = %report.diagnostic_id, overall = ?report.overall, "AI harness smoke test completed");
+    Ok(Json(report))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -1651,6 +1798,28 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_config::ServerConfig;
     use temps_core::{AppSettings, ProviderConfig};
+
+    #[test]
+    fn harness_diagnostic_problem_maps_safe_actionable_statuses() {
+        for (purpose, expected) in [
+            (
+                "provider.harness.preflight.busy",
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ("provider.harness.smoke.invalid", StatusCode::BAD_REQUEST),
+            (
+                "provider.harness.preflight",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let error = temps_ai::AiError::Provider {
+                purpose: purpose.into(),
+                reason: "candidate-secret-must-never-leak".into(),
+            };
+            let response = harness_diagnostic_problem("diagnostic", &error).into_response();
+            assert_eq!(response.status(), expected);
+        }
+    }
 
     #[test]
     fn candidate_verification_errors_are_safe_and_actionable() {

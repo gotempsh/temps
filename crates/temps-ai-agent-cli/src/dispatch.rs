@@ -248,6 +248,41 @@ impl AiService for AiProviderRegistry {
             .await
     }
 
+    async fn harness_preflight(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.preflight".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service.harness_preflight(provider, principal_id).await
+    }
+
+    async fn run_saved_credential_smoke(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.smoke".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .run_saved_credential_smoke(provider, auth_type, credential, principal_id, model)
+            .await
+    }
+
     async fn capabilities_snapshot_for(
         &self,
         provider: Option<&str>,
