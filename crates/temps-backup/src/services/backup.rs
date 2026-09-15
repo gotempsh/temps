@@ -590,6 +590,15 @@ fn retention_cutoff(days: i32) -> Result<DateTime<Utc>, BackupError> {
 /// Returns `None` when the retention period is not a positive number of days
 /// (retention is disabled, so the backup is kept until deleted) or when the
 /// resulting timestamp would overflow the supported date range.
+///
+/// Raw-SQL callers that add a retention period to a timestamp directly
+/// (instead of going through this function) cannot express "return None on
+/// overflow" — `timestamp + interval` in Postgres raises an error and aborts
+/// the statement instead. They must clamp the number of days to
+/// [`MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC`] first so the addition can never
+/// leave the range Postgres/chrono support.
+pub const MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC: i64 = 36_500_000; // ~100,000 years
+
 fn retention_expiry(
     started_at: DateTime<Utc>,
     retention_period_days: i32,
@@ -1812,29 +1821,6 @@ SELECT cp.id
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
-        // Retention deadline: a backup owned by a schedule is deleted by
-        // `run_retention_cleanup` once it is older than the schedule's
-        // retention period. Read that period up front (before the expensive
-        // dump) so the row can record when it stops being kept. A schedule
-        // that disappears in the meantime is not a reason to fail the
-        // backup — the row is then kept until deleted.
-        let retention_period = match schedule_id {
-            Some(id) => match self.get_backup_schedule(id).await {
-                Ok(schedule) => Some(schedule.retention_period),
-                Err(error) => {
-                    warn!(
-                        schedule_id = id,
-                        error = %error,
-                        "create_backup: could not load schedule to compute the retention deadline; \
-                         backup {} will be recorded without an expiry",
-                        backup_id,
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-
         // Create S3 client for the portable OSS fallback.
         let s3_client = self.create_s3_client(&s3_source).await?;
 
@@ -1880,6 +1866,32 @@ SELECT cp.id
                     .await?;
                 (s3_location, size_bytes, "gzip".to_string())
             }
+        };
+
+        // Retention deadline: a backup owned by a schedule is deleted by
+        // `run_retention_cleanup` once it is older than the schedule's
+        // retention period. Read that period now, right before the row is
+        // written, rather than before the (potentially long-running) dump —
+        // otherwise a concurrent schedule retention edit that already
+        // recomputed every *existing* row's `expires_at` would be lost the
+        // moment this backup's row is inserted with the stale value. A
+        // schedule that disappears in the meantime is not a reason to fail
+        // the backup — the row is then kept until deleted.
+        let retention_period = match schedule_id {
+            Some(id) => match self.get_backup_schedule(id).await {
+                Ok(schedule) => Some(schedule.retention_period),
+                Err(error) => {
+                    warn!(
+                        schedule_id = id,
+                        error = %error,
+                        "create_backup: could not load schedule to compute the retention deadline; \
+                         backup {} will be recorded without an expiry",
+                        backup_id,
+                    );
+                    None
+                }
+            },
+            None => None,
         };
 
         // Create backup record
@@ -8077,7 +8089,9 @@ RETURNING id
                 // Retention deadline recorded on the row. `null` means the
                 // backup has no schedule-driven expiry and is kept until
                 // someone deletes it.
-                "expires_at": backup.expires_at.map(|dt| dt.to_rfc3339()),
+                "expires_at": backup.expires_at.map(|dt| {
+                    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                }),
                 "size_bytes": backup.size_bytes,
                 "location": backup.s3_location,
                 "metadata_location": metadata_location,
@@ -9276,12 +9290,16 @@ ORDER BY a.opened_at DESC
         // keep showing the deadline that was correct under the old period.
         if let Some(days) = request.retention_period {
             if days != existing.retention_period {
+                // Clamp before the raw SQL addition: unlike `retention_expiry`,
+                // `timestamp + interval` in Postgres raises an error (aborting
+                // the whole transaction) instead of saturating on overflow.
+                let clamped_days = i64::from(days).min(MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC);
                 let recomputed = txn
                     .execute(Statement::from_sql_and_values(
                         DatabaseBackend::Postgres,
                         "UPDATE backups SET expires_at = started_at + ($1 * interval '1 day') \
                          WHERE schedule_id = $2",
-                        vec![Value::from(i64::from(days)), Value::from(id)],
+                        vec![Value::from(clamped_days), Value::from(id)],
                     ))
                     .await?;
                 info!(

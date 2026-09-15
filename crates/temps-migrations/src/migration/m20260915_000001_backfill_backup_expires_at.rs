@@ -14,8 +14,14 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+// Clamped to the same bound as `temps_backup::services::backup::
+// MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC` (~100,000 years). Unlike the
+// Rust-side `retention_expiry` helper, `timestamp + interval` in Postgres
+// raises an error on overflow instead of saturating, which would abort this
+// migration for any row whose schedule has an unrealistically large
+// `retention_period` (e.g. a bad manual edit near `i32::MAX`).
 pub const UP_SQL: &str = "UPDATE backups b
-     SET expires_at = b.started_at + (s.retention_period * interval '1 day')
+     SET expires_at = b.started_at + (LEAST(s.retention_period, 36500000) * interval '1 day')
      FROM backup_schedules s
      WHERE b.schedule_id = s.id
        AND b.expires_at IS NULL
