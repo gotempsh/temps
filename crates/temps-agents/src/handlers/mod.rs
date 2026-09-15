@@ -123,6 +123,8 @@ use crate::services::secret_service::SecretService;
         ai_providers::save_ai_provider_credential,
         ai_providers::import_local_ai_provider_credential,
         ai_providers::verify_saved_ai_provider_credential,
+        ai_providers::run_ai_provider_preflight,
+        ai_providers::run_ai_provider_smoke,
         ai_providers::activate_ai_provider,
         ai_providers::update_ai_provider,
         ai_providers::refresh_ai_provider_models,
@@ -192,6 +194,7 @@ use crate::services::secret_service::SecretService;
         ai_providers::ProviderCatalogResponse,
         ai_providers::SaveCredentialRequest,
         ai_providers::VerifySavedCredentialRequest,
+        ai_providers::HarnessSmokeRequest,
         ai_providers::SaveCredentialResponse,
         ai_providers::LocalCredentialDto,
         ai_providers::ImportLocalCredentialResponse,
@@ -200,6 +203,11 @@ use crate::services::secret_service::SecretService;
         ai_providers::UpdateProviderResponse,
         ai_providers::RefreshProviderModelsResponse,
         temps_ai::ModelCatalogSource,
+        temps_ai::HarnessCheck,
+        temps_ai::HarnessCheckMode,
+        temps_ai::HarnessCheckOverall,
+        temps_ai::HarnessCheckReport,
+        temps_ai::HarnessCheckStatus,
     )),
     tags(
         (name = "Agents", description = "Autonomous AI agents, autofixer (interactive AI debugging), skills/MCP definitions, and preview gateway management.")

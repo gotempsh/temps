@@ -4,11 +4,13 @@
 import type { Pool } from "pg";
 import { countryForRequest } from "../geo.js";
 
-// Known event types — kept in lockstep with the Rust binary's
+// Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
 // rejects anything not in this set so a typo or rogue client can't pollute the
-// table. When adding an event, add it in BOTH places.
+// table. Add runtime events in BOTH places; cli_setup_step is CLI-only.
 export const KNOWN_EVENT_TYPES = new Set([
+  // CLI-only, per-attempt setup funnel; not emitted by the Rust runtime.
+  "cli_setup_step",
   // Instance lifecycle
   "instance_started",
   "instance_heartbeat",
@@ -132,6 +134,32 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
       ? sanitizeProperties(obj.properties)
       : {};
 
+  if (obj.event_type === "cli_setup_step") {
+    const allowed: Record<string, readonly string[]> = {
+      step: ["preflight", "install", "verify", "context"],
+      status: ["started", "completed", "failed"],
+      method: ["ssh"],
+      elapsed_bucket: ["under_minute", "under_five_minutes", "five_minutes_plus"],
+    };
+    for (const [key, values] of Object.entries(allowed)) {
+      if (typeof properties[key] !== "string" || !values.includes(properties[key] as string)) {
+        return { error: "invalid CLI setup properties" };
+      }
+    }
+    if (typeof properties.cli_version !== "string" ||
+        !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(properties.cli_version)) {
+      return { error: "invalid CLI version" };
+    }
+    // Reject extra fields instead of trusting the generic PII blacklist.
+    if (!isValidProperties(obj.properties) || Object.keys(obj.properties).some(
+      key => !Object.hasOwn(allowed, key) && key !== "cli_version"
+    )) return { error: "unexpected CLI setup property" };
+    if (obj.temps_version !== undefined || obj.occurred_at !== undefined ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(obj.anonymous_id as string)) {
+      return { error: "invalid CLI setup metadata" };
+    }
+  }
+
   let occurred_at: string | undefined;
   if (obj.occurred_at !== undefined) {
     const d = new Date(obj.occurred_at as string);
@@ -157,6 +185,7 @@ async function insertEvent(
   event: IngestBody,
   country: string | null
 ): Promise<void> {
+  if (event.event_type === "cli_setup_step") country = null;
   await pool.query(
     `INSERT INTO telemetry_events
        (anonymous_id, event_type, properties, temps_version, occurred_at, country)
@@ -170,6 +199,9 @@ async function insertEvent(
       country,
     ]
   );
+
+  // An installer attempt is not an active Temps server.
+  if (event.event_type === "cli_setup_step") return;
 
   // Upsert the instance-day record for cheap DAI (daily active instances)
   // queries. Backfill country if it was previously null (an instance's country

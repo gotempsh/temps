@@ -828,6 +828,7 @@ pub struct LoadBalancer {
     /// this is a plain required field here rather than an `Option`: a gate
     /// value always exists, whether or not a plugin claimed the slot.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+    request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
     challenge_service: Arc<ChallengeService>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
@@ -912,6 +913,7 @@ impl LoadBalancer {
             config_service,
             ip_access_control_service,
             project_ip_gate,
+            request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
             challenge_service,
             cert_host_cache,
             disable_https_redirect,
@@ -925,6 +927,14 @@ impl LoadBalancer {
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    pub fn with_request_policy_gate(
+        mut self,
+        gate: Arc<dyn temps_core::RequestPolicyGate>,
+    ) -> Self {
+        self.request_policy_gate = gate;
+        self
     }
 
     /// Handle to the hot-path metrics counters, for the background sampler.
@@ -2827,6 +2837,53 @@ fn ip_restriction_denies(
     }
 }
 
+fn legacy_ip_gate_denies(
+    decision: temps_core::RequestPolicyDecision,
+    gate: &dyn temps_core::ProjectIpGate,
+    project_id: i32,
+    environment_id: i32,
+    parsed_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match decision {
+        temps_core::RequestPolicyDecision::Continue => {
+            ip_restriction_denies(gate, project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Allow { .. } => {
+            gate.is_explicitly_denied(project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Deny { .. }
+        | temps_core::RequestPolicyDecision::Unavailable { .. } => false,
+    }
+}
+
+fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        ip => ip,
+    }
+}
+
+fn evaluate_request_policy(
+    gate: &dyn temps_core::RequestPolicyGate,
+    request: &pingora_http::RequestHeader,
+    host: &str,
+    project_id: i32,
+    environment_id: i32,
+    client_ip: Option<std::net::IpAddr>,
+) -> temps_core::RequestPolicyDecision {
+    gate.evaluate(&temps_core::RequestPolicyContext {
+        path: request.uri.path(),
+        method: request.method.as_str(),
+        host,
+        project_id,
+        environment_id,
+        client_ip,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicAuthority {
     host: String,
@@ -4558,20 +4615,64 @@ impl ProxyHttp for LoadBalancer {
             let parsed_ip = ctx
                 .ip_address
                 .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-            let ip_restricted = ip_restriction_denies(
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(normalize_client_ip);
+            let decision = evaluate_request_policy(
+                self.request_policy_gate.as_ref(),
+                session.req_header(),
+                &ctx.host,
+                project_ctx.project.id,
+                project_ctx.environment.id,
+                parsed_ip,
+            );
+            let ip_restricted = legacy_ip_gate_denies(
+                decision,
                 self.project_ip_gate.as_ref(),
                 project_ctx.project.id,
                 project_ctx.environment.id,
                 parsed_ip,
             );
-            if ip_restricted {
+            if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
                 warn!(
-                    environment_id = project_ctx.environment.id,
                     project_id = project_ctx.project.id,
-                    ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                    "Request denied by project IP restriction"
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    "Project policy unavailable; denying request"
                 );
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                    .await?;
+                ctx.routing_status = "request_policy_unavailable".to_string();
+                return Ok(true);
+            }
+            if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
+                match decision {
+                    temps_core::RequestPolicyDecision::Deny {
+                        reason,
+                        rule_id,
+                        revision,
+                    } => warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        reason,
+                        rule_id,
+                        revision,
+                        "Request denied by project policy"
+                    ),
+                    _ => warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        "Request denied by project IP restriction"
+                    ),
+                }
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
                 response.insert_header("X-Request-ID", &ctx.request_id)?;
@@ -4582,7 +4683,13 @@ impl ProxyHttp for LoadBalancer {
                 session
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
-                ctx.routing_status = "project_ip_restricted".to_string();
+                ctx.routing_status =
+                    if matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
+                        "request_policy_denied"
+                    } else {
+                        "project_ip_restricted"
+                    }
+                    .to_string();
                 return Ok(true);
             }
 
@@ -4749,14 +4856,61 @@ impl ProxyHttp for LoadBalancer {
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
 
-                    let redirect = params
-                        .iter()
-                        .find(|(k, _)| k == "redirect")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("/");
+                    // The destination is client input: reduce it to a
+                    // same-origin path before it becomes a Location header.
+                    let redirect = crate::handler::password_wall::sanitize_redirect_path(
+                        params
+                            .iter()
+                            .find(|(k, _)| k == "redirect")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("/"),
+                    );
+
+                    // Guesses are limited per (client IP, environment) with
+                    // the same sliding window as the sandbox preview login,
+                    // so the wall cannot be brute-forced. The attempt is
+                    // taken atomically before the password is checked, so a
+                    // concurrent burst cannot outrun the count. An unparsable
+                    // client address shares one bucket rather than escaping
+                    // the limit.
+                    let client_ip = ctx
+                        .ip_address
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+                    if !self
+                        .preview_auth_limiter
+                        .try_admit_password_wall(client_ip, env_id)
+                    {
+                        warn!(
+                            environment_id = env_id,
+                            client_ip = %client_ip,
+                            "password-wall: verify POST rate limited"
+                        );
+                        let mut resp = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                        resp.insert_header("Retry-After", "60")?;
+                        resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from_static(
+                                    b"Too many failed attempts. Try again in a minute.\n",
+                                )),
+                                true,
+                            )
+                            .await?;
+                        ctx.routing_status = "password_rate_limited".to_string();
+                        return Ok(true);
+                    }
 
                     if crate::handler::password_wall::verify_password(password, &password_hash) {
                         // Password correct — set cookie and redirect
+                        self.preview_auth_limiter
+                            .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
                         let set_cookie = crate::handler::password_wall::build_set_cookie_header(
                             env_id,
@@ -4768,13 +4922,15 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Location", redirect)?;
                         resp.insert_header("Set-Cookie", &set_cookie)?;
                         resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                         session.write_response_header(Box::new(resp), true).await?;
                         ctx.routing_status = "password_verified".to_string();
                         return Ok(true);
                     } else {
-                        // Wrong password — show form again with error
+                        // Wrong password — the attempt is already counted;
+                        // show the form again with an error
                         let html = crate::handler::password_wall::generate_password_form_html(
                             redirect,
                             true,
@@ -4787,6 +4943,9 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         resp.insert_header("Cache-Control", "no-store")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        // A credential prompt must not be framed or leak its URL.
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
 
                         session.write_response_header(Box::new(resp), false).await?;
                         session.write_response_body(Some(html_bytes), true).await?;
@@ -4837,6 +4996,9 @@ impl ProxyHttp for LoadBalancer {
                     resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     resp.insert_header("Cache-Control", "no-store")?;
                     resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                    // A credential prompt must not be framed or leak its URL.
+                    resp.insert_header("Referrer-Policy", "no-referrer")?;
+                    resp.insert_header("X-Frame-Options", "DENY")?;
 
                     session.write_response_header(Box::new(resp), false).await?;
                     session.write_response_body(Some(html_bytes), true).await?;
@@ -7619,12 +7781,12 @@ mod content_type_tests {
 
 #[cfg(test)]
 mod ip_restriction_fail_closed_tests {
-    use super::ip_restriction_denies;
+    use super::{ip_restriction_denies, legacy_ip_gate_denies, normalize_client_ip};
     use std::net::IpAddr;
-    use temps_core::ProjectIpGate;
+    use temps_core::{ProjectIpGate, RequestPolicyDecision};
 
-    /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
-    /// project/environment is on a closed/restricted mode: `is_allowed`
+    /// Stands in for a cached project IP gate when a project/environment is
+    /// on a closed/restricted mode: `is_allowed`
     /// denies (baring an explicit allowlist match, irrelevant here since we
     /// never reach it — the IP is unresolvable) and `has_active_policy`
     /// truthfully reports the restriction exists.
@@ -7635,6 +7797,14 @@ mod ip_restriction_fail_closed_tests {
         }
         fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
             true
+        }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            _ip: Option<IpAddr>,
+        ) -> bool {
+            false
         }
     }
 
@@ -7647,6 +7817,21 @@ mod ip_restriction_fail_closed_tests {
             true
         }
         // has_active_policy uses the trait default (`false`).
+    }
+
+    struct ExplicitDenyGate;
+    impl ProjectIpGate for ExplicitDenyGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            ip: Option<IpAddr>,
+        ) -> bool {
+            ip.is_none() || ip == Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)))
+        }
     }
 
     #[test]
@@ -7672,6 +7857,161 @@ mod ip_restriction_fail_closed_tests {
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         assert!(ip_restriction_denies(&RestrictedGate, 1, 1, Some(ip)));
         assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, Some(ip)));
+    }
+
+    #[test]
+    fn policy_continue_keeps_legacy_restrictions_but_allow_owns_access() {
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Continue,
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Deny {
+                reason: "blocked",
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None
+            },
+            &ExplicitDenyGate,
+            1,
+            2,
+            None
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv6_uses_ipv4_identity_for_both_gates() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let ipv4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(normalize_client_ip(mapped), ipv4);
+        assert_eq!(normalize_client_ip(ipv4), ipv4);
+    }
+}
+
+#[cfg(test)]
+mod request_policy_path_handoff_tests {
+    use super::evaluate_request_policy;
+    use pingora_proxy::Session;
+    use std::sync::{Arc, Mutex};
+    use temps_core::{RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RecordingAllowGate {
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestPolicyGate for RecordingAllowGate {
+        fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
+            assert_eq!(context.method, "POST");
+            assert_eq!(context.host, "app.example.test");
+            assert_eq!(context.project_id, 41);
+            assert_eq!(context.environment_id, 73);
+            assert_eq!(context.client_ip, None);
+            self.paths
+                .lock()
+                .expect("recording gate mutex poisoned")
+                .push(context.path.to_string());
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_preserves_policy_path_spelling_in_upstream_request_target() {
+        let cases = [
+            ("/hook/admin?token=x", "/hook/admin"),
+            ("/hook%2fadmin?token=x", "/hook%2fadmin"),
+            ("/hook%2Fadmin?token=x", "/hook%2Fadmin"),
+            ("/hook/../admin?token=x", "/hook/../admin"),
+            ("/hook//admin?token=x", "/hook//admin"),
+            ("/hook\\admin?token=x", "/hook\\admin"),
+        ];
+
+        for (request_target, expected_policy_path) in cases {
+            let request = format!(
+                "POST {request_target} HTTP/1.1\r\nHost: app.example.test\r\nContent-Length: 0\r\n\r\n"
+            );
+            let (mut downstream_writer, downstream_reader) = tokio::io::duplex(2048);
+            downstream_writer
+                .write_all(request.as_bytes())
+                .await
+                .expect("write raw downstream request");
+
+            let mut session =
+                Session::new_h1(Box::new(downstream_reader) as pingora_core::protocols::Stream);
+            session
+                .read_request()
+                .await
+                .unwrap_or_else(|error| panic!("Pingora rejected {request_target}: {error}"));
+
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let gate = RecordingAllowGate {
+                paths: Arc::clone(&paths),
+            };
+            assert!(matches!(
+                evaluate_request_policy(
+                    &gate,
+                    session.req_header(),
+                    "app.example.test",
+                    41,
+                    73,
+                    None,
+                ),
+                RequestPolicyDecision::Allow { .. }
+            ));
+            assert_eq!(
+                paths
+                    .lock()
+                    .expect("recording gate mutex poisoned")
+                    .as_slice(),
+                [expected_policy_path],
+                "policy path changed for {request_target}"
+            );
+
+            let (upstream_writer, mut upstream_reader) = tokio::io::duplex(2048);
+            let mut upstream = pingora_core::protocols::http::v1::client::HttpSession::new(
+                Box::new(upstream_writer) as pingora_core::protocols::Stream,
+            );
+            upstream
+                .write_request_header(Box::new(session.req_header().clone()))
+                .await
+                .unwrap_or_else(|error| panic!("serialize {request_target} upstream: {error}"));
+
+            let mut serialized = vec![0; request.len() + 256];
+            let bytes_read = upstream_reader
+                .read(&mut serialized)
+                .await
+                .expect("read serialized upstream request");
+            let serialized = String::from_utf8_lossy(&serialized[..bytes_read]);
+            assert!(
+                serialized.starts_with(&format!("POST {request_target} HTTP/1.1\r\n")),
+                "upstream request target changed for {request_target}: {serialized:?}"
+            );
+        }
     }
 }
 

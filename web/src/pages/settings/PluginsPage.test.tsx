@@ -83,7 +83,7 @@ describe('PluginsPage management permissions', () => {
     const markup = renderPage()
 
     expect(reportingEnabledValues).toEqual([])
-    expect(markup).toContain('Plugins currently loaded by Temps.')
+    expect(markup).toContain('Verified plugins currently loaded by Temps.')
     expect(markup).toContain('Ask a system administrator to install one.')
     expect(markup).not.toContain('Reload Plugins')
     expect(markup).toContain('Available plugins')

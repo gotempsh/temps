@@ -303,6 +303,31 @@ pub trait AiService: Send + Sync {
             .await
     }
 
+    async fn harness_preflight(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<crate::HarnessCheckReport, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.preflight".into(),
+            reason: format!("harness preflight is unavailable for '{provider}'"),
+        })
+    }
+
+    async fn run_saved_credential_smoke(
+        &self,
+        provider: &str,
+        _auth_type: &str,
+        _credential: &str,
+        _principal_id: i32,
+        _model: Option<&str>,
+    ) -> Result<crate::HarnessCheckReport, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.smoke".into(),
+            reason: format!("harness smoke test is unavailable for '{provider}'"),
+        })
+    }
+
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
 

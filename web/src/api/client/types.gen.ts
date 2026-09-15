@@ -10539,6 +10539,41 @@ export type GroupedPageMetricsResponse = {
     total_events: number;
 };
 
+export type HarnessCheck = {
+    action?: string | null;
+    detail: string;
+    duration_ms: number;
+    id: string;
+    label: string;
+    status: HarnessCheckStatus;
+};
+
+export type HarnessCheckMode = 'preflight' | 'smoke';
+
+export type HarnessCheckOverall = 'passed' | 'warning' | 'failed';
+
+export type HarnessCheckReport = {
+    checked_at: string;
+    checks: Array<HarnessCheck>;
+    diagnostic_id: string;
+    mode: HarnessCheckMode;
+    overall: HarnessCheckOverall;
+    provider_id: string;
+};
+
+export type HarnessCheckStatus = 'passed' | 'warning' | 'failed' | 'not_tested';
+
+export type HarnessSmokeRequest = {
+    /**
+     * Explicit acknowledgement that this check makes a billable model request.
+     */
+    consent: boolean;
+    /**
+     * Optional catalog model identifier. It is validated by the provider adapter.
+     */
+    model?: string | null;
+};
+
 export type HasAnalyticsEventsResponse = {
     has_events: boolean;
 };
@@ -15164,8 +15199,8 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned by digest per Temps release.
-     * Operators can override this to test a custom build.
+     * Docker image reference for the gateway. Empty follows this Temps
+     * release's digest; any nonempty value is an explicit operator pin.
      */
     image?: string;
     /**
@@ -57818,6 +57853,76 @@ export type RefreshAiProviderModelsResponses = {
 };
 
 export type RefreshAiProviderModelsResponse = RefreshAiProviderModelsResponses[keyof RefreshAiProviderModelsResponses];
+
+export type RunAiProviderPreflightData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/preflight';
+};
+
+export type RunAiProviderPreflightErrors = {
+    /**
+     * Unknown provider
+     */
+    400: unknown;
+    /**
+     * Another diagnostic is running
+     */
+    429: ProblemDetails;
+    /**
+     * Diagnostic unavailable
+     */
+    503: unknown;
+};
+
+export type RunAiProviderPreflightError = RunAiProviderPreflightErrors[keyof RunAiProviderPreflightErrors];
+
+export type RunAiProviderPreflightResponses = {
+    200: HarnessCheckReport;
+};
+
+export type RunAiProviderPreflightResponse = RunAiProviderPreflightResponses[keyof RunAiProviderPreflightResponses];
+
+export type RunAiProviderSmokeData = {
+    body: HarnessSmokeRequest;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/smoke';
+};
+
+export type RunAiProviderSmokeErrors = {
+    /**
+     * Consent required or unknown provider
+     */
+    400: unknown;
+    /**
+     * Another diagnostic is running
+     */
+    429: ProblemDetails;
+    /**
+     * Diagnostic unavailable
+     */
+    503: unknown;
+};
+
+export type RunAiProviderSmokeError = RunAiProviderSmokeErrors[keyof RunAiProviderSmokeErrors];
+
+export type RunAiProviderSmokeResponses = {
+    200: HarnessCheckReport;
+};
+
+export type RunAiProviderSmokeResponse = RunAiProviderSmokeResponses[keyof RunAiProviderSmokeResponses];
 
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;

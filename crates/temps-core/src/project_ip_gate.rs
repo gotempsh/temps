@@ -68,6 +68,22 @@ pub trait ProjectIpGate: Send + Sync {
     fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
         false
     }
+
+    /// Deny-only floor retained when a newer request policy explicitly allows
+    /// a request. Implementations with explicit IP deny rules must override
+    /// this and include project/environment deny buckets. `None` means the
+    /// trusted client IP could not be resolved and must be denied whenever an
+    /// applicable explicit deny policy cannot safely be evaluated.
+    /// The default denies all policy overrides so older implementations do
+    /// not silently lose explicit blocks; [`OpenIpGate`] explicitly opts out.
+    fn is_explicitly_denied(
+        &self,
+        _project_id: i32,
+        _environment_id: i32,
+        _ip: Option<IpAddr>,
+    ) -> bool {
+        true
+    }
 }
 
 /// Default [`ProjectIpGate`] that allows every IP unconditionally.
@@ -78,6 +94,15 @@ pub struct OpenIpGate;
 impl ProjectIpGate for OpenIpGate {
     fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
         true
+    }
+
+    fn is_explicitly_denied(
+        &self,
+        _project_id: i32,
+        _environment_id: i32,
+        _ip: Option<IpAddr>,
+    ) -> bool {
+        false
     }
 }
 
@@ -145,6 +170,17 @@ impl ProjectIpGate for ProjectIpGateSlot {
             .load()
             .has_active_policy(project_id, environment_id)
     }
+
+    fn is_explicitly_denied(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        ip: Option<IpAddr>,
+    ) -> bool {
+        self.gate
+            .load()
+            .is_explicitly_denied(project_id, environment_id, ip)
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +224,12 @@ mod tests {
     fn open_gate_has_no_active_policy() {
         let g = OpenIpGate;
         assert!(!g.has_active_policy(1, 1));
+        assert!(!g.is_explicitly_denied(1, 1, None));
+    }
+
+    #[test]
+    fn unknown_gate_denies_policy_override_until_it_implements_deny_floor() {
+        assert!(DenyAll.is_explicitly_denied(1, 1, None));
     }
 
     #[test]

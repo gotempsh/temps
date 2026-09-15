@@ -661,6 +661,21 @@ fn candidate_probe_runtime_failure(exit_code: i32, stderr: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
+fn validate_native_probe_model(model: Option<&str>) -> Result<Option<&str>, AiError> {
+    let Some(model) = model else { return Ok(None) };
+    if model.is_empty()
+        || model.len() > 256
+        || model.starts_with('-')
+        || model.chars().any(char::is_control)
+    {
+        return Err(AiError::Provider {
+            purpose: "provider.credentials.verify.invalid".into(),
+            reason: "verification model identifier is invalid".into(),
+        });
+    }
+    Ok(Some(model))
+}
+
 /// Only explicit native authentication failures are conclusive. Model-not-found,
 /// quota, transport, and unknown errors must not be mistaken for a bad secret.
 fn candidate_probe_native_auth_rejected(stdout: &str, stderr: &str) -> bool {
@@ -4531,7 +4546,448 @@ fn validate_additional_opencode_probe(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightStartupFailure {
+    Image,
+    Capacity,
+    Runtime,
+    Other,
+}
+
+fn classify_preflight_startup_failure(error: &AgentError) -> PreflightStartupFailure {
+    match error {
+        AgentError::SandboxProviderUnavailable { .. } => PreflightStartupFailure::Runtime,
+        AgentError::SandboxCreationFailed { reason, .. } => {
+            let reason = reason.to_ascii_lowercase();
+            if ["manifest unknown", "no such image", "pull access denied"]
+                .iter()
+                .any(|message| reason.contains(message))
+            {
+                PreflightStartupFailure::Image
+            } else if reason.contains("no space left") {
+                PreflightStartupFailure::Capacity
+            } else {
+                PreflightStartupFailure::Other
+            }
+        }
+        _ => PreflightStartupFailure::Other,
+    }
+}
+
+fn safe_image_reference(image: &str) -> String {
+    let Some(scheme_end) = image.find("://") else {
+        return image.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let Some(at) = image[authority_start..].find('@') else {
+        return image.to_string();
+    };
+    format!(
+        "{}***@{}",
+        &image[..authority_start],
+        &image[authority_start + at + 1..]
+    )
+}
+
 impl AgentCliAiService {
+    fn preflight_check(
+        id: &str,
+        label: &str,
+        status: temps_ai::HarnessCheckStatus,
+        detail: &str,
+        action: Option<&str>,
+        started: Instant,
+    ) -> temps_ai::HarnessCheck {
+        temps_ai::HarnessCheck {
+            id: id.into(),
+            label: label.into(),
+            status,
+            detail: detail.into(),
+            action: action.map(str::to_string),
+            duration_ms: if status == temps_ai::HarnessCheckStatus::NotTested {
+                0
+            } else {
+                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+            },
+        }
+    }
+
+    fn preflight_skipped_checks(
+        checks: &mut Vec<temps_ai::HarnessCheck>,
+        reason: &str,
+        _started: Instant,
+    ) {
+        for (id, label) in [
+            ("workspace", "Workspace read/write"),
+            ("harness", "Native harness"),
+            ("required_flags", "Required safe flags"),
+            ("relay", "Model relay"),
+        ] {
+            checks.push(temps_ai::HarnessCheck {
+                id: id.into(),
+                label: label.into(),
+                status: temps_ai::HarnessCheckStatus::NotTested,
+                detail: reason.into(),
+                action: None,
+                duration_ms: 0,
+            });
+        }
+    }
+
+    fn smoke_failure_guidance(error: &AiError) -> (&'static str, &'static str) {
+        match error {
+            AiError::Provider { purpose, .. }
+                if purpose == "provider.credentials.verify.auth" =>
+            {
+                ("The provider rejected the saved credential or denied access.", "Refresh the saved login or key and retry.")
+            }
+            AiError::Provider { purpose, .. }
+                if purpose == "provider.credentials.verify.allowance" =>
+            {
+                ("The provider refused the request because allowance was unavailable or rate limited.", "Restore provider allowance or wait for the rate limit, then retry.")
+            }
+            AiError::Provider { purpose, .. }
+                if purpose == "provider.credentials.verify.model" =>
+            {
+                ("The selected model did not complete the minimal authenticated response.", "Check that the saved account can access the selected model.")
+            }
+            _ => (
+                "Temps could not complete the smoke test because the isolated harness infrastructure was unavailable.",
+                "Review the diagnostic identifier in server logs, restore the sandbox or relay, then retry; the credential was not classified as invalid.",
+            ),
+        }
+    }
+
+    fn preflight_auth_boundary_check(provider: &str, started: Instant) -> temps_ai::HarnessCheck {
+        if provider == "opencode" {
+            Self::preflight_check("relay", "Native authentication", temps_ai::HarnessCheckStatus::NotTested, "OpenCode native authentication is staged only for the paid smoke test and is not accessed during no-inference preflight.", Some("Run the smoke test to validate the saved OpenCode authentication inside the isolated sandbox."), started)
+        } else {
+            Self::preflight_check("relay", "Model relay", temps_ai::HarnessCheckStatus::NotTested, "Relay routing requires a short-lived credential capability and is not contacted during no-inference preflight.", Some("Run the smoke test to validate relay connectivity."), started)
+        }
+    }
+
+    async fn run_harness_preflight(
+        &self,
+    ) -> Result<(String, Vec<temps_ai::HarnessCheck>), AiError> {
+        use temps_ai::HarnessCheckStatus::{Failed, NotTested, Passed, Warning};
+
+        let mut checks = Vec::new();
+        let diagnostic_id = uuid::Uuid::new_v4().to_string();
+        let started = Instant::now();
+        let Some(sandbox) = self.sandbox_provider.as_ref().cloned() else {
+            checks.push(Self::preflight_check(
+                "runtime",
+                "Sandbox runtime",
+                Failed,
+                "No isolated sandbox runtime is configured.",
+                Some("Configure a Docker or VM sandbox runtime, then retry."),
+                started,
+            ));
+            for (id, label) in [
+                ("image", "Managed image"),
+                ("startup", "Sandbox startup and health"),
+                ("workspace", "Workspace read/write"),
+                ("harness", "Native harness"),
+                ("required_flags", "Required safe flags"),
+                ("relay", "Model relay"),
+            ] {
+                checks.push(Self::preflight_check(
+                    id,
+                    label,
+                    NotTested,
+                    "Not tested because the sandbox runtime is unavailable.",
+                    None,
+                    started,
+                ));
+            }
+            tracing::warn!(%diagnostic_id, "harness preflight has no configured sandbox runtime");
+            return Ok((diagnostic_id, checks));
+        };
+        checks.push(Self::preflight_check(
+            "runtime",
+            "Sandbox runtime",
+            Warning,
+            "An isolated sandbox runtime is configured; startup will test connectivity.",
+            None,
+            started,
+        ));
+        checks.push(Self::preflight_check("runtime_compatibility", "Runtime compatibility", NotTested, "The sandbox provider does not expose its negotiated runtime API version to this check.", Some("Review the configured runtime and server startup logs for compatibility notices."), started));
+
+        let scratch =
+            Arc::new(
+                tempfile::tempdir_in(&self.scratch_dir).map_err(|_| AiError::Provider {
+                    purpose: "provider.harness.preflight".into(),
+                    reason: "could not create the isolated preflight directory".into(),
+                })?,
+            );
+        let label = format!("harness-preflight-{}", uuid::Uuid::new_v4().simple());
+        let config = match candidate_probe_create_config(
+            self.provider.name(),
+            label,
+            scratch.path().to_path_buf(),
+        ) {
+            Ok(config) => config,
+            Err(_) => {
+                checks.push(Self::preflight_check(
+                    "image",
+                    "Managed image",
+                    Failed,
+                    "The exact managed workspace image is not configured.",
+                    Some("Configure the managed Node workspace image and retry."),
+                    started,
+                ));
+                checks.push(Self::preflight_check(
+                    "startup",
+                    "Sandbox startup and health",
+                    NotTested,
+                    "Not tested because the managed image is unavailable.",
+                    None,
+                    started,
+                ));
+                Self::preflight_skipped_checks(
+                    &mut checks,
+                    "Not tested because the managed image is unavailable.",
+                    started,
+                );
+                tracing::warn!(%diagnostic_id, "harness preflight managed image is not configured");
+                return Ok((diagnostic_id, checks));
+            }
+        };
+        let image_reference = config
+            .image
+            .as_deref()
+            .map(safe_image_reference)
+            .unwrap_or_else(|| "managed default".into());
+        checks.push(Self::preflight_check(
+            "image",
+            "Managed image",
+            Warning,
+            &format!("Managed image '{image_reference}' is configured; startup will confirm availability."),
+            None,
+            started,
+        ));
+        let startup_started = Instant::now();
+        let create_provider = sandbox.clone();
+        let mut create_guard = CandidateCreateGuard {
+            provider: sandbox.clone(),
+            task: Some(tokio::spawn(
+                async move { create_provider.create(config).await },
+            )),
+            scratch: scratch.clone(),
+        };
+        let task = create_guard
+            .task
+            .as_mut()
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.preflight".into(),
+                reason: "sandbox startup task is unavailable".into(),
+            })?;
+        let handle = match tokio::time::timeout(Duration::from_secs(60), task).await {
+            Ok(Ok(Ok(handle))) => {
+                create_guard.task = None;
+                handle
+            }
+            Ok(Ok(Err(error))) => {
+                let failure = classify_preflight_startup_failure(&error);
+                tracing::warn!(%diagnostic_id, failure = ?failure, "harness preflight sandbox startup failed");
+                if failure == PreflightStartupFailure::Image {
+                    if let Some(check) = checks.iter_mut().find(|check| check.id == "image") {
+                        check.status = Failed;
+                        check.detail = format!(
+                            "Managed image '{image_reference}' could not be pulled or found."
+                        );
+                        check.action = Some(
+                            "Check the managed image reference and registry access, then retry."
+                                .into(),
+                        );
+                    }
+                }
+                let (detail, action) = match failure {
+                    PreflightStartupFailure::Runtime => ("The configured sandbox runtime was unavailable.", "Restore the configured sandbox runtime and retry."),
+                    PreflightStartupFailure::Capacity => ("The sandbox could not start because runtime storage capacity is exhausted.", "Free runtime storage capacity, then retry."),
+                    PreflightStartupFailure::Image => ("The sandbox could not start because the managed image was unavailable.", "Resolve the failed managed-image check, then retry."),
+                    PreflightStartupFailure::Other => ("The managed isolated sandbox could not start.", "Check runtime logs, image registry access, and available capacity."),
+                };
+                checks.push(Self::preflight_check(
+                    "startup",
+                    "Sandbox startup and health",
+                    Failed,
+                    detail,
+                    Some(action),
+                    startup_started,
+                ));
+                Self::preflight_skipped_checks(
+                    &mut checks,
+                    "Not tested because the sandbox did not start.",
+                    startup_started,
+                );
+                return Ok((diagnostic_id, checks));
+            }
+            Ok(Err(_)) => {
+                tracing::warn!(%diagnostic_id, "harness preflight sandbox startup task failed");
+                checks.push(Self::preflight_check(
+                    "startup",
+                    "Sandbox startup and health",
+                    Failed,
+                    "The isolated sandbox startup task failed.",
+                    Some("Retry the diagnostic; if it repeats, inspect server runtime health."),
+                    startup_started,
+                ));
+                Self::preflight_skipped_checks(
+                    &mut checks,
+                    "Not tested because the sandbox startup task failed.",
+                    startup_started,
+                );
+                return Ok((diagnostic_id, checks));
+            }
+            Err(_) => {
+                checks.push(Self::preflight_check(
+                    "startup",
+                    "Sandbox startup and health",
+                    Failed,
+                    "The managed isolated sandbox did not start before the deadline.",
+                    Some("Check runtime capacity and image registry connectivity."),
+                    started,
+                ));
+                Self::preflight_skipped_checks(
+                    &mut checks,
+                    "Not tested because sandbox startup timed out.",
+                    started,
+                );
+                tracing::warn!(%diagnostic_id, "harness preflight sandbox startup timed out");
+                return Ok((diagnostic_id, checks));
+            }
+        };
+        let guard = CandidateSandbox {
+            provider: sandbox.clone(),
+            handle: Some(handle.clone()),
+            scratch,
+        };
+        if handle.backend == SandboxBackend::Local {
+            if let Some(check) = checks.iter_mut().find(|check| check.id == "runtime") {
+                check.status = Failed;
+                check.detail = "The configured provider created a local host process instead of an isolated sandbox.".into();
+                check.action =
+                    Some("Configure an isolated Docker or VM sandbox runtime, then retry.".into());
+            }
+            if let Some(check) = checks.iter_mut().find(|check| check.id == "image") {
+                check.status = NotTested;
+                check.detail =
+                    "Not tested because the provider did not create an isolated sandbox.".into();
+            }
+            checks.push(Self::preflight_check(
+                "startup",
+                "Sandbox startup and health",
+                Failed,
+                "The provider did not create an isolated sandbox.",
+                Some("Configure an isolated Docker or VM sandbox runtime."),
+                startup_started,
+            ));
+            guard.destroy().await?;
+            Self::preflight_skipped_checks(
+                &mut checks,
+                "Not tested because the provider created a local process.",
+                startup_started,
+            );
+            return Ok((diagnostic_id, checks));
+        }
+        if let Some(check) = checks.iter_mut().find(|check| check.id == "runtime") {
+            check.status = Passed;
+            check.detail = "The sandbox runtime accepted creation of an isolated sandbox.".into();
+        }
+        if let Some(check) = checks.iter_mut().find(|check| check.id == "image") {
+            check.status = Passed;
+            check.detail =
+                "The runtime started the exact configured managed workspace image.".into();
+        }
+        let alive = tokio::time::timeout(Duration::from_secs(10), sandbox.is_alive(&handle)).await;
+        if !matches!(alive, Ok(Ok(true))) {
+            checks.push(Self::preflight_check(
+                "startup",
+                "Sandbox startup and health",
+                Failed,
+                "The sandbox started but did not pass its health check.",
+                Some("Inspect the sandbox runtime health and retry."),
+                startup_started,
+            ));
+            guard.destroy().await?;
+            Self::preflight_skipped_checks(
+                &mut checks,
+                "Not tested because sandbox health failed.",
+                started,
+            );
+            tracing::warn!(%diagnostic_id, "harness preflight sandbox health check failed");
+            return Ok((diagnostic_id, checks));
+        }
+        checks.push(Self::preflight_check(
+            "startup",
+            "Sandbox startup and health",
+            Passed,
+            "The exact managed image started in an isolated sandbox and is healthy.",
+            None,
+            started,
+        ));
+
+        let workspace_started = Instant::now();
+        let marker = b"temps-harness-preflight";
+        let marker_path = handle.work_dir.join(".temps-preflight");
+        let workspace_ok = tokio::time::timeout(Duration::from_secs(10), async {
+            let path = marker_path
+                .to_str()
+                .ok_or_else(|| AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: "sandbox workspace path is not valid UTF-8".into(),
+                })?;
+            sandbox.write_file(&handle, path, marker, 0o600).await?;
+            let contents = sandbox.read_file(&handle, path).await?;
+            Ok::<bool, AgentError>(contents == marker)
+        })
+        .await
+        .is_ok_and(|result| result.unwrap_or(false));
+        checks.push(Self::preflight_check(
+            "workspace",
+            "Workspace read/write",
+            if workspace_ok { Passed } else { Failed },
+            if workspace_ok {
+                "The sandbox workspace supports private file write and read operations."
+            } else {
+                "The sandbox workspace failed a private file write/read check."
+            },
+            (!workspace_ok).then_some(
+                "Check workspace ownership, mount permissions, and available disk space.",
+            ),
+            workspace_started,
+        ));
+
+        let harness_started = Instant::now();
+        let command = vec![
+            self.provider.name().trim_end_matches("_cli").into(),
+            "--version".into(),
+        ];
+        let harness_ok = matches!(tokio::time::timeout(Duration::from_secs(10), sandbox.exec(&handle, command, HashMap::new(), None)).await, Ok(Ok(output)) if output.exit_code == 0);
+        checks.push(Self::preflight_check(
+            "harness",
+            "Native harness",
+            if harness_ok { Passed } else { Failed },
+            if harness_ok {
+                "The native harness CLI is installed and responds to a fixed version check."
+            } else {
+                "The native harness CLI is missing or did not pass its fixed version check."
+            },
+            (!harness_ok)
+                .then_some("Update the managed sandbox image with the supported native harness."),
+            harness_started,
+        ));
+        checks.push(Self::preflight_check("required_flags", "Required safe flags", NotTested, "Required flags are exercised only by the paid smoke test to avoid interpreting untrusted command output.", Some("Run the smoke test to validate the installed harness and required safe flags."), started));
+        checks.push(Self::preflight_auth_boundary_check(
+            self.provider.name(),
+            started,
+        ));
+        guard.destroy().await?;
+        Ok((diagnostic_id, checks))
+    }
+
     async fn run_candidate_probe(
         &self,
         principal_id: i32,
@@ -4539,6 +4995,7 @@ impl AgentCliAiService {
         verification_model: Option<&str>,
     ) -> Result<(), AiError> {
         const PURPOSE: &str = "provider.credentials.verify";
+        let verification_model = validate_native_probe_model(verification_model)?;
         let verification_error = |stage, diagnostic| AiError::CredentialVerification {
             provider: self.provider.name().to_string(),
             stage,
@@ -4644,11 +5101,14 @@ impl AgentCliAiService {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
-            let opencode_model =
-                selected_opencode_probe_model(&opencode_models, verification_model)?;
+            let opencode_model = if self.provider.name() == "opencode" {
+                selected_opencode_probe_model(&opencode_models, verification_model)?
+            } else {
+                None
+            };
             let selected_model = match self.provider.name() {
-                "claude_cli" => Some("haiku"),
-                "codex_cli" => Some("gpt-5.6-luna"),
+                "claude_cli" => Some(verification_model.unwrap_or("haiku")),
+                "codex_cli" => Some(verification_model.unwrap_or("gpt-5.6-luna")),
                 "opencode" => opencode_model,
                 _ => None,
             };
@@ -4673,7 +5133,7 @@ impl AgentCliAiService {
                     "--strict-mcp-config".into(),
                     "--setting-sources=".into(),
                     "--model".into(),
-                    "haiku".into(),
+                    selected_model.unwrap_or("haiku").into(),
                 ],
                 "codex_cli" => vec![
                     "codex".into(),
@@ -4685,7 +5145,7 @@ impl AgentCliAiService {
                     "--sandbox".into(),
                     "read-only".into(),
                     "--model".into(),
-                    "gpt-5.6-luna".into(),
+                    selected_model.unwrap_or("gpt-5.6-luna").into(),
                     "Reply OK.".into(),
                     "--json".into(),
                     "--skip-git-repo-check".into(),
@@ -4846,6 +5306,129 @@ impl AgentCliAiService {
 
 #[async_trait]
 impl AiService for AgentCliAiService {
+    async fn harness_preflight(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        if provider != self.provider.name() {
+            return Err(AiError::Provider {
+                purpose: "provider.harness.preflight.invalid".into(),
+                reason: format!("provider '{provider}' does not match the selected harness"),
+            });
+        }
+        let _permit =
+            self.concurrency
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.harness.preflight.busy".into(),
+                    reason: "harness diagnostic concurrency limit reached".into(),
+                })?;
+        let (diagnostic_id, checks) = self.run_harness_preflight().await?;
+        Ok(temps_ai::HarnessCheckReport {
+            provider_id: provider.into(),
+            mode: temps_ai::HarnessCheckMode::Preflight,
+            overall: temps_ai::HarnessCheckReport::calculate_overall(&checks),
+            checked_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            diagnostic_id,
+            checks,
+        })
+    }
+
+    async fn run_saved_credential_smoke(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        if provider != self.provider.name() {
+            return Err(AiError::Provider {
+                purpose: "provider.harness.smoke.invalid".into(),
+                reason: format!("provider '{provider}' does not match the selected harness"),
+            });
+        }
+        let _permit =
+            self.concurrency
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AiError::Provider {
+                    purpose: "provider.harness.smoke.busy".into(),
+                    reason: "harness diagnostic concurrency limit reached".into(),
+                })?;
+        let (diagnostic_id, checks) = self.run_harness_preflight().await?;
+        let mut report = temps_ai::HarnessCheckReport {
+            provider_id: provider.into(),
+            mode: temps_ai::HarnessCheckMode::Smoke,
+            overall: temps_ai::HarnessCheckReport::calculate_overall(&checks),
+            checked_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            diagnostic_id,
+            checks,
+        };
+        let started = Instant::now();
+        if report.overall == temps_ai::HarnessCheckOverall::Failed {
+            report.checks.push(Self::preflight_check(
+                "smoke",
+                "Paid model smoke test",
+                temps_ai::HarnessCheckStatus::NotTested,
+                "Not tested because an infrastructure preflight check failed.",
+                Some("Resolve failed preflight checks, then retry."),
+                started,
+            ));
+        } else {
+            let result = self
+                .verify_candidate_credential_with_model(
+                    provider,
+                    auth_type,
+                    credential,
+                    principal_id,
+                    model,
+                )
+                .await;
+            if result.is_ok() {
+                for check in &mut report.checks {
+                    if check.id == "required_flags" {
+                        check.status = temps_ai::HarnessCheckStatus::Passed;
+                        check.detail = "The native harness accepted the required safe flags during the smoke test.".into();
+                        check.action = None;
+                    } else if check.id == "relay" && provider != "opencode" {
+                        check.status = temps_ai::HarnessCheckStatus::Passed;
+                        check.detail = "The isolated harness completed a model response through the short-lived relay capability.".into();
+                        check.action = None;
+                    } else if check.id == "relay" && provider == "opencode" {
+                        check.status = temps_ai::HarnessCheckStatus::NotTested;
+                        check.detail = "Not applicable: OpenCode verifies its native auth file inside the isolated sandbox rather than using the server credential relay.".into();
+                        check.action = None;
+                    }
+                }
+            }
+            let (detail, action) = match &result {
+                Ok(()) if provider == "opencode" => ("The saved OpenCode auth completed a minimal model response inside the isolated sandbox.", None),
+                Ok(()) => ("The saved credential completed a minimal authenticated model response through the relay.", None),
+                Err(error) => {
+                    let (detail, action) = Self::smoke_failure_guidance(error);
+                    (detail, Some(action))
+                }
+            };
+            report.checks.push(Self::preflight_check(
+                "smoke",
+                "Paid model smoke test",
+                if result.is_ok() {
+                    temps_ai::HarnessCheckStatus::Passed
+                } else {
+                    temps_ai::HarnessCheckStatus::Failed
+                },
+                detail,
+                action,
+                started,
+            ));
+        }
+        report.overall = temps_ai::HarnessCheckReport::calculate_overall(&report.checks);
+        Ok(report)
+    }
+
     async fn verify_candidate_credential(
         &self,
         provider: &str,
@@ -4883,7 +5466,7 @@ impl AiService for AgentCliAiService {
         principal_id: i32,
         model: Option<&str>,
     ) -> Result<(), AiError> {
-        if provider != "opencode" || model.is_none() {
+        if model.is_none() {
             return self
                 .verify_candidate_credential(provider, auth_type, credential, principal_id)
                 .await;
@@ -5972,6 +6555,9 @@ mod tests {
             if self.candidate_mode {
                 assert_eq!(command.first().map(String::as_str), Some("claude"));
                 assert!(command.iter().any(|arg| arg == "--tools"));
+                assert!(command
+                    .windows(2)
+                    .any(|args| args == ["--model", "claude-selected-model"]));
                 assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
                 return Ok(temps_agents::sandbox::SandboxExecResult {
                     exit_code: 0,
@@ -6345,7 +6931,7 @@ mod tests {
                     "candidate-secret",
                     "http://model-relay.internal",
                 ),
-                None,
+                Some("claude-selected-model"),
             )
             .await;
         assert!(
@@ -6379,6 +6965,39 @@ mod tests {
         ));
         assert!(candidate_probe_runtime_failure(127, ""));
         assert!(!candidate_probe_runtime_failure(1, "authentication failed"));
+    }
+
+    #[test]
+    fn smoke_failure_guidance_preserves_safe_failure_classes() {
+        let cases = [
+            ("provider.credentials.verify.auth", "rejected"),
+            ("provider.credentials.verify.allowance", "allowance"),
+            ("provider.credentials.verify.model", "selected model"),
+            ("provider.credentials.verify", "infrastructure"),
+        ];
+        for (purpose, expected) in cases {
+            let error = AiError::Provider {
+                purpose: purpose.into(),
+                reason: "candidate-secret-must-never-leak".into(),
+            };
+            let (detail, action) = AgentCliAiService::smoke_failure_guidance(&error);
+            assert!(format!("{detail} {action}")
+                .to_lowercase()
+                .contains(expected));
+            assert!(!detail.contains("candidate-secret"));
+            assert!(!action.contains("candidate-secret"));
+        }
+    }
+
+    #[test]
+    fn native_probe_model_is_bounded_and_cannot_be_a_flag() {
+        assert_eq!(
+            validate_native_probe_model(Some("saved-model")).unwrap(),
+            Some("saved-model")
+        );
+        for invalid in ["", "--config", "model\nother"] {
+            assert!(validate_native_probe_model(Some(invalid)).is_err());
+        }
     }
 
     #[test]
@@ -6899,6 +7518,377 @@ mod tests {
         ) -> Result<AiRunResult, AgentError> {
             self.run(config).await
         }
+    }
+
+    #[tokio::test]
+    async fn no_inference_preflight_reports_missing_runtime_without_calling_provider() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let called = Arc::new(AtomicBool::new(false));
+        let service = AgentCliAiService::new(
+            Arc::new(MockProvider {
+                status: available_status(),
+                output: "candidate-secret-must-not-appear".into(),
+                model: None,
+                called: called.clone(),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+
+        let report = service
+            .harness_preflight("mock", 42)
+            .await
+            .expect("preflight report");
+
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(report.mode, temps_ai::HarnessCheckMode::Preflight);
+        assert_eq!(report.overall, temps_ai::HarnessCheckOverall::Failed);
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.id == "relay"
+                && check.status == temps_ai::HarnessCheckStatus::NotTested));
+        assert!(!serde_json::to_string(&report)
+            .expect("serialize report")
+            .contains("candidate-secret"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum PreflightFailure {
+        None,
+        Create,
+        Image,
+        Runtime,
+        Local,
+        Health,
+        Workspace,
+        Harness,
+    }
+
+    struct PreflightSandbox {
+        failure: PreflightFailure,
+        creates: Arc<AtomicUsize>,
+        destroys: Arc<AtomicUsize>,
+        execs: Arc<AtomicUsize>,
+    }
+
+    impl PreflightSandbox {
+        fn error(stage: &str) -> AgentError {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: "preflight-test".into(),
+                reason: format!("synthetic {stage} failure"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxProvider for PreflightSandbox {
+        async fn create(
+            &self,
+            config: SandboxCreateConfig,
+        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            assert!(config
+                .container_name_override
+                .as_deref()
+                .is_some_and(|name| name.starts_with("harness-preflight-")));
+            assert!(config.workspace_volume.is_none());
+            assert!(config.env_vars.is_empty());
+            if matches!(self.failure, PreflightFailure::Create) {
+                return Err(Self::error("create"));
+            }
+            if matches!(self.failure, PreflightFailure::Image) {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: 0,
+                    provider: "test".into(),
+                    reason: "manifest unknown: private diagnostic".into(),
+                });
+            }
+            if matches!(self.failure, PreflightFailure::Runtime) {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "test".into(),
+                    reason: "private diagnostic".into(),
+                });
+            }
+            let mut handle = test_sandbox_handle();
+            handle.backend = if matches!(self.failure, PreflightFailure::Local) {
+                SandboxBackend::Local
+            } else {
+                SandboxBackend::Docker
+            };
+            Ok(handle)
+        }
+
+        async fn exec(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            command: Vec<String>,
+            environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+            self.execs.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(command, vec!["mock".to_string(), "--version".to_string()]);
+            assert!(environment.is_empty());
+            Ok(temps_agents::sandbox::SandboxExecResult {
+                exit_code: if matches!(self.failure, PreflightFailure::Harness) {
+                    1
+                } else {
+                    0
+                },
+                stdout: String::new(),
+                stderr: "candidate-secret-must-never-leak".into(),
+            })
+        }
+
+        async fn is_alive(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<bool, AgentError> {
+            Ok(!matches!(self.failure, PreflightFailure::Health))
+        }
+
+        async fn write_file(
+            &self,
+            handle: &temps_agents::sandbox::SandboxHandle,
+            path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            assert_eq!(Path::new(path), handle.work_dir.join(".temps-preflight"));
+            if matches!(self.failure, PreflightFailure::Workspace) {
+                Err(Self::error("workspace"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn read_file(
+            &self,
+            handle: &temps_agents::sandbox::SandboxHandle,
+            path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            assert_eq!(Path::new(path), handle.work_dir.join(".temps-preflight"));
+            Ok(b"temps-harness-preflight".to_vec())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _local_dir: &Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn kill_processes(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn destroy(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            self.destroys.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+        fn name(&self) -> &str {
+            "preflight-test"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "test-image".into()))
+        }
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("test-image".into())
+        }
+    }
+
+    fn preflight_test_service(
+        failure: PreflightFailure,
+        provider_called: Arc<AtomicBool>,
+        creates: Arc<AtomicUsize>,
+        destroys: Arc<AtomicUsize>,
+        execs: Arc<AtomicUsize>,
+    ) -> (tempfile::TempDir, AgentCliAiService) {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(PreflightSandbox {
+            failure,
+            creates,
+            destroys,
+            execs,
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(MockProvider {
+                status: available_status(),
+                output: "secret output".into(),
+                model: None,
+                called: provider_called,
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            scratch.path().to_owned(),
+            Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(|_, _, _| Box::pin(async { Err(AiError::NotAvailable) })),
+            Arc::new(SandboxModelRelayService::new().expect("relay")),
+            SandboxWorkspaceResolverSlot::new(),
+        );
+        (scratch, service)
+    }
+
+    fn check_status(
+        report: &temps_ai::HarnessCheckReport,
+        id: &str,
+    ) -> temps_ai::HarnessCheckStatus {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("missing check {id}"))
+            .status
+    }
+
+    #[tokio::test]
+    async fn preflight_success_checks_workspace_harness_and_cleanup_without_inference() {
+        let provider_called = Arc::new(AtomicBool::new(false));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let execs = Arc::new(AtomicUsize::new(0));
+        let (_scratch, service) = preflight_test_service(
+            PreflightFailure::None,
+            provider_called.clone(),
+            creates.clone(),
+            destroys.clone(),
+            execs.clone(),
+        );
+        let report = service
+            .harness_preflight("mock", 42)
+            .await
+            .expect("preflight");
+        assert_eq!(
+            check_status(&report, "startup"),
+            temps_ai::HarnessCheckStatus::Passed
+        );
+        assert_eq!(
+            check_status(&report, "workspace"),
+            temps_ai::HarnessCheckStatus::Passed
+        );
+        assert_eq!(
+            check_status(&report, "harness"),
+            temps_ai::HarnessCheckStatus::Passed
+        );
+        for id in ["required_flags", "relay", "runtime_compatibility"] {
+            let check = report
+                .checks
+                .iter()
+                .find(|check| check.id == id)
+                .unwrap_or_else(|| panic!("missing check {id}"));
+            assert_eq!(check.status, temps_ai::HarnessCheckStatus::NotTested);
+            assert_eq!(check.duration_ms, 0);
+        }
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(execs.load(Ordering::SeqCst), 1);
+        assert!(!provider_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn opencode_preflight_describes_native_auth_without_claiming_a_relay() {
+        let check = AgentCliAiService::preflight_auth_boundary_check("opencode", Instant::now());
+        assert_eq!(check.label, "Native authentication");
+        assert_eq!(check.status, temps_ai::HarnessCheckStatus::NotTested);
+        assert_eq!(check.duration_ms, 0);
+        assert!(check.detail.contains("OpenCode native authentication"));
+        assert!(!check.detail.to_ascii_lowercase().contains("relay"));
+        assert!(!check.detail.contains("short-lived credential capability"));
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_stages_are_reported_and_cleanup_is_bounded() {
+        for (failure, failed_id, expects_destroy, dependent_id) in [
+            (PreflightFailure::Create, "startup", false, "workspace"),
+            (PreflightFailure::Image, "image", false, "workspace"),
+            (PreflightFailure::Runtime, "startup", false, "workspace"),
+            (PreflightFailure::Local, "runtime", true, "workspace"),
+            (PreflightFailure::Health, "startup", true, "workspace"),
+            (PreflightFailure::Workspace, "workspace", true, "harness"),
+            (PreflightFailure::Harness, "harness", true, "relay"),
+        ] {
+            let provider_called = Arc::new(AtomicBool::new(false));
+            let creates = Arc::new(AtomicUsize::new(0));
+            let destroys = Arc::new(AtomicUsize::new(0));
+            let (_scratch, service) = preflight_test_service(
+                failure,
+                provider_called.clone(),
+                creates,
+                destroys.clone(),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            let report = service
+                .harness_preflight("mock", 42)
+                .await
+                .expect("failure report");
+            assert_eq!(
+                check_status(&report, failed_id),
+                temps_ai::HarnessCheckStatus::Failed
+            );
+            if matches!(
+                failure,
+                PreflightFailure::Create
+                    | PreflightFailure::Image
+                    | PreflightFailure::Runtime
+                    | PreflightFailure::Local
+                    | PreflightFailure::Health
+            ) {
+                assert_eq!(
+                    check_status(&report, dependent_id),
+                    temps_ai::HarnessCheckStatus::NotTested
+                );
+            }
+            assert_eq!(destroys.load(Ordering::SeqCst) > 0, expects_destroy);
+            assert!(!provider_called.load(Ordering::SeqCst));
+            assert!(!serde_json::to_string(&report)
+                .expect("serialize")
+                .contains("candidate-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn smoke_blocked_by_preflight_never_invokes_provider_or_candidate_resolver() {
+        let provider_called = Arc::new(AtomicBool::new(false));
+        let (_scratch, service) = preflight_test_service(
+            PreflightFailure::Create,
+            provider_called.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let report = service
+            .run_saved_credential_smoke("mock", "token", "candidate-secret", 42, None)
+            .await
+            .expect("blocked smoke report");
+        assert_eq!(
+            check_status(&report, "smoke"),
+            temps_ai::HarnessCheckStatus::NotTested
+        );
+        assert!(!provider_called.load(Ordering::SeqCst));
     }
 
     /// A mock that sleeps for a long time, used to trigger the timeout path.

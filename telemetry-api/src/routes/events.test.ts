@@ -6,10 +6,9 @@ import { createEventsRoutes, KNOWN_EVENT_TYPES } from "./events.js";
 import type { Pool } from "pg";
 
 describe("KNOWN_EVENT_TYPES", () => {
-  it("stays in lockstep with the Rust binary (38 events)", () => {
-    // Mirror of temps-core TelemetryEventKind::all().len(). If this changes,
-    // update both this set and the Rust enum together.
-    expect(KNOWN_EVENT_TYPES.size).toBe(38);
+  it("includes the runtime events plus the CLI setup event", () => {
+    // 38 runtime events plus one CLI-only event.
+    expect(KNOWN_EVENT_TYPES.size).toBe(39);
   });
 
   it("uses only snake_case names", () => {
@@ -34,6 +33,36 @@ function makeReq(body: unknown, method = "POST"): Request {
 }
 
 describe("POST /v1/events", () => {
+  const setupEvent = {
+    anonymous_id: "12345678-1234-4234-8234-123456789abc",
+    event_type: "cli_setup_step",
+    properties: { step: "install", status: "completed", method: "ssh", elapsed_bucket: "under_minute", cli_version: "0.1.36" },
+  };
+
+  it("accepts setup events without counting a CLI attempt as an active server", async () => {
+    const pool = makePool();
+    const res = await createEventsRoutes(pool).postEvent(makeReq(setupEvent));
+    expect(res.status).toBe(201);
+    expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    const values = (pool.query as ReturnType<typeof mock>).mock.calls[0]?.[1];
+    expect(values[5]).toBeNull();
+  });
+
+  it("rejects setup fields that could contain identifiers or raw errors", async () => {
+    for (const extra of [{ host: "private.example" }, { email: "admin@example.com" }, { error: "secret" }, { constructor: "unexpected" }]) {
+      const pool = makePool();
+      const res = await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, ...extra } }));
+      expect(res.status).toBe(422);
+      expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    }
+  });
+
+  it("rejects arbitrary setup statuses and non-random identifiers", async () => {
+    const pool = makePool();
+    expect((await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, anonymous_id: "server.example" }))).status).toBe(422);
+    expect((await createEventsRoutes(pool).postEvent(makeReq({ ...setupEvent, properties: { ...setupEvent.properties, status: "private error" } }))).status).toBe(422);
+  });
+
   it("accepts a valid event", async () => {
     const pool = makePool();
     const { postEvent } = createEventsRoutes(pool);

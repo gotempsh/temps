@@ -199,6 +199,25 @@ pub type ProjectIpGateBuilder = Box<
     dyn FnOnce(Arc<DbConnection>, &tokio::runtime::Handle) -> Arc<dyn temps_core::ProjectIpGate>,
 >;
 
+/// Fallible startup factory for a standalone proxy's project IP gate.
+///
+/// Use this when the gate must hydrate before the proxy may accept traffic.
+pub type FallibleProjectIpGateBuilder = Box<
+    dyn FnOnce(
+        Arc<DbConnection>,
+        &tokio::runtime::Handle,
+    ) -> anyhow::Result<Arc<dyn temps_core::ProjectIpGate>>,
+>;
+
+/// Startup factory for a standalone proxy's request policy snapshot. It may
+/// hydrate from the database and start background refresh using the runtime.
+pub type RequestPolicyGateBuilder = Box<
+    dyn FnOnce(
+        Arc<DbConnection>,
+        &tokio::runtime::Handle,
+    ) -> anyhow::Result<Arc<dyn temps_core::RequestPolicyGate>>,
+>;
+
 impl ProxyCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         self.execute_with_ip_gate(None)
@@ -208,6 +227,20 @@ impl ProxyCommand {
     pub fn execute_with_ip_gate(
         self,
         ip_gate_builder: Option<ProjectIpGateBuilder>,
+    ) -> anyhow::Result<()> {
+        self.execute_with_gates(
+            ip_gate_builder.map(|build| {
+                Box::new(move |db, handle: &tokio::runtime::Handle| Ok(build(db, handle)))
+                    as FallibleProjectIpGateBuilder
+            }),
+            None,
+        )
+    }
+
+    pub fn execute_with_gates(
+        self,
+        ip_gate_builder: Option<FallibleProjectIpGateBuilder>,
+        request_policy_gate_builder: Option<RequestPolicyGateBuilder>,
     ) -> anyhow::Result<()> {
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
@@ -251,17 +284,23 @@ impl ProxyCommand {
         // worker threads keep driving whatever the gate spawns.
         let project_ip_gate = match ip_gate_builder {
             Some(build) => {
-                let gate = build(db.clone(), rt.handle());
+                let gate = build(db.clone(), rt.handle())?;
                 debug!("proxy: enforcing project IP rules via a caller-supplied gate");
                 gate
             }
             None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+        };
+        let request_policy_gate = match request_policy_gate_builder {
+            Some(build) => build(db.clone(), rt.handle())?,
+            None => Arc::new(temps_core::OpenRequestPolicyGate)
+                as Arc<dyn temps_core::RequestPolicyGate>,
         };
 
         // Start proxy server
         self.start_proxy_server(
             db,
             project_ip_gate,
+            request_policy_gate,
             self.address.clone(),
             self.tls_address.clone(),
             self.console_address.clone(),
@@ -277,6 +316,7 @@ impl ProxyCommand {
         &self,
         db: Arc<DbConnection>,
         project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+        request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
         address: String,
         tls_address: Option<String>,
         console_address: Option<String>,
@@ -605,6 +645,7 @@ impl ProxyCommand {
             // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
             // which is what the plain `temps proxy` entrypoint passes.
             project_ip_gate,
+            request_policy_gate,
         ) {
             Ok(_) => {
                 info!("Proxy server exited");
@@ -827,5 +868,25 @@ mod skew_tests {
             }
         );
         assert_eq!(compare_versions("", Some("")), SkewStatus::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod gate_builder_contract_tests {
+    use super::{FallibleProjectIpGateBuilder, ProjectIpGateBuilder, ProxyCommand};
+    use std::sync::Arc;
+
+    #[test]
+    fn legacy_ip_gate_entrypoint_remains_infallible() {
+        let _: fn(ProxyCommand, Option<ProjectIpGateBuilder>) -> anyhow::Result<()> =
+            ProxyCommand::execute_with_ip_gate;
+        let _: ProjectIpGateBuilder =
+            Box::new(|_, _| Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>);
+    }
+
+    #[test]
+    fn hydrated_ip_gate_builder_accepts_startup_failure() {
+        let _: FallibleProjectIpGateBuilder =
+            Box::new(|_, _| Err(anyhow::anyhow!("snapshot hydration failed")));
     }
 }
