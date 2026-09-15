@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
+import { Checkbox } from '@/components/ui/checkbox'
 
 import {
   checkExplorerSupportOptions,
@@ -2517,12 +2518,10 @@ function DynamicFilterBuilder({
     if (type === 'boolean') {
       return (
         <div key={fieldName} className="flex items-center space-x-2">
-          <input
+          <Checkbox
             id={fieldName}
-            type="checkbox"
             checked={value || false}
-            onChange={(e) => handleFieldChange(fieldName, e.target.checked)}
-            className="h-4 w-4 rounded border-input"
+            onCheckedChange={(checked) => handleFieldChange(fieldName, checked === true)}
           />
           <Label htmlFor={fieldName} className="font-normal">
             {title}

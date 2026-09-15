@@ -209,7 +209,7 @@ export default function ApiKeyCreate() {
 
   if (newKeySecret) {
     return (
-      <div className="w-full space-y-6">
+      <div className="w-full min-w-0 space-y-6">
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
@@ -293,7 +293,7 @@ export default function ApiKeyCreate() {
   }
 
   return (
-    <div className="w-full space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       {verificationDialog}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -305,7 +305,9 @@ export default function ApiKeyCreate() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h1 className="text-3xl font-bold">Create API Key</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Create API Key
+            </h1>
             <p className="text-muted-foreground mt-1">
               Generate a new API key for programmatic access
             </p>

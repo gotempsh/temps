@@ -78,7 +78,6 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 queue,
                 db,
             ));
-
             // Kick off discovery + start in the background. When it
             // completes, the shared proxy router is swapped in and
             // `/x/<plugin>/...` routes start working.

@@ -244,7 +244,8 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 # ============================================================================
 instant-acme = "0.8.5"
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
-rustls = { version = "0.23", default-features = false, features = [
+# RUSTSEC-2026-0285: reject TLS 1.3 handshake messages across key changes.
+rustls = { version = "0.23.45", default-features = false, features = [
     "ring",
     "std",
     "tls12",

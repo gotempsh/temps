@@ -53,13 +53,14 @@ permissions: {}
 
 jobs:
   daemon-images:
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64]
+    needs: validate-release-ref
     uses: ./.github/workflows/daemon-images.yml
     permissions:
       contents: read
       packages: write
     with:
-      # Match Create Release's channel selection without depending on publication.
+      revision_only: true
+      # Publish content-addressed dependencies before compiling the server.
       channel: ${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
@@ -141,7 +142,7 @@ jobs:
 
   build-linux-amd64:
     name: Build Linux AMD64
-    needs: build-web-assets
+    needs: [build-web-assets, runtime-image-manifest]
     # Pinned to 22.04 (glibc 2.35) so the released binary runs on Ubuntu 22.04+/Debian 12+.
     # ubuntu-latest currently resolves to 24.04 (glibc 2.39), which broke the binary on
     # older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error.
@@ -175,9 +176,16 @@ jobs:
           name: web-dist
           path: crates/temps-cli/dist
 
+      - name: Download verified runtime image manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-image-manifest
+          path: release-inputs
+
       - name: Build release binary
         run: cargo build --release --bin temps
         env:
+          TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
@@ -190,7 +198,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE
+          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -213,7 +221,7 @@ jobs:
 
   build-linux-arm64:
     name: Build Linux ARM64
-    needs: build-web-assets
+    needs: [build-web-assets, runtime-image-manifest]
     # See build-linux-amd64: pinned to 22.04 (glibc 2.35) for the same broad-compatibility reason.
     runs-on: ubuntu-22.04-arm
     permissions:
@@ -245,9 +253,16 @@ jobs:
           name: web-dist
           path: crates/temps-cli/dist
 
+      - name: Download verified runtime image manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-image-manifest
+          path: release-inputs
+
       - name: Build release binary
         run: cargo build --release --bin temps
         env:
+          TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
@@ -263,7 +278,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE
+          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum
@@ -286,7 +301,7 @@ jobs:
 
   build-darwin-amd64:
     name: Build macOS AMD64
-    needs: build-web-assets
+    needs: [build-web-assets, runtime-image-manifest]
     # Cross-compiled from Apple Silicon (same host as build-darwin-arm64),
     # not run natively on Intel hardware. GitHub's Intel macOS pool is
     # smaller/older and measured ~2x the wall-clock of the arm64 pool for
@@ -324,9 +339,16 @@ jobs:
           name: web-dist
           path: crates/temps-cli/dist
 
+      - name: Download verified runtime image manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-image-manifest
+          path: release-inputs
+
       - name: Build release binary
         run: cargo build --release --bin temps --target x86_64-apple-darwin
         env:
+          TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
@@ -339,7 +361,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-darwin-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE
+          tar -czf temps-darwin-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-darwin-amd64.tar.gz
 
       - name: Generate checksum
@@ -362,7 +384,7 @@ jobs:
 
   build-darwin-arm64:
     name: Build macOS ARM64
-    needs: build-web-assets
+    needs: [build-web-assets, runtime-image-manifest]
     runs-on: macos-14
     permissions:
       contents: read
@@ -391,9 +413,16 @@ jobs:
           key: darwin-arm64-release
           save-if: false
 
+      - name: Download verified runtime image manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-image-manifest
+          path: release-inputs
+
       - name: Build release binary
         run: cargo build --release --bin temps --target aarch64-apple-darwin
         env:
+          TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
@@ -406,7 +435,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar -czf temps-darwin-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE
+          tar -czf temps-darwin-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-darwin-arm64.tar.gz
 
       - name: Generate checksum
@@ -427,10 +456,85 @@ jobs:
             temps-darwin-arm64.tar.gz
             temps-darwin-arm64.tar.gz.sha256
 
+
+  runtime-image-manifest:
+    name: Verify release runtime image set
+    needs: [daemon-images, build-and-push-sandbox-images, build-and-push-preview-gateway]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: runtime-image-*
+          path: image-records
+          merge-multiple: true
+      - name: Require every image and both architectures
+        env:
+          IMAGE_REVISION: ${{ github.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          python3 .github/scripts/release_image_manifest.py assemble --directory image-records --revision "$IMAGE_REVISION" --output runtime-images.json "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-image-manifest
+          path: runtime-images.json
+          retention-days: 1
+
+
+  promote-runtime-images:
+    name: Promote verified runtime aliases
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, prepare-sandbox-context]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-image-manifest
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote only after every binary build succeeds
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        env:
+          IMAGE_REVISION: ${{ github.sha }}
+          IMAGE_CHANNEL: ${{ contains(github.ref_name, '-') && 'beta' || 'stable' }}
+          SANDBOX_VERSION: ${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}
+          GATEWAY_VERSION: ${{ needs.prepare-sandbox-context.outputs.gateway_version }}
+        run: |
+          DAEMON_VERSION=$(python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools/sandbox-runtime"); from image_metadata import image_version; print(image_version(Path("crates/temps-sandbox/src/services/sandbox_service.rs").read_text()))')
+          python3 .github/scripts/release_image_manifest.py promote --manifest runtime-images.json --revision "$IMAGE_REVISION" --channel "$IMAGE_CHANNEL" --daemon-version "$DAEMON_VERSION" --sandbox-version "$SANDBOX_VERSION" --gateway-version "$GATEWAY_VERSION"
+
   create-release:
     name: Create Release
-    # A failed/cancelled daemon flavor must prevent public release publication.
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, daemon-images]
+    # All image sets, embedded manifests and binaries must succeed before publication.
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -485,6 +589,7 @@ jobs:
           cp artifacts/temps-linux-arm64/* release/
           cp artifacts/temps-darwin-amd64/* release/
           cp artifacts/temps-darwin-arm64/* release/
+          cp artifacts/runtime-image-manifest/runtime-images.json release/
           ls -lh release/
 
       - name: Create combined checksums file
@@ -494,6 +599,7 @@ jobs:
           cat temps-linux-arm64.tar.gz.sha256 >> checksums.txt
           cat temps-darwin-amd64.tar.gz.sha256 >> checksums.txt
           cat temps-darwin-arm64.tar.gz.sha256 >> checksums.txt
+          sha256sum runtime-images.json >> checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
 
@@ -674,6 +780,7 @@ jobs:
             release/temps-darwin-arm64.tar.gz
             release/temps-darwin-arm64.tar.gz.sha256
             release/checksums.txt
+            release/runtime-images.json
             release/install.sh
             release/temps.rb
           )
@@ -851,13 +958,10 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   # Sandbox images and preview gateway
   #
-  # Published to ghcr.io on every release tag (v*.*.*). The sandbox image
-  # version that the running temps server expects is pinned via
-  # `SANDBOX_IMAGE_VERSION` in crates/temps-agents/src/sandbox/docker.rs —
-  # bumping that constant is what causes hosts to pull a new image, since
-  # `docker inspect` short-circuits cached `:latest` tags. We tag both
-  # `:<SANDBOX_IMAGE_VERSION>` (the immutable tag the runtime pulls) and
-  # `:latest` (operator convenience).
+  # Stage revision tags before compiling Temps. The resulting multiarch
+  # digests are verified, embedded in the binaries, and published in their
+  # runtime-images.json. Version/channel aliases are operator conveniences
+  # promoted only after every binary build passes.
   # ─────────────────────────────────────────────────────────────────────────
   # ─────────────────────────────────────────────────────────────────────
   # Compile helpers + render every per-runtime Dockerfile + materialise
@@ -866,7 +970,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   prepare-sandbox-context:
     name: Prepare sandbox build context
-    needs: [create-release]
+    needs: validate-release-ref
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -954,7 +1058,7 @@ jobs:
 
   build-and-push-sandbox-images:
     name: Build sandbox image (${{ matrix.runtime }})
-    needs: [create-release, prepare-sandbox-context]
+    needs: [validate-release-ref, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -963,12 +1067,12 @@ jobs:
       fail-fast: false
       matrix:
         runtime: [node, bun, python, rust, go, full]
-    env:
-      # Channel decided once in `create-release`; reused here so beta tags
-      # never get pushed to the stable `:latest` ref.
-      CHANNEL_TAG: ${{ needs.create-release.outputs.channel_tag }}
-      IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
+      - name: Checkout digest recording script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Download prepared context
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -1003,48 +1107,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Compose channel-aware tag list. Stable releases own the canonical
-      # `:<sandbox_version>` ref + `:latest` + `:stable`; beta releases
-      # publish only suffixed refs (`:<sandbox_version>-beta`, `:beta`) so a
-      # beta Dockerfile change cannot overwrite the stable image at the same
-      # `SANDBOX_IMAGE_VERSION`. The `:<sha>` tag is always pushed for
-      # forensic traceability.
+      # Stage a revision-only tag; no live channel moves before binaries pass.
       - name: Compose tag list
         id: tags
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}"
-          VER="${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
             echo "$REPO:$SHA"
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              echo "$REPO:${VER}-beta"
-              echo "$REPO:beta"
-            else
-              echo "$REPO:$VER"
-              echo "$REPO:${VER}-stable"
-              echo "$REPO:latest"
-              echo "$REPO:stable"
-            fi
             echo "TAGS_EOF"
           } >> $GITHUB_OUTPUT
 
-          echo "Channel: $CHANNEL_TAG (prerelease=$IS_PRERELEASE)"
-          echo "Will push:"
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            echo "  $REPO:$SHA"
-            echo "  $REPO:${VER}-beta"
-            echo "  $REPO:beta"
-          else
-            echo "  $REPO:$SHA"
-            echo "  $REPO:$VER"
-            echo "  $REPO:${VER}-stable"
-            echo "  $REPO:latest"
-            echo "  $REPO:stable"
-          fi
 
       - name: Build and push sandbox image
+        id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ./build-context
@@ -1053,6 +1130,7 @@ jobs:
           # `dry_run=true` to verify the pipeline works without polluting
           # the registry. Real tag pushes always push.
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+          outputs: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'type=oci,dest=/tmp/sandbox-image.oci.tar' || '' }}
           tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -1065,15 +1143,28 @@ jobs:
           # read-only here" note at the top of this file.
           cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
 
+
+      - name: Record runtime image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_KIND: sandbox_${{ matrix.runtime }}
+          IMAGE_REVISION: ${{ github.sha }}
+        run: python3 .github/scripts/release_image_manifest.py record --kind "$IMAGE_KIND" --digest "$IMAGE_DIGEST" --revision "$IMAGE_REVISION" --output "$IMAGE_KIND.json"
+
+      - name: Upload runtime image digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-image-sandbox_${{ matrix.runtime }}
+          path: sandbox_${{ matrix.runtime }}.json
+          retention-days: 1
+
   build-and-push-preview-gateway:
     name: Build preview gateway image
-    needs: [create-release, prepare-sandbox-context]
+    needs: [validate-release-ref, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    env:
-      IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1095,37 +1186,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Same channel-aware tag composition as the sandbox images: stable
-      # owns canonical refs, beta only suffixed refs. Without this, every
-      # release (including pre-releases) overwrites `:<version>` and
-      # `:latest`, defeating the channel split.
+      # Stage a revision-only tag; the binary embeds the resulting digest.
       - name: Compose tag list
         id: tags
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-preview-gateway"
-          VER="${{ needs.prepare-sandbox-context.outputs.gateway_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
             echo "$REPO:$SHA"
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              echo "$REPO:${VER}-beta"
-              echo "$REPO:beta"
-            else
-              echo "$REPO:$VER"
-              echo "$REPO:${VER}-stable"
-              echo "$REPO:latest"
-              echo "$REPO:stable"
-            fi
             echo "TAGS_EOF"
           } >> $GITHUB_OUTPUT
 
       - name: Build and push preview gateway image
+        id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ./crates/temps-preview-gateway
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+          outputs: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'type=oci,dest=/tmp/gateway-image.oci.tar' || '' }}
           tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -1135,3 +1215,17 @@ jobs:
             org.opencontainers.image.description=Temps preview gateway — routes ws-<sid>-<port> hosts to sandbox containers
           # Read-only, same reasoning as the sandbox images above.
           cache-from: type=gha,scope=preview-gateway
+
+      - name: Record runtime image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_KIND: preview_gateway
+          IMAGE_REVISION: ${{ github.sha }}
+        run: python3 .github/scripts/release_image_manifest.py record --kind "$IMAGE_KIND" --digest "$IMAGE_DIGEST" --revision "$IMAGE_REVISION" --output "$IMAGE_KIND.json"
+
+      - name: Upload runtime image digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-image-preview_gateway
+          path: preview_gateway.json
+          retention-days: 1

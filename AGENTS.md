@@ -302,15 +302,15 @@ reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
 
-## Use the design system for redesigned UI
+## Follow the console design standard
 
-UI built on the operator design system (`@temps-sdk/ds` in
-`web/packages/ds`, mockups and docs in `design-system/`) follows
-`design-system/docs/RULES.md`. The `temps-design-system` skill
-(`.agents/skills/temps-design-system/SKILL.md`) gives the procedure, the
-verification (`bun run lint`, `bun run e2e` in `design-system/`) and the
-boundary with the legacy `web/src` console, which stays on its current look
-until a screen is migrated whole.
+`DESIGN.md` is the authoritative reference for console UI: full-width pages,
+compact empty states, shared tables and pagination, and shared shadcn controls.
+The `temps-design-system` skill
+(`.agents/skills/temps-design-system/SKILL.md`) points to this same standard.
+The separate prototype app is retired. The retained `web/packages/ds` package
+is not the default for console work; do not introduce it without an explicit
+product decision.
 
 ## Responsive pagination is a shared UI contract
 

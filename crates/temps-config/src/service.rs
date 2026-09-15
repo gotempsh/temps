@@ -1061,6 +1061,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .as_ref()
             .map(|model| AppSettings::from_json(model.data.clone()))
             .unwrap_or_default();
+        // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
+        // settings save must not undo a consent update committed before this lock.
+        settings.plugin_installation_reporting_enabled =
+            locked_settings.plugin_installation_reporting_enabled;
         preserve_provider_credential_proof(&mut settings, &locked_settings);
 
         let previous_compression = existing
@@ -2130,6 +2134,7 @@ mod tests {
     async fn bulk_update_uses_locked_credential_and_publishes_rebased_cache() {
         let mut locked = settings_row("old.example.com");
         let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.plugin_installation_reporting_enabled = true;
         locked_settings.agent_sandbox.providers.insert(
             "codex_cli".into(),
             temps_core::ProviderConfig {
@@ -2170,6 +2175,7 @@ mod tests {
         svc.update_settings(incoming).await.expect("bulk update");
         let cached = svc.get_settings().await.expect("rebased cache");
         assert_eq!(cached.preview_domain, "new.example.com");
+        assert!(cached.plugin_installation_reporting_enabled);
         let provider = &cached.agent_sandbox.providers["codex_cli"];
         assert_eq!(provider.auth_type, "subscription");
         assert_eq!(
@@ -2188,6 +2194,10 @@ mod tests {
             .find(|sql| sql.starts_with("UPDATE "))
             .expect("settings update statement");
         assert!(update_sql.contains("replacement"), "{update_sql}");
+        assert!(
+            update_sql.contains("plugin_installation_reporting_enabled"),
+            "{update_sql}"
+        );
         assert!(!update_sql.contains("stale"), "{update_sql}");
     }
 

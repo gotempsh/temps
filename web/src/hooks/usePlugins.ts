@@ -2,22 +2,59 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
-  installPlugin,
+  getPluginInstallationReporting,
   listExternalPlugins,
   listPluginCatalog,
   reloadPlugins,
+  setPluginInstallationReporting,
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
 import type {
-  InstallPluginResponse,
   PluginCatalogResponse,
   ReloadResponse,
 } from '@/api/client/types.gen'
 import type { PluginManifest } from '@/types/plugins'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
 export const PLUGIN_CATALOG_QUERY_KEY = ['external-plugins', 'catalog']
+export const PLUGIN_REPORTING_QUERY_KEY = [
+  'external-plugins',
+  'installation-reporting',
+]
+
+export function usePluginInstallationReporting(enabled = true) {
+  return useQuery({
+    queryKey: PLUGIN_REPORTING_QUERY_KEY,
+    queryFn: async () =>
+      (await getPluginInstallationReporting({ throwOnError: true })).data,
+    enabled,
+    retry: false,
+  })
+}
+
+export function useSetPluginInstallationReporting() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (enabled: boolean) =>
+      (
+        await setPluginInstallationReporting({
+          body: { enabled },
+          throwOnError: true,
+        })
+      ).data,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: PLUGIN_REPORTING_QUERY_KEY,
+      })
+    },
+  })
+}
 
 /**
  * Fetch the list of running external plugin manifests.
@@ -37,14 +74,21 @@ async function fetchPluginManifests(): Promise<PluginManifest[]> {
  * React Query hook to get the list of running external plugins.
  * Caches for 5 minutes since plugins rarely change at runtime.
  */
-export function usePlugins() {
-  return useQuery({
+export function pluginManifestQueryOptions() {
+  return queryOptions({
     queryKey: PLUGINS_QUERY_KEY,
     queryFn: fetchPluginManifests,
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
+    // CLI installs happen outside this tab. Refresh local manifests when the
+    // user returns to the console, without polling the public registry.
+    refetchOnWindowFocus: 'always',
     retry: false,
   })
+}
+
+export function usePlugins() {
+  return useQuery(pluginManifestQueryOptions())
 }
 
 /** Fetch the signed registry catalog exposed by the backend. */
@@ -58,30 +102,6 @@ export function usePluginCatalog(enabled = true) {
     staleTime: 5 * 60 * 1000,
     retry: false,
     enabled,
-  })
-}
-
-/** Install a named plugin release selected and verified by the backend. */
-export function useInstallPlugin() {
-  const queryClient = useQueryClient()
-
-  return useMutation({
-    mutationFn: async (name: string): Promise<InstallPluginResponse> => {
-      const response = await installPlugin({
-        body: { name },
-        throwOnError: true,
-      })
-      return response.data
-    },
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: PLUGINS_QUERY_KEY,
-          exact: true,
-        }),
-        queryClient.invalidateQueries({ queryKey: PLUGIN_CATALOG_QUERY_KEY }),
-      ])
-    },
   })
 }
 

@@ -3,6 +3,7 @@
 
 'use client'
 
+import { Checkbox } from '@/components/ui/checkbox'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
@@ -158,13 +159,11 @@ function S3SourceForm({
             htmlFor="forcePathStyle"
             className="flex items-center space-x-2"
           >
-            <Input
+            <Checkbox
               id="forcePathStyle"
-              type="checkbox"
-              className="h-4 w-4"
               checked={formData.force_path_style || false}
-              onChange={(e) =>
-                setFormData({ ...formData, force_path_style: e.target.checked })
+              onCheckedChange={(checked) =>
+                setFormData({ ...formData, force_path_style: checked === true })
               }
             />
             <div>

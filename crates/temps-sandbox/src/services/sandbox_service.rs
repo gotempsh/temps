@@ -223,10 +223,17 @@ pub struct ApplicationWorkspaceConfig {
 /// silently fall back to a general-purpose agent image when their desired
 /// image is NULL.
 pub fn managed_application_workspace_image(runtime: &str) -> Option<&'static str> {
+    use temps_core::release_images;
     match runtime {
-        "node" | "bun" => Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4"),
-        "python" => Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4"),
-        "rust" | "go" | "full" => Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.4"),
+        "node" | "bun" => Some(
+            release_images::DAEMON_NODEJS.unwrap_or("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4"),
+        ),
+        "python" => Some(
+            release_images::DAEMON_PYTHON.unwrap_or("ghcr.io/gotempsh/temps-sandbox-python:0.3.4"),
+        ),
+        "rust" | "go" | "full" => {
+            Some(release_images::DAEMON_ALL.unwrap_or("ghcr.io/gotempsh/temps-sandbox-all:0.3.4"))
+        }
         _ => None,
     }
 }
@@ -237,6 +244,15 @@ pub fn is_managed_application_workspace_image(image: &str) -> bool {
             .iter()
             .any(|version| image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:{version}"))
     }) || image == "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
+        || ["nodejs", "python", "all"].iter().any(|flavor| {
+            let prefix = format!("ghcr.io/gotempsh/temps-sandbox-{flavor}@sha256:");
+            image.strip_prefix(&prefix).is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        })
 }
 
 impl Default for ApplicationWorkspaceConfig {
@@ -4240,10 +4256,17 @@ mod tests {
         for runtime in ["node", "bun", "python", "rust", "go", "full"] {
             let image = managed_application_workspace_image(runtime)
                 .expect("managed runtime must resolve to an image");
-            assert!(
-                migration.contains(&format!("'{image}'")),
-                "migration does not allow {image}"
-            );
+            if temps_core::release_images::REVISION.is_none() {
+                assert!(
+                    migration.contains(&format!("'{image}'")),
+                    "migration does not allow {image}"
+                );
+            } else {
+                assert!(is_managed_application_workspace_image(image));
+            }
+        }
+        if temps_core::release_images::REVISION.is_some() {
+            return;
         }
         assert_eq!(
             managed_application_workspace_image("node"),
@@ -4289,6 +4312,33 @@ mod tests {
         assert!(!is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-nodejs:0.1.0"
         ));
+        for flavor in ["nodejs", "python", "all"] {
+            let image = format!(
+                "ghcr.io/gotempsh/temps-sandbox-{flavor}@sha256:{}",
+                "a".repeat(64)
+            );
+            assert!(is_managed_application_workspace_image(&image));
+        }
+        for image in [
+            format!(
+                "ghcr.io/gotempsh/temps-sandbox-bun@sha256:{}",
+                "a".repeat(64)
+            ),
+            format!(
+                "ghcr.io/other/temps-sandbox-nodejs@sha256:{}",
+                "a".repeat(64)
+            ),
+            format!(
+                "ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:{}",
+                "A".repeat(64)
+            ),
+            "ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:short".into(),
+        ] {
+            assert!(
+                !is_managed_application_workspace_image(&image),
+                "accepted {image}"
+            );
+        }
     }
 
     #[test]
@@ -4314,7 +4364,7 @@ mod tests {
         let mapped = ApplicationWorkspaceConfig::from(&row);
         assert_eq!(
             mapped.image.as_deref(),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4")
+            managed_application_workspace_image("python")
         );
 
         row.image = Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0".to_string());

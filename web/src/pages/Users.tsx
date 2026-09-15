@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { PageContainer } from '@/components/layout/PageContainer'
-
 import { useQuery } from '@tanstack/react-query'
 import { listUsersOptions } from '@/api/client/@tanstack/react-query.gen'
 import { UsersManagement } from '@/components/users/UsersManagement'
@@ -46,7 +44,7 @@ export function Users() {
   usePageTitle('Users')
 
   return (
-    <PageContainer innerClassName="space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       <div className="space-y-6">
         <UsersManagement
           users={users}
@@ -63,6 +61,6 @@ export function Users() {
           onOpenChange={(open) => !open && setSelectedUser(null)}
         />
       )}
-    </PageContainer>
+    </div>
   )
 }

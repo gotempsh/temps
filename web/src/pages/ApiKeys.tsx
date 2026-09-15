@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+import { PageHeader } from '@/components/layout/PageContainer'
 
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -100,7 +100,7 @@ export default function ApiKeys() {
   }
 
   return (
-    <PageContainer innerClassName="space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       <PageHeader
         title="API Keys"
         description="Manage your API keys for programmatic access"
@@ -188,6 +188,6 @@ export default function ApiKeys() {
         onConfirm={handleDeleteConfirm}
         isPending={deleteMutation.isPending}
       />
-    </PageContainer>
+    </div>
   )
 }

@@ -3,13 +3,16 @@
 
 import { ComposableMap, Geographies, Geography } from 'react-simple-maps'
 import worldTopo from './assets/geo/countries-110m.json'
-import { useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from './lib/cn'
 import { GLYPH, GLYPH_CLASS, glyphClass, type State } from './status'
 import { Num } from './num'
 import { fmtNum, fmtPct } from './fmt'
 import { Kbd } from './kbd'
+
+// react-simple-maps accepts TopoJSON at runtime, but its v5 prop type omits it.
+const worldGeography = worldTopo as unknown as ComponentProps<typeof Geographies>['geography']
 
 /* ────────────────────────────────────────────────────────────────────────
    The observe primitives the live console draws and the system did not have
@@ -201,7 +204,7 @@ export function CalendarHeatmap({ days, cell = 12, unit = 'deploys', onOpen, cla
   className?: string
 }) {
   const [i, setI] = useState<number | null>(null)
-  const [at, setAt] = useState<{ x: number; y: number } | null>(null)
+  const [at, setAt] = useState<{ x: number; y: number; width: number } | null>(null)
   const box = useRef<HTMLDivElement>(null)
   const touched = useRef(false)
   const coarse = () => touched.current || (typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches)
@@ -243,7 +246,7 @@ export function CalendarHeatmap({ days, cell = 12, unit = 'deploys', onOpen, cla
           if (step !== undefined) { e.preventDefault(); move(step) }
           if (e.key === 'Enter' && day) { e.preventDefault(); onOpen?.(day) }
         }}
-        onMouseMove={(e) => { const r = box.current?.getBoundingClientRect(); if (r && !coarse()) setAt({ x: e.clientX - r.left, y: e.clientY - r.top }) }}
+        onMouseMove={(e) => { const r = box.current?.getBoundingClientRect(); if (r && !coarse()) setAt({ x: e.clientX - r.left, y: e.clientY - r.top, width: r.width }) }}
         className="flex gap-0.5 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       >
         {weeks.map((w, wi) => (
@@ -270,7 +273,7 @@ export function CalendarHeatmap({ days, cell = 12, unit = 'deploys', onOpen, cla
       {/* fine pointer: the readout follows the cursor, nothing under the grid */}
       {day && at && (
         <div aria-hidden className="pointer-events-none absolute z-10 hidden items-center gap-2 whitespace-nowrap border bg-background px-2 py-1 font-mono text-[11px] md:flex"
-          style={{ left: at.x + 12, top: at.y + 12, ...(box.current && at.x > box.current.clientWidth * 0.6 ? { left: 'auto', right: box.current.clientWidth - at.x + 12 } : {}) }}>
+          style={{ left: at.x + 12, top: at.y + 12, ...(at.x > at.width * 0.6 ? { left: 'auto', right: at.width - at.x + 12 } : {}) }}>
           {readout}
         </div>
       )}
@@ -611,7 +614,7 @@ const GEO_FILL: Record<State, string> = {
  */
 export function GeoMap({ rows, onOpen, className }: { rows: GeoRow[]; onOpen?: (row: GeoRow) => void; className?: string }) {
   const [hot, setHot] = useState<GeoRow | null>(null)
-  const [at, setAt] = useState<{ x: number; y: number } | null>(null)
+  const [at, setAt] = useState<{ x: number; y: number; width: number } | null>(null)
   const box = useRef<HTMLDivElement>(null)
   const byGeo = useMemo(() => Object.fromEntries(rows.map((r) => [r.geo, r])), [rows])
   // A real touch fires touchstart before the synthesised click; the media query covers devices that never touch.
@@ -628,16 +631,17 @@ export function GeoMap({ rows, onOpen, className }: { rows: GeoRow[]; onOpen?: (
   return (
     <div ref={box} className={cn('op-geo relative min-w-0 border bg-background', className)} onTouchStart={() => { touched.current = true }}>
       <ComposableMap projection="geoNaturalEarth1" projectionConfig={{ scale: 155, center: [0, 8] }} width={880} height={400} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label={`map · ${rows.length} countries with data`}
-        onMouseMove={(e) => { const r = box.current?.getBoundingClientRect(); if (r) setAt({ x: e.clientX - r.left, y: e.clientY - r.top }) }}>
-        <Geographies geography={worldTopo}>
+        onMouseMove={(e) => { const r = box.current?.getBoundingClientRect(); if (r) setAt({ x: e.clientX - r.left, y: e.clientY - r.top, width: r.width }) }}>
+        <Geographies geography={worldGeography}>
           {({ geographies }) => geographies.filter((g) => g.id !== '010').map((g) => {
-            const row = byGeo[g.properties.name as string]
-            const read = row ?? { geo: g.properties.name, label: g.properties.name, value: '', state: 'idle' as State }
+            const name = typeof g.properties?.name === 'string' ? g.properties.name : String(g.id ?? '')
+            const row = byGeo[name]
+            const read = row ?? { geo: name, label: name, value: '', state: 'idle' as State }
             return (
               <Geography key={g.rsmKey} geography={g}
                 fill={row ? GEO_FILL[row.state] : GEO_FILL.idle}
                 stroke={hot && hot.geo === read.geo ? 'var(--foreground)' : 'var(--background)'} strokeWidth={hot && hot.geo === read.geo ? 1 : 0.5}
-                style={{ default: { outline: 'none' }, hover: { outline: 'none', stroke: 'var(--foreground)', strokeWidth: 1, cursor: row && onOpen ? 'pointer' : 'default' }, pressed: { outline: 'none' } }}
+                style={{ outline: 'none', cursor: row && onOpen ? 'pointer' : 'default' }}
                 onMouseEnter={() => { if (!coarse()) setHot(read) }}
                 onMouseLeave={() => { if (!coarse()) { setHot(null); setAt(null) } }}
                 onClick={() => {
@@ -652,7 +656,7 @@ export function GeoMap({ rows, onOpen, className }: { rows: GeoRow[]; onOpen?: (
       {/* fine pointer: the readout follows the cursor, nothing under the map */}
       {hot && at && (
         <div aria-hidden className="pointer-events-none absolute z-10 hidden items-center gap-2 border bg-background px-2 py-1 font-mono text-[11px] md:flex"
-          style={{ left: at.x + 12, top: at.y + 12, ...(box.current && at.x > box.current.clientWidth * 0.6 ? { left: 'auto', right: box.current.clientWidth - at.x + 12 } : {}) }}>
+          style={{ left: at.x + 12, top: at.y + 12, ...(at.x > at.width * 0.6 ? { left: 'auto', right: at.width - at.x + 12 } : {}) }}>
           {readout}
         </div>
       )}

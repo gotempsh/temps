@@ -3,10 +3,10 @@
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 let role = 'reader'
-let catalogEnabledValues: boolean[] = []
-let emptyCatalog = false
+let reportingEnabledValues: boolean[] = []
 
 mock.module('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { role } }),
@@ -28,32 +28,17 @@ mock.module('@/hooks/useSensitiveActionVerification', () => ({
 }))
 
 mock.module('@/hooks/usePlugins', () => ({
+  PLUGINS_QUERY_KEY: ['external-plugins'],
   usePlugins: () => ({ data: [], isLoading: false }),
-  usePluginCatalog: (enabled = true) => {
-    catalogEnabledValues.push(enabled)
+  usePluginInstallationReporting: (enabled = true) => {
+    reportingEnabledValues.push(enabled)
     return {
-      data: {
-        available: true,
-        plugins: emptyCatalog
-          ? []
-          : [
-              {
-                author: 'Temps',
-                category: 'Observability',
-                description: 'Checks deployment health.',
-                name: 'deployment-health',
-                platforms: {},
-                summary: 'Monitor recent deployments.',
-                title: 'Deployment Health',
-                version: '1.0.0',
-              },
-            ],
-      },
+      data: { enabled: false },
       isLoading: false,
-      error: null,
+      isError: false,
     }
   },
-  useInstallPlugin: () => ({
+  useSetPluginInstallationReporting: () => ({
     isPending: false,
     mutateAsync: () => Promise.resolve(),
   }),
@@ -69,49 +54,74 @@ mock.module('@/hooks/usePlugins', () => ({
 
 const { PluginsPage } = await import('./PluginsPage')
 
+function renderPage() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  client.setQueryData(['repository-plugin-catalog'], {
+    available: true,
+    source:
+      'https://raw.githubusercontent.com/gotempsh/plugins/main/registry/catalog.json',
+    platform: 'linux-amd64-gnu',
+    plugins: [],
+  })
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <PluginsPage />
+    </QueryClientProvider>
+  )
+}
+
 describe('PluginsPage management permissions', () => {
   beforeEach(() => {
-    catalogEnabledValues = []
-    emptyCatalog = false
+    reportingEnabledValues = []
   })
 
-  test('keeps plugin management and its catalog request disabled for readers', () => {
+  test('lets readers browse the GitHub catalog without management controls', () => {
     role = 'reader'
 
-    const markup = renderToStaticMarkup(<PluginsPage />)
+    const markup = renderPage()
 
-    expect(catalogEnabledValues).toEqual([false])
-    expect(markup).toContain('Verified plugins currently loaded by Temps.')
+    expect(reportingEnabledValues).toEqual([])
+    expect(markup).toContain('Plugins currently loaded by Temps.')
     expect(markup).toContain('Ask a system administrator to install one.')
     expect(markup).not.toContain('Reload Plugins')
-    expect(markup).not.toContain('>Registry<')
-    expect(markup).not.toContain('>Install<')
+    expect(markup).toContain('Available plugins')
+    expect(markup).not.toContain('Build and install')
+    expect(markup).not.toContain('GitHub repository')
+    expect(markup).not.toContain('Share installation counts')
   })
 
   test('enables the catalog and management controls for system administrators', () => {
     role = 'admin'
 
-    const markup = renderToStaticMarkup(<PluginsPage />)
+    const markup = renderPage()
 
-    expect(catalogEnabledValues).toEqual([true])
+    expect(reportingEnabledValues).toEqual([])
     expect(markup).toContain('Reload Plugins')
-    expect(markup).toContain('>Registry<')
-    expect(markup).toContain('>Install<')
+    expect(markup).toContain('Available plugins')
+    expect(markup).toContain('Advanced')
+    expect(markup).toContain('aria-expanded="false"')
+    expect(markup).not.toContain('Build and install')
+    expect(markup).not.toContain('id="plugin-repo"')
+    expect(markup).not.toContain('Share installation counts')
+    expect(markup.indexOf('Available plugins')).toBeLessThan(
+      markup.indexOf('running-plugins-title')
+    )
   })
 
-  test('explains when no published releases support the server platform', () => {
+  test('explains when no catalog plugins support the server platform', () => {
     role = 'admin'
-    emptyCatalog = true
 
-    const markup = renderToStaticMarkup(<PluginsPage />)
+    const markup = renderPage()
 
     expect(markup).toContain(
-      'No published plugins support this server’s platform yet.'
+      'No catalog plugins support this server’s platform yet.'
     )
     expect(markup).toContain(
-      'Compatible releases will appear here when they are published.'
+      'Compatible plugins will appear here when they are listed.'
     )
-    expect(markup).not.toContain('The registry has no plugins yet.')
-    expect(markup).not.toContain('>Install<')
+    expect(markup).not.toContain('No matching plugins.')
+    expect(markup).not.toContain('Review and install')
   })
 })

@@ -1347,6 +1347,18 @@ fn image_name_for_runtime_in_channel(runtime: &str, channel: SandboxChannel) -> 
 
 /// Convenience wrapper that reads the channel from the environment.
 pub fn image_name_for_runtime(runtime: &str) -> String {
+    let embedded = match runtime {
+        "" | "node" => temps_core::release_images::SANDBOX_NODE,
+        "bun" => temps_core::release_images::SANDBOX_BUN,
+        "python" => temps_core::release_images::SANDBOX_PYTHON,
+        "rust" => temps_core::release_images::SANDBOX_RUST,
+        "go" => temps_core::release_images::SANDBOX_GO,
+        "full" => temps_core::release_images::SANDBOX_FULL,
+        _ => None,
+    };
+    if let Some(image) = embedded {
+        return image.to_string();
+    }
     image_name_for_runtime_in_channel(runtime, SandboxChannel::from_env())
 }
 
@@ -1357,7 +1369,11 @@ pub fn image_name_for_runtime(runtime: &str) -> String {
 /// rebuilding a missing image.
 fn runtime_from_image_name(image: &str) -> Option<&str> {
     let rest = image.strip_prefix(SANDBOX_IMAGE_REGISTRY_PREFIX)?;
-    Some(rest.split(':').next().unwrap_or(rest))
+    Some(rest.split([':', '@']).next().unwrap_or(rest))
+}
+
+fn selected_preset_runtime(image: &str) -> Option<&str> {
+    runtime_from_image_name(image).filter(|runtime| image == image_name_for_runtime(runtime))
 }
 
 /// Configuration for the Docker sandbox provider.
@@ -1402,6 +1418,15 @@ impl DockerSandboxConfig {
             image_name_for_runtime(&self.runtime)
         }
     }
+}
+
+fn ensure_mutable_rebuild_target(image: &str) -> Result<(), AgentError> {
+    if image.contains("@sha256:") || image.starts_with("sha256:") {
+        return Err(AgentError::ImmutableSandboxImageRebuild {
+            image: image.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Docker-based sandbox provider. Each agent run gets its own container with
@@ -1960,6 +1985,14 @@ impl DockerSandboxProvider {
                 return Ok(());
             }
             Err(reason) => {
+                if image_name.contains("@sha256:") {
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "Failed to pull pinned runtime image {image_name}: {reason}"
+                        ),
+                    });
+                }
                 tracing::info!(
                     "Pull of {} failed ({}), falling back to local build",
                     image_name,
@@ -3343,11 +3376,11 @@ impl SandboxProvider for DockerSandboxProvider {
             // helper strips the registry prefix + version tag to recover
             // the runtime name. Anything that doesn't match the preset
             // prefix is treated as a user-supplied custom image.
-            if let Some(runtime) = runtime_from_image_name(image) {
+            if let Some(runtime) = selected_preset_runtime(image) {
                 self.ensure_image_for_runtime(runtime).await?;
-            }
-            // Otherwise it's a custom image — try to pull
-            else {
+            } else {
+                // A historical pinned image or custom image must be pulled
+                // by its exact reference, never rebuilt under the current tag.
                 tracing::info!("Pulling sandbox image {}...", image);
                 let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
                     .from_image(image)
@@ -4745,6 +4778,7 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn rebuild_image(&self) -> Result<String, AgentError> {
         let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
 
         // Remove existing image (force, in case containers reference it)
         if self.docker.inspect_image(&image_name).await.is_ok() {
@@ -4771,6 +4805,7 @@ impl SandboxProvider for DockerSandboxProvider {
         on_progress: tokio::sync::mpsc::Sender<String>,
     ) -> Result<String, AgentError> {
         let image_name = self.config.resolved_image();
+        ensure_mutable_rebuild_target(&image_name)?;
 
         // Remove existing image
         if self.docker.inspect_image(&image_name).await.is_ok() {
@@ -6688,6 +6723,20 @@ mod tests {
     }
 
     #[test]
+    fn immutable_digest_rebuild_is_rejected_before_any_docker_action() {
+        for image in [
+            "ghcr.io/gotempsh/temps-sandbox-node@sha256:aaaaaaaa",
+            "sha256:aaaaaaaa",
+        ] {
+            assert!(matches!(
+                ensure_mutable_rebuild_target(image),
+                Err(AgentError::ImmutableSandboxImageRebuild { image: rejected }) if rejected == image
+            ));
+        }
+        assert!(ensure_mutable_rebuild_target("ghcr.io/gotempsh/temps-sandbox-node:dev").is_ok());
+    }
+
+    #[test]
     fn test_dockerfile_for_runtime_node() {
         let df = dockerfile_for_runtime("node");
         assert!(df.contains("FROM ubuntu:24.04"));
@@ -7109,7 +7158,8 @@ mod tests {
         // stable and beta are valid targets here, so we check the
         // structural shape rather than the exact string.
         assert!(
-            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python:"),
+            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python:")
+                || image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python@sha256:"),
             "got: {image_name}"
         );
     }
@@ -7170,6 +7220,13 @@ mod tests {
             assert_eq!(runtime_from_image_name(&stable), Some(*runtime));
             let beta = image_name_for_runtime_in_channel(runtime, SandboxChannel::Beta);
             assert_eq!(runtime_from_image_name(&beta), Some(*runtime));
+            assert_eq!(
+                runtime_from_image_name(&format!(
+                    "ghcr.io/gotempsh/temps-sandbox-{runtime}@sha256:{}",
+                    "a".repeat(64)
+                )),
+                Some(*runtime)
+            );
         }
         // Custom images (anything outside our prefix) return None so the
         // recovery code falls back to a plain `docker pull` instead of
@@ -7184,6 +7241,20 @@ mod tests {
         assert_eq!(
             runtime_from_image_name(&format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")),
             Some("node")
+        );
+    }
+
+    #[test]
+    fn only_current_preset_reference_can_be_materialized_locally() {
+        let selected = image_name_for_runtime("node");
+        assert_eq!(selected_preset_runtime(&selected), Some("node"));
+        assert_eq!(
+            selected_preset_runtime("ghcr.io/gotempsh/temps-sandbox-node:0.0.1"),
+            None
+        );
+        assert_eq!(
+            selected_preset_runtime("docker.io/library/node:latest"),
+            None
         );
     }
 

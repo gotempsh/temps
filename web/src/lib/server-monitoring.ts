@@ -59,7 +59,10 @@ export function mergeSeries(
   for (const { key, points } of series) {
     for (const p of points ?? []) {
       if (Number.isNaN(Date.parse(p.time))) continue
-      const row = rows.get(p.time) ?? { time: p.time, label: label(p.time) }
+      const row: ChartRow = rows.get(p.time) ?? {
+        time: p.time,
+        label: label(p.time),
+      }
       row[key] = p.value
       rows.set(p.time, row)
     }

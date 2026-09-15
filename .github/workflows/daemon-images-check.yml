@@ -42,6 +42,8 @@ jobs:
           load: true
           push: false
           tags: temps-daemon-ci:check
+          # Public, read-only cache; PR jobs have no package credentials/writes.
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
       - name: Install Rust for the typed SDK smoke client
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:

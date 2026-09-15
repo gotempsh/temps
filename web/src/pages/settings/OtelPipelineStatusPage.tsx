@@ -213,7 +213,10 @@ function buildTrendRows(
     for (const point of series.points) {
       const ts = new Date(point.time).getTime()
       if (Number.isNaN(ts)) continue
-      const row = byTs.get(ts) ?? { ts, label: labelFormatter(ts) }
+      const row: TrendRow = byTs.get(ts) ?? {
+        ts,
+        label: labelFormatter(ts),
+      }
       row[slotKey] = point.value
       byTs.set(ts, row)
     }

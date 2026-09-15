@@ -1516,6 +1516,11 @@ export type AppSettings = {
      */
     observability_retention?: ObservabilityRetentionSettings;
     on_demand_tls?: OnDemandTlsSettings;
+    /**
+     * Share verified external-plugin installation counts with the official
+     * registry. Defaults to off; each plugin receives an unlinkable ID.
+     */
+    plugin_installation_reporting_enabled?: boolean;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
@@ -1672,6 +1677,10 @@ export type AppSettingsResponse = {
      * Retention windows for raw proxy logs and OpenTelemetry data.
      */
     observability_retention: ObservabilityRetentionSettings;
+    /**
+     * Consent for verified external-plugin installation count reporting.
+     */
+    plugin_installation_reporting_enabled: boolean;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     /**
@@ -11400,6 +11409,29 @@ export type InstallPluginResponse = {
     version: string;
 };
 
+export type InstallRepositoryRequest = {
+    name?: string | null;
+    ref_name?: string | null;
+    repository_url: string;
+};
+
+export type InstallRepositoryResponse = {
+    message: string;
+    name: string;
+    platform: string;
+    sha256: string;
+    source_commit: string;
+    version: string;
+};
+
+export type InstallationReportingSettings = {
+    /**
+     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
+     * with the official Temps registry after a verified install succeeds.
+     */
+    enabled: boolean;
+};
+
 export type IntegrationResponse = {
     config?: null | ProviderConfig;
     created_at: string;
@@ -14938,10 +14970,20 @@ export type PluginManifest = {
     version: string;
 };
 
+export type PluginSourceResponse = {
+    builder_image: string;
+    commit: string;
+    kind: string;
+    ref_name: string;
+    repository_url: string;
+    version: string;
+};
+
 export type PluginStatusResponse = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
+    source?: null | PluginSourceResponse;
 };
 
 /**
@@ -17084,6 +17126,32 @@ export type RepointContinuousArchiveSourceRequest = {
     new_s3_source_id: number;
 };
 
+export type RepositoryCatalogPlugin = {
+    author: string;
+    category: string;
+    commit: string;
+    description: string;
+    docsUrl?: string | null;
+    latestVersion: string;
+    logoUrl?: string | null;
+    name: string;
+    platforms: Array<string>;
+    readmeUrl?: string | null;
+    repository: string;
+    screenshots: Array<RepositoryScreenshot>;
+    summary: string;
+    title: string;
+    validation: RepositoryValidation;
+};
+
+export type RepositoryCatalogResponse = {
+    available: boolean;
+    platform: string;
+    plugins: Array<RepositoryCatalogPlugin>;
+    reason?: string | null;
+    source: string;
+};
+
 export type RepositoryComposeServicesResponse = {
     path: string;
     repositoryId: number;
@@ -17151,6 +17219,12 @@ export type RepositoryResponse = {
     updated_at: string;
 };
 
+export type RepositoryScreenshot = {
+    alt: string;
+    caption?: string | null;
+    url: string;
+};
+
 /**
  * Returned by `POST /git-connections/{id}/sync` to acknowledge that a
  * sync has been kicked off in the background. Clients should poll the
@@ -17161,6 +17235,11 @@ export type RepositorySyncStartedResponse = {
     connection_id: number;
     started_at: string;
     syncing: boolean;
+};
+
+export type RepositoryValidation = {
+    build: string;
+    metadata: string;
 };
 
 /**
@@ -23024,6 +23103,10 @@ export type UpdateProviderRequest = {
     config?: unknown;
     enabled?: boolean | null;
     name?: string | null;
+};
+
+export type UpdateRepositoryRequest = {
+    ref_name?: string | null;
 };
 
 export type UpdateRouteRequest = {
@@ -61705,16 +61788,29 @@ export type ListPluginCatalogResponses = {
 
 export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
 
-export type InstallPluginData = {
-    body: InstallPluginRequest;
+export type ListRepositoryPluginCatalogData = {
+    body?: never;
     path?: never;
     query?: never;
-    url: '/x/plugins/install';
+    url: '/x/plugins/catalog/repositories';
 };
 
-export type InstallPluginErrors = {
+export type ListRepositoryPluginCatalogResponses = {
+    200: RepositoryCatalogResponse;
+};
+
+export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
+
+export type InstallRepositoryData = {
+    body: InstallRepositoryRequest;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/install/repository';
+};
+
+export type InstallRepositoryErrors = {
     /**
-     * Invalid plugin name or registry release
+     * Invalid repository source
      */
     400: ProblemDetails;
     /**
@@ -61726,11 +61822,11 @@ export type InstallPluginErrors = {
      */
     403: ProblemDetails;
     /**
-     * Registry rollback refused
+     * Plugin source conflict
      */
     409: ProblemDetails;
     /**
-     * Request body exceeds the configured limit
+     * Request body exceeds configured limit
      */
     413: ProblemDetails;
     /**
@@ -61738,7 +61834,7 @@ export type InstallPluginErrors = {
      */
     415: ProblemDetails;
     /**
-     * Request JSON does not match the install schema
+     * Request JSON does not match install schema
      */
     422: ProblemDetails;
     /**
@@ -61750,25 +61846,51 @@ export type InstallPluginErrors = {
      */
     500: ProblemDetails;
     /**
-     * Registry, artifact, or plugin startup verification failed
+     * Repository, build, or startup failed
      */
     502: ProblemDetails;
     /**
-     * Registry trust, plugin service, or security audit unavailable
+     * Plugin service or security audit unavailable
      */
     503: ProblemDetails;
 };
 
-export type InstallPluginError = InstallPluginErrors[keyof InstallPluginErrors];
+export type InstallRepositoryError = InstallRepositoryErrors[keyof InstallRepositoryErrors];
 
-export type InstallPluginResponses = {
+export type InstallRepositoryResponses = {
     /**
-     * Plugin verified, installed, and started
+     * Repository commit built, verified, and activated
      */
-    200: InstallPluginResponse;
+    200: InstallRepositoryResponse;
 };
 
-export type InstallPluginResponse2 = InstallPluginResponses[keyof InstallPluginResponses];
+export type InstallRepositoryResponse2 = InstallRepositoryResponses[keyof InstallRepositoryResponses];
+
+export type GetPluginInstallationReportingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/installation-reporting';
+};
+
+export type GetPluginInstallationReportingResponses = {
+    200: InstallationReportingSettings;
+};
+
+export type GetPluginInstallationReportingResponse = GetPluginInstallationReportingResponses[keyof GetPluginInstallationReportingResponses];
+
+export type SetPluginInstallationReportingData = {
+    body: InstallationReportingSettings;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/installation-reporting';
+};
+
+export type SetPluginInstallationReportingResponses = {
+    200: InstallationReportingSettings;
+};
+
+export type SetPluginInstallationReportingResponse = SetPluginInstallationReportingResponses[keyof SetPluginInstallationReportingResponses];
 
 export type ReloadPluginsData = {
     body?: never;
@@ -61892,6 +62014,37 @@ export type UninstallPluginResponses = {
 };
 
 export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
+
+export type UpdateRepositoryData = {
+    body: UpdateRepositoryRequest;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/update';
+};
+
+export type UpdateRepositoryErrors = {
+    /**
+     * No repository-backed active plugin
+     */
+    404: ProblemDetails;
+    /**
+     * Build or startup failed; previous plugin preserved
+     */
+    502: ProblemDetails;
+};
+
+export type UpdateRepositoryError = UpdateRepositoryErrors[keyof UpdateRepositoryErrors];
+
+export type UpdateRepositoryResponses = {
+    /**
+     * Repository plugin explicitly updated to a new pinned commit
+     */
+    200: InstallRepositoryResponse;
+};
+
+export type UpdateRepositoryResponse = UpdateRepositoryResponses[keyof UpdateRepositoryResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

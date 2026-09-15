@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   revenueCreateIntegrationMutation,
   revenueDeleteIntegrationMutation,
@@ -1026,11 +1027,10 @@ function ConfigureIntegrationDialog({
                 </p>
               </div>
               <label className="flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
+                <Checkbox
                   className="mt-0.5"
                   checked={includeUnpriced}
-                  onChange={(e) => setIncludeUnpriced(e.target.checked)}
+                  onCheckedChange={(checked) => setIncludeUnpriced(checked === true)}
                 />
                 <span>
                   Include charges without a price reference

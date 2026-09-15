@@ -67,6 +67,11 @@ impl From<AgentError> for Problem {
             AgentError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
+            AgentError::ImmutableSandboxImageRebuild { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Immutable Sandbox Image")
+                    .with_detail(error.to_string())
+            }
             AgentError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(error.to_string()),
@@ -683,6 +688,15 @@ pub async fn delete_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immutable_image_rebuild_error_is_a_client_error() {
+        let problem = Problem::from(AgentError::ImmutableSandboxImageRebuild {
+            image: "registry.example.test/sandbox@sha256:abc".into(),
+        });
+        let response = axum::response::IntoResponse::into_response(problem);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn legacy_inline_mcp_response_masks_url_env_and_headers() {

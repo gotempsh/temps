@@ -3133,6 +3133,11 @@
               }
             ]
           },
+          "plugin_installation_reporting_enabled": {
+            "default": false,
+            "description": "Share verified external-plugin installation counts with the official\nregistry. Defaults to off; each plugin receives an unlinkable ID.",
+            "type": "boolean"
+          },
           "preview_domain": {
             "default": "localho.st",
             "type": "string"
@@ -3370,6 +3375,10 @@
             "$ref": "#/components/schemas/ObservabilityRetentionSettings",
             "description": "Retention windows for raw proxy logs and OpenTelemetry data."
           },
+          "plugin_installation_reporting_enabled": {
+            "description": "Consent for verified external-plugin installation count reporting.",
+            "type": "boolean"
+          },
           "preview_domain": {
             "type": "string"
           },
@@ -3420,6 +3429,7 @@
           }
         },
         "required": [
+          "plugin_installation_reporting_enabled",
           "preview_domain",
           "proxy_port",
           "cloud",
@@ -24756,6 +24766,73 @@
         ],
         "type": "object"
       },
+      "InstallRepositoryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_url"
+        ],
+        "type": "object"
+      },
+      "InstallRepositoryResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "source_commit": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "platform",
+          "sha256",
+          "source_commit",
+          "message"
+        ],
+        "type": "object"
+      },
+      "InstallationReportingSettings": {
+        "properties": {
+          "enabled": {
+            "description": "Opt in to sharing a plugin name and plugin-specific anonymous identifier\nwith the official Temps registry after a verified install succeeds.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "IntegrationResponse": {
         "properties": {
           "config": {
@@ -32837,6 +32914,37 @@
         ],
         "type": "object"
       },
+      "PluginSourceResponse": {
+        "properties": {
+          "builder_image": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "ref_name": {
+            "type": "string"
+          },
+          "repository_url": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "repository_url",
+          "ref_name",
+          "commit",
+          "version",
+          "builder_image"
+        ],
+        "type": "object"
+      },
       "PluginStatusResponse": {
         "properties": {
           "configured": {
@@ -32850,6 +32958,16 @@
           },
           "setup_path": {
             "type": "string"
+          },
+          "source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginSourceResponse"
+              }
+            ]
           }
         },
         "required": [
@@ -37232,6 +37350,117 @@
         ],
         "type": "object"
       },
+      "RepositoryCatalogPlugin": {
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "docsUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latestVersion": {
+            "type": "string"
+          },
+          "logoUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "platforms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "readmeUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository": {
+            "type": "string"
+          },
+          "screenshots": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryScreenshot"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/RepositoryValidation"
+          }
+        },
+        "required": [
+          "name",
+          "title",
+          "summary",
+          "description",
+          "author",
+          "category",
+          "repository",
+          "screenshots",
+          "latestVersion",
+          "platforms",
+          "commit",
+          "validation"
+        ],
+        "type": "object"
+      },
+      "RepositoryCatalogResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryCatalogPlugin"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "source",
+          "platform",
+          "plugins"
+        ],
+        "type": "object"
+      },
       "RepositoryComposeServicesResponse": {
         "properties": {
           "path": {
@@ -37477,6 +37706,27 @@
         ],
         "type": "object"
       },
+      "RepositoryScreenshot": {
+        "properties": {
+          "alt": {
+            "type": "string"
+          },
+          "caption": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "alt"
+        ],
+        "type": "object"
+      },
       "RepositorySyncStartedResponse": {
         "description": "Returned by `POST /git-connections/{id}/sync` to acknowledge that a\nsync has been kicked off in the background. Clients should poll the\nconnection's `syncing` and `synced_repository_count` fields to track\nprogress rather than waiting on this response.",
         "properties": {
@@ -37496,6 +37746,21 @@
           "connection_id",
           "syncing",
           "started_at"
+        ],
+        "type": "object"
+      },
+      "RepositoryValidation": {
+        "properties": {
+          "build": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metadata",
+          "build"
         ],
         "type": "object"
       },
@@ -50143,6 +50408,18 @@
             ]
           },
           "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateRepositoryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "ref_name": {
             "type": [
               "string",
               "null"
@@ -114734,14 +115011,39 @@
         ]
       }
     },
-    "/x/plugins/install": {
+    "/x/plugins/catalog/repositories": {
+      "get": {
+        "operationId": "list_repository_plugin_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryCatalogResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/install/repository": {
       "post": {
-        "operationId": "install_plugin",
+        "operationId": "install_repository",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/InstallPluginRequest"
+                "$ref": "#/components/schemas/InstallRepositoryRequest"
               }
             }
           },
@@ -114752,11 +115054,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/InstallPluginResponse"
+                  "$ref": "#/components/schemas/InstallRepositoryResponse"
                 }
               }
             },
-            "description": "Plugin verified, installed, and started"
+            "description": "Repository commit built, verified, and activated"
           },
           "400": {
             "content": {
@@ -114766,7 +115068,7 @@
                 }
               }
             },
-            "description": "Invalid plugin name or registry release"
+            "description": "Invalid repository source"
           },
           "401": {
             "content": {
@@ -114796,7 +115098,7 @@
                 }
               }
             },
-            "description": "Registry rollback refused"
+            "description": "Plugin source conflict"
           },
           "413": {
             "content": {
@@ -114806,7 +115108,7 @@
                 }
               }
             },
-            "description": "Request body exceeds the configured limit"
+            "description": "Request body exceeds configured limit"
           },
           "415": {
             "content": {
@@ -114826,7 +115128,7 @@
                 }
               }
             },
-            "description": "Request JSON does not match the install schema"
+            "description": "Request JSON does not match install schema"
           },
           "428": {
             "content": {
@@ -114856,7 +115158,7 @@
                 }
               }
             },
-            "description": "Registry, artifact, or plugin startup verification failed"
+            "description": "Repository, build, or startup failed"
           },
           "503": {
             "content": {
@@ -114866,7 +115168,65 @@
                 }
               }
             },
-            "description": "Registry trust, plugin service, or security audit unavailable"
+            "description": "Plugin service or security audit unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/installation-reporting": {
+      "get": {
+        "operationId": "get_plugin_installation_reporting",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallationReportingSettings"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      },
+      "put": {
+        "operationId": "set_plugin_installation_reporting",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallationReportingSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallationReportingSettings"
+                }
+              }
+            },
+            "description": ""
           }
         },
         "security": [
@@ -115098,6 +115458,71 @@
           }
         ],
         "summary": "Stop and deactivate a plugin while preserving all installed releases and data.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/update": {
+      "post": {
+        "operationId": "update_repository",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallRepositoryResponse"
+                }
+              }
+            },
+            "description": "Repository plugin explicitly updated to a new pinned commit"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No repository-backed active plugin"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Build or startup failed; previous plugin preserved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Plugins"
         ]

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { Checkbox } from '@/components/ui/checkbox'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 
@@ -240,21 +241,19 @@ function QuestionVariant({
                       key={opt.label}
                       className="flex cursor-pointer items-center gap-2 text-sm"
                     >
-                      <input
-                        type="checkbox"
+                      <Checkbox
                         checked={checked}
-                        onChange={(e) => {
+                        onCheckedChange={(checked) => {
                           setSelections((prev) => {
                             const cur = prev[q.question] ?? []
                             return {
                               ...prev,
-                              [q.question]: e.target.checked
+                              [q.question]: checked === true
                                 ? [...cur, opt.label]
                                 : cur.filter((l) => l !== opt.label),
                             }
                           })
                         }}
-                        className="h-3.5 w-3.5"
                       />
                       <span>{opt.label}</span>
                       {opt.description && (

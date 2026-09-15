@@ -186,6 +186,27 @@ struct InstallReceipt {
     sha256: String,
 }
 
+#[derive(Deserialize)]
+struct ReceiptSourceMarker {
+    source: Option<String>,
+}
+
+/// Local build provenance. This is intentionally not a registry signature: an
+/// administrator authorized execution of code from this exact Git commit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryReceipt {
+    pub source: String,
+    pub repository: String,
+    pub ref_name: String,
+    pub commit: String,
+    pub builder: String,
+    pub plugin_name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ActiveRecord {
     version: String,
@@ -217,6 +238,91 @@ pub struct PluginInstaller {
 }
 
 impl PluginInstaller {
+    /// Stage a repository-built executable using the same immutable release
+    /// and atomic activation path as signed catalogue installs.
+    pub(crate) async fn prepare_repository(
+        plugins_dir: &Path,
+        receipt: RepositoryReceipt,
+        built_binary: &Path,
+    ) -> Result<InstallCandidate, InstallError> {
+        validate_plugin_name(&receipt.plugin_name)?;
+        validate_version(&receipt.plugin_name, &receipt.version)?;
+        let platform = platform_target()?;
+        if platform != receipt.platform {
+            return Err(InstallError::UnsupportedPlatform {
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                target_env: platform,
+            });
+        }
+        let sha256 = normalize_digest(&receipt.plugin_name, &receipt.version, &receipt.sha256)?;
+        let actual =
+            hash_regular_file_capped(&receipt.plugin_name, built_binary, MAX_BINARY_BYTES).await?;
+        if actual != sha256 {
+            return Err(InstallError::DigestMismatch {
+                plugin: receipt.plugin_name,
+                version: receipt.version,
+                expected: sha256,
+                actual,
+            });
+        }
+        let name = receipt.plugin_name.clone();
+        let cleanup_name = name.clone();
+        ensure_directory(&name, plugins_dir).await?;
+        let staging_root = plugins_dir.join(".staging");
+        ensure_directory(&name, &staging_root).await?;
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let stage = staging_root.join(format!("{name}-{unique}"));
+        create_unique_directory(&name, &stage).await?;
+        let plugin_root = plugins_dir.join(&name);
+        let directory = format!("{}-{unique}", receipt.version);
+        let version_dir = plugin_root.join(&directory);
+        let mut moved_to_version_dir = false;
+        let prepared = async {
+            tokio::fs::copy(built_binary, stage.join(BINARY_FILE))
+                .await
+                .map_err(|error| io_error(&name, &stage.join(BINARY_FILE), error))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                tokio::fs::set_permissions(
+                    stage.join(BINARY_FILE),
+                    std::fs::Permissions::from_mode(0o500),
+                )
+                .await
+                .map_err(|error| io_error(&name, &stage.join(BINARY_FILE), error))?;
+            }
+            write_json_synced(&name, &stage.join(RECEIPT_FILE), &receipt).await?;
+            sync_directory(&name, &stage).await?;
+            ensure_directory(&name, &plugin_root).await?;
+            tokio::fs::rename(&stage, &version_dir)
+                .await
+                .map_err(|error| io_error(&name, &version_dir, error))?;
+            moved_to_version_dir = true;
+            sync_directory(&name, &plugin_root).await?;
+            Ok(InstallCandidate {
+                name,
+                version: receipt.version,
+                platform,
+                sha256,
+                binary_path: version_dir.join(BINARY_FILE),
+                plugin_root,
+                install_directory: directory,
+            })
+        }
+        .await;
+        if prepared.is_err() {
+            let cleanup_path = if moved_to_version_dir {
+                &version_dir
+            } else {
+                &stage
+            };
+            if let Err(error) = tokio::fs::remove_dir_all(cleanup_path).await {
+                tracing::warn!(plugin = %cleanup_name, path = %cleanup_path.display(), error = %error, "Failed to remove incomplete repository release");
+            }
+        }
+        prepared
+    }
     /// Deactivate an installation without deleting release receipts, binaries,
     /// rollback versions, or plugin-owned data. The active record is the only
     /// discovery selector, so removing it prevents restart resurrection.
@@ -1151,50 +1257,39 @@ pub async fn discover_active(
 ) -> Vec<Result<ActiveInstallation, InstallError>> {
     let mut results = Vec::new();
     let state_path = plugins_dir.join(REGISTRY_STATE_FILE);
-    let state_bytes = match read_regular_file_capped("registry", &state_path, 128 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            if has_plugin_directories(plugins_dir).await {
-                results.push(Err(error));
+    let accepted_keyset = match read_registry_state(&state_path).await {
+        Ok(Some(state)) => match VerifiedKeyset::verify(
+            state.keyset,
+            &registry.root_trust,
+            chrono::Utc::now(),
+            KeysetUse::HistoricalReceipt,
+        ) {
+            Ok(keyset) if keyset.document.generation == state.highest_keyset_generation => {
+                Some(keyset)
             }
-            return results;
-        }
-    };
-    let state: RegistryState = match serde_json::from_slice(&state_bytes) {
-        Ok(state) => state,
+            Ok(keyset) => {
+                results.push(Err(invalid_receipt(
+                    "registry",
+                    &state_path,
+                    format!(
+                        "keyset generation {} does not match persisted generation {}",
+                        keyset.document.generation, state.highest_keyset_generation
+                    ),
+                )));
+                return results;
+            }
+            Err(error) => {
+                results.push(Err(invalid_receipt(
+                    "registry",
+                    &state_path,
+                    error.to_string(),
+                )));
+                return results;
+            }
+        },
+        Ok(None) => None,
         Err(error) => {
-            results.push(Err(invalid_receipt(
-                "registry",
-                &state_path,
-                format!("invalid registry state: {error}"),
-            )));
-            return results;
-        }
-    };
-    let accepted_keyset = match VerifiedKeyset::verify(
-        state.keyset,
-        &registry.root_trust,
-        chrono::Utc::now(),
-        KeysetUse::HistoricalReceipt,
-    ) {
-        Ok(keyset) if keyset.document.generation == state.highest_keyset_generation => keyset,
-        Ok(keyset) => {
-            results.push(Err(invalid_receipt(
-                "registry",
-                &state_path,
-                format!(
-                    "keyset generation {} does not match persisted generation {}",
-                    keyset.document.generation, state.highest_keyset_generation
-                ),
-            )));
-            return results;
-        }
-        Err(error) => {
-            results.push(Err(invalid_receipt(
-                "registry",
-                &state_path,
-                error.to_string(),
-            )));
+            results.push(Err(error));
             return results;
         }
     };
@@ -1240,40 +1335,16 @@ pub async fn discover_active(
             }
             Ok(_) => {} // verify_active rejects malformed or symlinked records.
         }
-        results.push(verify_active(&name, &path, registry, &accepted_keyset).await);
+        results.push(verify_active(&name, &path, registry, accepted_keyset.as_ref()).await);
     }
     results
-}
-
-async fn has_plugin_directories(plugins_dir: &Path) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(plugins_dir).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        if tokio::fs::symlink_metadata(entry.path())
-            .await
-            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            && tokio::fs::symlink_metadata(entry.path().join(ACTIVE_FILE))
-                .await
-                .is_ok()
-        {
-            return true;
-        }
-    }
-    false
 }
 
 async fn verify_active(
     name: &str,
     plugin_root: &Path,
     registry: &RegistryConfig,
-    accepted_keyset: &VerifiedKeyset,
+    accepted_keyset: Option<&VerifiedKeyset>,
 ) -> Result<ActiveInstallation, InstallError> {
     validate_plugin_name(name)?;
     let active_path = plugin_root.join(ACTIVE_FILE);
@@ -1296,6 +1367,23 @@ async fn verify_active(
     let receipt_bytes = read_regular_file_capped(name, &receipt_path, 2 * 1024 * 1024)
         .await
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    if serde_json::from_slice::<ReceiptSourceMarker>(&receipt_bytes)
+        .ok()
+        .and_then(|marker| marker.source)
+        .as_deref()
+        == Some("github")
+    {
+        return verify_repository_active(
+            name,
+            &active,
+            &version_dir,
+            &receipt_path,
+            &receipt_bytes,
+        )
+        .await;
+    }
+    let accepted_keyset = accepted_keyset
+        .ok_or_else(|| invalid_receipt(name, &receipt_path, "signed registry state is missing"))?;
     let receipt: InstallReceipt = serde_json::from_slice(&receipt_bytes)
         .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
     let receipt_keyset = VerifiedKeyset::verify(
@@ -1376,6 +1464,114 @@ async fn verify_active(
         sha256: signed_digest,
         binary_path,
     })
+}
+
+async fn verify_repository_active(
+    name: &str,
+    active: &ActiveRecord,
+    version_dir: &Path,
+    receipt_path: &Path,
+    receipt_bytes: &[u8],
+) -> Result<ActiveInstallation, InstallError> {
+    let receipt: RepositoryReceipt = serde_json::from_slice(receipt_bytes)
+        .map_err(|error| invalid_receipt(name, receipt_path, error.to_string()))?;
+    if receipt.source != "github"
+        || receipt.plugin_name != name
+        || receipt.version != active.version
+        || !matches!(crate::repository::parse_repository(&receipt.repository),
+            Ok((owner, repo)) if format!("https://github.com/{owner}/{repo}") == receipt.repository)
+        || receipt.ref_name.is_empty()
+        || receipt.ref_name.len() > 128
+        || !receipt
+            .ref_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+        || receipt.ref_name.contains("..")
+        || receipt.commit.len() != 40
+        || !receipt.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || receipt.builder != crate::repository::BUILDER_IMAGE
+        || receipt.platform != platform_target()?
+    {
+        return Err(invalid_receipt(
+            name,
+            receipt_path,
+            "repository provenance fields are invalid",
+        ));
+    }
+    let expected = normalize_digest(name, &receipt.version, &receipt.sha256)?;
+    let binary_path = version_dir.join(BINARY_FILE);
+    let actual = hash_regular_file_capped(name, &binary_path, MAX_BINARY_BYTES).await?;
+    if actual != expected {
+        return Err(InstallError::DigestMismatch {
+            plugin: name.to_string(),
+            version: receipt.version,
+            expected,
+            actual,
+        });
+    }
+    Ok(ActiveInstallation {
+        name: name.to_string(),
+        version: active.version.clone(),
+        sha256: actual,
+        binary_path,
+    })
+}
+
+/// Return verified GitHub provenance for an active plugin. `None` means no
+/// active release or a registry-backed release, not an unverified GitHub one.
+pub(crate) async fn repository_source(
+    plugins_dir: &Path,
+    name: &str,
+) -> Result<Option<RepositoryReceipt>, InstallError> {
+    validate_plugin_name(name)?;
+    let root = plugins_dir.join(name);
+    for directory in [plugins_dir, root.as_path()] {
+        match tokio::fs::symlink_metadata(directory).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(name, directory, error)),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(invalid_receipt(
+                    name,
+                    directory,
+                    "installation directory is not a real directory",
+                ))
+            }
+            Ok(_) => {}
+        }
+    }
+    let active_path = root.join(ACTIVE_FILE);
+    match tokio::fs::symlink_metadata(&active_path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(name, &active_path, error)),
+        Ok(_) => {}
+    }
+    let active_bytes = read_regular_file_capped(name, &active_path, 16 * 1024).await?;
+    let active: ActiveRecord = serde_json::from_slice(&active_bytes)
+        .map_err(|error| invalid_receipt(name, &active_path, error.to_string()))?;
+    validate_version(name, &active.version)?;
+    validate_version(name, &active.directory)?;
+    let version_dir = root.join(&active.directory);
+    let version_metadata = tokio::fs::symlink_metadata(&version_dir)
+        .await
+        .map_err(|error| io_error(name, &version_dir, error))?;
+    if version_metadata.file_type().is_symlink() || !version_metadata.is_dir() {
+        return Err(invalid_receipt(
+            name,
+            &version_dir,
+            "release directory is not a real directory",
+        ));
+    }
+    let receipt_path = version_dir.join(RECEIPT_FILE);
+    let receipt_bytes = read_regular_file_capped(name, &receipt_path, 2 * 1024 * 1024).await?;
+    let marker: ReceiptSourceMarker = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    if marker.source.as_deref() != Some("github") {
+        return Ok(None);
+    }
+    verify_repository_active(name, &active, &version_dir, &receipt_path, &receipt_bytes).await?;
+    let receipt: RepositoryReceipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| invalid_receipt(name, &receipt_path, error.to_string()))?;
+    Ok(Some(receipt))
 }
 
 pub(crate) async fn open_verified_executable(
@@ -1638,7 +1834,7 @@ pub(crate) fn normalize_digest(
     Ok(digest.to_ascii_lowercase())
 }
 
-async fn ensure_directory(plugin: &str, path: &Path) -> Result<(), InstallError> {
+pub(crate) async fn ensure_directory(plugin: &str, path: &Path) -> Result<(), InstallError> {
     let result = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             Err(InstallError::Io {
@@ -1763,7 +1959,7 @@ async fn read_regular_file_capped(
     Ok(bytes)
 }
 
-async fn hash_regular_file_capped(
+pub(crate) async fn hash_regular_file_capped(
     plugin: &str,
     path: &Path,
     limit: u64,
@@ -1858,6 +2054,124 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn repository_receipt_survives_restart_without_registry_and_detects_tampering() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(repository_source(temp.path(), "not-installed")
+            .await
+            .expect("query absent plugin")
+            .is_none());
+        let binary = temp.path().join("built-plugin");
+        tokio::fs::write(&binary, b"fixture executable")
+            .await
+            .expect("write binary");
+        let name = "fixture-plugin";
+        let digest = hex::encode(Sha256::digest(b"fixture executable"));
+        let receipt = RepositoryReceipt {
+            source: "github".into(),
+            repository: "https://github.com/example/plugin".into(),
+            ref_name: "main".into(),
+            commit: "a".repeat(40),
+            builder: crate::repository::BUILDER_IMAGE.into(),
+            plugin_name: name.into(),
+            version: "1.0.0".into(),
+            platform: platform_target().expect("platform"),
+            sha256: digest.clone(),
+        };
+        let candidate = PluginInstaller::prepare_repository(temp.path(), receipt, &binary)
+            .await
+            .expect("prepare repository release");
+        open_verified_executable(name, temp.path(), &candidate.binary_path, &digest)
+            .await
+            .expect("staged repository binary must satisfy verified launcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&candidate.binary_path)
+                    .expect("staged executable")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500,
+                "repository executable must meet verified-launcher mode"
+            );
+        }
+        let (installer, config) = installer(
+            "http://127.0.0.1/plugin",
+            &SigningKey::from_bytes(&[42; 32]),
+        );
+        installer
+            .activate(&candidate)
+            .await
+            .expect("activate release");
+        let discovered = discover_active(temp.path(), &config).await;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].as_ref().expect("valid local receipt").sha256,
+            digest
+        );
+        let source = repository_source(temp.path(), name)
+            .await
+            .expect("read source")
+            .expect("repository receipt");
+        assert_eq!(source.ref_name, "main");
+        assert_eq!(source.commit, "a".repeat(40));
+        #[cfg(unix)]
+        tokio::fs::set_permissions(
+            &candidate.binary_path,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await
+        .expect("make fixture writable for tampering");
+        tokio::fs::write(&candidate.binary_path, b"tampered executable")
+            .await
+            .expect("tamper binary");
+        #[cfg(unix)]
+        tokio::fs::set_permissions(
+            &candidate.binary_path,
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .await
+        .expect("restore strict mode after tampering");
+        let discovered = discover_active(temp.path(), &config).await;
+        assert!(matches!(
+            &discovered[0],
+            Err(InstallError::DigestMismatch { .. })
+        ));
+        #[cfg(unix)]
+        tokio::fs::set_permissions(
+            &candidate.binary_path,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await
+        .expect("make fixture writable for restoration");
+        tokio::fs::write(&candidate.binary_path, b"fixture executable")
+            .await
+            .expect("restore binary");
+        let receipt_path = candidate
+            .plugin_root
+            .join(&candidate.install_directory)
+            .join(RECEIPT_FILE);
+        let mut source: RepositoryReceipt =
+            serde_json::from_slice(&tokio::fs::read(&receipt_path).await.expect("read receipt"))
+                .expect("parse receipt");
+        source.builder = "oven/bun@sha256:invalid".into();
+        tokio::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&source).expect("serialize receipt"),
+        )
+        .await
+        .expect("tamper receipt");
+        let discovered = discover_active(temp.path(), &config).await;
+        assert!(matches!(
+            &discovered[0],
+            Err(InstallError::InvalidReceipt { .. })
+        ));
+    }
 
     async fn serve_once(status: &str, headers: &[(&str, String)], body: Vec<u8>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

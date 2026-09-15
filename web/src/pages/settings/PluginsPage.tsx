@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type {
-  RegistryPlugin,
-  ReloadFailureResponse,
-} from '@/api/client/types.gen'
+import type { ReloadFailureResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -16,6 +13,11 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   AlertDialog,
   AlertDialogContent,
@@ -29,8 +31,6 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  useInstallPlugin,
-  usePluginCatalog,
   usePlugins,
   useReloadPlugins,
   useUninstallPlugin,
@@ -38,14 +38,12 @@ import {
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   canManageExternalPlugins,
-  pluginInstallAction,
   pluginReloadFailures,
-  safeRegistryNavigationUrl,
 } from '@/lib/plugin-registry'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   AlertCircle,
-  ExternalLink,
+  ChevronDown,
   Loader2,
   Puzzle,
   RefreshCw,
@@ -53,28 +51,31 @@ import {
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import {
+  RepositoryInstall,
+  type RepositorySelection,
+} from '@/components/plugins/RepositoryInstall'
+import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
+import { RepositoryUpdate } from '@/components/plugins/RepositoryUpdate'
+import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 
 export function PluginsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
   const canManagePlugins = canManageExternalPlugins(user?.role)
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
-  const {
-    data: catalog,
-    isLoading: catalogLoading,
-    error: catalogError,
-  } = usePluginCatalog(canManagePlugins)
-  const installPlugin = useInstallPlugin()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
+  const [catalogSelection, setCatalogSelection] =
+    useState<RepositorySelection | null>(null)
+  const [repositoryInstalling, setRepositoryInstalling] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const managementPending =
-    installPlugin.isPending ||
-    reloadPlugins.isPending ||
-    uninstallPlugin.isPending
+    reloadPlugins.isPending || uninstallPlugin.isPending || repositoryInstalling
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -102,20 +103,6 @@ export function PluginsPage() {
       setReloadFailures(pluginReloadFailures(error))
       toast.error(
         sensitiveActionErrorMessage(error, 'Failed to reload plugins.')
-      )
-    }
-  }
-
-  const handleInstall = async (name: string) => {
-    try {
-      const result = await installPlugin.mutateAsync(name)
-      toast.success(result.message)
-    } catch (error) {
-      if (handleSensitiveActionError(error, () => void handleInstall(name))) {
-        return
-      }
-      toast.error(
-        sensitiveActionErrorMessage(error, `Failed to install ${name}.`)
       )
     }
   }
@@ -176,11 +163,9 @@ export function PluginsPage() {
         <CardHeader>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <CardTitle>External Plugins</CardTitle>
+              <CardTitle>Plugins</CardTitle>
               <CardDescription>
-                {canManagePlugins
-                  ? 'Install signed, platform-specific releases from the trusted Temps registry.'
-                  : 'View verified external plugins currently running in Temps.'}
+                Discover plugins for your Temps instance.
               </CardDescription>
             </div>
             {canManagePlugins && (
@@ -220,19 +205,22 @@ export function PluginsPage() {
               </AlertDescription>
             </Alert>
           )}
-          {canManagePlugins && (
-            <RegistryCatalog
-              catalog={catalog}
-              error={catalogError}
-              isLoading={catalogLoading}
-              installedVersions={
-                new Map(plugins.map((plugin) => [plugin.name, plugin.version]))
-              }
-              installingName={
-                installPlugin.isPending ? installPlugin.variables : undefined
-              }
-              onInstall={(name) => void handleInstall(name)}
-              managementPending={managementPending}
+          <RepositoryCatalog
+            canInstall={canManagePlugins}
+            disabled={managementPending}
+            installedNames={plugins.map((plugin) => plugin.name)}
+            onSelect={(plugin) => {
+              setAdvancedOpen(false)
+              setCatalogSelection(plugin)
+            }}
+          />
+          {canManagePlugins && catalogSelection && (
+            <RepositoryInstall
+              disabled={managementPending}
+              onSensitiveError={handleSensitiveActionError}
+              selection={catalogSelection}
+              onClearSelection={() => setCatalogSelection(null)}
+              onPendingChange={setRepositoryInstalling}
             />
           )}
 
@@ -246,7 +234,7 @@ export function PluginsPage() {
                   Running
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Verified plugins currently loaded by Temps.
+                  Plugins currently loaded by Temps.
                 </p>
               </div>
               <span className="shrink-0 text-sm text-muted-foreground">
@@ -259,12 +247,10 @@ export function PluginsPage() {
             ) : plugins.length === 0 ? (
               <div className="rounded-lg border border-dashed px-4 py-8 text-center">
                 <Puzzle className="mx-auto size-5 text-muted-foreground" />
-                <p className="mt-3 font-medium">
-                  No verified plugins are running.
-                </p>
+                <p className="mt-3 font-medium">No plugins are running.</p>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {canManagePlugins
-                    ? 'Install a registry release above to add one.'
+                    ? 'Choose a plugin from the catalog to get started.'
                     : 'Ask a system administrator to install one.'}
                 </p>
               </div>
@@ -290,8 +276,16 @@ export function PluginsPage() {
                           {plugin.description}
                         </p>
                       )}
+                      <PluginNavigationHint nav={plugin.nav} />
                     </div>
                     <div className="flex items-center gap-2">
+                      {canManagePlugins && (
+                        <RepositoryUpdate
+                          name={plugin.name}
+                          disabled={managementPending}
+                          onSensitiveError={handleSensitiveActionError}
+                        />
+                      )}
                       {plugin.nav.some(
                         (entry) => entry.section !== 'project'
                       ) && (
@@ -315,196 +309,40 @@ export function PluginsPage() {
               </div>
             )}
           </section>
+          {canManagePlugins && !catalogSelection && (
+            <Collapsible
+              open={advancedOpen}
+              onOpenChange={(open) => {
+                if (!managementPending) setAdvancedOpen(open)
+              }}
+              className="border-t pt-4"
+            >
+              <CollapsibleTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={managementPending}
+                  className="group gap-2"
+                >
+                  Advanced
+                  <ChevronDown
+                    aria-hidden="true"
+                    className="size-4 shrink-0 transition-transform group-data-[state=open]:rotate-180"
+                  />
+                </Button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="pt-4">
+                <RepositoryInstall
+                  disabled={managementPending}
+                  onSensitiveError={handleSensitiveActionError}
+                  onPendingChange={setRepositoryInstalling}
+                />
+              </CollapsibleContent>
+            </Collapsible>
+          )}
         </CardContent>
       </Card>
-    </div>
-  )
-}
-
-interface RegistryCatalogProps {
-  managementPending: boolean
-  catalog?: {
-    available: boolean
-    plugins: RegistryPlugin[]
-    reason?: string | null
-    source: string
-  }
-  error: Error | null
-  installedVersions: Map<string, string>
-  installingName?: string
-  isLoading: boolean
-  onInstall: (name: string) => void
-}
-
-function RegistryCatalog({
-  managementPending,
-  catalog,
-  error,
-  installedVersions,
-  installingName,
-  isLoading,
-  onInstall,
-}: RegistryCatalogProps) {
-  return (
-    <section className="space-y-3" aria-labelledby="plugin-registry-title">
-      <div className="flex flex-col gap-2 border-b pb-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 id="plugin-registry-title" className="font-semibold">
-            Registry
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Only releases supporting this server’s platform are shown. Downloads
-            are hash-verified and installed atomically.
-          </p>
-        </div>
-        <a
-          href="https://temps.sh/docs/plugins"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
-        >
-          Plugin documentation
-          <ExternalLink className="size-3.5" />
-        </a>
-      </div>
-
-      {isLoading ? (
-        <CatalogSkeleton />
-      ) : error ? (
-        <Alert variant="destructive">
-          <AlertCircle className="size-4" />
-          <AlertTitle>Could not load the plugin registry</AlertTitle>
-          <AlertDescription>
-            {sensitiveActionErrorMessage(error, 'Try again in a moment.')}
-          </AlertDescription>
-        </Alert>
-      ) : catalog?.available === false ? (
-        <Alert>
-          <AlertCircle className="size-4" />
-          <AlertTitle>Plugin registry is not configured</AlertTitle>
-          <AlertDescription>
-            {catalog.reason ||
-              'Configure the registry URL and trusted signing key, then restart Temps.'}
-          </AlertDescription>
-        </Alert>
-      ) : catalog?.plugins.length === 0 ? (
-        <div className="rounded-lg border border-dashed px-4 py-8 text-center">
-          <Puzzle className="mx-auto size-5 text-muted-foreground" />
-          <p className="mt-3 font-medium">
-            No published plugins support this server’s platform yet.
-          </p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Compatible releases will appear here when they are published.
-          </p>
-        </div>
-      ) : (
-        <div className="@container">
-          <div className="grid gap-3 @2xl:grid-cols-2">
-            {catalog?.plugins.map((plugin) => (
-              <RegistryPluginCard
-                key={plugin.name}
-                plugin={plugin}
-                installedVersion={installedVersions.get(plugin.name)}
-                installing={installingName === plugin.name}
-                installDisabled={managementPending}
-                onInstall={onInstall}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
-  )
-}
-
-interface RegistryPluginCardProps {
-  installDisabled: boolean
-  installedVersion?: string
-  installing: boolean
-  onInstall: (name: string) => void
-  plugin: RegistryPlugin
-}
-
-function RegistryPluginCard({
-  installDisabled,
-  installedVersion,
-  installing,
-  onInstall,
-  plugin,
-}: RegistryPluginCardProps) {
-  const repositoryUrl = safeRegistryNavigationUrl(plugin.repository)
-  const action = pluginInstallAction(installedVersion, plugin.version)
-  const installed = action === 'installed'
-  let actionLabel = action === 'upgrade' ? 'Upgrade' : 'Install'
-  if (installed) actionLabel = 'Installed'
-  if (installing)
-    actionLabel = action === 'upgrade' ? 'Upgrading' : 'Installing'
-
-  return (
-    <article className="flex min-h-44 flex-col rounded-lg border p-4 transition-colors hover:bg-muted/30">
-      <div className="flex min-w-0 items-start gap-3">
-        <Puzzle className="mt-1 size-5 shrink-0 text-muted-foreground" />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="font-semibold">{plugin.title}</h3>
-            <Badge variant="secondary">v{plugin.version}</Badge>
-            <Badge variant="outline">{plugin.category}</Badge>
-          </div>
-          <p className="mt-1 font-mono text-sm text-muted-foreground">
-            {plugin.name}
-          </p>
-        </div>
-      </div>
-
-      <p className="mt-3 flex-1 text-sm text-muted-foreground">
-        {plugin.summary}
-      </p>
-
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-3">
-        <span className="text-sm text-muted-foreground">
-          By {plugin.author}
-        </span>
-        <div className="flex items-center gap-2">
-          {repositoryUrl && (
-            <Button asChild variant="ghost" size="sm">
-              <a href={repositoryUrl} target="_blank" rel="noopener noreferrer">
-                Source
-                <ExternalLink className="size-3.5" />
-              </a>
-            </Button>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={installed || installDisabled}
-            onClick={() => onInstall(plugin.name)}
-          >
-            {installing && <Loader2 className="size-4 animate-spin" />}
-            {actionLabel}
-          </Button>
-        </div>
-      </div>
-    </article>
-  )
-}
-
-function CatalogSkeleton() {
-  return (
-    <div className="grid gap-3 lg:grid-cols-2" aria-hidden="true">
-      {[0, 1].map((item) => (
-        <div key={item} className="space-y-4 rounded-lg border p-4">
-          <div className="flex items-center gap-3">
-            <Skeleton className="size-9" />
-            <div className="flex-1 space-y-2">
-              <Skeleton className="h-4 w-36" />
-              <Skeleton className="h-3 w-24" />
-            </div>
-          </div>
-          <Skeleton className="h-4 w-full" />
-          <Skeleton className="h-4 w-3/4" />
-        </div>
-      ))}
     </div>
   )
 }

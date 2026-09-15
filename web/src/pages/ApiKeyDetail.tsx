@@ -155,7 +155,7 @@ export default function ApiKeyDetail() {
 
   if (isLoading) {
     return (
-      <div className="w-full">
+      <div className="w-full min-w-0 space-y-6">
         <div className="text-center py-8">Loading API key details...</div>
       </div>
     )
@@ -167,7 +167,7 @@ export default function ApiKeyDetail() {
 
   if (!apiKey && apiKeyError && !isNotFound) {
     return (
-      <div className="w-full">
+      <div className="w-full min-w-0 space-y-6">
         <div className="flex flex-col items-center justify-center gap-4 py-8 text-center">
           <AlertCircle className="h-8 w-8 text-destructive" />
           <div>
@@ -195,7 +195,7 @@ export default function ApiKeyDetail() {
 
   if (!apiKey) {
     return (
-      <div className="w-full">
+      <div className="w-full min-w-0 space-y-6">
         <div className="text-center py-8">
           <p>API key not found</p>
           <Button onClick={() => navigate('/settings/keys')} className="mt-4">
@@ -207,15 +207,22 @@ export default function ApiKeyDetail() {
   }
 
   return (
-    <div className="w-full space-y-6">
+    <div className="w-full min-w-0 space-y-6">
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">
-          <Button variant="ghost" size="icon" className="shrink-0" onClick={() => navigate('/settings/keys')}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="shrink-0"
+            onClick={() => navigate('/settings/keys')}
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="min-w-0">
-            <h1 className="text-2xl sm:text-3xl font-bold truncate">{apiKey.name}</h1>
+            <h1 className="truncate text-2xl font-semibold tracking-tight">
+              {apiKey.name}
+            </h1>
             <p className="text-muted-foreground mt-1">
               API key details and permissions
             </p>
@@ -342,7 +349,8 @@ export default function ApiKeyDetail() {
           <div>
             <Label className="text-muted-foreground">Permissions</Label>
             <p className="text-xs text-muted-foreground mt-1 mb-2">
-              Permissions cannot be changed after creation. To change permissions, delete this key and create a new one.
+              Permissions cannot be changed after creation. To change
+              permissions, delete this key and create a new one.
             </p>
             <PermissionsDisplay
               permissions={

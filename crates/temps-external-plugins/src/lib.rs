@@ -21,7 +21,10 @@ pub mod install;
 pub mod manager;
 pub mod plugin;
 pub mod proxy;
+pub mod reporting;
+pub mod repository;
 pub mod service;
+pub mod source_catalog;
 pub mod trust;
 
 pub use channel::PluginChannel;

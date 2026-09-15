@@ -185,7 +185,7 @@ export function NotificationRouteForm() {
     (isEditing && (!Number.isInteger(routeId) || routeId <= 0))
   ) {
     return (
-      <div className="w-full">
+      <div className="w-full min-w-0 space-y-6">
         <EmptyState
           icon={RouteIcon}
           title="Notification route not found"
@@ -198,14 +198,14 @@ export function NotificationRouteForm() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="w-full space-y-6">
+      <div className="w-full min-w-0 space-y-6">
         <div className="space-y-4">
           <Button variant="ghost" className="-ml-3" onClick={returnToRoutes}>
             <ArrowLeft className="mr-2 h-4 w-4" />
             Back to Routes
           </Button>
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">
+            <h1 className="text-2xl font-semibold tracking-tight">
               {isEditing
                 ? 'Edit Notification Route'
                 : 'Create Notification Route'}

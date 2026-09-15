@@ -142,7 +142,7 @@ export function UserDetail() {
 
   if (!Number.isFinite(parsedId)) {
     return (
-      <div className="p-6">
+      <div className="w-full min-w-0 space-y-6">
         <EmptyState
           icon={ScrollText}
           title="Invalid user"
@@ -206,7 +206,7 @@ export function UserDetail() {
               </Avatar>
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate text-xl font-semibold">
+                  <h1 className="truncate text-2xl font-semibold tracking-tight">
                     {target.user.name || target.user.username}
                   </h1>
                   {Array.from(

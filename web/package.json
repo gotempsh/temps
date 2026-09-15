@@ -120,6 +120,7 @@
     "@types/react-simple-maps": "^3.0.6",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
     "@typescript-eslint/parser": "^8.70.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.10.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.6",
@@ -128,7 +129,7 @@
     "eslint-plugin-react-refresh": "^0.5.6",
     "eslint-plugin-unused-imports": "^4.4.1",
     "prettier": "^3.9.6",
-    "typescript": "^5.9.2",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.70.0"
   },
   "overrides": {

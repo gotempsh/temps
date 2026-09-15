@@ -55,6 +55,9 @@ pub enum AgentError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    #[error("Cannot locally rebuild immutable sandbox image '{image}'; choose a mutable tag before rebuilding")]
+    ImmutableSandboxImageRebuild { image: String },
+
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
 
