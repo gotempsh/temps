@@ -26,7 +26,7 @@ pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::{AgentSandboxSettings, AppSettings, PublicHostnameStrategy};
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
@@ -84,6 +84,9 @@ pub enum ConfigServiceError {
 
     #[error("Invalid configuration: {details}")]
     InvalidConfiguration { details: String },
+
+    #[error("Settings section '{section}' is malformed")]
+    MalformedSettingsSection { section: &'static str },
 
     #[error("Cluster CA is not initialized")]
     ClusterCaNotInitialized,
@@ -975,6 +978,24 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.cache_settings_if_current(generation, settings.clone())
             .await;
         Ok(settings)
+    }
+
+    /// Load only the AI sandbox section from the authoritative settings row.
+    /// This deliberately bypasses whole-document decoding and its cache: an
+    /// unrelated malformed section must neither hide valid provider settings
+    /// nor cause stale credentials to be returned.
+    pub async fn get_agent_sandbox_settings(
+        &self,
+    ) -> Result<AgentSandboxSettings, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(value) = record.and_then(|row| row.data.get("agent_sandbox").cloned()) else {
+            return Ok(AgentSandboxSettings::default());
+        };
+        serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
+            section: "agent_sandbox",
+        })
     }
 
     async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
@@ -2044,6 +2065,93 @@ mod tests {
             data: s.to_json(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_getter_ignores_malformed_unrelated_settings() {
+        let mut row = settings_row("example.test");
+        let mut sandbox = AgentSandboxSettings::default();
+        sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("encrypted-test-token".into()),
+                ..Default::default()
+            },
+        );
+        row.data["agent_sandbox"] = serde_json::to_value(sandbox).expect("sandbox JSON");
+        row.data["preview_domain"] = serde_json::json!(false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let loaded = service
+            .get_agent_sandbox_settings()
+            .await
+            .expect("valid scoped settings");
+
+        assert_eq!(
+            loaded
+                .provider_config("codex_cli")
+                .credentials_encrypted
+                .as_deref(),
+            Some("encrypted-test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_getter_rejects_a_malformed_present_section() {
+        let mut row = settings_row("example.test");
+        row.data["agent_sandbox"] = serde_json::json!("malformed-secret-must-not-leak");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let error = service
+            .get_agent_sandbox_settings()
+            .await
+            .expect_err("malformed section");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection {
+                section: "agent_sandbox"
+            }
+        ));
+        assert!(!error.to_string().contains("malformed-secret"));
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_getter_defaults_only_when_row_or_section_is_absent() {
+        let row_without_section = settings::Model {
+            id: 1,
+            data: serde_json::json!({"unrelated": true}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        for rows in [vec![], vec![row_without_section]] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([rows])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db);
+            let loaded = service
+                .get_agent_sandbox_settings()
+                .await
+                .expect("absent section default");
+            assert!(loaded.providers.is_empty());
+            assert_eq!(
+                loaded.default_provider,
+                AgentSandboxSettings::default().default_provider
+            );
         }
     }
 

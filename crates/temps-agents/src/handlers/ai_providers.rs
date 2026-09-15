@@ -1730,9 +1730,8 @@ async fn load_agent_sandbox(
     config_service: &temps_config::ConfigService,
 ) -> Result<temps_core::AgentSandboxSettings, Problem> {
     config_service
-        .get_settings()
+        .get_agent_sandbox_settings()
         .await
-        .map(|settings| settings.agent_sandbox)
         .map_err(|error| {
             tracing::error!(error_kind = ?std::mem::discriminant(&error), "AI provider settings read failed");
             problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
