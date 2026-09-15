@@ -10,7 +10,7 @@ test('preflight is non-billable; smoke requires consent and reports failures com
   page.on('pageerror', (error) => pageErrors.push(error.message))
   const provider = {
     id: 'codex_cli',
-    name: 'Codex (OpenAI)',
+    name: 'Test AI provider',
     install_command: 'install',
     auth_command: 'login',
     auth_flavors: [

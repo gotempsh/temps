@@ -25,7 +25,6 @@ use axum::{
     routing::{get, patch, post},
     Extension, Json, Router,
 };
-use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
@@ -502,7 +501,7 @@ pub async fn run_ai_provider_smoke(
             message: "Explicit consent is required because the smoke test makes a potentially billable model request".into(),
         }));
     }
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let config = sandbox.provider_config(&provider_id);
     let Some(encrypted) = config.credentials_encrypted.as_ref() else {
         let checks = vec![temps_ai::HarnessCheck {
@@ -583,7 +582,7 @@ pub async fn list_ai_providers(
     let sandbox = if query.catalog_only {
         temps_core::AgentSandboxSettings::default()
     } else {
-        load_agent_sandbox(&app_state).await?
+        load_agent_sandbox(app_state.platform_config_service.as_ref()).await?
     };
 
     let ai_service = app_state.ai_service.clone();
@@ -676,7 +675,7 @@ pub async fn refresh_ai_provider_models(
             .with_title("AI provider refresh unavailable")
             .with_detail("The AI provider service is not configured on this Temps instance.")
     })?;
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let provider_config = sandbox.provider_config(&provider_id);
     let workspace_discovery = uses_workspace_model_discovery(provider, &provider_config);
     if workspace_discovery {
@@ -1156,7 +1155,7 @@ pub async fn save_ai_provider_credential(
     )
     .await;
 
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let provider_dto =
         provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(SaveCredentialResponse {
@@ -1271,7 +1270,7 @@ pub async fn import_local_ai_provider_credential(
     )
     .await;
 
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let provider_dto =
         provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(ImportLocalCredentialResponse {
@@ -1320,7 +1319,7 @@ pub async fn verify_saved_ai_provider_credential(
             message: format!("Unknown AI provider '{provider_id}'"),
         })
     })?;
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let config = sandbox.provider_config(&provider_id);
     let encrypted = config.credentials_encrypted.as_ref().ok_or_else(|| {
         problemdetails::new(StatusCode::NOT_FOUND)
@@ -1375,7 +1374,7 @@ pub async fn verify_saved_ai_provider_credential(
         "verify-saved",
     )
     .await;
-    let sandbox = load_agent_sandbox(&app_state).await?;
+    let sandbox = load_agent_sandbox(app_state.platform_config_service.as_ref()).await?;
     let provider_dto =
         provider_catalog_dto(provider, sandbox.provider_config(&provider_id), None, None).await;
     Ok(Json(SaveCredentialResponse {
@@ -1728,20 +1727,18 @@ pub async fn update_ai_provider(
 /// `provider_config()` and `default_provider` work correctly. Returns the
 /// default settings when no row exists yet.
 async fn load_agent_sandbox(
-    app_state: &Arc<AppState>,
+    config_service: &temps_config::ConfigService,
 ) -> Result<temps_core::AgentSandboxSettings, Problem> {
-    let record = temps_entities::settings::Entity::find_by_id(1)
-        .one(app_state.db.as_ref())
+    config_service
+        .get_settings()
         .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
-
-    let sandbox = record
-        .as_ref()
-        .and_then(|r| r.data.get("agent_sandbox"))
-        .and_then(|v| serde_json::from_value::<temps_core::AgentSandboxSettings>(v.clone()).ok())
-        .unwrap_or_default();
-
-    Ok(sandbox)
+        .map(|settings| settings.agent_sandbox)
+        .map_err(|error| {
+            tracing::error!(error_kind = ?std::mem::discriminant(&error), "AI provider settings read failed");
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("AI provider settings unavailable")
+                .with_detail("Temps could not read AI provider settings. Retry or contact your Temps administrator.")
+        })
 }
 
 fn runtime_model_capability(
@@ -1988,6 +1985,53 @@ mod tests {
             )
             .expect("valid test server config"),
         )
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_settings_are_loaded_through_typed_config_service() {
+        let row = provider_settings_row("encrypted-test-token");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = temps_config::ConfigService::new(provider_test_server_config(), db);
+
+        let sandbox = load_agent_sandbox(&service)
+            .await
+            .expect("typed agent sandbox settings");
+
+        let provider = sandbox.provider_config("claude_cli");
+        assert_eq!(provider.auth_type, "subscription");
+        assert_eq!(
+            provider.credentials_encrypted.as_deref(),
+            Some("encrypted-test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_settings_read_failure_returns_sanitized_unavailable_problem() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "database-secret-must-never-leak".into(),
+                )])
+                .into_connection(),
+        );
+        let service = temps_config::ConfigService::new(provider_test_server_config(), db);
+
+        let response = load_agent_sandbox(&service)
+            .await
+            .expect_err("settings read must fail")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("problem body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 problem body");
+        assert!(body.contains("AI provider settings unavailable"));
+        assert!(!body.contains("database-secret-must-never-leak"));
     }
 
     #[tokio::test]
