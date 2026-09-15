@@ -234,7 +234,7 @@ export function PluginsPage() {
                   Running
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Plugins currently loaded by Temps.
+                  Verified plugins currently loaded by Temps.
                 </p>
               </div>
               <span className="shrink-0 text-sm text-muted-foreground">
@@ -247,7 +247,9 @@ export function PluginsPage() {
             ) : plugins.length === 0 ? (
               <div className="rounded-lg border border-dashed px-4 py-8 text-center">
                 <Puzzle className="mx-auto size-5 text-muted-foreground" />
-                <p className="mt-3 font-medium">No plugins are running.</p>
+                <p className="mt-3 font-medium">
+                  No verified plugins are running.
+                </p>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {canManagePlugins
                     ? 'Choose a plugin from the catalog to get started.'
