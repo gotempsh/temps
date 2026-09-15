@@ -7,26 +7,6 @@
 
 use std::{net::IpAddr, sync::Arc};
 
-/// Reject path spellings an upstream may parse differently from the policy
-/// evaluator. Both live enforcement and simulation must call this function.
-pub fn ambiguous_policy_path(path: &str) -> bool {
-    if path.contains('\\')
-        || path.contains("//")
-        || path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    {
-        return true;
-    }
-    path.as_bytes().windows(3).any(|part| {
-        part[0] == b'%'
-            && matches!(
-                (part[1].to_ascii_lowercase(), part[2].to_ascii_lowercase()),
-                (b'2', b'f' | b'e' | b'5') | (b'5', b'c')
-            )
-    })
-}
-
 /// Borrowed request facts after route and trusted client IP resolution.
 pub struct RequestPolicyContext<'a> {
     pub path: &'a str,
@@ -132,18 +112,6 @@ impl RequestPolicyGate for RequestPolicyGateSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejects_ambiguous_path_spellings() {
-        for path in [
-            "/a//b", "/a/../b", "/a/./b", "/a%2fb", "/a%2Fb", "/a%5cb", "/a%2eb", "/a%25b", "/a\\b",
-        ] {
-            assert!(ambiguous_policy_path(path), "{path}");
-        }
-        for path in ["/a/b", "/a-b", "/a%20b", "/a.b", "/a/%E2%82%AC"] {
-            assert!(!ambiguous_policy_path(path), "{path}");
-        }
-    }
 
     struct DenyAll;
     impl RequestPolicyGate for DenyAll {

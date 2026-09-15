@@ -4608,26 +4608,6 @@ impl ProxyHttp for LoadBalancer {
                 client_ip: parsed_ip,
             };
             let decision = self.request_policy_gate.evaluate(&policy_context);
-            if matches!(decision, temps_core::RequestPolicyDecision::Allow { .. })
-                && temps_core::request_policy_gate::ambiguous_policy_path(&ctx.path)
-            {
-                warn!(
-                    project_id = project_ctx.project.id,
-                    environment_id = project_ctx.environment.id,
-                    "Request denied because the path is ambiguous under project policy"
-                );
-                let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session
-                    .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                    .await?;
-                ctx.routing_status = "request_policy_ambiguous_path".to_string();
-                return Ok(true);
-            }
             let ip_restricted = legacy_ip_gate_denies(
                 decision,
                 self.project_ip_gate.as_ref(),
@@ -4635,21 +4615,6 @@ impl ProxyHttp for LoadBalancer {
                 project_ctx.environment.id,
                 parsed_ip,
             );
-            if let temps_core::RequestPolicyDecision::Deny {
-                reason,
-                rule_id,
-                revision,
-            } = decision
-            {
-                warn!(
-                    project_id = project_ctx.project.id,
-                    environment_id = project_ctx.environment.id,
-                    reason,
-                    rule_id,
-                    revision,
-                    "Request denied by project policy"
-                );
-            }
             if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
                 warn!(
                     project_id = project_ctx.project.id,
@@ -4671,12 +4636,26 @@ impl ProxyHttp for LoadBalancer {
                 return Ok(true);
             }
             if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
-                warn!(
-                    environment_id = project_ctx.environment.id,
-                    project_id = project_ctx.project.id,
-                    ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                    "Request denied by project IP restriction"
-                );
+                match decision {
+                    temps_core::RequestPolicyDecision::Deny {
+                        reason,
+                        rule_id,
+                        revision,
+                    } => warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        reason,
+                        rule_id,
+                        revision,
+                        "Request denied by project policy"
+                    ),
+                    _ => warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        "Request denied by project IP restriction"
+                    ),
+                }
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
                 response.insert_header("X-Request-ID", &ctx.request_id)?;
@@ -4687,7 +4666,13 @@ impl ProxyHttp for LoadBalancer {
                 session
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
-                ctx.routing_status = "project_ip_restricted".to_string();
+                ctx.routing_status =
+                    if matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
+                        "request_policy_denied"
+                    } else {
+                        "project_ip_restricted"
+                    }
+                    .to_string();
                 return Ok(true);
             }
 
