@@ -8,6 +8,11 @@
 use std::{net::IpAddr, sync::Arc};
 
 /// Borrowed request facts after route and trusted client IP resolution.
+///
+/// `path` is the URI path exactly as parsed from the incoming request header:
+/// the query is excluded, and percent escapes, dot segments, repeated slashes,
+/// and backslashes are not decoded or normalized. The proxy does not rewrite
+/// that request-header path after evaluation before forwarding it upstream.
 pub struct RequestPolicyContext<'a> {
     pub path: &'a str,
     pub method: &'a str,
@@ -19,6 +24,9 @@ pub struct RequestPolicyContext<'a> {
 
 /// `Continue` delegates to the legacy project IP gate. `Allow` means the
 /// installed policy owns project access, including migrated IP restrictions.
+/// A provider returning `Allow` for a path-based policy is responsible for
+/// interpreting [`RequestPolicyContext::path`] exactly as its protected
+/// upstream does, and for rejecting ambiguous spellings before allowing them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPolicyDecision {
     Continue,
@@ -37,6 +45,10 @@ pub enum RequestPolicyDecision {
 }
 
 pub trait RequestPolicyGate: Send + Sync {
+    /// Evaluate the exact request facts supplied by the proxy.
+    ///
+    /// Implementations must apply any normalization or ambiguity rejection
+    /// required by their own path policy before returning `Allow`.
     fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision;
 }
 
@@ -124,6 +136,24 @@ mod tests {
         }
     }
 
+    struct RejectRawAmbiguousPath;
+    impl RequestPolicyGate for RejectRawAmbiguousPath {
+        fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
+            if matches!(context.path, "/hook%2fadmin" | "/hook/../admin") {
+                RequestPolicyDecision::Deny {
+                    reason: "ambiguous test path",
+                    rule_id: None,
+                    revision: None,
+                }
+            } else {
+                RequestPolicyDecision::Allow {
+                    rule_id: None,
+                    revision: None,
+                }
+            }
+        }
+    }
+
     #[test]
     fn slot_defaults_to_continue_and_first_registration_wins() {
         let slot = RequestPolicyGateSlot::new_default();
@@ -151,6 +181,27 @@ mod tests {
                 revision: Some(2)
             }
         );
+    }
+
+    #[test]
+    fn slot_preserves_raw_path_for_provider_interpretation() {
+        let slot = RequestPolicyGateSlot::new_default();
+        assert!(slot.set(Arc::new(RejectRawAmbiguousPath)));
+
+        for path in ["/hook%2fadmin", "/hook/../admin"] {
+            let context = RequestPolicyContext {
+                path,
+                method: "POST",
+                host: "example.test",
+                project_id: 1,
+                environment_id: 2,
+                client_ip: None,
+            };
+            assert!(matches!(
+                slot.evaluate(&context),
+                RequestPolicyDecision::Deny { .. }
+            ));
+        }
     }
 
     #[test]
