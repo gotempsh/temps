@@ -1541,6 +1541,23 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_oauth_no_beta_header_adds_required_beta() {
+        let credential = RequestCredential::ClaudeOauthToken("host-token".to_string());
+
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &credential,
+            &HeaderMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(request.headers()[ANTHROPIC_BETA_HEADER], CLAUDE_OAUTH_BETA);
+    }
+
+    #[test]
     fn claude_oauth_deduplicates_the_required_beta() {
         let mut headers = HeaderMap::new();
         headers.append(
@@ -1722,6 +1739,49 @@ mod tests {
         assert!(!models_request
             .headers()
             .contains_key("x-codex-beta-features"));
+    }
+
+    #[test]
+    fn test_apply_forwarded_request_headers_sandbox_auth_not_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sandbox-controlled"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("sandbox-key"));
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("sandbox-account"),
+        );
+
+        let anthropic_request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &RequestCredential::AnthropicApiKey("host-key".to_string()),
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!anthropic_request
+            .headers()
+            .contains_key(header::AUTHORIZATION));
+        assert!(!anthropic_request.headers().contains_key("x-api-key"));
+
+        let codex_request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/responses"),
+            &RelayRequestKind::CodexResponse,
+            &RequestCredential::CodexChatGpt {
+                access_token: "host-token".to_string(),
+                account_id: "host-account".to_string(),
+            },
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!codex_request.headers().contains_key(header::AUTHORIZATION));
+        assert!(!codex_request.headers().contains_key("chatgpt-account-id"));
     }
 
     #[test]
