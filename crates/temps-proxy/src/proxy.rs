@@ -2866,6 +2866,24 @@ fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+fn evaluate_request_policy(
+    gate: &dyn temps_core::RequestPolicyGate,
+    request: &pingora_http::RequestHeader,
+    host: &str,
+    project_id: i32,
+    environment_id: i32,
+    client_ip: Option<std::net::IpAddr>,
+) -> temps_core::RequestPolicyDecision {
+    gate.evaluate(&temps_core::RequestPolicyContext {
+        path: request.uri.path(),
+        method: request.method.as_str(),
+        host,
+        project_id,
+        environment_id,
+        client_ip,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicAuthority {
     host: String,
@@ -4599,15 +4617,14 @@ impl ProxyHttp for LoadBalancer {
                 .as_deref()
                 .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                 .map(normalize_client_ip);
-            let policy_context = temps_core::RequestPolicyContext {
-                path: &ctx.path,
-                method: session.req_header().method.as_str(),
-                host: &ctx.host,
-                project_id: project_ctx.project.id,
-                environment_id: project_ctx.environment.id,
-                client_ip: parsed_ip,
-            };
-            let decision = self.request_policy_gate.evaluate(&policy_context);
+            let decision = evaluate_request_policy(
+                self.request_policy_gate.as_ref(),
+                session.req_header(),
+                &ctx.host,
+                project_ctx.project.id,
+                project_ctx.environment.id,
+                parsed_ip,
+            );
             let ip_restricted = legacy_ip_gate_denies(
                 decision,
                 self.project_ip_gate.as_ref(),
@@ -7835,6 +7852,111 @@ mod ip_restriction_fail_closed_tests {
         let ipv4: IpAddr = "203.0.113.7".parse().unwrap();
         assert_eq!(normalize_client_ip(mapped), ipv4);
         assert_eq!(normalize_client_ip(ipv4), ipv4);
+    }
+}
+
+#[cfg(test)]
+mod request_policy_path_handoff_tests {
+    use super::evaluate_request_policy;
+    use pingora_proxy::Session;
+    use std::sync::{Arc, Mutex};
+    use temps_core::{RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RecordingAllowGate {
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestPolicyGate for RecordingAllowGate {
+        fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
+            assert_eq!(context.method, "POST");
+            assert_eq!(context.host, "app.example.test");
+            assert_eq!(context.project_id, 41);
+            assert_eq!(context.environment_id, 73);
+            assert_eq!(context.client_ip, None);
+            self.paths
+                .lock()
+                .expect("recording gate mutex poisoned")
+                .push(context.path.to_string());
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_preserves_policy_path_spelling_in_upstream_request_target() {
+        let cases = [
+            ("/hook/admin?token=x", "/hook/admin"),
+            ("/hook%2fadmin?token=x", "/hook%2fadmin"),
+            ("/hook%2Fadmin?token=x", "/hook%2Fadmin"),
+            ("/hook/../admin?token=x", "/hook/../admin"),
+            ("/hook//admin?token=x", "/hook//admin"),
+            ("/hook\\admin?token=x", "/hook\\admin"),
+        ];
+
+        for (request_target, expected_policy_path) in cases {
+            let request = format!(
+                "POST {request_target} HTTP/1.1\r\nHost: app.example.test\r\nContent-Length: 0\r\n\r\n"
+            );
+            let (mut downstream_writer, downstream_reader) = tokio::io::duplex(2048);
+            downstream_writer
+                .write_all(request.as_bytes())
+                .await
+                .expect("write raw downstream request");
+
+            let mut session =
+                Session::new_h1(Box::new(downstream_reader) as pingora_core::protocols::Stream);
+            session
+                .read_request()
+                .await
+                .unwrap_or_else(|error| panic!("Pingora rejected {request_target}: {error}"));
+
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let gate = RecordingAllowGate {
+                paths: Arc::clone(&paths),
+            };
+            assert!(matches!(
+                evaluate_request_policy(
+                    &gate,
+                    session.req_header(),
+                    "app.example.test",
+                    41,
+                    73,
+                    None,
+                ),
+                RequestPolicyDecision::Allow { .. }
+            ));
+            assert_eq!(
+                paths
+                    .lock()
+                    .expect("recording gate mutex poisoned")
+                    .as_slice(),
+                [expected_policy_path],
+                "policy path changed for {request_target}"
+            );
+
+            let (upstream_writer, mut upstream_reader) = tokio::io::duplex(2048);
+            let mut upstream = pingora_core::protocols::http::v1::client::HttpSession::new(
+                Box::new(upstream_writer) as pingora_core::protocols::Stream,
+            );
+            upstream
+                .write_request_header(Box::new(session.req_header().clone()))
+                .await
+                .unwrap_or_else(|error| panic!("serialize {request_target} upstream: {error}"));
+
+            let mut serialized = vec![0; request.len() + 256];
+            let bytes_read = upstream_reader
+                .read(&mut serialized)
+                .await
+                .expect("read serialized upstream request");
+            let serialized = String::from_utf8_lossy(&serialized[..bytes_read]);
+            assert!(
+                serialized.starts_with(&format!("POST {request_target} HTTP/1.1\r\n")),
+                "upstream request target changed for {request_target}: {serialized:?}"
+            );
+        }
     }
 }
 
