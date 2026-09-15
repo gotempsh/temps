@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -12,6 +12,7 @@ import {
   formatFileSize,
   installInterruptHandlers,
   killChildOnAbort,
+  reconcileTimedOutImport,
   resolveTimeoutSeconds,
   uploadImageArchive,
   withTemporaryFileCleanup,
@@ -57,15 +58,15 @@ describe('detectLocalPackageManager', () => {
 
   test('detects pnpm, yarn, and bun lockfiles', async () => {
     const pnpmDir = await fixtureDirectory()
-    await writeFile(join(pnpmDir, 'pnpm-lock.yaml'), '')
+    await Bun.write(join(pnpmDir, 'pnpm-lock.yaml'), '')
     expect(detectLocalPackageManager(pnpmDir)).toBe('pnpm')
 
     const yarnDir = await fixtureDirectory()
-    await writeFile(join(yarnDir, 'yarn.lock'), '')
+    await Bun.write(join(yarnDir, 'yarn.lock'), '')
     expect(detectLocalPackageManager(yarnDir)).toBe('yarn')
 
     const bunDir = await fixtureDirectory()
-    await writeFile(join(bunDir, 'bun.lock'), '')
+    await Bun.write(join(bunDir, 'bun.lock'), '')
     expect(detectLocalPackageManager(bunDir)).toBe('bun')
   })
 
@@ -74,9 +75,9 @@ describe('detectLocalPackageManager', () => {
     // can have several lockfiles, and picking the wrong one generates a
     // Dockerfile that installs with the wrong tool.
     const dir = await fixtureDirectory()
-    await writeFile(join(dir, 'package-lock.json'), '')
-    await writeFile(join(dir, 'yarn.lock'), '')
-    await writeFile(join(dir, 'pnpm-lock.yaml'), '')
+    await Bun.write(join(dir, 'package-lock.json'), '')
+    await Bun.write(join(dir, 'yarn.lock'), '')
+    await Bun.write(join(dir, 'pnpm-lock.yaml'), '')
     expect(detectLocalPackageManager(dir)).toBe('pnpm')
   })
 })
@@ -85,7 +86,7 @@ describe('uploadImageArchive', () => {
   test('times out when the upload stops making progress', async () => {
     const directory = await fixtureDirectory()
     const archivePath = join(directory, 'image.tar')
-    await writeFile(archivePath, 'image payload')
+    await Bun.write(archivePath, 'image payload')
 
     const fetchImpl = async (
       _input: string | URL | Request,
@@ -115,7 +116,7 @@ describe('uploadImageArchive', () => {
   test('times out while the server imports an uploaded image', async () => {
     const directory = await fixtureDirectory()
     const archivePath = join(directory, 'image.tar')
-    await writeFile(archivePath, 'image payload')
+    await Bun.write(archivePath, 'image payload')
 
     let waitingForImport = false
     const fetchImpl = async (
@@ -157,7 +158,7 @@ describe('uploadImageArchive', () => {
   test('sends a content length for the streamed multipart request', async () => {
     const directory = await fixtureDirectory()
     const archivePath = join(directory, 'image.tar')
-    await writeFile(archivePath, 'payload')
+    await Bun.write(archivePath, 'payload')
 
     let requestHeaders: Headers | undefined
     let requestBody = new Uint8Array()
@@ -186,11 +187,74 @@ describe('uploadImageArchive', () => {
   })
 })
 
+describe('reconcileTimedOutImport', () => {
+  test('resolves once the lookup finds the deployment for this exact upload attempt', async () => {
+    let calls = 0
+    const lookup: Parameters<typeof reconcileTimedOutImport>[0]['lookup'] = async (path) => {
+      calls += 1
+      expect(path.upload_request_id).toBe('upload-attempt-1')
+      if (calls < 2) return { data: undefined }
+      return { data: { id: 42, slug: 'myapp-7' } }
+    }
+
+    const result = await reconcileTimedOutImport({
+      projectId: 1,
+      environmentId: 2,
+      uploadRequestId: 'upload-attempt-1',
+      delayMs: 0,
+      lookup,
+    })
+
+    expect(result).toEqual({ id: 42, slug: 'myapp-7' })
+    expect(calls).toBe(2)
+  })
+
+  test('gives up after exhausting attempts when no deployment ever appears', async () => {
+    let calls = 0
+    const lookup: Parameters<typeof reconcileTimedOutImport>[0]['lookup'] = async () => {
+      calls += 1
+      return { data: undefined }
+    }
+
+    const result = await reconcileTimedOutImport({
+      projectId: 1,
+      environmentId: 2,
+      uploadRequestId: 'upload-attempt-2',
+      attempts: 3,
+      delayMs: 0,
+      lookup,
+    })
+
+    expect(result).toBeUndefined()
+    expect(calls).toBe(3)
+  })
+
+  test('treats a lookup error on one attempt as a retryable miss, not a failure', async () => {
+    let calls = 0
+    const lookup: Parameters<typeof reconcileTimedOutImport>[0]['lookup'] = async () => {
+      calls += 1
+      if (calls === 1) throw new Error('network unreachable')
+      return { data: { id: 9, slug: 'myapp-9' } }
+    }
+
+    const result = await reconcileTimedOutImport({
+      projectId: 1,
+      environmentId: 2,
+      uploadRequestId: 'upload-attempt-3',
+      delayMs: 0,
+      lookup,
+    })
+
+    expect(result).toEqual({ id: 9, slug: 'myapp-9' })
+    expect(calls).toBe(2)
+  })
+})
+
 describe('withTemporaryFileCleanup', () => {
   test('removes the exported archive when upload fails', async () => {
     const directory = await fixtureDirectory()
     const archivePath = join(directory, 'image.tar')
-    await writeFile(archivePath, 'temporary image')
+    await Bun.write(archivePath, 'temporary image')
 
     await expect(
       withTemporaryFileCleanup(archivePath, async () => {
@@ -198,7 +262,7 @@ describe('withTemporaryFileCleanup', () => {
       })
     ).rejects.toThrow('upload failed')
 
-    await expect(access(archivePath)).rejects.toThrow()
+    expect(await Bun.file(archivePath).exists()).toBe(false)
   })
 })
 
@@ -286,7 +350,7 @@ describe('installInterruptHandlers', () => {
   test('interruption during an operation removes its temporary archive', async () => {
     const directory = await fixtureDirectory()
     const archivePath = join(directory, 'image.tar')
-    await writeFile(archivePath, 'temporary image')
+    await Bun.write(archivePath, 'temporary image')
 
     const controller = new AbortController()
     const remove = installInterruptHandlers(controller)
@@ -298,7 +362,7 @@ describe('installInterruptHandlers', () => {
       })
     ).rejects.toThrow('Local image deployment interrupted by SIGTERM')
 
-    await expect(access(archivePath)).rejects.toThrow()
+    expect(await Bun.file(archivePath).exists()).toBe(false)
     remove()
   })
 })

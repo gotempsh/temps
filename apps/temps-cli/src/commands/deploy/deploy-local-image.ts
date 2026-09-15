@@ -10,7 +10,7 @@ import {
   getProject,
   getEnvironments,
   generatePresetDockerfile,
-  getLastDeployment,
+  getDeploymentByUploadRequestId,
 } from '../../api/sdk.gen.js'
 import type { EnvironmentResponse } from '../../api/types.gen.js'
 import { promptSelect } from '../../ui/prompts.js'
@@ -37,6 +37,7 @@ import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { resolve, basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 interface DeployLocalImageOptions {
   image?: string
@@ -260,56 +261,54 @@ async function resolveUploadedDeployment(
   }
 }
 
-async function getLastDeploymentId(projectId: number): Promise<number | undefined> {
-  try {
-    const { data } = await getLastDeployment({ client, path: { id: projectId } })
-    return data?.id
-  } catch {
-    return undefined
-  }
-}
-
 interface ReconcileTimedOutImportOptions {
   projectId: number
   environmentId: number
-  baselineDeploymentId: number | undefined
-  startedAfter: number
+  uploadRequestId: string
   attempts?: number
   delayMs?: number
+  lookup?: (path: {
+    project_id: number
+    environment_id: number
+    upload_request_id: string
+  }) => Promise<{ data?: { id: number; slug: string } }>
 }
 
 /**
  * A response-import timeout only fires after the full archive has already
  * reached the server, so the server may still finish `docker load` and
  * create a deployment after the CLI gives up waiting. Reporting a bare
- * failure in that case invites a retry that deploys the same image twice
- * (there is no server-side idempotency key). Poll for a deployment that
- * appeared in the target environment after this upload started before
- * deciding the outcome.
+ * failure in that case invites a retry that deploys the same image twice.
+ * Every upload attempt carries a client-generated `uploadRequestId`, which
+ * the server stores on the deployment it creates (or reuses, if this exact
+ * ID already produced one) — poll the server for a deployment tagged with
+ * that exact ID before deciding the outcome, instead of guessing from
+ * timing which is inherently ambiguous when uploads can run concurrently.
  */
-async function reconcileTimedOutImport(
+export async function reconcileTimedOutImport(
   options: ReconcileTimedOutImportOptions
 ): Promise<ResolvedDeployment | undefined> {
   const attempts = options.attempts ?? 4
   const delayMs = options.delayMs ?? 3_000
+  const lookup =
+    options.lookup ??
+    (async (path) => {
+      const { data } = await getDeploymentByUploadRequestId({ client, path })
+      return { data }
+    })
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs))
     }
 
-    const { data } = await getLastDeployment({ client, path: { id: options.projectId } }).catch(
-      () => ({ data: undefined })
-    )
+    const { data } = await lookup({
+      project_id: options.projectId,
+      environment_id: options.environmentId,
+      upload_request_id: options.uploadRequestId,
+    }).catch(() => ({ data: undefined }))
 
-    if (
-      data &&
-      data.environment_id === options.environmentId &&
-      data.id !== options.baselineDeploymentId &&
-      data.created_at >= options.startedAfter
-    ) {
-      return { id: data.id, slug: data.url }
-    }
+    if (data) return { id: data.id, slug: data.slug }
   }
 
   return undefined
@@ -661,7 +660,15 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
       }
       const uploadUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image-upload`
 
+      // Sent with the upload and stored on the resulting deployment so a
+      // lost response (e.g. after `reconcileTimedOutImport`'s wait expires)
+      // can be resolved by exact ID instead of guessing from timing, and so
+      // a literal retry with the same ID reuses that deployment instead of
+      // importing and deploying the image again.
+      const uploadRequestId = randomUUID()
+
       const queryParams = new URLSearchParams()
+      queryParams.set('upload_request_id', uploadRequestId)
       if (options.tag) {
         queryParams.set('tag', options.tag)
       }
@@ -672,17 +679,11 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
         }
         queryParams.set('health_check_path', healthCheckPath)
       }
-      const finalUrl = queryParams.toString()
-        ? `${uploadUrl}?${queryParams.toString()}`
-        : uploadUrl
+      const finalUrl = `${uploadUrl}?${queryParams.toString()}`
 
       const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
 
       let awaitingServerImport = false
-      const uploadStartedAt = Date.now()
-      // Baseline lets the reconciliation check below tell apart a deployment
-      // created by *this* upload from one that already existed.
-      const baselineDeploymentId = await getLastDeploymentId(projectData.id)
 
       let response: Response
       try {
@@ -715,8 +716,7 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
         const reconciled = await reconcileTimedOutImport({
           projectId: projectData.id,
           environmentId: environmentId as number,
-          baselineDeploymentId,
-          startedAfter: uploadStartedAt,
+          uploadRequestId,
         })
 
         if (reconciled) {

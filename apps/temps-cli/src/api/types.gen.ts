@@ -6125,6 +6125,15 @@ export type DeployFromImageUploadQuery = {
      * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
+    /**
+     * Client-generated UUID identifying this upload attempt. When a
+     * deployment already exists for this project, environment, and ID, that
+     * deployment is returned as-is instead of importing and deploying the
+     * image again — this makes a client retry after a lost response safe.
+     * Callers that omit it get no such protection (each call always creates
+     * a new deployment), so the CLI always sends one.
+     */
+    upload_request_id?: string | null;
 };
 
 export type DeployFromStaticRequest = {
@@ -51144,6 +51153,15 @@ export type DeployFromImageUploadData = {
          * Must start with '/'. When omitted, defaults to "/".
          */
         health_check_path?: string | null;
+        /**
+         * Client-generated UUID identifying this upload attempt. When a
+         * deployment already exists for this project, environment, and ID, that
+         * deployment is returned as-is instead of importing and deploying the
+         * image again — this makes a client retry after a lost response safe.
+         * Callers that omit it get no such protection (each call always creates
+         * a new deployment), so the CLI always sends one.
+         */
+        upload_request_id?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
@@ -51183,6 +51201,54 @@ export type DeployFromImageUploadResponses = {
 };
 
 export type DeployFromImageUploadResponse = DeployFromImageUploadResponses[keyof DeployFromImageUploadResponses];
+
+export type GetDeploymentByUploadRequestIdData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * The upload_request_id sent with the original upload request
+         */
+        upload_request_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}';
+};
+
+export type GetDeploymentByUploadRequestIdErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No deployment found yet for this upload attempt
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentByUploadRequestIdResponses = {
+    /**
+     * Deployment produced by this upload attempt
+     */
+    200: RemoteDeploymentResponse;
+};
+
+export type GetDeploymentByUploadRequestIdResponse = GetDeploymentByUploadRequestIdResponses[keyof GetDeploymentByUploadRequestIdResponses];
 
 export type DeployFromUploadedSourceData = {
     body: SourceArchiveUpload;
