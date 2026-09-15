@@ -1689,12 +1689,16 @@ pub async fn deploy_from_image_upload(
     // the archive was fully sent — but the import and deployment creation
     // below actually completed), return that deployment instead of
     // re-importing and deploying the same image a second time.
+    //
+    // This check is an optimization, not the correctness guarantee: two
+    // requests carrying the same upload_request_id can both pass it before
+    // either inserts. The actual guarantee is the database's partial unique
+    // index on (project_id, environment_id, upload_request_id), enforced
+    // when the deployment is inserted below.
     if let Some(ref upload_request_id) = query.upload_request_id {
-        let existing = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::UploadRequestId.eq(upload_request_id.as_str()))
-            .one(state.db.as_ref())
+        let existing = state
+            .deployment_service
+            .find_deployment_by_upload_request_id(project_id, environment_id, upload_request_id)
             .await
             .map_err(|e| {
                 error!("Database error: {}", e);
@@ -1903,15 +1907,63 @@ pub async fn deploy_from_image_upload(
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
+    let deployment = match new_deployment.insert(state.db.as_ref()).await {
+        Ok(deployment) => deployment,
+        // A concurrent request carrying the same upload_request_id won the
+        // race and inserted first — the database's partial unique index
+        // rejects this insert instead of creating a duplicate deployment.
+        // Look up and return the winner's row rather than surfacing an
+        // error for an upload that in fact succeeded.
+        Err(e) if query.upload_request_id.is_some() && crate::services::is_unique_violation(&e) => {
+            let upload_request_id = query.upload_request_id.as_deref().unwrap_or_default();
+            let winner = state
+                .deployment_service
+                .find_deployment_by_upload_request_id(
+                    project_id,
+                    environment_id,
+                    upload_request_id,
+                )
+                .await
+                .map_err(|e| {
+                    error!("Database error: {}", e);
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Database Error")
+                        .with_detail(e.to_string())
+                })?
+                .ok_or_else(|| {
+                    error!(
+                        "Upload request {} hit a unique-constraint violation on insert, but no matching deployment exists",
+                        upload_request_id
+                    );
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Deployment Creation Failed")
+                        .with_detail(e.to_string())
+                })?;
+
+            info!(
+                "Upload request {} lost the insert race to a concurrent request — returning deployment {} instead",
+                upload_request_id, winner.id
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(RemoteDeploymentResponse {
+                    id: winner.id,
+                    project_id: winner.project_id,
+                    environment_id: winner.environment_id,
+                    slug: winner.slug,
+                    state: winner.state,
+                    source_type: "docker_image_upload".to_string(),
+                    created_at: winner.created_at,
+                }),
+            ));
+        }
+        Err(e) => {
             error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+                .with_detail(e.to_string()));
+        }
+    };
 
     info!(
         "Created deployment {} for image upload deployment",
@@ -2069,11 +2121,9 @@ pub async fn get_deployment_by_upload_request_id(
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
 
-    let deployment = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .filter(deployments::Column::EnvironmentId.eq(environment_id))
-        .filter(deployments::Column::UploadRequestId.eq(upload_request_id.as_str()))
-        .one(state.db.as_ref())
+    let deployment = state
+        .deployment_service
+        .find_deployment_by_upload_request_id(project_id, environment_id, &upload_request_id)
         .await
         .map_err(|e| {
             error!("Database error: {}", e);
