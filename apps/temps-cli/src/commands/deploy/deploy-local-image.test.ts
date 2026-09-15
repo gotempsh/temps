@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import {
   detectLocalPackageManager,
   formatFileSize,
+  installInterruptHandlers,
+  killChildOnAbort,
+  resolveTimeoutSeconds,
   uploadImageArchive,
   withTemporaryFileCleanup,
   writeArchiveStream,
@@ -211,6 +215,125 @@ describe('writeArchiveStream', () => {
 
     expect(bytesWritten).toBe(12)
     expect(progress).toEqual([5, 12])
-    expect(await readFile(archivePath, 'utf8')).toBe('first-second')
+    expect(await Bun.file(archivePath).text()).toBe('first-second')
+  })
+})
+
+describe('resolveTimeoutSeconds', () => {
+  test('defaults to 600 seconds when no flag is given', () => {
+    expect(resolveTimeoutSeconds(undefined)).toBe(600)
+  })
+
+  test('accepts a positive whole number of seconds', () => {
+    expect(resolveTimeoutSeconds('120')).toBe(120)
+  })
+
+  test('rejects non-numeric, fractional, zero, and negative values', () => {
+    // parseInt would have silently accepted all of these — "nope" as NaN,
+    // "30.5" truncated to 30, "0"/"-10" as an immediate abort.
+    expect(() => resolveTimeoutSeconds('nope')).toThrow('--timeout must be a positive whole number of seconds')
+    expect(() => resolveTimeoutSeconds('30.5')).toThrow('--timeout must be a positive whole number of seconds')
+    expect(() => resolveTimeoutSeconds('0')).toThrow('--timeout must be a positive whole number of seconds')
+    expect(() => resolveTimeoutSeconds('-10')).toThrow('--timeout must be a positive whole number of seconds')
+    expect(() => resolveTimeoutSeconds('600garbage')).toThrow(
+      '--timeout must be a positive whole number of seconds'
+    )
+  })
+})
+
+describe('installInterruptHandlers', () => {
+  test('registers exactly one SIGINT and one SIGTERM listener', () => {
+    const controller = new AbortController()
+    const sigintBefore = process.listenerCount('SIGINT')
+    const sigtermBefore = process.listenerCount('SIGTERM')
+
+    const remove = installInterruptHandlers(controller)
+
+    expect(process.listenerCount('SIGINT')).toBe(sigintBefore + 1)
+    expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore + 1)
+    remove()
+  })
+
+  test('aborts the controller with the signal name when SIGINT fires', () => {
+    // `process.emit` also invokes (and, since these are `.once` listeners,
+    // consumes) any other SIGINT handler already registered in this process
+    // — e.g. the test runner's own Ctrl-C handler — so this only asserts on
+    // the controller, not on ambient listener counts.
+    const controller = new AbortController()
+    const remove = installInterruptHandlers(controller)
+
+    process.emit('SIGINT')
+
+    expect(controller.signal.aborted).toBe(true)
+    expect((controller.signal.reason as Error).message).toContain('SIGINT')
+
+    remove()
+  })
+
+  test('removes both signal listeners on cleanup without ever firing', () => {
+    const controller = new AbortController()
+    const sigintBefore = process.listenerCount('SIGINT')
+    const sigtermBefore = process.listenerCount('SIGTERM')
+
+    const remove = installInterruptHandlers(controller)
+    remove()
+
+    expect(process.listenerCount('SIGINT')).toBe(sigintBefore)
+    expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore)
+    expect(controller.signal.aborted).toBe(false)
+  })
+
+  test('interruption during an operation removes its temporary archive', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    await writeFile(archivePath, 'temporary image')
+
+    const controller = new AbortController()
+    const remove = installInterruptHandlers(controller)
+
+    await expect(
+      withTemporaryFileCleanup(archivePath, async () => {
+        process.emit('SIGTERM')
+        if (controller.signal.aborted) throw controller.signal.reason
+      })
+    ).rejects.toThrow('Local image deployment interrupted by SIGTERM')
+
+    await expect(access(archivePath)).rejects.toThrow()
+    remove()
+  })
+})
+
+describe('killChildOnAbort', () => {
+  test('terminates the child process once the signal aborts', async () => {
+    const controller = new AbortController()
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'])
+    const remove = killChildOnAbort(child, controller.signal)
+
+    const exitCode = new Promise<number | null>((resolveExit) => {
+      child.once('exit', resolveExit)
+    })
+
+    controller.abort()
+
+    expect(await exitCode).not.toBe(0)
+    remove()
+  })
+
+  test('kills immediately when the signal is already aborted', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'])
+
+    const exitCode = new Promise<number | null>((resolveExit) => {
+      child.once('exit', resolveExit)
+    })
+    killChildOnAbort(child, controller.signal)
+
+    expect(await exitCode).not.toBe(0)
+  })
+
+  test('is a no-op without a signal', () => {
+    const child = spawn(process.execPath, ['-e', ''])
+    expect(() => killChildOnAbort(child)).not.toThrow()
   })
 })

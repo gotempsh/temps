@@ -5,7 +5,13 @@ import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../../lib/api-client.js'
 import { resolveProjectSlug } from '../../config/resolve-project.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
-import { getProjectBySlug, getProject, getEnvironments, generatePresetDockerfile } from '../../api/sdk.gen.js'
+import {
+  getProjectBySlug,
+  getProject,
+  getEnvironments,
+  generatePresetDockerfile,
+  getLastDeployment,
+} from '../../api/sdk.gen.js'
 import type { EnvironmentResponse } from '../../api/types.gen.js'
 import { promptSelect } from '../../ui/prompts.js'
 import {
@@ -24,7 +30,7 @@ import {
   colors,
   box,
 } from '../../ui/output.js'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, createWriteStream, writeFileSync, mkdirSync, createReadStream } from 'node:fs'
 import { unlink } from 'node:fs/promises'
 import { Readable, Transform } from 'node:stream'
@@ -68,6 +74,63 @@ const DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS = 600_000
 
 function timeoutSeconds(milliseconds: number): string {
   return (milliseconds / 1_000).toLocaleString('en-US', { maximumFractionDigits: 3 })
+}
+
+/**
+ * Parse and validate the `--timeout` flag as a whole number of seconds.
+ * `Number()` (unlike `parseInt`) rejects trailing garbage and fractional
+ * input instead of silently truncating it, so a typo becomes a clear error
+ * instead of an immediate or unintended abort after the archive uploads.
+ */
+export function resolveTimeoutSeconds(rawTimeout?: string): number {
+  if (rawTimeout === undefined) return 600
+
+  const parsed = Number(rawTimeout)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `--timeout must be a positive whole number of seconds, got "${rawTimeout}"`
+    )
+  }
+  return parsed
+}
+
+/**
+ * Forward SIGINT/SIGTERM into an AbortController so an in-flight export or
+ * upload can cancel and clean up instead of leaving a dangling docker
+ * process or temp archive. Returns a cleanup function that must be called
+ * once the operation settles, so a later signal doesn't abort a stale
+ * controller from a finished operation.
+ */
+export function installInterruptHandlers(controller: AbortController): () => void {
+  const interrupt = (signalName: string) => (): void => {
+    controller.abort(new Error(`Local image deployment interrupted by ${signalName}`))
+  }
+  const onSigint = interrupt('SIGINT')
+  const onSigterm = interrupt('SIGTERM')
+  process.once('SIGINT', onSigint)
+  process.once('SIGTERM', onSigterm)
+
+  return () => {
+    process.removeListener('SIGINT', onSigint)
+    process.removeListener('SIGTERM', onSigterm)
+  }
+}
+
+/**
+ * Kill a child process when the given signal aborts. Extracted from
+ * `dockerSaveToFile` so the termination behavior is testable without
+ * spawning a real `docker` process.
+ */
+export function killChildOnAbort(child: ChildProcess, signal?: AbortSignal): () => void {
+  if (!signal) return () => {}
+
+  const onAbort = (): void => {
+    if (!child.killed) child.kill('SIGTERM')
+  }
+  if (signal.aborted) onAbort()
+  else signal.addEventListener('abort', onAbort, { once: true })
+
+  return () => signal.removeEventListener('abort', onAbort)
 }
 
 /**
@@ -169,6 +232,89 @@ export async function uploadImageArchive(
   }
 }
 
+interface ResolvedDeployment {
+  id: number
+  slug: string
+}
+
+async function resolveUploadedDeployment(
+  response: Response,
+  finalUrl: string
+): Promise<ResolvedDeployment | undefined> {
+  if (!response.ok) {
+    const errorText = await response.text()
+    failSpinner(`Upload failed: ${response.status}`)
+    info(`URL: ${finalUrl}`)
+    warning(`Response: ${errorText}`)
+    return undefined
+  }
+
+  const responseText = await response.text()
+  try {
+    return JSON.parse(responseText) as ResolvedDeployment
+  } catch {
+    failSpinner('Failed to parse deployment response')
+    info(`URL: ${finalUrl}`)
+    warning(`Response: ${responseText}`)
+    return undefined
+  }
+}
+
+async function getLastDeploymentId(projectId: number): Promise<number | undefined> {
+  try {
+    const { data } = await getLastDeployment({ client, path: { id: projectId } })
+    return data?.id
+  } catch {
+    return undefined
+  }
+}
+
+interface ReconcileTimedOutImportOptions {
+  projectId: number
+  environmentId: number
+  baselineDeploymentId: number | undefined
+  startedAfter: number
+  attempts?: number
+  delayMs?: number
+}
+
+/**
+ * A response-import timeout only fires after the full archive has already
+ * reached the server, so the server may still finish `docker load` and
+ * create a deployment after the CLI gives up waiting. Reporting a bare
+ * failure in that case invites a retry that deploys the same image twice
+ * (there is no server-side idempotency key). Poll for a deployment that
+ * appeared in the target environment after this upload started before
+ * deciding the outcome.
+ */
+async function reconcileTimedOutImport(
+  options: ReconcileTimedOutImportOptions
+): Promise<ResolvedDeployment | undefined> {
+  const attempts = options.attempts ?? 4
+  const delayMs = options.delayMs ?? 3_000
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs))
+    }
+
+    const { data } = await getLastDeployment({ client, path: { id: options.projectId } }).catch(
+      () => ({ data: undefined })
+    )
+
+    if (
+      data &&
+      data.environment_id === options.environmentId &&
+      data.id !== options.baselineDeploymentId &&
+      data.created_at >= options.startedAfter
+    ) {
+      return { id: data.id, slug: data.url }
+    }
+  }
+
+  return undefined
+}
+
 export async function withTemporaryFileCleanup<T>(
   path: string,
   operation: () => Promise<T>
@@ -204,6 +350,14 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
   await setupClient()
 
   newline()
+
+  let timeoutSecondsValue: number
+  try {
+    timeoutSecondsValue = resolveTimeoutSeconds(options.timeout)
+  } catch (err) {
+    warning(err instanceof Error ? err.message : String(err))
+    return
+  }
 
   // ─── Step 1: Resolve project and environment ─────────────────────────────
   const resolved = await resolveProjectSlug(options.project)
@@ -465,17 +619,11 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
   const tempFilename = `temps-image-${Date.now()}.tar`
   const tempFilePath = join(tmpdir(), tempFilename)
   const operationController = new AbortController()
-  const interrupt = (signalName: string) => (): void => {
-    operationController.abort(new Error(`Local image deployment interrupted by ${signalName}`))
-  }
-  const interruptOnSigint = interrupt('SIGINT')
-  const interruptOnSigterm = interrupt('SIGTERM')
-  process.once('SIGINT', interruptOnSigint)
-  process.once('SIGTERM', interruptOnSigterm)
+  const removeInterruptHandlers = installInterruptHandlers(operationController)
 
-  let uploadResult: { response: Response; finalUrl: string } | undefined
+  let deployment: ResolvedDeployment | undefined
   try {
-    uploadResult = await withTemporaryFileCleanup(tempFilePath, async () => {
+    deployment = await withTemporaryFileCleanup(tempFilePath, async () => {
       startSpinner('Exporting image with docker save...')
 
       let exportedSize: number
@@ -530,56 +678,71 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
 
       const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
 
-      const response = await uploadImageArchive({
-        url: finalUrl,
-        apiKey,
-        archivePath: tempFilePath,
-        filename,
-        archiveSize: exportedSize,
-        responseTimeoutMs: parseInt(options.timeout || '600', 10) * 1_000,
-        signal: operationController.signal,
-        onProgress: (uploadedBytes) => {
-          updateSpinner(
-            `Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`
-          )
-        },
-        onAwaitingImport: () => {
-          updateSpinner('Upload complete. Waiting for the server to import the image...')
-        },
-      })
+      let awaitingServerImport = false
+      const uploadStartedAt = Date.now()
+      // Baseline lets the reconciliation check below tell apart a deployment
+      // created by *this* upload from one that already existed.
+      const baselineDeploymentId = await getLastDeploymentId(projectData.id)
 
-      return { response, finalUrl }
+      let response: Response
+      try {
+        response = await uploadImageArchive({
+          url: finalUrl,
+          apiKey,
+          archivePath: tempFilePath,
+          filename,
+          archiveSize: exportedSize,
+          responseTimeoutMs: timeoutSecondsValue * 1_000,
+          signal: operationController.signal,
+          onProgress: (uploadedBytes) => {
+            updateSpinner(
+              `Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`
+            )
+          },
+          onAwaitingImport: () => {
+            awaitingServerImport = true
+            updateSpinner('Upload complete. Waiting for the server to import the image...')
+          },
+        })
+      } catch (err) {
+        // The archive was already fully sent when this failed, so the server
+        // may still finish importing the image and create a deployment.
+        // Reporting a bare failure would invite a retry that deploys the
+        // same image twice — reconcile before deciding the outcome.
+        if (!awaitingServerImport) throw err
+
+        updateSpinner('Checking whether the server started a deployment before retrying...')
+        const reconciled = await reconcileTimedOutImport({
+          projectId: projectData.id,
+          environmentId: environmentId as number,
+          baselineDeploymentId,
+          startedAfter: uploadStartedAt,
+        })
+
+        if (reconciled) {
+          succeedSpinner(
+            `Server import continued after the local connection dropped — deployment ${reconciled.id} is running`
+          )
+          return reconciled
+        }
+
+        failSpinner('No confirmation received from the server')
+        if (err instanceof Error) warning(err.message)
+        warning('No deployment was found for this upload yet — it is safe to retry.')
+        if (operationController.signal.aborted) throw err
+        return undefined
+      }
+
+      return await resolveUploadedDeployment(response, finalUrl)
     })
   } catch (err) {
     failSpinner('Deployment failed')
     throw err
   } finally {
-    process.removeListener('SIGINT', interruptOnSigint)
-    process.removeListener('SIGTERM', interruptOnSigterm)
+    removeInterruptHandlers()
   }
 
-  if (!uploadResult) return
-
-  const { response: uploadResponse, finalUrl } = uploadResult
-
-  if (!uploadResponse.ok) {
-    const errorText = await uploadResponse.text()
-    failSpinner(`Upload failed: ${uploadResponse.status}`)
-    info(`URL: ${finalUrl}`)
-    warning(`Response: ${errorText}`)
-    return
-  }
-
-  const responseText = await uploadResponse.text()
-  let deployment: { id: number; slug: string }
-  try {
-    deployment = JSON.parse(responseText) as { id: number; slug: string }
-  } catch (parseErr) {
-    failSpinner('Failed to parse deployment response')
-    info(`URL: ${finalUrl}`)
-    warning(`Response: ${responseText}`)
-    return
-  }
+  if (!deployment) return
 
   succeedSpinner(`Deployment started: ${deployment.slug}`)
 
@@ -587,7 +750,7 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
     const result = await watchDeployment({
       projectId: projectData.id,
       deploymentId: deployment.id,
-      timeoutSecs: parseInt(options.timeout || '600', 10),
+      timeoutSecs: timeoutSecondsValue,
       projectName,
     })
 
@@ -732,11 +895,7 @@ async function dockerSaveToFile(
     stderr += chunk.toString()
   })
 
-  const abortDockerSave = (): void => {
-    docker.kill('SIGTERM')
-  }
-  signal?.addEventListener('abort', abortDockerSave, { once: true })
-  if (signal?.aborted) abortDockerSave()
+  const removeAbortListener = killChildOnAbort(docker, signal)
 
   const dockerExit = new Promise<number | null>((resolveExit, rejectExit) => {
     docker.once('close', resolveExit)
@@ -760,7 +919,7 @@ async function dockerSaveToFile(
     if (signal?.aborted && signal.reason instanceof Error) throw signal.reason
     throw error
   } finally {
-    signal?.removeEventListener('abort', abortDockerSave)
+    removeAbortListener()
   }
 }
 
