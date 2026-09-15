@@ -7728,8 +7728,8 @@ mod ip_restriction_fail_closed_tests {
     use std::net::IpAddr;
     use temps_core::{ProjectIpGate, RequestPolicyDecision};
 
-    /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
-    /// project/environment is on a closed/restricted mode: `is_allowed`
+    /// Stands in for a cached project IP gate when a project/environment is
+    /// on a closed/restricted mode: `is_allowed`
     /// denies (baring an explicit allowlist match, irrelevant here since we
     /// never reach it — the IP is unresolvable) and `has_active_policy`
     /// truthfully reports the restriction exists.
