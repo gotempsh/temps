@@ -430,48 +430,58 @@ impl PreviewAuthLimiter {
 
     /// Count one attempt against `key` and return the count in the current
     /// window. The read-modify-write happens under the entry's shard lock,
-    /// so concurrent callers see distinct, increasing counts.
+    /// so concurrent callers see distinct, increasing counts. The common
+    /// path takes no other lock; only an insert that pushes the map past
+    /// its cap pays for eviction.
     fn bump(&self, key: (IpAddr, LimiterSubject)) -> u32 {
-        if let Some(mut entry) = self.failures.get_mut(&key) {
+        // The entry API inserts or increments under the shard lock, so two
+        // first attempts for one key never both read as the first. The
+        // guard is dropped before any eviction, which walks every shard.
+        let (count, inserted) = {
+            let mut entry = self.failures.entry(key.clone()).or_insert(FailureState {
+                count: 0,
+                window_start: None,
+            });
+            let inserted = entry.window_start.is_none();
             Self::increment_failure(&mut entry);
-            return entry.count;
-        }
+            (entry.count, inserted)
+        };
 
-        // Serialize admission of new keys so concurrent requests cannot race
-        // past the hard cap. Once full, sweep at most once per rate-limit
-        // window; scanning the whole map for every unique attacker turns the
-        // limiter itself into a CPU-amplification vector. If nothing expired,
-        // evict an arbitrary entry in constant time before admitting the new
-        // key. The limiter is best-effort at the cap either way, while memory
-        // and per-request work remain bounded.
+        if inserted && self.failures.len() > MAX_TRACKED_ENTRIES {
+            self.trim_to_cap(&key);
+        }
+        count
+    }
+
+    /// Bring the map back under [`MAX_TRACKED_ENTRIES`] after an insert
+    /// pushed it over. Serialized so concurrent over-inserts each evict
+    /// exactly what they added: sweep expired entries at most once per
+    /// rate-limit window (scanning the whole map for every unique attacker
+    /// would turn the limiter into a CPU-amplification vector), otherwise
+    /// drop arbitrary entries other than `keep` in constant time each. The
+    /// limiter is best-effort at the cap either way; memory and per-request
+    /// work stay bounded.
+    fn trim_to_cap(&self, keep: &(IpAddr, LimiterSubject)) {
         let mut admission = self.admission.lock();
-        if let Some(mut entry) = self.failures.get_mut(&key) {
-            Self::increment_failure(&mut entry);
-            return entry.count;
+        if self.failures.len() > MAX_TRACKED_ENTRIES
+            && admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW
+        {
+            self.evict_expired();
+            admission.last_expiry_sweep = Instant::now();
         }
-
-        if self.failures.len() >= MAX_TRACKED_ENTRIES {
-            if admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW {
-                self.evict_expired();
-                admission.last_expiry_sweep = Instant::now();
-            }
-
-            if self.failures.len() >= MAX_TRACKED_ENTRIES {
-                let victim = self.failures.iter().next().map(|entry| entry.key().clone());
-                if let Some(victim) = victim {
+        while self.failures.len() > MAX_TRACKED_ENTRIES {
+            let victim = self
+                .failures
+                .iter()
+                .find(|entry| entry.key() != keep)
+                .map(|entry| entry.key().clone());
+            match victim {
+                Some(victim) => {
                     self.failures.remove(&victim);
                 }
+                None => break,
             }
         }
-
-        self.failures.insert(
-            key,
-            FailureState {
-                count: 1,
-                window_start: Some(Instant::now()),
-            },
-        );
-        1
     }
 
     fn increment_failure(entry: &mut FailureState) {
