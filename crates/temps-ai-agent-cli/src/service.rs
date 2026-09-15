@@ -4489,6 +4489,48 @@ fn candidate_relay_infrastructure_diagnostic(
         .then_some(temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable)
 }
 
+fn validate_additional_opencode_probe(
+    model: &str,
+    relay_status: Option<u16>,
+    output: &temps_agents::sandbox::SandboxExecResult,
+) -> Result<(), AiError> {
+    match relay_status {
+        Some(401 | 403) => {
+            return Err(AiError::Provider {
+                purpose: "provider.credentials.verify.auth".into(),
+                reason: "OpenCode provider explicitly rejected a credential".into(),
+            });
+        }
+        Some(402 | 429) => {
+            return Err(AiError::Provider {
+                purpose: "provider.credentials.verify.allowance".into(),
+                reason: "OpenCode provider allowance or rate limit prevented verification".into(),
+            });
+        }
+        Some(500..=599) => {
+            return Err(AiError::CredentialVerification {
+                provider: "opencode".into(),
+                stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
+                diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+            });
+        }
+        _ => {}
+    }
+    if candidate_probe_native_auth_rejected(&output.stdout, &output.stderr) {
+        return Err(AiError::Provider {
+            purpose: "provider.credentials.verify.auth".into(),
+            reason: format!("OpenCode native harness rejected the credential for '{model}'"),
+        });
+    }
+    if output.exit_code != 0 || !candidate_probe_has_answer("opencode", &output.stdout) {
+        return Err(AiError::Provider {
+            purpose: "provider.credentials.verify.model".into(),
+            reason: format!("OpenCode did not complete an authenticated request for '{model}'"),
+        });
+    }
+    Ok(())
+}
+
 impl AgentCliAiService {
     async fn run_candidate_probe(
         &self,
@@ -4782,35 +4824,7 @@ impl AgentCliAiService {
                         purpose: "provider.credentials.verify.model".into(),
                         reason: "OpenCode could not verify an additional provider entry".into(),
                     })?;
-                if matches!(relay_guard.inference_status(), Some(401 | 403)) {
-                    return Err(AiError::Provider {
-                        purpose: "provider.credentials.verify.auth".into(),
-                        reason: "OpenCode provider explicitly rejected a credential".into(),
-                    });
-                }
-                if matches!(relay_guard.inference_status(), Some(402 | 429)) {
-                    return Err(AiError::Provider {
-                        purpose: "provider.credentials.verify.allowance".into(),
-                        reason: "OpenCode provider allowance or rate limit prevented verification"
-                            .into(),
-                    });
-                }
-                if candidate_probe_native_auth_rejected(&next.stdout, &next.stderr) {
-                    return Err(AiError::Provider {
-                        purpose: "provider.credentials.verify.auth".into(),
-                        reason: format!(
-                            "OpenCode native harness rejected the credential for '{model}'"
-                        ),
-                    });
-                }
-                if next.exit_code != 0 || !candidate_probe_has_answer("opencode", &next.stdout) {
-                    return Err(AiError::Provider {
-                        purpose: "provider.credentials.verify.model".into(),
-                        reason: format!(
-                            "OpenCode did not complete an authenticated request for '{model}'"
-                        ),
-                    });
-                }
+                validate_additional_opencode_probe(model, relay_guard.inference_status(), &next)?;
             }
             Ok(())
         };
@@ -6239,6 +6253,59 @@ mod tests {
         );
         for status in [None, Some(200), Some(401), Some(402), Some(429)] {
             assert_eq!(candidate_relay_infrastructure_diagnostic(status), None);
+        }
+        let successful_output = temps_agents::sandbox::SandboxExecResult {
+            exit_code: 0,
+            stdout: r#"{"type":"text","part":{"text":"OK"}}"#.into(),
+            stderr: String::new(),
+        };
+        assert!(validate_additional_opencode_probe(
+            "anthropic/model",
+            Some(200),
+            &successful_output
+        )
+        .is_ok());
+        let error =
+            validate_additional_opencode_probe("openai/model", Some(503), &successful_output)
+                .expect_err("an additional relay 5xx must not fall through as a model failure");
+        assert!(matches!(
+            error,
+            AiError::CredentialVerification {
+                provider,
+                stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
+                diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+            } if provider == "opencode"
+        ));
+        let failed_output = temps_agents::sandbox::SandboxExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(matches!(
+            validate_additional_opencode_probe("openai/model", Some(503), &failed_output),
+            Err(AiError::CredentialVerification {
+                stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_additional_opencode_probe("openai/model", None, &failed_output),
+            Err(AiError::Provider { purpose, .. })
+                if purpose == "provider.credentials.verify.model"
+        ));
+        for status in [401, 403] {
+            assert!(matches!(
+                validate_additional_opencode_probe("openai/model", Some(status), &failed_output),
+                Err(AiError::Provider { purpose, .. })
+                    if purpose == "provider.credentials.verify.auth"
+            ));
+        }
+        for status in [402, 429] {
+            assert!(matches!(
+                validate_additional_opencode_probe("openai/model", Some(status), &failed_output),
+                Err(AiError::Provider { purpose, .. })
+                    if purpose == "provider.credentials.verify.allowance"
+            ));
         }
     }
 
