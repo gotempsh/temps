@@ -4440,17 +4440,17 @@ fn check_prompt_size(purpose: &str, prompt: &str) -> Result<(), AiError> {
 // ---------------------------------------------------------------------------
 
 fn candidate_probe_create_config(
+    provider: &str,
     label: String,
     host_work_dir: PathBuf,
 ) -> Result<SandboxCreateConfig, AiError> {
     let image =
         temps_sandbox::services::managed_application_workspace_image("node").ok_or_else(|| {
-            AiError::Provider {
-            purpose: "provider.credentials.verify".into(),
-            reason:
-                "managed node workspace runtime image is unavailable for credential verification"
-                    .into(),
-        }
+            AiError::CredentialVerification {
+                provider: provider.into(),
+                stage: temps_ai::CredentialVerificationStage::SandboxStartup,
+                diagnostic: temps_ai::CredentialVerificationDiagnostic::ImageUnavailable,
+            }
         })?;
     Ok(SandboxCreateConfig {
         run_id: 0,
@@ -4470,6 +4470,25 @@ fn candidate_probe_create_config(
     })
 }
 
+fn candidate_sandbox_startup_diagnostic(
+    error: &AgentError,
+) -> temps_ai::CredentialVerificationDiagnostic {
+    use temps_ai::CredentialVerificationDiagnostic as Diagnostic;
+
+    match error {
+        AgentError::SandboxProviderUnavailable { .. } => Diagnostic::RuntimeUnavailable,
+        _ => Diagnostic::OperationFailed,
+    }
+}
+
+fn candidate_relay_infrastructure_diagnostic(
+    status: Option<u16>,
+) -> Option<temps_ai::CredentialVerificationDiagnostic> {
+    status
+        .is_some_and(|status| (500..=599).contains(&status))
+        .then_some(temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable)
+}
+
 impl AgentCliAiService {
     async fn run_candidate_probe(
         &self,
@@ -4478,20 +4497,23 @@ impl AgentCliAiService {
         verification_model: Option<&str>,
     ) -> Result<(), AiError> {
         const PURPOSE: &str = "provider.credentials.verify";
-        let sandbox = self
-            .sandbox_provider
-            .as_ref()
-            .ok_or_else(|| AiError::Provider {
-                purpose: PURPOSE.into(),
-                reason: "sandbox provider is unavailable for credential verification".into(),
-            })?;
-        let relay_service = self
-            .sandbox_model_relay
-            .as_ref()
-            .ok_or_else(|| AiError::Provider {
-                purpose: PURPOSE.into(),
-                reason: "model relay is unavailable for credential verification".into(),
-            })?;
+        let verification_error = |stage, diagnostic| AiError::CredentialVerification {
+            provider: self.provider.name().to_string(),
+            stage,
+            diagnostic,
+        };
+        let sandbox = self.sandbox_provider.as_ref().ok_or_else(|| {
+            verification_error(
+                temps_ai::CredentialVerificationStage::SandboxUnavailable,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+            )
+        })?;
+        let relay_service = self.sandbox_model_relay.as_ref().ok_or_else(|| {
+            verification_error(
+                temps_ai::CredentialVerificationStage::RelayUnavailable,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+            )
+        })?;
         let scratch =
             Arc::new(
                 tempfile::tempdir_in(&self.scratch_dir).map_err(|_| AiError::Provider {
@@ -4500,7 +4522,11 @@ impl AgentCliAiService {
                 })?,
             );
         let label = format!("credential-verify-{}", uuid::Uuid::new_v4().simple());
-        let create_config = candidate_probe_create_config(label, scratch.path().to_path_buf())?;
+        let create_config = candidate_probe_create_config(
+            self.provider.name(),
+            label,
+            scratch.path().to_path_buf(),
+        )?;
         let create_provider = sandbox.clone();
         let mut create_guard = CandidateCreateGuard {
             provider: sandbox.clone(),
@@ -4521,17 +4547,23 @@ impl AgentCliAiService {
                 create_guard.task = None;
                 handle
             }
-            Ok(_) => {
-                return Err(AiError::Provider {
-                    purpose: PURPOSE.into(),
-                    reason: "could not start the isolated verification sandbox".into(),
-                })
+            Ok(Ok(Err(error))) => {
+                return Err(verification_error(
+                    temps_ai::CredentialVerificationStage::SandboxStartup,
+                    candidate_sandbox_startup_diagnostic(&error),
+                ))
+            }
+            Ok(Err(_)) => {
+                return Err(verification_error(
+                    temps_ai::CredentialVerificationStage::SandboxStartup,
+                    temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                ))
             }
             Err(_) => {
-                return Err(AiError::Provider {
-                    purpose: PURPOSE.into(),
-                    reason: "isolated verification sandbox startup timed out".into(),
-                })
+                return Err(verification_error(
+                    temps_ai::CredentialVerificationStage::SandboxStartupTimeout,
+                    temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                ))
             }
         };
         let guard = CandidateSandbox {
@@ -4541,18 +4573,20 @@ impl AgentCliAiService {
         };
         if handle.backend == SandboxBackend::Local {
             guard.destroy().await?;
-            return Err(AiError::Provider {
-                purpose: PURPOSE.into(),
-                reason: "credential verification requires an isolated Docker or VM sandbox".into(),
-            });
+            return Err(verification_error(
+                temps_ai::CredentialVerificationStage::SandboxUnavailable,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+            ));
         }
         let probe = async {
             let relay_base_url = sandbox
                 .model_relay_base_url(&handle, &credentials.internal_api_url)
                 .await
-                .map_err(|_| AiError::Provider {
-                    purpose: PURPOSE.into(),
-                    reason: "verification sandbox cannot reach the model relay".into(),
+                .map_err(|_| {
+                    verification_error(
+                        temps_ai::CredentialVerificationStage::RelayUnavailable,
+                        temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+                    )
                 })?;
             let opencode_models = match &credentials.provider_credential {
                 crate::model_relay::SandboxProviderCredential::OpenCodeAuthJson {
@@ -4651,23 +4685,35 @@ impl AgentCliAiService {
                 sandbox
                     .write_file(&handle, path, contents, 0o600)
                     .await
-                    .map_err(|_| AiError::Provider {
-                        purpose: PURPOSE.into(),
-                        reason: "could not stage a temporary relay capability".into(),
+                    .map_err(|_| {
+                        verification_error(
+                            temps_ai::CredentialVerificationStage::CapabilityStaging,
+                            temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                        )
                     })?;
             }
             let output = sandbox
                 .exec(&handle, command, environment, None)
                 .await
-                .map_err(|_| AiError::Provider {
-                    purpose: PURPOSE.into(),
-                    reason: "native harness verification failed to run".into(),
+                .map_err(|_| {
+                    verification_error(
+                        temps_ai::CredentialVerificationStage::HarnessExecution,
+                        temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                    )
                 })?;
             if matches!(relay_guard.inference_status(), Some(401 | 403)) {
                 return Err(AiError::Provider { purpose: "provider.credentials.verify.auth".into(), reason: format!("{} credential was rejected by its model provider (authentication or access denied)", self.provider.name()) });
             }
             if matches!(relay_guard.inference_status(), Some(402 | 429)) {
                 return Err(AiError::Provider { purpose: "provider.credentials.verify.allowance".into(), reason: format!("{} credential could not be verified because its account has insufficient allowance or is rate limited", self.provider.name()) });
+            }
+            if let Some(diagnostic) =
+                candidate_relay_infrastructure_diagnostic(relay_guard.inference_status())
+            {
+                return Err(verification_error(
+                    temps_ai::CredentialVerificationStage::RelayUnavailable,
+                    diagnostic,
+                ));
             }
             if candidate_probe_native_auth_rejected(&output.stdout, &output.stderr) {
                 return Err(AiError::Provider {
@@ -4681,17 +4727,15 @@ impl AgentCliAiService {
             if output.exit_code != 0 {
                 let runtime_failure =
                     candidate_probe_runtime_failure(output.exit_code, &output.stderr);
+                if runtime_failure {
+                    return Err(verification_error(
+                        temps_ai::CredentialVerificationStage::HarnessIncompatible,
+                        temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                    ));
+                }
                 return Err(AiError::Provider {
-                    purpose: if runtime_failure {
-                        PURPOSE.into()
-                    } else {
-                        "provider.credentials.verify.model".into()
-                    },
-                    reason: if runtime_failure {
-                        format!("{} verification runtime is unavailable or incompatible with required safe flags (exit {}); update the sandbox image", self.provider.name(), output.exit_code)
-                    } else {
-                        format!("{} could not complete a minimal model request (exit {}); check model access", self.provider.name(), output.exit_code)
-                    },
+                    purpose: "provider.credentials.verify.model".into(),
+                    reason: format!("{} could not complete a minimal model request (exit {}); check model access", self.provider.name(), output.exit_code),
                 });
             }
             let answered = candidate_probe_has_answer(self.provider.name(), &output.stdout);
@@ -4773,10 +4817,10 @@ impl AgentCliAiService {
         let result = tokio::time::timeout(Duration::from_secs(100), probe)
             .await
             .unwrap_or_else(|_| {
-                Err(AiError::Provider {
-                    purpose: PURPOSE.into(),
-                    reason: "native credential verification timed out".into(),
-                })
+                Err(verification_error(
+                    temps_ai::CredentialVerificationStage::HarnessTimeout,
+                    temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                ))
             });
         if let Err(cleanup_error) = guard.destroy().await {
             tracing::error!(provider = %self.provider.name(), probe_succeeded = result.is_ok(), "candidate verification sandbox cleanup failed");
@@ -5701,6 +5745,7 @@ mod tests {
     #[test]
     fn credential_probe_uses_managed_workspace_runtime_image() {
         let config = candidate_probe_create_config(
+            "claude_cli",
             "credential-verify-test".to_string(),
             PathBuf::from("/tmp/credential-verify-test"),
         )
@@ -6160,6 +6205,40 @@ mod tests {
                 matches!(selected_opencode_probe_model(&defaults, Some(model)), Err(AiError::Provider { purpose, .. }) if purpose == "provider.credentials.verify.invalid"),
                 "{model}"
             );
+        }
+    }
+
+    #[test]
+    fn candidate_startup_diagnostics_use_only_typed_safe_categories() {
+        let unavailable = AgentError::SandboxProviderUnavailable {
+            provider: "docker".into(),
+            reason: "candidate-secret-must-never-leak".into(),
+        };
+        assert_eq!(
+            candidate_sandbox_startup_diagnostic(&unavailable),
+            temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable
+        );
+
+        let unclassified = AgentError::SandboxCreationFailed {
+            run_id: 0,
+            provider: "docker".into(),
+            reason: "image pull candidate-secret-must-never-leak".into(),
+        };
+        assert_eq!(
+            candidate_sandbox_startup_diagnostic(&unclassified),
+            temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+            "unstructured provider text must not be guessed into a public diagnostic"
+        );
+    }
+
+    #[test]
+    fn candidate_relay_server_failures_are_infrastructure_failures() {
+        assert_eq!(
+            candidate_relay_infrastructure_diagnostic(Some(503)),
+            Some(temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable)
+        );
+        for status in [None, Some(200), Some(401), Some(402), Some(429)] {
+            assert_eq!(candidate_relay_infrastructure_diagnostic(status), None);
         }
     }
 

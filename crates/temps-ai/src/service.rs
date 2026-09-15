@@ -145,6 +145,26 @@ pub enum RuntimeProcessResponse {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerificationStage {
+    SandboxUnavailable,
+    SandboxStartup,
+    SandboxStartupTimeout,
+    RelayUnavailable,
+    CapabilityStaging,
+    HarnessExecution,
+    HarnessTimeout,
+    HarnessIncompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerificationDiagnostic {
+    RuntimeUnavailable,
+    ImageUnavailable,
+    NetworkUnavailable,
+    OperationFailed,
+}
+
 /// Why an AI call could not be completed. All variants are non-fatal — callers
 /// fall back to non-AI behaviour.
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +182,14 @@ pub enum AiError {
     /// Retained runtime diagnostic after exact turn-secret redaction at source.
     #[error("retained AI harness error for '{purpose}': {reason}")]
     RetainedHarnessDiagnostic { purpose: String, reason: String },
+    /// A safe, structured failure from the isolated credential-verification
+    /// harness. Neither field contains process output or credential material.
+    #[error("credential verification for '{provider}' failed at {stage:?} ({diagnostic:?})")]
+    CredentialVerification {
+        provider: String,
+        stage: CredentialVerificationStage,
+        diagnostic: CredentialVerificationDiagnostic,
+    },
 }
 
 /// The governed AI capability. Object-safe so it can be registered and resolved

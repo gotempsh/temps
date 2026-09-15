@@ -556,6 +556,7 @@ pub async fn refresh_ai_provider_models(
             temps_ai::AiError::RetainedHarnessDiagnostic { purpose, .. } => {
                 ("retained_harness", Some(purpose.as_str()))
             }
+            temps_ai::AiError::CredentialVerification { .. } => ("credential_verification", None),
         };
         tracing::warn!(
             provider_id,
@@ -1258,10 +1259,57 @@ impl CredentialVerification {
 
 fn opencode_probe_is_inconclusive(provider_id: &str, error: &temps_ai::AiError) -> bool {
     provider_id == "opencode"
-        && matches!(error,
-            temps_ai::AiError::Provider { purpose, .. }
-                if matches!(purpose.as_str(), "provider.credentials.verify" | "provider.credentials.verify.model" | "provider.credentials.verify.allowance")
-        )
+        && (matches!(error, temps_ai::AiError::CredentialVerification { .. })
+            || matches!(error,
+                temps_ai::AiError::Provider { purpose, .. }
+                    if matches!(purpose.as_str(), "provider.credentials.verify" | "provider.credentials.verify.model" | "provider.credentials.verify.allowance")
+            ))
+}
+
+fn credential_verification_log_fields(error: &temps_ai::AiError) -> (&'static str, &'static str) {
+    match error {
+        temps_ai::AiError::CredentialVerification {
+            stage, diagnostic, ..
+        } => (
+            match stage {
+                temps_ai::CredentialVerificationStage::SandboxUnavailable => "sandbox_unavailable",
+                temps_ai::CredentialVerificationStage::SandboxStartup => "sandbox_startup",
+                temps_ai::CredentialVerificationStage::SandboxStartupTimeout => {
+                    "sandbox_startup_timeout"
+                }
+                temps_ai::CredentialVerificationStage::RelayUnavailable => "relay_unavailable",
+                temps_ai::CredentialVerificationStage::CapabilityStaging => "capability_staging",
+                temps_ai::CredentialVerificationStage::HarnessExecution => "harness_execution",
+                temps_ai::CredentialVerificationStage::HarnessTimeout => "harness_timeout",
+                temps_ai::CredentialVerificationStage::HarnessIncompatible => {
+                    "harness_incompatible"
+                }
+            },
+            match diagnostic {
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable => {
+                    "runtime_unavailable"
+                }
+                temps_ai::CredentialVerificationDiagnostic::ImageUnavailable => "image_unavailable",
+                temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable => {
+                    "network_unavailable"
+                }
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed => "operation_failed",
+            },
+        ),
+        temps_ai::AiError::Provider { purpose, .. } => (
+            "provider",
+            match purpose.as_str() {
+                "provider.credentials.verify.invalid" => "invalid",
+                "provider.credentials.verify.auth" => "auth",
+                "provider.credentials.verify.allowance" => "allowance",
+                "provider.credentials.verify.model" => "model",
+                _ => "other",
+            },
+        ),
+        temps_ai::AiError::NotAvailable => ("service", "not_available"),
+        temps_ai::AiError::NoModel { .. } => ("service", "no_model"),
+        temps_ai::AiError::RetainedHarnessDiagnostic { .. } => ("service", "retained_diagnostic"),
+    }
 }
 
 async fn verify_candidate(
@@ -1290,23 +1338,91 @@ async fn verify_candidate(
     {
         Ok(()) => Ok(CredentialVerification::Verified),
         Err(error) if opencode_probe_is_inconclusive(provider_id, &error) => {
-            tracing::warn!(provider_id, auth_type, error_kind = ?std::mem::discriminant(&error), "OpenCode credential saved without model verification");
+            let (failure_stage, diagnostic) = credential_verification_log_fields(&error);
+            tracing::warn!(
+                provider_id,
+                auth_type,
+                failure_stage,
+                diagnostic,
+                "OpenCode credential saved without model verification"
+            );
             Ok(CredentialVerification::Unverified)
         }
         Err(error) => {
-            let (status, title, guidance) = credential_verification_failure(&error);
-            tracing::warn!(provider_id, auth_type, error_kind = ?std::mem::discriminant(&error), "candidate credential verification failed");
-            Err(problemdetails::new(status)
-                .with_title(title)
-                .with_detail(format!("Provider '{provider_id}' ({auth_type}): {guidance} A previously saved credential was not changed.")))
+            let (failure_stage, diagnostic) = credential_verification_log_fields(&error);
+            tracing::warn!(
+                provider_id,
+                auth_type,
+                failure_stage,
+                diagnostic,
+                "candidate credential verification failed"
+            );
+            Err(credential_verification_problem(
+                provider_id,
+                auth_type,
+                &error,
+            ))
         }
     }
+}
+
+fn credential_verification_problem(
+    provider_id: &str,
+    auth_type: &str,
+    error: &temps_ai::AiError,
+) -> Problem {
+    let (status, title, guidance) = credential_verification_failure(error);
+    problemdetails::new(status)
+        .with_title(title)
+        .with_detail(format!("Provider '{provider_id}' ({auth_type}): {guidance} A previously saved credential was not changed."))
 }
 
 fn credential_verification_failure(
     error: &temps_ai::AiError,
 ) -> (StatusCode, &'static str, &'static str) {
     match error {
+        temps_ai::AiError::CredentialVerification {
+            stage,
+            diagnostic,
+            ..
+        } => match (stage, diagnostic) {
+            (
+                temps_ai::CredentialVerificationStage::SandboxStartup,
+                temps_ai::CredentialVerificationDiagnostic::ImageUnavailable,
+            ) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification sandbox image unavailable", "Temps could not validate this credential because the configured managed sandbox image is unavailable. Check the image configuration and registry access, then retry; the credential has not been classified as invalid.",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::SandboxStartup,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+            ) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification sandbox runtime unavailable", "Temps could not validate this credential because the configured sandbox runtime is unavailable. Restore the runtime and retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::SandboxUnavailable, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification sandbox unavailable", "Temps could not validate this credential because an isolated Docker or VM runtime is unavailable. Configure the sandbox runtime and retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::SandboxStartup, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification sandbox could not start", "Temps could not validate this credential because the isolated sandbox failed to start. Check the sandbox runtime logs and retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::SandboxStartupTimeout, _) => (
+                StatusCode::GATEWAY_TIMEOUT, "Verification sandbox startup timed out", "Temps could not validate this credential before the isolated sandbox startup deadline. Check sandbox runtime capacity and retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::RelayUnavailable, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification relay unavailable", "Temps could not validate this credential because the model relay or upstream provider was unavailable. Check relay connectivity and provider status, then retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::CapabilityStaging, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification setup failed", "Temps could not validate this credential because the temporary relay capability could not be staged in the sandbox. Check sandbox file access and retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::HarnessExecution, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification harness could not run", "Temps could not validate this credential because the native verification command could not be executed. Check the sandbox runtime and installed harness, then retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::HarnessTimeout, _) => (
+                StatusCode::GATEWAY_TIMEOUT, "Verification harness timed out", "Temps could not validate this credential before the verification deadline. Check sandbox and model-relay availability, then retry; the credential has not been classified as invalid.",
+            ),
+            (temps_ai::CredentialVerificationStage::HarnessIncompatible, _) => (
+                StatusCode::SERVICE_UNAVAILABLE, "Verification harness is incompatible", "Temps could not validate this credential because the sandbox image is missing a compatible native harness or required safe flags. Update the managed sandbox image and retry; the credential has not been classified as invalid.",
+            ),
+        },
         temps_ai::AiError::Provider { purpose, .. } if purpose == "provider.credentials.verify.invalid" => (
             StatusCode::BAD_REQUEST, "Invalid provider credential", "The credential is malformed or uses an unsupported authentication format. Check its contents and retry.",
         ),
@@ -1678,6 +1794,100 @@ mod tests {
             credential_verification_failure(&quota).0,
             StatusCode::TOO_MANY_REQUESTS
         );
+
+        let secret = "candidate-secret-must-never-leak";
+        let cases = [
+            (
+                temps_ai::CredentialVerificationStage::SandboxUnavailable,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification sandbox unavailable",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::SandboxStartup,
+                temps_ai::CredentialVerificationDiagnostic::ImageUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification sandbox image unavailable",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::SandboxStartup,
+                temps_ai::CredentialVerificationDiagnostic::RuntimeUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification sandbox runtime unavailable",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::SandboxStartupTimeout,
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                StatusCode::GATEWAY_TIMEOUT,
+                "Verification sandbox startup timed out",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::CapabilityStaging,
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification setup failed",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::RelayUnavailable,
+                temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification relay unavailable",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::HarnessTimeout,
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                StatusCode::GATEWAY_TIMEOUT,
+                "Verification harness timed out",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::HarnessExecution,
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification harness could not run",
+            ),
+            (
+                temps_ai::CredentialVerificationStage::HarnessIncompatible,
+                temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification harness is incompatible",
+            ),
+        ];
+        for (stage, diagnostic, expected_status, expected_title) in cases {
+            let error = temps_ai::AiError::CredentialVerification {
+                provider: secret.into(),
+                stage,
+                diagnostic,
+            };
+            let (status, title, guidance) = credential_verification_failure(&error);
+            assert_eq!(status, expected_status);
+            assert_eq!(title, expected_title);
+            assert!(guidance.contains("could not validate this credential"));
+            assert!(guidance.contains("has not been classified as invalid"));
+            assert!(!guidance.contains(secret));
+            let (logged_stage, logged_diagnostic) = credential_verification_log_fields(&error);
+            assert_ne!(logged_stage, "service");
+            assert_ne!(logged_diagnostic, secret);
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_problem_response_is_sanitized_and_preserves_actionable_detail() {
+        let error = temps_ai::AiError::CredentialVerification {
+            provider: "candidate-secret-must-never-leak".into(),
+            stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
+            diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+        };
+        let response =
+            credential_verification_problem("codex_cli", "oauth", &error).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("problem body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 problem body");
+        assert!(body.contains("Verification relay unavailable"));
+        assert!(body.contains("could not validate this credential"));
+        assert!(body.contains("has not been classified as invalid"));
+        assert!(!body.contains("candidate-secret-must-never-leak"));
     }
 
     #[test]
@@ -1715,6 +1925,19 @@ mod tests {
                 "{purpose}"
             );
         }
+        let infrastructure_error = temps_ai::AiError::CredentialVerification {
+            provider: "opencode".into(),
+            stage: temps_ai::CredentialVerificationStage::SandboxStartup,
+            diagnostic: temps_ai::CredentialVerificationDiagnostic::OperationFailed,
+        };
+        assert!(opencode_probe_is_inconclusive(
+            "opencode",
+            &infrastructure_error
+        ));
+        assert!(!opencode_probe_is_inconclusive(
+            "codex_cli",
+            &infrastructure_error
+        ));
         for purpose in [
             "provider.credentials.verify.auth",
             "provider.credentials.verify.invalid",

@@ -34,7 +34,8 @@ pub use provider::{
     ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,
 };
 pub use service::{
-    AiError, AiRequest, AiResponse, AiService, NativeSessionExport, NativeSessionExportRequest,
+    AiError, AiRequest, AiResponse, AiService, CredentialVerificationDiagnostic,
+    CredentialVerificationStage, NativeSessionExport, NativeSessionExportRequest,
     RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest, RuntimeProcessResponse,
     RuntimeProcessSnapshot,
 };
