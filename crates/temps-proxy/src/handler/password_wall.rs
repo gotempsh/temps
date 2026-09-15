@@ -47,15 +47,15 @@ pub fn generate_password_form_html(
             "{{ERROR_INPUT_CLASS}}",
             if show_error { "input-error" } else { "" },
         )
-        .replace("{{REDIRECT_PATH}}", &html_escape(&redirect_path))
+        .replace("{{REDIRECT_PATH}}", &html_escape(redirect_path))
 }
 
 /// Reduce a client-supplied post-login destination to a same-origin
 /// absolute path. Anything else (absolute URLs, scheme-relative `//host`,
 /// backslashes, control characters, relative paths) becomes `/`, so the
 /// value is safe both as a `Location` header and inside the form.
-pub fn sanitize_redirect_path(redirect_path: &str) -> String {
-    temps_core::sanitize_preview_next(redirect_path)
+pub fn sanitize_redirect_path(redirect_path: &str) -> &str {
+    temps_core::sanitize_preview_next_ref(redirect_path)
 }
 
 fn html_escape(s: &str) -> String {

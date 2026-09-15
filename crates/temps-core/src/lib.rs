@@ -157,9 +157,9 @@ pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
 pub use encryption::EncryptionService;
 pub use preview_grant::{
-    encode_preview_session_grant, sanitize_preview_next, validate_preview_session_grant_envelope,
-    verify_preview_session_grant, PreviewGrantError, PREVIEW_SESSION_GRANT_MAX_TTL,
-    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+    encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
+    validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
+    PREVIEW_SESSION_GRANT_MAX_TTL, PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
 };
 pub use repo_config::*;
 pub use request_metadata::{

@@ -4761,7 +4761,9 @@ impl ProxyHttp for LoadBalancer {
 
                     // Guesses are limited per (client IP, environment) with
                     // the same sliding window as the sandbox preview login,
-                    // so the wall cannot be brute-forced. An unparsable
+                    // so the wall cannot be brute-forced. The attempt is
+                    // taken atomically before the password is checked, so a
+                    // concurrent burst cannot outrun the count. An unparsable
                     // client address shares one bucket rather than escaping
                     // the limit.
                     let client_ip = ctx
@@ -4769,10 +4771,9 @@ impl ProxyHttp for LoadBalancer {
                         .as_deref()
                         .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-                    let limiter_key = format!("pw_env_{env_id}");
-                    if self
+                    if !self
                         .preview_auth_limiter
-                        .is_blocked(client_ip, &limiter_key)
+                        .try_admit_password_wall(client_ip, env_id)
                     {
                         warn!(
                             environment_id = env_id,
@@ -4802,7 +4803,7 @@ impl ProxyHttp for LoadBalancer {
                     if crate::handler::password_wall::verify_password(password, &password_hash) {
                         // Password correct — set cookie and redirect
                         self.preview_auth_limiter
-                            .record_success(client_ip, &limiter_key);
+                            .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
                         let set_cookie = crate::handler::password_wall::build_set_cookie_header(
                             env_id,
@@ -4811,7 +4812,7 @@ impl ProxyHttp for LoadBalancer {
                         );
 
                         let mut resp = ResponseHeader::build(303, None)?;
-                        resp.insert_header("Location", redirect.as_str())?;
+                        resp.insert_header("Location", redirect)?;
                         resp.insert_header("Set-Cookie", &set_cookie)?;
                         resp.insert_header("Cache-Control", "no-store")?;
                         resp.insert_header("Referrer-Policy", "no-referrer")?;
@@ -4821,11 +4822,10 @@ impl ProxyHttp for LoadBalancer {
                         ctx.routing_status = "password_verified".to_string();
                         return Ok(true);
                     } else {
-                        // Wrong password — count the guess, show form again with error
-                        self.preview_auth_limiter
-                            .record_failure(client_ip, &limiter_key);
+                        // Wrong password — the attempt is already counted;
+                        // show the form again with an error
                         let html = crate::handler::password_wall::generate_password_form_html(
-                            &redirect,
+                            redirect,
                             true,
                             project_name,
                             environment_name,

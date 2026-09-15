@@ -359,10 +359,20 @@ struct LimiterAdmissionState {
     last_expiry_sweep: Instant,
 }
 
+/// What a limiter entry is about. Sandbox logins are keyed by the
+/// sandbox's hex label; environment password walls by the environment id,
+/// which needs no allocation per request and can never collide with a
+/// label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LimiterSubject {
+    Sandbox(String),
+    PasswordWall(i32),
+}
+
 /// In-memory rate limiter for preview auth failures.
 #[derive(Debug)]
 pub struct PreviewAuthLimiter {
-    failures: DashMap<(IpAddr, String), FailureState>,
+    failures: DashMap<(IpAddr, LimiterSubject), FailureState>,
     admission: Mutex<LimiterAdmissionState>,
 }
 
@@ -384,7 +394,9 @@ impl PreviewAuthLimiter {
 
     /// Returns `true` if the (ip, sandbox_hex) pair is currently rate-limited.
     pub fn is_blocked(&self, ip: IpAddr, hex: &str) -> bool {
-        let entry = self.failures.get(&(ip, hex.to_string()));
+        let entry = self
+            .failures
+            .get(&(ip, LimiterSubject::Sandbox(hex.to_string())));
         let Some(state) = entry else { return false };
         let Some(start) = state.window_start else {
             return false;
@@ -396,10 +408,33 @@ impl PreviewAuthLimiter {
     }
 
     pub fn record_failure(&self, ip: IpAddr, hex: &str) {
-        let key = (ip, hex.to_string());
+        self.bump((ip, LimiterSubject::Sandbox(hex.to_string())));
+    }
+
+    /// Atomically take one password-wall attempt for (ip, environment).
+    /// Returns `false` when the window's attempts are used up. The attempt
+    /// is counted before the caller verifies anything, so a burst of
+    /// concurrent guesses cannot all slip past a check that only looked at
+    /// failures recorded so far; a correct password then clears the entry
+    /// with [`Self::clear_password_wall`].
+    pub fn try_admit_password_wall(&self, ip: IpAddr, environment_id: i32) -> bool {
+        self.bump((ip, LimiterSubject::PasswordWall(environment_id))) <= MAX_FAILURES
+    }
+
+    /// Forget the password-wall attempts for (ip, environment) after a
+    /// successful login.
+    pub fn clear_password_wall(&self, ip: IpAddr, environment_id: i32) {
+        self.failures
+            .remove(&(ip, LimiterSubject::PasswordWall(environment_id)));
+    }
+
+    /// Count one attempt against `key` and return the count in the current
+    /// window. The read-modify-write happens under the entry's shard lock,
+    /// so concurrent callers see distinct, increasing counts.
+    fn bump(&self, key: (IpAddr, LimiterSubject)) -> u32 {
         if let Some(mut entry) = self.failures.get_mut(&key) {
             Self::increment_failure(&mut entry);
-            return;
+            return entry.count;
         }
 
         // Serialize admission of new keys so concurrent requests cannot race
@@ -412,7 +447,7 @@ impl PreviewAuthLimiter {
         let mut admission = self.admission.lock();
         if let Some(mut entry) = self.failures.get_mut(&key) {
             Self::increment_failure(&mut entry);
-            return;
+            return entry.count;
         }
 
         if self.failures.len() >= MAX_TRACKED_ENTRIES {
@@ -436,6 +471,7 @@ impl PreviewAuthLimiter {
                 window_start: Some(Instant::now()),
             },
         );
+        1
     }
 
     fn increment_failure(entry: &mut FailureState) {
@@ -452,7 +488,8 @@ impl PreviewAuthLimiter {
     }
 
     pub fn record_success(&self, ip: IpAddr, hex: &str) {
-        self.failures.remove(&(ip, hex.to_string()));
+        self.failures
+            .remove(&(ip, LimiterSubject::Sandbox(hex.to_string())));
     }
 
     /// Drop all entries whose window has expired. O(n), but only called when
@@ -1019,6 +1056,54 @@ mod tests {
         assert!(limiter.is_blocked(ip, "abc"));
         limiter.record_success(ip, "abc");
         assert!(!limiter.is_blocked(ip, "abc"));
+    }
+
+    #[test]
+    fn password_wall_admission_is_counted_before_the_guess() {
+        let limiter = PreviewAuthLimiter::new();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_admit_password_wall(ip, 7));
+        }
+        // The attempt after the window's allowance is refused even though
+        // no failure was ever recorded separately.
+        assert!(!limiter.try_admit_password_wall(ip, 7));
+        // Another environment and another address are independent.
+        assert!(limiter.try_admit_password_wall(ip, 8));
+        assert!(limiter.try_admit_password_wall("127.0.0.2".parse().unwrap(), 7));
+        // A sandbox label that spells the same digits is a different key.
+        assert!(!limiter.is_blocked(ip, "7"));
+        limiter.clear_password_wall(ip, 7);
+        assert!(limiter.try_admit_password_wall(ip, 7));
+    }
+
+    #[test]
+    fn password_wall_admission_holds_under_concurrent_guesses() {
+        use std::sync::Arc;
+        let limiter = Arc::new(PreviewAuthLimiter::new());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let admitted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                let admitted = Arc::clone(&admitted);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        if limiter.try_admit_password_wall(ip, 1) {
+                            admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::Relaxed),
+            MAX_FAILURES,
+            "exactly the window's allowance is admitted across threads"
+        );
     }
 
     #[test]
