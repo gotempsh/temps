@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, test, expect } from 'bun:test'
-import { mkdtemp, writeFile, readFile, stat, rm } from 'node:fs/promises'
+import { mkdtemp, chmod, stat, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -50,13 +50,13 @@ describe('SSH setup boundary', () => {
     const dir = await mkdtemp(join(tmpdir(), 'temps-setup-fresh-'))
     try {
       const fixture = join(dir, 'fixture.sh')
-      await writeFile(fixture, `echo private-installer-password\nprintf '%s' '${raw}' > '${dir}/setup-result.json'\n`)
+      await Bun.write(fixture, `echo private-installer-password\nprintf '%s' '${raw}' > '${dir}/setup-result.json'\n`)
       const script = `flock() { return 0; }\ncurl() { cp '${fixture}' "\${@: -1}"; }\n` + installScript(options).replaceAll('/root/.temps', dir)
       const result = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
       expect(result.status).toBe(0)
       expect(result.stdout).toBe(raw)
       expect(result.stderr).toBe('')
-      expect(await readFile(join(dir, 'cli-setup.log'), 'utf8')).toContain('private-installer-password')
+      expect(await Bun.file(join(dir, 'cli-setup.log')).text()).toContain('private-installer-password')
       expect((await stat(join(dir, 'cli-setup.log'))).mode & 0o777).toBe(0o600)
     } finally { await rm(dir, { recursive: true, force: true }) }
   })
@@ -205,17 +205,18 @@ describe('retry inspection', () => {
     const dir = await mkdtemp(join(tmpdir(), 'temps-setup-repair-'))
     try {
       const broken = '{interrupted'
-      await writeFile(join(dir, 'setup-result.json'), broken, { mode: 0o600 })
-      await writeFile(join(dir, 'cli-setup-selection'), 'quick:stable:latest')
+      await Bun.write(join(dir, 'setup-result.json'), broken)
+      await chmod(join(dir, 'setup-result.json'), 0o600)
+      await Bun.write(join(dir, 'cli-setup-selection'), 'quick:stable:latest')
       const inspection = spawnSync('bash', ['-s'], { input: INSPECT_RESULT_SCRIPT.replaceAll('/root/.temps', dir), encoding: 'utf8' })
       const snapshot = inspection.stdout.split('\n')[1]!
       const fixture = join(dir, 'fixture.sh')
-      await writeFile(fixture, `printf '%s' '${raw}' > '${dir}/setup-result.json'\n`)
+      await Bun.write(fixture, `printf '%s' '${raw}' > '${dir}/setup-result.json'\n`)
       const script = `flock() { return 0; }\ncurl() { cp '${fixture}' "\${@: -1}"; }\n` + installScript(options, snapshot).replaceAll('/root/.temps', dir)
       const result = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
       expect(result.status).toBe(0)
       expect(result.stdout).toBe(raw)
-      expect(await readFile(join(dir, 'setup-result.incomplete.json'), 'utf8')).toBe(broken)
+      expect(await Bun.file(join(dir, 'setup-result.incomplete.json')).text()).toBe(broken)
       const changed = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
       expect(changed.status).toBe(21)
     } finally { await rm(dir, { recursive: true, force: true }) }
