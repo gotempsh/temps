@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -30,6 +30,9 @@ const MAX_OUTPUT_TOKENS_PER_REQUEST: u64 = 32_768;
 const MAX_MODEL_RESPONSE_BYTES_PER_REQUEST: u64 = 16 * 1024 * 1024;
 const MAX_MODEL_RESPONSE_BYTES_PER_TURN: u64 = 64 * 1024 * 1024;
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
+const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const ANTHROPIC_REQUEST_HEADERS: &[&str] = &[
     "accept",
     "anthropic-beta",
@@ -449,18 +452,9 @@ impl SandboxModelRelayService {
             RelayRequestKind::CodexModels => bytes.to_vec(),
         };
         let url = upstream_url(&request_kind, &credential, normalized_path, query)?;
-        let mut request = self.client.request(method, url).body(bytes);
-        let allowed_headers = match request_kind {
-            RelayRequestKind::Anthropic => ANTHROPIC_REQUEST_HEADERS,
-            RelayRequestKind::CodexResponse | RelayRequestKind::CodexModels => {
-                CODEX_REQUEST_HEADERS
-            }
-        };
-        for name in allowed_headers {
-            if let Some(value) = headers.get(*name) {
-                request = request.header(*name, value);
-            }
-        }
+        let request = self.client.request(method, url).body(bytes);
+        let mut request =
+            apply_forwarded_request_headers(request, &request_kind, &credential, &headers)?;
         request = match credential {
             RequestCredential::AnthropicApiKey(value) => request.header("x-api-key", value),
             RequestCredential::ClaudeOauthToken(value) => {
@@ -845,6 +839,87 @@ enum RequestCredential {
     },
 }
 
+fn apply_forwarded_request_headers(
+    mut request: reqwest::RequestBuilder,
+    request_kind: &RelayRequestKind,
+    credential: &RequestCredential,
+    headers: &HeaderMap,
+) -> Result<reqwest::RequestBuilder, RelayError> {
+    let allowed_headers = match request_kind {
+        RelayRequestKind::Anthropic => ANTHROPIC_REQUEST_HEADERS,
+        RelayRequestKind::CodexResponse | RelayRequestKind::CodexModels => CODEX_REQUEST_HEADERS,
+    };
+    for name in allowed_headers {
+        if *name == ANTHROPIC_BETA_HEADER
+            && matches!(credential, RequestCredential::ClaudeOauthToken(_))
+        {
+            continue;
+        }
+        if let Some(value) = headers.get(*name) {
+            request = request.header(*name, value);
+        }
+    }
+
+    if matches!(
+        (request_kind, credential),
+        (
+            RelayRequestKind::Anthropic,
+            RequestCredential::ClaudeOauthToken(_)
+        )
+    ) {
+        request = request.header(ANTHROPIC_BETA_HEADER, claude_oauth_beta_header(headers)?);
+    }
+
+    if matches!(
+        (request_kind, credential),
+        (
+            RelayRequestKind::CodexResponse,
+            RequestCredential::CodexChatGpt { .. }
+        )
+    ) && has_single_exact_header_value(headers, CODEX_RESPONSES_LITE_HEADER, b"true")
+    {
+        request = request.header(CODEX_RESPONSES_LITE_HEADER, "true");
+    }
+
+    // `x-codex-beta-features` is intentionally not forwarded. It is not
+    // required to authenticate Responses Lite, and accepting sandbox-chosen
+    // feature flags would expand the upstream protocol surface without a
+    // server-controlled allowlist of supported features.
+    Ok(request)
+}
+
+fn claude_oauth_beta_header(headers: &HeaderMap) -> Result<HeaderValue, RelayError> {
+    let mut beta_values = Vec::new();
+    for value in headers.get_all(ANTHROPIC_BETA_HEADER) {
+        let value = value
+            .to_str()
+            .map_err(|_| RelayError::InvalidProviderHeader {
+                name: ANTHROPIC_BETA_HEADER,
+            })?;
+        beta_values.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if !beta_values.iter().any(|value| value == CLAUDE_OAUTH_BETA) {
+        beta_values.push(CLAUDE_OAUTH_BETA.to_string());
+    }
+    HeaderValue::from_str(&beta_values.join(",")).map_err(|_| RelayError::InvalidProviderHeader {
+        name: ANTHROPIC_BETA_HEADER,
+    })
+}
+
+fn has_single_exact_header_value(headers: &HeaderMap, name: &str, expected: &[u8]) -> bool {
+    let mut values = headers.get_all(name).iter();
+    matches!(
+        (values.next(), values.next()),
+        (Some(value), None) if value.as_bytes() == expected
+    )
+}
+
 pub(crate) struct SandboxModelRelayGuard {
     entries: Arc<Mutex<HashMap<String, RelayEntry>>>,
     relay_id: String,
@@ -898,6 +973,8 @@ enum RelayError {
     RequestTooLarge,
     #[error("sandbox model relay request body must be a JSON object")]
     InvalidJson,
+    #[error("sandbox model relay received an invalid provider header '{name}'")]
+    InvalidProviderHeader { name: &'static str },
     #[error("sandbox model relay exhausted its per-turn request budget")]
     RequestBudgetExhausted,
     #[error("sandbox model relay concurrency limit reached")]
@@ -914,7 +991,9 @@ impl IntoResponse for RelayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::PathNotAllowed => StatusCode::NOT_FOUND,
-            Self::QueryNotAllowed | Self::ModelNotSelected => StatusCode::BAD_REQUEST,
+            Self::QueryNotAllowed | Self::ModelNotSelected | Self::InvalidProviderHeader { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             Self::CredentialMismatch => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InvalidJson => StatusCode::BAD_REQUEST,
@@ -1429,6 +1508,220 @@ mod tests {
             ),
             Err(RelayError::QueryNotAllowed)
         ));
+    }
+
+    #[test]
+    fn claude_oauth_adds_required_beta_without_dropping_cli_betas() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static("claude-code-20250219,interleaved-thinking-2025-05-14"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sandbox-controlled"),
+        );
+        let credential = RequestCredential::ClaudeOauthToken("host-token".to_string());
+
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &credential,
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[ANTHROPIC_BETA_HEADER],
+            "claude-code-20250219,interleaved-thinking-2025-05-14,oauth-2025-04-20"
+        );
+        assert!(!request.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn claude_oauth_deduplicates_the_required_beta() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static("claude-code-20250219, oauth-2025-04-20"),
+        );
+        headers.append(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        let credential = RequestCredential::ClaudeOauthToken("host-token".to_string());
+
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &credential,
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let beta = request.headers()[ANTHROPIC_BETA_HEADER].to_str().unwrap();
+
+        assert_eq!(
+            beta,
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+        );
+        assert_eq!(beta.matches(CLAUDE_OAUTH_BETA).count(), 1);
+    }
+
+    #[test]
+    fn claude_oauth_rejects_non_text_beta_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_bytes(&[0x80]).unwrap(),
+        );
+        let credential = RequestCredential::ClaudeOauthToken("host-token".to_string());
+
+        let result = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &credential,
+            &headers,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RelayError::InvalidProviderHeader {
+                name: ANTHROPIC_BETA_HEADER
+            })
+        ));
+    }
+
+    #[test]
+    fn anthropic_api_key_beta_headers_are_unchanged() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        let credential = RequestCredential::AnthropicApiKey("host-key".to_string());
+
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/v1/messages"),
+            &RelayRequestKind::Anthropic,
+            &credential,
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[ANTHROPIC_BETA_HEADER],
+            "claude-code-20250219"
+        );
+        assert!(!request.headers()[ANTHROPIC_BETA_HEADER]
+            .to_str()
+            .unwrap()
+            .contains(CLAUDE_OAUTH_BETA));
+    }
+
+    #[test]
+    fn codex_chatgpt_preserves_only_the_exact_responses_lite_signal() {
+        let credential = RequestCredential::CodexChatGpt {
+            access_token: "access-token".to_string(),
+            account_id: "account-id".to_string(),
+        };
+        for (value, expected) in [("true", true), ("TRUE", false), ("false", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CODEX_RESPONSES_LITE_HEADER,
+                HeaderValue::from_str(value).unwrap(),
+            );
+
+            let request = apply_forwarded_request_headers(
+                reqwest::Client::new().post("https://example.test/responses"),
+                &RelayRequestKind::CodexResponse,
+                &credential,
+                &headers,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+            assert_eq!(
+                request.headers().contains_key(CODEX_RESPONSES_LITE_HEADER),
+                expected,
+                "unexpected forwarding decision for {value}"
+            );
+        }
+
+        let mut duplicate_headers = HeaderMap::new();
+        duplicate_headers.append(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        duplicate_headers.append(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/responses"),
+            &RelayRequestKind::CodexResponse,
+            &credential,
+            &duplicate_headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!request.headers().contains_key(CODEX_RESPONSES_LITE_HEADER));
+    }
+
+    #[test]
+    fn codex_subscription_headers_are_isolated_by_credential_and_route() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            "x-codex-beta-features",
+            HeaderValue::from_static("remote_compaction_v2"),
+        );
+        let api_key = RequestCredential::OpenAiApiKey("api-key".to_string());
+        let api_key_request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://example.test/responses"),
+            &RelayRequestKind::CodexResponse,
+            &api_key,
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!api_key_request
+            .headers()
+            .contains_key(CODEX_RESPONSES_LITE_HEADER));
+        assert!(!api_key_request
+            .headers()
+            .contains_key("x-codex-beta-features"));
+
+        let subscription = RequestCredential::CodexChatGpt {
+            access_token: "access-token".to_string(),
+            account_id: "account-id".to_string(),
+        };
+        let models_request = apply_forwarded_request_headers(
+            reqwest::Client::new().get("https://example.test/models"),
+            &RelayRequestKind::CodexModels,
+            &subscription,
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!models_request
+            .headers()
+            .contains_key(CODEX_RESPONSES_LITE_HEADER));
+        assert!(!models_request
+            .headers()
+            .contains_key("x-codex-beta-features"));
     }
 
     #[test]
