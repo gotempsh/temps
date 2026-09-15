@@ -1233,6 +1233,7 @@ pub struct ConsoleApiParams {
     /// not to apply. Do not treat this as a second precedent for adding
     /// further objects to the shared-slot pattern without their own review.
     pub project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
+    pub request_policy_gate_slot: Arc<temps_core::RequestPolicyGateSlot>,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -2180,6 +2181,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
         project_ip_gate_slot,
+        request_policy_gate_slot,
         update_status,
         self_updater,
         traefik_discovery,
@@ -2307,6 +2309,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 0022) for why this is flagged for security review rather than a
     // routine addition.
     service_context.register_service(project_ip_gate_slot.clone());
+    service_context.register_service(request_policy_gate_slot.clone());
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.

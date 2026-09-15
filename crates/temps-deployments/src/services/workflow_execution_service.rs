@@ -5,10 +5,10 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
+use chrono::Timelike;
 use futures::StreamExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set,
+    sea_query::Expr, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
 use temps_core::{
@@ -54,6 +54,26 @@ fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String
         "{RETAINED_CLEANUP_RETRY_PREFIX}{}",
         at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     )
+}
+
+fn cleanup_snapshot_condition(
+    container: &temps_entities::deployment_containers::Model,
+) -> Condition {
+    use temps_entities::deployment_containers;
+
+    let status_condition = match &container.status {
+        Some(status) => deployment_containers::Column::Status.eq(status.clone()),
+        None => deployment_containers::Column::Status.is_null(),
+    };
+    let deleted_condition = match container.deleted_at {
+        Some(deleted_at) => deployment_containers::Column::DeletedAt.eq(deleted_at),
+        None => deployment_containers::Column::DeletedAt.is_null(),
+    };
+
+    Condition::all()
+        .add(deployment_containers::Column::Id.eq(container.id))
+        .add(status_condition)
+        .add(deleted_condition)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2982,20 +3002,22 @@ impl WorkflowExecutionService {
     async fn teardown_registered_container(
         &self,
         container: temps_entities::deployment_containers::Model,
-    ) -> Result<String, WorkflowExecutionError> {
+        retry_failed_cleanup: bool,
+    ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
         let container_id = container.container_id.clone();
         let node_id = container.node_id;
         let original_status = container.status.clone();
-        let was_retained = original_status
-            .as_deref()
-            .is_some_and(|status| status.starts_with("retained:"));
+        let rotate_retry = retry_failed_cleanup
+            || original_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("retained:"));
         let deployer = match self.teardown_deployer_for_node(container.node_id).await {
             Ok(deployer) => deployer,
-            Err(error) if was_retained => {
+            Err(error) if rotate_retry => {
                 if let Err(rotation_error) = self
-                    .rotate_retained_cleanup_retry(&container, &container_id)
+                    .rotate_retained_cleanup_retry(&container, &container_id, None)
                     .await
                 {
                     return Err(WorkflowExecutionError::JobCreationFailed(format!(
@@ -3009,10 +3031,36 @@ impl WorkflowExecutionService {
 
         // Mark deleted before stopping to prevent the independent health poll
         // from reporting an intentional shutdown as a crash.
-        let mut active_container: deployment_containers::ActiveModel = container.clone().into();
-        active_container.deleted_at = Set(Some(chrono::Utc::now()));
-        active_container.status = Set(Some("deleted".to_string()));
-        active_container.update(self.db.as_ref()).await?;
+        // PostgreSQL stores this column at microsecond precision. Normalize the
+        // claim before writing it so the failure CAS below compares exactly.
+        let now = chrono::Utc::now();
+        let claim_at = now
+            .with_nanosecond((now.nanosecond() / 1_000) * 1_000)
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to create cleanup claim timestamp for container {container_id}"
+                ))
+            })?;
+        let claim = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(Some(claim_at)),
+            )
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(Some("deleted".to_string())),
+            )
+            .filter(cleanup_snapshot_condition(&container))
+            .exec(self.db.as_ref())
+            .await?;
+        if claim.rows_affected == 0 {
+            debug!(
+                container_id = %container_id,
+                container_row_id = container.id,
+                "Skipped cleanup because another task already claimed the container"
+            );
+            return Ok(None);
+        }
 
         if let Err(error) = deployer.stop_container(&container_id).await {
             warn!(
@@ -3028,14 +3076,27 @@ impl WorkflowExecutionService {
                 // Retained failures receive a timestamped, lexically-last state,
                 // which moves them behind unattempted rows and rotates retries
                 // fairly inside the bounded cleanup window.
-                if was_retained {
-                    self.rotate_retained_cleanup_retry(&container, &container_id)
+                if rotate_retry {
+                    self.rotate_retained_cleanup_retry(&container, &container_id, Some(claim_at))
                         .await?;
                 } else {
-                    let mut restore: deployment_containers::ActiveModel = container.into();
-                    restore.deleted_at = Set(None);
-                    restore.status = Set(original_status);
-                    restore.update(self.db.as_ref()).await?;
+                    let claimed = deployment_containers::Model {
+                        deleted_at: Some(claim_at),
+                        status: Some("deleted".to_string()),
+                        ..container
+                    };
+                    deployment_containers::Entity::update_many()
+                        .col_expr(
+                            deployment_containers::Column::DeletedAt,
+                            Expr::value(None::<chrono::DateTime<chrono::Utc>>),
+                        )
+                        .col_expr(
+                            deployment_containers::Column::Status,
+                            Expr::value(original_status),
+                        )
+                        .filter(cleanup_snapshot_condition(&claimed))
+                        .exec(self.db.as_ref())
+                        .await?;
                 }
                 return Err(WorkflowExecutionError::JobCreationFailed(format!(
                     "Failed to remove container {container_id} from node {:?}: {error}",
@@ -3044,24 +3105,42 @@ impl WorkflowExecutionService {
             }
         }
 
-        Ok(container_id)
+        Ok(Some(container_id))
     }
 
     async fn rotate_retained_cleanup_retry(
         &self,
         container: &temps_entities::deployment_containers::Model,
         container_id: &str,
+        claim_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
-        let mut retry: deployment_containers::ActiveModel = container.clone().into();
-        retry.deleted_at = Set(None);
-        retry.status = Set(Some(retained_cleanup_retry_status()));
-        retry.update(self.db.as_ref()).await.map_err(|error| {
-            WorkflowExecutionError::JobCreationFailed(format!(
-                "Failed to persist a later cleanup attempt for retained container {container_id}: {error}"
-            ))
-        })?;
+        let expected = match claim_at {
+            Some(claim_at) => deployment_containers::Model {
+                deleted_at: Some(claim_at),
+                status: Some("deleted".to_string()),
+                ..container.clone()
+            },
+            None => container.clone(),
+        };
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(None::<chrono::DateTime<chrono::Utc>>),
+            )
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(Some(retained_cleanup_retry_status())),
+            )
+            .filter(cleanup_snapshot_condition(&expected))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to persist a later cleanup attempt for retained container {container_id}: {error}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -3139,29 +3218,30 @@ impl WorkflowExecutionService {
             );
 
             for container in containers {
-                match self.teardown_registered_container(container).await {
-                    Ok(container_id) => {
+                match self.teardown_registered_container(container, false).await {
+                    Ok(Some(container_id)) => {
                         info!("Removed container {}", container_id);
                         if first_stopped_container_id.is_none() {
                             first_stopped_container_id = Some(container_id);
                         }
                         total_containers_cleaned += 1;
                     }
+                    Ok(None) => {}
                     Err(error) => warn!("Failed to teardown previous container: {error}"),
                 }
             }
         }
 
-        // Failed candidates are deliberately kept for debugging. Query their
-        // live rows directly rather than applying the active-deployment cap.
-        // The per-sweep limit below bounds latency, and status ordering gives
-        // unattempted rows priority while timestamped retry rows rotate fairly.
+        // Failed candidates include legacy rows without a retained status and
+        // rows left by unsuccessful failure cleanup. Ownership and deployment
+        // state determine eligibility, not the container status. Keep failure
+        // history intact while removing these containers after a newer success.
+        // Prioritize unattempted rows, then rotate timestamped retries fairly.
         const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
         const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
         let retained_failed = deployment_containers::Entity::find()
             .find_also_related(deployments::Entity)
             .filter(deployment_containers::Column::DeletedAt.is_null())
-            .filter(deployment_containers::Column::Status.starts_with("retained:"))
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(deployments::Column::State.eq("failed"))
@@ -3174,6 +3254,17 @@ impl WorkflowExecutionService {
                             .add(deployments::Column::Id.lt(current_deployment.id)),
                     ),
             )
+            .order_by_asc(sea_orm::sea_query::SimpleExpr::Case(Box::new(
+                sea_orm::sea_query::Expr::case(
+                    sea_orm::sea_query::Expr::col((
+                        deployment_containers::Entity,
+                        deployment_containers::Column::Status,
+                    ))
+                    .like(format!("{RETAINED_CLEANUP_RETRY_PREFIX}%")),
+                    1,
+                )
+                .finally(0),
+            )))
             .order_by_asc(deployment_containers::Column::Status)
             .order_by_asc(deployment_containers::Column::Id)
             .limit(MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT)
@@ -3190,7 +3281,7 @@ impl WorkflowExecutionService {
         let cleanup_results = futures::stream::iter(
             retained_failed
                 .into_iter()
-                .map(|(container, _)| self.teardown_registered_container(container)),
+                .map(|(container, _)| self.teardown_registered_container(container, true)),
         )
         .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -3198,13 +3289,14 @@ impl WorkflowExecutionService {
 
         for result in cleanup_results {
             match result {
-                Ok(container_id) => {
+                Ok(Some(container_id)) => {
                     info!("Removed retained failed container {}", container_id);
                     if first_stopped_container_id.is_none() {
                         first_stopped_container_id = Some(container_id);
                     }
                     total_containers_cleaned += 1;
                 }
+                Ok(None) => {}
                 Err(error) => warn!("Failed to teardown retained failed container: {error}"),
             }
         }
@@ -4378,6 +4470,8 @@ mod tests {
     /// independent poll loop (see the comment in `teardown_previous_deployment`).
     struct AssertDeletedBeforeStopDeployer {
         db: Arc<DbConnection>,
+        fail_remove_container: Option<&'static str>,
+        remove_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -4432,8 +4526,15 @@ mod tests {
 
         async fn remove_container(
             &self,
-            _container_id: &str,
+            container_id: &str,
         ) -> Result<(), temps_deployer::DeployerError> {
+            self.remove_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_remove_container == Some(container_id) {
+                return Err(temps_deployer::DeployerError::Other(format!(
+                    "deterministic removal failure for {container_id}"
+                )));
+            }
             Ok(())
         }
 
@@ -4480,6 +4581,10 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use temps_entities::{deployment_containers, nodes};
 
+        if !docker_available().await {
+            eprintln!("Skipping container teardown integration test: Docker unavailable");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -4542,6 +4647,27 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // Older failed deployments and interrupted cleanup need not have the
+        // retained prefix. They must still be selected by the failure sweep.
+        let mut legacy_containers = Vec::new();
+        for (index, status) in [None, Some("running"), Some("exited")]
+            .into_iter()
+            .enumerate()
+        {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(failed_deployment.id),
+                container_id: Set(format!("legacy-failed-{index}")),
+                container_name: Set(format!("legacy-failed-{index}")),
+                container_port: Set(3000),
+                status: Set(status.map(str::to_string)),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            legacy_containers.push(container);
+        }
+
         // A remote retained row whose deployer cannot be constructed must move
         // into the retry rotation. Otherwise twenty unavailable workers can
         // permanently starve every newer diagnostic container.
@@ -4567,6 +4693,34 @@ mod tests {
             container_port: Set(3000),
             status: Set(Some("retained:failed-readiness".to_string())),
             node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let legacy_retry_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("legacy-remote-failure".to_string()),
+            container_name: Set("legacy-remote-failure".to_string()),
+            container_port: Set(3000),
+            status: Set(None),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Exercise the Docker removal error path for a legacy failed row. It
+        // must become eligible for a later retry after owning the cleanup
+        // claim, rather than remaining hidden behind the pre-stop marker.
+        let legacy_remove_error = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("legacy-remove-error".to_string()),
+            container_name: Set("legacy-remove-error".to_string()),
+            container_port: Set(3000),
+            status: Set(None),
             deployed_at: Set(Utc::now()),
             ..Default::default()
         }
@@ -4605,7 +4759,12 @@ mod tests {
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
-        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer { db: db.clone() });
+        let remove_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer {
+            db: db.clone(),
+            fail_remove_container: Some("legacy-remove-error"),
+            remove_calls: remove_calls.clone(),
+        });
         let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
@@ -4667,6 +4826,103 @@ mod tests {
             "deployer lookup failures must rotate instead of starving cleanup: {:?}",
             retry_refreshed.status
         );
+
+        let legacy_retry = deployment_containers::Entity::find_by_id(legacy_retry_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("legacy retry row remains");
+        assert!(legacy_retry.deleted_at.is_none());
+        assert!(
+            legacy_retry
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "legacy removal failures must remain eligible and rotate behind unattempted rows"
+        );
+
+        let legacy_remove_error = deployment_containers::Entity::find_by_id(legacy_remove_error.id)
+            .one(db.as_ref())
+            .await?
+            .expect("legacy removal failure row remains");
+        assert!(legacy_remove_error.deleted_at.is_none());
+        assert!(
+            legacy_remove_error
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "an actual legacy remove error must rotate into a later cleanup attempt"
+        );
+
+        // Model a stale task that selected the same retained row before this
+        // task successfully removed it. Its later retry write must compare the
+        // original snapshot and leave the winning deleted marker intact.
+        let stale_snapshot = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("stale-cleanup-race".to_string()),
+            container_name: Set("stale-cleanup-race".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let first_result = service
+            .teardown_registered_container(stale_snapshot.clone(), true)
+            .await?;
+        assert_eq!(first_result, Some(stale_snapshot.container_id.clone()));
+        let calls_after_winner = remove_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let stale_result = service
+            .teardown_registered_container(stale_snapshot.clone(), true)
+            .await?;
+        assert_eq!(stale_result, None);
+        assert_eq!(
+            remove_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_winner,
+            "a stale snapshot that loses the claim must not call the container runtime"
+        );
+
+        let winning_row = deployment_containers::Entity::find_by_id(stale_snapshot.id)
+            .one(db.as_ref())
+            .await?
+            .expect("winning cleanup row remains for history");
+        let winning_claim = winning_row
+            .deleted_at
+            .expect("winning cleanup persisted its claim");
+        let stale_claim = winning_claim - chrono::Duration::microseconds(1);
+        service
+            .rotate_retained_cleanup_retry(
+                &stale_snapshot,
+                &stale_snapshot.container_id,
+                Some(stale_claim),
+            )
+            .await?;
+        let race_winner = deployment_containers::Entity::find_by_id(stale_snapshot.id)
+            .one(db.as_ref())
+            .await?
+            .expect("successfully removed row remains for history");
+        assert!(
+            race_winner.deleted_at.is_some(),
+            "a stale retry must not resurrect a container removed by a competing cleanup"
+        );
+        assert_eq!(race_winner.status.as_deref(), Some("deleted"));
+
+        for legacy in legacy_containers {
+            let refreshed = deployment_containers::Entity::find_by_id(legacy.id)
+                .one(db.as_ref())
+                .await?
+                .expect("legacy row remains for history");
+            assert!(
+                refreshed.deleted_at.is_some(),
+                "legacy failed container {} was skipped",
+                legacy.container_id
+            );
+        }
+        let failed_after = deployments::Entity::find_by_id(failed_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("failure history remains");
+        assert_eq!(failed_after.state, "failed");
 
         let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
             .one(db.as_ref())

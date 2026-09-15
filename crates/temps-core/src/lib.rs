@@ -34,6 +34,7 @@ pub mod public_hostname_resolver;
 pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
+pub mod request_policy_gate;
 /// Immutable image references embedded at compile time in official releases.
 pub mod release_images {
     pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
@@ -113,6 +114,10 @@ pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
+pub use request_policy_gate::{
+    OpenRequestPolicyGate, RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate,
+    RequestPolicyGateSlot,
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,

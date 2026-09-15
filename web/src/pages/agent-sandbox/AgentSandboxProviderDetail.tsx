@@ -11,10 +11,8 @@ import {
   CheckCircle2,
   Download,
   Loader2,
-  Play,
   RefreshCw,
   Save,
-  XCircle,
 } from 'lucide-react'
 
 import {
@@ -41,7 +39,6 @@ import {
   activateAiProvider,
   saveAiProviderCredential,
   verifySavedAiProviderCredential,
-  smokeTestAgent,
   updateAiProvider,
   type ProviderCatalogDto,
   type ProviderCatalogResponse,
@@ -49,7 +46,6 @@ import {
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import {
   harnessSetupHref,
-  harnessCheckError,
   harnessSetupStatus,
   workspaceReturnTo,
   credentialVerificationMessage,
@@ -59,6 +55,7 @@ import {
   refreshAiProviderModelsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail } from '@/lib/api-problem'
+import { HarnessPreflightChecks } from './HarnessPreflightChecks'
 import {
   aiProviderCatalogQueryOptions,
   publishVerifiedProvider,
@@ -206,6 +203,7 @@ export function ProviderEditor({
   const setCredential = (value: string) =>
     setCredentialDraft({ method: connectionMethod, value })
   const [savingCredential, setSaving] = useState(false)
+  const [diagnosticsRevision, setDiagnosticsRevision] = useState(0)
   const [credentialError, setCredentialError] = useState<string | null>(null)
   const [verificationModel, setVerificationModel] = useState(
     provider.default_model ?? ''
@@ -224,6 +222,7 @@ export function ProviderEditor({
       onVerificationPending?.(true)
     },
     onSuccess: async (data) => {
+      setDiagnosticsRevision((revision) => revision + 1)
       if (data.provider)
         await publishVerifiedProvider(queryClient, data.provider)
       toast.success(credentialVerificationMessage(data))
@@ -240,16 +239,6 @@ export function ProviderEditor({
   })
   const saving = savingCredential || verifySavedMutation.isPending
   const [activating, setActivating] = useState(false)
-  const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<{
-    passed: boolean
-    environment: string
-    cli_version?: string | null
-    auth_info?: string | null
-    setup_hint?: string | null
-    detail?: string | null
-  } | null>(null)
-
   const initialModel = provider.default_model ?? ''
   const [serverModel, setServerModel] = useState(initialModel)
   const [modelDraft, setModelDraft] = useState(initialModel)
@@ -350,7 +339,7 @@ export function ProviderEditor({
         throwOnError: true,
       })
       setServerModel(next)
-      setTestResult(null)
+      setDiagnosticsRevision((revision) => revision + 1)
       toast.success(
         next === ''
           ? `${provider.name} will use its default model`
@@ -413,36 +402,6 @@ export function ProviderEditor({
     }
   }
 
-  const handleTest = async () => {
-    setTesting(true)
-    setTestResult(null)
-    try {
-      const { data } = await smokeTestAgent({
-        path: { project_id: 0 },
-        query: { provider_id: provider.id },
-        throwOnError: true,
-      })
-      setTestResult(data)
-      if (data.passed) {
-        toast.success(`${provider.name} environment check passed`)
-      } else {
-        toast.error(`${provider.name} test failed`, {
-          description: data.setup_hint ?? 'See card for details',
-        })
-      }
-    } catch (e) {
-      const detail = harnessCheckError(e)
-      setTestResult({
-        passed: false,
-        environment: 'unknown',
-        setup_hint: detail,
-      })
-      toast.error('Environment check failed', { description: detail })
-    } finally {
-      setTesting(false)
-    }
-  }
-
   const handleSave = async () => {
     if (!credential.trim()) return
     setSaving(true)
@@ -460,7 +419,7 @@ export function ProviderEditor({
         },
         throwOnError: true,
       })
-      setTestResult(null)
+      setDiagnosticsRevision((revision) => revision + 1)
       if (data.provider) {
         await publishVerifiedProvider(queryClient, data.provider)
       } else {
@@ -502,8 +461,8 @@ export function ProviderEditor({
             ? { verification_model: verificationModel.trim() }
             : undefined,
       })
-      setTestResult(null)
       setSelectedFlavorId(imported.auth_type)
+      setDiagnosticsRevision((revision) => revision + 1)
       setCredential('')
       if (imported.provider) {
         await publishVerifiedProvider(queryClient, imported.provider)
@@ -907,73 +866,13 @@ export function ProviderEditor({
               </Tabs>
             </>
           )}
-          {!embedded && !usesConnectionCards && (
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                Optional: check the CLI installation and authentication in the
-                configured execution environment. This does not verify a reply
-                in your persistent workspace.
-              </p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void handleTest()}
-                disabled={testing || !provider.credential_saved}
-              >
-                {testing ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Play className="size-4" />
-                )}{' '}
-                {testing ? 'Checking…' : 'Check environment'}
-              </Button>
-            </div>
-          )}
-          {testResult && (
-            <div
-              role="status"
-              className={`rounded-md border p-3 text-xs space-y-1 ${
-                testResult.passed
-                  ? 'border-green-500/30 bg-green-500/5'
-                  : 'border-red-500/30 bg-red-500/5'
-              }`}
-            >
-              <div className="flex items-center gap-1.5 font-medium">
-                {testResult.passed ? (
-                  <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
-                ) : (
-                  <XCircle className="h-3.5 w-3.5 text-red-500" />
-                )}
-                {testResult.passed
-                  ? 'Environment check passed'
-                  : 'Environment check failed'}
-                <span className="text-muted-foreground font-normal">
-                  ({testResult.environment})
-                </span>
-              </div>
-              {testResult.cli_version && (
-                <p className="text-muted-foreground">
-                  Version:{' '}
-                  <code className="bg-muted px-1 rounded">
-                    {testResult.cli_version}
-                  </code>
-                </p>
-              )}
-              {testResult.auth_info && (
-                <p className="text-muted-foreground">
-                  Auth: {testResult.auth_info}
-                </p>
-              )}
-              {testResult.detail && (
-                <pre className="whitespace-pre-wrap break-words text-xs">
-                  {testResult.detail}
-                </pre>
-              )}
-              {testResult.setup_hint && (
-                <p className="text-muted-foreground">{testResult.setup_hint}</p>
-              )}
-            </div>
-          )}
+          <HarnessPreflightChecks
+            key={JSON.stringify([provider, diagnosticsRevision])}
+            providerId={provider.id}
+            model={provider.default_model}
+            credentialSaved={provider.credential_saved}
+            disabled={saving || savingModel}
+          />
         </CardContent>
       </Card>
 

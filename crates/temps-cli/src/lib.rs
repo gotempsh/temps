@@ -284,10 +284,27 @@ pub fn dispatch_with_ip_gate(
     extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ip_gate_builder: Option<commands::proxy::ProjectIpGateBuilder>,
 ) -> anyhow::Result<()> {
+    // Keep the original infallible callback contract source-compatible.
+    let ip_gate_builder = ip_gate_builder.map(|build| {
+        Box::new(move |db, handle: &tokio::runtime::Handle| Ok(build(db, handle)))
+            as commands::proxy::FallibleProjectIpGateBuilder
+    });
+    dispatch_with_request_policy_gate(cli, extra_plugins, ip_gate_builder, None)
+}
+
+/// Dispatch with both legacy IP and resolved-request policy builders for a standalone proxy.
+pub fn dispatch_with_request_policy_gate(
+    cli: Cli,
+    extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+    ip_gate_builder: Option<commands::proxy::FallibleProjectIpGateBuilder>,
+    request_policy_gate_builder: Option<commands::proxy::RequestPolicyGateBuilder>,
+) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
         Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
-        Commands::Proxy(proxy_cmd) => proxy_cmd.execute_with_ip_gate(ip_gate_builder),
+        Commands::Proxy(proxy_cmd) => {
+            proxy_cmd.execute_with_gates(ip_gate_builder, request_policy_gate_builder)
+        }
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::Migrate(migrate_cmd) => migrate_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
@@ -621,5 +638,21 @@ mod command_tree_tests {
                 "`temps {path} --help` did not render help: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ip_gate_dispatch_contract_tests {
+    use super::{commands, dispatch_with_ip_gate, Cli};
+
+    type LegacyDispatch = fn(
+        Cli,
+        Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+        Option<commands::proxy::ProjectIpGateBuilder>,
+    ) -> anyhow::Result<()>;
+
+    #[test]
+    fn legacy_dispatch_entrypoint_keeps_infallible_builder() {
+        let _: LegacyDispatch = dispatch_with_ip_gate;
     }
 }

@@ -717,6 +717,7 @@ impl ServeCommand {
         // retention_resolver_slot immediately above, flagged for security
         // review as an explicit exception rather than a second precedent.
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
+        let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
 
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -737,6 +738,7 @@ impl ServeCommand {
             admin_gate_handle: Some(admin_gate_handle.clone()),
             retention_resolver_slot: retention_resolver_slot.clone(),
             project_ip_gate_slot: project_ip_gate_slot.clone(),
+            request_policy_gate_slot: request_policy_gate_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
@@ -879,6 +881,7 @@ impl ServeCommand {
             Some(admin_gate_handle),
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
+            request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
         )
     }
 }

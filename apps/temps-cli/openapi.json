@@ -23012,6 +23012,118 @@
         ],
         "type": "object"
       },
+      "HarnessCheck": {
+        "properties": {
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HarnessCheckStatus"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status",
+          "detail",
+          "duration_ms"
+        ],
+        "type": "object"
+      },
+      "HarnessCheckMode": {
+        "enum": [
+          "preflight",
+          "smoke"
+        ],
+        "type": "string"
+      },
+      "HarnessCheckOverall": {
+        "enum": [
+          "passed",
+          "warning",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "HarnessCheckReport": {
+        "properties": {
+          "checked_at": {
+            "type": "string"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/HarnessCheck"
+            },
+            "type": "array"
+          },
+          "diagnostic_id": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/HarnessCheckMode"
+          },
+          "overall": {
+            "$ref": "#/components/schemas/HarnessCheckOverall"
+          },
+          "provider_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_id",
+          "mode",
+          "overall",
+          "checked_at",
+          "diagnostic_id",
+          "checks"
+        ],
+        "type": "object"
+      },
+      "HarnessCheckStatus": {
+        "enum": [
+          "passed",
+          "warning",
+          "failed",
+          "not_tested"
+        ],
+        "type": "string"
+      },
+      "HarnessSmokeRequest": {
+        "properties": {
+          "consent": {
+            "description": "Explicit acknowledgement that this check makes a billable model request.",
+            "type": "boolean"
+          },
+          "model": {
+            "description": "Optional catalog model identifier. It is validated by the provider adapter.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "consent"
+        ],
+        "type": "object"
+      },
       "HasAnalyticsEventsResponse": {
         "properties": {
           "has_events": {
@@ -109026,6 +109138,120 @@
           }
         ],
         "summary": "Refresh exactly one provider's account-aware model inventory. This is an\nexplicit operation because it starts a CLI process (and, for Claude\nworkspaces, creates or wakes the user's persistent sandbox). Authorization\ntherefore matches the provider's chat execution requirement instead of\nrequiring unrelated settings mutation access. The AI service applies a\nprovider-scoped single-flight and cooldown before doing that work.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/preflight": {
+      "post": {
+        "operationId": "run_ai_provider_preflight",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessCheckReport"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Unknown provider"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another diagnostic is running"
+          },
+          "503": {
+            "description": "Diagnostic unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/smoke": {
+      "post": {
+        "operationId": "run_ai_provider_smoke",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HarnessSmokeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessCheckReport"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Consent required or unknown provider"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another diagnostic is running"
+          },
+          "503": {
+            "description": "Diagnostic unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Agents"
         ]
