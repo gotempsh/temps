@@ -4,7 +4,7 @@
 import type { Command } from 'commander'
 import { createClient } from '../../api/client/index.js'
 import { getCurrentUser } from '../../api/sdk.gen.js'
-import { getContext, upsertContext } from '../../config/contexts.js'
+import { getContext, upsertContext, type CliContext } from '../../config/contexts.js'
 import { promptConfirm, promptText } from '../../ui/prompts.js'
 import { provision, runSsh, validateOptions, SetupError, type SetupOptions, type SetupResult } from './provision.js'
 import { setupTelemetry } from './telemetry.js'
@@ -18,16 +18,33 @@ export async function verifySetup(result: SetupResult, transport: typeof fetch =
         client, headers: { Authorization: `Bearer ${result.apiKey}` },
         redirect: 'error', signal: AbortSignal.timeout(5000),
       })
-        if (response?.status === 401 || response?.status === 403) {
+      if (response?.status === 401 || response?.status === 403) {
         throw new SetupError('verify', 'auth_failed', 'The installer API key was rejected. Renew it on the server before retrying; no context was saved.')
       }
       if (data?.email === result.email) return
+      if (data?.email) throw new SetupError('verify', 'identity_mismatch', 'The authenticated user does not match the installer admin email. Check the bootstrap credentials on the server; no context was saved.')
     } catch (error) {
       if (error instanceof SetupError) throw error
     }
     if (attempt < 5) await new Promise(resolve => setTimeout(resolve, 2000))
   }
   throw new SetupError('verify', 'unreachable', `Could not verify HTTPS and authentication at ${result.url}. Check DNS, certificates and inbound port 443. Installation remains on the server; rerun setup after fixing access.`)
+}
+
+export function assertSetupContext(name: string, current: CliContext | null, result: SetupResult | undefined): void {
+  if (current && (!result || current.url.replace(/\/api\/?$/, '').replace(/\/$/, '') !== result.url)) {
+    throw new SetupError('preflight', 'context_conflict', `Context ${name} cannot be matched to this server. Rerun with a different --context; existing credentials were preserved.`)
+  }
+}
+
+export function refreshedContext(name: string, current: CliContext | null, result: SetupResult): CliContext {
+  assertSetupContext(name, current, result)
+  return {
+    ...current, name, url: result.url, apiKey: result.apiKey, email: result.email,
+    // Expiry and prefix describe the key, so retain them only for that key.
+    keyPrefix: current?.apiKey === result.apiKey ? current.keyPrefix : undefined,
+    expiresAt: current?.apiKey === result.apiKey ? current.expiresAt : undefined,
+  }
 }
 
 interface CommandOptions extends SetupOptions { yes?: boolean; dryRun?: boolean; telemetry?: boolean }
@@ -46,7 +63,7 @@ export function registerSetupCommand(program: Command): void {
     .option('--telemetry', 'Opt in to coarse setup-step analytics for this attempt only')
     .option('--no-telemetry', 'Do not send setup analytics (default)')
     .option('-y, --yes', 'Approve the installation plan without prompting')
-    .addHelpText('after', '\nRequires a Linux VPS, key-based SSH, a trusted host key, root or passwordless sudo, curl and flock.\nQuickStart needs public inbound ports 80/443. Installer logs remain on the server and may contain secrets.\nRuntime telemetry is disabled for fresh installs in this PoC; --telemetry covers CLI setup only.\n')
+    .addHelpText('after', '\nRequires a Linux VPS, key-based SSH, a trusted host key, root or passwordless sudo, curl, flock and cksum.\nQuickStart needs public inbound ports 80/443. Installer logs remain on the server and may contain secrets.\nRuntime telemetry is disabled for fresh installs in this PoC; --telemetry covers CLI setup only.\n')
     .action(async (options: CommandOptions) => {
       if (!options.email) {
         if (!process.stdin.isTTY) throw new SetupError('preflight', 'missing_email', 'Provide --email for non-interactive setup.')
@@ -68,13 +85,11 @@ export function registerSetupCommand(program: Command): void {
       try {
         const result = await provision(options, {
           remote: (script, step) => runSsh(options, script, step),
+          beforeInstall: async result => assertSetupContext(options.context, await getContext(options.context), result),
           verify: result => verifySetup(result),
           save: async result => {
             const current = await getContext(options.context)
-            if (current && current.url.replace(/\/api\/?$/, '').replace(/\/$/, '') !== result.url) {
-              throw new SetupError('context', 'context_conflict', `Context ${options.context} points to another server. Rerun with a different --context; existing credentials were preserved.`)
-            }
-            await upsertContext({ name: options.context, url: result.url, apiKey: result.apiKey, email: result.email, isActive: current?.isActive }, { makeActive: false })
+            await upsertContext(refreshedContext(options.context, current, result), { makeActive: false })
           },
           event: (step, status) => {
             process.stderr.write(`${step}: ${status}\n`)

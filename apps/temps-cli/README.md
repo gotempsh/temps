@@ -27,7 +27,7 @@ bun run src/index.ts setup --ssh root@server.example --email admin@example.com -
 ```
 
 The target must have key-based SSH access, an already verified host key in your
-SSH configuration, root or passwordless sudo, and `curl` plus `flock` installed.
+SSH configuration, root or passwordless sudo, and `curl`, `flock`, and `cksum` installed.
 The PoC supports Linux x86_64/ARM64 and public QuickStart networking (ports 80/443).
 `--identity`, `--port`, `--channel`, and `--runtime-version` are supported.
 
@@ -36,12 +36,20 @@ Setup downloads the existing HTTPS installer at `https://temps.sh/deploy.sh`;
 a VPS or enroll a worker. It rejects unrecognized existing installations and
 checks common port conflicts. The installer owns dependency setup and its own
 durable wizard state. A remote lock prevents overlapping CLI setups. Repeating
-the command reuses `/root/.temps/setup-result.json` when present, verifies HTTPS
-and the API key, and saves an authenticated context. A result with broken TLS or
-missing credentials needs repair on the server before retrying.
+the command inspects `/root/.temps/setup-result.json` without modifying the server
+and checks context-name conflicts before installation. Valid matching results are
+reused after HTTPS and API-key verification. Incomplete CLI results are backed up
+and the installer resumes its wizard state. The requested release selection is
+recorded before installation; retries with another channel or version fail clearly.
+Setup is not an upgrade command. Legacy results must identify QuickStart and the
+same channel; legacy pins or unidentifiable state require server inspection.
+Rejected API keys or broken DNS/TLS still require operator repair.
 
 The selected context is not switched when another context already exists. A
-different server cannot overwrite a context with the same name. Deploy local
+different server cannot overwrite a context with the same name. If an existing
+context cannot be matched to a valid remote result, choose another context name
+before recovery. Refreshes preserve the default project and active selection;
+key metadata is retained for unchanged keys and cleared when the key changes. Deploy local
 source using the existing command:
 
 ```bash

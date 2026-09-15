@@ -6,12 +6,12 @@ import { mkdtemp, writeFile, readFile, stat, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { installScript, parseResult, provision, remoteCommand, validateOptions, type SetupOptions, type SetupDependencies } from './provision.js'
+import { INSPECT_RESULT_SCRIPT, installScript, parseResult, provision, remoteCommand, validateOptions, type SetupOptions, type SetupDependencies } from './provision.js'
 import { setupTelemetry } from './telemetry.js'
-import { verifySetup } from './index.js'
+import { verifySetup, assertSetupContext, refreshedContext } from './index.js'
 
 const options: SetupOptions = { ssh: 'root@server.example', email: 'admin@example.com', port: '22', context: 'test', channel: 'stable' }
-const raw = JSON.stringify({ status: 'ok', console_url: 'https://console.example.com', api_key: 'test-key-12345', admin_email: 'admin@example.com', admin_password: 'never-display-this' })
+const raw = JSON.stringify({ status: 'ok', mode: 'quick', channel: 'stable', console_url: 'https://console.example.com', api_key: 'test-key-12345', admin_email: 'admin@example.com', admin_password: 'never-display-this' })
 
 describe('SSH setup boundary', () => {
   test('rejects SSH options, shell syntax, invalid ports and installer flags', () => {
@@ -36,18 +36,6 @@ describe('SSH setup boundary', () => {
     }
     expect(() => parseResult('secret invalid response')).toThrow('Installer did not return')
     expect(() => parseResult(JSON.stringify({ ...JSON.parse(raw), api_key: null }))).toThrow()
-  })
-  test('completed remote setup reuses result without downloading or reinstalling', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'temps-setup-retry-'))
-    try {
-      await writeFile(join(dir, 'setup-result.json'), raw, { mode: 0o600 })
-      // Execute the actual generated script with only the fixed root path and
-      // Linux lock primitive adapted for this isolated macOS fixture.
-      const script = 'flock() { return 0; }\ncurl() { exit 91; }\n' + installScript(options).replaceAll('/root/.temps', dir)
-      const result = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
-      expect(result.status).toBe(0)
-      expect(result.stdout).toBe(raw)
-    } finally { await rm(dir, { recursive: true, force: true }) }
   })
   test('download failure cannot execute a partial installer', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'temps-setup-failure-'))
@@ -78,7 +66,7 @@ describe('setup workflow', () => {
   function fixture(fail?: string) {
     const calls: string[] = []
     const deps: SetupDependencies = {
-      remote: async (_, step) => { calls.push(step); if (fail === step) throw new Error('private remote error'); return step === 'install' ? raw : 'ready' },
+      remote: async (script, step) => { calls.push(step); if (fail === step) throw new Error('private remote error'); return script === INSPECT_RESULT_SCRIPT ? '\nabsent\n' : step === 'install' ? raw : 'ready' },
       verify: async () => { calls.push('verify'); if (fail === 'verify') throw new Error('secret key') },
       save: async () => { calls.push('save'); if (fail === 'context') throw new Error('disk full') },
       event: (step, status) => { calls.push(`${step}:${status}`) },
@@ -150,5 +138,86 @@ describe('authenticated readiness', () => {
   })
   test('rejects invalid credentials without surfacing a private response', async () => {
     await expect(verifySetup(parseResult(raw), (async () => Response.json({ secret: 'do-not-log' }, { status: 401 })) as unknown as typeof fetch)).rejects.toThrow('installer API key was rejected')
+  })
+})
+
+
+describe('setup context refresh', () => {
+  const result = parseResult(raw)
+  const current = { name: 'test', ...result, isActive: false, defaultProject: 'important-project', keyPrefix: 'test-key', expiresAt: '2027-01-01' }
+  test('retains project, active state and metadata for an unchanged key', () => {
+    expect(refreshedContext('test', current, result)).toEqual(current)
+  })
+  test('key rotation clears stale key metadata but preserves preferences', () => {
+    expect(refreshedContext('test', current, { ...result, apiKey: 'new-key-123' })).toEqual({ ...current, apiKey: 'new-key-123', keyPrefix: undefined, expiresAt: undefined })
+  })
+  test('rejects occupied names for fresh or different servers before install', () => {
+    expect(() => assertSetupContext('test', current, undefined)).toThrow('cannot be matched')
+    expect(() => assertSetupContext('test', current, { ...result, url: 'https://another.example' })).toThrow('cannot be matched')
+    expect(() => assertSetupContext('test', { ...current, url: result.url + '/api/' }, result)).not.toThrow()
+    expect(() => assertSetupContext('new', null, undefined)).not.toThrow()
+  })
+  test('reports authenticated identity mismatch immediately', async () => {
+    let calls = 0
+    await expect(verifySetup(result, (async () => { calls++; return Response.json({ email: 'other@example.com' }) }) as unknown as typeof fetch)).rejects.toThrow('does not match the installer admin email')
+    expect(calls).toBe(1)
+  })
+})
+
+
+describe('retry inspection', () => {
+  function workflow(inspection: string, beforeInstall?: SetupDependencies['beforeInstall']) {
+    const calls: string[] = []
+    return { calls, deps: {
+      remote: async (script: string, step: string) => { calls.push(step); return script === INSPECT_RESULT_SCRIPT ? inspection : step === 'install' ? raw : 'ready' },
+      beforeInstall,
+      verify: async () => {}, save: async () => {}, event: () => {},
+    } }
+  }
+  test('valid matching selection reuses completion without installing', async () => {
+    const { deps, calls } = workflow('quick:stable:latest\n123 456\n' + raw)
+    await provision(options, deps)
+    expect(calls).not.toContain('install')
+  })
+  test('incomplete CLI result resumes installer', async () => {
+    for (const value of ['', '{broken', '{}', JSON.stringify({ ...JSON.parse(raw), api_key: null })]) {
+      const { deps, calls } = workflow('quick:stable:latest\n123 456\n' + value)
+      await provision(options, deps)
+      expect(calls).toContain('install')
+    }
+  })
+  test('context guard runs before mutation on fresh servers', async () => {
+    const { deps, calls } = workflow('\nabsent\n', async result => assertSetupContext('test', { name: 'test', ...parseResult(raw) }, result))
+    await expect(provision(options, deps)).rejects.toThrow('cannot be matched')
+    expect(calls).not.toContain('install')
+  })
+  test('rejects changed selection and unknown legacy pins before installing', async () => {
+    for (const inspection of ['quick:beta:latest\n123 456\n' + raw, 'quick:stable:v0.1.0\n123 456\n' + raw, '\n123 456\n' + JSON.stringify({ ...JSON.parse(raw), mode: 'advanced' })]) {
+      const { deps, calls } = workflow(inspection)
+      await expect(provision(options, deps)).rejects.toThrow()
+      expect(calls).not.toContain('install')
+    }
+    const { deps, calls } = workflow('\n123 456\n' + raw)
+    await expect(provision({ ...options, runtimeVersion: 'v0.1.0' }, deps)).rejects.toThrow('Cannot establish')
+    expect(calls).not.toContain('install')
+  })
+  test('actual shell preserves broken result and refuses a stale snapshot', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'temps-setup-repair-'))
+    try {
+      const broken = '{interrupted'
+      await writeFile(join(dir, 'setup-result.json'), broken, { mode: 0o600 })
+      await writeFile(join(dir, 'cli-setup-selection'), 'quick:stable:latest')
+      const inspection = spawnSync('bash', ['-s'], { input: INSPECT_RESULT_SCRIPT.replaceAll('/root/.temps', dir), encoding: 'utf8' })
+      const snapshot = inspection.stdout.split('\n')[1]!
+      const fixture = join(dir, 'fixture.sh')
+      await writeFile(fixture, `printf '%s' '${raw}' > '${dir}/setup-result.json'\n`)
+      const script = `flock() { return 0; }\ncurl() { cp '${fixture}' "\${@: -1}"; }\n` + installScript(options, snapshot).replaceAll('/root/.temps', dir)
+      const result = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe(raw)
+      expect(await readFile(join(dir, 'setup-result.incomplete.json'), 'utf8')).toBe(broken)
+      const changed = spawnSync('bash', ['-s'], { input: script, encoding: 'utf8' })
+      expect(changed.status).toBe(21)
+    } finally { await rm(dir, { recursive: true, force: true }) }
   })
 })

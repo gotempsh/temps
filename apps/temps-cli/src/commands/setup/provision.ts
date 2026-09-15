@@ -70,7 +70,7 @@ export function remoteCommand(options: SetupOptions): string[] {
 export const PREFLIGHT_SCRIPT = `set -eu
 [ "$(uname -s)" = Linux ] || { echo unsupported_os; exit 10; }
 case "$(uname -m)" in x86_64|aarch64|arm64) ;; *) echo unsupported_arch; exit 11;; esac
-for tool in curl flock; do command -v "$tool" >/dev/null || { echo missing_prerequisite; exit 12; }; done
+for tool in curl flock cksum; do command -v "$tool" >/dev/null || { echo missing_prerequisite; exit 12; }; done
 if [ ! -f /root/.temps/setup-result.json ] && [ ! -d /root/.temps/.wizard-state ]; then
   if command -v temps >/dev/null || [ -e /root/.temps/data ] || systemctl cat temps >/dev/null 2>&1; then
     echo existing_installation; exit 13
@@ -82,7 +82,28 @@ fi
 echo ready
 `
 
-export function installScript(options: SetupOptions): string {
+// The first two lines are non-secret selection/snapshot metadata; the remainder
+// is the installer result. This inspection never creates files on the server.
+export const INSPECT_RESULT_SCRIPT = `set -eu
+if [ -f /root/.temps/cli-setup-selection ]; then
+  cat /root/.temps/cli-setup-selection
+elif [ -d /root/.temps/.wizard-state ] && [ ! -f /root/.temps/setup-result.json ]; then
+  printf 'legacy-unknown'
+fi
+printf '\n'
+if [ -f /root/.temps/setup-result.json ]; then
+  cksum < /root/.temps/setup-result.json
+  cat /root/.temps/setup-result.json
+else
+  printf 'absent\n'
+fi
+`
+
+function selection(options: SetupOptions): string {
+  return `quick:${options.channel}:${options.runtimeVersion ?? 'latest'}`
+}
+
+export function installScript(options: SetupOptions, snapshot = 'absent'): string {
   validateOptions(options)
   const flags = ['--mode', 'quick', '--email', options.email, '--yes', '--no-telemetry', '--channel', options.channel]
   if (options.runtimeVersion) flags.push('--version', options.runtimeVersion)
@@ -91,10 +112,17 @@ umask 077
 mkdir -p /root/.temps
 exec 9>/root/.temps/.cli-setup.lock
 flock -n 9 || { echo 'Setup is already running on this server.' >&2; exit 20; }
-# A completed installation is never reconfigured on retry.
+# Recheck the inspected result under the lock before any installation changes.
+actual=absent
+if [ -f /root/.temps/setup-result.json ]; then actual=$(cksum < /root/.temps/setup-result.json); fi
+[ "$actual" = ${quote(snapshot)} ] || { echo 'Setup result changed; retry inspection.' >&2; exit 21; }
+if [ -f /root/.temps/cli-setup-selection ]; then
+  [ "$(cat /root/.temps/cli-setup-selection)" = ${quote(selection(options))} ] || exit 22
+fi
+printf '%s' ${quote(selection(options))} > /root/.temps/cli-setup-selection
+# Preserve incomplete results for diagnosis; the wizard resumes its durable state.
 if [ -f /root/.temps/setup-result.json ]; then
-  cat /root/.temps/setup-result.json
-  exit 0
+  mv /root/.temps/setup-result.json /root/.temps/setup-result.incomplete.json
 fi
 installer=$(mktemp /root/.temps/cli-installer.XXXXXX)
 trap 'rm -f "$installer"' EXIT
@@ -139,13 +167,15 @@ export function runSsh(options: SetupOptions, script: string, step: SetupStep): 
         const preflightReasons: Record<number, string> = {
           10: 'This PoC requires Linux.',
           11: 'This PoC requires x86_64 or ARM64.',
-          12: 'Install curl and flock on the server, then retry.',
+          12: 'Install curl, flock and cksum on the server, then retry.',
           13: 'An existing installation was found without wizard state. Connect with temps login instead; no installation was changed.',
           14: 'A required port (80, 443, 5432 or 8080) is occupied. Choose a clean VPS or resolve the conflict; no service was stopped.',
         }
         if (step === 'preflight' && code !== null && preflightReasons[code]) {
           return reject(new SetupError(step, 'preflight_failed', preflightReasons[code]))
         }
+        if (code === 21) return reject(new SetupError(step, 'setup_changed', 'Server setup changed during inspection. Retry setup to inspect it again.'))
+        if (code === 22) return reject(new SetupError(step, 'selection_conflict', 'This server was set up with another runtime selection. Use the server upgrade workflow to change it.'))
         if (code === 20) return reject(new SetupError(step, 'setup_running', 'Another setup holds the server lock. Wait for it to finish, then retry.'))
         return reject(new SetupError(step, 'ssh_failed', `SSH ${step} failed (exit ${code}). Check trusted host keys, key authentication and passwordless sudo. For installation failures inspect /root/.temps/cli-setup.log on the server; rerun setup to resume.`))
       }
@@ -172,6 +202,7 @@ export function parseResult(raw: string): SetupResult {
 
 export interface SetupDependencies {
   remote(script: string, step: SetupStep): Promise<string>
+  beforeInstall?(result: SetupResult | undefined): Promise<void>
   verify(result: SetupResult): Promise<void>
   save(result: SetupResult): Promise<void>
   event(step: SetupStep, status: 'started' | 'completed' | 'failed'): void
@@ -183,10 +214,30 @@ export async function provision(options: SetupOptions, deps: SetupDependencies):
   try {
     deps.event(step, 'started')
     await deps.remote(PREFLIGHT_SCRIPT, step)
+    const inspection = await deps.remote(INSPECT_RESULT_SCRIPT, step)
+    const [recordedSelection, snapshot, ...resultLines] = inspection.split('\n')
+    if (!snapshot || !/^(absent|[0-9]+ +[0-9]+)$/.test(snapshot)) {
+      throw new SetupError('preflight', 'invalid_inspection', 'Could not inspect existing server setup; no installation was changed.')
+    }
+    const cachedRaw = resultLines.join('\n')
+    if (recordedSelection && recordedSelection !== selection(options)) {
+      throw new SetupError('preflight', 'selection_conflict', 'This server uses another runtime selection. Setup does not upgrade or reconfigure existing installations; use the server upgrade workflow.')
+    }
+    let cached: SetupResult | undefined
+    let metadata: { mode?: string; channel?: string } | undefined
+    try { metadata = JSON.parse(cachedRaw) } catch { /* Incomplete result: resume installer. */ }
+    if (metadata && ((metadata.mode !== undefined && metadata.mode !== 'quick') || (metadata.channel !== undefined && metadata.channel !== options.channel))) {
+      throw new SetupError('preflight', 'selection_conflict', 'Existing setup mode or channel does not match QuickStart. Use temps login to connect or the server upgrade workflow to reconfigure it.')
+    }
+    if (!recordedSelection && snapshot !== 'absent' && (options.runtimeVersion || metadata?.mode !== 'quick' || metadata?.channel !== options.channel)) {
+      throw new SetupError('preflight', 'unknown_selection', 'Cannot establish the previous runtime selection. Inspect the legacy installer state on the server before reconfiguration; no installation was changed.')
+    }
+    try { cached = parseResult(cachedRaw) } catch { /* Resume incomplete output. */ }
+    await deps.beforeInstall?.(cached)
     deps.event(step, 'completed')
     step = 'install'
     deps.event(step, 'started')
-    const raw = await deps.remote(installScript(options), step)
+    const raw = cached ? cachedRaw : await deps.remote(installScript(options, snapshot), step)
     deps.event(step, 'completed')
     step = 'verify'
     deps.event(step, 'started')
