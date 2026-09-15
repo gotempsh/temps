@@ -4,6 +4,10 @@
 // Re-export OSS UI primitives — no fork, no duplicate components.
 export { cn } from '../../../src/lib/utils'
 export { useIsMobile } from '../../../src/components/hooks/use-mobile'
+export {
+  PageContainer,
+  PageHeader,
+} from '../../../src/components/layout/PageContainer'
 
 export * from '../../../src/components/ui/alert-dialog'
 export * from '../../../src/components/ui/alert'
