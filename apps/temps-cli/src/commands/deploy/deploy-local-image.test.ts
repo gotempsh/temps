@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { detectLocalPackageManager, formatFileSize } from './deploy-local-image.js'
+import { Readable } from 'node:stream'
+import {
+  detectLocalPackageManager,
+  formatFileSize,
+  uploadImageArchive,
+  withTemporaryFileCleanup,
+  writeArchiveStream,
+} from './deploy-local-image.js'
 
 const temporaryDirectories: string[] = []
 
@@ -67,5 +74,143 @@ describe('detectLocalPackageManager', () => {
     await writeFile(join(dir, 'yarn.lock'), '')
     await writeFile(join(dir, 'pnpm-lock.yaml'), '')
     expect(detectLocalPackageManager(dir)).toBe('pnpm')
+  })
+})
+
+describe('uploadImageArchive', () => {
+  test('times out when the upload stops making progress', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    await writeFile(archivePath, 'image payload')
+
+    const fetchImpl = async (
+      _input: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        })
+      })
+    }
+
+    await expect(
+      uploadImageArchive({
+        url: 'https://example.invalid/image-upload',
+        apiKey: 'test-token',
+        archivePath,
+        filename: 'image.tar',
+        archiveSize: 13,
+        idleTimeoutMs: 20,
+        responseTimeoutMs: 1_000,
+        fetchImpl,
+      })
+    ).rejects.toThrow('Image upload made no progress for 0.02 seconds')
+  })
+
+  test('times out while the server imports an uploaded image', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    await writeFile(archivePath, 'image payload')
+
+    let waitingForImport = false
+    const fetchImpl = async (
+      _input: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      const body = init?.body as ReadableStream<Uint8Array>
+      const reader = body.getReader()
+      while (!(await reader.read()).done) {
+        // Consume the full upload, then simulate an import that never responds.
+      }
+
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        })
+      })
+    }
+
+    await expect(
+      uploadImageArchive({
+        url: 'https://example.invalid/image-upload',
+        apiKey: 'test-token',
+        archivePath,
+        filename: 'image.tar',
+        archiveSize: 13,
+        idleTimeoutMs: 1_000,
+        responseTimeoutMs: 20,
+        fetchImpl,
+        onAwaitingImport: () => {
+          waitingForImport = true
+        },
+      })
+    ).rejects.toThrow('server did not finish importing the image within 0.02 seconds')
+
+    expect(waitingForImport).toBe(true)
+  })
+
+  test('sends a content length for the streamed multipart request', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    await writeFile(archivePath, 'payload')
+
+    let requestHeaders: Headers | undefined
+    let requestBody = new Uint8Array()
+    const fetchImpl = async (
+      _input: string | URL | Request,
+      init?: RequestInit
+    ): Promise<Response> => {
+      requestHeaders = new Headers(init?.headers)
+      requestBody = new Uint8Array(await new Response(init?.body).arrayBuffer())
+      return new Response('{}', { status: 202 })
+    }
+
+    await uploadImageArchive({
+      url: 'https://example.invalid/image-upload',
+      apiKey: 'test-token',
+      archivePath,
+      filename: 'image.tar',
+      archiveSize: 7,
+      idleTimeoutMs: 1_000,
+      responseTimeoutMs: 1_000,
+      fetchImpl,
+    })
+
+    expect(Number(requestHeaders?.get('content-length'))).toBe(requestBody.byteLength)
+    expect(new TextDecoder().decode(requestBody)).toContain('payload')
+  })
+})
+
+describe('withTemporaryFileCleanup', () => {
+  test('removes the exported archive when upload fails', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    await writeFile(archivePath, 'temporary image')
+
+    await expect(
+      withTemporaryFileCleanup(archivePath, async () => {
+        throw new Error('upload failed')
+      })
+    ).rejects.toThrow('upload failed')
+
+    await expect(access(archivePath)).rejects.toThrow()
+  })
+})
+
+describe('writeArchiveStream', () => {
+  test('resolves only after the complete archive has been flushed', async () => {
+    const directory = await fixtureDirectory()
+    const archivePath = join(directory, 'image.tar')
+    const progress: number[] = []
+    const source = Readable.from([Buffer.from('first'), Buffer.from('-second')])
+
+    const bytesWritten = await writeArchiveStream(source, archivePath, (bytes) => {
+      progress.push(bytes)
+    })
+
+    expect(bytesWritten).toBe(12)
+    expect(progress).toEqual([5, 12])
+    expect(await readFile(archivePath, 'utf8')).toBe('first-second')
   })
 })
