@@ -141,6 +141,19 @@ impl From<sea_orm::DbErr> for DeploymentError {
     }
 }
 
+/// True only for a Postgres unique-constraint violation (SQLSTATE 23505).
+///
+/// Used to detect the race where two requests carrying the same
+/// `upload_request_id` both pass the existence pre-check before either
+/// inserts: the loser's plain (non-`on_conflict`) insert hits
+/// `idx_deployments_upload_request_id` instead of succeeding, and that
+/// specific failure -- not a generic database error -- means the winner's
+/// row should be looked up and returned instead of surfacing a 500.
+pub(crate) fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    err.sql_err()
+        .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
+}
+
 fn confined_archive_path(
     data_dir: &std::path::Path,
     stored_path: &str,
@@ -1459,6 +1472,27 @@ impl DeploymentService {
         })
     }
 
+    /// Find the deployment produced by a specific local-image-upload attempt,
+    /// identified by the client-generated `upload_request_id` it was
+    /// submitted with. Used both to short-circuit a retried upload before
+    /// re-importing the image, and to let a client that lost the original
+    /// HTTP response (e.g. after its own wait timed out) resolve the
+    /// deployment by exact ID instead of guessing from timing.
+    pub async fn find_deployment_by_upload_request_id(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        upload_request_id: &str,
+    ) -> Result<Option<deployments::Model>, DeploymentError> {
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::UploadRequestId.eq(upload_request_id))
+            .one(self.db.as_ref())
+            .await?;
+        Ok(deployment)
+    }
+
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
@@ -2091,6 +2125,7 @@ impl DeploymentService {
             }))),
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
+            upload_request_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -2796,6 +2831,7 @@ impl DeploymentService {
             }))),
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
+            upload_request_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -5018,6 +5054,21 @@ mod tests {
                 Err(DeploymentError::InvalidBundlePath { .. })
             ));
         }
+    }
+
+    #[test]
+    fn record_not_inserted_is_not_treated_as_a_unique_violation() {
+        // This insert never uses `on_conflict().do_nothing()`, so a bare
+        // `RecordNotInserted` cannot be produced by the race this check
+        // exists to catch, and must not be misclassified as one.
+        assert!(!is_unique_violation(&sea_orm::DbErr::RecordNotInserted));
+    }
+
+    #[test]
+    fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
+        assert!(!is_unique_violation(&sea_orm::DbErr::Custom(
+            "connection reset by peer".to_string()
+        )));
     }
 
     #[test]

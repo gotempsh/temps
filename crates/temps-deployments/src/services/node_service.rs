@@ -1337,6 +1337,7 @@ mod tests {
             image_name: None,
             deployment_config: None,
             promoted_from_deployment_id: None,
+            upload_request_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

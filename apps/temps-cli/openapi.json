@@ -12903,6 +12903,14 @@
               "string",
               "null"
             ]
+          },
+          "upload_request_id": {
+            "description": "Client-generated UUID identifying this upload attempt. When a\ndeployment already exists for this project, environment, and ID, that\ndeployment is returned as-is instead of importing and deploying the\nimage again — this makes a client retry after a lost response safe.\nCallers that omit it get no such protection (each call always creates\na new deployment), so the CLI always sends one.",
+            "example": "9b1f7a4e-6e3e-4d9b-8c34-5b6b6a6d7e21",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -97723,6 +97731,18 @@
             }
           },
           {
+            "description": "Client-generated UUID identifying this upload attempt. When a\ndeployment already exists for this project, environment, and ID, that\ndeployment is returned as-is instead of importing and deploying the\nimage again — this makes a client retry after a lost response safe.\nCallers that omit it get no such protection (each call always creates\na new deployment), so the CLI always sends one.",
+            "in": "query",
+            "name": "upload_request_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -97777,6 +97797,76 @@
           }
         ],
         "summary": "Deploy from an uploaded Docker image tarball",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}": {
+      "get": {
+        "description": "A client that lost the response to `POST .../deploy/image-upload` (for\nexample, its own wait timed out after the archive was fully sent) can\npoll this endpoint with the same `upload_request_id` it sent on that\nrequest to find out whether the server finished the import and created a\ndeployment, without re-uploading the image. Returns 404 until the\ndeployment exists.",
+        "operationId": "get_deployment_by_upload_request_id",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The upload_request_id sent with the original upload request",
+            "in": "path",
+            "name": "upload_request_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoteDeploymentResponse"
+                }
+              }
+            },
+            "description": "Deployment produced by this upload attempt"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No deployment found yet for this upload attempt"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Look up the deployment produced by a specific local-image-upload attempt",
         "tags": [
           "Deployments"
         ]

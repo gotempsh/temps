@@ -172,6 +172,12 @@ pub struct Model {
     pub deployment_config: Option<DeploymentConfigSnapshot>,
     /// ID of the source deployment this was promoted from (if applicable)
     pub promoted_from_deployment_id: Option<i32>,
+    /// Client-generated correlation ID for a local-image-upload deployment.
+    /// Lets a client that lost the HTTP response (e.g. after a timeout) look
+    /// up the exact deployment its upload produced instead of guessing from
+    /// timing, and lets the server reject a literal retry of the same
+    /// upload attempt instead of importing and deploying the image twice.
+    pub upload_request_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -5,7 +5,13 @@ import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../../lib/api-client.js'
 import { resolveProjectSlug } from '../../config/resolve-project.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
-import { getProjectBySlug, getProject, getEnvironments, generatePresetDockerfile } from '../../api/sdk.gen.js'
+import {
+  getProjectBySlug,
+  getProject,
+  getEnvironments,
+  generatePresetDockerfile,
+  getDeploymentByUploadRequestId,
+} from '../../api/sdk.gen.js'
 import type { EnvironmentResponse } from '../../api/types.gen.js'
 import { promptSelect } from '../../ui/prompts.js'
 import {
@@ -24,12 +30,14 @@ import {
   colors,
   box,
 } from '../../ui/output.js'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, createWriteStream, writeFileSync, mkdirSync, createReadStream } from 'node:fs'
 import { unlink } from 'node:fs/promises'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { resolve, basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 interface DeployLocalImageOptions {
   image?: string
@@ -48,11 +56,307 @@ interface DeployLocalImageOptions {
   timeout?: string
 }
 
+interface UploadImageArchiveOptions {
+  url: string
+  apiKey: string
+  archivePath: string
+  filename: string
+  archiveSize: number
+  idleTimeoutMs?: number
+  responseTimeoutMs?: number
+  signal?: AbortSignal
+  fetchImpl?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>
+  onProgress?: (uploadedBytes: number) => void
+  onAwaitingImport?: () => void
+}
+
+const DEFAULT_UPLOAD_IDLE_TIMEOUT_MS = 120_000
+const DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS = 600_000
+
+function timeoutSeconds(milliseconds: number): string {
+  return (milliseconds / 1_000).toLocaleString('en-US', { maximumFractionDigits: 3 })
+}
+
+/**
+ * Parse and validate the `--timeout` flag as a whole number of seconds.
+ * `Number()` (unlike `parseInt`) rejects trailing garbage and fractional
+ * input instead of silently truncating it, so a typo becomes a clear error
+ * instead of an immediate or unintended abort after the archive uploads.
+ */
+export function resolveTimeoutSeconds(rawTimeout?: string): number {
+  if (rawTimeout === undefined) return 600
+
+  const parsed = Number(rawTimeout)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `--timeout must be a positive whole number of seconds, got "${rawTimeout}"`
+    )
+  }
+  return parsed
+}
+
+/**
+ * Forward SIGINT/SIGTERM into an AbortController so an in-flight export or
+ * upload can cancel and clean up instead of leaving a dangling docker
+ * process or temp archive. Returns a cleanup function that must be called
+ * once the operation settles, so a later signal doesn't abort a stale
+ * controller from a finished operation.
+ */
+export function installInterruptHandlers(controller: AbortController): () => void {
+  const interrupt = (signalName: string) => (): void => {
+    controller.abort(new Error(`Local image deployment interrupted by ${signalName}`))
+  }
+  const onSigint = interrupt('SIGINT')
+  const onSigterm = interrupt('SIGTERM')
+  process.once('SIGINT', onSigint)
+  process.once('SIGTERM', onSigterm)
+
+  return () => {
+    process.removeListener('SIGINT', onSigint)
+    process.removeListener('SIGTERM', onSigterm)
+  }
+}
+
+/**
+ * Kill a child process when the given signal aborts. Extracted from
+ * `dockerSaveToFile` so the termination behavior is testable without
+ * spawning a real `docker` process.
+ */
+export function killChildOnAbort(child: ChildProcess, signal?: AbortSignal): () => void {
+  if (!signal) return () => {}
+
+  const onAbort = (): void => {
+    if (!child.killed) child.kill('SIGTERM')
+  }
+  if (signal.aborted) onAbort()
+  else signal.addEventListener('abort', onAbort, { once: true })
+
+  return () => signal.removeEventListener('abort', onAbort)
+}
+
+/**
+ * Stream a Docker archive as multipart data without buffering the whole image.
+ * The idle deadline covers stalled transfer progress; after the body is sent,
+ * the response deadline covers the server-side image import.
+ */
+export async function uploadImageArchive(
+  options: UploadImageArchiveOptions
+): Promise<Response> {
+  const controller = new AbortController()
+  const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_UPLOAD_IDLE_TIMEOUT_MS
+  const responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_UPLOAD_RESPONSE_TIMEOUT_MS
+  const fetchImpl = options.fetchImpl ?? fetch
+  let timeout: ReturnType<typeof setTimeout> | undefined
+
+  const abortWith = (message: string): void => {
+    if (!controller.signal.aborted) controller.abort(new Error(message))
+  }
+  const scheduleTimeout = (milliseconds: number, message: string): void => {
+    if (timeout) clearTimeout(timeout)
+    timeout = setTimeout(() => abortWith(message), milliseconds)
+  }
+  const forwardAbort = (): void => {
+    const reason = options.signal?.reason
+    controller.abort(reason instanceof Error ? reason : new Error('Local image upload interrupted'))
+  }
+
+  if (options.signal?.aborted) {
+    forwardAbort()
+  } else {
+    options.signal?.addEventListener('abort', forwardAbort, { once: true })
+  }
+
+  const boundary = `----TempsFormBoundary${Date.now().toString(16)}`
+  const header = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="file"; filename="${options.filename}"`,
+    'Content-Type: application/x-tar',
+    '',
+    '',
+  ].join('\r\n')
+  const footer = `\r\n--${boundary}--\r\n`
+  const headerBytes = new TextEncoder().encode(header)
+  const footerBytes = new TextEncoder().encode(footer)
+  const contentLength = headerBytes.byteLength + options.archiveSize + footerBytes.byteLength
+
+  async function* multipartBody(): AsyncGenerator<Uint8Array> {
+    yield headerBytes
+    const fileStream = createReadStream(options.archivePath, { signal: controller.signal })
+    let uploadedBytes = 0
+
+    for await (const chunk of fileStream) {
+      const bytes = chunk instanceof Buffer ? chunk : Buffer.from(chunk)
+      uploadedBytes += bytes.byteLength
+      options.onProgress?.(uploadedBytes)
+      scheduleTimeout(
+        idleTimeoutMs,
+        `Image upload made no progress for ${timeoutSeconds(idleTimeoutMs)} seconds`
+      )
+      yield bytes
+    }
+
+    yield footerBytes
+    options.onAwaitingImport?.()
+    scheduleTimeout(
+      responseTimeoutMs,
+      `Image upload completed, but the server did not finish importing the image within ${timeoutSeconds(responseTimeoutMs)} seconds`
+    )
+  }
+
+  scheduleTimeout(
+    idleTimeoutMs,
+    `Image upload made no progress for ${timeoutSeconds(idleTimeoutMs)} seconds`
+  )
+
+  const body = Readable.toWeb(Readable.from(multipartBody())) as unknown as ReadableStream<Uint8Array>
+
+  try {
+    return await fetchImpl(options.url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${options.apiKey}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(contentLength),
+      },
+      body,
+      duplex: 'half',
+      signal: controller.signal,
+    } as RequestInit)
+  } catch (error) {
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+      throw controller.signal.reason
+    }
+    throw error
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', forwardAbort)
+  }
+}
+
+interface ResolvedDeployment {
+  id: number
+  slug: string
+}
+
+async function resolveUploadedDeployment(
+  response: Response,
+  finalUrl: string
+): Promise<ResolvedDeployment | undefined> {
+  if (!response.ok) {
+    const errorText = await response.text()
+    failSpinner(`Upload failed: ${response.status}`)
+    info(`URL: ${finalUrl}`)
+    warning(`Response: ${errorText}`)
+    return undefined
+  }
+
+  const responseText = await response.text()
+  try {
+    return JSON.parse(responseText) as ResolvedDeployment
+  } catch {
+    failSpinner('Failed to parse deployment response')
+    info(`URL: ${finalUrl}`)
+    warning(`Response: ${responseText}`)
+    return undefined
+  }
+}
+
+interface ReconcileTimedOutImportOptions {
+  projectId: number
+  environmentId: number
+  uploadRequestId: string
+  attempts?: number
+  delayMs?: number
+  lookup?: (path: {
+    project_id: number
+    environment_id: number
+    upload_request_id: string
+  }) => Promise<{ data?: { id: number; slug: string } }>
+}
+
+/**
+ * A response-import timeout only fires after the full archive has already
+ * reached the server, so the server may still finish `docker load` and
+ * create a deployment after the CLI gives up waiting. Reporting a bare
+ * failure in that case invites a retry that deploys the same image twice.
+ * Every upload attempt carries a client-generated `uploadRequestId`, which
+ * the server stores on the deployment it creates (or reuses, if this exact
+ * ID already produced one) — poll the server for a deployment tagged with
+ * that exact ID before deciding the outcome, instead of guessing from
+ * timing which is inherently ambiguous when uploads can run concurrently.
+ */
+export async function reconcileTimedOutImport(
+  options: ReconcileTimedOutImportOptions
+): Promise<ResolvedDeployment | undefined> {
+  const attempts = options.attempts ?? 4
+  const delayMs = options.delayMs ?? 3_000
+  const lookup =
+    options.lookup ??
+    (async (path) => {
+      const { data } = await getDeploymentByUploadRequestId({ client, path })
+      return { data }
+    })
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs))
+    }
+
+    const { data } = await lookup({
+      project_id: options.projectId,
+      environment_id: options.environmentId,
+      upload_request_id: options.uploadRequestId,
+    }).catch(() => ({ data: undefined }))
+
+    if (data) return { id: data.id, slug: data.slug }
+  }
+
+  return undefined
+}
+
+export async function withTemporaryFileCleanup<T>(
+  path: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  try {
+    return await operation()
+  } finally {
+    await unlink(path).catch(() => {})
+  }
+}
+
+export async function writeArchiveStream(
+  source: Readable,
+  outputPath: string,
+  onProgress?: (bytesWritten: number) => void,
+  signal?: AbortSignal
+): Promise<number> {
+  let totalBytes = 0
+  const countProgress = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      totalBytes += chunk.byteLength
+      onProgress?.(totalBytes)
+      callback(null, chunk)
+    },
+  })
+
+  await pipeline(source, countProgress, createWriteStream(outputPath), { signal })
+  return totalBytes
+}
+
 export async function deployLocalImage(options: DeployLocalImageOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
   newline()
+
+  let timeoutSecondsValue: number
+  try {
+    timeoutSecondsValue = resolveTimeoutSeconds(options.timeout)
+  } catch (err) {
+    warning(err instanceof Error ? err.message : String(err))
+    return
+  }
 
   // ─── Step 1: Resolve project and environment ─────────────────────────────
   const resolved = await resolveProjectSlug(options.project)
@@ -313,153 +617,153 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
   // ─── Step 5: Export, upload, and deploy ──────────────────────────────────
   const tempFilename = `temps-image-${Date.now()}.tar`
   const tempFilePath = join(tmpdir(), tempFilename)
+  const operationController = new AbortController()
+  const removeInterruptHandlers = installInterruptHandlers(operationController)
 
-  startSpinner('Exporting image with docker save...')
-
-  let exportedSize: number
+  let deployment: ResolvedDeployment | undefined
   try {
-    exportedSize = await dockerSaveToFile(imageName, tempFilePath, (progress) => {
-      updateSpinner(`Exporting image... ${formatFileSize(progress)} saved`)
-    })
-    succeedSpinner(`Image exported: ${formatFileSize(exportedSize)}`)
-  } catch (err) {
-    failSpinner('Failed to export image')
-    if (err instanceof Error) {
-      warning(err.message)
-    }
-    return
-  }
+    deployment = await withTemporaryFileCleanup(tempFilePath, async () => {
+      startSpinner('Exporting image with docker save...')
 
-  const MAX_SIZE = 1024 * 1024 * 1024
-  if (exportedSize > MAX_SIZE) {
-    warning(`Image size (${formatFileSize(exportedSize)}) exceeds maximum allowed (1 GB)`)
-    await unlink(tempFilePath).catch(() => {})
-    return
-  }
-
-  startSpinner('Uploading image to server...')
-
-  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
-  const apiKey = await credentials.getApiKey()
-
-  try {
-    const uploadUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image-upload`
-
-    const queryParams = new URLSearchParams()
-    if (options.tag) {
-      queryParams.set('tag', options.tag)
-    }
-    const healthCheckPath = options.healthCheckPath?.trim()
-    if (healthCheckPath) {
-      if (!healthCheckPath.startsWith('/')) {
-        throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
+      let exportedSize: number
+      try {
+        exportedSize = await dockerSaveToFile(
+          imageName,
+          tempFilePath,
+          (progress) => {
+            updateSpinner(`Exporting image... ${formatFileSize(progress)} saved`)
+          },
+          operationController.signal
+        )
+        succeedSpinner(`Image exported: ${formatFileSize(exportedSize)}`)
+      } catch (err) {
+        failSpinner('Failed to export image')
+        if (err instanceof Error) {
+          warning(err.message)
+        }
+        if (operationController.signal.aborted) throw err
+        return undefined
       }
-      queryParams.set('health_check_path', healthCheckPath)
-    }
-    const finalUrl = queryParams.toString()
-      ? `${uploadUrl}?${queryParams.toString()}`
-      : uploadUrl
 
-    const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
+      const MAX_SIZE = 1024 * 1024 * 1024
+      if (exportedSize > MAX_SIZE) {
+        warning(`Image size (${formatFileSize(exportedSize)}) exceeds maximum allowed (1 GB)`)
+        return undefined
+      }
 
-    const boundary = `----TempsFormBoundary${Date.now().toString(16)}`
+      startSpinner('Uploading image to server...')
 
-    // The published CLI is bundled for Node (see docs.ts), so this must use
-    // Node's fs streaming rather than Bun.file, which is undefined there.
-    const fileStream = Readable.toWeb(createReadStream(tempFilePath)) as unknown as ReadableStream<Uint8Array>
+      const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+      const apiKey = await credentials.getApiKey()
+      if (!apiKey) {
+        throw new Error('Cannot upload the local image because no API key is configured')
+      }
+      const uploadUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image-upload`
 
-    const header = [
-      `--${boundary}`,
-      `Content-Disposition: form-data; name="file"; filename="${filename}"`,
-      'Content-Type: application/x-tar',
-      '',
-      '',
-    ].join('\r\n')
+      // Sent with the upload and stored on the resulting deployment so a
+      // lost response (e.g. after `reconcileTimedOutImport`'s wait expires)
+      // can be resolved by exact ID instead of guessing from timing, and so
+      // a literal retry with the same ID reuses that deployment instead of
+      // importing and deploying the image again.
+      const uploadRequestId = randomUUID()
 
-    const footer = `\r\n--${boundary}--\r\n`
+      const queryParams = new URLSearchParams()
+      queryParams.set('upload_request_id', uploadRequestId)
+      if (options.tag) {
+        queryParams.set('tag', options.tag)
+      }
+      const healthCheckPath = options.healthCheckPath?.trim()
+      if (healthCheckPath) {
+        if (!healthCheckPath.startsWith('/')) {
+          throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
+        }
+        queryParams.set('health_check_path', healthCheckPath)
+      }
+      const finalUrl = `${uploadUrl}?${queryParams.toString()}`
 
-    const headerBytes = new TextEncoder().encode(header)
-    const footerBytes = new TextEncoder().encode(footer)
+      const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
 
-    let uploadedBytes = 0
+      let awaitingServerImport = false
 
-    const combinedStream = new ReadableStream({
-      async start(controller) {
-        controller.enqueue(headerBytes)
+      let response: Response
+      try {
+        response = await uploadImageArchive({
+          url: finalUrl,
+          apiKey,
+          archivePath: tempFilePath,
+          filename,
+          archiveSize: exportedSize,
+          responseTimeoutMs: timeoutSecondsValue * 1_000,
+          signal: operationController.signal,
+          onProgress: (uploadedBytes) => {
+            updateSpinner(
+              `Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`
+            )
+          },
+          onAwaitingImport: () => {
+            awaitingServerImport = true
+            updateSpinner('Upload complete. Waiting for the server to import the image...')
+          },
+        })
+      } catch (err) {
+        // The archive was already fully sent when this failed, so the server
+        // may still finish importing the image and create a deployment.
+        // Reporting a bare failure would invite a retry that deploys the
+        // same image twice — reconcile before deciding the outcome.
+        if (!awaitingServerImport) throw err
 
-        const reader = fileStream.getReader()
-        try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            uploadedBytes += value.byteLength
-            updateSpinner(`Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`)
-            controller.enqueue(value)
-          }
-        } finally {
-          reader.releaseLock()
+        updateSpinner('Checking whether the server started a deployment before retrying...')
+        const reconciled = await reconcileTimedOutImport({
+          projectId: projectData.id,
+          environmentId: environmentId as number,
+          uploadRequestId,
+        })
+
+        if (reconciled) {
+          succeedSpinner(
+            `Server import continued after the local connection dropped — deployment ${reconciled.id} is running`
+          )
+          return reconciled
         }
 
-        controller.enqueue(footerBytes)
-        controller.close()
-      },
-    })
-
-    const uploadResponse = await fetch(finalUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-      },
-      body: combinedStream,
-      duplex: 'half',
-    } as RequestInit)
-
-    await unlink(tempFilePath).catch(() => {})
-
-    if (!uploadResponse.ok) {
-      const errorText = await uploadResponse.text()
-      failSpinner(`Upload failed: ${uploadResponse.status}`)
-      info(`URL: ${finalUrl}`)
-      warning(`Response: ${errorText}`)
-      return
-    }
-
-    const responseText = await uploadResponse.text()
-    let deployment: { id: number; slug: string }
-    try {
-      deployment = JSON.parse(responseText) as { id: number; slug: string }
-    } catch (parseErr) {
-      failSpinner('Failed to parse deployment response')
-      info(`URL: ${finalUrl}`)
-      warning(`Response: ${responseText}`)
-      return
-    }
-
-    succeedSpinner(`Deployment started: ${deployment.slug}`)
-
-    if (options.wait !== false) {
-      const result = await watchDeployment({
-        projectId: projectData.id,
-        deploymentId: deployment.id,
-        timeoutSecs: parseInt(options.timeout || '600', 10),
-        projectName,
-      })
-
-      if (!result.success) {
-        process.exitCode = 1
+        failSpinner('No confirmation received from the server')
+        if (err instanceof Error) warning(err.message)
+        warning('No deployment was found for this upload yet — it is safe to retry.')
+        if (operationController.signal.aborted) throw err
+        return undefined
       }
-    } else {
-      newline()
-      info('Deployment running in background')
-      info(`Check status with: temps deployments list --project ${projectName}`)
-      newline()
-      success('Local image deployment initiated successfully!')
-      newline()
-    }
+
+      return await resolveUploadedDeployment(response, finalUrl)
+    })
   } catch (err) {
     failSpinner('Deployment failed')
     throw err
+  } finally {
+    removeInterruptHandlers()
+  }
+
+  if (!deployment) return
+
+  succeedSpinner(`Deployment started: ${deployment.slug}`)
+
+  if (options.wait !== false) {
+    const result = await watchDeployment({
+      projectId: projectData.id,
+      deploymentId: deployment.id,
+      timeoutSecs: timeoutSecondsValue,
+      projectName,
+    })
+
+    if (!result.success) {
+      process.exitCode = 1
+    }
+  } else {
+    newline()
+    info('Deployment running in background')
+    info(`Check status with: temps deployments list --project ${projectName}`)
+    newline()
+    success('Local image deployment initiated successfully!')
+    newline()
   }
 }
 
@@ -579,48 +883,44 @@ async function getImageSize(imageName: string): Promise<number> {
 async function dockerSaveToFile(
   imageName: string,
   outputPath: string,
-  onProgress?: (bytesWritten: number) => void
+  onProgress?: (bytesWritten: number) => void,
+  signal?: AbortSignal
 ): Promise<number> {
-  return new Promise((resolve, reject) => {
-    let totalBytes = 0
+  const docker = spawn('docker', ['save', imageName], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
 
-    const docker = spawn('docker', ['save', imageName], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+  let stderr = ''
+  docker.stderr.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString()
+  })
 
-    const writeStream = createWriteStream(outputPath)
+  const removeAbortListener = killChildOnAbort(docker, signal)
 
-    docker.stdout.on('data', (chunk: Buffer) => {
-      writeStream.write(chunk)
-      totalBytes += chunk.length
-      if (onProgress) {
-        onProgress(totalBytes)
-      }
-    })
-
-    let stderr = ''
-    docker.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString()
-    })
-
-    docker.on('close', (code) => {
-      writeStream.end()
-      if (code === 0) {
-        resolve(totalBytes)
-      } else {
-        reject(new Error(`docker save failed with code ${code}: ${stderr}`))
-      }
-    })
-
-    docker.on('error', (err) => {
-      writeStream.end()
-      reject(new Error(`Failed to spawn docker: ${err.message}`))
-    })
-
-    writeStream.on('error', (err) => {
-      reject(new Error(`Failed to write to file: ${err.message}`))
+  const dockerExit = new Promise<number | null>((resolveExit, rejectExit) => {
+    docker.once('close', resolveExit)
+    docker.once('error', (error) => {
+      rejectExit(new Error(`Failed to spawn docker save for image "${imageName}": ${error.message}`))
     })
   })
+
+  try {
+    const [exitCode, totalBytes] = await Promise.all([
+      dockerExit,
+      writeArchiveStream(docker.stdout, outputPath, onProgress, signal),
+    ])
+
+    if (exitCode !== 0) {
+      throw new Error(`docker save failed with code ${exitCode}: ${stderr}`)
+    }
+    return totalBytes
+  } catch (error) {
+    if (!docker.killed) docker.kill('SIGTERM')
+    if (signal?.aborted && signal.reason instanceof Error) throw signal.reason
+    throw error
+  } finally {
+    removeAbortListener()
+  }
 }
 
 export function formatFileSize(bytes: number): string {
