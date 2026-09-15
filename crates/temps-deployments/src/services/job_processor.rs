@@ -1491,6 +1491,7 @@ async fn process_git_push_event(
             cancelled_reason: sea_orm::Set(None),
             commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
             deployment_config: sea_orm::Set(deployment_config_snapshot),
+            upload_request_id: sea_orm::Set(None),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };

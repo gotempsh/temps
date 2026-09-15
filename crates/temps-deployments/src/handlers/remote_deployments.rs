@@ -49,6 +49,7 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
     paths(
         deploy_from_image,
         deploy_from_image_upload,
+        get_deployment_by_upload_request_id,
         deploy_from_static,
         deploy_from_uploaded_source,
         upload_static_bundle,
@@ -650,6 +651,14 @@ pub struct DeployFromImageUploadQuery {
     /// Must start with '/'. When omitted, defaults to "/".
     #[schema(example = "/api/healthz")]
     pub health_check_path: Option<String>,
+    /// Client-generated UUID identifying this upload attempt. When a
+    /// deployment already exists for this project, environment, and ID, that
+    /// deployment is returned as-is instead of importing and deploying the
+    /// image again — this makes a client retry after a lost response safe.
+    /// Callers that omit it get no such protection (each call always creates
+    /// a new deployment), so the CLI always sends one.
+    #[schema(example = "9b1f7a4e-6e3e-4d9b-8c34-5b6b6a6d7e21")]
+    pub upload_request_id: Option<String>,
 }
 
 /// Validate a deploy-time `health_check_path` override.
@@ -1675,6 +1684,45 @@ pub async fn deploy_from_image_upload(
             .with_detail("Environment does not belong to this project"));
     }
 
+    // 2b. If this exact upload attempt already produced a deployment (the
+    // caller's earlier response was lost — e.g. a client-side timeout after
+    // the archive was fully sent — but the import and deployment creation
+    // below actually completed), return that deployment instead of
+    // re-importing and deploying the same image a second time.
+    if let Some(ref upload_request_id) = query.upload_request_id {
+        let existing = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::UploadRequestId.eq(upload_request_id.as_str()))
+            .one(state.db.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error: {}", e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Error")
+                    .with_detail(e.to_string())
+            })?;
+
+        if let Some(existing) = existing {
+            info!(
+                "Upload request {} already produced deployment {} — returning it instead of re-importing",
+                upload_request_id, existing.id
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(RemoteDeploymentResponse {
+                    id: existing.id,
+                    project_id: existing.project_id,
+                    environment_id: existing.environment_id,
+                    slug: existing.slug,
+                    state: existing.state,
+                    source_type: "docker_image_upload".to_string(),
+                    created_at: existing.created_at,
+                }),
+            ));
+        }
+    }
+
     // 3. Read the uploaded image tarball from multipart
     let mut file_data: Option<bytes::Bytes> = None;
     let mut original_filename: Option<String> = None;
@@ -1849,6 +1897,7 @@ pub async fn deploy_from_image_upload(
         }))),
         image_name: Set(Some(image_tag.clone())),
         deployment_config: Set(deployment_config_snapshot),
+        upload_request_id: Set(query.upload_request_id.clone()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -1984,6 +2033,72 @@ pub async fn deploy_from_image_upload(
             created_at: deployment.created_at,
         }),
     ))
+}
+
+/// Look up the deployment produced by a specific local-image-upload attempt
+///
+/// A client that lost the response to `POST .../deploy/image-upload` (for
+/// example, its own wait timed out after the archive was fully sent) can
+/// poll this endpoint with the same `upload_request_id` it sent on that
+/// request to find out whether the server finished the import and created a
+/// deployment, without re-uploading the image. Returns 404 until the
+/// deployment exists.
+#[utoipa::path(
+    get,
+    tag = "Deployments",
+    path = "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("upload_request_id" = String, Path, description = "The upload_request_id sent with the original upload request")
+    ),
+    responses(
+        (status = 200, description = "Deployment produced by this upload attempt", body = RemoteDeploymentResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No deployment found yet for this upload attempt"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_deployment_by_upload_request_id(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, upload_request_id)): Path<(i32, i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+
+    let deployment = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project_id))
+        .filter(deployments::Column::EnvironmentId.eq(environment_id))
+        .filter(deployments::Column::UploadRequestId.eq(upload_request_id.as_str()))
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(e.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Deployment Not Found")
+                .with_detail(format!(
+                    "No deployment found yet for upload request {}",
+                    upload_request_id
+                ))
+        })?;
+
+    Ok(Json(RemoteDeploymentResponse {
+        id: deployment.id,
+        project_id: deployment.project_id,
+        environment_id: deployment.environment_id,
+        slug: deployment.slug,
+        state: deployment.state,
+        source_type: "docker_image_upload".to_string(),
+        created_at: deployment.created_at,
+    }))
 }
 
 /// Upload a static bundle for later deployment
@@ -2745,6 +2860,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
             post(deploy_from_image_upload).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}",
+            get(get_deployment_by_upload_request_id),
         )
         .route(
             "/projects/{project_id}/upload/static",

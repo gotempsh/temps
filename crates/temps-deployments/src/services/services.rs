@@ -2091,6 +2091,7 @@ impl DeploymentService {
             }))),
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
+            upload_request_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -2796,6 +2797,7 @@ impl DeploymentService {
             }))),
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
+            upload_request_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
