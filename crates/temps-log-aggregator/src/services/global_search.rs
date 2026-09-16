@@ -76,8 +76,8 @@ pub struct GlobalLogSearchResponse {
     pub lines: Vec<GlobalLogLine>,
     pub next_cursor: Option<String>,
     /// True means the scan budget was exhausted. Lines contain the newest
-    /// matches found so far, but unread chunks may contain newer lines.
-    /// No cursor is returned because the partial results cannot be paginated safely.
+    /// matches found in this scan window, but unread chunks may contain newer
+    /// lines. `next_cursor` continues into another bounded scan window.
     pub scan_limit_reached: bool,
     pub scanned_chunks: usize,
     pub scanned_bytes: usize,
@@ -103,11 +103,15 @@ struct Candidate {
 }
 
 type LineKey = (DateTime<Utc>, Uuid, i32);
+type ChunkKey = (DateTime<Utc>, Uuid);
+type CursorState = (Option<LineKey>, Option<ChunkKey>);
 #[derive(Serialize, Deserialize)]
 struct Cursor {
     version: u8,
     scope: String,
-    before: LineKey,
+    before: Option<LineKey>,
+    #[serde(default)]
+    frontier: Option<ChunkKey>,
 }
 fn invalid(message: &str) -> LogAggregatorError {
     LogAggregatorError::Validation {
@@ -153,24 +157,29 @@ impl GlobalLogSearchRequest {
         }
         Ok(())
     }
-    fn cursor_key(&self) -> Result<Option<LineKey>, LogAggregatorError> {
+    fn cursor_state(&self) -> Result<CursorState, LogAggregatorError> {
         let Some(raw) = &self.cursor else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if raw.len() > 2048 {
             return Err(invalid("Invalid log cursor"));
         }
         let cursor: Cursor =
             serde_json::from_str(raw).map_err(|_| invalid("Invalid log cursor"))?;
-        if cursor.version != 1
+        let valid_shape = match cursor.version {
+            1 => cursor.before.is_some() && cursor.frontier.is_none(),
+            2 => cursor.frontier.is_some(),
+            _ => false,
+        };
+        if !valid_shape
             || cursor.scope != self.scope_hash()?
-            || cursor.before.0 < self.start_time
-            || cursor.before.0 > self.end_time
-            || cursor.before.2 < 0
+            || cursor.before.as_ref().is_some_and(|before| {
+                before.0 < self.start_time || before.0 > self.end_time || before.2 < 0
+            })
         {
             return Err(invalid("Cursor does not match the log search"));
         }
-        Ok(Some(cursor.before))
+        Ok((cursor.before, cursor.frontier))
     }
 }
 
@@ -181,9 +190,8 @@ impl LogSearchService {
         access: &GlobalLogAccess,
     ) -> Result<GlobalLogSearchResponse, LogAggregatorError> {
         q.validate()?;
-        let before = q.cursor_key()?;
+        let (before, mut frontier) = q.cursor_state()?;
         let text = q.text.as_ref().map(|text| text.to_lowercase());
-        let mut frontier: Option<(DateTime<Utc>, Uuid)> = None;
         let mut matches = BTreeMap::<LineKey, GlobalLogLine>::new();
         let cap = q.page_size.unwrap_or(100) as usize;
         let mut scanned_chunks = 0;
@@ -204,8 +212,11 @@ impl LogSearchService {
                 // writers recorded arrival bounds, so an ended_at value alone
                 // cannot prove that an unread chunk contains no newer event.
                 let declared = usize::try_from(chunk.compressed_size_bytes).unwrap_or(usize::MAX);
+                if declared > MAX_CHUNK_BYTES {
+                    frontier = Some((chunk.ended_at, chunk.id));
+                    break 'scan;
+                }
                 if scanned_chunks >= MAX_CHUNKS
-                    || declared > MAX_CHUNK_BYTES
                     || scanned_bytes.saturating_add(declared) > MAX_COMPRESSED_BYTES
                 {
                     break 'scan;
@@ -216,6 +227,9 @@ impl LogSearchService {
                     .await?;
                 scanned_bytes += compressed.len();
                 if compressed.len() > MAX_CHUNK_BYTES || scanned_bytes > MAX_COMPRESSED_BYTES {
+                    if compressed.len() > MAX_CHUNK_BYTES {
+                        frontier = Some((chunk.ended_at, chunk.id));
+                    }
                     break 'scan;
                 }
                 // At most one chunk is decoded per search; decoding never blocks
@@ -232,6 +246,7 @@ impl LogSearchService {
                     .await
                     .map_err(|_| invalid("Log decompression task failed"))??;
                 if data.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                    frontier = Some((chunk.ended_at, chunk.id));
                     break 'scan;
                 }
                 scanned_chunks += 1;
@@ -262,6 +277,7 @@ impl LogSearchService {
                         continue;
                     }
                     if raw.len() > 64 * 1024 {
+                        frontier = Some((chunk.ended_at, chunk.id));
                         break 'scan;
                     }
                     matches.insert(
@@ -303,14 +319,33 @@ impl LogSearchService {
             tokio::task::yield_now().await;
         }
         if !complete {
+            let page: Vec<_> = matches.into_iter().rev().take(cap).collect();
+            let continuation = if let Some((key, _)) = page.last() {
+                Cursor {
+                    version: 1,
+                    scope: q.scope_hash()?,
+                    before: Some(*key),
+                    frontier: None,
+                }
+            } else if let Some(frontier) = frontier {
+                Cursor {
+                    version: 2,
+                    scope: q.scope_hash()?,
+                    before,
+                    frontier: Some(frontier),
+                }
+            } else {
+                return Ok(GlobalLogSearchResponse {
+                    lines: Vec::new(),
+                    next_cursor: None,
+                    scan_limit_reached: true,
+                    scanned_chunks,
+                    scanned_bytes,
+                });
+            };
             return Ok(GlobalLogSearchResponse {
-                lines: matches
-                    .into_iter()
-                    .rev()
-                    .take(cap)
-                    .map(|(_, line)| line)
-                    .collect(),
-                next_cursor: None,
+                lines: page.into_iter().map(|(_, line)| line).collect(),
+                next_cursor: Some(serde_json::to_string(&continuation)?),
                 scan_limit_reached: true,
                 scanned_chunks,
                 scanned_bytes,
@@ -324,7 +359,8 @@ impl LogSearchService {
                     serde_json::to_string(&Cursor {
                         version: 1,
                         scope: q.scope_hash()?,
-                        before: *key,
+                        before: Some(*key),
+                        frontier: None,
                     })
                     .map_err(LogAggregatorError::from)
                 })
@@ -348,7 +384,7 @@ impl super::LogMetadataService {
         q: &GlobalLogSearchRequest,
         access: &GlobalLogAccess,
         before: Option<&LineKey>,
-        frontier: Option<(DateTime<Utc>, Uuid)>,
+        frontier: Option<ChunkKey>,
     ) -> Result<Vec<Candidate>, LogAggregatorError> {
         let mut values = Vec::<Value>::new();
         let mut bind = |value: Value| {
@@ -505,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_exhaustion_keeps_newest_collected_lines_without_cursor() {
+    async fn budget_exhaustion_keeps_newest_collected_lines_with_cursor() {
         let result = mock_search(
             &[
                 ("2026-01-01T12:00:00Z", "oldest"),
@@ -518,7 +554,7 @@ mod tests {
         assert!(result.scan_limit_reached);
         assert_eq!(result.scanned_chunks, 1);
         assert!(result.scanned_bytes > 0);
-        assert!(result.next_cursor.is_none());
+        assert!(result.next_cursor.is_some());
         assert_eq!(
             result
                 .lines
@@ -534,7 +570,10 @@ mod tests {
         let result = mock_search(&[("2026-01-01T12:00:00Z", "unrelated")], Some("absent")).await;
         assert!(result.scan_limit_reached);
         assert!(result.lines.is_empty());
-        assert!(result.next_cursor.is_none());
+        let cursor: Cursor = serde_json::from_str(result.next_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor.version, 2);
+        assert!(cursor.before.is_none());
+        assert!(cursor.frontier.is_some());
     }
 
     #[test]
@@ -549,15 +588,16 @@ mod tests {
             serde_json::to_string(&Cursor {
                 version: 1,
                 scope: q.scope_hash().unwrap(),
-                before: key,
+                before: Some(key),
+                frontier: None,
             })
             .unwrap(),
         );
-        assert_eq!(q.cursor_key().unwrap(), Some(key));
+        assert_eq!(q.cursor_state().unwrap(), (Some(key), None));
         q.text = Some("changed".into());
-        assert!(q.cursor_key().is_err());
+        assert!(q.cursor_state().is_err());
         q.cursor = Some("bad".into());
-        assert!(q.cursor_key().is_err());
+        assert!(q.cursor_state().is_err());
         q.page_size = Some(501);
         assert!(q.validate().is_err());
     }
@@ -689,6 +729,37 @@ mod tests {
         let limited = service.search_global(&q, &unrestricted).await.unwrap();
         assert!(limited.scan_limit_reached);
         assert_eq!(limited.lines.len(), 16); // 8 newer chunks before project 105
-        assert!(limited.next_cursor.is_none());
+        assert!(limited.next_cursor.is_some());
+
+        // A scan window can exhaust its budget without finding a match. Its
+        // v2 cursor must resume after the blocking chunk rather than looping
+        // over the same candidates forever. Project 1 sorts behind the
+        // oversized project-105 chunk and is reached only if the frontier
+        // predicate is applied in the correct direction.
+        q.text = Some("message 1:0".into());
+        q.cursor = None;
+        let empty_window = service.search_global(&q, &unrestricted).await.unwrap();
+        assert!(empty_window.scan_limit_reached);
+        assert!(empty_window.lines.is_empty());
+        let continuation = empty_window
+            .next_cursor
+            .expect("an exhausted empty scan window remains pageable");
+        let cursor: Cursor = serde_json::from_str(&continuation).unwrap();
+        assert_eq!(cursor.version, 2);
+        assert!(cursor.frontier.is_some());
+
+        q.cursor = Some(continuation);
+        let resumed = service.search_global(&q, &unrestricted).await.unwrap();
+        assert!(
+            !resumed.scan_limit_reached,
+            "resumed scan unexpectedly exhausted its budget after {} chunks / {} bytes with {} lines and cursor {:?}",
+            resumed.scanned_chunks,
+            resumed.scanned_bytes,
+            resumed.lines.len(),
+            resumed.next_cursor
+        );
+        assert_eq!(resumed.lines.len(), 1);
+        assert_eq!(resumed.lines[0].line.message, "message 1:0");
+        assert!(resumed.next_cursor.is_none());
     }
 }

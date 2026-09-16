@@ -253,17 +253,18 @@ test('scan-budget exhaustion asks for a narrower search instead of claiming no l
           scan_limit_reached: true,
           scanned_bytes: 100,
           scanned_chunks: 512,
+          next_cursor: 'scan-next-token',
         },
       })
   )
   await page.goto('/logs')
-  await expect(
-    page.getByText('Search limit reached', { exact: true })
-  ).toBeVisible()
+  await expect(page.getByText(/Scan limit reached/)).toBeVisible()
   await expect(page.getByText('No logs in this view')).toHaveCount(0)
   await expect(
     page.getByRole('button', { name: 'Next page', exact: true })
-  ).toBeDisabled()
+  ).toBeEnabled()
+  await page.getByRole('button', { name: 'Next page', exact: true }).click()
+  await expect(page).toHaveURL(/cursor=scan-next-token/)
 })
 
 for (const width of [1440, 390]) {
@@ -280,13 +281,13 @@ for (const width of [1440, 390]) {
             ...fixtures.logs,
             scan_limit_reached: true,
             scanned_chunks: 512,
-            next_cursor: null,
+            next_cursor: 'partial-next-token',
           },
         })
     )
     await page.goto('/logs')
     await expect(
-      page.getByText('Partial results', { exact: true })
+      page.getByText(/Scan limit reached · showing partial results/)
     ).toBeVisible()
     await expect(
       page.getByRole('cell', { name: 'Checkout request failed', exact: false })
@@ -296,7 +297,7 @@ for (const width of [1440, 390]) {
     ).toBeVisible()
     await expect(
       page.getByRole('button', { name: 'Next page', exact: true })
-    ).toBeDisabled()
+    ).toBeEnabled()
     await expect(page.getByText('No logs in this view')).toHaveCount(0)
     await page.screenshot({
       path: `/tmp/temps-log-partial-results-${width}.png`,

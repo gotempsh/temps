@@ -12,11 +12,10 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
-import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { positiveInteger } from '@/lib/global-observability'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { RefreshCw, Play, Pause } from 'lucide-react'
+import { AlertTriangle, RefreshCw, Play, Pause } from 'lucide-react'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 export default function GlobalLogs() {
@@ -77,18 +76,16 @@ export default function GlobalLogs() {
   const incomplete = ready && !!query.data?.scan_limit_reached
   const lines = ready ? (query.data?.lines ?? []) : []
   const status = incomplete ? (
-    <Alert variant="warning">
-      <AlertTitle>
-        {lines.length ? 'Partial results' : 'Search limit reached'}
-      </AlertTitle>
-      <AlertDescription>
-        {lines.length
-          ? 'Showing logs found before the search limit was reached. Some matching logs may be missing.'
-          : 'The search limit was reached before any matching logs were found.'}{' '}
-        Choose a shorter time range or narrow the project or source to search
-        fewer archives.
-      </AlertDescription>
-    </Alert>
+    <div
+      role="status"
+      className="flex items-center gap-1.5 px-1 text-xs text-amber-700 dark:text-amber-400"
+    >
+      <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
+      <span>
+        Scan limit reached{lines.length ? ' · showing partial results' : ''}.
+        Use Next page to continue or narrow the search.
+      </span>
+    </div>
   ) : !ready || !lines.length ? (
     <QueryContent
       title="Logs"
@@ -218,10 +215,7 @@ export default function GlobalLogs() {
                 size="sm"
                 className="h-7 text-xs"
                 disabled={
-                  !query.data?.next_cursor ||
-                  query.isFetching ||
-                  !ready ||
-                  incomplete
+                  !query.data?.next_cursor || query.isFetching || !ready
                 }
                 onClick={() => {
                   setAuto(false)
