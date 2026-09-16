@@ -3489,6 +3489,15 @@ mod tests {
                 DeploymentFailureCode::OutOfMemory,
             ),
             (
+                // The build job's out-of-memory explanation, whose only
+                // exit-code text is the ordinary 1 the build tool returned.
+                "Failed to build image: The build step ran out of memory: the kernel's OOM \
+                 killer terminated 1 process on this host while the step ran; the step exited \
+                 with code 1 after one of its processes was killed; host RAM 3902 MB",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+            ),
+            (
                 "write failed: no space left on device",
                 DeploymentFailureStage::Resource,
                 DeploymentFailureCode::DiskExhausted,

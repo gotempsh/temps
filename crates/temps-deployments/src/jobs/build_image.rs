@@ -1173,6 +1173,9 @@ impl BuildImageJob {
         build_host_platform: &str,
         error: &temps_deployer::BuilderError,
     ) -> String {
+        if let temps_deployer::BuilderError::BuildOutOfMemory { message, diagnosis } = error {
+            return Self::describe_out_of_memory(platform, message, diagnosis);
+        }
         if let Some(message) = Self::describe_registry_rate_limit(platform, error) {
             return message;
         }
@@ -1206,6 +1209,47 @@ impl BuildImageJob {
         } else {
             format!("Failed to build image for {}: {}", platform, error)
         }
+    }
+
+    /// Explain a build step that ran out of memory and what to do about it.
+    ///
+    /// The deployer already established the facts (`BuildMemoryDiagnosis`);
+    /// this adds the part a self-hoster cannot see from the log: on a
+    /// BuildKit host the per-build memory cap from Settings is not applied,
+    /// so the step competes with everything else on the host and the kernel
+    /// ends the largest process, usually a compiler or bundler, whose parent
+    /// then exits with an ordinary status. Without this, the log ends in a
+    /// bare `exit code: 1` after minutes of silence.
+    fn describe_out_of_memory(
+        platform: Option<&str>,
+        message: &str,
+        diagnosis: &temps_deployer::BuildMemoryDiagnosis,
+    ) -> String {
+        let scope = match platform {
+            Some(platform) => format!(" for {}", platform),
+            None => String::new(),
+        };
+        let cap_explanation = if diagnosis.cap_enforced {
+            format!(
+                "The per-build memory cap of {} MB (Settings > Build Limits) was reached. \
+                 Raise it, or reduce the build's memory use.",
+                diagnosis.requested_cap_mb
+            )
+        } else {
+            "This host builds with BuildKit, which does not apply the per-build memory cap \
+             from Settings > Build Limits, so a build can use all of the host's RAM; when the \
+             host runs out, the kernel ends the largest process (usually the compiler or \
+             bundler) and the build tool exits with a generic status."
+                .to_string()
+        };
+        format!(
+            "Failed to build image{scope}: {diagnosis}. {cap_explanation} Options: run this \
+             build on a host with more RAM, lower the maximum number of concurrent builds, \
+             reduce the build's memory use (for Node.js builds set the build variable \
+             NODE_OPTIONS=--max-old-space-size=<MB>), or build the image in CI and deploy it \
+             as an image (https://temps.sh/docs/set-up-ci-cd-pipeline). Underlying error: \
+             {message}"
+        )
     }
 
     /// Recognise a Docker Hub anonymous-pull rate limit and explain the fix.
@@ -2141,5 +2185,90 @@ mod tests {
         assert_eq!(repo_output.checkout_ref, "main");
         assert_eq!(repo_output.repo_owner, "user");
         assert_eq!(repo_output.repo_name, "project");
+    }
+
+    #[test]
+    fn test_describe_build_failure_explains_out_of_memory() {
+        let host = "linux/amd64";
+        let oom = BuilderError::BuildOutOfMemory {
+            message: "Docker stream error: process \"/bin/sh -c npm run build\" did not \
+                      complete successfully: exit code: 1"
+                .into(),
+            diagnosis: temps_deployer::BuildMemoryDiagnosis {
+                host_oom_kills: Some(1),
+                exit_code: Some(1),
+                host_memory_mb: Some(3902),
+                requested_cap_mb: 2047,
+                cap_enforced: false,
+            },
+        };
+
+        let msg = BuildImageJob::describe_build_failure(Some(host), host, &oom);
+        assert!(
+            msg.starts_with(
+                "Failed to build image for linux/amd64: The build step ran out of memory"
+            ),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("terminated 1 process on this host"),
+            "got: {}",
+            msg
+        );
+        assert!(msg.contains("host RAM 3902 MB"), "got: {}", msg);
+        assert!(
+            msg.contains("does not apply the per-build memory cap"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("NODE_OPTIONS=--max-old-space-size"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("https://temps.sh/docs/set-up-ci-cd-pipeline"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.ends_with("exit code: 1"),
+            "keeps the builder's own text: {}",
+            msg
+        );
+        assert!(!msg.contains("Docker Hub rate-limited"), "got: {}", msg);
+        assert!(!msg.contains("binfmt"), "got: {}", msg);
+
+        // No platform requested: same explanation without the scope.
+        let plain = BuildImageJob::describe_build_failure(None, host, &oom);
+        assert!(
+            plain.starts_with("Failed to build image: The build step ran out of memory"),
+            "got: {}",
+            plain
+        );
+
+        // Under the legacy builder the cap is real, so the advice is to raise it.
+        let capped = BuilderError::BuildOutOfMemory {
+            message: "returned a non-zero code: 137".into(),
+            diagnosis: temps_deployer::BuildMemoryDiagnosis {
+                host_oom_kills: Some(1),
+                exit_code: Some(137),
+                host_memory_mb: Some(3902),
+                requested_cap_mb: 512,
+                cap_enforced: true,
+            },
+        };
+        let capped_msg = BuildImageJob::describe_build_failure(None, host, &capped);
+        assert!(
+            capped_msg.contains("memory cap of 512 MB (Settings > Build Limits) was reached"),
+            "got: {}",
+            capped_msg
+        );
+        assert!(
+            !capped_msg.contains("does not apply"),
+            "got: {}",
+            capped_msg
+        );
     }
 }
