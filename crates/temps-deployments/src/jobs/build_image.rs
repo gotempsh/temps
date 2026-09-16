@@ -2202,6 +2202,8 @@ mod tests {
                       complete successfully: exit code: 1"
                 .into(),
             diagnosis: temps_deployer::BuildMemoryDiagnosis {
+                attribution: temps_deployer::OomAttribution::OnlyBuildRunning,
+                victim: None,
                 host_oom_kills: Some(1),
                 exit_code: Some(1),
                 host_memory_mb: Some(3902),
@@ -2213,8 +2215,13 @@ mod tests {
         let msg = BuildImageJob::describe_build_failure(Some(host), host, &oom);
         assert!(
             msg.starts_with(
-                "Failed to build image for linux/amd64: The build step ran out of memory"
+                "Failed to build image for linux/amd64: The build step most likely ran out of memory"
             ),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("; no other build was running;"),
             "got: {}",
             msg
         );
@@ -2250,7 +2257,8 @@ mod tests {
         // No platform requested: same explanation without the scope.
         let plain = BuildImageJob::describe_build_failure(None, host, &oom);
         assert!(
-            plain.starts_with("Failed to build image: The build step ran out of memory"),
+            plain
+                .starts_with("Failed to build image: The build step most likely ran out of memory"),
             "got: {}",
             plain
         );
@@ -2259,6 +2267,8 @@ mod tests {
         let capped = BuilderError::BuildOutOfMemory {
             message: "returned a non-zero code: 137".into(),
             diagnosis: temps_deployer::BuildMemoryDiagnosis {
+                attribution: temps_deployer::OomAttribution::StepKilled,
+                victim: None,
                 host_oom_kills: Some(1),
                 exit_code: Some(137),
                 host_memory_mb: Some(3902),

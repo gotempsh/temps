@@ -7,7 +7,7 @@ use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_ST
 use crate::{
     BuildMemoryDiagnosis, BuildRequest, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerRuntime, ContainerStatus, DeployRequest, DeployResult, DeployerError,
-    ImageBuilder, ImageImportStream, PortMapping, Protocol, RuntimeInfo,
+    ImageBuilder, ImageImportStream, OomAttribution, PortMapping, Protocol, RuntimeInfo,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -723,6 +723,9 @@ pub struct DockerRuntime {
     /// taking down the box. None on worker nodes and in tests — they get
     /// the legacy unbounded behaviour.
     build_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Size of `build_semaphore`, so a failure can tell how many other builds
+    /// were in flight at the time.
+    build_permits: Option<usize>,
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
@@ -739,6 +742,36 @@ pub struct DockerRuntime {
     /// [`Self::refresh_daemon_platform`]; until then `get_native_platform`
     /// falls back to the compiled-in architecture.
     daemon_platform: Arc<std::sync::OnceLock<String>>,
+}
+
+/// Host readings taken before a build starts, for attributing a failure.
+#[derive(Debug, Clone, Copy)]
+struct HostSample {
+    oom_kills: Option<u64>,
+    uptime_us: Option<u64>,
+}
+
+/// Everything the host could tell about a failed step, gathered after it.
+#[derive(Debug, Clone, Default)]
+struct MemorySignals {
+    /// Kernel OOM kills on the host during the build (`None`: unavailable).
+    oom_kills: Option<u64>,
+    /// Victims named by the kernel log (`None`: log not readable).
+    victims: Option<Vec<OomVictim>>,
+    /// Other builds holding a permit at failure time (`None`: unknown).
+    other_builds: Option<usize>,
+}
+
+/// Outcome of looking at a failed step through `MemorySignals`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryVerdict {
+    /// The step ran out of memory; carry the facts.
+    OutOfMemory(BuildMemoryDiagnosis),
+    /// Something was killed on the host but it cannot be pinned on this
+    /// build; the string is a note for the build log.
+    Unattributed(String),
+    /// No memory signal at all.
+    NotMemory,
 }
 
 /// Explicit per-build resource caps, set by the control plane from
@@ -891,6 +924,95 @@ fn host_oom_kill_count() -> Option<u64> {
         .ok()
         .as_deref()
         .and_then(parse_oom_kill_count)
+}
+
+/// A process the kernel's OOM killer terminated, from the kernel log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OomVictim {
+    /// Command name (`task=` in the kernel's `oom-kill:` line).
+    comm: String,
+    /// Memory cgroup of the victim (`task_memcg=`).
+    cgroup: String,
+}
+
+/// Whether a memory cgroup path belongs to a BuildKit build step rather than
+/// a container. dockerd runs BuildKit steps under its default cgroup parent
+/// with BuildKit's own exec id: `.../system.slice:docker:<id>` with the
+/// systemd driver, `/docker/<id>` with cgroupfs. Containers are
+/// `docker-<64 hex>.scope` or `/docker/<64 hex>`.
+fn cgroup_is_build_step(cgroup: &str) -> bool {
+    if cgroup.contains(":docker:") {
+        return true;
+    }
+    let is_container_id =
+        |segment: &str| segment.len() == 64 && segment.chars().all(|c| c.is_ascii_hexdigit());
+    match cgroup.rsplit_once("/docker/") {
+        Some((_, id)) => !id.is_empty() && !id.contains('/') && !is_container_id(id),
+        None => false,
+    }
+}
+
+/// Seconds since boot from `/proc/uptime`, in microseconds, the clock the
+/// kernel log timestamps its records with.
+fn uptime_us() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let seconds: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    Some((seconds * 1_000_000.0) as u64)
+}
+
+/// OOM victims named in `/dev/kmsg` records at or after `since_us`. Each
+/// record is `prio,seq,timestamp_us,flags;message`; continuation lines
+/// start with a space and carry no timestamp.
+fn parse_oom_victims(kmsg: &str, since_us: u64) -> Vec<OomVictim> {
+    kmsg.lines()
+        .filter_map(|line| {
+            let (header, message) = line.split_once(';')?;
+            let timestamp: u64 = header.split(',').nth(2)?.trim().parse().ok()?;
+            if timestamp < since_us || !message.starts_with("oom-kill:") {
+                return None;
+            }
+            let field = |key: &str| {
+                message
+                    .split(',')
+                    .find_map(|part| part.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            Some(OomVictim {
+                comm: field("task=")?,
+                cgroup: field("task_memcg=")?,
+            })
+        })
+        .collect()
+}
+
+/// The kernel log, when this process may read it (`/dev/kmsg` needs
+/// CAP_SYSLOG or `dmesg_restrict=0`). Non-blocking, one record per read.
+#[cfg(target_os = "linux")]
+fn read_kernel_log() -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const O_NONBLOCK: i32 = 0o4000;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open("/dev/kmsg")
+        .ok()?;
+    let mut log = String::new();
+    let mut record = [0u8; 8192];
+    loop {
+        match file.read(&mut record) {
+            Ok(0) => break,
+            Ok(n) => log.push_str(&String::from_utf8_lossy(&record[..n])),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    Some(log)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_kernel_log() -> Option<String> {
+    None
 }
 
 /// The exit status a builder error reports for a failed step. BuildKit
@@ -1121,6 +1243,7 @@ impl DockerRuntime {
             overlay_peers: None,
             secrets_root,
             build_semaphore: None,
+            build_permits: None,
             build_resource_override: None,
             daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
@@ -1191,6 +1314,7 @@ impl DockerRuntime {
     ) -> Self {
         let permits = max_concurrent.max(1) as usize;
         self.build_semaphore = Some(Arc::new(tokio::sync::Semaphore::new(permits)));
+        self.build_permits = Some(permits);
         self.build_resource_override =
             resource_limits.filter(|r| r.cpu_cores > 0.0 && r.memory_mb > 0);
         if let (true, Some(caps)) = (self.use_buildkit, self.build_resource_override) {
@@ -1745,45 +1869,111 @@ impl DockerRuntime {
     fn diagnose_out_of_memory(
         &self,
         error_text: &str,
-        oom_kills_before: Option<u64>,
+        before: Option<&HostSample>,
         requested_cap_bytes: i64,
-    ) -> Option<BuildMemoryDiagnosis> {
-        let oom_kills_after = oom_kills_before.and_then(|_| host_oom_kill_count());
-        self.diagnose_out_of_memory_with(
-            error_text,
-            oom_kills_before,
-            oom_kills_after,
-            requested_cap_bytes,
-        )
+    ) -> MemoryVerdict {
+        let Some(before) = before else {
+            return self.diagnose_out_of_memory_with(
+                error_text,
+                &MemorySignals::default(),
+                requested_cap_bytes,
+            );
+        };
+        let oom_kills = match (before.oom_kills, host_oom_kill_count()) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => None,
+        };
+        // Only read the kernel log when something was killed; it is a
+        // privileged read and the ring buffer can be large.
+        let victims = match (oom_kills, before.uptime_us) {
+            (Some(kills), Some(since)) if kills > 0 => {
+                read_kernel_log().map(|log| parse_oom_victims(&log, since))
+            }
+            _ => None,
+        };
+        let signals = MemorySignals {
+            oom_kills,
+            victims,
+            other_builds: self.other_builds_in_flight(),
+        };
+        self.diagnose_out_of_memory_with(error_text, &signals, requested_cap_bytes)
     }
 
-    /// [`Self::diagnose_out_of_memory`] with both counter samples supplied.
+    /// [`Self::diagnose_out_of_memory`] with the host signals supplied.
+    ///
+    /// A kill is attributed to this build when the step's own process was
+    /// killed (exit 137), when the kernel log names a build step's cgroup as
+    /// the victim, or when a process was killed while no other build was
+    /// running. A kill the log attributes to something else, or one that
+    /// happened while other builds ran, is reported as a note instead.
     fn diagnose_out_of_memory_with(
         &self,
         error_text: &str,
-        oom_kills_before: Option<u64>,
-        oom_kills_after: Option<u64>,
+        signals: &MemorySignals,
         requested_cap_bytes: i64,
-    ) -> Option<BuildMemoryDiagnosis> {
+    ) -> MemoryVerdict {
         let exit_code = build_step_exit_code(error_text);
-        let host_oom_kills = match (oom_kills_before, oom_kills_after) {
-            (Some(before), Some(after)) => Some(after.saturating_sub(before)),
-            _ => None,
+        let step_killed = exit_code == Some(SIGKILL_EXIT_CODE);
+        let kills = signals.oom_kills;
+        let build_victim = signals
+            .victims
+            .as_ref()
+            .and_then(|victims| victims.iter().find(|v| cgroup_is_build_step(&v.cgroup)));
+        let other_victim = signals
+            .victims
+            .as_ref()
+            .and_then(|victims| victims.first())
+            .filter(|_| build_victim.is_none());
+
+        let attribution = if step_killed
+            && kills.is_none_or(|k| k > 0)
+            && (signals.victims.is_none() || build_victim.is_some())
+        {
+            OomAttribution::StepKilled
+        } else if build_victim.is_some() {
+            OomAttribution::VictimWasBuildStep
+        } else if kills.is_some_and(|k| k > 0)
+            && signals.victims.is_none()
+            && signals.other_builds == Some(0)
+        {
+            OomAttribution::OnlyBuildRunning
+        } else if kills.is_some_and(|k| k > 0) {
+            let note = match (other_victim, signals.other_builds) {
+                (Some(victim), _) => format!(
+                    "NOTE: the kernel's OOM killer terminated `{}` (in {}) on this host while \
+                     this step ran; that process was not part of this build, so the failure is \
+                     not attributed to memory.\n",
+                    victim.comm, victim.cgroup
+                ),
+                (None, Some(others)) => format!(
+                    "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
+                     this step ran and {} other build(s) were running, so the kill cannot be \
+                     attributed to this build; if this failure looks like a crash without a \
+                     compiler error, the step may have run out of memory.\n",
+                    kills.unwrap_or(0),
+                    others
+                ),
+                (None, None) => format!(
+                    "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
+                     this step ran; other builds may have been running, so the kill cannot be \
+                     attributed to this build.\n",
+                    kills.unwrap_or(0)
+                ),
+            };
+            return MemoryVerdict::Unattributed(note);
+        } else {
+            return MemoryVerdict::NotMemory;
         };
-        let out_of_memory = match host_oom_kills {
-            Some(kills) => kills > 0,
-            None => exit_code == Some(SIGKILL_EXIT_CODE),
-        };
-        if !out_of_memory {
-            return None;
-        }
+
         let host_memory_mb = self.daemon_is_local.then(|| {
             let mut sys = System::new();
             sys.refresh_memory();
             sys.total_memory() / (1024 * 1024)
         });
-        Some(BuildMemoryDiagnosis {
-            host_oom_kills,
+        MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+            attribution,
+            victim: build_victim.map(|v| v.comm.clone()),
+            host_oom_kills: kills,
             exit_code,
             host_memory_mb,
             requested_cap_mb: (requested_cap_bytes / (1024 * 1024)).max(0) as u64,
@@ -1791,14 +1981,24 @@ impl DockerRuntime {
         })
     }
 
-    /// Kernel OOM-kill counter to compare against after the build, or `None`
-    /// when it would not describe the build host.
-    fn oom_kills_before_build(&self) -> Option<u64> {
-        if self.daemon_is_local {
-            host_oom_kill_count()
-        } else {
-            None
+    /// Host-side samples taken before a build so a failure can be attributed:
+    /// the kernel's OOM-kill counter and the boot-relative clock the kernel
+    /// log uses. `None` when the daemon is not on this host.
+    fn host_sample_before_build(&self) -> Option<HostSample> {
+        if !self.daemon_is_local {
+            return None;
         }
+        Some(HostSample {
+            oom_kills: host_oom_kill_count(),
+            uptime_us: uptime_us(),
+        })
+    }
+
+    /// Builds other than the current one holding a permit right now.
+    fn other_builds_in_flight(&self) -> Option<usize> {
+        let permits = self.build_permits?;
+        let available = self.build_semaphore.as_ref()?.available_permits();
+        Some(permits.saturating_sub(available).saturating_sub(1))
     }
 
     /// Map a failed build step to its error. When the failure looks like an
@@ -1807,11 +2007,11 @@ impl DockerRuntime {
     fn classify_build_failure(
         &self,
         error_text: String,
-        oom_kills_before: Option<u64>,
+        before: Option<&HostSample>,
         requested_cap_bytes: i64,
     ) -> (BuilderError, Option<String>) {
-        match self.diagnose_out_of_memory(&error_text, oom_kills_before, requested_cap_bytes) {
-            Some(diagnosis) => {
+        match self.diagnose_out_of_memory(&error_text, before, requested_cap_bytes) {
+            MemoryVerdict::OutOfMemory(diagnosis) => {
                 let line = format!("ERROR: {}\n", diagnosis);
                 (
                     BuilderError::BuildOutOfMemory {
@@ -1821,7 +2021,10 @@ impl DockerRuntime {
                     Some(line),
                 )
             }
-            None => (BuilderError::BuildFailed(error_text), None),
+            MemoryVerdict::Unattributed(note) => {
+                (BuilderError::BuildFailed(error_text), Some(note))
+            }
+            MemoryVerdict::NotMemory => (BuilderError::BuildFailed(error_text), None),
         }
     }
 
@@ -2126,7 +2329,7 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
-        let oom_kills_before = self.oom_kills_before_build();
+        let host_before = self.host_sample_before_build();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -2151,7 +2354,7 @@ impl ImageBuilder for DockerRuntime {
                             .await;
                         let (err, memory_line) = self.classify_build_failure(
                             error,
-                            oom_kills_before,
+                            host_before.as_ref(),
                             i64::from(memory_i32),
                         );
                         if let Some(line) = memory_line {
@@ -2168,7 +2371,7 @@ impl ImageBuilder for DockerRuntime {
                         .await;
                     let (err, memory_line) = self.classify_build_failure(
                         error_msg,
-                        oom_kills_before,
+                        host_before.as_ref(),
                         i64::from(memory_i32),
                     );
                     if let Some(line) = memory_line {
@@ -2339,7 +2542,7 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
-        let oom_kills_before = self.oom_kills_before_build();
+        let host_before = self.host_sample_before_build();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -2375,7 +2578,7 @@ impl ImageBuilder for DockerRuntime {
 
                         let (err, memory_line) = self.classify_build_failure(
                             error,
-                            oom_kills_before,
+                            host_before.as_ref(),
                             i64::from(memory_i32),
                         );
                         if let Some(line) = memory_line {
@@ -2443,7 +2646,7 @@ impl ImageBuilder for DockerRuntime {
 
                     let (err, memory_line) = self.classify_build_failure(
                         error_msg,
-                        oom_kills_before,
+                        host_before.as_ref(),
                         i64::from(memory_i32),
                     );
                     if let Some(line) = memory_line {
@@ -5917,42 +6120,76 @@ CMD ["cat", "/hello.txt"]
         )
     }
 
+    fn signals(
+        oom_kills: Option<u64>,
+        victims: Option<Vec<OomVictim>>,
+        other_builds: Option<usize>,
+    ) -> MemorySignals {
+        MemorySignals {
+            oom_kills,
+            victims,
+            other_builds,
+        }
+    }
+
+    fn victim(comm: &str, cgroup: &str) -> OomVictim {
+        OomVictim {
+            comm: comm.into(),
+            cgroup: cgroup.into(),
+        }
+    }
+
+    const EXITED_ONE: &str = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                              successfully: exit code: 1";
+    const KILLED: &str = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                          successfully: exit code: 137";
+    const CAP: i64 = 512 * 1024 * 1024;
+
     #[test]
     fn diagnose_out_of_memory_needs_a_kill_signal() {
         let rt = runtime_for_diagnosis(true);
-        let cap = 512 * 1024 * 1024;
         // A plain failure with no OOM kill on the host is not a memory failure.
-        // `u64::MAX` as the before-sample makes the delta zero whatever the
-        // host's counter says.
-        let plain = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
-                     successfully: exit code: 1";
         assert_eq!(
-            rt.diagnose_out_of_memory_with(plain, Some(7), Some(7), cap),
-            None
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(0), None, Some(0)), CAP),
+            MemoryVerdict::NotMemory
         );
-        assert_eq!(rt.diagnose_out_of_memory_with(plain, None, None, cap), None);
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &MemorySignals::default(), CAP),
+            MemoryVerdict::NotMemory
+        );
         // A SIGKILL with a readable counter that did not move came from
         // something other than the kernel's OOM killer.
-        let killed = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
-                      successfully: exit code: 137";
         assert_eq!(
-            rt.diagnose_out_of_memory_with(killed, Some(7), Some(7), cap),
-            None
+            rt.diagnose_out_of_memory_with(KILLED, &signals(Some(0), None, Some(0)), CAP),
+            MemoryVerdict::NotMemory
         );
-        // The live wrapper only samples "after" when it sampled "before".
-        assert_eq!(rt.diagnose_out_of_memory(plain, None, cap), None);
+        // The live wrapper with no host sample (remote daemon) can still
+        // recognise the step's own kill signal.
+        assert!(matches!(
+            rt.diagnose_out_of_memory(KILLED, None, CAP),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::StepKilled,
+                ..
+            })
+        ));
+        assert_eq!(
+            rt.diagnose_out_of_memory(EXITED_ONE, None, CAP),
+            MemoryVerdict::NotMemory
+        );
     }
 
     #[test]
     fn diagnose_out_of_memory_from_the_sigkill_exit_status() {
         let rt = runtime_for_diagnosis(true);
-        let killed = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
-                      successfully: exit code: 137";
-        let diagnosis = rt
-            .diagnose_out_of_memory_with(killed, None, None, 512 * 1024 * 1024)
-            .expect("exit code 137 is a kill signal without a readable counter");
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(KILLED, &MemorySignals::default(), CAP)
+        else {
+            panic!("exit code 137 is a kill signal without a readable counter");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::StepKilled);
         assert_eq!(diagnosis.exit_code, Some(137));
         assert_eq!(diagnosis.host_oom_kills, None);
+        assert_eq!(diagnosis.victim, None);
         assert_eq!(diagnosis.requested_cap_mb, 512);
         assert!(!diagnosis.cap_enforced, "BuildKit does not apply the cap");
     }
@@ -5961,19 +6198,140 @@ CMD ["cat", "/hello.txt"]
     fn diagnose_out_of_memory_from_a_host_oom_kill_with_an_ordinary_exit_code() {
         let rt = runtime_for_diagnosis(false);
         // The reported shape: a child of the build tool was killed, the tool
-        // itself exited 1, and the kernel's counter moved by one during the
-        // build.
-        let exited_one = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
-                          successfully: exit code: 1";
-        let diagnosis = rt
-            .diagnose_out_of_memory_with(exited_one, Some(7), Some(8), 2_147_483_647)
-            .expect("an OOM kill during the build is a memory failure");
+        // itself exited 1, the kernel's counter moved by one, no other build
+        // was running, and the kernel log was not readable.
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), None, Some(0)), CAP)
+        else {
+            panic!("an OOM kill during the only running build is a memory failure");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::OnlyBuildRunning);
         assert_eq!(diagnosis.exit_code, Some(1));
         assert_eq!(diagnosis.host_oom_kills, Some(1));
-        assert_eq!(diagnosis.requested_cap_mb, 2047);
         assert!(diagnosis.cap_enforced, "the legacy builder applies the cap");
         if rt.daemon_is_local {
             assert!(diagnosis.host_memory_mb.unwrap_or(0) > 0);
         }
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_attributes_through_the_kernel_log() {
+        let rt = runtime_for_diagnosis(true);
+        // The log names a build step's cgroup: attributed even with an
+        // ordinary exit code and other builds running.
+        let step = vec![victim(
+            "node",
+            "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi",
+        )];
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), Some(step), Some(1)), CAP)
+        else {
+            panic!("a killed build-step process is a memory failure");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::VictimWasBuildStep);
+        assert_eq!(diagnosis.victim.as_deref(), Some("node"));
+
+        // The log names a container instead: not this build's problem, even
+        // though the counter moved and no other build was running.
+        let container = vec![victim(
+            "postgres",
+            "/system.slice/docker-2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c.scope",
+        )];
+        match rt.diagnose_out_of_memory_with(
+            EXITED_ONE,
+            &signals(Some(1), Some(container.clone()), Some(0)),
+            CAP,
+        ) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("terminated `postgres`"), "{note}");
+                assert!(note.contains("not attributed to memory"), "{note}");
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // Same with the step's own SIGKILL: the kernel killed something else,
+        // so this SIGKILL came from elsewhere.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                KILLED,
+                &signals(Some(1), Some(container), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_hedges_when_other_builds_were_running() {
+        let rt = runtime_for_diagnosis(true);
+        // Counter moved, log unreadable, another build in flight: a note, not
+        // a diagnosis, because the kill could be the other build's.
+        match rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), None, Some(1)), CAP) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("1 other build(s) were running"), "{note}");
+                assert!(
+                    note.contains("cannot be attributed to this build"),
+                    "{note}"
+                );
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // Concurrency unknown (no semaphore): same hedge, different wording.
+        match rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(2), None, None), CAP) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("terminated 2 process(es)"), "{note}");
+                assert!(
+                    note.contains("other builds may have been running"),
+                    "{note}"
+                );
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // The step's own SIGKILL is still conclusive with other builds running.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(KILLED, &signals(Some(1), None, Some(1)), CAP),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::StepKilled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cgroup_is_build_step_tells_buildkit_execs_from_containers() {
+        assert!(cgroup_is_build_step(
+            "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi"
+        ));
+        assert!(cgroup_is_build_step("/docker/zglzqvzuv2kxjwkdcpi6udshi"));
+        assert!(!cgroup_is_build_step(
+            "/system.slice/docker-2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c.scope"
+        ));
+        assert!(!cgroup_is_build_step(
+            "/docker/2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c"
+        ));
+        assert!(!cgroup_is_build_step(
+            "/user.slice/user-1000.slice/session-3.scope"
+        ));
+        assert!(!cgroup_is_build_step("/docker/"));
+    }
+
+    #[test]
+    fn parse_oom_victims_reads_kernel_log_records_since_the_build_started() {
+        let kmsg = "6,100,1000000,-;usb 1-1: new device\n\
+                    3,101,2000000,-;oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/system.slice/docker-abc.scope,task=postgres,pid=42,uid=0\n\
+                    3,102,2000500,-;Out of memory: Killed process 42 (postgres) total-vm:1kB\n\
+                    3,103,3000000,-;oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi,task=node,pid=99,uid=0\n\
+                     SUBSYSTEM=mem\n";
+        let since_build_start = parse_oom_victims(kmsg, 2_500_000);
+        assert_eq!(
+            since_build_start,
+            vec![victim(
+                "node",
+                "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi"
+            )]
+        );
+        let all = parse_oom_victims(kmsg, 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].comm, "postgres");
+        assert!(parse_oom_victims("garbage without separators\n", 0).is_empty());
     }
 }

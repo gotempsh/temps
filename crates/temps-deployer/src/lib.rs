@@ -47,6 +47,18 @@ pub use platform::{
     normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
 };
 
+/// How the deployer linked an OOM kill to the failed build step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OomAttribution {
+    /// The step's own process was killed (exit status 137).
+    StepKilled,
+    /// The kernel log named a process in a build step's cgroup as the victim.
+    VictimWasBuildStep,
+    /// A process on the host was killed while this was the only build
+    /// running; the kernel log was not readable to confirm which one.
+    OnlyBuildRunning,
+}
+
 /// What the deployer observed about memory pressure around a failed build step.
 ///
 /// Produced by `DockerRuntime` when a step's failure coincides with a kernel
@@ -55,6 +67,10 @@ pub use platform::{
 /// re-deriving them; `Display` renders them as one factual sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildMemoryDiagnosis {
+    /// How the kill was linked to this build.
+    pub attribution: OomAttribution,
+    /// Command name of the killed process when the kernel log named it.
+    pub victim: Option<String>,
     /// Processes the kernel's OOM killer terminated on the build host while
     /// the build ran (`/proc/vmstat` `oom_kill` delta). `None` when the
     /// counter is unavailable or the daemon is not on this host.
@@ -73,7 +89,14 @@ pub struct BuildMemoryDiagnosis {
 
 impl std::fmt::Display for BuildMemoryDiagnosis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "The build step ran out of memory")?;
+        match self.attribution {
+            OomAttribution::StepKilled | OomAttribution::VictimWasBuildStep => {
+                write!(f, "The build step ran out of memory")?
+            }
+            OomAttribution::OnlyBuildRunning => {
+                write!(f, "The build step most likely ran out of memory")?
+            }
+        }
         match self.host_oom_kills {
             Some(1) => write!(
                 f,
@@ -84,6 +107,12 @@ impl std::fmt::Display for BuildMemoryDiagnosis {
                 ": the kernel's OOM killer terminated {n} processes on this host while the step ran"
             )?,
             _ => {}
+        }
+        if let Some(victim) = &self.victim {
+            write!(f, "; the killed process was `{victim}`")?;
+        }
+        if self.attribution == OomAttribution::OnlyBuildRunning {
+            write!(f, "; no other build was running")?;
         }
         match self.exit_code {
             Some(137) => write!(f, "; the step's process was killed (exit code 137)")?,
@@ -1482,6 +1511,8 @@ CMD ["echo", "Hello from container"]
     #[test]
     fn build_memory_diagnosis_reads_as_one_factual_sentence() {
         let buildkit = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStep,
+            victim: Some("node".into()),
             host_oom_kills: Some(1),
             exit_code: Some(1),
             host_memory_mb: Some(3902),
@@ -1494,6 +1525,8 @@ CMD ["echo", "Hello from container"]
             "{text}"
         );
         assert!(text.contains("terminated 1 process on this host"), "{text}");
+        assert!(text.contains("the killed process was `node`"), "{text}");
+        assert!(!text.contains("no other build was running"), "{text}");
         assert!(
             text.contains("exited with code 1 after one of its processes was killed"),
             "{text}"
@@ -1505,6 +1538,8 @@ CMD ["echo", "Hello from container"]
         );
 
         let legacy = BuildMemoryDiagnosis {
+            attribution: OomAttribution::StepKilled,
+            victim: None,
             host_oom_kills: Some(2),
             exit_code: Some(137),
             host_memory_mb: None,
@@ -1512,6 +1547,10 @@ CMD ["echo", "Hello from container"]
             cap_enforced: true,
         };
         let text = legacy.to_string();
+        assert!(
+            text.starts_with("The build step ran out of memory"),
+            "{text}"
+        );
         assert!(text.contains("terminated 2 processes"), "{text}");
         assert!(text.contains("killed (exit code 137)"), "{text}");
         assert!(!text.contains("host RAM"), "{text}");
@@ -1527,5 +1566,21 @@ CMD ["echo", "Hello from container"]
             "{text}"
         );
         assert!(text.contains("ran out of memory"), "{text}");
+
+        let hedged = BuildMemoryDiagnosis {
+            attribution: OomAttribution::OnlyBuildRunning,
+            victim: None,
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = hedged.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
     }
 }
