@@ -839,6 +839,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
             .collect(),
         summaries: true,
         use_preaggregated_summaries: true,
+        lifetime_candidate_total: None,
         source_offset: 0,
     };
     let page = h.storage.global_trace_page(q.clone()).await.unwrap();
@@ -884,6 +885,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
             .collect(),
         summaries: true,
         use_preaggregated_summaries: false,
+        lifetime_candidate_total: None,
         source_offset: 20,
     };
     let refs = BTreeMap::from([(701, "scope-a".into()), (702, "scope-b".into())]);
@@ -953,11 +955,10 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     assert_eq!(page.total, 45);
 
     h.probe.query("INSERT INTO telemetry_spans SELECT 'scope-a', concat('over-budget-', toString(number)), 'root', '', 'GET /bulk', 'api', 'production', 'SERVER', 'OK', fromUnixTimestamp64Milli(1700000000000-number), 1.0 FROM numbers(5001)").execute().await.unwrap();
-    let error = match global_traces::clickhouse(&h.probe, &lifetime, Some(&refs)).await {
-        Ok(_) => panic!("an over-budget lifetime expansion must be rejected"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("safe lifetime-expansion limit is 5000"));
+    let stream = global_traces::clickhouse(&h.probe, &lifetime, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &lifetime).await.unwrap();
+    assert_eq!(page.total, 5_046);
+    assert_eq!(page.data.len(), 100);
 }

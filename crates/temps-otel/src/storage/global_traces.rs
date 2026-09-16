@@ -37,6 +37,9 @@ pub struct GlobalTraceQuery {
     /// Adding an unrelated project therefore cannot change an existing trace's
     /// values or compare incompatible sort keys in global pagination.
     pub use_preaggregated_summaries: bool,
+    /// Exact Cloud candidate count prepared by the routing layer. Reusing it
+    /// avoids a second scan and lets mixed sources choose one bounded contract.
+    pub lifetime_candidate_total: Option<u64>,
     pub source_offset: u64,
 }
 
@@ -282,7 +285,7 @@ struct Sql {
 /// Maximum number of Cloud traces whose lifetime spans one request may expand.
 /// The proxy separately caps rows read, memory, results, and execution time;
 /// this client-side gate makes the fan-out explicit before the historical join.
-const MAX_LIFETIME_CANDIDATES: u64 = 5_000;
+pub(crate) const MAX_LIFETIME_CANDIDATES: u64 = 5_000;
 
 /// Build the indexed Postgres trace-summary query.
 ///
@@ -487,6 +490,25 @@ fn build_clickhouse_lifetime_candidate_count(
         ),
         binds,
     })
+}
+
+pub(crate) async fn cloud_lifetime_candidate_count(
+    client: &clickhouse::Client,
+    q: &GlobalTraceQuery,
+    refs: &BTreeMap<i32, String>,
+) -> StorageResult<u64> {
+    let count = build_clickhouse_lifetime_candidate_count(q, Some(refs))?;
+    temps_cloud_client::query::within_query_budget(
+        ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
+    )
+    .await
+    .map_err(|error| OtelError::Storage {
+        message: format!(
+            "Temps Cloud trace-candidate count exceeded its wall-clock budget: {error}"
+        ),
+        kind: StorageErrorKind::ClickHouseTimeout,
+    })?
+    .map_err(storage)
 }
 
 pub(crate) async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
@@ -745,38 +767,25 @@ pub async fn clickhouse(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
-    let lifetime_total = if can_use_lifetime_summaries(q) {
-        let count = build_clickhouse_lifetime_candidate_count(q, refs)?;
-        let total = if refs.is_some() {
-            temps_cloud_client::query::within_query_budget(
-                ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
-            )
-            .await
-            .map_err(|error| OtelError::Storage {
-                message: format!(
-                    "Temps Cloud trace-candidate count exceeded its wall-clock budget: {error}"
-                ),
-                kind: StorageErrorKind::ClickHouseTimeout,
-            })?
-            .map_err(storage)?
+    let candidate_total = if can_use_lifetime_summaries(q) {
+        let total = if let Some(total) = q.lifetime_candidate_total {
+            total
+        } else if let Some(refs) = refs {
+            cloud_lifetime_candidate_count(client, q, refs).await?
         } else {
+            let count = build_clickhouse_lifetime_candidate_count(q, None)?;
             ch_query(client, &count.body, &count.binds)
                 .fetch_one::<u64>()
                 .await
                 .map_err(storage)?
         };
-        if total > MAX_LIFETIME_CANDIDATES {
-            return Err(invalid(&format!(
-                "Trace summary query matched {total} traces; the safe lifetime-expansion limit is \
-                 {MAX_LIFETIME_CANDIDATES}. Choose a shorter time range or fewer projects."
-            )));
-        }
         Some(total)
     } else {
         None
     };
+    let use_lifetime_values = candidate_total.is_some_and(|total| total <= MAX_LIFETIME_CANDIDATES);
     let empty = BTreeMap::new();
-    let sql = if lifetime_total.is_some() {
+    let sql = if use_lifetime_values {
         build_clickhouse_lifetime_summaries(q, refs)?
     } else {
         build(
@@ -789,7 +798,7 @@ pub async fn clickhouse(
             refs.unwrap_or(&empty),
         )?
     };
-    if let (Some(total), Some(_)) = (lifetime_total, refs) {
+    if let (Some(total), Some(_)) = (candidate_total.filter(|_| use_lifetime_values), refs) {
         let page_sql = ordered(&sql, q);
         let rows = temps_cloud_client::query::within_query_budget(
             ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
@@ -810,7 +819,7 @@ pub async fn clickhouse(
             rows: Box::pin(futures::stream::iter(rows)),
         });
     }
-    if let Some(total) = lifetime_total {
+    if let Some(total) = candidate_total.filter(|_| refs.is_none()) {
         let cursor = ch_query(client, &ordered(&sql, q), &sql.binds)
             .fetch::<GlobalTraceRow>()
             .map_err(storage)?;
@@ -1008,6 +1017,7 @@ mod tests {
             scopes: vec![],
             summaries: true,
             use_preaggregated_summaries: true,
+            lifetime_candidate_total: None,
             source_offset: 0,
         }
     }

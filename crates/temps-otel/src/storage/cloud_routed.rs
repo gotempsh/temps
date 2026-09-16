@@ -77,6 +77,13 @@ use crate::types::{
 /// consumers that inherit this decorator.
 #[async_trait]
 pub trait CloudSpanSource: Send + Sync {
+    async fn global_lifetime_candidate_count(
+        &self,
+        _query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<Option<u64>> {
+        Ok(None)
+    }
+
     async fn global_trace_stream(
         &self,
         _query: super::global_traces::GlobalTraceQuery,
@@ -286,6 +293,15 @@ impl OtelStorage for CloudRoutedOtelStorage {
         if query.use_preaggregated_summaries && query.scopes.iter().any(|scope| !scope.cloud) {
             let local_ready = self.local.global_lifetime_summaries_ready().await?;
             align_global_trace_semantics(&mut query, local_ready);
+        }
+        if query.use_preaggregated_summaries && query.scopes.iter().any(|scope| scope.cloud) {
+            let mut cloud_query = query.clone();
+            cloud_query.scopes.retain(|scope| scope.cloud);
+            let candidate_total = self
+                .cloud
+                .global_lifetime_candidate_count(cloud_query)
+                .await?;
+            align_cloud_candidate_budget(&mut query, candidate_total);
         }
         let (local, cloud) = split_global_trace_query(&mut query);
         let local_read = async {
@@ -752,6 +768,18 @@ fn align_global_trace_semantics(
     query.use_preaggregated_summaries &= local_lifetime_summaries_ready;
 }
 
+fn align_cloud_candidate_budget(
+    query: &mut super::global_traces::GlobalTraceQuery,
+    candidate_total: Option<u64>,
+) {
+    match candidate_total {
+        Some(total) if total <= super::global_traces::MAX_LIFETIME_CANDIDATES => {
+            query.lifetime_candidate_total = Some(total);
+        }
+        Some(_) | None => align_global_trace_semantics(query, false),
+    }
+}
+
 fn split_global_trace_query(
     query: &mut super::global_traces::GlobalTraceQuery,
 ) -> (
@@ -850,6 +878,7 @@ mod tests {
                 .collect(),
             summaries: true,
             use_preaggregated_summaries: true,
+            lifetime_candidate_total: None,
             source_offset: 0,
         }
     }
@@ -896,6 +925,20 @@ mod tests {
 
         assert!(!local.use_preaggregated_summaries);
         assert!(!cloud.use_preaggregated_summaries);
+    }
+
+    #[test]
+    fn over_budget_cloud_catalog_falls_back_without_disabling_pagination() {
+        let mut query = global_query(&[false, true]);
+
+        align_cloud_candidate_budget(
+            &mut query,
+            Some(super::super::global_traces::MAX_LIFETIME_CANDIDATES + 1),
+        );
+
+        assert!(!query.use_preaggregated_summaries);
+        assert_eq!(query.filter.limit, Some(20));
+        assert_eq!(query.filter.offset, Some(40));
     }
 
     #[async_trait]

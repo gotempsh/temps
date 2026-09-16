@@ -205,6 +205,7 @@ async fn read(
         source_offset: 0,
         summaries,
         use_preaggregated_summaries: true,
+        lifetime_candidate_total: None,
         scopes,
         filter: TraceQuery {
             trace_id: p.trace_id,

@@ -128,6 +128,7 @@ async fn global_postgres_pagination_and_raw_spans_use_the_same_authorized_scope(
             .collect(),
         summaries: true,
         use_preaggregated_summaries: true,
+        lifetime_candidate_total: None,
         source_offset: 0,
     };
     let page = storage.global_trace_page(q.clone()).await.unwrap();
