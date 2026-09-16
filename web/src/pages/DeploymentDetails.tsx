@@ -5,6 +5,7 @@ import { DeploymentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
+  deployFromStaticMutation,
   getDeploymentOptions,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
@@ -48,6 +49,10 @@ import {
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import {
+  deploymentRedeployPlan,
+  resolveDeploymentSourceType,
+} from '@/lib/deployment-source-summary'
 import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
@@ -944,7 +949,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  // docker_image projects re-pull the prebuilt image instead of the git pipeline.
+  // Docker-image deployments re-pull the prebuilt image instead of invoking
+  // the Git pipeline.
   const redeployImage = useMutation({
     ...deployFromImageMutation(),
     meta: {
@@ -954,6 +960,23 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       setIsRedeployModalOpen(false)
     },
   })
+
+  const redeployStatic = useMutation({
+    ...deployFromStaticMutation(),
+    meta: {
+      errorTitle: 'Failed to redeploy static files',
+    },
+    onSuccess: () => {
+      setIsRedeployModalOpen(false)
+    },
+  })
+
+  const deploymentSourceType = deployment
+    ? resolveDeploymentSourceType(deployment, project.source_type)
+    : undefined
+  const redeployPlan = deployment
+    ? deploymentRedeployPlan(deployment, project.source_type)
+    : undefined
 
   const pauseDeployment = useMutation({
     ...pauseDeploymentMutation(),
@@ -1005,45 +1028,73 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     tag,
     environmentId,
     imageRef: editedImageRef,
+    staticBundleId,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
+    staticBundleId?: number
   }) => {
-    if (project.source_type === 'docker_image') {
-      const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
-      const ref =
-        editedImageRef?.trim() || deployment?.metadata?.externalImageRef
-      if (!ref) {
-        toast.error('No image reference found for this deployment')
-        return
-      }
-      await redeployImage.mutateAsync({
-        path: { project_id: project.id, environment_id: environmentId },
-        body: {
-          ...deploymentRuntime,
-          image_ref: ref,
-        },
-      })
-      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    if (!redeployPlan) {
+      toast.error('This deployment is no longer available')
       return
     }
-
-    await createDeployment.mutateAsync({
-      path: {
-        id: project.id,
-      },
-      body: {
-        branch,
-        commit,
-        tag,
-        environment_id: environmentId,
-      },
-    })
-
-    navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    switch (redeployPlan.kind) {
+      case 'docker_image': {
+        const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
+        const ref =
+          editedImageRef?.trim() || deployment?.metadata?.externalImageRef
+        if (!ref) {
+          toast.error('No image reference found for this deployment')
+          return
+        }
+        await redeployImage.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: {
+            ...deploymentRuntime,
+            image_ref: ref,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return
+      }
+      case 'static_files':
+        if (!staticBundleId || staticBundleId !== redeployPlan.staticBundleId) {
+          toast.error('The stored static bundle is no longer available')
+          return
+        }
+        await redeployStatic.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: {
+            static_bundle_id: staticBundleId,
+            health_check_path: deployment?.metadata?.healthCheckPath,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return
+      case 'unsupported':
+        toast.error(
+          redeployPlan.sourceType === 'uploaded_source'
+            ? 'Upload the source archive again to redeploy it'
+            : 'This manual deployment has no reusable source artifact'
+        )
+        return
+      case 'git':
+        await createDeployment.mutateAsync({
+          path: {
+            id: project.id,
+          },
+          body: {
+            branch,
+            commit,
+            tag,
+            environment_id: environmentId,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    }
   }
 
   const handlePauseDeployment = async () => {
@@ -1436,8 +1487,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             deployment.tag ? 'tag' : deployment.branch ? 'branch' : 'commit'
           }
           defaultEnvironment={deployment.environment_id || 0}
-          isLoading={createDeployment.isPending || redeployImage.isPending}
+          isLoading={
+            createDeployment.isPending ||
+            redeployImage.isPending ||
+            redeployStatic.isPending
+          }
+          deploymentSourceType={deploymentSourceType}
           imageRef={deployment.metadata?.externalImageRef}
+          staticBundleId={
+            redeployPlan?.kind === 'static_files'
+              ? redeployPlan.staticBundleId
+              : undefined
+          }
         />
       </div>
     </div>
