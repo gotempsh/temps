@@ -374,19 +374,6 @@ fn build_clickhouse_lifetime_summaries(
         binds.push(value);
         "?".to_string()
     };
-    let mut mapping = Vec::new();
-    if let Some(refs) = refs {
-        for scope in &q.scopes {
-            let project_ref = refs
-                .get(&scope.project_id)
-                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
-            mapping.push(format!(
-                "WHEN {} THEN {}",
-                bind(Bind::Text(project_ref.clone())),
-                scope.project_id
-            ));
-        }
-    }
     let mut membership = Vec::with_capacity(q.scopes.len());
     for scope in &q.scopes {
         let id = if let Some(refs) = refs {
@@ -413,6 +400,22 @@ fn build_clickhouse_lifetime_summaries(
     } else {
         membership.join(" OR ")
     };
+    // `membership` appears first in the candidates CTE, so its values must be
+    // bound before the project mapping used by the following raw CTE. The
+    // ClickHouse client resolves anonymous placeholders in SQL order.
+    let mut mapping = Vec::new();
+    if let Some(refs) = refs {
+        for scope in &q.scopes {
+            let project_ref = refs
+                .get(&scope.project_id)
+                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+            mapping.push(format!(
+                "WHEN {} THEN {}",
+                bind(Bind::Text(project_ref.clone())),
+                scope.project_id
+            ));
+        }
+    }
     let pick = |field: &str| {
         format!("argMax(raw.{field}, tuple(raw.parent_span_id = '', raw.duration, raw.span_id))")
     };
@@ -1178,6 +1181,16 @@ mod tests {
         let sql = build_clickhouse_lifetime_summaries(&q, Some(&refs)).unwrap();
 
         assert_eq!(sql.binds.len(), 8);
+        match sql.binds.as_slice() {
+            [Bind::Text(member_a), Bind::Int(1000), Bind::Int(2000), Bind::Text(member_b), Bind::Int(1000), Bind::Int(2000), Bind::Text(mapping_a), Bind::Text(mapping_b)] =>
+            {
+                assert_eq!(member_a, "project-a");
+                assert_eq!(member_b, "project-b");
+                assert_eq!(mapping_a, "project-a");
+                assert_eq!(mapping_b, "project-b");
+            }
+            _ => panic!("Cloud lifetime binds must follow SQL placeholder order"),
+        }
         assert_eq!(sql.body.matches('?').count(), 8);
         assert!(sql
             .body

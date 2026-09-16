@@ -868,7 +868,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
                 "GET /bulk",
                 "api",
                 SpanStatusCode::Ok,
-                index % 60,
+                index % 60 + 1,
                 1.0,
                 None,
                 &[],
