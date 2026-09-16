@@ -661,6 +661,41 @@ fn candidate_probe_runtime_failure(exit_code: i32, stderr: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
+/// Detect only concrete transport evidence emitted by a native harness. The
+/// native output is used solely for this classification and must never be
+/// copied into logs or public errors.
+fn candidate_probe_transport_failure(stdout: &str, stderr: &str) -> bool {
+    fn contains_transport_signal(output: &str) -> bool {
+        let lower = output.to_ascii_lowercase();
+        [
+            "connection refused",
+            "connection reset",
+            "connection timed out",
+            "network is unreachable",
+            "no route to host",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "dns lookup failed",
+            "failed to lookup address",
+            "failed to connect",
+            "could not connect",
+            "error sending request",
+            "request timed out",
+            "operation timed out",
+            "deadline exceeded",
+            "deadline has elapsed",
+            "econnrefused",
+            "econnreset",
+            "enotfound",
+            "etimedout",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    }
+
+    contains_transport_signal(stdout) || contains_transport_signal(stderr)
+}
+
 fn validate_native_probe_model(model: Option<&str>) -> Result<Option<&str>, AiError> {
     let Some(model) = model else { return Ok(None) };
     if model.is_empty()
@@ -4518,8 +4553,9 @@ fn candidate_relay_status_category(status: Option<u16>) -> &'static str {
 fn candidate_missing_relay_diagnostic(
     provider: &str,
     status: Option<u16>,
+    transport_failure: bool,
 ) -> Option<temps_ai::CredentialVerificationDiagnostic> {
-    (matches!(provider, "claude_cli" | "codex_cli") && status.is_none())
+    (matches!(provider, "claude_cli" | "codex_cli") && status.is_none() && transport_failure)
         .then_some(temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable)
 }
 
@@ -4530,6 +4566,7 @@ fn validate_candidate_probe(
     output: &temps_agents::sandbox::SandboxExecResult,
 ) -> Result<(), AiError> {
     let answered = candidate_probe_has_answer(provider, &output.stdout);
+    let transport_failure = candidate_probe_transport_failure(&output.stdout, &output.stderr);
     tracing::info!(
         provider,
         exit_code = output.exit_code,
@@ -4537,6 +4574,7 @@ fn validate_candidate_probe(
         relay_status_category = candidate_relay_status_category(relay_status),
         relay_succeeded,
         answered,
+        transport_failure,
         "candidate credential verification harness completed"
     );
 
@@ -4577,11 +4615,20 @@ fn validate_candidate_probe(
                 diagnostic: temps_ai::CredentialVerificationDiagnostic::OperationFailed,
             });
         }
-        if let Some(diagnostic) = candidate_missing_relay_diagnostic(provider, relay_status) {
+        if let Some(diagnostic) =
+            candidate_missing_relay_diagnostic(provider, relay_status, transport_failure)
+        {
             return Err(AiError::CredentialVerification {
                 provider: provider.into(),
                 stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
                 diagnostic,
+            });
+        }
+        if matches!(provider, "claude_cli" | "codex_cli") && relay_status.is_none() {
+            return Err(AiError::CredentialVerification {
+                provider: provider.into(),
+                stage: temps_ai::CredentialVerificationStage::HarnessExecution,
+                diagnostic: temps_ai::CredentialVerificationDiagnostic::OperationFailed,
             });
         }
         return Err(AiError::Provider {
@@ -4593,7 +4640,9 @@ fn validate_candidate_probe(
         });
     }
     if !answered || (provider != "opencode" && !relay_succeeded) {
-        if let Some(diagnostic) = candidate_missing_relay_diagnostic(provider, relay_status) {
+        if let Some(diagnostic) =
+            candidate_missing_relay_diagnostic(provider, relay_status, transport_failure)
+        {
             return Err(AiError::CredentialVerification {
                 provider: provider.into(),
                 stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
@@ -6957,36 +7006,57 @@ mod tests {
     }
 
     #[test]
-    fn relay_backed_probes_report_missing_relay_observations_as_infrastructure_failures() {
+    fn relay_backed_probes_require_transport_evidence_for_infrastructure_failures() {
+        for provider in ["claude_cli", "codex_cli"] {
+            for stderr in [
+                "error sending request: connection refused",
+                "request timed out before a response was received",
+            ] {
+                let failed_output = temps_agents::sandbox::SandboxExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: stderr.into(),
+                };
+                assert!(matches!(
+                    validate_candidate_probe(provider, None, false, &failed_output),
+                    Err(AiError::CredentialVerification {
+                        stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
+                        diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_pre_relay_failures_are_harness_execution_failures() {
         for provider in ["claude_cli", "codex_cli"] {
             let failed_output = temps_agents::sandbox::SandboxExecResult {
                 exit_code: 1,
                 stdout: String::new(),
-                stderr: "model request failed before relay traffic".into(),
+                stderr: "native harness stopped without a diagnostic".into(),
             };
             assert!(matches!(
                 validate_candidate_probe(provider, None, false, &failed_output),
                 Err(AiError::CredentialVerification {
-                    stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
-                    diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
-                    ..
-                })
-            ));
-
-            let missing_answer = temps_agents::sandbox::SandboxExecResult {
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            };
-            assert!(matches!(
-                validate_candidate_probe(provider, None, false, &missing_answer),
-                Err(AiError::CredentialVerification {
-                    stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
-                    diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
+                    stage: temps_ai::CredentialVerificationStage::HarnessExecution,
+                    diagnostic: temps_ai::CredentialVerificationDiagnostic::OperationFailed,
                     ..
                 })
             ));
         }
+
+        let missing_answer = temps_agents::sandbox::SandboxExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(matches!(
+            validate_candidate_probe("codex_cli", None, false, &missing_answer),
+            Err(AiError::Provider { purpose, .. })
+                if purpose == "provider.credentials.verify.model"
+        ));
     }
 
     #[test]
@@ -7095,14 +7165,9 @@ mod tests {
                 Some("claude-selected-model"),
             )
             .await;
-        assert!(matches!(
-            result,
-            Err(AiError::CredentialVerification {
-                provider,
-                stage: temps_ai::CredentialVerificationStage::RelayUnavailable,
-                diagnostic: temps_ai::CredentialVerificationDiagnostic::NetworkUnavailable,
-            }) if provider == "claude_cli"
-        ));
+        assert!(
+            matches!(result, Err(AiError::Provider { reason, .. }) if reason.contains("did not confirm"))
+        );
         assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             lifecycle.load(Ordering::SeqCst),
