@@ -967,12 +967,14 @@ impl WorkflowExecutionService {
                         .await
                         .map(|d| d.state)
                         .unwrap_or_default();
-                    if current_state == "stopped" {
+                    if matches!(
+                        current_state.as_str(),
+                        "cancelled" | "stopped" | "completed" | "failed"
+                    ) {
                         info!(
-                            "Workflow for deployment {} ended with an error but \
-                             the deployment was already marked 'stopped' by a \
-                             concurrent rollback — preserving 'stopped'",
-                            deployment_id
+                            deployment_id,
+                            state = %current_state,
+                            "Workflow ended with an error after the deployment reached a terminal state; preserving that state"
                         );
                     } else {
                         // Update deployment status to failed with reason

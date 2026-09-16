@@ -4,8 +4,9 @@
 use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
-    sea_query::{Expr, Query},
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+    sea_query::{Expr, LockType, Query},
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -13,10 +14,11 @@ use std::sync::Arc;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_database::DbConnection;
 use temps_entities::{
-    deployments,
+    deployments, environments,
     prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent},
     types::PipelineStatus,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug)]
@@ -24,6 +26,18 @@ pub enum JobProcessorError {
     QueueError(String),
     PipelineError(String),
     DatabaseError(String),
+    FailoverRecoverySemaphoreClosed {
+        project_id: i32,
+        environment_id: Option<i32>,
+        recovery_kind: &'static str,
+        reason: String,
+    },
+    DeploymentCreationFailed {
+        project_id: i32,
+        environment_id: i32,
+        operation: &'static str,
+        reason: String,
+    },
     Other(String),
 }
 
@@ -33,6 +47,24 @@ impl std::fmt::Display for JobProcessorError {
             JobProcessorError::QueueError(msg) => write!(f, "Queue error: {}", msg),
             JobProcessorError::PipelineError(msg) => write!(f, "Pipeline error: {}", msg),
             JobProcessorError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
+            JobProcessorError::FailoverRecoverySemaphoreClosed {
+                project_id,
+                environment_id,
+                recovery_kind,
+                reason,
+            } => write!(
+                f,
+                "Failover {recovery_kind} recovery for project {project_id}, environment {environment_id:?} could not acquire its deployment slot: {reason}"
+            ),
+            JobProcessorError::DeploymentCreationFailed {
+                project_id,
+                environment_id,
+                operation,
+                reason,
+            } => write!(
+                f,
+                "Failed to {operation} deployment for project {project_id}, environment {environment_id}: {reason}"
+            ),
             JobProcessorError::Other(msg) => write!(f, "Other error: {}", msg),
         }
     }
@@ -46,6 +78,27 @@ struct CommitInfo {
     message: String,
     author: String,
     commit_json: serde_json::Value,
+}
+
+enum DeploymentDuplicateKey {
+    Commit(String),
+    Image(String),
+}
+
+enum DeploymentCreationOutcome {
+    Created {
+        deployment: Box<deployments::Model>,
+        cancellation_events: Vec<Job>,
+    },
+    Duplicate {
+        deployment_id: i32,
+        state: String,
+    },
+    StaleRecovery {
+        source_deployment_id: i32,
+        current_deployment_id: Option<i32>,
+        newer_deployment_id: Option<i32>,
+    },
 }
 
 /// Shared slot for the optional [`temps_core::DeploymentGate`] — see the
@@ -75,9 +128,337 @@ pub struct JobProcessorService {
     /// dispatch loop re-reads it per job, so a gate registered after
     /// startup still protects every job dispatched from that point on.
     deployment_gate: DeploymentGateSlot,
+    /// Failover recovery can fan out across many environments after a node
+    /// outage. Keep those workflows strictly serial without throttling normal
+    /// webhook, manual, or drain-triggered deployments.
+    failover_recovery_semaphore: Arc<Semaphore>,
 }
 
 impl JobProcessorService {
+    /// Acquire the dedicated failover slot when this job is an automatic node
+    /// recovery. Ordinary jobs return immediately without touching the
+    /// semaphore, so webhook, manual, and drain-triggered deploys retain their
+    /// existing concurrency.
+    async fn acquire_failover_recovery_permit(
+        semaphore: Arc<Semaphore>,
+        recovery_of_deployment_id: Option<i32>,
+        project_id: i32,
+        environment_id: Option<i32>,
+        recovery_kind: &'static str,
+    ) -> Result<Option<OwnedSemaphorePermit>, JobProcessorError> {
+        if recovery_of_deployment_id.is_none() {
+            return Ok(None);
+        }
+
+        info!(
+            project_id,
+            environment_id = ?environment_id,
+            recovery_of_deployment_id = ?recovery_of_deployment_id,
+            recovery_kind,
+            "Failover recovery queued; waiting for the dedicated deployment slot"
+        );
+
+        let permit = semaphore.acquire_owned().await.map_err(|error| {
+            JobProcessorError::FailoverRecoverySemaphoreClosed {
+                project_id,
+                environment_id,
+                recovery_kind,
+                reason: error.to_string(),
+            }
+        })?;
+
+        info!(
+            project_id,
+            environment_id = ?environment_id,
+            recovery_of_deployment_id = ?recovery_of_deployment_id,
+            recovery_kind,
+            "Failover recovery acquired the dedicated deployment slot"
+        );
+
+        Ok(Some(permit))
+    }
+
+    /// Serialize deployment generation changes on the environment row. Every
+    /// caller, including ordinary webhooks and manual deploys, takes the same
+    /// lock so the order in which jobs supersede each other is deterministic.
+    async fn create_deployment_with_generation_fence(
+        db: &DbConnection,
+        project_id: i32,
+        environment_id: i32,
+        recovery_of_deployment_id: Option<i32>,
+        duplicate_key: DeploymentDuplicateKey,
+        mut new_deployment: deployments::ActiveModel,
+    ) -> Result<DeploymentCreationOutcome, JobProcessorError> {
+        let creation_error = |operation: &'static str, error: sea_orm::DbErr| {
+            JobProcessorError::DeploymentCreationFailed {
+                project_id,
+                environment_id,
+                operation,
+                reason: error.to_string(),
+            }
+        };
+
+        let transaction = db
+            .begin()
+            .await
+            .map_err(|error| creation_error("begin transaction for", error))?;
+
+        let environment = super::services::lock_environment_for_deployment_generation(
+            &transaction,
+            project_id,
+            environment_id,
+        )
+        .await
+        .map_err(|error| creation_error("lock environment before creating", error))?;
+
+        if let Some(source_deployment_id) = recovery_of_deployment_id {
+            let mut newer_deployment_id = None;
+            if environment.current_deployment_id == Some(source_deployment_id) {
+                let source = deployments::Entity::find_by_id(source_deployment_id)
+                    .filter(deployments::Column::ProjectId.eq(project_id))
+                    .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                    .one(&transaction)
+                    .await
+                    .map_err(|error| creation_error("load recovery source for", error))?;
+
+                if let Some(source) = source {
+                    newer_deployment_id = deployments::Entity::find()
+                        .filter(deployments::Column::ProjectId.eq(project_id))
+                        .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                        .filter(deployments::Column::State.is_in(vec![
+                            "pending",
+                            "running",
+                            "deploying",
+                            "built",
+                            "ready",
+                        ]))
+                        .filter(
+                            Condition::any()
+                                .add(deployments::Column::CreatedAt.gt(source.created_at))
+                                .add(
+                                    Condition::all()
+                                        .add(deployments::Column::CreatedAt.eq(source.created_at))
+                                        .add(deployments::Column::Id.gt(source.id)),
+                                ),
+                        )
+                        .order_by_desc(deployments::Column::CreatedAt)
+                        .order_by_desc(deployments::Column::Id)
+                        .one(&transaction)
+                        .await
+                        .map_err(|error| {
+                            creation_error(
+                                "check newer in-flight generations before recovering",
+                                error,
+                            )
+                        })?
+                        .map(|deployment| deployment.id);
+                } else {
+                    newer_deployment_id = Some(source_deployment_id);
+                }
+            }
+
+            if environment.current_deployment_id != Some(source_deployment_id)
+                || newer_deployment_id.is_some()
+            {
+                let current_deployment_id = environment.current_deployment_id;
+                transaction.commit().await.map_err(|error| {
+                    creation_error("finish stale recovery validation for", error)
+                })?;
+                return Ok(DeploymentCreationOutcome::StaleRecovery {
+                    source_deployment_id,
+                    current_deployment_id,
+                    newer_deployment_id,
+                });
+            }
+        }
+
+        let duplicate_query = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "built",
+                "ready",
+            ]));
+        let duplicate_query = if let Some(source_deployment_id) = recovery_of_deployment_id {
+            duplicate_query.filter(deployments::Column::Id.ne(source_deployment_id))
+        } else {
+            duplicate_query
+        };
+        let duplicate_query = match duplicate_key {
+            DeploymentDuplicateKey::Commit(commit) => {
+                duplicate_query.filter(deployments::Column::CommitSha.eq(commit))
+            }
+            DeploymentDuplicateKey::Image(image) => {
+                duplicate_query.filter(deployments::Column::ImageName.eq(image))
+            }
+        };
+        if let Some(existing) = duplicate_query
+            .order_by_desc(deployments::Column::CreatedAt)
+            .order_by_desc(deployments::Column::Id)
+            .one(&transaction)
+            .await
+            .map_err(|error| creation_error("check duplicate generations before creating", error))?
+        {
+            let outcome = DeploymentCreationOutcome::Duplicate {
+                deployment_id: existing.id,
+                state: existing.state,
+            };
+            transaction
+                .commit()
+                .await
+                .map_err(|error| creation_error("finish duplicate validation for", error))?;
+            return Ok(outcome);
+        }
+
+        let cancellation_events = cancel_in_flight_deployments(
+            &transaction,
+            project_id,
+            environment_id,
+            environment.current_deployment_id,
+        )
+        .await?;
+        let generation_time = chrono::Utc::now();
+        new_deployment.created_at = Set(generation_time);
+        new_deployment.updated_at = Set(generation_time);
+        let deployment = new_deployment
+            .insert(&transaction)
+            .await
+            .map_err(|error| creation_error("insert", error))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| creation_error("commit", error))?;
+
+        Ok(DeploymentCreationOutcome::Created {
+            deployment: Box::new(deployment),
+            cancellation_events,
+        })
+    }
+
+    async fn send_post_commit_events(queue: &Arc<dyn JobQueue>, events: Vec<Job>) {
+        for event in events {
+            if let Err(error) = queue.send(event).await {
+                warn!(error = %error, "Failed to publish post-commit deployment event");
+            }
+        }
+    }
+
+    fn recovery_source(deployment: &deployments::Model) -> Option<i32> {
+        deployment
+            .context_vars
+            .as_ref()
+            .and_then(|context| context.get("recovery_of_deployment_id"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+    }
+
+    /// Revalidate a gate-blocked recovery under the same environment lock used
+    /// by deployment creation. A manual/webhook generation committed while the
+    /// gate was blocked makes this recovery stale and cancels it before it can
+    /// enter the workflow.
+    async fn validate_gate_rechecked_recovery(
+        db: &DbConnection,
+        deployment: &deployments::Model,
+        source_deployment_id: i32,
+    ) -> Result<bool, JobProcessorError> {
+        let project_id = deployment.project_id;
+        let environment_id = deployment.environment_id;
+        let creation_error = |operation: &'static str, error: sea_orm::DbErr| {
+            JobProcessorError::DeploymentCreationFailed {
+                project_id,
+                environment_id,
+                operation,
+                reason: error.to_string(),
+            }
+        };
+        let transaction = db
+            .begin()
+            .await
+            .map_err(|error| creation_error("begin gate recheck transaction for", error))?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock(LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| creation_error("lock environment during gate recheck for", error))?;
+
+        let newer_deployment_id = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::Id.ne(deployment.id))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "built",
+                "ready",
+            ]))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.gt(deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(deployment.created_at))
+                            .add(deployments::Column::Id.gt(deployment.id)),
+                    ),
+            )
+            .order_by_desc(deployments::Column::CreatedAt)
+            .order_by_desc(deployments::Column::Id)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                creation_error("check newer generations during gate recheck for", error)
+            })?
+            .map(|newer| newer.id);
+        let current_deployment_id = environment.and_then(|env| env.current_deployment_id);
+        let valid =
+            current_deployment_id == Some(source_deployment_id) && newer_deployment_id.is_none();
+
+        if !valid {
+            deployments::Entity::update_many()
+                .col_expr(deployments::Column::State, Expr::value("cancelled"))
+                .col_expr(
+                    deployments::Column::CancelledReason,
+                    Expr::value("Failover recovery was superseded while awaiting deployment gate"),
+                )
+                .col_expr(
+                    deployments::Column::FinishedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .col_expr(
+                    deployments::Column::UpdatedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .filter(deployments::Column::Id.eq(deployment.id))
+                .filter(deployments::Column::State.eq("pending"))
+                .exec(&transaction)
+                .await
+                .map_err(|error| creation_error("cancel stale gate-blocked recovery for", error))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| creation_error("commit gate recheck validation for", error))?;
+
+        if !valid {
+            info!(
+                project_id,
+                environment_id,
+                deployment_id = deployment.id,
+                source_deployment_id,
+                current_deployment_id = ?current_deployment_id,
+                newer_deployment_id = ?newer_deployment_id,
+                "Skipping stale gate-blocked failover recovery"
+            );
+        }
+        Ok(valid)
+    }
+
     async fn resolve_image_target_environments(
         db: &DbConnection,
         project_id: i32,
@@ -167,6 +548,7 @@ impl JobProcessorService {
             workflow_executor,
             git_provider_manager,
             deployment_gate: Arc::new(tokio::sync::RwLock::new(None)),
+            failover_recovery_semaphore: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -186,6 +568,7 @@ impl JobProcessorService {
             workflow_executor,
             git_provider_manager,
             deployment_gate: Arc::new(tokio::sync::RwLock::new(None)),
+            failover_recovery_semaphore: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -223,9 +606,36 @@ impl JobProcessorService {
                             let git_provider_manager = Arc::clone(&self.git_provider_manager);
                             let queue = Arc::clone(&self.queue);
                             let deployment_gate = self.deployment_gate.read().await.clone();
+                            let failover_recovery_semaphore =
+                                Arc::clone(&self.failover_recovery_semaphore);
+                            let recovery_of_deployment_id = git_push_job.recovery_of_deployment_id;
+                            let recovery_project_id = git_push_job.project_id;
+                            let recovery_environment_id = git_push_job.target_environment_id;
 
                             // Spawn a task to handle the job asynchronously
                             tokio::spawn(async move {
+                                let recovery_permit = match Self::acquire_failover_recovery_permit(
+                                    failover_recovery_semaphore,
+                                    recovery_of_deployment_id,
+                                    recovery_project_id,
+                                    recovery_environment_id,
+                                    "git",
+                                )
+                                .await
+                                {
+                                    Ok(permit) => permit,
+                                    Err(error) => {
+                                        error!(
+                                            project_id = recovery_project_id,
+                                            environment_id = ?recovery_environment_id,
+                                            recovery_kind = "git",
+                                            error = %error,
+                                            "Failover recovery could not acquire the dedicated deployment slot"
+                                        );
+                                        return;
+                                    }
+                                };
+
                                 debug!("Starting async processing for GitPushEvent job");
                                 Self::process_git_push_event_job(
                                     workflow_planner,
@@ -238,6 +648,16 @@ impl JobProcessorService {
                                 )
                                 .await;
                                 debug!("Completed async processing for GitPushEvent job");
+
+                                if recovery_of_deployment_id.is_some() {
+                                    info!(
+                                        project_id = recovery_project_id,
+                                        environment_id = ?recovery_environment_id,
+                                        recovery_kind = "git",
+                                        "Failover recovery finished; releasing the dedicated deployment slot"
+                                    );
+                                }
+                                drop(recovery_permit);
                             });
                         }
                         Job::DeployImageRequested(image_job) => {
@@ -250,8 +670,35 @@ impl JobProcessorService {
                             let db = Arc::clone(&self.db);
                             let queue = Arc::clone(&self.queue);
                             let deployment_gate = self.deployment_gate.read().await.clone();
+                            let failover_recovery_semaphore =
+                                Arc::clone(&self.failover_recovery_semaphore);
+                            let recovery_of_deployment_id = image_job.recovery_of_deployment_id;
+                            let recovery_project_id = image_job.project_id;
+                            let recovery_environment_id = image_job.target_environment_id;
 
                             tokio::spawn(async move {
+                                let recovery_permit = match Self::acquire_failover_recovery_permit(
+                                    failover_recovery_semaphore,
+                                    recovery_of_deployment_id,
+                                    recovery_project_id,
+                                    recovery_environment_id,
+                                    "image",
+                                )
+                                .await
+                                {
+                                    Ok(permit) => permit,
+                                    Err(error) => {
+                                        error!(
+                                            project_id = recovery_project_id,
+                                            environment_id = ?recovery_environment_id,
+                                            recovery_kind = "image",
+                                            error = %error,
+                                            "Failover recovery could not acquire the dedicated deployment slot"
+                                        );
+                                        return;
+                                    }
+                                };
+
                                 Self::process_deploy_image_requested_job(
                                     workflow_planner,
                                     workflow_executor,
@@ -261,6 +708,16 @@ impl JobProcessorService {
                                     image_job,
                                 )
                                 .await;
+
+                                if recovery_of_deployment_id.is_some() {
+                                    info!(
+                                        project_id = recovery_project_id,
+                                        environment_id = ?recovery_environment_id,
+                                        recovery_kind = "image",
+                                        "Failover recovery finished; releasing the dedicated deployment slot"
+                                    );
+                                }
+                                drop(recovery_permit);
                             });
                         }
                         Job::DeploymentGateRecheck(recheck_job) => {
@@ -271,12 +728,15 @@ impl JobProcessorService {
                             let workflow_executor = Arc::clone(&self.workflow_executor);
                             let db = Arc::clone(&self.db);
                             let deployment_gate = self.deployment_gate.read().await.clone();
+                            let failover_recovery_semaphore =
+                                Arc::clone(&self.failover_recovery_semaphore);
 
                             tokio::spawn(async move {
                                 Self::process_deployment_gate_recheck_job(
                                     db,
                                     workflow_executor,
                                     deployment_gate,
+                                    failover_recovery_semaphore,
                                     recheck_job,
                                 )
                                 .await;
@@ -401,16 +861,24 @@ impl JobProcessorService {
             let deployment_config_snapshot = merged_config
                 .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
 
+            let trigger_context = match job.recovery_of_deployment_id {
+                Some(source_deployment_id) => serde_json::json!({
+                    "trigger": "failover_recovery",
+                    "source": "docker_image",
+                    "recovery_of_deployment_id": source_deployment_id,
+                }),
+                None => serde_json::json!({
+                    "trigger": "template_image",
+                    "source": "docker_image"
+                }),
+            };
             let new_deployment = deployments::ActiveModel {
                 project_id: Set(project.id),
                 environment_id: Set(environment.id),
                 slug: Set(deployment_slug),
                 state: Set("pending".to_string()),
                 metadata: Set(Some(metadata)),
-                context_vars: Set(Some(serde_json::json!({
-                    "trigger": "template_image",
-                    "source": "docker_image"
-                }))),
+                context_vars: Set(Some(trigger_context)),
                 image_name: Set(Some(job.image_ref.clone())),
                 deployment_config: Set(deployment_config_snapshot),
                 created_at: Set(Utc::now()),
@@ -418,34 +886,74 @@ impl JobProcessorService {
                 ..Default::default()
             };
 
-            let deployment = match new_deployment.insert(db.as_ref()).await {
-                Ok(d) => d,
-                Err(e) => {
-                    error!(
+            let (deployment, mut post_commit_events) =
+                match Self::create_deployment_with_generation_fence(
+                    db.as_ref(),
+                    project.id,
+                    environment.id,
+                    job.recovery_of_deployment_id,
+                    DeploymentDuplicateKey::Image(job.image_ref.clone()),
+                    new_deployment,
+                )
+                .await
+                {
+                    Ok(DeploymentCreationOutcome::Created {
+                        deployment,
+                        cancellation_events,
+                    }) => (*deployment, cancellation_events),
+                    Ok(DeploymentCreationOutcome::Duplicate {
+                        deployment_id,
+                        state,
+                    }) => {
+                        info!(
+                            project_id = project.id,
+                            environment_id = environment.id,
+                            deployment_id,
+                            state,
+                            image_ref = %job.image_ref,
+                            "Image deployment already exists; skipping duplicate"
+                        );
+                        continue;
+                    }
+                    Ok(DeploymentCreationOutcome::StaleRecovery {
+                        source_deployment_id,
+                        current_deployment_id,
+                        newer_deployment_id,
+                    }) => {
+                        info!(
+                            project_id = project.id,
+                            environment_id = environment.id,
+                            source_deployment_id,
+                            current_deployment_id = ?current_deployment_id,
+                            newer_deployment_id = ?newer_deployment_id,
+                            recovery_kind = "image",
+                            "Skipping stale failover recovery generation"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
                         "DeployImageRequested: failed to create deployment for project {} env {}: {}",
                         project.id, environment.id, e
                     );
-                    continue;
-                }
-            };
+                        continue;
+                    }
+                };
 
             info!(
                 "Created deployment {} for project {} env {} from DeployImageRequested (image {})",
                 deployment.id, project.id, environment.id, job.image_ref
             );
 
-            let deployment_created_event =
-                Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
-                    deployment_id: deployment.id,
-                    project_id: project.id,
-                    environment_id: environment.id,
-                    environment_name: environment.name.clone(),
-                    branch: None,
-                    commit_sha: None,
-                });
-            if let Err(e) = queue.send(deployment_created_event).await {
-                error!("Failed to send DeploymentCreated event: {}", e);
-            }
+            post_commit_events.push(Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+                deployment_id: deployment.id,
+                project_id: project.id,
+                environment_id: environment.id,
+                environment_name: environment.name.clone(),
+                branch: None,
+                commit_sha: None,
+            }));
+            Self::send_post_commit_events(&queue, post_commit_events).await;
 
             match workflow_planner.create_deployment_jobs(deployment.id).await {
                 Ok(created_jobs) => {
@@ -677,19 +1185,24 @@ impl JobProcessorService {
             // "stopped" set by stop_environment_containers would be silently
             // overwritten here, making the deployment unavailable for
             // promote/rollback even though it was successfully superseded.
-            let already_stopped = deployments::Entity::find_by_id(deployment_id)
+            let terminal_state = deployments::Entity::find_by_id(deployment_id)
                 .one(db.as_ref())
                 .await
                 .ok()
                 .flatten()
-                .map(|d| d.state == "stopped")
-                .unwrap_or(false);
+                .map(|deployment| deployment.state)
+                .filter(|state| {
+                    matches!(
+                        state.as_str(),
+                        "cancelled" | "stopped" | "completed" | "failed"
+                    )
+                });
 
-            if already_stopped {
+            if let Some(state) = terminal_state {
                 info!(
-                    "Deployment {} already marked 'stopped' by a concurrent \
-                     rollback — not overwriting with 'failed'",
-                    deployment_id
+                    deployment_id,
+                    state,
+                    "Deployment already reached a terminal state; not overwriting it with failed"
                 );
             } else if let Err(update_err) =
                 JobProcessorService::update_deployment_status_with_message(
@@ -723,6 +1236,7 @@ impl JobProcessorService {
         db: Arc<DbConnection>,
         workflow_executor: Arc<WorkflowExecutionService>,
         deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+        failover_recovery_semaphore: Arc<Semaphore>,
         job: temps_core::DeploymentGateRecheckJob,
     ) {
         let deployment = match deployments::Entity::find_by_id(job.deployment_id)
@@ -776,6 +1290,53 @@ impl JobProcessorService {
                 }
             };
 
+        let recovery_of_deployment_id = Self::recovery_source(&deployment);
+        let recovery_permit = match Self::acquire_failover_recovery_permit(
+            failover_recovery_semaphore,
+            recovery_of_deployment_id,
+            deployment.project_id,
+            Some(deployment.environment_id),
+            "gate_recheck",
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                error!(
+                    project_id = deployment.project_id,
+                    environment_id = deployment.environment_id,
+                    deployment_id = deployment.id,
+                    error = %error,
+                    "Gate-rechecked failover recovery could not acquire its deployment slot"
+                );
+                return;
+            }
+        };
+
+        if let Some(source_deployment_id) = recovery_of_deployment_id {
+            match Self::validate_gate_rechecked_recovery(
+                db.as_ref(),
+                &deployment,
+                source_deployment_id,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    error!(
+                        project_id = deployment.project_id,
+                        environment_id = deployment.environment_id,
+                        deployment_id = deployment.id,
+                        source_deployment_id,
+                        error = %error,
+                        "Failed to validate gate-rechecked failover recovery"
+                    );
+                    return;
+                }
+            }
+        }
+
         Self::gate_check_then_run(
             &db,
             &workflow_executor,
@@ -785,6 +1346,7 @@ impl JobProcessorService {
             deployment.id,
         )
         .await;
+        drop(recovery_permit);
     }
 
     async fn process_git_push_event_job(
@@ -1314,7 +1876,7 @@ async fn process_git_push_event(
     }
 
     use chrono::Utc;
-    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
+    use sea_orm::{EntityTrait, PaginatorTrait};
 
     // Fetch commit info once — it's the same for every environment receiving this push.
     let commit_info =
@@ -1366,32 +1928,6 @@ async fn process_git_push_event(
                 project.id, environment.id, environment.name
             );
         }
-
-        // Check for duplicate deployment (same project, environment, and commit).
-        let existing_deployment = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .filter(deployments::Column::EnvironmentId.eq(environment.id))
-            .filter(deployments::Column::CommitSha.eq(&job.commit))
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "deploying",
-                "ready",
-            ]))
-            .order_by_desc(deployments::Column::CreatedAt)
-            .one(db.as_ref())
-            .await;
-
-        if let Ok(Some(existing)) = existing_deployment {
-            info!(
-                "Deployment already exists for project {} environment {} commit {} (deployment #{}, state: {}). Skipping duplicate.",
-                project.id, environment.id, job.commit, existing.id, existing.state
-            );
-            continue;
-        }
-
-        // Cancel-on-supersede: newest push always wins.
-        cancel_in_flight_deployments(&db, &queue, project.id, environment.id).await;
 
         // Get the next deployment number for this project.
         let deployment_count = match deployments::Entity::find()
@@ -1452,7 +1988,13 @@ async fn process_git_push_event(
             rolled_back_from_id: job.rollback_from_deployment_id,
             ..Default::default()
         };
-        let trigger_context = if is_rollback {
+        let trigger_context = if let Some(source_deployment_id) = job.recovery_of_deployment_id {
+            serde_json::json!({
+                "trigger": "failover_recovery",
+                "source": "git",
+                "recovery_of_deployment_id": source_deployment_id,
+            })
+        } else if is_rollback {
             serde_json::json!({
                 "trigger": "rollback",
                 "source": "rebuild_from_source",
@@ -1496,33 +2038,74 @@ async fn process_git_push_event(
             updated_at: sea_orm::Set(Utc::now()),
         };
 
-        let deployment = match new_deployment.insert(db.as_ref()).await {
-            Ok(deployment) => deployment,
-            Err(e) => {
-                error!(
-                    "Failed to create deployment for project {} environment {}: {}",
-                    project.id, environment.id, e
-                );
-                continue;
-            }
-        };
+        let (deployment, mut post_commit_events) =
+            match JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project.id,
+                environment.id,
+                job.recovery_of_deployment_id,
+                DeploymentDuplicateKey::Commit(job.commit.clone()),
+                new_deployment,
+            )
+            .await
+            {
+                Ok(DeploymentCreationOutcome::Created {
+                    deployment,
+                    cancellation_events,
+                }) => (*deployment, cancellation_events),
+                Ok(DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                }) => {
+                    info!(
+                        project_id = project.id,
+                        environment_id = environment.id,
+                        deployment_id,
+                        state,
+                        commit = %job.commit,
+                        "Git deployment already exists; skipping duplicate"
+                    );
+                    continue;
+                }
+                Ok(DeploymentCreationOutcome::StaleRecovery {
+                    source_deployment_id,
+                    current_deployment_id,
+                    newer_deployment_id,
+                }) => {
+                    info!(
+                        project_id = project.id,
+                        environment_id = environment.id,
+                        source_deployment_id,
+                        current_deployment_id = ?current_deployment_id,
+                        newer_deployment_id = ?newer_deployment_id,
+                        recovery_kind = "git",
+                        "Skipping stale failover recovery generation"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create deployment for project {} environment {}: {}",
+                        project.id, environment.id, e
+                    );
+                    continue;
+                }
+            };
 
         info!(
             "Created deployment {} for project {} environment {} from GitPushEvent",
             deployment.id, project.id, environment.id
         );
 
-        let deployment_created_event = Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+        post_commit_events.push(Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
             deployment_id: deployment.id,
             project_id: project.id,
             environment_id: environment.id,
             environment_name: environment.name.clone(),
             branch: job.branch.clone(),
             commit_sha: (!job.commit.is_empty()).then(|| job.commit.clone()),
-        });
-        if let Err(e) = queue.send(deployment_created_event).await {
-            error!("Failed to send DeploymentCreated event: {}", e);
-        }
+        }));
+        JobProcessorService::send_post_commit_events(&queue, post_commit_events).await;
 
         let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
         let deployment_id = deployment.id;
@@ -1577,33 +2160,34 @@ async fn process_git_push_event(
 /// the workflow executor checks `DatabaseCancellationProvider::is_cancelled()`
 /// between job batches and stops.
 async fn cancel_in_flight_deployments(
-    db: &DbConnection,
-    queue: &Arc<dyn JobQueue>,
+    transaction: &DatabaseTransaction,
     project_id: i32,
     environment_id: i32,
-) {
+    current_deployment_id: Option<i32>,
+) -> Result<Vec<Job>, JobProcessorError> {
     use temps_entities::deployment_jobs;
     use temps_entities::types::JobStatus;
 
-    let in_flight = match deployments::Entity::find()
+    let in_flight_query = deployments::Entity::find()
         .filter(deployments::Column::EnvironmentId.eq(environment_id))
         .filter(deployments::Column::ProjectId.eq(project_id))
-        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "built"]))
-        .all(db)
-        .await
-    {
-        Ok(deps) => deps,
-        Err(e) => {
-            error!(
-                "Failed to query in-flight deployments for environment {}: {}",
-                environment_id, e
-            );
-            return;
-        }
+        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "built"]));
+    let in_flight_query = if let Some(current_deployment_id) = current_deployment_id {
+        in_flight_query.filter(deployments::Column::Id.ne(current_deployment_id))
+    } else {
+        in_flight_query
     };
+    let in_flight = in_flight_query.all(transaction).await.map_err(|error| {
+        JobProcessorError::DeploymentCreationFailed {
+            project_id,
+            environment_id,
+            operation: "query in-flight generations before superseding",
+            reason: error.to_string(),
+        }
+    })?;
 
     if in_flight.is_empty() {
-        return;
+        return Ok(Vec::new());
     }
 
     info!(
@@ -1612,6 +2196,7 @@ async fn cancel_in_flight_deployments(
         environment_id
     );
 
+    let mut events = Vec::with_capacity(in_flight.len());
     for deployment in in_flight {
         let deployment_id = deployment.id;
         let environment_name = deployment.slug.clone();
@@ -1620,7 +2205,7 @@ async fn cancel_in_flight_deployments(
         if let Ok(running_jobs) = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
             .filter(deployment_jobs::Column::Status.eq(JobStatus::Running))
-            .all(db)
+            .all(transaction)
             .await
         {
             for job in &running_jobs {
@@ -1640,13 +2225,14 @@ async fn cancel_in_flight_deployments(
         active.finished_at = Set(Some(chrono::Utc::now()));
         active.updated_at = Set(chrono::Utc::now());
 
-        if let Err(e) = active.update(db).await {
-            error!(
-                "Failed to cancel superseded deployment {}: {}",
-                deployment_id, e
-            );
-            continue;
-        }
+        active.update(transaction).await.map_err(|error| {
+            JobProcessorError::DeploymentCreationFailed {
+                project_id,
+                environment_id,
+                operation: "cancel superseded generation before creating",
+                reason: format!("deployment {deployment_id}: {error}"),
+            }
+        })?;
 
         info!(
             "Cancelled deployment {} (superseded) for environment {}",
@@ -1654,19 +2240,17 @@ async fn cancel_in_flight_deployments(
         );
 
         // Fire DeploymentCancelled event so notification systems can react
-        let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
-            deployment_id,
-            project_id,
-            environment_id,
-            environment_name: environment_name.clone(),
-        });
-        if let Err(e) = queue.send(event).await {
-            warn!(
-                "Failed to send DeploymentCancelled event for deployment {}: {}",
-                deployment_id, e
-            );
-        }
+        events.push(Job::DeploymentCancelled(
+            temps_core::DeploymentCancelledJob {
+                deployment_id,
+                project_id,
+                environment_id,
+                environment_name: environment_name.clone(),
+            },
+        ));
     }
+
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -1681,6 +2265,161 @@ mod tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_logs::LogService;
+
+    #[tokio::test]
+    async fn test_acquire_failover_recovery_permit_ordinary_job_bypasses_occupied_slot() {
+        // Arrange: a recovery already owns the sole failover slot.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let recovery_permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("failover semaphore must be open");
+
+        // Act: an ordinary deployment must not wait for or consume that slot.
+        let ordinary_permit = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            JobProcessorService::acquire_failover_recovery_permit(
+                semaphore.clone(),
+                None,
+                42,
+                Some(7),
+                "git",
+            ),
+        )
+        .await
+        .expect("ordinary job must return immediately")
+        .expect("ordinary job must not fail");
+
+        // Assert
+        assert!(ordinary_permit.is_none());
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(recovery_permit);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_failover_recovery_permit_serializes_recovery_jobs() {
+        // Arrange: the first recovery acquires the only slot.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let first_permit = JobProcessorService::acquire_failover_recovery_permit(
+            semaphore.clone(),
+            Some(99),
+            42,
+            Some(7),
+            "git",
+        )
+        .await
+        .expect("first recovery acquisition must succeed")
+        .expect("recovery job must receive a permit");
+
+        let second_acquisition = JobProcessorService::acquire_failover_recovery_permit(
+            semaphore.clone(),
+            Some(99),
+            43,
+            Some(8),
+            "image",
+        );
+        tokio::pin!(second_acquisition);
+
+        // Act + Assert: the second recovery remains pending while the first
+        // owns the slot.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                &mut second_acquisition,
+            )
+            .await
+            .is_err(),
+            "a second recovery must wait for the dedicated slot"
+        );
+
+        // Act: releasing the first permit unblocks the queued recovery.
+        drop(first_permit);
+        let second_permit = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut second_acquisition,
+        )
+        .await
+        .expect("second recovery must unblock after the first permit drops")
+        .expect("second recovery acquisition must succeed")
+        .expect("second recovery must receive the permit");
+
+        // Assert
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(second_permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_gate_recheck_recovers_source_marker_and_reacquires_recovery_slot() {
+        // Arrange: gate-blocked recovery deployments persist their source id in
+        // context_vars while waiting for a later DeploymentGateRecheck job.
+        let deployment = deployments::Model {
+            id: 100,
+            project_id: 42,
+            environment_id: 7,
+            slug: "gate-blocked-recovery".to_string(),
+            state: "pending".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: Some(serde_json::json!({"recovery_of_deployment_id": 99})),
+            branch_ref: Some("main".to_string()),
+            tag_ref: None,
+            commit_sha: Some("abc123".to_string()),
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            upload_request_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let recovery_source = JobProcessorService::recovery_source(&deployment);
+        assert_eq!(recovery_source, Some(99));
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let first_permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("first recovery owns the slot");
+        let gate_recheck_acquisition = JobProcessorService::acquire_failover_recovery_permit(
+            semaphore.clone(),
+            recovery_source,
+            deployment.project_id,
+            Some(deployment.environment_id),
+            "gate_recheck",
+        );
+        tokio::pin!(gate_recheck_acquisition);
+
+        // Act + Assert: the recheck still behaves as recovery work and waits.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            &mut gate_recheck_acquisition,
+        )
+        .await
+        .is_err());
+
+        drop(first_permit);
+        let gate_recheck_permit = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut gate_recheck_acquisition,
+        )
+        .await
+        .expect("gate recheck must unblock when the recovery slot is released")
+        .expect("gate recheck acquisition must succeed")
+        .expect("gate recheck must reacquire the recovery permit");
+        drop(gate_recheck_permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 
     fn create_test_config_service(db: Arc<DbConnection>) -> Arc<temps_config::ConfigService> {
         let server_config = Arc::new(
@@ -1707,6 +2446,553 @@ mod tests {
                 .await
                 .map(|output| output.status.success())
                 .unwrap_or(false)
+    }
+
+    fn generation_model(
+        project_id: i32,
+        environment_id: i32,
+        slug: &str,
+        state: &str,
+        commit: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> deployments::ActiveModel {
+        deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            slug: Set(slug.to_string()),
+            state: Set(state.to_string()),
+            commit_sha: Set(Some(commit.to_string())),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+            ..Default::default()
+        }
+    }
+
+    async fn set_current_deployment(db: &DbConnection, environment_id: i32, deployment_id: i32) {
+        let environment = environments::Entity::find_by_id(environment_id)
+            .one(db)
+            .await
+            .expect("query environment")
+            .expect("environment exists");
+        let mut active: environments::ActiveModel = environment.into();
+        active.current_deployment_id = Set(Some(deployment_id));
+        active.update(db).await.expect("set current deployment");
+    }
+
+    #[tokio::test]
+    async fn test_create_deployment_stale_recovery_preserves_newer_in_flight_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping stale recovery generation-fence test");
+            return;
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let source = generation_model(
+            project_id,
+            environment_id,
+            "source",
+            "completed",
+            "source-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert recovery source");
+        set_current_deployment(db.as_ref(), environment_id, source.id).await;
+        let newer = generation_model(
+            project_id,
+            environment_id,
+            "manual-newer",
+            "pending",
+            "manual-commit",
+            now + chrono::Duration::seconds(1),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert newer manual generation");
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            Some(source.id),
+            DeploymentDuplicateKey::Commit("recovery-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "stale-recovery",
+                "pending",
+                "recovery-commit",
+                now + chrono::Duration::seconds(2),
+            ),
+        )
+        .await
+        .expect("stale recovery validation must succeed");
+
+        // Assert
+        match outcome {
+            DeploymentCreationOutcome::StaleRecovery {
+                source_deployment_id,
+                current_deployment_id,
+                newer_deployment_id,
+            } => {
+                assert_eq!(source_deployment_id, source.id);
+                assert_eq!(current_deployment_id, Some(source.id));
+                assert_eq!(newer_deployment_id, Some(newer.id));
+            }
+            _ => panic!("newer in-flight work must make recovery stale"),
+        }
+        let rows = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .all(db.as_ref())
+            .await
+            .expect("reload deployment generations");
+        assert_eq!(rows.len(), 2, "stale recovery must not create a row");
+        assert_eq!(
+            rows.iter().find(|row| row.id == source.id).unwrap().state,
+            "completed"
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.id == newer.id).unwrap().state,
+            "pending",
+            "stale recovery must not cancel newer work"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_with_source_commit_creates_new_generation_instead_of_duplicate() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping recovery commit self-duplicate test");
+            return;
+        }
+
+        // Arrange: the recovery rebuilds the exact commit of the currently
+        // routed running deployment.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let source = generation_model(
+            project_id,
+            environment_id,
+            "source",
+            "running",
+            "same-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert routed recovery source");
+        set_current_deployment(db.as_ref(), environment_id, source.id).await;
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            Some(source.id),
+            DeploymentDuplicateKey::Commit("same-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "recovery",
+                "pending",
+                "same-commit",
+                now,
+            ),
+        )
+        .await
+        .expect("create recovery generation");
+
+        // Assert
+        let recovery = match outcome {
+            DeploymentCreationOutcome::Created {
+                deployment,
+                cancellation_events,
+            } => {
+                assert!(cancellation_events.is_empty());
+                deployment
+            }
+            DeploymentCreationOutcome::Duplicate { deployment_id, .. } => panic!(
+                "routed source deployment {deployment_id} must not self-match duplicate detection"
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("current recovery source must not be stale")
+            }
+        };
+        assert_ne!(recovery.id, source.id);
+        assert_eq!(recovery.state, "pending");
+        assert_eq!(recovery.commit_sha.as_deref(), Some("same-commit"));
+        let source = deployments::Entity::find_by_id(source.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload source")
+            .expect("source exists");
+        assert_eq!(source.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_with_source_image_creates_new_generation_instead_of_duplicate() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping recovery image self-duplicate test");
+            return;
+        }
+
+        // Arrange: image recovery intentionally deploys the exact immutable
+        // image already associated with the currently routed source.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let image_ref = "registry.example/app:immutable";
+        let mut source_model = generation_model(
+            project_id,
+            environment_id,
+            "source",
+            "running",
+            "source-commit",
+            now,
+        );
+        source_model.image_name = Set(Some(image_ref.to_string()));
+        let source = source_model
+            .insert(db.as_ref())
+            .await
+            .expect("insert routed recovery source");
+        set_current_deployment(db.as_ref(), environment_id, source.id).await;
+        let mut recovery_model = generation_model(
+            project_id,
+            environment_id,
+            "recovery",
+            "pending",
+            "recovery-commit",
+            now,
+        );
+        recovery_model.image_name = Set(Some(image_ref.to_string()));
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            Some(source.id),
+            DeploymentDuplicateKey::Image(image_ref.to_string()),
+            recovery_model,
+        )
+        .await
+        .expect("create image recovery generation");
+
+        // Assert
+        let recovery = match outcome {
+            DeploymentCreationOutcome::Created {
+                deployment,
+                cancellation_events,
+            } => {
+                assert!(cancellation_events.is_empty());
+                deployment
+            }
+            DeploymentCreationOutcome::Duplicate { deployment_id, .. } => panic!(
+                "routed source deployment {deployment_id} must not self-match duplicate detection"
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("current recovery source must not be stale")
+            }
+        };
+        assert_ne!(recovery.id, source.id);
+        assert_eq!(recovery.state, "pending");
+        assert_eq!(recovery.image_name.as_deref(), Some(image_ref));
+        let source = deployments::Entity::find_by_id(source.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload source")
+            .expect("source exists");
+        assert_eq!(source.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_create_deployment_manual_generation_supersedes_recovery_normally() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping recovery then manual supersession test");
+            return;
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let source = generation_model(
+            project_id,
+            environment_id,
+            "source",
+            "completed",
+            "source-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert recovery source");
+        set_current_deployment(db.as_ref(), environment_id, source.id).await;
+
+        let recovery = match JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            Some(source.id),
+            DeploymentDuplicateKey::Commit("recovery-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "recovery",
+                "pending",
+                "recovery-commit",
+                now,
+            ),
+        )
+        .await
+        .expect("create recovery generation")
+        {
+            DeploymentCreationOutcome::Created { deployment, .. } => deployment,
+            _ => panic!("first recovery must create a generation"),
+        };
+
+        // Act: ordinary/manual work participates in the normal newest-wins path.
+        let manual = match JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::Commit("manual-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "manual",
+                "pending",
+                "manual-commit",
+                now,
+            ),
+        )
+        .await
+        .expect("create manual generation")
+        {
+            DeploymentCreationOutcome::Created { deployment, .. } => deployment,
+            _ => panic!("manual work must create a generation"),
+        };
+
+        // Assert
+        let recovery = deployments::Entity::find_by_id(recovery.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload recovery")
+            .expect("recovery row exists");
+        assert_eq!(recovery.state, "cancelled");
+        assert_eq!(
+            recovery.cancelled_reason.as_deref(),
+            Some("Superseded by a newer deployment for this environment")
+        );
+        let manual = deployments::Entity::find_by_id(manual.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload manual generation")
+            .expect("manual generation exists");
+        assert_eq!(manual.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_create_deployment_supersession_preserves_current_routed_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping routed generation supersession test");
+            return;
+        }
+
+        // Arrange: a running deployment is currently routed while an unrelated
+        // pending generation is also in flight.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let routed = generation_model(
+            project_id,
+            environment_id,
+            "routed",
+            "running",
+            "routed-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert routed deployment");
+        set_current_deployment(db.as_ref(), environment_id, routed.id).await;
+        let obsolete = generation_model(
+            project_id,
+            environment_id,
+            "obsolete-pending",
+            "pending",
+            "obsolete-commit",
+            now + chrono::Duration::seconds(1),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert obsolete pending deployment");
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::Commit("new-manual-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "new-manual",
+                "pending",
+                "new-manual-commit",
+                now + chrono::Duration::seconds(2),
+            ),
+        )
+        .await
+        .expect("create newest generation");
+        let created = match outcome {
+            DeploymentCreationOutcome::Created {
+                deployment,
+                cancellation_events,
+            } => {
+                assert_eq!(cancellation_events.len(), 1);
+                match &cancellation_events[0] {
+                    Job::DeploymentCancelled(event) => {
+                        assert_eq!(event.deployment_id, obsolete.id)
+                    }
+                    other => panic!("unexpected cancellation event: {other:?}"),
+                }
+                deployment
+            }
+            _ => panic!("ordinary work must create a generation"),
+        };
+
+        // Assert: supersession only cancels non-routed in-flight work.
+        let routed = deployments::Entity::find_by_id(routed.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload routed deployment")
+            .expect("routed deployment exists");
+        assert_eq!(routed.state, "running");
+        let obsolete = deployments::Entity::find_by_id(obsolete.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload obsolete deployment")
+            .expect("obsolete deployment exists");
+        assert_eq!(obsolete.state, "cancelled");
+        assert_eq!(created.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_shared_generation_insert_makes_later_recovery_stale() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping shared generation insert ordering test");
+            return;
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let source = generation_model(
+            project_id,
+            environment_id,
+            "source",
+            "completed",
+            "source-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert recovery source");
+        set_current_deployment(db.as_ref(), environment_id, source.id).await;
+
+        // Act: model a direct/manual or source-drop path using the universal
+        // insertion helper before the delayed recovery reaches its fence.
+        let direct = super::super::services::insert_deployment_with_generation_lock(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            generation_model(
+                project_id,
+                environment_id,
+                "direct-insert",
+                "pending",
+                "direct-commit",
+                now,
+            ),
+        )
+        .await
+        .expect("insert direct generation under shared lock");
+        let recovery = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            Some(source.id),
+            DeploymentDuplicateKey::Commit("recovery-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "recovery",
+                "pending",
+                "recovery-commit",
+                now,
+            ),
+        )
+        .await
+        .expect("validate delayed recovery");
+
+        // Assert
+        match recovery {
+            DeploymentCreationOutcome::StaleRecovery {
+                source_deployment_id,
+                newer_deployment_id,
+                ..
+            } => {
+                assert_eq!(source_deployment_id, source.id);
+                assert_eq!(newer_deployment_id, Some(direct.id));
+            }
+            _ => panic!("direct generation must make delayed recovery stale"),
+        }
+        let direct = deployments::Entity::find_by_id(direct.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload direct generation")
+            .expect("direct generation exists");
+        assert_eq!(direct.state, "pending");
     }
 
     mock! {
@@ -1975,6 +3261,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
 
         // Try to find the project (should return None)
@@ -2425,6 +3712,7 @@ mod tests {
             manual_trigger: true,
             rollback_from_deployment_id: None,
             target_environment_id: target,
+            recovery_of_deployment_id: None,
         };
 
         // Explicit target → exactly production, despite no branch match.

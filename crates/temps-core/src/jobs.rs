@@ -43,6 +43,15 @@ pub struct GitPushEventJob {
     /// branch.
     #[serde(default)]
     pub target_environment_id: Option<i32>,
+    /// Source deployment being recovered after its node went offline. The
+    /// deployment processor serializes these jobs and verifies that this id is
+    /// still the environment's current generation before creating new work.
+    /// Manual redeploys and webhook pushes use `None`.
+    ///
+    /// `#[serde(default)]` keeps jobs queued by older versions compatible and
+    /// treats them as ordinary deployments.
+    #[serde(default)]
+    pub recovery_of_deployment_id: Option<i32>,
 }
 
 /// Request to deploy a prebuilt Docker image to a project (no build step).
@@ -67,6 +76,10 @@ pub struct DeployImageRequestedJob {
     /// Optional command passed to the image entrypoint.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Source deployment being recovered after its node went offline.
+    /// See [`GitPushEventJob::recovery_of_deployment_id`].
+    #[serde(default)]
+    pub recovery_of_deployment_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -577,4 +590,53 @@ pub trait JobQueue: Send + Sync {
 pub trait JobReceiver: Send {
     /// Receive the next job
     async fn recv(&mut self) -> Result<Job, QueueError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeployImageRequestedJob, GitPushEventJob};
+
+    #[test]
+    fn test_git_push_event_job_missing_recovery_source_defaults_to_none() {
+        // Arrange: this is the JSON shape emitted before failover recovery was
+        // added to the queue payload.
+        let legacy_payload = serde_json::json!({
+            "owner": "temps-sh",
+            "repo": "temps",
+            "branch": "main",
+            "tag": null,
+            "commit": "abc123",
+            "project_id": 42,
+            "manual_trigger": true,
+            "rollback_from_deployment_id": null,
+            "target_environment_id": 7
+        });
+
+        // Act
+        let job: GitPushEventJob = serde_json::from_value(legacy_payload)
+            .expect("legacy GitPushEventJob payload must remain deserializable");
+
+        // Assert
+        assert_eq!(job.recovery_of_deployment_id, None);
+    }
+
+    #[test]
+    fn test_deploy_image_requested_job_missing_recovery_source_defaults_to_none() {
+        // Arrange: this is the JSON shape emitted before failover recovery was
+        // added to the queue payload.
+        let legacy_payload = serde_json::json!({
+            "project_id": 42,
+            "target_environment_id": 7,
+            "image_ref": "ghcr.io/temps-sh/example:latest",
+            "health_check_path": "/healthz",
+            "command": ["serve"]
+        });
+
+        // Act
+        let job: DeployImageRequestedJob = serde_json::from_value(legacy_payload)
+            .expect("legacy DeployImageRequestedJob payload must remain deserializable");
+
+        // Assert
+        assert_eq!(job.recovery_of_deployment_id, None);
+    }
 }

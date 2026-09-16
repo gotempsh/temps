@@ -20,7 +20,10 @@ use temps_entities::source_type::SourceType;
 use temps_entities::{deployments, environments, projects, source_bundles};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{DeploymentGateSlot, JobProcessorService, WorkflowExecutionService, WorkflowPlanner};
+use super::{
+    lock_environment_for_deployment_generation, DeploymentGateSlot, JobProcessorService,
+    WorkflowExecutionService, WorkflowPlanner,
+};
 
 const MAX_SOURCE_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -342,6 +345,18 @@ impl SourceDropDeployer for SourceDropService {
             .map_err(|error| SourceDropError::Database {
                 reason: error.to_string(),
             })?;
+        if let Err(error) =
+            lock_environment_for_deployment_generation(&transaction, project.id, environment.id)
+                .await
+        {
+            let _ = transaction.rollback().await;
+            let original = SourceDropError::Database {
+                reason: format!("could not lock deployment generation: {error}"),
+            };
+            return Err(self
+                .compensate(original, None, None, None, &absolute_path)
+                .await);
+        }
         let now = Utc::now();
         let bundle = match (source_bundles::ActiveModel {
             project_id: Set(project.id),

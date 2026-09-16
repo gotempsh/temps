@@ -342,6 +342,19 @@ pub async fn deploy_from_uploaded_source(
             .with_title("Source Registration Failed")
             .with_detail(error.to_string())
     })?;
+    if let Err(error) = crate::services::lock_environment_for_deployment_generation(
+        &transaction,
+        project_id,
+        environment_id,
+    )
+    .await
+    {
+        let _ = transaction.rollback().await;
+        rollback_uploaded_source(&state, None, None, &absolute_path).await;
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(error.to_string()));
+    }
     let now = Utc::now();
     let bundle = match (source_bundles::ActiveModel {
         project_id: Set(project_id),
@@ -1204,15 +1217,19 @@ pub async fn deploy_from_image(
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+    let deployment = crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to create deployment: {}", e);
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(e.to_string())
+    })?;
 
     info!(
         "Created deployment {} for Docker image deployment",
@@ -1470,15 +1487,19 @@ pub async fn deploy_from_static(
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+    let deployment = crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to create deployment: {}", e);
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(e.to_string())
+    })?;
 
     info!(
         "Created deployment {} for static bundle deployment",
@@ -1907,7 +1928,14 @@ pub async fn deploy_from_image_upload(
         ..Default::default()
     };
 
-    let deployment = match new_deployment.insert(state.db.as_ref()).await {
+    let deployment = match crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    {
         Ok(deployment) => deployment,
         // A concurrent request carrying the same upload_request_id won the
         // race and inserted first — the database's partial unique index

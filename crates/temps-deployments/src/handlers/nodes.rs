@@ -8,7 +8,7 @@
 //! (not the regular user auth) — the node presents the registration token
 //! which is verified against the hashed token stored in the nodes table.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -2361,9 +2361,21 @@ async fn admin_drain_node(
 
     let mut retired_count = 0usize;
     let mut redeployed_count = 0usize;
+    let mut redeployed_environments = HashSet::new();
 
     for dep in &affected {
-        if dep.needs_redeploy() {
+        if dep.is_current && dep.needs_redeploy() {
+            if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
+                info!(
+                    node_id,
+                    project_id = dep.project_id,
+                    environment_id = dep.environment_id,
+                    deployment_id = dep.deployment_id,
+                    "Drain: redeploy already queued for environment in this drain pass"
+                );
+                continue;
+            }
+
             // All replicas are on this node — must redeploy to maintain availability
             match app_state
                 .deployment_service
@@ -2376,21 +2388,26 @@ async fn admin_drain_node(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
+                        deployment_id = dep.deployment_id,
                         "Drain: triggered full redeploy (no healthy replicas on other nodes)"
                     );
                 }
                 Err(e) => {
+                    redeployed_environments.remove(&(dep.project_id, dep.environment_id));
                     error!(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
+                        deployment_id = dep.deployment_id,
                         "Drain: failed to trigger redeploy: {}",
                         e
                     );
                 }
             }
         } else {
-            // Other nodes still have healthy replicas — stop and retire containers on this node
+            // Historical deployments are never redeployed. Current deployments
+            // reach this branch only when another node still has a healthy
+            // replica. In both cases, stop and retire this node's containers.
             // First, stop containers on the agent (best-effort)
             let containers = app_state
                 .node_service
@@ -2430,9 +2447,14 @@ async fn admin_drain_node(
                     info!(
                         node_id,
                         deployment_id = dep.deployment_id,
+                        project_id = dep.project_id,
+                        environment_id = dep.environment_id,
+                        is_current = dep.is_current,
                         retired = count,
-                        remaining = dep.total_active_containers - dep.containers_on_node,
-                        "Drain: retired containers, healthy replicas remain on other nodes"
+                        remaining = dep
+                            .total_active_containers
+                            .saturating_sub(dep.containers_on_node),
+                        "Drain: retired containers without starting another deployment"
                     );
                 }
                 Err(e) => {

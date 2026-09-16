@@ -10,6 +10,7 @@
 //! to healthy nodes.
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use std::collections::HashSet;
 
 use temps_entities::nodes;
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
@@ -433,6 +434,8 @@ pub async fn failover_offline_nodes(
         return;
     }
 
+    let mut redeployed_environments = HashSet::new();
+
     for &node_id in offline_node_ids {
         let affected = match node_service.affected_deployments(node_id).await {
             Ok(deps) => deps,
@@ -459,18 +462,19 @@ pub async fn failover_offline_nodes(
         );
 
         for dep in &affected {
-            if dep.needs_redeploy() {
-                // All replicas were on this node — must redeploy
-                match deployment_service
-                    .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
+            if !dep.is_current {
+                match node_service
+                    .retire_containers_on_node(node_id, dep.deployment_id)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(count) => {
                         tracing::info!(
                             node_id,
                             project_id = dep.project_id,
                             environment_id = dep.environment_id,
-                            "Failover: triggered full redeploy (no healthy replicas elsewhere)"
+                            deployment_id = dep.deployment_id,
+                            retired = count,
+                            "Failover: retired historical deployment containers without redeploying"
                         );
                     }
                     Err(e) => {
@@ -478,6 +482,52 @@ pub async fn failover_offline_nodes(
                             node_id,
                             project_id = dep.project_id,
                             environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Failover: failed to retire historical deployment containers: {}",
+                            e
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if dep.needs_redeploy() {
+                if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
+                    tracing::info!(
+                        node_id,
+                        project_id = dep.project_id,
+                        environment_id = dep.environment_id,
+                        deployment_id = dep.deployment_id,
+                        "Failover: recovery redeploy already queued for environment in this health-check pass"
+                    );
+                    continue;
+                }
+
+                // All replicas were on this node — must redeploy
+                match deployment_service
+                    .redeploy_environment_for_failover(
+                        dep.project_id,
+                        dep.environment_id,
+                        dep.deployment_id,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            node_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Failover: queued serialized recovery redeploy (no healthy replicas elsewhere)"
+                        );
+                    }
+                    Err(e) => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        tracing::error!(
+                            node_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
                             "Failover: failed to trigger redeploy: {}",
                             e
                         );

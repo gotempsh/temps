@@ -4753,6 +4753,7 @@ impl ProjectService {
             // Infer the target from the branch at creation time (the default
             // environment tracks main_branch).
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
 
         self.queue_service
@@ -4938,6 +4939,7 @@ impl ProjectService {
             // (which would fall through to a preview/named-preview env when the
             // environment doesn't have the branch configured).
             target_environment_id: Some(environment_id),
+            recovery_of_deployment_id: None,
         };
 
         // Send the job to the queue

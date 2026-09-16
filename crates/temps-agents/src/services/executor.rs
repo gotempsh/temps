@@ -2894,6 +2894,7 @@ impl AgentExecutor {
             rollback_from_deployment_id: None,
             // Webhook-like: infer the target environment from the branch.
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         });
 
         if let Err(e) = self.queue.send(push_job).await {

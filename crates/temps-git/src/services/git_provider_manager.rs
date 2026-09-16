@@ -4783,6 +4783,7 @@ impl GitProviderManager {
                 rollback_from_deployment_id: None,
                 // Webhook: infer the target environment(s) from the branch.
                 target_environment_id: None,
+                recovery_of_deployment_id: None,
             };
 
             if let Err(e) = self

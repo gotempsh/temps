@@ -10,8 +10,8 @@
 
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -146,9 +146,43 @@ impl MarkDeploymentCompleteJob {
                 self.deployment_id, environment_id, error
             ))
         })?;
+        let _environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock environment {environment_id} during readiness rollback for deployment {}: {error}",
+                    self.deployment_id
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Environment {environment_id} disappeared during readiness rollback for deployment {}",
+                    self.deployment_id
+                ))
+            })?;
+        let deployment = deployments::Entity::find_by_id(self.deployment_id)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock deployment {} during readiness rollback in environment {environment_id}: {error}",
+                    self.deployment_id
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {} disappeared during readiness rollback in environment {environment_id}",
+                    self.deployment_id
+                ))
+            })?;
         let now = chrono::Utc::now();
         let failed_deployment = deployments::ActiveModel {
-            id: sea_orm::ActiveValue::Unchanged(self.deployment_id),
+            id: sea_orm::ActiveValue::Unchanged(deployment.id),
             state: Set("failed".to_string()),
             finished_at: Set(Some(now)),
             updated_at: Set(now),
@@ -678,16 +712,13 @@ impl MarkDeploymentCompleteJob {
             "Rollback target resolved for route-table timeout"
         );
 
-        let mut active_environment: environments::ActiveModel = environment.clone().into();
-        active_environment.current_deployment_id = Set(Some(self.deployment_id));
-
-        active_environment
-            .clone()
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to update environment: {}", e))
-            })?;
+        let active_environment: environments::ActiveModel = environment.clone().into();
+        if !self.promote_if_latest(self.deployment_id).await? {
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Deployment {} was cancelled or superseded before route promotion",
+                self.deployment_id
+            )));
+        }
 
         info!(
             "Environment {} current_deployment_id updated to {}",
@@ -922,16 +953,15 @@ impl MarkDeploymentCompleteJob {
 
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
-        active_deployment.state = Set("completed".to_string());
-        active_deployment.finished_at = Set(Some(now));
-        active_deployment.updated_at = Set(now);
-
-        active_deployment
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to update deployment: {}", e))
-            })?;
+        if !self
+            .finalize_if_current_and_latest(self.deployment_id, now)
+            .await?
+        {
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Deployment {} was cancelled or superseded before completion",
+                self.deployment_id
+            )));
+        }
 
         // Compose-specific: refresh the settings-page checklist only after the
         // deployment is completed. The atomic JSONB update changes only
@@ -1464,6 +1494,240 @@ WHERE project.id = $2
             Some(env) => Ok(env.current_deployment_id == Some(expected_deployment_id)),
             None => Ok(false),
         }
+    }
+
+    async fn newer_deployment_id(
+        transaction: &sea_orm::DatabaseTransaction,
+        deployment: &deployments::Model,
+    ) -> Result<Option<i32>, sea_orm::DbErr> {
+        deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(deployment.environment_id))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.gt(deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(deployment.created_at))
+                            .add(deployments::Column::Id.gt(deployment.id)),
+                    ),
+            )
+            .order_by_desc(deployments::Column::CreatedAt)
+            .order_by_desc(deployments::Column::Id)
+            .one(transaction)
+            .await
+            .map(|deployment| deployment.map(|deployment| deployment.id))
+    }
+
+    /// Atomically select this deployment for routing only if it is still the
+    /// newest running generation. Creation paths lock the same environment row,
+    /// so either the newer deployment commits first and wins, or it waits and
+    /// cancels this generation immediately after this transaction commits.
+    async fn promote_if_latest(&self, deployment_id: i32) -> Result<bool, WorkflowError> {
+        let candidate = deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load deployment {deployment_id} before promotion: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {deployment_id} disappeared before promotion"
+                ))
+            })?;
+        let transaction = self.db.begin().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to begin promotion transaction for deployment {deployment_id}: {error}"
+            ))
+        })?;
+        let environment = environments::Entity::find_by_id(candidate.environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock environment {} for deployment {deployment_id} promotion: {error}",
+                    candidate.environment_id
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Environment {} was deleted before deployment {deployment_id} promotion",
+                    candidate.environment_id
+                ))
+            })?;
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock deployment {deployment_id} for promotion: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {deployment_id} disappeared before promotion"
+                ))
+            })?;
+        let newer_deployment_id = Self::newer_deployment_id(&transaction, &deployment)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to check newer deployments before promoting deployment {deployment_id}: {error}"
+                ))
+            })?;
+
+        if deployment.state != "running" || newer_deployment_id.is_some() {
+            if deployment.state == "running" && newer_deployment_id.is_some() {
+                deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("stopped"))
+                    .col_expr(
+                        deployments::Column::CancelledReason,
+                        Expr::value("Superseded by a newer deployment before route promotion"),
+                    )
+                    .col_expr(
+                        deployments::Column::FinishedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .col_expr(
+                        deployments::Column::UpdatedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .filter(deployments::Column::Id.eq(deployment_id))
+                    .filter(deployments::Column::State.eq("running"))
+                    .exec(&transaction)
+                    .await
+                    .map_err(|error| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Failed to stop superseded deployment {deployment_id}: {error}"
+                        ))
+                    })?;
+            }
+            transaction.commit().await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to finish rejected promotion for deployment {deployment_id}: {error}"
+                ))
+            })?;
+            info!(
+                deployment_id,
+                environment_id = deployment.environment_id,
+                state = %deployment.state,
+                newer_deployment_id = ?newer_deployment_id,
+                "Deployment promotion rejected by generation fence"
+            );
+            return Ok(false);
+        }
+
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(deployment_id));
+        active_environment
+            .update(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to promote deployment {deployment_id} onto environment {}: {error}",
+                    deployment.environment_id
+                ))
+            })?;
+        transaction.commit().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to commit promotion for deployment {deployment_id}: {error}"
+            ))
+        })?;
+        Ok(true)
+    }
+
+    /// Final completion compare-and-swap. The deployment must still be running
+    /// and selected by the environment. A newer generation may be building in
+    /// parallel and can promote itself once it is ready.
+    async fn finalize_if_current_and_latest(
+        &self,
+        deployment_id: i32,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, WorkflowError> {
+        let candidate = deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load deployment {deployment_id} before completion: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {deployment_id} disappeared before completion"
+                ))
+            })?;
+        let transaction = self.db.begin().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to begin completion transaction for deployment {deployment_id}: {error}"
+            ))
+        })?;
+        let environment = environments::Entity::find_by_id(candidate.environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock environment {} while completing deployment {deployment_id}: {error}",
+                    candidate.environment_id
+                ))
+            })?;
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .lock(sea_orm::sea_query::LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to lock deployment {deployment_id} for completion: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {deployment_id} disappeared before completion"
+                ))
+            })?;
+        let current_deployment_id =
+            environment.and_then(|environment| environment.current_deployment_id);
+        if deployment.state != "running" || current_deployment_id != Some(deployment_id) {
+            transaction.commit().await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to finish rejected completion for deployment {deployment_id}: {error}"
+                ))
+            })?;
+            info!(
+                deployment_id,
+                environment_id = deployment.environment_id,
+                state = %deployment.state,
+                current_deployment_id = ?current_deployment_id,
+                "Deployment completion rejected by compare-and-swap fence"
+            );
+            return Ok(false);
+        }
+
+        let updated = deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("completed"))
+            .col_expr(deployments::Column::FinishedAt, Expr::value(now))
+            .col_expr(deployments::Column::UpdatedAt, Expr::value(now))
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.eq("running"))
+            .exec(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to complete deployment {deployment_id} with compare-and-swap: {error}"
+                ))
+            })?;
+        transaction.commit().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to commit completion for deployment {deployment_id}: {error}"
+            ))
+        })?;
+        Ok(updated.rows_affected == 1)
     }
 
     /// Find the last deployment for the given environment that reached a
@@ -2578,6 +2842,130 @@ mod teardown_tests {
             !saved.to_string().contains("stale-service"),
             "superseded snapshot must not overwrite the current one"
         );
+    }
+
+    #[tokio::test]
+    async fn test_promote_if_latest_rejects_cancelled_and_superseded_generations() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = seed_project_env(&db).await;
+        let serving =
+            insert_deployment(&db, project.id, environment.id, "serving", "completed").await;
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(serving.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+
+        // A deployment cancelled before completion cannot claim the route.
+        let cancelled =
+            insert_deployment(&db, project.id, environment.id, "cancelled", "cancelled").await;
+        let cancelled_job = make_job(db.clone(), cancelled.id, Arc::new(RecordingDeployer::new()));
+        assert!(!cancelled_job
+            .promote_if_latest(cancelled.id)
+            .await
+            .expect("cancelled promotion check"));
+
+        // An older running generation also loses once newer work exists.
+        let superseded =
+            insert_deployment(&db, project.id, environment.id, "superseded", "running").await;
+        let newer = insert_deployment(&db, project.id, environment.id, "newer", "pending").await;
+        let superseded_job = make_job(
+            db.clone(),
+            superseded.id,
+            Arc::new(RecordingDeployer::new()),
+        );
+        assert!(!superseded_job
+            .promote_if_latest(superseded.id)
+            .await
+            .expect("superseded promotion check"));
+
+        let environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            environment.current_deployment_id,
+            Some(serving.id),
+            "cancelled or superseded work must not replace the serving route"
+        );
+        let superseded = deployments::Entity::find_by_id(superseded.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(superseded.state, "stopped");
+        let newer = deployments::Entity::find_by_id(newer.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_current_routed_generation_with_newer_work_in_flight() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = seed_project_env(&db).await;
+        let routed = insert_deployment(&db, project.id, environment.id, "routed", "running").await;
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(routed.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+
+        // Both states represent newer work that may build in parallel while
+        // the currently routed deployment finishes its completion bookkeeping.
+        let newer_pending =
+            insert_deployment(&db, project.id, environment.id, "newer-pending", "pending").await;
+        let newer_running =
+            insert_deployment(&db, project.id, environment.id, "newer-running", "running").await;
+
+        let job = make_job(db.clone(), routed.id, Arc::new(RecordingDeployer::new()));
+
+        // Act
+        let finalized = job
+            .finalize_if_current_and_latest(routed.id, chrono::Utc::now())
+            .await
+            .expect("finalize routed generation");
+
+        // Assert
+        assert!(finalized);
+        let routed = deployments::Entity::find_by_id(routed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(routed.state, "completed");
+        assert!(routed.finished_at.is_some());
+        let environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.current_deployment_id, Some(routed.id));
+        let newer_pending = deployments::Entity::find_by_id(newer_pending.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let newer_running = deployments::Entity::find_by_id(newer_running.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer_pending.state, "pending");
+        assert_eq!(newer_running.state, "running");
     }
 
     #[tokio::test]
