@@ -677,6 +677,7 @@ fn sandbox_network_matches_isolation_policy(
     network: &bollard::models::NetworkInspect,
     container_name: &str,
     preview_gateway_container_name: &str,
+    legacy_gateway_attached: bool,
 ) -> bool {
     let labels = network.labels.as_ref();
     docker_network_matches_policy(network, true, false)
@@ -693,7 +694,8 @@ fn sandbox_network_matches_isolation_policy(
                 // one singleton gateway with this exact default name. Adopt
                 // those networks only for that historical singleton; custom
                 // multi-instance gateways must have an explicit match.
-                preview_gateway_container_name == crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+                preview_gateway_container_name == crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+                    || legacy_gateway_attached,
                 |value| value == preview_gateway_container_name,
             )
         && has_host_isolation(network.options.as_ref())
@@ -2313,10 +2315,22 @@ impl DockerSandboxProvider {
             }
         };
 
+        let legacy_gateway_attached = if network
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.contains_key(SANDBOX_PREVIEW_GATEWAY_LABEL))
+            && self.config.preview_gateway_container_name
+                != crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+        {
+            self.verified_gateway_is_attached(&network).await?
+        } else {
+            false
+        };
         if !sandbox_network_matches_isolation_policy(
             &network,
             container_name,
             &self.config.preview_gateway_container_name,
+            legacy_gateway_attached,
         ) {
             return Err(AgentError::SandboxProviderUnavailable {
                 provider: "docker".to_string(),
@@ -2326,6 +2340,42 @@ impl DockerSandboxProvider {
             });
         }
         Ok(())
+    }
+
+    async fn verified_gateway_is_attached(
+        &self,
+        network: &bollard::models::NetworkInspect,
+    ) -> Result<bool, AgentError> {
+        let gateway = &self.config.preview_gateway_container_name;
+        let inspected = match self
+            .docker
+            .inspect_container(
+                gateway,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(inspected) => inspected,
+            Err(source) if docker_error_is_not_found(&source) => return Ok(false),
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect legacy preview gateway '{gateway}' network ownership: {source}"
+                    ),
+                })
+            }
+        };
+        if !is_managed_preview_gateway(&inspected) {
+            return Ok(false);
+        }
+        let Some(gateway_id) = inspected.id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(network
+            .containers
+            .as_ref()
+            .is_some_and(|containers| containers.contains_key(gateway_id)))
     }
 
     async fn connect_container_to_network(
@@ -6206,7 +6256,8 @@ mod tests {
         assert!(sandbox_network_matches_isolation_policy(
             &modern,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            false
         ));
 
         let mut legacy = modern.clone();
@@ -6216,7 +6267,8 @@ mod tests {
         assert!(sandbox_network_matches_isolation_policy(
             &legacy,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            false
         ));
 
         let mut wrong_owner = legacy.clone();
@@ -6227,7 +6279,8 @@ mod tests {
         assert!(!sandbox_network_matches_isolation_policy(
             &wrong_owner,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            false
         ));
 
         let mut wrong_gateway = legacy.clone();
@@ -6241,7 +6294,8 @@ mod tests {
         assert!(!sandbox_network_matches_isolation_policy(
             &wrong_gateway,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            true
         ));
 
         let mut externally_routed = legacy.clone();
@@ -6249,7 +6303,8 @@ mod tests {
         assert!(!sandbox_network_matches_isolation_policy(
             &externally_routed,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            false
         ));
 
         let mut disabled_isolation = legacy;
@@ -6260,7 +6315,8 @@ mod tests {
         assert!(!sandbox_network_matches_isolation_policy(
             &disabled_isolation,
             "sandbox-container",
-            "temps-preview-gateway-test"
+            "temps-preview-gateway-test",
+            false
         ));
 
         let mut legacy_unscoped = modern;
@@ -6271,12 +6327,20 @@ mod tests {
         assert!(sandbox_network_matches_isolation_policy(
             &legacy_unscoped,
             "sandbox-container",
-            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+            crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER,
+            false
         ));
         assert!(!sandbox_network_matches_isolation_policy(
             &legacy_unscoped,
             "sandbox-container",
-            "temps-preview-gateway-custom"
+            "temps-preview-gateway-custom",
+            false
+        ));
+        assert!(sandbox_network_matches_isolation_policy(
+            &legacy_unscoped,
+            "sandbox-container",
+            "temps-preview-gateway-custom",
+            true
         ));
     }
 

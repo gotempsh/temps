@@ -191,7 +191,7 @@ pub async fn restart_preview_gateway(
         image = %spec.image,
         "preview gateway restart requested"
     );
-    preview_gateway::force_restart(state.docker.clone(), spec)
+    preview_gateway::force_restart(state.docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
@@ -246,7 +246,7 @@ pub async fn upgrade_preview_gateway(
 
     let settings = preview_gateway::load_settings(&state.db).await;
     let spec = PreviewGatewaySpec::from_settings(&settings);
-    preview_gateway::reconcile(state.docker.clone(), spec)
+    preview_gateway::reconcile(state.docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
