@@ -32,9 +32,10 @@ pub struct GlobalTraceQuery {
     pub scopes: Vec<TraceReadScope>,
     pub summaries: bool,
     /// Use the local Postgres one-row-per-trace table when semantics allow it.
-    /// This remains enabled for the local half of a mixed local/Cloud read so
-    /// adding an unrelated Cloud project cannot change a local trace's
-    /// lifetime aggregates or its position in global pagination.
+    /// This remains enabled for both halves of a mixed local/Cloud read so
+    /// every source uses window membership plus lifetime aggregate values.
+    /// Adding an unrelated project therefore cannot change an existing trace's
+    /// values or compare incompatible sort keys in global pagination.
     pub use_preaggregated_summaries: bool,
     pub source_offset: u64,
 }
@@ -276,7 +277,11 @@ fn build_postgres_summaries(q: &GlobalTraceQuery) -> StorageResult<Sql> {
     })
 }
 
-fn postgres_can_use_summaries(q: &GlobalTraceQuery) -> bool {
+/// Whether an unfiltered summary response may expose whole-trace values.
+///
+/// Every source participating in a merged page must make this decision the
+/// same way. Otherwise duration/start ordering changes at the storage boundary.
+fn can_use_lifetime_summaries(q: &GlobalTraceQuery) -> bool {
     q.summaries
         && q.use_preaggregated_summaries
         // Filtered global queries retain the existing any-matching-span
@@ -294,6 +299,63 @@ fn postgres_can_use_summaries(q: &GlobalTraceQuery) -> bool {
             .as_ref()
             .is_none_or(std::collections::BTreeMap::is_empty)
         && q.filter.name_pattern.as_ref().is_none_or(String::is_empty)
+}
+
+/// Build Cloud summaries with window membership and lifetime aggregate values.
+///
+/// The first pass finds trace IDs with a span in each project's effective
+/// window. The second pass aggregates every Cloud-held span for those traces,
+/// matching the local `otel_trace_summaries` contract before the two sorted
+/// streams are merged.
+fn build_cloud_lifetime_summaries(
+    q: &GlobalTraceQuery,
+    refs: &BTreeMap<i32, String>,
+) -> StorageResult<Sql> {
+    let mut binds = Vec::new();
+    let mut bind = |value: Bind| {
+        binds.push(value);
+        "?".to_string()
+    };
+    let mut mapping = Vec::with_capacity(q.scopes.len());
+    for scope in &q.scopes {
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+        mapping.push(format!(
+            "WHEN {} THEN {}",
+            bind(Bind::Text(project_ref.clone())),
+            scope.project_id
+        ));
+    }
+    let mut membership = Vec::with_capacity(q.scopes.len());
+    for scope in &q.scopes {
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+        membership.push(format!(
+            "(project_ref = {} AND toUnixTimestamp64Milli(ts) >= {} AND toUnixTimestamp64Milli(ts) <= {})",
+            bind(Bind::Text(project_ref.clone())),
+            bind(Bind::Int(scope.from.timestamp_millis())),
+            bind(Bind::Int(scope.to.timestamp_millis()))
+        ));
+    }
+    let membership = if membership.is_empty() {
+        "FALSE".to_string()
+    } else {
+        membership.join(" OR ")
+    };
+    let pick = |field: &str| {
+        format!("argMax(raw.{field}, tuple(raw.parent_span_id = '', raw.duration, raw.span_id))")
+    };
+    let body = format!(
+        "WITH candidates AS (SELECT project_ref, trace_id FROM telemetry_spans WHERE {membership} GROUP BY project_ref, trace_id), raw AS (SELECT toInt32(CASE span.project_ref {} ELSE 0 END) AS project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE(span.environment, '') AS environment, span.span_kind AS kind, upper(span.status_code) AS status, toUnixTimestamp64Milli(span.ts) AS start_ms, span.duration_ms AS duration FROM telemetry_spans AS span INNER JOIN candidates AS candidate ON candidate.project_ref = span.project_ref AND candidate.trace_id = span.trace_id), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, '{{}}' AS attributes, '[]' AS events, '' AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
+        mapping.join(" "),
+        pick("name"),
+        pick("service_name"),
+        pick("environment"),
+        pick("kind")
+    );
+    Ok(Sql { body, binds })
 }
 
 async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
@@ -534,15 +596,19 @@ pub async fn clickhouse(
         return Ok(GlobalTraceStream::empty());
     }
     let empty = BTreeMap::new();
-    let sql = build(
-        q,
-        if refs.is_some() {
-            Dialect::Cloud
-        } else {
-            Dialect::ClickHouse
-        },
-        refs.unwrap_or(&empty),
-    )?;
+    let sql = if let Some(refs) = refs.filter(|_| can_use_lifetime_summaries(q)) {
+        build_cloud_lifetime_summaries(q, refs)?
+    } else {
+        build(
+            q,
+            if refs.is_some() {
+                Dialect::Cloud
+            } else {
+                Dialect::ClickHouse
+            },
+            refs.unwrap_or(&empty),
+        )?
+    };
     let count_sql = format!("SELECT count() FROM ({})", sql.body);
     let total = ch_query(client, &count_sql, &sql.binds)
         .fetch_one::<u64>()
@@ -571,7 +637,7 @@ pub async fn postgres(
         return Ok(GlobalTraceStream::empty());
     }
     let use_summaries =
-        postgres_can_use_summaries(q) && !trace_summary_rebuild_pending(&db).await?;
+        can_use_lifetime_summaries(q) && !trace_summary_rebuild_pending(&db).await?;
     let sql = if use_summaries {
         build_postgres_summaries(q)?
     } else {
@@ -774,32 +840,69 @@ mod tests {
     }
 
     #[test]
+    fn cloud_global_summaries_use_window_membership_and_lifetime_values() {
+        let mut q = query();
+        q.source_offset = 0;
+        q.scopes = (1..=2)
+            .map(|project_id| TraceReadScope {
+                project_id,
+                from: DateTime::from_timestamp_millis(1000).unwrap(),
+                to: DateTime::from_timestamp_millis(2000).unwrap(),
+                cloud: true,
+                window_clamped_at: None,
+            })
+            .collect();
+        let refs = BTreeMap::from([(1, "project-a".into()), (2, "project-b".into())]);
+
+        let sql = build_cloud_lifetime_summaries(&q, &refs).unwrap();
+
+        assert_eq!(sql.binds.len(), 8);
+        assert_eq!(sql.body.matches('?').count(), 8);
+        assert!(sql
+            .body
+            .contains("candidates AS (SELECT project_ref, trace_id FROM telemetry_spans"));
+        assert!(sql
+            .body
+            .contains("toUnixTimestamp64Milli(ts) >= ? AND toUnixTimestamp64Milli(ts) <= ?"));
+        assert!(sql.body.contains(
+            "INNER JOIN candidates AS candidate ON candidate.project_ref = span.project_ref AND candidate.trace_id = span.trace_id"
+        ));
+        assert!(sql.body.contains("MIN(raw.start_ms) AS start_ms"));
+        assert!(sql.body.contains("MAX(raw.duration) AS duration"));
+        assert!(sql.body.contains("toInt64(count()) AS span_count"));
+        assert!(sql.body.contains(
+            "CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status"
+        ));
+        assert!(ordered(&sql, &q).ends_with("LIMIT 820 OFFSET 0"));
+    }
+
+    #[test]
     fn filtered_queries_keep_the_exact_raw_span_path() {
         let mut q = query();
         q.filter.name_pattern = Some("checkout".into());
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
 
         q.filter.name_pattern = None;
         q.filter
             .attributes
             .get_or_insert_default()
             .insert("http.method".into(), "GET".into());
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
 
         q.filter.attributes = None;
         q.filter.status = Some(SpanStatusCode::Unset);
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
 
         q.filter.status = None;
         q.filter.service_name = Some("worker".into());
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
 
         q.filter.service_name = None;
         q.filter.min_duration_ms = Some(500.0);
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
 
         q.filter.min_duration_ms = None;
         q.use_preaggregated_summaries = false;
-        assert!(!postgres_can_use_summaries(&q));
+        assert!(!can_use_lifetime_summaries(&q));
     }
 }

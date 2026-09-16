@@ -904,7 +904,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &raw).await.unwrap();
     assert_eq!(page.total, 45);
     assert_eq!(page.data[0].span_id, "root");
-    let mut filtered = q;
+    let mut filtered = q.clone();
     filtered.filter.offset = Some(0);
     filtered.source_offset = 0;
     filtered.filter.min_duration_ms = Some(40.0);
@@ -916,4 +916,29 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &filtered).await.unwrap();
     assert_eq!(page.total, 6);
     assert_eq!(page.data[0].trace_id, "cloud-39");
+
+    // Membership remains window-bounded, but a qualifying trace's values use
+    // all of its Cloud-held spans so they match local lifetime summaries in a
+    // mixed-source merge.
+    h.probe.query("INSERT INTO telemetry_spans VALUES ('scope-a', 'cloud-0', 'late-child', 'root', 'child outside window', 'worker', 'production', 'INTERNAL', 'ERROR', fromUnixTimestamp64Milli(1699999800000), 999.0)").execute().await.unwrap();
+    let mut lifetime = q;
+    lifetime.filter.offset = Some(0);
+    lifetime.filter.limit = Some(100);
+    lifetime.source_offset = 0;
+    lifetime.use_preaggregated_summaries = true;
+    let stream = global_traces::clickhouse(&h.probe, &lifetime, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &lifetime).await.unwrap();
+    let trace = page
+        .data
+        .iter()
+        .find(|trace| trace.trace_id == "cloud-0")
+        .expect("window member keeps its lifetime Cloud summary");
+    assert_eq!(trace.name, "GET /items");
+    assert_eq!(trace.start_ms, 1_699_999_800_000);
+    assert_eq!(trace.duration, 999.0);
+    assert_eq!(trace.span_count, 2);
+    assert_eq!(trace.error_count, 1);
+    assert_eq!(trace.status, "ERROR");
 }
