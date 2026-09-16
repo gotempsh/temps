@@ -5897,26 +5897,29 @@ CMD ["cat", "/hello.txt"]
         );
     }
 
-    fn runtime_for_diagnosis(use_buildkit: bool) -> Option<DockerRuntime> {
-        let docker = Docker::connect_with_local_defaults().ok()?;
-        Some(
-            DockerRuntime::new(docker.into(), use_buildkit, "test-network".to_string())
-                .with_build_limits(
-                    2,
-                    Some(BuildResourceLimits {
-                        cpu_cores: 1.0,
-                        memory_mb: 512,
-                    }),
-                ),
+    /// A runtime whose client never connects (port 1 refuses), so the
+    /// diagnosis tests run on hosts without a daemon instead of skipping.
+    fn runtime_for_diagnosis(use_buildkit: bool) -> DockerRuntime {
+        let unreachable =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("client construction makes no connection");
+        DockerRuntime::new(
+            Arc::new(unreachable),
+            use_buildkit,
+            "test-network".to_string(),
+        )
+        .with_build_limits(
+            2,
+            Some(BuildResourceLimits {
+                cpu_cores: 1.0,
+                memory_mb: 512,
+            }),
         )
     }
 
     #[test]
     fn diagnose_out_of_memory_needs_a_kill_signal() {
-        let Some(rt) = runtime_for_diagnosis(true) else {
-            println!("Docker client unavailable, skipping");
-            return;
-        };
+        let rt = runtime_for_diagnosis(true);
         let cap = 512 * 1024 * 1024;
         // A plain failure with no OOM kill on the host is not a memory failure.
         // `u64::MAX` as the before-sample makes the delta zero whatever the
@@ -5942,10 +5945,7 @@ CMD ["cat", "/hello.txt"]
 
     #[test]
     fn diagnose_out_of_memory_from_the_sigkill_exit_status() {
-        let Some(rt) = runtime_for_diagnosis(true) else {
-            println!("Docker client unavailable, skipping");
-            return;
-        };
+        let rt = runtime_for_diagnosis(true);
         let killed = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
                       successfully: exit code: 137";
         let diagnosis = rt
@@ -5959,10 +5959,7 @@ CMD ["cat", "/hello.txt"]
 
     #[test]
     fn diagnose_out_of_memory_from_a_host_oom_kill_with_an_ordinary_exit_code() {
-        let Some(rt) = runtime_for_diagnosis(false) else {
-            println!("Docker client unavailable, skipping");
-            return;
-        };
+        let rt = runtime_for_diagnosis(false);
         // The reported shape: a child of the build tool was killed, the tool
         // itself exited 1, and the kernel's counter moved by one during the
         // build.
