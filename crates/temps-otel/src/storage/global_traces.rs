@@ -279,6 +279,11 @@ struct Sql {
     binds: Vec<Bind>,
 }
 
+/// Maximum number of Cloud traces whose lifetime spans one request may expand.
+/// The proxy separately caps rows read, memory, results, and execution time;
+/// this client-side gate makes the fan-out explicit before the historical join.
+const MAX_CLOUD_LIFETIME_CANDIDATES: u64 = 5_000;
+
 /// Build the indexed Postgres trace-summary query.
 ///
 /// The project-scoped trace list already maintains one row per trace in
@@ -402,6 +407,39 @@ fn build_cloud_lifetime_summaries(
         pick("kind")
     );
     Ok(Sql { body, binds })
+}
+
+fn build_cloud_lifetime_candidate_count(
+    q: &GlobalTraceQuery,
+    refs: &BTreeMap<i32, String>,
+) -> StorageResult<Sql> {
+    let mut binds = Vec::new();
+    let mut bind = |value: Bind| {
+        binds.push(value);
+        "?".to_string()
+    };
+    let membership = q
+        .scopes
+        .iter()
+        .map(|scope| {
+            let project_ref = refs
+                .get(&scope.project_id)
+                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+            Ok(format!(
+                "(project_ref = {} AND toUnixTimestamp64Milli(ts) >= {} AND toUnixTimestamp64Milli(ts) <= {})",
+                bind(Bind::Text(project_ref.clone())),
+                bind(Bind::Int(scope.from.timestamp_millis())),
+                bind(Bind::Int(scope.to.timestamp_millis()))
+            ))
+        })
+        .collect::<StorageResult<Vec<_>>>()?
+        .join(" OR ");
+    Ok(Sql {
+        body: format!(
+            "SELECT uniqExact(tuple(project_ref, trace_id)) FROM telemetry_spans WHERE {membership}"
+        ),
+        binds,
+    })
 }
 
 pub(crate) async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
@@ -660,8 +698,31 @@ pub async fn clickhouse(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
+    let cloud_lifetime_total = if let Some(refs) = refs.filter(|_| can_use_lifetime_summaries(q)) {
+        let count = build_cloud_lifetime_candidate_count(q, refs)?;
+        let total = temps_cloud_client::query::within_query_budget(
+            ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
+        )
+        .await
+        .map_err(|error| OtelError::Storage {
+            message: format!(
+                "Temps Cloud trace-candidate count exceeded its wall-clock budget: {error}"
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        })?
+        .map_err(storage)?;
+        if total > MAX_CLOUD_LIFETIME_CANDIDATES {
+            return Err(invalid(&format!(
+                "Cloud trace summary query matched {total} traces; the safe limit is \
+                 {MAX_CLOUD_LIFETIME_CANDIDATES}. Choose a shorter time range or fewer projects."
+            )));
+        }
+        Some(total)
+    } else {
+        None
+    };
     let empty = BTreeMap::new();
-    let sql = if let Some(refs) = refs.filter(|_| can_use_lifetime_summaries(q)) {
+    let sql = if let (Some(refs), Some(_)) = (refs, cloud_lifetime_total) {
         build_cloud_lifetime_summaries(q, refs)?
     } else {
         build(
@@ -674,6 +735,27 @@ pub async fn clickhouse(
             refs.unwrap_or(&empty),
         )?
     };
+    if let Some(total) = cloud_lifetime_total {
+        let page_sql = ordered(&sql, q);
+        let rows = temps_cloud_client::query::within_query_budget(
+            ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
+        )
+        .await
+        .map_err(|error| OtelError::Storage {
+            message: format!(
+                "Temps Cloud lifetime trace page exceeded its wall-clock budget: {error}"
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        })?
+        .map_err(storage)?
+        .into_iter()
+        .map(Ok)
+        .collect::<Vec<_>>();
+        return Ok(GlobalTraceStream {
+            total,
+            rows: Box::pin(futures::stream::iter(rows)),
+        });
+    }
     if refs.is_some() {
         let page_sql = cloud_ordered_with_total(&sql, q);
         let fetched = temps_cloud_client::query::within_query_budget(
@@ -963,6 +1045,12 @@ mod tests {
             })
             .collect();
         let refs = BTreeMap::from([(1, "project-a".into()), (2, "project-b".into())]);
+
+        let count = build_cloud_lifetime_candidate_count(&q, &refs).unwrap();
+        assert_eq!(count.binds.len(), 6);
+        assert!(count
+            .body
+            .starts_with("SELECT uniqExact(tuple(project_ref, trace_id))"));
 
         let sql = build_cloud_lifetime_summaries(&q, &refs).unwrap();
 

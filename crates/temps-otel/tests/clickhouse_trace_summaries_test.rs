@@ -942,7 +942,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     assert_eq!(trace.error_count, 1);
     assert_eq!(trace.status, "ERROR");
 
-    let mut past_end = lifetime;
+    let mut past_end = lifetime.clone();
     past_end.filter.offset = Some(100);
     past_end.source_offset = 100;
     let stream = global_traces::clickhouse(&h.probe, &past_end, Some(&refs))
@@ -951,4 +951,11 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &past_end).await.unwrap();
     assert!(page.data.is_empty());
     assert_eq!(page.total, 45);
+
+    h.probe.query("INSERT INTO telemetry_spans SELECT 'scope-a', concat('over-budget-', toString(number)), 'root', '', 'GET /bulk', 'api', 'production', 'SERVER', 'OK', fromUnixTimestamp64Milli(1700000000000-number), 1.0 FROM numbers(5001)").execute().await.unwrap();
+    let error = match global_traces::clickhouse(&h.probe, &lifetime, Some(&refs)).await {
+        Ok(_) => panic!("an over-budget lifetime expansion must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("safe limit is 5000"));
 }
