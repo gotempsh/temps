@@ -352,51 +352,36 @@ fn can_use_lifetime_summaries(q: &GlobalTraceQuery) -> bool {
         && q.filter.name_pattern.as_ref().is_none_or(String::is_empty)
 }
 
-/// Build ClickHouse summaries with window membership and lifetime values.
-///
-/// `refs` selects the Cloud schema; without it this targets the local
-/// ClickHouse schema. Both paths produce the same values as Postgres summaries.
-fn build_clickhouse_lifetime_summaries(
+/// Build Cloud summaries with window membership and lifetime values.
+fn build_cloud_lifetime_summaries(
     q: &GlobalTraceQuery,
-    refs: Option<&BTreeMap<i32, String>>,
+    refs: &BTreeMap<i32, String>,
 ) -> StorageResult<Sql> {
-    let cloud = refs.is_some();
     let mut binds = Vec::new();
     let mut bind = |value: Bind| {
         binds.push(value);
         "?".to_string()
     };
-    let mut mapping = Vec::new();
-    if let Some(refs) = refs {
-        for scope in &q.scopes {
-            let project_ref = refs
-                .get(&scope.project_id)
-                .ok_or_else(|| invalid("Missing Cloud project scope"))?;
-            mapping.push(format!(
-                "WHEN {} THEN {}",
-                bind(Bind::Text(project_ref.clone())),
-                scope.project_id
-            ));
-        }
+    let mut mapping = Vec::with_capacity(q.scopes.len());
+    for scope in &q.scopes {
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
+        mapping.push(format!(
+            "WHEN {} THEN {}",
+            bind(Bind::Text(project_ref.clone())),
+            scope.project_id
+        ));
     }
     let mut membership = Vec::with_capacity(q.scopes.len());
     for scope in &q.scopes {
-        let id = if let Some(refs) = refs {
-            Bind::Text(
-                refs.get(&scope.project_id)
-                    .ok_or_else(|| invalid("Missing Cloud project scope"))?
-                    .clone(),
-            )
-        } else {
-            Bind::Int(scope.project_id as i64)
-        };
+        let project_ref = refs
+            .get(&scope.project_id)
+            .ok_or_else(|| invalid("Missing Cloud project scope"))?;
         membership.push(format!(
-            "({} = {} AND toUnixTimestamp64Milli({}) >= {} AND toUnixTimestamp64Milli({}) <= {})",
-            if cloud { "project_ref" } else { "project_id" },
-            bind(id),
-            if cloud { "ts" } else { "start_time" },
+            "(project_ref = {} AND toUnixTimestamp64Milli(ts) >= {} AND toUnixTimestamp64Milli(ts) <= {})",
+            bind(Bind::Text(project_ref.clone())),
             bind(Bind::Int(scope.from.timestamp_millis())),
-            if cloud { "ts" } else { "start_time" },
             bind(Bind::Int(scope.to.timestamp_millis()))
         ));
     }
@@ -408,30 +393,9 @@ fn build_clickhouse_lifetime_summaries(
     let pick = |field: &str| {
         format!("argMax(raw.{field}, tuple(raw.parent_span_id = '', raw.duration, raw.span_id))")
     };
-    let key = if cloud { "project_ref" } else { "project_id" };
-    let table = if cloud { "telemetry_spans" } else { "spans" };
-    let project = if cloud {
-        format!(
-            "toInt32(CASE span.project_ref {} ELSE 0 END)",
-            mapping.join(" ")
-        )
-    } else {
-        "span.project_id".to_string()
-    };
-    let timestamp = if cloud { "span.ts" } else { "span.start_time" };
-    let environment = if cloud {
-        "span.environment"
-    } else {
-        "span.deployment_environment"
-    };
-    let kind = if cloud { "span.span_kind" } else { "span.kind" };
-    let deduplicate = if cloud {
-        ""
-    } else {
-        " ORDER BY span._version DESC LIMIT 1 BY project_id, trace_id, span_id"
-    };
     let body = format!(
-        "WITH candidates AS (SELECT {key}, trace_id FROM {table} WHERE {membership} GROUP BY {key}, trace_id), raw AS (SELECT {project} AS project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE({environment}, '') AS environment, {kind} AS kind, upper(span.status_code) AS status, toUnixTimestamp64Milli({timestamp}) AS start_ms, span.duration_ms AS duration FROM {table} AS span INNER JOIN candidates AS candidate ON candidate.{key} = span.{key} AND candidate.trace_id = span.trace_id{deduplicate}), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, '{{}}' AS attributes, '[]' AS events, '' AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
+        "WITH candidates AS (SELECT project_ref, trace_id FROM telemetry_spans WHERE {membership} GROUP BY project_ref, trace_id), raw AS (SELECT toInt32(CASE span.project_ref {} ELSE 0 END) AS project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE(span.environment, '') AS environment, span.span_kind AS kind, upper(span.status_code) AS status, toUnixTimestamp64Milli(span.ts) AS start_ms, span.duration_ms AS duration FROM telemetry_spans AS span INNER JOIN candidates AS candidate ON candidate.project_ref = span.project_ref AND candidate.trace_id = span.trace_id), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, '{{}}' AS attributes, '[]' AS events, '' AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
+        mapping.join(" "),
         pick("name"),
         pick("service_name"),
         pick("environment"),
@@ -440,38 +404,7 @@ fn build_clickhouse_lifetime_summaries(
     Ok(Sql { body, binds })
 }
 
-/// Raw-Postgres fallback used while the durable summary rebuild is pending.
-/// It is slower, but keeps the same lifetime-value contract during cutover.
-fn build_postgres_lifetime_summaries(q: &GlobalTraceQuery) -> Sql {
-    let mut binds = Vec::new();
-    let mut bind = |value: Bind| {
-        binds.push(value);
-        format!("${}", binds.len())
-    };
-    let membership = q
-        .scopes
-        .iter()
-        .map(|scope| {
-            format!(
-                "(project_id = {} AND start_time >= {}::timestamptz AND start_time <= {}::timestamptz)",
-                bind(Bind::Int(scope.project_id as i64)),
-                bind(Bind::Text(scope.from.to_rfc3339())),
-                bind(Bind::Text(scope.to.to_rfc3339()))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let pick = |field: &str| {
-        format!("(array_agg(raw.{field} ORDER BY (raw.parent_span_id = '') DESC, raw.duration DESC, raw.span_id))[1]")
-    };
-    let body = format!(
-        "WITH candidates AS (SELECT project_id, trace_id FROM otel_spans WHERE {membership} GROUP BY project_id, trace_id), raw AS (SELECT span.project_id, span.trace_id, span.span_id, COALESCE(span.parent_span_id, '') AS parent_span_id, span.name, span.service_name, COALESCE(span.deployment_environment, '') AS environment, span.kind, upper(span.status_code) AS status, FLOOR(EXTRACT(EPOCH FROM span.start_time) * 1000)::bigint AS start_ms, span.duration_ms AS duration FROM otel_spans AS span INNER JOIN candidates AS candidate ON candidate.project_id = span.project_id AND candidate.trace_id = span.trace_id), grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, {} AS name, {} AS service_name, {} AS environment, {} AS kind, CASE WHEN COUNT(*) FILTER (WHERE raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status, MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, COUNT(*)::bigint AS span_count, COUNT(*) FILTER (WHERE raw.status = 'ERROR')::bigint AS error_count, '{{}}'::text AS attributes, '[]'::text AS events, ''::text AS status_message FROM raw GROUP BY project_id, trace_id) SELECT * FROM grouped",
-        pick("name"), pick("service_name"), pick("environment"), pick("kind")
-    );
-    Sql { body, binds }
-}
-
-async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
+pub(crate) async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
     let state_exists = db
         .query_one(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -728,8 +661,8 @@ pub async fn clickhouse(
         return Ok(GlobalTraceStream::empty());
     }
     let empty = BTreeMap::new();
-    let sql = if can_use_lifetime_summaries(q) {
-        build_clickhouse_lifetime_summaries(q, refs)?
+    let sql = if let Some(refs) = refs.filter(|_| can_use_lifetime_summaries(q)) {
+        build_cloud_lifetime_summaries(q, refs)?
     } else {
         build(
             q,
@@ -813,13 +746,10 @@ pub async fn postgres(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
-    let use_lifetime_summaries = can_use_lifetime_summaries(q);
-    let sql = if use_lifetime_summaries {
-        if trace_summary_rebuild_pending(&db).await? {
-            build_postgres_lifetime_summaries(q)
-        } else {
-            build_postgres_summaries(q)?
-        }
+    let use_summaries =
+        can_use_lifetime_summaries(q) && !trace_summary_rebuild_pending(&db).await?;
+    let sql = if use_summaries {
+        build_postgres_summaries(q)?
     } else {
         build(q, Dialect::Postgres, &BTreeMap::new())?
     };
@@ -1034,7 +964,7 @@ mod tests {
             .collect();
         let refs = BTreeMap::from([(1, "project-a".into()), (2, "project-b".into())]);
 
-        let sql = build_clickhouse_lifetime_summaries(&q, Some(&refs)).unwrap();
+        let sql = build_cloud_lifetime_summaries(&q, &refs).unwrap();
 
         assert_eq!(sql.binds.len(), 8);
         assert_eq!(sql.body.matches('?').count(), 8);
@@ -1057,36 +987,6 @@ mod tests {
         let page = cloud_ordered_with_total(&sql, &q);
         assert!(page.contains("count() OVER () AS total"));
         assert!(page.ends_with("LIMIT 820 OFFSET 0"));
-    }
-
-    #[test]
-    fn local_clickhouse_and_postgres_fallbacks_keep_lifetime_values() {
-        let mut q = query();
-        q.source_offset = 0;
-        q.scopes = vec![TraceReadScope {
-            project_id: 7,
-            from: DateTime::from_timestamp_millis(1000).unwrap(),
-            to: DateTime::from_timestamp_millis(2000).unwrap(),
-            cloud: false,
-            window_clamped_at: None,
-        }];
-
-        let clickhouse = build_clickhouse_lifetime_summaries(&q, None).unwrap();
-        assert_eq!(clickhouse.binds.len(), 3);
-        assert!(clickhouse
-            .body
-            .contains("candidates AS (SELECT project_id, trace_id FROM spans"));
-        assert!(clickhouse
-            .body
-            .contains("ORDER BY span._version DESC LIMIT 1 BY project_id, trace_id, span_id"));
-
-        let postgres = build_postgres_lifetime_summaries(&q);
-        assert_eq!(postgres.binds.len(), 3);
-        assert!(postgres
-            .body
-            .contains("candidates AS (SELECT project_id, trace_id FROM otel_spans"));
-        assert!(postgres.body.contains("MIN(raw.start_ms) AS start_ms"));
-        assert!(postgres.body.contains("MAX(raw.duration) AS duration"));
     }
 
     #[test]

@@ -283,6 +283,10 @@ impl OtelStorage for CloudRoutedOtelStorage {
         &self,
         mut query: super::global_traces::GlobalTraceQuery,
     ) -> StorageResult<super::global_traces::GlobalTracePage> {
+        if query.use_preaggregated_summaries && query.scopes.iter().any(|scope| !scope.cloud) {
+            let local_ready = self.local.global_lifetime_summaries_ready().await?;
+            align_global_trace_semantics(&mut query, local_ready);
+        }
         let (local, cloud) = split_global_trace_query(&mut query);
         let local_read = async {
             if local.scopes.is_empty() {
@@ -741,6 +745,13 @@ impl OtelStorage for CloudRoutedOtelStorage {
     }
 }
 
+fn align_global_trace_semantics(
+    query: &mut super::global_traces::GlobalTraceQuery,
+    local_lifetime_summaries_ready: bool,
+) {
+    query.use_preaggregated_summaries &= local_lifetime_summaries_ready;
+}
+
 fn split_global_trace_query(
     query: &mut super::global_traces::GlobalTraceQuery,
 ) -> (
@@ -874,6 +885,17 @@ mod tests {
         assert!(local.use_preaggregated_summaries);
         assert_eq!(local.scopes.len(), 1);
         assert_eq!(cloud.scopes.len(), 1);
+    }
+
+    #[test]
+    fn mixed_global_reads_use_window_semantics_when_local_summaries_are_unavailable() {
+        let mut query = global_query(&[false, true]);
+
+        align_global_trace_semantics(&mut query, false);
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert!(!local.use_preaggregated_summaries);
+        assert!(!cloud.use_preaggregated_summaries);
     }
 
     #[async_trait]

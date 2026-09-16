@@ -869,6 +869,10 @@ struct P95Row {
 
 #[async_trait]
 impl OtelStorage for TimescaleDbStorage {
+    async fn global_lifetime_summaries_ready(&self) -> StorageResult<bool> {
+        Ok(!super::global_traces::trace_summary_rebuild_pending(&self.db).await?)
+    }
+
     async fn global_trace_stream(
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,

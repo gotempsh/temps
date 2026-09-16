@@ -838,7 +838,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
             })
             .collect(),
         summaries: true,
-        use_preaggregated_summaries: true,
+        use_preaggregated_summaries: false,
         source_offset: 0,
     };
     let page = h.storage.global_trace_page(q.clone()).await.unwrap();
