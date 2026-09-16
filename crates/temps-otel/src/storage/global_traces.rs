@@ -769,10 +769,12 @@ pub async fn clickhouse(
         return Ok(GlobalTraceStream::empty());
     }
     let candidate_total = if can_use_lifetime_summaries(q) {
-        let total = if let Some(total) = q.lifetime_candidate_total {
-            total
-        } else if let Some(refs) = refs {
-            cloud_lifetime_candidate_count(client, q, refs).await?
+        let total = if let Some(refs) = refs {
+            if let Some(total) = q.lifetime_candidate_total {
+                total
+            } else {
+                cloud_lifetime_candidate_count(client, q, refs).await?
+            }
         } else {
             let count = build_clickhouse_lifetime_candidate_count(q, None)?;
             tokio::time::timeout(
