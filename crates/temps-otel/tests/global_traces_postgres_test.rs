@@ -151,10 +151,17 @@ async fn global_postgres_pagination_and_raw_spans_use_the_same_authorized_scope(
     all.filter.offset = Some(0);
     all.filter.limit = Some(100);
     let all_page = storage.global_trace_page(all).await.unwrap();
-    assert!(all_page
+    let overlapping = all_page
         .data
         .iter()
-        .any(|trace| trace.trace_id == "overlapping-trace"));
+        .find(|trace| trace.trace_id == "overlapping-trace")
+        .expect("overlapping trace is present");
+    assert_eq!(overlapping.name, "summary:root before window");
+    assert_eq!(
+        overlapping.start_ms,
+        (now - Duration::hours(2)).timestamp_millis()
+    );
+    assert_eq!(overlapping.span_count, 2);
     assert!(all_page
         .data
         .iter()

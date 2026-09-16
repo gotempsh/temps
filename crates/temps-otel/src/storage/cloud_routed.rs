@@ -753,7 +753,6 @@ fn split_global_trace_query(
     }
     let mut local = query.clone();
     local.scopes.retain(|scope| !scope.cloud);
-    local.use_preaggregated_summaries &= local_only;
     let mut cloud = query.clone();
     cloud.scopes.retain(|scope| scope.cloud);
     (local, cloud)
@@ -866,13 +865,13 @@ mod tests {
     }
 
     #[test]
-    fn mixed_global_reads_use_matching_raw_semantics_for_both_sources() {
+    fn mixed_global_reads_keep_local_preaggregated_semantics() {
         let mut query = global_query(&[false, true]);
 
         let (local, cloud) = split_global_trace_query(&mut query);
 
         assert_eq!(query.source_offset, 0);
-        assert!(!local.use_preaggregated_summaries);
+        assert!(local.use_preaggregated_summaries);
         assert_eq!(local.scopes.len(), 1);
         assert_eq!(cloud.scopes.len(), 1);
     }

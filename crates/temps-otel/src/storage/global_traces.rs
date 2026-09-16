@@ -32,8 +32,9 @@ pub struct GlobalTraceQuery {
     pub scopes: Vec<TraceReadScope>,
     pub summaries: bool,
     /// Use the local Postgres one-row-per-trace table when semantics allow it.
-    /// Mixed local/Cloud reads disable this so both merge inputs use identical
-    /// windowed-span aggregation semantics.
+    /// This remains enabled for the local half of a mixed local/Cloud read so
+    /// adding an unrelated Cloud project cannot change a local trace's
+    /// lifetime aggregates or its position in global pagination.
     pub use_preaggregated_summaries: bool,
     pub source_offset: u64,
 }
