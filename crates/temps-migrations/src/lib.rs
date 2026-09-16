@@ -14,4 +14,8 @@ mod migration;
 // Re-export removed
 pub use migration::m20260805_000001_index_normalized_managed_domains::Migration as NormalizedManagedDomainIndexMigration;
 pub use migration::m20260806_000001_sandbox_workspace_lifecycle::Migration as SandboxWorkspaceLifecycleMigration;
+pub use migration::m20260916_000001_reconcile_otel_trace_summaries::Migration as ReconcileOtelTraceSummariesMigration;
+pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
+    trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
+};
 pub use migration::Migrator;

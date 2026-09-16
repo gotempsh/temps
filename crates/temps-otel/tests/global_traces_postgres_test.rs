@@ -67,7 +67,7 @@ async fn global_postgres_pagination_and_raw_spans_use_the_same_authorized_scope(
     ))
     .await
     .unwrap();
-    let storage = TimescaleDbStorage::new(db, None);
+    let storage = TimescaleDbStorage::new(db.clone(), None);
     let q = GlobalTraceQuery {
         filter: TraceQuery {
             limit: Some(20),
@@ -93,6 +93,18 @@ async fn global_postgres_pagination_and_raw_spans_use_the_same_authorized_scope(
     assert_eq!(page.data.len(), 20);
     assert_eq!(page.data[0].trace_id, "trace-020");
     assert_eq!(page.data[0].name, "summary:GET /items");
+    db.execute_unprepared(
+        "CREATE TABLE otel_trace_summary_rebuild_state (completed boolean NOT NULL); \
+         INSERT INTO otel_trace_summary_rebuild_state VALUES (FALSE)",
+    )
+    .await
+    .unwrap();
+    let page = storage.global_trace_page(q.clone()).await.unwrap();
+    assert_eq!(page.total, 45);
+    assert_eq!(page.data[0].name, "GET /items");
+    db.execute_unprepared("DROP TABLE otel_trace_summary_rebuild_state")
+        .await
+        .unwrap();
     let mut scoped = q.clone();
     scoped.scopes.retain(|s| s.project_id == 2);
     scoped.filter.offset = Some(0);

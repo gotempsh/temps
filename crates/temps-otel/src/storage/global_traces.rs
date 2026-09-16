@@ -285,6 +285,31 @@ fn postgres_can_use_summaries(q: &GlobalTraceQuery) -> bool {
             .is_none_or(std::collections::BTreeMap::is_empty)
         && q.filter.name_pattern.as_ref().is_none_or(String::is_empty)
 }
+
+async fn trace_summary_rebuild_pending(db: &DatabaseConnection) -> StorageResult<bool> {
+    let state_exists = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('otel_trace_summary_rebuild_state') IS NOT NULL AS present"
+                .to_string(),
+        ))
+        .await?
+        .and_then(|row| row.try_get::<bool>("", "present").ok())
+        .unwrap_or(false);
+    if !state_exists {
+        return Ok(false);
+    }
+    Ok(db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+             WHERE NOT completed) AS pending"
+                .to_string(),
+        ))
+        .await?
+        .and_then(|row| row.try_get::<bool>("", "pending").ok())
+        .unwrap_or(false))
+}
 fn build(
     q: &GlobalTraceQuery,
     dialect: Dialect,
@@ -535,7 +560,9 @@ pub async fn postgres(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
-    let sql = if postgres_can_use_summaries(q) {
+    let use_summaries =
+        postgres_can_use_summaries(q) && !trace_summary_rebuild_pending(&db).await?;
+    let sql = if use_summaries {
         build_postgres_summaries(q)?
     } else {
         build(q, Dialect::Postgres, &BTreeMap::new())?

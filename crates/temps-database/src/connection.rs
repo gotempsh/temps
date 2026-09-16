@@ -4,6 +4,7 @@
 //! Database connection management
 
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use sqlx::Acquire;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{ServiceError, ServiceResult};
@@ -810,14 +811,15 @@ where
     Ok(())
 }
 
-/// Run post-migration backfill for continuous aggregates.
+/// Run post-migration reconciliation and continuous-aggregate backfills.
 ///
-/// `CALL refresh_continuous_aggregate()` cannot run inside a transaction block,
-/// but Sea-ORM migrations run inside transactions. This function runs the backfill
-/// after the migration transaction has been committed.
+/// Long trace-summary reconciliation and `CALL refresh_continuous_aggregate()`
+/// cannot safely run inside SeaORM's migration transaction. This function runs
+/// that work after the migration transaction has committed.
 ///
-/// This is idempotent — refreshing an already-populated aggregate is a no-op for
-/// unchanged data, so it's safe to call on every startup.
+/// This is idempotent and safe to call on every startup. Trace reconciliation
+/// uses durable pending state and an atomic shadow-table cutover; refreshing an
+/// already-populated aggregate is a no-op for unchanged data.
 ///
 /// Run this on a long-lived runtime (e.g. via `tokio::spawn`) so it never blocks
 /// startup; it is decoupled from `establish_connection` for exactly that reason.
@@ -841,6 +843,8 @@ pub async fn run_post_migration_backfill_streaming<F>(
 where
     F: Fn(MaintenanceProgress<'_>),
 {
+    reconcile_otel_trace_summaries(db).await?;
+
     // Report the backend that will run the refresh calls, so an interrupt can
     // cancel THIS one. The migrate pool is capped at a single connection, so the
     // PID read here is the PID every `refresh_continuous_aggregate()` below runs
@@ -989,6 +993,159 @@ where
         }
     }
 
+    Ok(())
+}
+
+pub async fn reconcile_otel_trace_summaries(db: &DatabaseConnection) -> ServiceResult<()> {
+    let pending = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT CASE WHEN to_regclass('otel_trace_summary_rebuild_state') IS NULL \
+                 THEN FALSE ELSE EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+                 WHERE NOT completed) END AS pending"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to inspect trace-summary rebuild state: {error}"
+            ))
+        })?
+        .and_then(|row| row.try_get::<bool>("", "pending").ok())
+        .unwrap_or(false);
+    if !pending {
+        return Ok(());
+    }
+
+    // A named shadow table is shared by every process using this database.
+    // Serialize the complete rebuild on one disposable session, then re-check
+    // state after acquiring the lock in case another replica just finished it.
+    let pool = db.get_postgres_connection_pool();
+    let mut connection = pool.acquire().await.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to acquire trace-summary reconciliation connection: {error}"
+        ))
+    })?;
+    connection.close_on_drop();
+    sqlx::query("SELECT pg_advisory_lock(hashtext('temps:otel_trace_summary_rebuild')::BIGINT)")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to lock trace-summary reconciliation: {error}"
+            ))
+        })?;
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state WHERE NOT completed)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to re-check trace-summary rebuild state: {error}"
+        ))
+    })?;
+    if !pending {
+        return Ok(());
+    }
+
+    // Take the watermark while inserts are briefly stopped. This makes the ID
+    // boundary commit-safe: every transaction that allocated/inserts an older
+    // ID has finished before MAX(id) is observed.
+    let mut watermark_tx = connection.begin().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to begin trace-summary watermark: {error}"))
+    })?;
+    sqlx::query("LOCK TABLE otel_spans IN SHARE MODE")
+        .execute(&mut *watermark_tx)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to lock spans for summary watermark: {error}"
+            ))
+        })?;
+    sqlx::query(
+        "UPDATE otel_trace_summary_rebuild_state \
+             SET watermark = (SELECT COALESCE(MAX(id), 0) FROM otel_spans), updated_at = now() \
+             WHERE NOT completed",
+    )
+    .execute(&mut *watermark_tx)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!("Failed to record trace-summary watermark: {error}"))
+    })?;
+    watermark_tx.commit().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to commit trace-summary watermark: {error}"))
+    })?;
+
+    sqlx::query("DROP TABLE IF EXISTS otel_trace_summaries_rebuild CASCADE")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to remove stale trace-summary shadow table: {error}"
+            ))
+        })?;
+    sqlx::query(
+        "CREATE TABLE otel_trace_summaries_rebuild \
+             (LIKE otel_trace_summaries INCLUDING ALL)",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to create trace-summary shadow table: {error}"
+        ))
+    })?;
+    let initial_rebuild_sql = temps_migrations::trace_summary_rebuild_initial_sql();
+    sqlx::query(&initial_rebuild_sql)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to populate trace-summary shadow table: {error}"
+            ))
+        })?;
+
+    let mut cutover = connection.begin().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to begin trace-summary cutover: {error}"))
+    })?;
+    sqlx::query("LOCK TABLE otel_spans IN SHARE MODE")
+        .execute(&mut *cutover)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!("Failed to lock spans for summary cutover: {error}"))
+        })?;
+    let delta_rebuild_sql = temps_migrations::trace_summary_rebuild_delta_sql();
+    sqlx::query(&delta_rebuild_sql)
+        .execute(&mut *cutover)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to apply trace-summary rebuild delta: {error}"
+            ))
+        })?;
+    for statement in [
+        "LOCK TABLE otel_trace_summaries IN ACCESS EXCLUSIVE MODE",
+        "ALTER TABLE otel_trace_summaries RENAME TO otel_trace_summaries_old",
+        "ALTER TABLE otel_trace_summaries_rebuild RENAME TO otel_trace_summaries",
+        "DROP TABLE otel_trace_summaries_old CASCADE",
+        "UPDATE otel_trace_summary_rebuild_state \
+         SET completed = TRUE, updated_at = now() WHERE NOT completed",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *cutover)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to swap rebuilt trace summaries while executing '{statement}': {error}"
+                ))
+            })?;
+    }
+    cutover.commit().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to commit rebuilt trace summaries: {error}"))
+    })?;
+
+    debug!("OTel trace-summary reconciliation complete");
     Ok(())
 }
 
