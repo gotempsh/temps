@@ -838,7 +838,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
             })
             .collect(),
         summaries: true,
-        use_preaggregated_summaries: false,
+        use_preaggregated_summaries: true,
         source_offset: 0,
     };
     let page = h.storage.global_trace_page(q.clone()).await.unwrap();
@@ -957,5 +957,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
         Ok(_) => panic!("an over-budget lifetime expansion must be rejected"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("safe limit is 5000"));
+    assert!(error
+        .to_string()
+        .contains("safe lifetime-expansion limit is 5000"));
 }
