@@ -2509,7 +2509,11 @@ export type BuildConfiguration = {
 export type BuildLimitsSettings = {
     /**
      * CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
-     * a core). 0 means "use the legacy 50%-of-host default".
+     * a core). 0 means "use the legacy 50%-of-host default". Applied only
+     * by Docker's legacy builder: BuildKit, the default since Docker 18.09,
+     * ignores the CPU and memory options of the image build API, so on
+     * BuildKit hosts this has no effect. Read once at startup; a change
+     * takes effect after `temps serve` restarts.
      */
     cpu_limit_cores?: number;
     /**
@@ -2519,8 +2523,10 @@ export type BuildLimitsSettings = {
     max_concurrent?: number;
     /**
      * Memory allowed per build, in megabytes. 0 means "use the legacy
-     * 50%-of-host default". Docker enforces this as a hard cap — builds
-     * that exceed it OOM-kill.
+     * 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
+     * by the legacy builder, ignored by BuildKit, read once at startup.
+     * Values above 2047 MB are reduced to 2047 MB, the most the build API
+     * accepts through the client, with a warning in the server log.
      */
     memory_limit_mb?: number;
 };

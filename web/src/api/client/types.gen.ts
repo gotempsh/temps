@@ -2509,7 +2509,11 @@ export type BuildConfiguration = {
 export type BuildLimitsSettings = {
     /**
      * CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
-     * a core). 0 means "use the legacy 50%-of-host default".
+     * a core). 0 means "use the legacy 50%-of-host default". Applied only
+     * by Docker's legacy builder: BuildKit, the default since Docker 18.09,
+     * ignores the CPU and memory options of the image build API, so on
+     * BuildKit hosts this has no effect. Read once at startup; a change
+     * takes effect after `temps serve` restarts.
      */
     cpu_limit_cores?: number;
     /**
@@ -2519,8 +2523,10 @@ export type BuildLimitsSettings = {
     max_concurrent?: number;
     /**
      * Memory allowed per build, in megabytes. 0 means "use the legacy
-     * 50%-of-host default". Docker enforces this as a hard cap — builds
-     * that exceed it OOM-kill.
+     * 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
+     * by the legacy builder, ignored by BuildKit, read once at startup.
+     * Values above 2047 MB are reduced to 2047 MB, the most the build API
+     * accepts through the client, with a warning in the server log.
      */
     memory_limit_mb?: number;
 };
@@ -6125,6 +6131,15 @@ export type DeployFromImageUploadQuery = {
      * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
+    /**
+     * Client-generated UUID identifying this upload attempt. When a
+     * deployment already exists for this project, environment, and ID, that
+     * deployment is returned as-is instead of importing and deploying the
+     * image again — this makes a client retry after a lost response safe.
+     * Callers that omit it get no such protection (each call always creates
+     * a new deployment), so the CLI always sends one.
+     */
+    upload_request_id?: string | null;
 };
 
 export type DeployFromStaticRequest = {
@@ -51106,6 +51121,15 @@ export type DeployFromImageUploadData = {
          * Must start with '/'. When omitted, defaults to "/".
          */
         health_check_path?: string | null;
+        /**
+         * Client-generated UUID identifying this upload attempt. When a
+         * deployment already exists for this project, environment, and ID, that
+         * deployment is returned as-is instead of importing and deploying the
+         * image again — this makes a client retry after a lost response safe.
+         * Callers that omit it get no such protection (each call always creates
+         * a new deployment), so the CLI always sends one.
+         */
+        upload_request_id?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
@@ -51145,6 +51169,54 @@ export type DeployFromImageUploadResponses = {
 };
 
 export type DeployFromImageUploadResponse = DeployFromImageUploadResponses[keyof DeployFromImageUploadResponses];
+
+export type GetDeploymentByUploadRequestIdData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * The upload_request_id sent with the original upload request
+         */
+        upload_request_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}';
+};
+
+export type GetDeploymentByUploadRequestIdErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No deployment found yet for this upload attempt
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentByUploadRequestIdResponses = {
+    /**
+     * Deployment produced by this upload attempt
+     */
+    200: RemoteDeploymentResponse;
+};
+
+export type GetDeploymentByUploadRequestIdResponse = GetDeploymentByUploadRequestIdResponses[keyof GetDeploymentByUploadRequestIdResponses];
 
 export type DeployFromUploadedSourceData = {
     body: SourceArchiveUpload;
