@@ -1554,7 +1554,7 @@ fn credential_verification_failure(
                 StatusCode::GATEWAY_TIMEOUT, "Verification sandbox startup timed out", "Temps could not validate this credential before the isolated sandbox startup deadline. Check sandbox runtime capacity and retry; the credential has not been classified as invalid.",
             ),
             (temps_ai::CredentialVerificationStage::RelayUnavailable, _) => (
-                StatusCode::SERVICE_UNAVAILABLE, "Verification relay unavailable", "Temps could not validate this credential because the model relay or upstream provider was unavailable. Check relay connectivity and provider status, then retry; the credential has not been classified as invalid.",
+                StatusCode::SERVICE_UNAVAILABLE, "Verification relay unavailable", "Temps could not validate this credential because the model relay or upstream provider was unavailable. Open Settings → Overview and verify that the internal URL (TEMPS_INTERNAL_API_URL) is reachable from Docker, then check the upstream provider status and retry; the credential has not been classified as invalid.",
             ),
             (temps_ai::CredentialVerificationStage::CapabilityStaging, _) => (
                 StatusCode::SERVICE_UNAVAILABLE, "Verification setup failed", "Temps could not validate this credential because the temporary relay capability could not be staged in the sandbox. Check sandbox file access and retry; the credential has not been classified as invalid.",
@@ -2051,6 +2051,10 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("UTF-8 problem body");
         assert!(body.contains("Verification relay unavailable"));
         assert!(body.contains("could not validate this credential"));
+        assert!(body.contains("Settings"));
+        assert!(body.contains("TEMPS_INTERNAL_API_URL"));
+        assert!(body.contains("reachable from Docker"));
+        assert!(body.contains("upstream provider status"));
         assert!(body.contains("has not been classified as invalid"));
         assert!(!body.contains("candidate-secret-must-never-leak"));
     }
