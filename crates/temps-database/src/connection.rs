@@ -1096,6 +1096,25 @@ pub async fn reconcile_otel_trace_summaries(db: &DatabaseConnection) -> ServiceR
             "Failed to create trace-summary shadow table: {error}"
         ))
     })?;
+    // Build indexes on the offline shadow table. Creating them on the live
+    // summary table inside the schema migration would retain a write-blocking
+    // table lock for the full index scan and, because span + summary writes
+    // are atomic, would stall ingestion on large upgrades.
+    for statement in [
+        "CREATE INDEX otel_trace_summaries_rebuild_project_last_span_start \
+         ON otel_trace_summaries_rebuild (project_id, last_span_start_time DESC)",
+        "CREATE INDEX otel_trace_summaries_rebuild_last_span_start \
+         ON otel_trace_summaries_rebuild (last_span_start_time)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to index trace-summary shadow table while executing '{statement}': {error}"
+                ))
+            })?;
+    }
     let initial_rebuild_sql = temps_migrations::trace_summary_rebuild_initial_sql();
     sqlx::query(&initial_rebuild_sql)
         .execute(&mut *connection)

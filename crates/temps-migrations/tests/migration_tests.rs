@@ -5252,7 +5252,10 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
     let cross = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT identity_span_id, root_span_name, span_count, error_count, has_root \
+            "SELECT identity_span_id, root_span_name, \
+                    last_span_start_time = TIMESTAMPTZ '2026-09-15 00:00:01+00' \
+                        AS last_span_start_matches, \
+                    span_count, error_count, has_root \
              FROM otel_trace_summaries WHERE project_id = 77 AND trace_id = 'cross-day'"
                 .to_string(),
         ))
@@ -5260,6 +5263,7 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
         .expect("cross-day summary exists");
     assert_eq!(cross.try_get::<String>("", "identity_span_id")?, "root");
     assert_eq!(cross.try_get::<String>("", "root_span_name")?, "POST /jobs");
+    assert!(cross.try_get::<bool>("", "last_span_start_matches")?);
     assert_eq!(cross.try_get::<i64>("", "span_count")?, 2);
     assert_eq!(cross.try_get::<i64>("", "error_count")?, 1);
     assert!(cross.try_get::<bool>("", "has_root")?);
@@ -5281,6 +5285,7 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
 
     db.execute_unprepared(
         "ALTER TABLE otel_trace_summaries DROP COLUMN identity_span_id; \
+         ALTER TABLE otel_trace_summaries DROP COLUMN last_span_start_time; \
          DELETE FROM otel_trace_summaries WHERE trace_id = 'rootless'; \
          UPDATE otel_trace_summaries SET span_count = 99, error_count = 99, \
              root_span_name = 'stale' WHERE trace_id = 'cross-day'",

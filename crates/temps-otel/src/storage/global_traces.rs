@@ -238,17 +238,27 @@ fn build_postgres_summaries(q: &GlobalTraceQuery) -> StorageResult<Sql> {
         binds.push(value);
         format!("${}", binds.len())
     };
-    let scope = q
+    let scopes = q
         .scopes
         .iter()
         .map(|scope| {
             let project_id = bind(Bind::Int(scope.project_id as i64));
             let from = bind(Bind::Text(scope.from.to_rfc3339()));
             let to = bind(Bind::Text(scope.to.to_rfc3339()));
-            format!(
-                "(ts.project_id = {project_id} AND ts.start_time >= {from}::timestamptz AND ts.start_time <= {to}::timestamptz)"
+            (
+                format!("(ts.project_id = {project_id} AND ts.last_span_start_time >= {from}::timestamptz AND ts.start_time <= {to}::timestamptz)"),
+                format!("(window_span.project_id = {project_id} AND window_span.start_time >= {from}::timestamptz AND window_span.start_time <= {to}::timestamptz)"),
             )
         })
+        .collect::<Vec<_>>();
+    let summary_scope = scopes
+        .iter()
+        .map(|(summary, _)| summary.as_str())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let span_scope = scopes
+        .iter()
+        .map(|(_, span)| span.as_str())
         .collect::<Vec<_>>()
         .join(" OR ");
 
@@ -259,8 +269,7 @@ fn build_postgres_summaries(q: &GlobalTraceQuery) -> StorageResult<Sql> {
     let status = "CASE WHEN ts.error_count > 0 THEN 'ERROR' ELSE 'OK' END";
     Ok(Sql {
         body: format!(
-            "SELECT ts.project_id, ts.trace_id, ''::text AS span_id, ''::text AS parent_span_id, ts.root_span_name AS name, ts.service_name, COALESCE(ts.deployment_environment, '') AS environment, ts.kind, {status} AS status, FLOOR(EXTRACT(EPOCH FROM ts.start_time) * 1000)::bigint AS start_ms, ts.duration_ms AS duration, ts.span_count, ts.error_count, '{{}}'::text AS attributes, '[]'::text AS events, ''::text AS status_message FROM otel_trace_summaries ts WHERE {}",
-            scope
+            "SELECT ts.project_id, ts.trace_id, ''::text AS span_id, ''::text AS parent_span_id, ts.root_span_name AS name, ts.service_name, COALESCE(ts.deployment_environment, '') AS environment, ts.kind, {status} AS status, FLOOR(EXTRACT(EPOCH FROM ts.start_time) * 1000)::bigint AS start_ms, ts.duration_ms AS duration, ts.span_count, ts.error_count, '{{}}'::text AS attributes, '[]'::text AS events, ''::text AS status_message FROM otel_trace_summaries ts WHERE ({summary_scope}) AND (ts.project_id, ts.trace_id) IN (SELECT window_span.project_id, window_span.trace_id FROM otel_spans window_span WHERE {span_scope} GROUP BY window_span.project_id, window_span.trace_id)"
         ),
         binds,
     })
@@ -746,12 +755,21 @@ mod tests {
 
         assert_eq!(sql.binds.len(), 315);
         assert!(sql.body.contains("FROM otel_trace_summaries ts"));
-        assert!(!sql.body.contains("GROUP BY"));
+        assert_eq!(sql.body.matches("GROUP BY").count(), 1);
         assert!(!sql.body.contains("FROM otel_spans span GROUP BY"));
-        assert!(sql.body.contains("ts.start_time >= $2::timestamptz"));
+        assert!(sql
+            .body
+            .contains("ts.last_span_start_time >= $2::timestamptz"));
+        assert!(sql.body.contains("ts.start_time <= $3::timestamptz"));
+        assert!(sql.body.contains("IN (SELECT window_span.project_id"));
+        assert!(sql
+            .body
+            .contains("window_span.start_time >= $2::timestamptz"));
+        assert!(sql
+            .body
+            .contains("window_span.start_time <= $3::timestamptz"));
         assert!(ordered(&sql, &q).contains("ORDER BY start_ms ASC"));
         assert!(ordered(&sql, &q).ends_with("LIMIT 20 OFFSET 800"));
-        assert!(!sql.body.contains("FROM otel_spans"));
     }
 
     #[test]

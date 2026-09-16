@@ -604,7 +604,7 @@ impl TimescaleDbStorage {
         let mut sql = String::from(
             "INSERT INTO otel_trace_summaries (
                 project_id, trace_id, identity_span_id, root_span_name, service_name, kind,
-                deployment_environment, deployment_id, start_time, duration_ms,
+                deployment_environment, deployment_id, start_time, last_span_start_time, duration_ms,
                 span_count, error_count, has_root, last_seen
             ) VALUES ",
         );
@@ -615,9 +615,9 @@ impl TimescaleDbStorage {
             if i > 0 {
                 sql.push_str(", ");
             }
-            // 13 bound params per row; last_seen uses now() in SQL.
+            // 14 bound params per row; last_seen uses now() in SQL.
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now())",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now())",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -631,8 +631,9 @@ impl TimescaleDbStorage {
                 param_idx + 10,
                 param_idx + 11,
                 param_idx + 12,
+                param_idx + 13,
             ));
-            param_idx += 13;
+            param_idx += 14;
 
             values.extend_from_slice(&[
                 d.project_id.into(),
@@ -650,6 +651,7 @@ impl TimescaleDbStorage {
                 d.root_env.clone().into(),
                 d.root_deployment_id.into(),
                 d.start_time.into(),
+                d.last_span_start_time.into(),
                 d.max_duration_ms.into(),
                 d.span_count.into(),
                 d.error_count.into(),
@@ -662,6 +664,7 @@ impl TimescaleDbStorage {
                 span_count  = otel_trace_summaries.span_count + EXCLUDED.span_count,
                 error_count = otel_trace_summaries.error_count + EXCLUDED.error_count,
                 start_time  = LEAST(otel_trace_summaries.start_time, EXCLUDED.start_time),
+                last_span_start_time = GREATEST(otel_trace_summaries.last_span_start_time, EXCLUDED.last_span_start_time),
                 duration_ms = GREATEST(otel_trace_summaries.duration_ms, EXCLUDED.duration_ms),
                 last_seen   = now(),
                 -- Identity: a root always replaces a fallback. Until a root
@@ -3054,14 +3057,14 @@ impl OtelStorage for TimescaleDbStorage {
         // hypertable, so no native retention policy covers it. A summary row
         // can't outlive the spans it derives from, which `otel_spans` expires
         // at 90 days, so we sweep summaries on the same window here. This is a
-        // plain indexed DELETE on `start_time` (idx_otel_trace_summaries_start)
+        // plain indexed DELETE on `last_span_start_time`
         // and does not race any Timescale `drop_chunks` worker, since the
         // summary table has no chunks.
         let deleted = self
             .db
             .execute(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "DELETE FROM otel_trace_summaries WHERE start_time < now() - INTERVAL '90 days'"
+                "DELETE FROM otel_trace_summaries WHERE last_span_start_time < now() - INTERVAL '90 days'"
                     .to_string(),
             ))
             .await
@@ -3584,7 +3587,7 @@ impl TimescaleDbStorage {
     /// list/count queries. Returns `(where_sql, values, next_param_idx)`.
     ///
     /// All filters map to indexed `ts` columns:
-    /// - time window → `ts.start_time` (the trace's earliest span)
+    /// - time window → an indexed existence check for a span in the window
     /// - `status` → `ts.error_count > 0` / `= 0` (partial index for errors)
     /// - `min_duration_ms` → `ts.duration_ms` (the trace's longest span)
     /// - `environment_id` → `ts.deployment_id IN (SELECT … environment_id = ?)`
@@ -3610,15 +3613,29 @@ impl TimescaleDbStorage {
             values.push(min_dur.into());
             param_idx += 1;
         }
+        let mut time_clauses = Vec::new();
+        let has_start = query.start_time.is_some();
+        let has_end = query.end_time.is_some();
         if let Some(start) = query.start_time {
-            where_clauses.push(format!("ts.start_time >= ${param_idx}"));
+            where_clauses.push(format!("ts.last_span_start_time >= ${param_idx}"));
+            time_clauses.push(format!("window_span.start_time >= ${param_idx}"));
             values.push(start.into());
             param_idx += 1;
         }
         if let Some(end) = query.end_time {
             where_clauses.push(format!("ts.start_time <= ${param_idx}"));
+            time_clauses.push(format!("window_span.start_time <= ${param_idx}"));
             values.push(end.into());
             param_idx += 1;
+        }
+        // A single bound is represented exactly by the summary MIN/MAX. With
+        // both bounds, reject traces whose spans only straddle the window by
+        // building one time-pruned candidate trace set from raw spans.
+        if has_start && has_end {
+            where_clauses.push(format!(
+                "ts.trace_id IN (SELECT window_span.trace_id FROM otel_spans window_span WHERE window_span.project_id = $1 AND {} GROUP BY window_span.trace_id)",
+                time_clauses.join(" AND ")
+            ));
         }
         if let Some(deployment_id) = query.deployment_id {
             where_clauses.push(format!("ts.deployment_id = ${param_idx}"));
@@ -4098,6 +4115,8 @@ struct TraceDelta {
     trace_id: String,
     /// Earliest span start seen in this batch for the trace.
     start_time: DateTime<Utc>,
+    /// Latest span start seen in this batch for summary retention.
+    last_span_start_time: DateTime<Utc>,
     /// Longest span duration seen in this batch for the trace.
     max_duration_ms: f64,
     span_count: i64,
@@ -4143,6 +4162,7 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
             project_id: s.project_id,
             trace_id: s.trace_id.clone(),
             start_time: s.start_time,
+            last_span_start_time: s.start_time,
             max_duration_ms: 0.0,
             span_count: 0,
             error_count: 0,
@@ -4162,6 +4182,9 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
         }
         if s.start_time < entry.start_time {
             entry.start_time = s.start_time;
+        }
+        if s.start_time > entry.last_span_start_time {
+            entry.last_span_start_time = s.start_time;
         }
         if s.duration_ms > entry.max_duration_ms {
             entry.max_duration_ms = s.duration_ms;
@@ -4445,6 +4468,7 @@ mod tests {
         assert_eq!(a.error_count, 1);
         // start_time is the MIN (the root at +10s), duration the MAX (250ms).
         assert_eq!(a.start_time, ts(10));
+        assert_eq!(a.last_span_start_time, ts(12));
         assert_eq!(a.max_duration_ms, 250.0);
 
         let b = &deltas[1];

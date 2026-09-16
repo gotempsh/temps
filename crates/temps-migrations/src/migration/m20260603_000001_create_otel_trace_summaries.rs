@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS otel_trace_summaries (
     deployment_id           INTEGER,
     -- earliest span start in the trace (the trace's start time)
     start_time              TIMESTAMPTZ      NOT NULL,
+    -- latest span start keeps the summary alive until all of its spans age
+    -- past retention; list membership remains an exact raw-span EXISTS check
+    last_span_start_time    TIMESTAMPTZ      NOT NULL DEFAULT '-infinity',
     -- longest span duration in the trace (the trace's duration)
     duration_ms             DOUBLE PRECISION NOT NULL DEFAULT 0,
     span_count              BIGINT           NOT NULL DEFAULT 0,
@@ -76,6 +79,9 @@ CREATE TABLE IF NOT EXISTS otel_trace_summaries (
 CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_start
     ON otel_trace_summaries (project_id, start_time DESC);
 
+CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_last_span_start
+    ON otel_trace_summaries (project_id, last_span_start_time DESC);
+
 -- Duration sort — the whole point of this table. Now an index scan.
 CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_duration
     ON otel_trace_summaries (project_id, duration_ms DESC);
@@ -89,9 +95,9 @@ CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_errors_start
     ON otel_trace_summaries (project_id, start_time DESC)
     WHERE error_count > 0;
 
--- Retention sweeps by start_time across all projects.
-CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_start
-    ON otel_trace_summaries (start_time);
+-- Retention sweeps only after the trace's latest span ages out.
+CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_last_span_start
+    ON otel_trace_summaries (last_span_start_time);
 "#,
         )
         .await?;
@@ -141,7 +147,7 @@ BEGIN
     WHILE cur_day >= min_day LOOP
         INSERT INTO otel_trace_summaries (
             project_id, trace_id, identity_span_id, root_span_name, service_name, kind,
-            deployment_environment, deployment_id, start_time, duration_ms,
+            deployment_environment, deployment_id, start_time, last_span_start_time, duration_ms,
             span_count, error_count, has_root, last_seen
         )
         SELECT
@@ -172,6 +178,7 @@ BEGIN
                 s.duration_ms DESC,
                 s.span_id ASC))[1],
             MIN(s.start_time),
+            MAX(s.start_time),
             MAX(s.duration_ms),
             COUNT(*)::bigint,
             COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint,
@@ -185,6 +192,7 @@ BEGIN
             span_count = otel_trace_summaries.span_count + EXCLUDED.span_count,
             error_count = otel_trace_summaries.error_count + EXCLUDED.error_count,
             start_time = LEAST(otel_trace_summaries.start_time, EXCLUDED.start_time),
+            last_span_start_time = GREATEST(otel_trace_summaries.last_span_start_time, EXCLUDED.last_span_start_time),
             duration_ms = GREATEST(otel_trace_summaries.duration_ms, EXCLUDED.duration_ms),
             last_seen = now(),
             has_root = otel_trace_summaries.has_root OR EXCLUDED.has_root,

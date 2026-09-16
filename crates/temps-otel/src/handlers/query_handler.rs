@@ -363,6 +363,27 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+type OptionalTimeWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+fn trace_summary_window(
+    exact_trace: bool,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<OptionalTimeWindow, Problem> {
+    if exact_trace {
+        return Ok((start, end));
+    }
+    let end = end.unwrap_or(now);
+    let start = start.unwrap_or_else(|| end - chrono::Duration::hours(24));
+    if start >= end || end - start > chrono::Duration::days(31) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Trace Time Range")
+            .with_detail("Use a trace time window greater than zero and no longer than 31 days"));
+    }
+    Ok((Some(start), Some(end)))
+}
+
 /// Resolve an optional RFC-3339 (start, end) pair into a concrete window for the
 /// label-discovery queries. Missing `end` → now; missing `start` → 24h before
 /// `end`. Keeping the window bounded is what keeps the sampled scans cheap.
@@ -741,14 +762,21 @@ pub async fn query_trace_summaries(
         _ => SpanStatusCode::Unset,
     });
 
+    let (start_time, end_time) = trace_summary_window(
+        params.trace_id.is_some(),
+        params.start_time.as_deref().and_then(parse_datetime),
+        params.end_time.as_deref().and_then(parse_datetime),
+        Utc::now(),
+    )?;
+
     let query = TraceQuery {
         project_id: params.project_id,
         trace_id: params.trace_id,
         service_name: params.service_name,
         status,
         min_duration_ms: params.min_duration_ms,
-        start_time: params.start_time.as_deref().and_then(parse_datetime),
-        end_time: params.end_time.as_deref().and_then(parse_datetime),
+        start_time,
+        end_time,
         environment_id: params.environment_id,
         deployment_id: params.deployment_id,
         attributes: params
@@ -2041,6 +2069,28 @@ mod tests {
     use crate::services::cross_project::{AnnotatedSpan, ProjectRef};
     use crate::types::{SpanKind, SpanRecord, SpanStatusCode};
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn trace_summary_window_is_bounded_unless_trace_id_is_exact() {
+        let now = DateTime::parse_from_rfc3339("2026-09-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (start, end) = trace_summary_window(false, None, None, now).unwrap();
+        assert_eq!(end, Some(now));
+        assert_eq!(start, Some(now - chrono::Duration::hours(24)));
+        assert!(trace_summary_window(
+            false,
+            Some(now - chrono::Duration::days(32)),
+            Some(now),
+            now,
+        )
+        .is_err());
+        assert!(trace_summary_window(false, Some(now), Some(now), now).is_err());
+        assert_eq!(
+            trace_summary_window(true, None, None, now).unwrap(),
+            (None, None)
+        );
+    }
 
     fn span_for(project_id: i32, offset_ms: i64, status: SpanStatusCode) -> AnnotatedSpan {
         let start_time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)

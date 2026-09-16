@@ -104,7 +104,16 @@ struct Candidate {
 
 type LineKey = (DateTime<Utc>, Uuid, i32);
 type ChunkKey = (DateTime<Utc>, Uuid);
-type CursorState = (Option<LineKey>, Option<ChunkKey>);
+#[derive(Clone)]
+struct ScanWindow {
+    chunks: Vec<Uuid>,
+    continue_after: ChunkKey,
+}
+struct CursorState {
+    before: Option<LineKey>,
+    frontier: Option<ChunkKey>,
+    window: Option<ScanWindow>,
+}
 #[derive(Serialize, Deserialize)]
 struct Cursor {
     version: u8,
@@ -112,6 +121,10 @@ struct Cursor {
     before: Option<LineKey>,
     #[serde(default)]
     frontier: Option<ChunkKey>,
+    #[serde(default)]
+    window_chunks: Option<Vec<Uuid>>,
+    #[serde(default)]
+    continue_after: Option<ChunkKey>,
 }
 fn invalid(message: &str) -> LogAggregatorError {
     LogAggregatorError::Validation {
@@ -159,16 +172,42 @@ impl GlobalLogSearchRequest {
     }
     fn cursor_state(&self) -> Result<CursorState, LogAggregatorError> {
         let Some(raw) = &self.cursor else {
-            return Ok((None, None));
+            return Ok(CursorState {
+                before: None,
+                frontier: None,
+                window: None,
+            });
         };
-        if raw.len() > 2048 {
+        if raw.len() > 32 * 1024 {
             return Err(invalid("Invalid log cursor"));
         }
         let cursor: Cursor =
             serde_json::from_str(raw).map_err(|_| invalid("Invalid log cursor"))?;
         let valid_shape = match cursor.version {
-            1 => cursor.before.is_some() && cursor.frontier.is_none(),
-            2 => cursor.frontier.is_some(),
+            1 => {
+                cursor.before.is_some()
+                    && cursor.frontier.is_none()
+                    && cursor.window_chunks.is_none()
+                    && cursor.continue_after.is_none()
+            }
+            2 => {
+                cursor.frontier.is_some()
+                    && cursor.window_chunks.is_none()
+                    && cursor.continue_after.is_none()
+            }
+            3 => {
+                cursor.before.is_some()
+                    && cursor.window_chunks.as_ref().is_some_and(|chunks| {
+                        !chunks.is_empty()
+                            && chunks.len() <= MAX_CHUNKS
+                            && chunks
+                                .iter()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
+                                == chunks.len()
+                    })
+                    && cursor.continue_after.is_some()
+            }
             _ => false,
         };
         if !valid_shape
@@ -179,7 +218,16 @@ impl GlobalLogSearchRequest {
         {
             return Err(invalid("Cursor does not match the log search"));
         }
-        Ok((cursor.before, cursor.frontier))
+        Ok(CursorState {
+            before: cursor.before,
+            frontier: cursor.frontier,
+            window: cursor.window_chunks.zip(cursor.continue_after).map(
+                |(chunks, continue_after)| ScanWindow {
+                    chunks,
+                    continue_after,
+                },
+            ),
+        })
     }
 }
 
@@ -190,17 +238,27 @@ impl LogSearchService {
         access: &GlobalLogAccess,
     ) -> Result<GlobalLogSearchResponse, LogAggregatorError> {
         q.validate()?;
-        let (before, mut frontier) = q.cursor_state()?;
+        let cursor_state = q.cursor_state()?;
+        let before = cursor_state.before;
+        let scan_start = cursor_state.frontier;
+        let mut frontier = scan_start;
+        let window = cursor_state.window;
         let text = q.text.as_ref().map(|text| text.to_lowercase());
         let mut matches = BTreeMap::<LineKey, GlobalLogLine>::new();
         let cap = q.page_size.unwrap_or(100) as usize;
         let mut scanned_chunks = 0;
         let mut scanned_bytes: usize = 0;
         let mut complete = false;
+        let mut scanned_chunk_ids = Vec::new();
         'scan: loop {
             let chunks = self
                 .metadata_service
-                .global_chunks(q, access, before.as_ref(), frontier)
+                .global_chunks(
+                    q,
+                    access,
+                    frontier,
+                    window.as_ref().map(|window| window.chunks.as_slice()),
+                )
                 .await?;
             if chunks.is_empty() {
                 complete = true;
@@ -250,7 +308,15 @@ impl LogSearchService {
                     break 'scan;
                 }
                 scanned_chunks += 1;
+                scanned_chunk_ids.push(chunk.id);
                 for (offset, raw) in data.split(|b| *b == b'\n').enumerate() {
+                    // The decompressed chunk already has a hard size cap. Skip
+                    // a single response-hostile record without abandoning the
+                    // rest of the chunk or losing the pagination boundary for
+                    // valid rows decoded before it.
+                    if raw.len() > 64 * 1024 {
+                        continue;
+                    }
                     let Ok(line) = serde_json::from_slice::<LogLine>(raw) else {
                         continue;
                     };
@@ -275,10 +341,6 @@ impl LogSearchService {
                             .is_some_and(|(oldest, _)| key <= *oldest)
                     {
                         continue;
-                    }
-                    if raw.len() > 64 * 1024 {
-                        frontier = Some((chunk.ended_at, chunk.id));
-                        break 'scan;
                     }
                     matches.insert(
                         key,
@@ -318,27 +380,42 @@ impl LogSearchService {
             }
             tokio::task::yield_now().await;
         }
-        if !complete {
+        if !complete || window.is_some() {
+            let has_more_in_window = matches.len() > cap;
             let page: Vec<_> = matches.into_iter().rev().take(cap).collect();
-            let continuation = if let Some((key, _)) = page.last() {
+            let continue_after = window
+                .as_ref()
+                .map_or(frontier, |window| Some(window.continue_after));
+            let continuation = if has_more_in_window {
+                let Some((key, _)) = page.last() else {
+                    return Err(invalid("Log scan window lost its pagination boundary"));
+                };
+                let chunks = window
+                    .as_ref()
+                    .map(|window| window.chunks.clone())
+                    .unwrap_or(scanned_chunk_ids);
                 Cursor {
-                    version: 1,
+                    version: 3,
                     scope: q.scope_hash()?,
                     before: Some(*key),
-                    frontier: None,
+                    frontier: scan_start,
+                    window_chunks: Some(chunks),
+                    continue_after,
                 }
-            } else if let Some(frontier) = frontier {
+            } else if let Some(frontier) = continue_after {
                 Cursor {
                     version: 2,
                     scope: q.scope_hash()?,
-                    before,
+                    before: None,
                     frontier: Some(frontier),
+                    window_chunks: None,
+                    continue_after: None,
                 }
             } else {
                 return Ok(GlobalLogSearchResponse {
-                    lines: Vec::new(),
+                    lines: page.into_iter().map(|(_, line)| line).collect(),
                     next_cursor: None,
-                    scan_limit_reached: true,
+                    scan_limit_reached: !complete,
                     scanned_chunks,
                     scanned_bytes,
                 });
@@ -361,6 +438,8 @@ impl LogSearchService {
                         scope: q.scope_hash()?,
                         before: Some(*key),
                         frontier: None,
+                        window_chunks: None,
+                        continue_after: None,
                     })
                     .map_err(LogAggregatorError::from)
                 })
@@ -383,8 +462,8 @@ impl super::LogMetadataService {
         &self,
         q: &GlobalLogSearchRequest,
         access: &GlobalLogAccess,
-        before: Option<&LineKey>,
         frontier: Option<ChunkKey>,
+        window_chunks: Option<&[Uuid]>,
     ) -> Result<Vec<Candidate>, LogAggregatorError> {
         let mut values = Vec::<Value>::new();
         let mut bind = |value: Value| {
@@ -396,7 +475,10 @@ impl super::LogMetadataService {
         let unrestricted = bind(access.unrestricted_services.into());
         let user = bind(access.user_id.into());
         let from = bind(q.start_time.into());
-        let to = bind(before.map_or(q.end_time, |key| key.0).into());
+        // Line timestamps are not archive metadata timestamps. Always select
+        // chunks using the original query bounds, then apply `before` after
+        // decoding so delayed legacy chunks cannot disappear between pages.
+        let to = bind(q.end_time.into());
         let mut conditions = vec![
             format!("c.started_at <= {to} AND c.ended_at >= {from}"),
             format!(
@@ -445,6 +527,10 @@ impl super::LogMetadataService {
             let t = bind(time.into());
             let i = bind(id.into());
             conditions.push(format!("(c.ended_at,c.id)<({t},{i})"));
+        }
+        if let Some(chunk_ids) = window_chunks {
+            let ids = bind(chunk_ids.to_vec().into());
+            conditions.push(format!("c.id=ANY({ids}::uuid[])"));
         }
         let sql = format!("SELECT c.id,c.project_id,c.external_service_id,COALESCE(s.name,p.name) AS owner,c.env,c.ended_at,c.storage_key,c.compressed_size_bytes FROM log_chunks c LEFT JOIN projects p ON p.id=c.project_id AND c.external_service_id IS NULL LEFT JOIN external_services s ON s.id=c.external_service_id WHERE {} ORDER BY c.ended_at DESC,c.id DESC LIMIT {CHUNK_BATCH}", conditions.join(" AND "));
         let rows = self
@@ -497,7 +583,11 @@ mod tests {
         row
     }
 
-    async fn mock_search(lines: &[(&str, &str)], text: Option<&str>) -> GlobalLogSearchResponse {
+    async fn mock_search(
+        lines: &[(&str, &str)],
+        text: Option<&str>,
+        append_oversized_line: bool,
+    ) -> GlobalLogSearchResponse {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(FilesystemStorage::new(dir.path().into()).unwrap());
         let mut content = Vec::new();
@@ -506,6 +596,18 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "ts": timestamp, "level": "ERROR", "msg": message,
                     "stream": "stderr", "container_id": "container-1", "service": "app",
+                    "env": "production", "project_id": 1
+                }))
+                .unwrap(),
+            );
+            content.push(b'\n');
+        }
+        if append_oversized_line {
+            content.extend(
+                serde_json::to_vec(&serde_json::json!({
+                    "ts": "2026-01-01T12:00:01Z", "level": "ERROR",
+                    "msg": "x".repeat(65 * 1024), "stream": "stderr",
+                    "container_id": "container-oversized", "service": "app",
                     "env": "production", "project_id": 1
                 }))
                 .unwrap(),
@@ -549,6 +651,7 @@ mod tests {
                 ("2026-01-01T12:00:02Z", "middle"),
             ],
             None,
+            true,
         )
         .await;
         assert!(result.scan_limit_reached);
@@ -567,7 +670,12 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exhaustion_without_matches_returns_empty_lines() {
-        let result = mock_search(&[("2026-01-01T12:00:00Z", "unrelated")], Some("absent")).await;
+        let result = mock_search(
+            &[("2026-01-01T12:00:00Z", "unrelated")],
+            Some("absent"),
+            false,
+        )
+        .await;
         assert!(result.scan_limit_reached);
         assert!(result.lines.is_empty());
         let cursor: Cursor = serde_json::from_str(result.next_cursor.as_deref().unwrap()).unwrap();
@@ -590,10 +698,15 @@ mod tests {
                 scope: q.scope_hash().unwrap(),
                 before: Some(key),
                 frontier: None,
+                window_chunks: None,
+                continue_after: None,
             })
             .unwrap(),
         );
-        assert_eq!(q.cursor_state().unwrap(), (Some(key), None));
+        let state = q.cursor_state().unwrap();
+        assert_eq!(state.before, Some(key));
+        assert_eq!(state.frontier, None);
+        assert!(state.window.is_none());
         q.text = Some("changed".into());
         assert!(q.cursor_state().is_err());
         q.cursor = Some("bad".into());
@@ -644,6 +757,15 @@ mod tests {
                 "INSERT INTO log_chunks VALUES($1,$2,$3,'production','2026-01-01T12:00:01Z','2026-01-01T12:00:00Z',$4,$5,NULL,NULL)",
                 [Uuid::from_u128(id as u128).into(),if id<200 {id} else {0}.into(),if id>=200 {Some(id)} else {None}.into(),key.into(),(compressed.len() as i32).into()])).await.unwrap();
         }
+        // Legacy metadata can reflect archive arrival rather than event time.
+        // Replay must select these chunks by the saved exact snapshot even
+        // after the line cursor moves before its started_at value.
+        db.execute_unprepared(
+            "UPDATE log_chunks SET started_at = '2026-01-01T18:00:00Z' \
+            WHERE project_id IN (1, 108)",
+        )
+        .await
+        .unwrap();
         let unrestricted = GlobalLogAccess {
             hidden_projects: vec![],
             bound_project: None,
@@ -731,12 +853,104 @@ mod tests {
         assert_eq!(limited.lines.len(), 16); // 8 newer chunks before project 105
         assert!(limited.next_cursor.is_some());
 
+        // When a limited scan window itself contains more than one page, v3
+        // cursors replay only that bounded chunk window until every retained
+        // line has been returned. They then yield the v2 frontier that moves
+        // beyond the oversized chunk. This prevents both dropping overflow
+        // rows and skipping newer events in unread legacy chunks.
+        q.page_size = Some(5);
+        q.cursor = None;
+        let mut window_page = service.search_global(&q, &unrestricted).await.unwrap();
+
+        // Freeze both ends of the replay window. A chunk archived after page
+        // one must not enter that window and consume its bounded scan budget.
+        let late_key = "late-window.zst";
+        let mut late_content = Vec::new();
+        for offset in 0..2 {
+            let value = serde_json::json!({
+                "ts": "2026-01-01T12:00:00.123456789Z",
+                "level": "ERROR",
+                "msg": format!("late inserted:{offset}"),
+                "stream": "stderr",
+                "container_id": "late-container",
+                "service": "app",
+                "env": "production",
+                "project_id": 1
+            });
+            late_content.extend(serde_json::to_vec(&value).unwrap());
+            late_content.push(b'\n');
+        }
+        let late_compressed = zstd::encode_all(late_content.as_slice(), 1).unwrap();
+        storage
+            .write_chunk(late_key, &late_compressed)
+            .await
+            .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO log_chunks VALUES($1,1,NULL,'production','2026-01-01T12:00:01Z','2026-01-01T12:00:00Z',$2,$3,NULL,NULL)",
+            [
+                Uuid::from_u128(150).into(),
+                late_key.into(),
+                (late_compressed.len() as i32).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let mut window_lines = HashSet::new();
+        let continuation = loop {
+            assert!(window_page.scan_limit_reached);
+            for line in &window_page.lines {
+                assert!(window_lines.insert((line.line.chunk_id, line.line.line_offset)));
+            }
+            let continuation = window_page
+                .next_cursor
+                .expect("a partial scan window remains pageable");
+            let cursor: Cursor = serde_json::from_str(&continuation).unwrap();
+            if cursor.version == 2 {
+                break continuation;
+            }
+            assert_eq!(cursor.version, 3);
+            assert!(cursor.before.is_some());
+            assert!(cursor.window_chunks.is_some());
+            assert!(cursor.continue_after.is_some());
+            q.cursor = Some(continuation);
+            window_page = service.search_global(&q, &unrestricted).await.unwrap();
+        };
+        assert_eq!(window_lines.len(), 16);
+        assert!(!window_lines
+            .iter()
+            .any(|(chunk_id, _)| { *chunk_id == Uuid::from_u128(150) }));
+
+        q.cursor = Some(continuation);
+        let after_window = service.search_global(&q, &unrestricted).await.unwrap();
+        assert!(!after_window.scan_limit_reached);
+        assert_eq!(after_window.lines.len(), 5);
+        assert_eq!(
+            after_window
+                .lines
+                .iter()
+                .map(|line| line.line.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "message 104:1",
+                "message 104:0",
+                "message 103:1",
+                "message 103:0",
+                "message 102:1",
+            ]
+        );
+        assert!(after_window
+            .lines
+            .iter()
+            .all(|line| !window_lines.contains(&(line.line.chunk_id, line.line.line_offset))));
+
         // A scan window can exhaust its budget without finding a match. Its
         // v2 cursor must resume after the blocking chunk rather than looping
         // over the same candidates forever. Project 1 sorts behind the
         // oversized project-105 chunk and is reached only if the frontier
         // predicate is applied in the correct direction.
         q.text = Some("message 1:0".into());
+        q.page_size = Some(500);
         q.cursor = None;
         let empty_window = service.search_global(&q, &unrestricted).await.unwrap();
         assert!(empty_window.scan_limit_reached);

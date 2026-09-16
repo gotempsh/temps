@@ -23,6 +23,7 @@ fn trace_summary_rebuild_insert_sql(target: &str, predicate: &str, merge: bool) 
              span_count = {target}.span_count + EXCLUDED.span_count, \
              error_count = {target}.error_count + EXCLUDED.error_count, \
              start_time = LEAST({target}.start_time, EXCLUDED.start_time), \
+             last_span_start_time = GREATEST({target}.last_span_start_time, EXCLUDED.last_span_start_time), \
              duration_ms = GREATEST({target}.duration_ms, EXCLUDED.duration_ms), \
              last_seen = now(), \
              has_root = {target}.has_root OR EXCLUDED.has_root, \
@@ -64,6 +65,7 @@ fn trace_summary_rebuild_insert_sql(target: &str, predicate: &str, merge: bool) 
     format!(
         "WITH aggregates AS ( \
              SELECT s.project_id, s.trace_id, MIN(s.start_time) AS start_time, \
+                    MAX(s.start_time) AS last_span_start_time, \
                     MAX(s.duration_ms) AS duration_ms, COUNT(*)::BIGINT AS span_count, \
                     COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::BIGINT AS error_count, \
                     bool_or(s.parent_span_id IS NULL) AS has_root \
@@ -80,12 +82,12 @@ fn trace_summary_rebuild_insert_sql(target: &str, predicate: &str, merge: bool) 
          ) \
          INSERT INTO {target} ( \
              project_id, trace_id, identity_span_id, root_span_name, service_name, kind, \
-             deployment_environment, deployment_id, start_time, duration_ms, \
+             deployment_environment, deployment_id, start_time, last_span_start_time, duration_ms, \
              span_count, error_count, has_root, last_seen \
          ) \
          SELECT a.project_id, a.trace_id, i.identity_span_id, i.root_span_name, \
                 i.service_name, i.kind, i.deployment_environment, i.deployment_id, \
-                a.start_time, a.duration_ms, a.span_count, a.error_count, a.has_root, now() \
+                a.start_time, a.last_span_start_time, a.duration_ms, a.span_count, a.error_count, a.has_root, now() \
          FROM aggregates a JOIN identities i USING (project_id, trace_id) {conflict}"
     )
 }
@@ -121,10 +123,17 @@ BEGIN
         WHERE table_schema = current_schema()
           AND table_name = 'otel_trace_summaries'
           AND column_name = 'identity_span_id'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'otel_trace_summaries'
+          AND column_name = 'last_span_start_time'
     ) INTO needs_rebuild;
 
     ALTER TABLE otel_trace_summaries
         ADD COLUMN IF NOT EXISTS identity_span_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE otel_trace_summaries
+        ADD COLUMN IF NOT EXISTS last_span_start_time TIMESTAMPTZ NOT NULL DEFAULT '-infinity';
 
     CREATE TABLE IF NOT EXISTS otel_trace_summary_rebuild_state (
         singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
@@ -150,7 +159,7 @@ END $$;
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
-            .execute_unprepared("DROP TABLE IF EXISTS otel_trace_summary_rebuild_state; ALTER TABLE otel_trace_summaries DROP COLUMN IF EXISTS identity_span_id")
+            .execute_unprepared("DROP TABLE IF EXISTS otel_trace_summary_rebuild_state; ALTER TABLE otel_trace_summaries DROP COLUMN IF EXISTS identity_span_id; ALTER TABLE otel_trace_summaries DROP COLUMN IF EXISTS last_span_start_time")
             .await?;
         Ok(())
     }

@@ -196,6 +196,83 @@ async fn test_store_and_get_trace() {
 }
 
 #[tokio::test]
+async fn test_project_trace_summary_includes_trace_with_late_span_in_window() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let now = Utc::now();
+    let project_id = 907;
+    let trace_id = "trace-started-before-window";
+    let mut root = sample_span(
+        project_id,
+        trace_id,
+        "root-before-window",
+        None,
+        "root before window",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    root.start_time = now - Duration::hours(2);
+    root.end_time = root.start_time + Duration::milliseconds(100);
+    let mut child = sample_span(
+        project_id,
+        trace_id,
+        "child-inside-window",
+        Some("root-before-window"),
+        "child inside window",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        50.0,
+    );
+    child.start_time = now - Duration::minutes(30);
+    child.end_time = child.start_time + Duration::milliseconds(50);
+    storage.store_spans(vec![root, child]).await.unwrap();
+
+    let gap_trace_id = "trace-with-gap-around-window";
+    let mut before = sample_span(
+        project_id,
+        gap_trace_id,
+        "before-window",
+        None,
+        "before window",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    before.start_time = now - Duration::hours(2);
+    before.end_time = before.start_time + Duration::milliseconds(100);
+    let mut after = sample_span(
+        project_id,
+        gap_trace_id,
+        "after-window",
+        Some("before-window"),
+        "after window",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        50.0,
+    );
+    after.start_time = now + Duration::hours(1);
+    after.end_time = after.start_time + Duration::milliseconds(50);
+    storage.store_spans(vec![before, after]).await.unwrap();
+
+    let query = TraceQuery {
+        project_id,
+        start_time: Some(now - Duration::hours(1)),
+        end_time: Some(now),
+        ..Default::default()
+    };
+    let summaries = storage.query_trace_summaries(query.clone()).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].trace_id, trace_id);
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.trace_id != gap_trace_id));
+    assert_eq!(storage.count_traces(query).await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn test_has_traces() {
     let Some((_db, storage)) = setup_storage().await else {
         return;
@@ -699,6 +776,17 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
         .expect("higher ID commits first");
     _db.db
         .execute_unprepared(
+            "INSERT INTO otel_spans \
+             (project_id, service_name, trace_id, span_id, parent_span_id, name, kind, \
+              start_time, end_time, duration_ms, status_code, attributes, events) \
+             VALUES (903, 'reconcile', 'higher-id', 'span-high-late', 'span-high', \
+                     'high child', 'INTERNAL', now() - INTERVAL '100 milliseconds', now(), \
+                     100, 'OK', '{}', '[]')",
+        )
+        .await
+        .expect("later child makes the rebuild MAX(start_time) observable");
+    _db.db
+        .execute_unprepared(
             "INSERT INTO otel_trace_summaries \
              (project_id, trace_id, identity_span_id, root_span_name, service_name, kind, \
               start_time, duration_ms, span_count, error_count, has_root) \
@@ -734,7 +822,7 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
         .expect("project list falls back to raw spans while rebuild is pending");
     assert_eq!(pending_rows.len(), 1);
     assert_eq!(pending_rows[0].root_span_name, "high root");
-    assert_eq!(pending_rows[0].span_count, 1);
+    assert_eq!(pending_rows[0].span_count, 2);
     assert_eq!(
         storage
             .count_traces(TraceQuery {
@@ -771,12 +859,29 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
     );
     reconciliation.expect("reconciliation succeeds");
     competing_reconciliation.expect("competing reconciliation observes completion safely");
+    let retention_index = _db
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('otel_trace_summaries_rebuild_last_span_start') IS NOT NULL AS present"
+                .to_string(),
+        ))
+        .await
+        .expect("retention index lookup succeeds")
+        .expect("retention index lookup returns a row");
+    assert!(retention_index
+        .try_get::<bool>("", "present")
+        .expect("retention index presence is boolean"));
 
     let rows = _db
         .db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT trace_id, identity_span_id, root_span_name, span_count, error_count, has_root \
+            "SELECT trace_id, identity_span_id, root_span_name, span_count, error_count, has_root, \
+                    last_span_start_time > '-infinity'::timestamptz AS has_last_span_start, \
+                    last_span_start_time = (SELECT MAX(s.start_time) FROM otel_spans s \
+                        WHERE s.project_id = otel_trace_summaries.project_id \
+                          AND s.trace_id = otel_trace_summaries.trace_id) AS last_span_start_matches \
              FROM otel_trace_summaries WHERE project_id = 903 ORDER BY trace_id"
                 .to_string(),
         ))
@@ -787,8 +892,12 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
         rows[0].try_get::<String>("", "trace_id").unwrap(),
         "higher-id"
     );
-    assert_eq!(rows[0].try_get::<i64>("", "span_count").unwrap(), 1);
+    assert_eq!(rows[0].try_get::<i64>("", "span_count").unwrap(), 2);
     assert_eq!(rows[0].try_get::<i64>("", "error_count").unwrap(), 0);
+    assert!(rows[0].try_get::<bool>("", "has_last_span_start").unwrap());
+    assert!(rows[0]
+        .try_get::<bool>("", "last_span_start_matches")
+        .unwrap());
     assert_eq!(
         rows[1].try_get::<String>("", "trace_id").unwrap(),
         "lower-id"
@@ -802,6 +911,10 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
         "low root"
     );
     assert!(rows[1].try_get::<bool>("", "has_root").unwrap());
+    assert!(rows[1].try_get::<bool>("", "has_last_span_start").unwrap());
+    assert!(rows[1]
+        .try_get::<bool>("", "last_span_start_matches")
+        .unwrap());
 }
 
 // ── Duplicate-write characterization (Greptile P1) ──────────────────
