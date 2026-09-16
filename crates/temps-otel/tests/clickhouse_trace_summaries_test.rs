@@ -941,4 +941,14 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     assert_eq!(trace.span_count, 2);
     assert_eq!(trace.error_count, 1);
     assert_eq!(trace.status, "ERROR");
+
+    let mut past_end = lifetime;
+    past_end.filter.offset = Some(100);
+    past_end.source_offset = 100;
+    let stream = global_traces::clickhouse(&h.probe, &past_end, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &past_end).await.unwrap();
+    assert!(page.data.is_empty());
+    assert_eq!(page.total, 45);
 }

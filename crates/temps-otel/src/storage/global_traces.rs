@@ -69,6 +69,57 @@ pub struct GlobalTraceRow {
     pub events: String,
     pub status_message: String,
 }
+
+/// Cloud pages carry their exact total on each returned row so the expensive
+/// lifetime aggregation runs once instead of once for `COUNT` and again for
+/// the page. The SQL limit keeps this decoded buffer page-bounded.
+#[derive(Debug, Deserialize, clickhouse::Row)]
+struct CloudGlobalTraceRow {
+    project_id: i32,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    name: String,
+    service_name: String,
+    environment: String,
+    kind: String,
+    status: String,
+    start_ms: i64,
+    duration: f64,
+    span_count: i64,
+    error_count: i64,
+    attributes: String,
+    events: String,
+    status_message: String,
+    total: u64,
+}
+
+impl CloudGlobalTraceRow {
+    fn into_parts(self) -> (GlobalTraceRow, u64) {
+        let total = self.total;
+        (
+            GlobalTraceRow {
+                project_id: self.project_id,
+                trace_id: self.trace_id,
+                span_id: self.span_id,
+                parent_span_id: self.parent_span_id,
+                name: self.name,
+                service_name: self.service_name,
+                environment: self.environment,
+                kind: self.kind,
+                status: self.status,
+                start_ms: self.start_ms,
+                duration: self.duration,
+                span_count: self.span_count,
+                error_count: self.error_count,
+                attributes: self.attributes,
+                events: self.events,
+                status_message: self.status_message,
+            },
+            total,
+        )
+    }
+}
 impl GlobalTraceRow {
     pub fn span(self) -> StorageResult<SpanRecord> {
         let start_time = DateTime::from_timestamp_millis(self.start_ms)
@@ -638,6 +689,25 @@ fn ordered(sql: &Sql, q: &GlobalTraceQuery) -> String {
         q.source_offset
     )
 }
+
+fn cloud_ordered_with_total(sql: &Sql, q: &GlobalTraceQuery) -> String {
+    let field = if q.filter.sort_by == TraceSortField::Duration {
+        "duration"
+    } else {
+        "start_ms"
+    };
+    format!(
+        "SELECT page.*, count() OVER () AS total FROM ({}) AS page ORDER BY {field} {}, project_id, trace_id, span_id LIMIT {} OFFSET {}",
+        sql.body,
+        q.filter.sort_order.as_sql(),
+        q.filter
+            .offset
+            .unwrap_or(0)
+            .saturating_add(q.filter.limit.unwrap_or(20).clamp(1, 100))
+            .saturating_sub(q.source_offset),
+        q.source_offset
+    )
+}
 fn ch_query(client: &clickhouse::Client, sql: &str, binds: &[Bind]) -> clickhouse::query::Query {
     let mut query = client.query(sql);
     for b in binds {
@@ -671,6 +741,51 @@ pub async fn clickhouse(
             refs.unwrap_or(&empty),
         )?
     };
+    if refs.is_some() {
+        let page_sql = cloud_ordered_with_total(&sql, q);
+        let fetched = temps_cloud_client::query::within_query_budget(
+            ch_query(client, &page_sql, &sql.binds).fetch_all::<CloudGlobalTraceRow>(),
+        )
+        .await
+        .map_err(|error| OtelError::Storage {
+            message: format!(
+                "Temps Cloud global trace query exceeded its wall-clock budget: {error}"
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        })?
+        .map_err(storage)?;
+        let mut total = None;
+        let rows = fetched
+            .into_iter()
+            .map(|row| {
+                let (row, row_total) = row.into_parts();
+                total = Some(row_total);
+                Ok(row)
+            })
+            .collect::<Vec<_>>();
+        let total = if let Some(total) = total {
+            total
+        } else {
+            // An offset beyond the final row carries no window-count value.
+            // Keep exact totals for that rare page, under the same hard budget.
+            let count_sql = format!("SELECT count() FROM ({})", sql.body);
+            temps_cloud_client::query::within_query_budget(
+                ch_query(client, &count_sql, &sql.binds).fetch_one::<u64>(),
+            )
+            .await
+            .map_err(|error| OtelError::Storage {
+                message: format!(
+                    "Temps Cloud global trace count exceeded its wall-clock budget: {error}"
+                ),
+                kind: StorageErrorKind::ClickHouseTimeout,
+            })?
+            .map_err(storage)?
+        };
+        return Ok(GlobalTraceStream {
+            total,
+            rows: Box::pin(futures::stream::iter(rows)),
+        });
+    }
     let count_sql = format!("SELECT count() FROM ({})", sql.body);
     let total = ch_query(client, &count_sql, &sql.binds)
         .fetch_one::<u64>()
@@ -939,6 +1054,9 @@ mod tests {
             "CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE 'OK' END AS status"
         ));
         assert!(ordered(&sql, &q).ends_with("LIMIT 820 OFFSET 0"));
+        let page = cloud_ordered_with_total(&sql, &q);
+        assert!(page.contains("count() OVER () AS total"));
+        assert!(page.ends_with("LIMIT 820 OFFSET 0"));
     }
 
     #[test]
