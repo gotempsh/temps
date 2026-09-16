@@ -35,6 +35,7 @@ describe('mergeSettingsNavigationGroups', () => {
     const original = settingsNavigationGroups.find((g) => g.label === 'Access')!
     expect(access.items.slice(0, original.items.length)).toEqual(original.items)
     expect(access.items[access.items.length - 1]).toMatchObject({
+      id: 'sso',
       title: 'Single Sign-On',
       url: '/settings/sso',
     })

@@ -444,6 +444,7 @@ function NavSection({
 }: {
   label: string
   items: {
+    id?: string
     title: string
     url: string
     icon: SettingsNavigationIcon
@@ -491,7 +492,7 @@ function NavSection({
           const isActive =
             item.activeWhen?.(location.pathname) ?? item.url === activeUrl
           return (
-            <SidebarMenuItem key={item.title}>
+            <SidebarMenuItem key={item.id ?? item.url}>
               <SidebarMenuButton
                 asChild
                 tooltip={compact ? item.title : undefined}

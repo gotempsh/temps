@@ -36,6 +36,8 @@ import type { ConsoleSettingsNavItem } from '@temps-sdk/console-kit'
 export type SettingsNavigationIcon = ComponentType<{ className?: string }>
 
 export interface SettingsNavigationItem {
+  /** Stable key for rendering. Built-in entries are keyed by url. */
+  id?: string
   title: string
   url: string
   icon: SettingsNavigationIcon
@@ -191,6 +193,7 @@ export function mergeSettingsNavigationGroups(
       merged.push(group)
     }
     group.items.push({
+      id: ext.id,
       title: ext.label,
       url: ext.path,
       icon: nodeIcon(ext.icon),

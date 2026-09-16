@@ -1424,7 +1424,7 @@ export function CommandPalette() {
 
     return {
       navigation: indexedMainNavItems,
-      settings: indexedSettingsNavItems,
+      settings: [...indexedSettingsNavItems, ...extensionSettingsNavItems],
       observe: visibleObserveNavItems,
       account: accountNavItems,
       plugins: pluginNavItems,
@@ -1443,6 +1443,7 @@ export function CommandPalette() {
     currentProjectSlug,
     currentProject,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
   ])
 
   const commandDestinations = useMemo(() => {
