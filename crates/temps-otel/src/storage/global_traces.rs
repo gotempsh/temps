@@ -286,6 +286,7 @@ struct Sql {
 /// The proxy separately caps rows read, memory, results, and execution time;
 /// this client-side gate makes the fan-out explicit before the historical join.
 pub(crate) const MAX_LIFETIME_CANDIDATES: u64 = 5_000;
+const LOCAL_LIFETIME_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build the indexed Postgres trace-summary query.
 ///
@@ -774,10 +775,19 @@ pub async fn clickhouse(
             cloud_lifetime_candidate_count(client, q, refs).await?
         } else {
             let count = build_clickhouse_lifetime_candidate_count(q, None)?;
-            ch_query(client, &count.body, &count.binds)
-                .fetch_one::<u64>()
-                .await
-                .map_err(storage)?
+            tokio::time::timeout(
+                LOCAL_LIFETIME_QUERY_BUDGET,
+                ch_query(client, &count.body, &count.binds).fetch_one::<u64>(),
+            )
+            .await
+            .map_err(|_| OtelError::Storage {
+                message: format!(
+                    "Local ClickHouse trace-candidate count exceeded its {:?} budget",
+                    LOCAL_LIFETIME_QUERY_BUDGET
+                ),
+                kind: StorageErrorKind::ClickHouseTimeout,
+            })?
+            .map_err(storage)?
         };
         Some(total)
     } else {
@@ -820,19 +830,26 @@ pub async fn clickhouse(
         });
     }
     if let Some(total) = candidate_total.filter(|_| refs.is_none()) {
-        let cursor = ch_query(client, &ordered(&sql, q), &sql.binds)
-            .fetch::<GlobalTraceRow>()
-            .map_err(storage)?;
-        let rows = futures::stream::try_unfold(cursor, |mut cursor| async move {
-            Ok(cursor
-                .next()
-                .await
-                .map_err(storage)?
-                .map(|row| (row, cursor)))
-        });
+        let page_sql = ordered(&sql, q);
+        let rows = tokio::time::timeout(
+            LOCAL_LIFETIME_QUERY_BUDGET,
+            ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
+        )
+        .await
+        .map_err(|_| OtelError::Storage {
+            message: format!(
+                "Local ClickHouse lifetime trace page exceeded its {:?} budget",
+                LOCAL_LIFETIME_QUERY_BUDGET
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        })?
+        .map_err(storage)?
+        .into_iter()
+        .map(Ok)
+        .collect::<Vec<_>>();
         return Ok(GlobalTraceStream {
             total,
-            rows: Box::pin(rows),
+            rows: Box::pin(futures::stream::iter(rows)),
         });
     }
     if refs.is_some() {

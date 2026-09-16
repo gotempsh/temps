@@ -135,6 +135,11 @@ pub struct ClickHouseOtelClient {
 /// user's point of view; this makes it fail as one.
 const CH_MAX_EXECUTION_TIME_SECS: &str = "120";
 
+/// Rows any one query may read before ClickHouse aborts it. This bounds
+/// lifetime trace expansion even when a small candidate set contains traces
+/// with pathological span counts.
+const CH_MAX_ROWS_TO_READ: &str = "10000000";
+
 /// Memory ceiling for any single ClickHouse query, in bytes (8 GiB).
 const CH_MAX_MEMORY_USAGE_BYTES: &str = "8589934592";
 
@@ -167,6 +172,7 @@ impl ClickHouseOtelClient {
             // demand for tuning them yet; if that appears, they belong on a
             // settings row (CLAUDE.md forbids env-var config), not an env var.
             .with_setting("max_execution_time", CH_MAX_EXECUTION_TIME_SECS)
+            .with_setting("max_rows_to_read", CH_MAX_ROWS_TO_READ)
             .with_setting("max_memory_usage", CH_MAX_MEMORY_USAGE_BYTES)
             // Spill GROUP BY state to disk rather than dying at the ceiling.
             .with_setting(
