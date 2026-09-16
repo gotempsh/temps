@@ -488,21 +488,44 @@ impl TempsPlugin for AgentsPlugin {
             let notification_service = context.require_service::<NotificationService>();
             let platform_config_service = context.require_service::<temps_config::ConfigService>();
 
-            // Load global sandbox settings to configure the Docker provider
-            let global_sandbox = {
-                use sea_orm::EntityTrait;
-                temps_entities::settings::Entity::find_by_id(1)
-                    .one(db.as_ref())
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| {
-                        s.data.get("agent_sandbox").cloned().and_then(|v| {
-                            serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
+            // Load the sandbox and preview-gateway settings from the same
+            // snapshot so network ownership cannot be configured from two
+            // different revisions of the settings row.
+            let (global_sandbox, preview_gateway_settings) =
+                {
+                    use sea_orm::EntityTrait;
+                    let settings = temps_entities::settings::Entity::find_by_id(1)
+                        .one(db.as_ref())
+                        .await
+                        .ok()
+                        .flatten();
+                    let global_sandbox = settings
+                        .as_ref()
+                        .and_then(|settings| {
+                            settings
+                                .data
+                                .get("agent_sandbox")
+                                .cloned()
+                                .and_then(|value| {
+                                    serde_json::from_value::<temps_core::AgentSandboxSettings>(
+                                        value,
+                                    )
+                                    .ok()
+                                })
                         })
-                    })
-                    .unwrap_or_default()
-            };
+                        .unwrap_or_default();
+                    let preview_gateway =
+                        settings
+                            .and_then(|settings| {
+                                settings.data.get("preview_gateway").cloned().and_then(|value| {
+                            serde_json::from_value::<temps_core::PreviewGatewaySettings>(value).ok()
+                        })
+                            })
+                            .unwrap_or_default();
+                    (global_sandbox, preview_gateway)
+                };
+            let preview_gateway_container_name =
+                crate::preview_gateway::container_name(&preview_gateway_settings);
 
             // Set up sandbox provider: try Docker first, fall back to local.
             //
@@ -527,6 +550,7 @@ impl TempsPlugin for AgentsPlugin {
                                     control_plane_url: platform_config_service
                                         .resolve_internal_url()
                                         .await,
+                                    preview_gateway_container_name,
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));

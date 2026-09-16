@@ -153,7 +153,7 @@ pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 /// network, but never receives an externally routed interface.
 pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
 const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
-const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
+pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
 const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
 const PREVIEW_GATEWAY_INGRESS_LABEL: &str = "sh.temps.preview-gateway-ingress";
@@ -393,15 +393,7 @@ async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Resu
         .await
         .context("failed to discover isolated sandbox networks")?;
     for network in networks {
-        let managed = network
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
-            .is_some();
-        if !managed {
-            continue;
-        }
-        let Some(network_name) = network.name.as_deref() else {
+        let Some(network_name) = managed_sandbox_network_name(&network, container_name) else {
             continue;
         };
         let request = bollard::models::NetworkConnectRequest {
@@ -418,6 +410,31 @@ async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Resu
         }
     }
     Ok(())
+}
+
+fn managed_sandbox_network_name<'a>(
+    network: &'a bollard::models::Network,
+    gateway_container_name: &str,
+) -> Option<&'a str> {
+    let network_name = network.name.as_deref()?;
+    let owner = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))?;
+    let labels = network.labels.as_ref()?;
+    let gateway_matches = labels
+        .get(crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map_or(
+            // Legacy networks predate multi-instance ownership and belonged
+            // to the historical singleton. Never infer ownership for a
+            // custom-named gateway.
+            gateway_container_name == PREVIEW_GATEWAY_CONTAINER,
+            |value| value == gateway_container_name,
+        );
+    (!owner.is_empty()
+        && network_name == crate::sandbox::docker::sandbox_network_name(owner)
+        && gateway_matches)
+        .then_some(network_name)
 }
 
 async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
@@ -983,6 +1000,15 @@ async fn create_and_start(
         .start_container(&spec.container_name, None::<StartContainerOptions>)
         .await
         .with_context(|| format!("failed to start container {}", spec.container_name))?;
+
+    // A recreated gateway starts with only its control-network attachment.
+    // Restore every existing workspace route as part of creation so callers
+    // cannot accidentally leave already-running sandboxes unreachable. Keep
+    // the gateway pair fail-closed if Docker cannot restore every owned route.
+    if let Err(error) = connect_sandbox_networks(docker, &spec.container_name).await {
+        let _ = remove_gateway_pair(docker, &spec.container_name).await;
+        return Err(error);
+    }
 
     if let Err(error) = create_and_start_ingress(docker, spec, ingress_image).await {
         let _ = remove_gateway_pair(docker, &spec.container_name).await;
@@ -1713,6 +1739,66 @@ mod tests {
         assert!(should_preserve_existing_image(false, true));
         assert!(!should_preserve_existing_image(false, false));
         assert!(!should_preserve_existing_image(true, true));
+    }
+
+    #[test]
+    fn gateway_reconnects_only_to_managed_per_sandbox_networks() {
+        let legacy_default = bollard::models::Network {
+            name: Some("temps-sandbox-net-v3-temps-sandbox-workspace".to_string()),
+            labels: Some(HashMap::from([(
+                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                "temps-sandbox-workspace".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let scoped_custom = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            labels: Some(HashMap::from([
+                (
+                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                    "temps-sandbox-workspace".to_string(),
+                ),
+                (
+                    crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                    "temps-preview-gateway-custom".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let spoofed_name = bollard::models::Network {
+            name: Some("application-production".to_string()),
+            labels: legacy_default.labels.clone(),
+            ..Default::default()
+        };
+        let missing_owner = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, PREVIEW_GATEWAY_CONTAINER),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, "temps-preview-gateway-custom"),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, "temps-preview-gateway-custom"),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, PREVIEW_GATEWAY_CONTAINER),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&spoofed_name, PREVIEW_GATEWAY_CONTAINER),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&missing_owner, PREVIEW_GATEWAY_CONTAINER),
+            None
+        );
     }
 
     #[test]
