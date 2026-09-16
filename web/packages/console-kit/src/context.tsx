@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { createContext, useContext, type ReactNode } from 'react'
-import {
-  type ConsoleExtensions,
-  emptyConsoleExtensions,
-} from './extensions'
+import { type ConsoleExtensions, emptyConsoleExtensions } from './extensions'
 
-const ConsoleExtensionsContext =
-  createContext<ConsoleExtensions>(emptyConsoleExtensions)
+const ConsoleExtensionsContext = createContext<ConsoleExtensions>(
+  emptyConsoleExtensions
+)
 
 export interface ConsoleExtensionsProviderProps {
   extensions?: ConsoleExtensions

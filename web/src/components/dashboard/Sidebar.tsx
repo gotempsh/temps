@@ -79,7 +79,11 @@ import {
 } from '../ui/dropdown-menu'
 import { useTheme } from 'next-themes'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
-import { settingsNavigationGroups } from '@/components/settings/settings-navigation'
+import {
+  mergeSettingsNavigationGroups,
+  settingsNavigationGroups,
+  type SettingsNavigationIcon,
+} from '@/components/settings/settings-navigation'
 
 interface PlatformNavItem {
   title: string
@@ -442,7 +446,7 @@ function NavSection({
   items: {
     title: string
     url: string
-    icon: LucideIcon
+    icon: SettingsNavigationIcon
     activeWhen?: (pathname: string) => boolean
     featureKey?: string
   }[]
@@ -882,16 +886,26 @@ function DefaultNav({
 // ─────────────────────────────────────────────────────────────────────────────
 
 function SettingsNav({ onBack }: { onBack: () => void }) {
+  // Extension-provided links (e.g. an identity-provider page from a
+  // console extension) join the built-in groups here, so instance
+  // configuration lands in Settings rather than the workspace nav.
+  const { settingsNavItems: extensionSettingsItems } = useConsoleExtensions()
+  const groups = useMemo(
+    () =>
+      mergeSettingsNavigationGroups(
+        settingsNavigationGroups,
+        extensionSettingsItems
+      ),
+    [extensionSettingsItems]
+  )
   // Every url across every settings group. Each section gets the list
   // minus its own items so active-state resolution sees the full tree
   // (prevents `/settings` lighting up on `/settings/keys`).
-  const allSettingsUrls = settingsNavigationGroups.flatMap((g) =>
-    g.items.map((i) => i.url)
-  )
+  const allSettingsUrls = groups.flatMap((g) => g.items.map((i) => i.url))
   return (
     <>
       <SwapHeader title="Settings" onBack={onBack} backLabel="Back to menu" />
-      {settingsNavigationGroups.map((group) => {
+      {groups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
         const siblings = allSettingsUrls.filter((u) => !ownUrls.has(u))
         return (

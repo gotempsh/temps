@@ -36,11 +36,17 @@ import {
   excludeNavigationUrls,
   filterRestrictedNavigationItems,
   isSettingsNavigationUrl,
+  indexSettingsNavigationGroups,
   mergeNavigationItems,
   platformToolNavigationItems,
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
+import {
+  mergeSettingsNavigationGroups,
+  type SettingsNavigationIcon,
+} from '@/components/settings/settings-navigation'
+import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
 import {
@@ -102,7 +108,7 @@ import { useLocation, useNavigate } from 'react-router'
 interface NavigationItem {
   title: string
   url: string
-  icon: LucideIcon
+  icon: SettingsNavigationIcon
   keywords?: string[]
 }
 
@@ -1253,6 +1259,18 @@ export function CommandPalette() {
     [projectNavEntries]
   )
 
+  // Settings links contributed by a console extension. Indexed at runtime,
+  // unlike the static registry above, because extensions arrive via
+  // context rather than at module load.
+  const { settingsNavItems: extensionSettingsItems } = useConsoleExtensions()
+  const extensionSettingsNavItems: NavigationItem[] = useMemo(
+    () =>
+      indexSettingsNavigationGroups(
+        mergeSettingsNavigationGroups([], extensionSettingsItems)
+      ),
+    [extensionSettingsItems]
+  )
+
   const canViewAuditLogs = useCanViewAuditLogs()
   const visibleObserveNavItems = useMemo(
     () => filterRestrictedNavigationItems(observeNavItems, canViewAuditLogs),
@@ -1267,6 +1285,10 @@ export function CommandPalette() {
         category: 'Navigation',
       })),
       ...indexedSettingsNavItems.map((item) => ({
+        ...item,
+        category: 'Settings',
+      })),
+      ...extensionSettingsNavItems.map((item) => ({
         ...item,
         category: 'Settings',
       })),
@@ -1309,6 +1331,7 @@ export function CommandPalette() {
     pluginNavItems,
     projectPluginNavItems,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
   ])
 
   const projectsFuse = useMemo(() => {
@@ -1788,6 +1811,7 @@ export function CommandPalette() {
     const allNavItems: NavigationItem[] = [
       ...indexedMainNavItems,
       ...indexedSettingsNavItems,
+      ...extensionSettingsNavItems,
       ...visibleObserveNavItems,
       ...accountNavItems,
       ...pluginNavItems,
@@ -1876,6 +1900,7 @@ export function CommandPalette() {
     globalMcpServers,
     canViewAuditLogs,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
     navigate,
   ])
 

@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { platformToolGroups } from '@/components/platform/platform-tools'
-import { settingsNavigationGroups } from '@/components/settings/settings-navigation'
-import type { LucideIcon } from 'lucide-react'
+import {
+  settingsNavigationGroups,
+  type SettingsNavigationGroup,
+  type SettingsNavigationIcon,
+} from '@/components/settings/settings-navigation'
 
 export interface IndexedNavigationItem {
   title: string
   url: string
-  icon: LucideIcon
+  icon: SettingsNavigationIcon
   keywords?: string[]
 }
 
@@ -33,15 +36,21 @@ export const platformToolNavigationItems: IndexedNavigationItem[] =
     }))
   )
 
-export const settingsPageNavigationItems: IndexedNavigationItem[] =
-  settingsNavigationGroups.flatMap((group) =>
+export function indexSettingsNavigationGroups(
+  groups: readonly SettingsNavigationGroup[]
+): IndexedNavigationItem[] {
+  return groups.flatMap((group) =>
     group.items.map((item) => ({
       title: item.title,
       url: item.url,
       icon: item.icon,
-      keywords: ['settings', group.label, item.title],
+      keywords: ['settings', group.label, item.title, ...(item.keywords ?? [])],
     }))
   )
+}
+
+export const settingsPageNavigationItems: IndexedNavigationItem[] =
+  indexSettingsNavigationGroups(settingsNavigationGroups)
 
 /**
  * Prefer purpose-written command labels while merging the canonical page
