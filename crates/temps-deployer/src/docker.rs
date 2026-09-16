@@ -5,9 +5,9 @@
 
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use crate::{
-    BuildRequest, BuildResult, BuilderError, ContainerDeployer, ContainerInfo, ContainerRuntime,
-    ContainerStatus, DeployRequest, DeployResult, DeployerError, ImageBuilder, ImageImportStream,
-    PortMapping, Protocol, RuntimeInfo,
+    BuildMemoryDiagnosis, BuildRequest, BuildResult, BuilderError, ContainerDeployer,
+    ContainerInfo, ContainerRuntime, ContainerStatus, DeployRequest, DeployResult, DeployerError,
+    ImageBuilder, ImageImportStream, PortMapping, Protocol, RuntimeInfo,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -726,6 +726,11 @@ pub struct DockerRuntime {
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
+    /// Whether the daemon runs on this machine (unset or `unix://`
+    /// `DOCKER_HOST`, the same convention bollard connects with). Host-level
+    /// facts such as `/proc/vmstat` and total RAM describe the build host only
+    /// when this is true.
+    daemon_is_local: bool,
     /// Platform of the Docker *daemon* this runtime talks to, cached after the
     /// first `docker info`. This is deliberately not the platform of the
     /// binary: with `DOCKER_HOST` set (or a QEMU-emulated `docker:dind`), the
@@ -830,6 +835,78 @@ pub(crate) fn build_exit_reason(
         }),
         None => None,
     }
+}
+
+/// Largest per-build memory cap the Docker build API accepts through this
+/// client: bollard declares `BuildImageOptions.memory` as `Option<i32>`.
+const MAX_REQUESTABLE_BUILD_MEMORY_BYTES: i64 = i32::MAX as i64;
+
+/// Exit status of a build step whose process was killed with SIGKILL, which
+/// is how the kernel's OOM killer and a memory cgroup limit end a process.
+const SIGKILL_EXIT_CODE: i32 = 137;
+
+/// Legacy per-build caps used when no override is configured: half of the
+/// host's CPUs and half of its RAM in whole GiB, each with a floor of 2.
+/// `total_memory_bytes` is what `sysinfo::System::total_memory` returns.
+fn legacy_build_caps(cpu_count: usize, total_memory_bytes: u64) -> (usize, u64) {
+    let total_memory_gib = total_memory_bytes / (1024 * 1024 * 1024);
+    (
+        std::cmp::max(2, cpu_count / 2),
+        std::cmp::max(2, total_memory_gib / 2),
+    )
+}
+
+/// Reduce a requested per-build memory cap to what the build API accepts.
+/// Returns the value to send and whether it had to be reduced.
+fn clamp_build_memory(requested_bytes: i64) -> (i32, bool) {
+    if requested_bytes > MAX_REQUESTABLE_BUILD_MEMORY_BYTES {
+        (i32::MAX, true)
+    } else {
+        (requested_bytes.max(0) as i32, false)
+    }
+}
+
+/// Whether a `DOCKER_HOST` value points at the daemon on this machine.
+/// Unset means the default local socket, as it does for bollard.
+fn docker_host_is_local(docker_host: Option<&str>) -> bool {
+    match docker_host.map(str::trim) {
+        None | Some("") => true,
+        Some(host) => host.starts_with("unix://") || host.starts_with("npipe://"),
+    }
+}
+
+/// The kernel's cumulative OOM-kill counter from `/proc/vmstat` text
+/// (`oom_kill`, Linux 4.13 and later).
+fn parse_oom_kill_count(vmstat: &str) -> Option<u64> {
+    vmstat
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Processes the kernel's OOM killer has terminated on this host since boot,
+/// or `None` where the counter cannot be read.
+fn host_oom_kill_count() -> Option<u64> {
+    std::fs::read_to_string("/proc/vmstat")
+        .ok()
+        .as_deref()
+        .and_then(parse_oom_kill_count)
+}
+
+/// The exit status a builder error reports for a failed step. BuildKit
+/// writes `exit code: N`; the legacy builder writes `returned a non-zero
+/// code: N`.
+fn build_step_exit_code(error_text: &str) -> Option<i32> {
+    ["exit code: ", "returned a non-zero code: "]
+        .iter()
+        .find_map(|marker| {
+            let start = error_text.rfind(marker)? + marker.len();
+            let digits: String = error_text[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
 }
 
 /// Sample container stats twice ~1s apart so the CPU delta formula has a real
@@ -1045,6 +1122,7 @@ impl DockerRuntime {
             secrets_root,
             build_semaphore: None,
             build_resource_override: None,
+            daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -1115,6 +1193,14 @@ impl DockerRuntime {
         self.build_semaphore = Some(Arc::new(tokio::sync::Semaphore::new(permits)));
         self.build_resource_override =
             resource_limits.filter(|r| r.cpu_cores > 0.0 && r.memory_mb > 0);
+        if let (true, Some(caps)) = (self.use_buildkit, self.build_resource_override) {
+            warn!(
+                "Per-build caps of {} cores and {} MB are configured, but this host builds with \
+                 BuildKit, which ignores the memory and CPU options of the Docker image build \
+                 API: build steps run uncapped. Only the concurrency limit of {} is enforced.",
+                caps.cpu_cores, caps.memory_mb, permits
+            );
+        }
         self
     }
 
@@ -1628,17 +1714,115 @@ impl DockerRuntime {
     }
 
     fn get_resource_limits() -> (usize, u64) {
-        let cpu_num = num_cpus::get();
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        let total_memory_gb = sys.total_memory() / 1024 / 1024; // Convert KB to GB
+        let mut sys = System::new();
+        sys.refresh_memory();
+        legacy_build_caps(num_cpus::get(), sys.total_memory())
+    }
 
-        // Use half of CPUs with minimum of 2
-        let cpu_limit = std::cmp::max(2, cpu_num / 2);
-        // Use half of memory with minimum of 2GB
-        let memory_limit = std::cmp::max(2, total_memory_gb / 2);
+    /// The `memory` value to put on `BuildImageOptions` for a requested cap.
+    /// Warns when the request had to be reduced to what the API accepts.
+    fn effective_build_memory(&self, requested_bytes: i64, image_name: &str) -> i32 {
+        let (memory, clamped) = clamp_build_memory(requested_bytes);
+        if clamped {
+            warn!(
+                "Build {}: per-build memory cap of {} MB exceeds the {} MB the Docker build API \
+                 accepts through this client; requesting {} MB instead",
+                image_name,
+                requested_bytes / (1024 * 1024),
+                MAX_REQUESTABLE_BUILD_MEMORY_BYTES / (1024 * 1024),
+                i64::from(memory) / (1024 * 1024)
+            );
+        }
+        memory
+    }
 
-        (cpu_limit, memory_limit)
+    /// Decide whether a failed build step ran out of memory, from the
+    /// builder's error text and the host's OOM-kill counter sampled before the
+    /// build. A kernel kill during the build is conclusive. The SIGKILL exit
+    /// status alone counts only when the counter is unavailable (remote
+    /// daemon, or no `/proc/vmstat`): when the counter is readable and did
+    /// not move, the kill came from something else.
+    fn diagnose_out_of_memory(
+        &self,
+        error_text: &str,
+        oom_kills_before: Option<u64>,
+        requested_cap_bytes: i64,
+    ) -> Option<BuildMemoryDiagnosis> {
+        let oom_kills_after = oom_kills_before.and_then(|_| host_oom_kill_count());
+        self.diagnose_out_of_memory_with(
+            error_text,
+            oom_kills_before,
+            oom_kills_after,
+            requested_cap_bytes,
+        )
+    }
+
+    /// [`Self::diagnose_out_of_memory`] with both counter samples supplied.
+    fn diagnose_out_of_memory_with(
+        &self,
+        error_text: &str,
+        oom_kills_before: Option<u64>,
+        oom_kills_after: Option<u64>,
+        requested_cap_bytes: i64,
+    ) -> Option<BuildMemoryDiagnosis> {
+        let exit_code = build_step_exit_code(error_text);
+        let host_oom_kills = match (oom_kills_before, oom_kills_after) {
+            (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+            _ => None,
+        };
+        let out_of_memory = match host_oom_kills {
+            Some(kills) => kills > 0,
+            None => exit_code == Some(SIGKILL_EXIT_CODE),
+        };
+        if !out_of_memory {
+            return None;
+        }
+        let host_memory_mb = self.daemon_is_local.then(|| {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            sys.total_memory() / (1024 * 1024)
+        });
+        Some(BuildMemoryDiagnosis {
+            host_oom_kills,
+            exit_code,
+            host_memory_mb,
+            requested_cap_mb: (requested_cap_bytes / (1024 * 1024)).max(0) as u64,
+            cap_enforced: !self.use_buildkit,
+        })
+    }
+
+    /// Kernel OOM-kill counter to compare against after the build, or `None`
+    /// when it would not describe the build host.
+    fn oom_kills_before_build(&self) -> Option<u64> {
+        if self.daemon_is_local {
+            host_oom_kill_count()
+        } else {
+            None
+        }
+    }
+
+    /// Map a failed build step to its error. When the failure looks like an
+    /// out-of-memory kill, the second value is an extra `ERROR:` line for the
+    /// build log so the deployment log says so where the user reads it.
+    fn classify_build_failure(
+        &self,
+        error_text: String,
+        oom_kills_before: Option<u64>,
+        requested_cap_bytes: i64,
+    ) -> (BuilderError, Option<String>) {
+        match self.diagnose_out_of_memory(&error_text, oom_kills_before, requested_cap_bytes) {
+            Some(diagnosis) => {
+                let line = format!("ERROR: {}\n", diagnosis);
+                (
+                    BuilderError::BuildOutOfMemory {
+                        message: error_text,
+                        diagnosis,
+                    },
+                    Some(line),
+                )
+            }
+            None => (BuilderError::BuildFailed(error_text), None),
+        }
     }
 
     /// Resolve the per-build `(memory_bytes, cpu_quota_us, cpu_period_us)`
@@ -1874,13 +2058,21 @@ impl ImageBuilder for DockerRuntime {
         }
 
         // Resolve effective build caps from settings (or fall back to the
-        // legacy 50%-of-host heuristic when no override is set). Note that
-        // Bollard's `BuildImageOptions.memory` field is `Option<i32>` so
-        // any limit above i32::MAX (≈ 2 GiB) gets silently clamped here —
-        // matches the historical behaviour (the `& 0x7FFFFFFF` mask) and
-        // is a known upstream Bollard limitation.
+        // legacy 50%-of-host heuristic when no override is set). The memory
+        // value is reduced to what the API accepts, with a warning, in
+        // `effective_build_memory`.
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
+        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        info!(
+            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
+            request.image_name,
+            i64::from(memory_i32) / (1024 * 1024),
+            if self.use_buildkit {
+                ", which BuildKit does not enforce"
+            } else {
+                ""
+            }
+        );
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -1934,6 +2126,7 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
+        let oom_kills_before = self.oom_kills_before_build();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -1956,7 +2149,15 @@ impl ImageBuilder for DockerRuntime {
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
                             .await;
-                        return Err(BuilderError::BuildFailed(error));
+                        let (err, memory_line) = self.classify_build_failure(
+                            error,
+                            oom_kills_before,
+                            i64::from(memory_i32),
+                        );
+                        if let Some(line) = memory_line {
+                            let _ = log_file.write_all(line.as_bytes()).await;
+                        }
+                        return Err(err);
                     }
                 }
                 Err(e) => {
@@ -1965,7 +2166,15 @@ impl ImageBuilder for DockerRuntime {
                     let _ = log_file
                         .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
                         .await;
-                    return Err(BuilderError::BuildFailed(error_msg));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_msg,
+                        oom_kills_before,
+                        i64::from(memory_i32),
+                    );
+                    if let Some(line) = memory_line {
+                        let _ = log_file.write_all(line.as_bytes()).await;
+                    }
+                    return Err(err);
                 }
             }
         }
@@ -2068,7 +2277,17 @@ impl ImageBuilder for DockerRuntime {
         }
 
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
+        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        info!(
+            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
+            request.image_name,
+            i64::from(memory_i32) / (1024 * 1024),
+            if self.use_buildkit {
+                ", which BuildKit does not enforce"
+            } else {
+                ""
+            }
+        );
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -2120,6 +2339,7 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
+        let oom_kills_before = self.oom_kills_before_build();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -2153,7 +2373,18 @@ impl ImageBuilder for DockerRuntime {
                             callback(error_line.clone()).await;
                         }
 
-                        return Err(BuilderError::BuildFailed(error));
+                        let (err, memory_line) = self.classify_build_failure(
+                            error,
+                            oom_kills_before,
+                            i64::from(memory_i32),
+                        );
+                        if let Some(line) = memory_line {
+                            let _ = log_file.write_all(line.as_bytes()).await;
+                            if let Some(ref callback) = log_callback {
+                                callback(line).await;
+                            }
+                        }
+                        return Err(err);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         // Emit vertex names (build step descriptions) when they
@@ -2210,7 +2441,18 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    return Err(BuilderError::BuildFailed(error_msg));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_msg,
+                        oom_kills_before,
+                        i64::from(memory_i32),
+                    );
+                    if let Some(line) = memory_line {
+                        let _ = log_file.write_all(line.as_bytes()).await;
+                        if let Some(ref callback) = log_callback {
+                            callback(line).await;
+                        }
+                    }
+                    return Err(err);
                 }
             }
         }
@@ -3303,7 +3545,7 @@ impl ContainerRuntime for DockerRuntime {
             runtime_type: "Docker".to_string(),
             version: version.version.unwrap_or_default(),
             available_cpu_cores: num_cpus::get(),
-            available_memory_mb: system.total_memory() / 1024,
+            available_memory_mb: system.total_memory() / (1024 * 1024),
             available_disk_mb: 0, // Docker doesn't easily expose this
         })
     }
@@ -5604,5 +5846,137 @@ CMD ["cat", "/hello.txt"]
             }),
         );
         assert!(rt.build_resource_override.is_none());
+    }
+
+    #[test]
+    fn legacy_build_caps_use_half_of_host_memory_in_gib() {
+        // sysinfo reports bytes; a 16 GiB host must yield 8 GiB, not the 8192
+        // "GB" the old KB-to-GB arithmetic produced.
+        assert_eq!(legacy_build_caps(16, 16 * 1024 * 1024 * 1024), (8, 8));
+        // The reference box (3 vCPU / 4 GB) lands on both floors.
+        assert_eq!(legacy_build_caps(3, 4_092_583_936), (2, 2));
+        assert_eq!(legacy_build_caps(1, 1024 * 1024 * 1024), (2, 2));
+    }
+
+    #[test]
+    fn clamp_build_memory_reduces_only_above_the_api_maximum() {
+        assert_eq!(clamp_build_memory(512 * 1024 * 1024), (536_870_912, false));
+        assert_eq!(clamp_build_memory(i32::MAX as i64), (i32::MAX, false));
+        assert_eq!(clamp_build_memory(8 * 1024 * 1024 * 1024), (i32::MAX, true));
+        assert_eq!(clamp_build_memory(-1), (0, false));
+    }
+
+    #[test]
+    fn docker_host_is_local_only_for_unset_or_socket_hosts() {
+        assert!(docker_host_is_local(None));
+        assert!(docker_host_is_local(Some("")));
+        assert!(docker_host_is_local(Some("unix:///var/run/docker.sock")));
+        assert!(docker_host_is_local(Some("npipe:////./pipe/docker_engine")));
+        assert!(!docker_host_is_local(Some("tcp://10.0.0.5:2376")));
+        assert!(!docker_host_is_local(Some("ssh://build@10.0.0.5")));
+    }
+
+    #[test]
+    fn parse_oom_kill_count_reads_the_vmstat_counter() {
+        let vmstat = "nr_free_pages 12345\noom_kill 3\nswap_ra 0\n";
+        assert_eq!(parse_oom_kill_count(vmstat), Some(3));
+        assert_eq!(parse_oom_kill_count("nr_free_pages 12345\n"), None);
+        assert_eq!(parse_oom_kill_count("oom_kill nope\n"), None);
+    }
+
+    #[test]
+    fn build_step_exit_code_reads_buildkit_and_legacy_phrasing() {
+        let buildkit = "Build failed: Docker stream error: process \"/bin/sh -c npm run build\" \
+                        did not complete successfully: exit code: 137";
+        assert_eq!(build_step_exit_code(buildkit), Some(137));
+        let legacy = "The command '/bin/sh -c npm run build' returned a non-zero code: 1";
+        assert_eq!(build_step_exit_code(legacy), Some(1));
+        assert_eq!(
+            build_step_exit_code("failed to resolve source metadata"),
+            None
+        );
+    }
+
+    fn runtime_for_diagnosis(use_buildkit: bool) -> Option<DockerRuntime> {
+        let docker = Docker::connect_with_local_defaults().ok()?;
+        Some(
+            DockerRuntime::new(docker.into(), use_buildkit, "test-network".to_string())
+                .with_build_limits(
+                    2,
+                    Some(BuildResourceLimits {
+                        cpu_cores: 1.0,
+                        memory_mb: 512,
+                    }),
+                ),
+        )
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_needs_a_kill_signal() {
+        let Some(rt) = runtime_for_diagnosis(true) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let cap = 512 * 1024 * 1024;
+        // A plain failure with no OOM kill on the host is not a memory failure.
+        // `u64::MAX` as the before-sample makes the delta zero whatever the
+        // host's counter says.
+        let plain = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                     successfully: exit code: 1";
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(plain, Some(7), Some(7), cap),
+            None
+        );
+        assert_eq!(rt.diagnose_out_of_memory_with(plain, None, None, cap), None);
+        // A SIGKILL with a readable counter that did not move came from
+        // something other than the kernel's OOM killer.
+        let killed = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                      successfully: exit code: 137";
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(killed, Some(7), Some(7), cap),
+            None
+        );
+        // The live wrapper only samples "after" when it sampled "before".
+        assert_eq!(rt.diagnose_out_of_memory(plain, None, cap), None);
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_from_the_sigkill_exit_status() {
+        let Some(rt) = runtime_for_diagnosis(true) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let killed = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                      successfully: exit code: 137";
+        let diagnosis = rt
+            .diagnose_out_of_memory_with(killed, None, None, 512 * 1024 * 1024)
+            .expect("exit code 137 is a kill signal without a readable counter");
+        assert_eq!(diagnosis.exit_code, Some(137));
+        assert_eq!(diagnosis.host_oom_kills, None);
+        assert_eq!(diagnosis.requested_cap_mb, 512);
+        assert!(!diagnosis.cap_enforced, "BuildKit does not apply the cap");
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_from_a_host_oom_kill_with_an_ordinary_exit_code() {
+        let Some(rt) = runtime_for_diagnosis(false) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        // The reported shape: a child of the build tool was killed, the tool
+        // itself exited 1, and the kernel's counter moved by one during the
+        // build.
+        let exited_one = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                          successfully: exit code: 1";
+        let diagnosis = rt
+            .diagnose_out_of_memory_with(exited_one, Some(7), Some(8), 2_147_483_647)
+            .expect("an OOM kill during the build is a memory failure");
+        assert_eq!(diagnosis.exit_code, Some(1));
+        assert_eq!(diagnosis.host_oom_kills, Some(1));
+        assert_eq!(diagnosis.requested_cap_mb, 2047);
+        assert!(diagnosis.cap_enforced, "the legacy builder applies the cap");
+        if rt.daemon_is_local {
+            assert!(diagnosis.host_memory_mb.unwrap_or(0) > 0);
+        }
     }
 }
