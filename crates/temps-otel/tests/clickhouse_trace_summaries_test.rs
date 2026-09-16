@@ -783,7 +783,7 @@ async fn has_traces_is_true_for_a_project_with_spans_and_false_otherwise() {
 
 #[tokio::test]
 async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
-    use temps_otel::storage::global_traces::{GlobalTraceQuery, TraceReadScope};
+    use temps_otel::storage::global_traces::{self, GlobalTraceQuery, TraceReadScope};
     let Some(h) = harness().await else { return };
     let now = Utc::now();
     let mut records = Vec::new();
@@ -852,11 +852,39 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
     sorted.filter.sort_by = TraceSortField::Duration;
     let page = h.storage.global_trace_page(sorted).await.unwrap();
     assert_eq!(page.data[0].trace_id, "global-024");
-    let mut raw = q;
+    let mut raw = q.clone();
     raw.summaries = false;
     let page = h.storage.global_trace_page(raw).await.unwrap();
     assert_eq!(page.data[0].span_id, "root");
     assert_eq!(page.total, 45);
+
+    let bulk = (0..5_001)
+        .map(|index| {
+            span(
+                601,
+                &format!("global-bulk-{index:04}"),
+                "root",
+                None,
+                "GET /bulk",
+                "api",
+                SpanStatusCode::Ok,
+                index % 60,
+                1.0,
+                None,
+                &[],
+            )
+        })
+        .collect();
+    h.storage.store_spans(bulk).await.unwrap();
+    let mut deep = q;
+    deep.filter.offset = Some(5_000);
+    deep.source_offset = 0;
+    let stream = global_traces::clickhouse(&h.probe, &deep, None)
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &deep).await.unwrap();
+    assert_eq!(page.total, 5_046);
+    assert_eq!(page.data.len(), 20);
 }
 
 #[tokio::test]
