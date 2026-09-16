@@ -400,6 +400,13 @@ impl BuildImageJob {
 
     /// Detect log level from message content
     fn detect_log_level(message: &str) -> LogLevel {
+        // The deployer prefixes its own failure lines with `ERROR:`. Check
+        // that before the substring heuristics below, which would otherwise
+        // file a daemon error that says "did not complete successfully"
+        // under `success`.
+        if message.trim_start().starts_with("ERROR:") {
+            return LogLevel::Error;
+        }
         if message.contains("✅") || message.contains("Complete") || message.contains("success") {
             LogLevel::Success
         } else if message.contains("❌")
@@ -2270,5 +2277,32 @@ mod tests {
             "got: {}",
             capped_msg
         );
+    }
+
+    #[test]
+    fn test_detect_log_level_files_deployer_error_lines_as_errors() {
+        // The daemon's step failure text contains "successfully"; the
+        // `ERROR:` prefix the deployer adds must win over that substring.
+        let daemon_error = "ERROR: Build failed: Docker stream error: process \"/bin/sh -c npm \
+                            run build\" did not complete successfully: exit code: 1";
+        assert!(matches!(
+            BuildImageJob::detect_log_level(daemon_error),
+            LogLevel::Error
+        ));
+        let memory_line = "ERROR: The build step ran out of memory: the kernel's OOM killer \
+                           terminated 1 process on this host while the step ran";
+        assert!(matches!(
+            BuildImageJob::detect_log_level(memory_line),
+            LogLevel::Error
+        ));
+        // Ordinary step output keeps the existing heuristics.
+        assert!(matches!(
+            BuildImageJob::detect_log_level("Image built successfully: app:latest"),
+            LogLevel::Success
+        ));
+        assert!(matches!(
+            BuildImageJob::detect_log_level("Creating an optimized production build ..."),
+            LogLevel::Info
+        ));
     }
 }
