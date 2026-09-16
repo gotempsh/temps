@@ -252,6 +252,15 @@ fn container_has_environment_value(
         })
 }
 
+fn is_managed_preview_gateway(container: &bollard::models::ContainerInspectResponse) -> bool {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(crate::preview_gateway::PREVIEW_GATEWAY_LABEL))
+        .is_some_and(|value| value == "true")
+}
+
 /// A recovered network-enabled container must satisfy the current policy,
 /// not merely still be running. This makes upgrades fail closed: a container
 /// left on the legacy outward-routed bridge is recreated by the registry and
@@ -2359,14 +2368,7 @@ impl DockerSandboxProvider {
             )
             .await
         {
-            Ok(info)
-                if info
-                    .config
-                    .as_ref()
-                    .and_then(|config| config.labels.as_ref())
-                    .and_then(|labels| labels.get(crate::preview_gateway::PREVIEW_GATEWAY_LABEL))
-                    .is_some_and(|value| value == "true") =>
-            {
+            Ok(info) if is_managed_preview_gateway(&info) => {
                 self.connect_container_to_network(gateway, network, None).await
             }
             Ok(_) => Err(AgentError::SandboxProviderUnavailable {
@@ -6153,6 +6155,36 @@ mod tests {
                 .map(String::as_str),
             Some("temps-preview-gateway-test")
         );
+    }
+
+    #[test]
+    fn sandbox_attaches_only_a_verified_preview_gateway_container() {
+        let managed = bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(
+                    crate::preview_gateway::PREVIEW_GATEWAY_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wrong_label = bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(
+                    crate::preview_gateway::PREVIEW_GATEWAY_LABEL.to_string(),
+                    "false".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(is_managed_preview_gateway(&managed));
+        assert!(!is_managed_preview_gateway(&wrong_label));
+        assert!(!is_managed_preview_gateway(
+            &bollard::models::ContainerInspectResponse::default()
+        ));
     }
 
     #[test]

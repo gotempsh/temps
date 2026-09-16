@@ -1801,6 +1801,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recreated_gateway_joins_existing_owned_sandbox_network() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-test-{suffix}");
+        let control_network = format!("temps-preview-gateway-control-test-{suffix}");
+        let sandbox_container = format!("temps-sandbox-test-{suffix}");
+        let sandbox_network = crate::sandbox::docker::sandbox_network_name(&sandbox_container);
+
+        ensure_network(&docker, &control_network)
+            .await
+            .expect("test control network should be created");
+        ensure_ingress_network(&docker)
+            .await
+            .expect("test ingress network should be available");
+        create_host_isolated_network(
+            &docker,
+            with_host_isolation(NetworkCreateRequest {
+                name: sandbox_network.clone(),
+                labels: Some(HashMap::from([
+                    (SANDBOX_NETWORK_OWNER_LABEL.to_string(), sandbox_container),
+                    (
+                        crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                        gateway_name.clone(),
+                    ),
+                ])),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("test sandbox network should be created");
+
+        let spec = PreviewGatewaySpec {
+            image: image.clone(),
+            container_name: gateway_name.clone(),
+            network: control_network.clone(),
+            host_port: 0,
+            shared_secret: String::new(),
+        };
+        let create_result = create_and_start(&docker, &spec, &image).await;
+        let attached = match &create_result {
+            Ok(()) => docker
+                .inspect_container(&gateway_name, None::<InspectContainerOptions>)
+                .await
+                .ok()
+                .and_then(|container| container.network_settings)
+                .and_then(|settings| settings.networks)
+                .is_some_and(|networks| networks.contains_key(&sandbox_network)),
+            Err(_) => false,
+        };
+
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        let _ = docker.remove_network(&sandbox_network).await;
+        let _ = docker.remove_network(&control_network).await;
+
+        create_result.expect("gateway recreation should succeed");
+        assert!(
+            attached,
+            "the recreated gateway must join the pre-existing owned sandbox network"
+        );
+    }
+
     #[test]
     fn local_gateway_images_are_inspected_without_registry_pull() {
         assert!(!should_pull_gateway_image("temps-preview-gateway:dev"));
