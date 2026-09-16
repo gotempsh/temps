@@ -731,6 +731,27 @@ fn ordered(sql: &Sql, q: &GlobalTraceQuery) -> String {
     )
 }
 
+fn ordered_with_row_cap(sql: &Sql, q: &GlobalTraceQuery, row_cap: u64) -> String {
+    let field = if q.filter.sort_by == TraceSortField::Duration {
+        "duration"
+    } else {
+        "start_ms"
+    };
+    let requested = q
+        .filter
+        .offset
+        .unwrap_or(0)
+        .saturating_add(q.filter.limit.unwrap_or(20).clamp(1, 100))
+        .saturating_sub(q.source_offset);
+    format!(
+        "{} ORDER BY {field} {}, project_id, trace_id, span_id LIMIT {} OFFSET {}",
+        sql.body,
+        q.filter.sort_order.as_sql(),
+        requested.min(row_cap),
+        q.source_offset
+    )
+}
+
 fn cloud_ordered_with_total(sql: &Sql, q: &GlobalTraceQuery) -> String {
     let field = if q.filter.sort_by == TraceSortField::Duration {
         "duration"
@@ -832,7 +853,10 @@ pub async fn clickhouse(
         });
     }
     if let Some(total) = candidate_total.filter(|_| refs.is_none()) {
-        let page_sql = ordered(&sql, q);
+        // This path buffers to put the entire decode under the timeout. Even
+        // if a caller bypasses CloudRouted's source-offset negotiation, the
+        // allocation cannot exceed the independently counted candidate cap.
+        let page_sql = ordered_with_row_cap(&sql, q, MAX_LIFETIME_CANDIDATES);
         let rows = tokio::time::timeout(
             LOCAL_LIFETIME_QUERY_BUDGET,
             ch_query(client, &page_sql, &sql.binds).fetch_all::<GlobalTraceRow>(),
@@ -1187,6 +1211,9 @@ mod tests {
         assert!(local
             .body
             .contains("ORDER BY span._version DESC LIMIT 1 BY project_id, trace_id, span_id"));
+        q.filter.offset = Some(1_000_000);
+        assert!(ordered_with_row_cap(&local, &q, MAX_LIFETIME_CANDIDATES)
+            .ends_with("LIMIT 5000 OFFSET 0"));
     }
 
     #[test]
