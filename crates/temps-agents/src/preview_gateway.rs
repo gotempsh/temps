@@ -153,6 +153,15 @@ pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 /// network, but never receives an externally routed interface.
 pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
 const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
+
+#[derive(Debug, thiserror::Error)]
+enum PreviewGatewayOwnershipError {
+    #[error("failed to load instance-owned sandboxes for preview gateway reconciliation")]
+    LoadSandboxes {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
 pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
 const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
@@ -453,14 +462,16 @@ fn managed_sandbox_network_name<'a>(
         .then_some(network_name)
 }
 
-async fn owned_legacy_sandbox_networks(db: &DatabaseConnection) -> Result<HashSet<String>> {
+async fn owned_legacy_sandbox_networks(
+    db: &DatabaseConnection,
+) -> std::result::Result<HashSet<String>, PreviewGatewayOwnershipError> {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     let rows = temps_entities::sandboxes::Entity::find()
         .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
         .all(db)
         .await
-        .context("failed to load instance-owned sandboxes for preview gateway reconciliation")?;
+        .map_err(|source| PreviewGatewayOwnershipError::LoadSandboxes { source })?;
 
     Ok(rows
         .into_iter()
