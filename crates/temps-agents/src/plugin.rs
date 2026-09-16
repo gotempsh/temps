@@ -63,17 +63,49 @@ impl AgentSyncService for AgentConfigSyncAdapter {
 /// Maximum number of simultaneous active runs per project.
 const MAX_CONCURRENT_RUNS_PER_PROJECT: u64 = 5;
 
+#[derive(Debug)]
+struct AgentPlatformSettings {
+    agent_sandbox: temps_core::AgentSandboxSettings,
+    preview_gateway: temps_core::PreviewGatewaySettings,
+}
+
 fn decode_platform_settings(
     data: Option<serde_json::Value>,
-) -> Result<temps_core::AppSettings, PluginError> {
-    data.map(serde_json::from_value::<temps_core::AppSettings>)
+) -> Result<AgentPlatformSettings, PluginError> {
+    let Some(data) = data else {
+        return Ok(AgentPlatformSettings {
+            agent_sandbox: Default::default(),
+            preview_gateway: Default::default(),
+        });
+    };
+    let object = data.as_object().ok_or_else(|| {
+        PluginError::InitializationFailed(
+            "decode sandbox and preview-gateway settings: settings row is not an object".into(),
+        )
+    })?;
+    let agent_sandbox = object
+        .get("agent_sandbox")
+        .cloned()
+        .map(serde_json::from_value)
         .transpose()
         .map_err(|error| {
-            PluginError::InitializationFailed(format!(
-                "decode sandbox and preview-gateway settings: {error}"
-            ))
-        })
-        .map(Option::unwrap_or_default)
+            PluginError::InitializationFailed(format!("decode agent_sandbox settings: {error}"))
+        })?
+        .unwrap_or_default();
+    let preview_gateway = object
+        .get("preview_gateway")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            PluginError::InitializationFailed(format!("decode preview_gateway settings: {error}"))
+        })?
+        .unwrap_or_default();
+
+    Ok(AgentPlatformSettings {
+        agent_sandbox,
+        preview_gateway,
+    })
 }
 
 /// Narrow a list of trigger-matching agents down to the agent the trigger
@@ -841,7 +873,23 @@ mod tests {
         assert!(matches!(error, PluginError::InitializationFailed(_)));
         assert!(error
             .to_string()
-            .contains("decode sandbox and preview-gateway settings"));
+            .contains("decode preview_gateway settings"));
+    }
+
+    #[test]
+    fn malformed_unrelated_settings_do_not_disable_agents() {
+        let settings = decode_platform_settings(Some(serde_json::json!({
+            "preview_gateway": {
+                "container_name": "temps-preview-gateway-instance-b"
+            },
+            "letsencrypt": "malformed but unrelated"
+        })))
+        .expect("unrelated settings must be isolated from agent startup");
+
+        assert_eq!(
+            crate::preview_gateway::container_name(&settings.preview_gateway),
+            "temps-preview-gateway-instance-b"
+        );
     }
 
     #[test]

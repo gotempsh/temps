@@ -558,13 +558,17 @@ fn preview_gateway_network_matches_policy(network: &bollard::models::NetworkInsp
 }
 
 async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
+    ensure_ingress_network_named(docker, PREVIEW_GATEWAY_INGRESS_NETWORK).await
+}
+
+async fn ensure_ingress_network_named(docker: &Docker, network_name: &str) -> Result<()> {
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
         .context("failed to list Docker networks for preview ingress")?;
     if let Some(network) = networks
         .iter()
-        .find(|network| network.name.as_deref() == Some(PREVIEW_GATEWAY_INGRESS_NETWORK))
+        .find(|network| network.name.as_deref() == Some(network_name))
     {
         let policy_matches = network
             .labels
@@ -587,22 +591,27 @@ async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
         {
             return Err(anyhow!(
                 "existing preview ingress network {} does not match the managed bridge policy",
-                PREVIEW_GATEWAY_INGRESS_NETWORK
+                network_name
             ));
         }
         return Ok(());
     }
 
     docker
-        .create_network(preview_gateway_ingress_network_request())
+        .create_network(preview_gateway_ingress_network_request_named(network_name))
         .await
         .context("failed to create preview gateway ingress network")?;
     Ok(())
 }
 
+#[cfg(test)]
 fn preview_gateway_ingress_network_request() -> NetworkCreateRequest {
+    preview_gateway_ingress_network_request_named(PREVIEW_GATEWAY_INGRESS_NETWORK)
+}
+
+fn preview_gateway_ingress_network_request_named(network_name: &str) -> NetworkCreateRequest {
     NetworkCreateRequest {
-        name: PREVIEW_GATEWAY_INGRESS_NETWORK.to_string(),
+        name: network_name.to_string(),
         driver: Some("bridge".to_string()),
         internal: Some(false),
         enable_ipv6: Some(false),
@@ -968,6 +977,23 @@ async fn create_and_start(
     ingress_image: &str,
     legacy_owned_networks: &HashSet<String>,
 ) -> Result<()> {
+    create_and_start_on_ingress(
+        docker,
+        spec,
+        ingress_image,
+        legacy_owned_networks,
+        PREVIEW_GATEWAY_INGRESS_NETWORK,
+    )
+    .await
+}
+
+async fn create_and_start_on_ingress(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    ingress_image: &str,
+    legacy_owned_networks: &HashSet<String>,
+    ingress_network: &str,
+) -> Result<()> {
     let container_port_key = format!("{}/tcp", GATEWAY_CONTAINER_PORT);
     let exposed_ports: Vec<String> = vec![container_port_key.clone()];
 
@@ -1044,7 +1070,8 @@ async fn create_and_start(
         return Err(error);
     }
 
-    if let Err(error) = create_and_start_ingress(docker, spec, ingress_image).await {
+    if let Err(error) = create_and_start_ingress(docker, spec, ingress_image, ingress_network).await
+    {
         let _ = remove_gateway_pair(docker, &spec.container_name).await;
         return Err(error);
     }
@@ -1056,6 +1083,7 @@ async fn create_and_start_ingress(
     docker: &Docker,
     spec: &PreviewGatewaySpec,
     ingress_image: &str,
+    ingress_network: &str,
 ) -> Result<()> {
     let name = ingress_container_name(&spec.container_name);
     let container_port_key = format!("{GATEWAY_CONTAINER_PORT}/tcp");
@@ -1084,7 +1112,7 @@ async fn create_and_start_ingress(
             PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
         )])),
         host_config: Some(HostConfig {
-            network_mode: Some(PREVIEW_GATEWAY_INGRESS_NETWORK.to_string()),
+            network_mode: Some(ingress_network.to_string()),
             port_bindings: Some(port_bindings),
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
@@ -1869,29 +1897,9 @@ mod tests {
         );
         let gateway_name = format!("temps-preview-gateway-test-{suffix}");
         let control_network = format!("temps-preview-gateway-control-test-{suffix}");
+        let ingress_network = format!("temps-preview-gateway-ingress-test-{suffix}");
         let sandbox_container = format!("temps-sandbox-test-{suffix}");
         let sandbox_network = crate::sandbox::docker::sandbox_network_name(&sandbox_container);
-
-        ensure_network(&docker, &control_network)
-            .await
-            .expect("test control network should be created");
-        ensure_ingress_network(&docker)
-            .await
-            .expect("test ingress network should be available");
-        create_host_isolated_network(
-            &docker,
-            with_host_isolation(NetworkCreateRequest {
-                name: sandbox_network.clone(),
-                labels: Some(HashMap::from([(
-                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
-                    sandbox_container,
-                )])),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("test sandbox network should be created");
-
         let spec = PreviewGatewaySpec {
             image: image.clone(),
             container_name: gateway_name.clone(),
@@ -1899,41 +1907,54 @@ mod tests {
             host_port: 0,
             shared_secret: String::new(),
         };
-        create_and_start(&docker, &spec, &image, &HashSet::new())
-            .await
-            .expect("legacy gateway fixture should start");
-        docker
-            .connect_network(
-                &sandbox_network,
-                bollard::models::NetworkConnectRequest {
-                    container: gateway_name.clone(),
-                    endpoint_config: None,
-                },
+        let test_result: Result<bool> = async {
+            ensure_network(&docker, &control_network).await?;
+            ensure_ingress_network_named(&docker, &ingress_network).await?;
+            create_host_isolated_network(
+                &docker,
+                with_host_isolation(NetworkCreateRequest {
+                    name: sandbox_network.clone(),
+                    labels: Some(HashMap::from([(
+                        SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                        sandbox_container,
+                    )])),
+                    ..Default::default()
+                }),
             )
-            .await
-            .expect("legacy gateway fixture should already own the sandbox network");
-        let preserved = HashSet::from([sandbox_network.clone()]);
+            .await?;
 
-        remove_gateway_pair(&docker, &gateway_name)
-            .await
-            .expect("legacy gateway fixture should be removable");
-        let create_result = create_and_start(&docker, &spec, &image, &preserved).await;
-        let attached = match &create_result {
-            Ok(()) => docker
+            create_and_start_on_ingress(&docker, &spec, &image, &HashSet::new(), &ingress_network)
+                .await?;
+            docker
+                .connect_network(
+                    &sandbox_network,
+                    bollard::models::NetworkConnectRequest {
+                        container: gateway_name.clone(),
+                        endpoint_config: None,
+                    },
+                )
+                .await?;
+            let preserved = HashSet::from([sandbox_network.clone()]);
+
+            remove_gateway_pair(&docker, &gateway_name).await?;
+            create_and_start_on_ingress(&docker, &spec, &image, &preserved, &ingress_network)
+                .await?;
+            Ok(docker
                 .inspect_container(&gateway_name, None::<InspectContainerOptions>)
                 .await
                 .ok()
                 .and_then(|container| container.network_settings)
                 .and_then(|settings| settings.networks)
-                .is_some_and(|networks| networks.contains_key(&sandbox_network)),
-            Err(_) => false,
-        };
+                .is_some_and(|networks| networks.contains_key(&sandbox_network)))
+        }
+        .await;
 
         let _ = remove_gateway_pair(&docker, &gateway_name).await;
         let _ = docker.remove_network(&sandbox_network).await;
+        let _ = docker.remove_network(&ingress_network).await;
         let _ = docker.remove_network(&control_network).await;
 
-        create_result.expect("gateway recreation should succeed");
+        let attached = test_result.expect("gateway recreation should succeed");
         assert!(
             attached,
             "the recreated custom gateway must preserve its DB-owned legacy sandbox network"
