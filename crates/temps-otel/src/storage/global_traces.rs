@@ -852,7 +852,7 @@ pub async fn clickhouse(
             rows: Box::pin(futures::stream::iter(rows)),
         });
     }
-    if let Some(total) = candidate_total.filter(|_| refs.is_none()) {
+    if let Some(total) = candidate_total.filter(|_| refs.is_none() && use_lifetime_values) {
         // This path buffers to put the entire decode under the timeout. Even
         // if a caller bypasses CloudRouted's source-offset negotiation, the
         // allocation cannot exceed the independently counted candidate cap.

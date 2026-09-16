@@ -144,8 +144,8 @@ impl GlobalLogSearchRequest {
         {
             return Err(invalid("Choose a log window between zero and 24 hours"));
         }
-        if !(1..=500).contains(&self.page_size.unwrap_or(100)) {
-            return Err(invalid("Page size must be between 1 and 500"));
+        if !(1..=100).contains(&self.page_size.unwrap_or(100)) {
+            return Err(invalid("Page size must be between 1 and 100"));
         }
         for values in [
             &self.projects,
@@ -685,6 +685,18 @@ mod tests {
     }
 
     #[test]
+    fn global_page_size_is_capped_at_one_hundred() {
+        let mut q = request();
+        q.page_size = Some(101);
+
+        let error = q.validate().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Page size must be between 1 and 100"));
+    }
+
+    #[test]
     fn global_cursor_is_exact_and_bound_to_filters() {
         let mut q = request();
         let key = (
@@ -801,7 +813,7 @@ mod tests {
             "all projects and services, no timestamp-tie gaps"
         );
         q = request();
-        q.page_size = Some(500);
+        q.page_size = Some(100);
         let restricted = GlobalLogAccess {
             hidden_projects: vec![110],
             bound_project: None,
@@ -809,7 +821,7 @@ mod tests {
             user_id: Some(7),
         };
         let result = service.search_global(&q, &restricted).await.unwrap();
-        assert_eq!(result.lines.len(), 220); // 109 projects + shared service
+        assert_eq!(result.lines.len(), 100);
         assert!(result.lines.iter().all(|line| line.project_id != Some(110)
             && !matches!(line.external_service_id, Some(202 | 203))));
         let token = GlobalLogAccess {
@@ -950,7 +962,7 @@ mod tests {
         // oversized project-105 chunk and is reached only if the frontier
         // predicate is applied in the correct direction.
         q.text = Some("message 1:0".into());
-        q.page_size = Some(500);
+        q.page_size = Some(100);
         q.cursor = None;
         let empty_window = service.search_global(&q, &unrestricted).await.unwrap();
         assert!(empty_window.scan_limit_reached);
