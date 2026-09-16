@@ -712,7 +712,6 @@ impl MarkDeploymentCompleteJob {
             "Rollback target resolved for route-table timeout"
         );
 
-        let active_environment: environments::ActiveModel = environment.clone().into();
         if !self.promote_if_latest(self.deployment_id).await? {
             return Err(WorkflowError::JobExecutionFailed(format!(
                 "Deployment {} was cancelled or superseded before route promotion",
@@ -1053,7 +1052,7 @@ impl MarkDeploymentCompleteJob {
         // Get deployment URL from environment: prefer custom host, fall back to preview domain.
         // Use the scheme from external_url so HTTP-only installs (sslip.io quick/local
         // modes) don't emit dead https:// links for custom-host environments.
-        let url = if !active_environment.host.as_ref().is_empty() {
+        let url = if !environment.host.is_empty() {
             let scheme = if let Some(ref cs) = self.config_service {
                 cs.get_url_scheme()
                     .await
@@ -1061,12 +1060,12 @@ impl MarkDeploymentCompleteJob {
             } else {
                 "https".to_string()
             };
-            Some(format!("{}://{}", scheme, active_environment.host.as_ref()))
-        } else if !active_environment.subdomain.as_ref().is_empty() {
+            Some(format!("{}://{}", scheme, environment.host))
+        } else if !environment.subdomain.is_empty() {
             // No custom host set — construct URL from preview domain
             if let Some(ref config_service) = self.config_service {
                 match config_service
-                    .get_deployment_url_by_slug(active_environment.subdomain.as_ref())
+                    .get_deployment_url_by_slug(&environment.subdomain)
                     .await
                 {
                     Ok(preview_url) => Some(preview_url),
@@ -1093,7 +1092,7 @@ impl MarkDeploymentCompleteJob {
             deployment_id: self.deployment_id,
             project_id: deployment.project_id,
             environment_id,
-            environment_name: active_environment.name.as_ref().clone(),
+            environment_name: environment.name.clone(),
             commit_sha: deployment.commit_sha.clone(),
             url,
             health_check_path,

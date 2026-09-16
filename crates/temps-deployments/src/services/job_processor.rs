@@ -272,45 +272,51 @@ impl JobProcessorService {
             }
         }
 
-        let duplicate_query = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "deploying",
-                "built",
-                "ready",
-            ]));
-        let duplicate_query = if let Some(source_deployment_id) = recovery_of_deployment_id {
-            duplicate_query.filter(deployments::Column::Id.ne(source_deployment_id))
-        } else {
-            duplicate_query
-        };
-        let duplicate_query = match duplicate_key {
-            DeploymentDuplicateKey::Commit(commit) => {
-                duplicate_query.filter(deployments::Column::CommitSha.eq(commit))
-            }
-            DeploymentDuplicateKey::Image(image) => {
-                duplicate_query.filter(deployments::Column::ImageName.eq(image))
-            }
-        };
-        if let Some(existing) = duplicate_query
-            .order_by_desc(deployments::Column::CreatedAt)
-            .order_by_desc(deployments::Column::Id)
-            .one(&transaction)
-            .await
-            .map_err(|error| creation_error("check duplicate generations before creating", error))?
-        {
-            let outcome = DeploymentCreationOutcome::Duplicate {
-                deployment_id: existing.id,
-                state: existing.state,
+        let should_check_duplicate = recovery_of_deployment_id.is_some()
+            || matches!(&duplicate_key, DeploymentDuplicateKey::Commit(_));
+        if should_check_duplicate {
+            let duplicate_query = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::State.is_in(vec![
+                    "pending",
+                    "running",
+                    "deploying",
+                    "built",
+                    "ready",
+                ]));
+            let duplicate_query = if let Some(source_deployment_id) = recovery_of_deployment_id {
+                duplicate_query.filter(deployments::Column::Id.ne(source_deployment_id))
+            } else {
+                duplicate_query
             };
-            transaction
-                .commit()
+            let duplicate_query = match duplicate_key {
+                DeploymentDuplicateKey::Commit(commit) => {
+                    duplicate_query.filter(deployments::Column::CommitSha.eq(commit))
+                }
+                DeploymentDuplicateKey::Image(image) => {
+                    duplicate_query.filter(deployments::Column::ImageName.eq(image))
+                }
+            };
+            if let Some(existing) = duplicate_query
+                .order_by_desc(deployments::Column::CreatedAt)
+                .order_by_desc(deployments::Column::Id)
+                .one(&transaction)
                 .await
-                .map_err(|error| creation_error("finish duplicate validation for", error))?;
-            return Ok(outcome);
+                .map_err(|error| {
+                    creation_error("check duplicate generations before creating", error)
+                })?
+            {
+                let outcome = DeploymentCreationOutcome::Duplicate {
+                    deployment_id: existing.id,
+                    state: existing.state,
+                };
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| creation_error("finish duplicate validation for", error))?;
+                return Ok(outcome);
+            }
         }
 
         let cancellation_events = cancel_in_flight_deployments(
@@ -2724,6 +2730,213 @@ mod tests {
             .expect("reload source")
             .expect("source exists");
         assert_eq!(source.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_explicit_image_redeploy_same_image_creates_and_supersedes_in_flight() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping explicit image redeploy regression test");
+            return;
+        }
+
+        // Arrange: a different deployment is currently routed while an
+        // explicit image deployment using the requested image is still in
+        // flight. Re-requesting that image is intentional, not a duplicate.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let routed = generation_model(
+            project_id,
+            environment_id,
+            "routed",
+            "running",
+            "routed-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert routed deployment");
+        set_current_deployment(db.as_ref(), environment_id, routed.id).await;
+
+        let image_ref = "registry.example/app:immutable";
+        let mut obsolete_model = generation_model(
+            project_id,
+            environment_id,
+            "obsolete-image-deployment",
+            "pending",
+            "obsolete-image-request",
+            now + chrono::Duration::seconds(1),
+        );
+        obsolete_model.image_name = Set(Some(image_ref.to_string()));
+        let obsolete = obsolete_model
+            .insert(db.as_ref())
+            .await
+            .expect("insert in-flight image deployment");
+        let mut requested_model = generation_model(
+            project_id,
+            environment_id,
+            "explicit-image-redeploy",
+            "pending",
+            "new-image-request",
+            now + chrono::Duration::seconds(2),
+        );
+        requested_model.image_name = Set(Some(image_ref.to_string()));
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::Image(image_ref.to_string()),
+            requested_model,
+        )
+        .await
+        .expect("create explicit image redeploy");
+
+        // Assert: a fresh generation wins and the older non-routed work is
+        // superseded even though both rows reference the same image.
+        let created = match outcome {
+            DeploymentCreationOutcome::Created {
+                deployment,
+                cancellation_events,
+            } => {
+                assert_eq!(cancellation_events.len(), 1);
+                match &cancellation_events[0] {
+                    Job::DeploymentCancelled(event) => {
+                        assert_eq!(event.deployment_id, obsolete.id)
+                    }
+                    other => panic!("unexpected cancellation event: {other:?}"),
+                }
+                deployment
+            }
+            DeploymentCreationOutcome::Duplicate { deployment_id, .. } => panic!(
+                "explicit image redeploy must create a fresh generation, not reuse {deployment_id}"
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary image redeploy cannot be stale recovery")
+            }
+        };
+        assert_ne!(created.id, obsolete.id);
+        assert_eq!(created.state, "pending");
+        assert_eq!(created.image_name.as_deref(), Some(image_ref));
+
+        let obsolete = deployments::Entity::find_by_id(obsolete.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload superseded image deployment")
+            .expect("superseded image deployment exists");
+        assert_eq!(obsolete.state, "cancelled");
+        assert_eq!(
+            obsolete.cancelled_reason.as_deref(),
+            Some("Superseded by a newer deployment for this environment")
+        );
+        let routed = deployments::Entity::find_by_id(routed.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload routed deployment")
+            .expect("routed deployment exists");
+        assert_eq!(routed.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_git_same_commit_remains_deduplicated() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping ordinary Git deduplication regression test");
+            return;
+        }
+
+        // Arrange: a Git delivery for this commit is already pending and is
+        // not the currently routed deployment.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let routed = generation_model(
+            project_id,
+            environment_id,
+            "routed",
+            "running",
+            "routed-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert routed deployment");
+        set_current_deployment(db.as_ref(), environment_id, routed.id).await;
+        let existing = generation_model(
+            project_id,
+            environment_id,
+            "existing-git-delivery",
+            "pending",
+            "same-commit",
+            now + chrono::Duration::seconds(1),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert pending Git deployment");
+
+        // Act
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::Commit("same-commit".to_string()),
+            generation_model(
+                project_id,
+                environment_id,
+                "duplicate-git-delivery",
+                "pending",
+                "same-commit",
+                now + chrono::Duration::seconds(2),
+            ),
+        )
+        .await
+        .expect("deduplicate ordinary Git delivery");
+
+        // Assert
+        match outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, existing.id);
+                assert_eq!(state, "pending");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "ordinary Git same-commit delivery must reuse {}, created {}",
+                existing.id, deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary Git delivery cannot be stale recovery")
+            }
+        }
+        let rows = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .all(db.as_ref())
+            .await
+            .expect("reload environment deployments");
+        assert_eq!(rows.len(), 2, "deduplication must not insert a new row");
+        let existing = rows
+            .iter()
+            .find(|deployment| deployment.id == existing.id)
+            .expect("existing Git deployment remains");
+        assert_eq!(existing.state, "pending");
+        let routed = rows
+            .iter()
+            .find(|deployment| deployment.id == routed.id)
+            .expect("routed deployment remains");
+        assert_eq!(routed.state, "running");
     }
 
     #[tokio::test]
