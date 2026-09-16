@@ -52,8 +52,17 @@ pub use platform::{
 pub enum OomAttribution {
     /// The step's own process was killed (exit status 137).
     StepKilled,
-    /// The kernel log named a process in a build step's cgroup as the victim.
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// and no other build was running.
     VictimWasBuildStep,
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// while other builds were running; it died within seconds of this
+    /// step's failure, which is what a killed child of the step looks like,
+    /// but it could belong to one of the other builds.
+    VictimWasBuildStepConcurrent {
+        other_builds: usize,
+        seconds_before_failure: u32,
+    },
     /// A process on the host was killed while this was the only build
     /// running; the kernel log was not readable to confirm which one.
     OnlyBuildRunning,
@@ -93,7 +102,8 @@ impl std::fmt::Display for BuildMemoryDiagnosis {
             OomAttribution::StepKilled | OomAttribution::VictimWasBuildStep => {
                 write!(f, "The build step ran out of memory")?
             }
-            OomAttribution::OnlyBuildRunning => {
+            OomAttribution::VictimWasBuildStepConcurrent { .. }
+            | OomAttribution::OnlyBuildRunning => {
                 write!(f, "The build step most likely ran out of memory")?
             }
         }
@@ -109,10 +119,21 @@ impl std::fmt::Display for BuildMemoryDiagnosis {
             _ => {}
         }
         if let Some(victim) = &self.victim {
-            write!(f, "; the killed process was `{victim}`")?;
+            write!(f, "; the killed process was `{victim}` in a build step")?;
         }
-        if self.attribution == OomAttribution::OnlyBuildRunning {
-            write!(f, "; no other build was running")?;
+        match self.attribution {
+            OomAttribution::OnlyBuildRunning | OomAttribution::VictimWasBuildStep => {
+                write!(f, "; no other build was running")?
+            }
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds,
+                seconds_before_failure,
+            } => write!(
+                f,
+                ", killed {seconds_before_failure} s before this step failed while {other_builds} \
+                 other build(s) were running, so it may belong to one of them"
+            )?,
+            OomAttribution::StepKilled => {}
         }
         match self.exit_code {
             Some(137) => write!(f, "; the step's process was killed (exit code 137)")?,
@@ -1525,8 +1546,11 @@ CMD ["echo", "Hello from container"]
             "{text}"
         );
         assert!(text.contains("terminated 1 process on this host"), "{text}");
-        assert!(text.contains("the killed process was `node`"), "{text}");
-        assert!(!text.contains("no other build was running"), "{text}");
+        assert!(
+            text.contains("the killed process was `node` in a build step"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
         assert!(
             text.contains("exited with code 1 after one of its processes was killed"),
             "{text}"
@@ -1582,5 +1606,30 @@ CMD ["echo", "Hello from container"]
             "{text}"
         );
         assert!(text.contains("; no other build was running"), "{text}");
+
+        let concurrent = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: 1,
+                seconds_before_failure: 0,
+            },
+            victim: Some("node".into()),
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = concurrent.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`node` in a build step, killed 0 s before this step failed while 1 other \
+                 build(s) were running, so it may belong to one of them"
+            ),
+            "{text}"
+        );
     }
 }

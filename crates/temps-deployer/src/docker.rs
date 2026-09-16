@@ -723,9 +723,12 @@ pub struct DockerRuntime {
     /// taking down the box. None on worker nodes and in tests — they get
     /// the legacy unbounded behaviour.
     build_semaphore: Option<Arc<tokio::sync::Semaphore>>,
-    /// Size of `build_semaphore`, so a failure can tell how many other builds
-    /// were in flight at the time.
+    /// Size of `build_semaphore`, so a build can tell how many other builds
+    /// were in flight when it started.
     build_permits: Option<usize>,
+    /// Builds started on this runtime so far, so a build can tell how many
+    /// others started while it ran.
+    builds_started: Arc<std::sync::atomic::AtomicU64>,
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
@@ -744,12 +747,23 @@ pub struct DockerRuntime {
     daemon_platform: Arc<std::sync::OnceLock<String>>,
 }
 
-/// Host readings taken before a build starts, for attributing a failure.
+/// Readings taken when a build starts, for attributing a later failure.
 #[derive(Debug, Clone, Copy)]
-struct HostSample {
+struct BuildStartSample {
+    /// Kernel OOM-kill counter, when the daemon is on this host.
     oom_kills: Option<u64>,
+    /// Boot-relative clock, when the daemon is on this host.
     uptime_us: Option<u64>,
+    /// Other builds holding a permit at that moment (`None`: no semaphore).
+    others_at_start: Option<usize>,
+    /// `builds_started` at that moment.
+    builds_started: u64,
 }
+
+/// Kernel log timestamps and `/proc/uptime` come from different clocks and
+/// `/proc/uptime` has 10 ms resolution; a kill logged this much after the
+/// observed failure still counts as before it.
+const CLOCK_SLOP_US: u64 = 1_000_000;
 
 /// Everything the host could tell about a failed step, gathered after it.
 #[derive(Debug, Clone, Default)]
@@ -758,8 +772,10 @@ struct MemorySignals {
     oom_kills: Option<u64>,
     /// Victims named by the kernel log (`None`: log not readable).
     victims: Option<Vec<OomVictim>>,
-    /// Other builds holding a permit at failure time (`None`: unknown).
+    /// Other builds that overlapped this one at any point (`None`: unknown).
     other_builds: Option<usize>,
+    /// When the step's failure was observed, microseconds since boot.
+    failed_at_us: Option<u64>,
 }
 
 /// Outcome of looking at a failed step through `MemorySignals`.
@@ -933,7 +949,14 @@ struct OomVictim {
     comm: String,
     /// Memory cgroup of the victim (`task_memcg=`).
     cgroup: String,
+    /// When the kernel logged the kill, microseconds since boot.
+    at_us: u64,
 }
+
+/// How long after an OOM kill a build step is still considered its victim
+/// when other builds were running. A killed child ends its parent build tool
+/// within milliseconds; the window leaves room for slow shutdown paths.
+const OOM_KILL_ATTRIBUTION_WINDOW_US: u64 = 10 * 1_000_000;
 
 /// Whether a memory cgroup path belongs to a BuildKit build step rather than
 /// a container. dockerd runs BuildKit steps under its default cgroup parent
@@ -980,6 +1003,7 @@ fn parse_oom_victims(kmsg: &str, since_us: u64) -> Vec<OomVictim> {
             Some(OomVictim {
                 comm: field("task=")?,
                 cgroup: field("task_memcg=")?,
+                at_us: timestamp,
             })
         })
         .collect()
@@ -1244,6 +1268,7 @@ impl DockerRuntime {
             secrets_root,
             build_semaphore: None,
             build_permits: None,
+            builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             build_resource_override: None,
             daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
@@ -1869,23 +1894,16 @@ impl DockerRuntime {
     fn diagnose_out_of_memory(
         &self,
         error_text: &str,
-        before: Option<&HostSample>,
+        start: &BuildStartSample,
         requested_cap_bytes: i64,
     ) -> MemoryVerdict {
-        let Some(before) = before else {
-            return self.diagnose_out_of_memory_with(
-                error_text,
-                &MemorySignals::default(),
-                requested_cap_bytes,
-            );
-        };
-        let oom_kills = match (before.oom_kills, host_oom_kill_count()) {
+        let oom_kills = match (start.oom_kills, host_oom_kill_count()) {
             (Some(b), Some(a)) => Some(a.saturating_sub(b)),
             _ => None,
         };
         // Only read the kernel log when something was killed; it is a
         // privileged read and the ring buffer can be large.
-        let victims = match (oom_kills, before.uptime_us) {
+        let victims = match (oom_kills, start.uptime_us) {
             (Some(kills), Some(since)) if kills > 0 => {
                 read_kernel_log().map(|log| parse_oom_victims(&log, since))
             }
@@ -1894,7 +1912,8 @@ impl DockerRuntime {
         let signals = MemorySignals {
             oom_kills,
             victims,
-            other_builds: self.other_builds_in_flight(),
+            other_builds: self.other_builds_since(start),
+            failed_at_us: self.daemon_is_local.then(uptime_us).flatten(),
         };
         self.diagnose_out_of_memory_with(error_text, &signals, requested_cap_bytes)
     }
@@ -1902,10 +1921,13 @@ impl DockerRuntime {
     /// [`Self::diagnose_out_of_memory`] with the host signals supplied.
     ///
     /// A kill is attributed to this build when the step's own process was
-    /// killed (exit 137), when the kernel log names a build step's cgroup as
-    /// the victim, or when a process was killed while no other build was
-    /// running. A kill the log attributes to something else, or one that
-    /// happened while other builds ran, is reported as a note instead.
+    /// killed (exit 137), or when the kernel log names a build step's process
+    /// killed within [`OOM_KILL_ATTRIBUTION_WINDOW_US`] of this step's
+    /// failure (a killed child ends its parent tool within milliseconds):
+    /// as fact when no other build overlapped this one, as "most likely"
+    /// otherwise. With the log unreadable, a kill while this was the only
+    /// build is "most likely" too. Anything else, including a build-step
+    /// kill long before this failure, is a note in the build log.
     fn diagnose_out_of_memory_with(
         &self,
         error_text: &str,
@@ -1915,37 +1937,63 @@ impl DockerRuntime {
         let exit_code = build_step_exit_code(error_text);
         let step_killed = exit_code == Some(SIGKILL_EXIT_CODE);
         let kills = signals.oom_kills;
-        let build_victim = signals
-            .victims
-            .as_ref()
-            .and_then(|victims| victims.iter().find(|v| cgroup_is_build_step(&v.cgroup)));
+        // The latest build-step victim killed before this step failed
+        // (allowing for the clocks not agreeing exactly).
+        let build_victim = signals.victims.as_ref().and_then(|victims| {
+            victims
+                .iter()
+                .filter(|v| cgroup_is_build_step(&v.cgroup))
+                .filter(|v| {
+                    signals
+                        .failed_at_us
+                        .is_none_or(|t| v.at_us <= t.saturating_add(CLOCK_SLOP_US))
+                })
+                .max_by_key(|v| v.at_us)
+        });
         let other_victim = signals
             .victims
             .as_ref()
             .and_then(|victims| victims.first())
             .filter(|_| build_victim.is_none());
+        let alone = signals.other_builds == Some(0);
+        let since_kill_us = build_victim
+            .zip(signals.failed_at_us)
+            .map(|(v, t)| t.saturating_sub(v.at_us));
+        // With the clock known, only a kill shortly before this failure can
+        // be this step's own child; without it, any build-step kill counts.
+        let victim_in_window = build_victim.is_some()
+            && since_kill_us.is_none_or(|elapsed| elapsed <= OOM_KILL_ATTRIBUTION_WINDOW_US);
 
         let attribution = if step_killed
             && kills.is_none_or(|k| k > 0)
-            && (signals.victims.is_none() || build_victim.is_some())
+            && (signals.victims.is_none() || victim_in_window)
         {
             OomAttribution::StepKilled
-        } else if build_victim.is_some() {
+        } else if victim_in_window && alone {
             OomAttribution::VictimWasBuildStep
-        } else if kills.is_some_and(|k| k > 0)
-            && signals.victims.is_none()
-            && signals.other_builds == Some(0)
-        {
+        } else if victim_in_window {
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: signals.other_builds.unwrap_or(0),
+                seconds_before_failure: (since_kill_us.unwrap_or(0) / 1_000_000) as u32,
+            }
+        } else if kills.is_some_and(|k| k > 0) && signals.victims.is_none() && alone {
             OomAttribution::OnlyBuildRunning
         } else if kills.is_some_and(|k| k > 0) {
-            let note = match (other_victim, signals.other_builds) {
-                (Some(victim), _) => format!(
+            let note = match (build_victim, other_victim, signals.other_builds) {
+                (Some(victim), _, _) => format!(
+                    "NOTE: the kernel's OOM killer terminated `{}` in a build step on this host \
+                     {} s before this step failed; a killed child ends its build tool within \
+                     seconds, so that kill is not attributed to this build.\n",
+                    victim.comm,
+                    since_kill_us.map_or(0, |us| us / 1_000_000)
+                ),
+                (None, Some(victim), _) => format!(
                     "NOTE: the kernel's OOM killer terminated `{}` (in {}) on this host while \
                      this step ran; that process was not part of this build, so the failure is \
                      not attributed to memory.\n",
                     victim.comm, victim.cgroup
                 ),
-                (None, Some(others)) => format!(
+                (None, None, Some(others)) => format!(
                     "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
                      this step ran and {} other build(s) were running, so the kill cannot be \
                      attributed to this build; if this failure looks like a crash without a \
@@ -1953,7 +2001,7 @@ impl DockerRuntime {
                     kills.unwrap_or(0),
                     others
                 ),
-                (None, None) => format!(
+                (None, None, None) => format!(
                     "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
                      this step ran; other builds may have been running, so the kill cannot be \
                      attributed to this build.\n",
@@ -1981,24 +2029,35 @@ impl DockerRuntime {
         })
     }
 
-    /// Host-side samples taken before a build so a failure can be attributed:
-    /// the kernel's OOM-kill counter and the boot-relative clock the kernel
-    /// log uses. `None` when the daemon is not on this host.
-    fn host_sample_before_build(&self) -> Option<HostSample> {
-        if !self.daemon_is_local {
-            return None;
+    /// Readings taken as a build starts so a failure can be attributed: the
+    /// kernel's OOM-kill counter and the boot-relative clock the kernel log
+    /// uses (only when the daemon is on this host), and the concurrency
+    /// bookkeeping. Call after the build permit is held.
+    fn sample_build_start(&self) -> BuildStartSample {
+        let builds_started = self
+            .builds_started
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let others_at_start = self.build_permits.and_then(|permits| {
+            let available = self.build_semaphore.as_ref()?.available_permits();
+            Some(permits.saturating_sub(available).saturating_sub(1))
+        });
+        BuildStartSample {
+            oom_kills: self.daemon_is_local.then(host_oom_kill_count).flatten(),
+            uptime_us: self.daemon_is_local.then(uptime_us).flatten(),
+            others_at_start,
+            builds_started,
         }
-        Some(HostSample {
-            oom_kills: host_oom_kill_count(),
-            uptime_us: uptime_us(),
-        })
     }
 
-    /// Builds other than the current one holding a permit right now.
-    fn other_builds_in_flight(&self) -> Option<usize> {
-        let permits = self.build_permits?;
-        let available = self.build_semaphore.as_ref()?.available_permits();
-        Some(permits.saturating_sub(available).saturating_sub(1))
+    /// Builds other than this one that were in flight at any point since
+    /// `start`: those already running then, plus those started since.
+    fn other_builds_since(&self, start: &BuildStartSample) -> Option<usize> {
+        let started_since = self
+            .builds_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            .saturating_sub(start.builds_started);
+        Some(start.others_at_start? + started_since as usize)
     }
 
     /// Map a failed build step to its error. When the failure looks like an
@@ -2007,10 +2066,10 @@ impl DockerRuntime {
     fn classify_build_failure(
         &self,
         error_text: String,
-        before: Option<&HostSample>,
+        start: &BuildStartSample,
         requested_cap_bytes: i64,
     ) -> (BuilderError, Option<String>) {
-        match self.diagnose_out_of_memory(&error_text, before, requested_cap_bytes) {
+        match self.diagnose_out_of_memory(&error_text, start, requested_cap_bytes) {
             MemoryVerdict::OutOfMemory(diagnosis) => {
                 let line = format!("ERROR: {}\n", diagnosis);
                 (
@@ -2329,7 +2388,7 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
-        let host_before = self.host_sample_before_build();
+        let build_start = self.sample_build_start();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -2352,11 +2411,8 @@ impl ImageBuilder for DockerRuntime {
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
                             .await;
-                        let (err, memory_line) = self.classify_build_failure(
-                            error,
-                            host_before.as_ref(),
-                            i64::from(memory_i32),
-                        );
+                        let (err, memory_line) =
+                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
                         if let Some(line) = memory_line {
                             let _ = log_file.write_all(line.as_bytes()).await;
                         }
@@ -2369,11 +2425,8 @@ impl ImageBuilder for DockerRuntime {
                     let _ = log_file
                         .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
                         .await;
-                    let (err, memory_line) = self.classify_build_failure(
-                        error_msg,
-                        host_before.as_ref(),
-                        i64::from(memory_i32),
-                    );
+                    let (err, memory_line) =
+                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
@@ -2542,7 +2595,7 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
-        let host_before = self.host_sample_before_build();
+        let build_start = self.sample_build_start();
         let mut build_stream = self.docker.build_image(
             build_options,
             None,
@@ -2576,11 +2629,8 @@ impl ImageBuilder for DockerRuntime {
                             callback(error_line.clone()).await;
                         }
 
-                        let (err, memory_line) = self.classify_build_failure(
-                            error,
-                            host_before.as_ref(),
-                            i64::from(memory_i32),
-                        );
+                        let (err, memory_line) =
+                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
                         if let Some(line) = memory_line {
                             let _ = log_file.write_all(line.as_bytes()).await;
                             if let Some(ref callback) = log_callback {
@@ -2644,11 +2694,8 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    let (err, memory_line) = self.classify_build_failure(
-                        error_msg,
-                        host_before.as_ref(),
-                        i64::from(memory_i32),
-                    );
+                    let (err, memory_line) =
+                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                         if let Some(ref callback) = log_callback {
@@ -6120,6 +6167,7 @@ CMD ["cat", "/hello.txt"]
         )
     }
 
+    /// Signals as observed at `FAILED_AT_US`; victims are stamped by the tests.
     fn signals(
         oom_kills: Option<u64>,
         victims: Option<Vec<OomVictim>>,
@@ -6129,13 +6177,21 @@ CMD ["cat", "/hello.txt"]
             oom_kills,
             victims,
             other_builds,
+            failed_at_us: Some(FAILED_AT_US),
         }
     }
 
+    const FAILED_AT_US: u64 = 500_000_000;
+
     fn victim(comm: &str, cgroup: &str) -> OomVictim {
+        victim_at(comm, cgroup, FAILED_AT_US - 200_000)
+    }
+
+    fn victim_at(comm: &str, cgroup: &str, at_us: u64) -> OomVictim {
         OomVictim {
             comm: comm.into(),
             cgroup: cgroup.into(),
+            at_us,
         }
     }
 
@@ -6163,19 +6219,49 @@ CMD ["cat", "/hello.txt"]
             rt.diagnose_out_of_memory_with(KILLED, &signals(Some(0), None, Some(0)), CAP),
             MemoryVerdict::NotMemory
         );
-        // The live wrapper with no host sample (remote daemon) can still
+        // The live wrapper with a remote daemon (no host readings) can still
         // recognise the step's own kill signal.
+        let remote = BuildStartSample {
+            oom_kills: None,
+            uptime_us: None,
+            others_at_start: Some(0),
+            builds_started: 0,
+        };
         assert!(matches!(
-            rt.diagnose_out_of_memory(KILLED, None, CAP),
+            rt.diagnose_out_of_memory(KILLED, &remote, CAP),
             MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
                 attribution: OomAttribution::StepKilled,
                 ..
             })
         ));
         assert_eq!(
-            rt.diagnose_out_of_memory(EXITED_ONE, None, CAP),
+            rt.diagnose_out_of_memory(EXITED_ONE, &remote, CAP),
             MemoryVerdict::NotMemory
         );
+    }
+
+    #[test]
+    fn other_builds_since_counts_overlap_over_the_whole_build() {
+        let rt = runtime_for_diagnosis(true);
+        let first = rt.sample_build_start();
+        assert_eq!(first.others_at_start, Some(0));
+        assert_eq!(rt.other_builds_since(&first), Some(0));
+        // A build that starts while the first one runs counts even after it
+        // has finished by the time the first one fails.
+        let _second = rt.sample_build_start();
+        assert_eq!(rt.other_builds_since(&first), Some(1));
+        // Without a semaphore the count is unknown, never zero.
+        let unbounded = DockerRuntime::new(
+            Arc::new(
+                Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                    .expect("client construction makes no connection"),
+            ),
+            true,
+            "test-network".to_string(),
+        );
+        let start = unbounded.sample_build_start();
+        assert_eq!(start.others_at_start, None);
+        assert_eq!(unbounded.other_builds_since(&start), None);
     }
 
     #[test]
@@ -6217,19 +6303,100 @@ CMD ["cat", "/hello.txt"]
     #[test]
     fn diagnose_out_of_memory_attributes_through_the_kernel_log() {
         let rt = runtime_for_diagnosis(true);
-        // The log names a build step's cgroup: attributed even with an
-        // ordinary exit code and other builds running.
-        let step = vec![victim(
-            "node",
-            "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi",
-        )];
+        let step_cgroup = "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi";
+        // The log names a build step's cgroup and no other build was
+        // running: attributed even with an ordinary exit code.
+        let step = vec![victim("node", step_cgroup)];
         let MemoryVerdict::OutOfMemory(diagnosis) =
-            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), Some(step), Some(1)), CAP)
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), Some(step), Some(0)), CAP)
         else {
             panic!("a killed build-step process is a memory failure");
         };
         assert_eq!(diagnosis.attribution, OomAttribution::VictimWasBuildStep);
         assert_eq!(diagnosis.victim.as_deref(), Some("node"));
+
+        // Another build was running: the victim could be its child. Only a
+        // kill within the attribution window of this step's failure counts,
+        // and then as "most likely".
+        let just_before = vec![victim_at("node", step_cgroup, FAILED_AT_US - 200_000)];
+        let MemoryVerdict::OutOfMemory(diagnosis) = rt.diagnose_out_of_memory_with(
+            EXITED_ONE,
+            &signals(Some(1), Some(just_before), Some(1)),
+            CAP,
+        ) else {
+            panic!("a build-step kill right before the failure is attributed");
+        };
+        assert_eq!(
+            diagnosis.attribution,
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: 1,
+                seconds_before_failure: 0,
+            }
+        );
+        assert!(diagnosis
+            .to_string()
+            .starts_with("The build step most likely"));
+
+        // A build-step kill long before this failure was some earlier
+        // build's child (a killed child ends its parent within seconds),
+        // even if no other build overlapped this one by the bookkeeping.
+        let long_before = vec![victim_at(
+            "node",
+            step_cgroup,
+            FAILED_AT_US - OOM_KILL_ATTRIBUTION_WINDOW_US - 1,
+        )];
+        for others in [Some(0), Some(1), None] {
+            match rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(long_before.clone()), others),
+                CAP,
+            ) {
+                MemoryVerdict::Unattributed(note) => {
+                    assert!(note.contains("`node` in a build step"), "{note}");
+                    assert!(note.contains("10 s before this step failed"), "{note}");
+                    assert!(note.contains("not attributed to this build"), "{note}");
+                }
+                other => panic!("expected an unattributed note, got {other:?}"),
+            }
+        }
+        // Even the step's own SIGKILL is not pinned on a kill that old.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                KILLED,
+                &signals(Some(1), Some(long_before), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
+
+        // The kernel log and /proc/uptime are different clocks: a kill logged
+        // within the slop after the observed failure still counts as before
+        // it; one clearly after it belongs to someone else.
+        let within_slop = vec![victim_at("node", step_cgroup, FAILED_AT_US + CLOCK_SLOP_US)];
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(within_slop), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::VictimWasBuildStep,
+                ..
+            })
+        ));
+        let after = vec![victim_at(
+            "node",
+            step_cgroup,
+            FAILED_AT_US + CLOCK_SLOP_US + 1,
+        )];
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(after), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
 
         // The log names a container instead: not this build's problem, even
         // though the counter moved and no other build was running.
@@ -6324,14 +6491,16 @@ CMD ["cat", "/hello.txt"]
         let since_build_start = parse_oom_victims(kmsg, 2_500_000);
         assert_eq!(
             since_build_start,
-            vec![victim(
+            vec![victim_at(
                 "node",
-                "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi"
+                "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi",
+                3_000_000
             )]
         );
         let all = parse_oom_victims(kmsg, 0);
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].comm, "postgres");
+        assert_eq!(all[0].at_us, 2_000_000);
         assert!(parse_oom_victims("garbage without separators\n", 0).is_empty());
     }
 }
