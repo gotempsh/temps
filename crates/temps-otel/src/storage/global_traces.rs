@@ -31,6 +31,10 @@ pub struct GlobalTraceQuery {
     pub filter: TraceQuery,
     pub scopes: Vec<TraceReadScope>,
     pub summaries: bool,
+    /// Use the local Postgres one-row-per-trace table when semantics allow it.
+    /// Mixed local/Cloud reads disable this so both merge inputs use identical
+    /// windowed-span aggregation semantics.
+    pub use_preaggregated_summaries: bool,
     pub source_offset: u64,
 }
 
@@ -221,6 +225,66 @@ struct Sql {
     body: String,
     binds: Vec<Bind>,
 }
+
+/// Build the indexed Postgres trace-summary query.
+///
+/// The project-scoped trace list already maintains one row per trace in
+/// `otel_trace_summaries`. Global reads must use the same table: rebuilding
+/// every summary from `otel_spans` makes a small page proportional to the
+/// number of spans in every accessible project.
+fn build_postgres_summaries(q: &GlobalTraceQuery) -> StorageResult<Sql> {
+    let mut binds = Vec::new();
+    let mut bind = |value: Bind| {
+        binds.push(value);
+        format!("${}", binds.len())
+    };
+    let scope = q
+        .scopes
+        .iter()
+        .map(|scope| {
+            let project_id = bind(Bind::Int(scope.project_id as i64));
+            let from = bind(Bind::Text(scope.from.to_rfc3339()));
+            let to = bind(Bind::Text(scope.to.to_rfc3339()));
+            format!(
+                "(ts.project_id = {project_id} AND ts.start_time >= {from}::timestamptz AND ts.start_time <= {to}::timestamptz)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    // Match the project trace-list semantics: any error makes the trace an
+    // error; every other summary is OK. Do not look up raw spans per result —
+    // compressed Timescale chunks cannot seek by trace_id, so that would turn
+    // a 100-row page into 100 decompression scans.
+    let status = "CASE WHEN ts.error_count > 0 THEN 'ERROR' ELSE 'OK' END";
+    Ok(Sql {
+        body: format!(
+            "SELECT ts.project_id, ts.trace_id, ''::text AS span_id, ''::text AS parent_span_id, ts.root_span_name AS name, ts.service_name, COALESCE(ts.deployment_environment, '') AS environment, ts.kind, {status} AS status, FLOOR(EXTRACT(EPOCH FROM ts.start_time) * 1000)::bigint AS start_ms, ts.duration_ms AS duration, ts.span_count, ts.error_count, '{{}}'::text AS attributes, '[]'::text AS events, ''::text AS status_message FROM otel_trace_summaries ts WHERE {}",
+            scope
+        ),
+        binds,
+    })
+}
+
+fn postgres_can_use_summaries(q: &GlobalTraceQuery) -> bool {
+    q.summaries
+        && q.use_preaggregated_summaries
+        // Filtered global queries retain the existing any-matching-span
+        // semantics. The summary row stores root/whole-trace fields, so using
+        // it for these filters would change membership at service, deployment,
+        // duration, or status boundaries.
+        && q.filter.trace_id.is_none()
+        && q.filter.service_name.is_none()
+        && q.filter.status.is_none()
+        && q.filter.min_duration_ms.is_none()
+        && q.filter.deployment_id.is_none()
+        && q.filter.environment_id.is_none()
+        && q.filter
+            .attributes
+            .as_ref()
+            .is_none_or(std::collections::BTreeMap::is_empty)
+        && q.filter.name_pattern.as_ref().is_none_or(String::is_empty)
+}
 fn build(
     q: &GlobalTraceQuery,
     dialect: Dialect,
@@ -397,14 +461,15 @@ fn build(
     };
     Ok(Sql { body, binds })
 }
-fn ordered(sql: &str, q: &GlobalTraceQuery) -> String {
+fn ordered(sql: &Sql, q: &GlobalTraceQuery) -> String {
     let field = if q.filter.sort_by == TraceSortField::Duration {
         "duration"
     } else {
         "start_ms"
     };
     format!(
-        "{sql} ORDER BY {field} {}, project_id, trace_id, span_id LIMIT {} OFFSET {}",
+        "{} ORDER BY {field} {}, project_id, trace_id, span_id LIMIT {} OFFSET {}",
+        sql.body,
         q.filter.sort_order.as_sql(),
         q.filter
             .offset
@@ -448,7 +513,7 @@ pub async fn clickhouse(
         .fetch_one::<u64>()
         .await
         .map_err(storage)?;
-    let cursor = ch_query(client, &ordered(&sql.body, q), &sql.binds)
+    let cursor = ch_query(client, &ordered(&sql, q), &sql.binds)
         .fetch::<GlobalTraceRow>()
         .map_err(storage)?;
     let rows = futures::stream::try_unfold(cursor, |mut cursor| async move {
@@ -470,7 +535,11 @@ pub async fn postgres(
     if q.scopes.is_empty() {
         return Ok(GlobalTraceStream::empty());
     }
-    let sql = build(q, Dialect::Postgres, &BTreeMap::new())?;
+    let sql = if postgres_can_use_summaries(q) {
+        build_postgres_summaries(q)?
+    } else {
+        build(q, Dialect::Postgres, &BTreeMap::new())?
+    };
     let values: Vec<sea_orm::Value> = sql
         .binds
         .iter()
@@ -493,7 +562,7 @@ pub async fn postgres(
         .ok_or_else(|| invalid("Missing trace count"))?;
     let total: i64 = count.try_get("", "total")?;
     let statement =
-        Statement::from_sql_and_values(DatabaseBackend::Postgres, ordered(&sql.body, q), values);
+        Statement::from_sql_and_values(DatabaseBackend::Postgres, ordered(&sql, q), values);
     // The task owns the DB lifetime. Dropping the response closes this bounded
     // channel and cancels the database cursor, including while no rows arrive.
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -573,6 +642,7 @@ mod tests {
             },
             scopes: vec![],
             summaries: true,
+            use_preaggregated_summaries: true,
             source_offset: 0,
         }
     }
@@ -626,8 +696,64 @@ mod tests {
         let sql = build(&q, Dialect::ClickHouse, &BTreeMap::new()).unwrap();
         assert_eq!(sql.binds.len(), 315);
         assert_eq!(sql.body.matches('?').count(), 315);
-        assert!(ordered(&sql.body, &q).ends_with("LIMIT 20 OFFSET 800"));
+        assert!(ordered(&sql, &q).ends_with("LIMIT 20 OFFSET 800"));
         assert!(sql.body.contains("GROUP BY project_id, trace_id"));
         assert!(!sql.body.contains("FINAL"));
+    }
+
+    #[test]
+    fn postgres_global_summaries_use_the_preaggregated_table() {
+        let mut q = query();
+        q.source_offset = 800;
+        q.scopes = (1..=105)
+            .map(|project_id| TraceReadScope {
+                project_id,
+                from: DateTime::from_timestamp_millis(1000).unwrap(),
+                to: DateTime::from_timestamp_millis(2000).unwrap(),
+                cloud: false,
+                window_clamped_at: None,
+            })
+            .collect();
+
+        let sql = build_postgres_summaries(&q).unwrap();
+
+        assert_eq!(sql.binds.len(), 315);
+        assert!(sql.body.contains("FROM otel_trace_summaries ts"));
+        assert!(!sql.body.contains("GROUP BY"));
+        assert!(!sql.body.contains("FROM otel_spans span GROUP BY"));
+        assert!(sql.body.contains("ts.start_time >= $2::timestamptz"));
+        assert!(ordered(&sql, &q).contains("ORDER BY start_ms ASC"));
+        assert!(ordered(&sql, &q).ends_with("LIMIT 20 OFFSET 800"));
+        assert!(!sql.body.contains("FROM otel_spans"));
+    }
+
+    #[test]
+    fn filtered_queries_keep_the_exact_raw_span_path() {
+        let mut q = query();
+        q.filter.name_pattern = Some("checkout".into());
+        assert!(!postgres_can_use_summaries(&q));
+
+        q.filter.name_pattern = None;
+        q.filter
+            .attributes
+            .get_or_insert_default()
+            .insert("http.method".into(), "GET".into());
+        assert!(!postgres_can_use_summaries(&q));
+
+        q.filter.attributes = None;
+        q.filter.status = Some(SpanStatusCode::Unset);
+        assert!(!postgres_can_use_summaries(&q));
+
+        q.filter.status = None;
+        q.filter.service_name = Some("worker".into());
+        assert!(!postgres_can_use_summaries(&q));
+
+        q.filter.service_name = None;
+        q.filter.min_duration_ms = Some(500.0);
+        assert!(!postgres_can_use_summaries(&q));
+
+        q.filter.min_duration_ms = None;
+        q.use_preaggregated_summaries = false;
+        assert!(!postgres_can_use_summaries(&q));
     }
 }

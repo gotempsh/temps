@@ -838,6 +838,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
             })
             .collect(),
         summaries: true,
+        use_preaggregated_summaries: false,
         source_offset: 0,
     };
     let page = h.storage.global_trace_page(q.clone()).await.unwrap();
@@ -882,6 +883,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
             })
             .collect(),
         summaries: true,
+        use_preaggregated_summaries: false,
         source_offset: 20,
     };
     let refs = BTreeMap::from([(701, "scope-a".into()), (702, "scope-b".into())]);

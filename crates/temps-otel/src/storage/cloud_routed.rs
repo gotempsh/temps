@@ -283,13 +283,7 @@ impl OtelStorage for CloudRoutedOtelStorage {
         &self,
         mut query: super::global_traces::GlobalTraceQuery,
     ) -> StorageResult<super::global_traces::GlobalTracePage> {
-        if query.scopes.iter().all(|s| s.cloud) || query.scopes.iter().all(|s| !s.cloud) {
-            query.source_offset = query.filter.offset.unwrap_or(0);
-        }
-        let mut local = query.clone();
-        local.scopes.retain(|s| !s.cloud);
-        let mut cloud = query.clone();
-        cloud.scopes.retain(|s| s.cloud);
+        let (local, cloud) = split_global_trace_query(&mut query);
         let local_read = async {
             if local.scopes.is_empty() {
                 Ok(super::global_traces::GlobalTraceStream::empty())
@@ -747,6 +741,24 @@ impl OtelStorage for CloudRoutedOtelStorage {
     }
 }
 
+fn split_global_trace_query(
+    query: &mut super::global_traces::GlobalTraceQuery,
+) -> (
+    super::global_traces::GlobalTraceQuery,
+    super::global_traces::GlobalTraceQuery,
+) {
+    let local_only = query.scopes.iter().all(|scope| !scope.cloud);
+    if query.scopes.iter().all(|scope| scope.cloud) || local_only {
+        query.source_offset = query.filter.offset.unwrap_or(0);
+    }
+    let mut local = query.clone();
+    local.scopes.retain(|scope| !scope.cloud);
+    local.use_preaggregated_summaries &= local_only;
+    let mut cloud = query.clone();
+    cloud.scopes.retain(|scope| scope.cloud);
+    (local, cloud)
+}
+
 impl CloudRoutedOtelStorage {
     /// Resolve a multi-project span-stats query.
     ///
@@ -804,6 +816,34 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn global_query(cloud_scopes: &[bool]) -> super::super::global_traces::GlobalTraceQuery {
+        let from = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+        let to = from + chrono::Duration::hours(1);
+        super::super::global_traces::GlobalTraceQuery {
+            filter: TraceQuery {
+                limit: Some(20),
+                offset: Some(40),
+                ..Default::default()
+            },
+            scopes: cloud_scopes
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, cloud)| super::super::global_traces::TraceReadScope {
+                        project_id: index as i32 + 1,
+                        from,
+                        to,
+                        cloud: *cloud,
+                        window_clamped_at: None,
+                    },
+                )
+                .collect(),
+            summaries: true,
+            use_preaggregated_summaries: true,
+            source_offset: 0,
+        }
+    }
+
     /// Records which side a call landed on, so a test can assert routing
     /// without a database or a Cloud tenant.
     #[derive(Default)]
@@ -811,6 +851,30 @@ mod tests {
         query_spans: AtomicUsize,
         get_trace: AtomicUsize,
         has_traces: AtomicUsize,
+    }
+
+    #[test]
+    fn local_only_global_reads_keep_the_preaggregated_fast_path() {
+        let mut query = global_query(&[false, false]);
+
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert_eq!(query.source_offset, 40);
+        assert!(local.use_preaggregated_summaries);
+        assert_eq!(local.scopes.len(), 2);
+        assert!(cloud.scopes.is_empty());
+    }
+
+    #[test]
+    fn mixed_global_reads_use_matching_raw_semantics_for_both_sources() {
+        let mut query = global_query(&[false, true]);
+
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert_eq!(query.source_offset, 0);
+        assert!(!local.use_preaggregated_summaries);
+        assert_eq!(local.scopes.len(), 1);
+        assert_eq!(cloud.scopes.len(), 1);
     }
 
     #[async_trait]

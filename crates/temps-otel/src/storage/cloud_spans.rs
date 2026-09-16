@@ -316,6 +316,7 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
                 filter: query,
                 scopes: vec![scope],
                 summaries: true,
+                use_preaggregated_summaries: false,
             };
             let stream = self.global_trace_stream(q.clone()).await?;
             super::global_traces::merge(vec![stream], &q)

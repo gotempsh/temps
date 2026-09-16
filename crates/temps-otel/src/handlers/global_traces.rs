@@ -204,6 +204,7 @@ async fn read(
     let query = GlobalTraceQuery {
         source_offset: 0,
         summaries,
+        use_preaggregated_summaries: true,
         scopes,
         filter: TraceQuery {
             trace_id: p.trace_id,
