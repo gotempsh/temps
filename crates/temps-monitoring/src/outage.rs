@@ -19,7 +19,9 @@ use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
 use temps_core::{AutopilotTriggerJob, Job, JobQueue, JobReceiver};
-use temps_entities::{deployments, environments, status_checks, status_incidents, status_monitors};
+use temps_entities::{
+    deployments, environments, projects, status_checks, status_incidents, status_monitors,
+};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -105,6 +107,11 @@ pub struct OutageEvent {
     pub monitor_id: i32,
     pub monitor_name: String,
     pub project_id: i32,
+    /// Human-readable project slug (e.g. "my-app"), resolved once at event
+    /// construction time so notification providers never have to show the
+    /// raw `project_id` to a human. Falls back to `format!("project #{id}")`
+    /// if the project can't be looked up (e.g. deleted between checks).
+    pub project_slug: String,
     pub environment_id: Option<i32>,
     pub previous_status: MonitorStatus,
     pub current_status: MonitorStatus,
@@ -221,6 +228,27 @@ impl OutageDetectionService {
             .unwrap_or(false)
     }
 
+    /// Resolve a project's slug for display in human-facing notifications.
+    /// Degrades gracefully to `project #{id}` if the lookup fails or the
+    /// project no longer exists, rather than surfacing a raw numeric ID or
+    /// failing the whole outage-notification path over a missing name.
+    async fn project_slug(&self, project_id: i32) -> String {
+        match projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(project)) => project.slug,
+            Ok(None) => {
+                warn!("Project {} not found while resolving slug", project_id);
+                format!("project #{project_id}")
+            }
+            Err(e) => {
+                warn!("Failed to look up project {} slug: {}", project_id, e);
+                format!("project #{project_id}")
+            }
+        }
+    }
+
     /// Process a new status check and detect state transitions
     pub async fn process_check(
         &self,
@@ -286,6 +314,10 @@ impl OutageDetectionService {
                         monitor_id,
                         monitor_name: monitor.name.clone(),
                         project_id: monitor.project_id,
+                        // Filled in below, after the state lock is dropped —
+                        // resolving the slug requires an async DB lookup and
+                        // shouldn't happen while holding `monitor_states`.
+                        project_slug: String::new(),
                         environment_id: monitor.environment_id,
                         previous_status: prev.status,
                         current_status: status,
@@ -331,6 +363,8 @@ impl OutageDetectionService {
                         monitor_id,
                         monitor_name: monitor.name.clone(),
                         project_id: monitor.project_id,
+                        // Filled in below, after the state lock is dropped.
+                        project_slug: String::new(),
                         environment_id: monitor.environment_id,
                         previous_status: MonitorStatus::Operational,
                         current_status: status,
@@ -349,6 +383,10 @@ impl OutageDetectionService {
         drop(states);
 
         // Handle incident creation/resolution and notifications
+        let mut event = event;
+        if let Some(event) = event.as_mut() {
+            event.project_slug = self.project_slug(event.project_id).await;
+        }
         if let Some(ref event) = event {
             self.handle_outage_event(event).await?;
         }
@@ -741,9 +779,8 @@ impl OutageDetectionService {
             severity: Some(severity.as_str().to_string()),
             timestamp: event.occurred_at,
             metadata: [
-                ("monitor_id".to_string(), event.monitor_id.to_string()),
                 ("monitor_name".to_string(), event.monitor_name.clone()),
-                ("project_id".to_string(), event.project_id.to_string()),
+                ("project".to_string(), event.project_slug.clone()),
                 ("incident_id".to_string(), incident_id.to_string()),
                 (
                     "status".to_string(),
@@ -779,9 +816,8 @@ impl OutageDetectionService {
             severity: None,
             timestamp: event.occurred_at,
             metadata: [
-                ("monitor_id".to_string(), event.monitor_id.to_string()),
                 ("monitor_name".to_string(), event.monitor_name.clone()),
-                ("project_id".to_string(), event.project_id.to_string()),
+                ("project".to_string(), event.project_slug.clone()),
                 ("status".to_string(), "recovered".to_string()),
             ]
             .into_iter()
@@ -1393,6 +1429,7 @@ mod tests {
             monitor_id: 1,
             monitor_name: "API Health".to_string(),
             project_id: 1,
+            project_slug: "api-health-project".to_string(),
             environment_id,
             previous_status,
             current_status,
