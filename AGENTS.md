@@ -304,13 +304,18 @@ that leaves the client unable to distinguish "not built" from
 
 ## Follow the console design standard
 
-`DESIGN.md` is the authoritative reference for console UI: full-width pages,
-compact empty states, shared tables and pagination, and shared shadcn controls.
-The `temps-design-system` skill
-(`.agents/skills/temps-design-system/SKILL.md`) points to this same standard.
-The separate prototype app is retired. The retained `web/packages/ds` package
-is not the default for console work; do not introduce it without an explicit
-product decision.
+`DESIGN.md` is the authoritative reference for existing console UI:
+full-width pages, compact empty states, shared tables and pagination, and
+shared shadcn controls. `web/packages/ds` (`@temps-sdk/ds`) is a real,
+maintained package now — page/record/list/settings templates, the status
+vocabulary, and tokens, built on `@temps-sdk/ui` — with its own rules at
+`web/packages/ds/docs/RULES.md`. It is not yet the default for `web/src`;
+production migration is tracked as numbered follow-ups in
+`web/packages/ds/docs/design-system-handoff.md`, not assumed. The
+`temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`)
+covers both: which one to use when, and the classification procedure for new
+screens. The old "operator ink" prototype app is retired and is not a
+reference for either.
 
 ## Responsive pagination is a shared UI contract
 

@@ -1,10 +1,20 @@
 # Temps console design standard
 
-This is the authoritative UI reference for contributors working in `web/src`.
-Use the existing shadcn/ui components, Tailwind semantic tokens, and shared
-layouts. The separate prototype app has been retired; it is not an alternative
-design direction. The retained `web/packages/ds` package is not the default
-for console work and must not be introduced as an incidental redesign.
+This is the authoritative UI reference for existing contributions to
+`web/src`. Use the existing shadcn/ui components, Tailwind semantic tokens,
+and shared layouts. The separate "operator ink" prototype app has been
+retired; it is not an alternative design direction and never was one worth
+resurrecting.
+
+`web/packages/ds` (`@temps-sdk/ds`) is a real, maintained package — the
+codification of these same conventions into reusable page/record/list/
+settings templates, built on `@temps-sdk/ui`. See its
+`docs/design-system-handoff.md` and `docs/RULES.md`. It is not yet a mandate
+to migrate `web/src` screen by screen — that migration is tracked as numbered
+follow-ups in the handoff doc, not assumed to have happened. New work that
+fits one of its templates should use it; retrofitting an existing screen is a
+deliberate, separate decision, not an incidental side effect of an unrelated
+change.
 
 The product should feel like one application: consistent page width, compact
 resource lists, predictable controls, and useful states when data is absent.

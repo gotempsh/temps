@@ -1025,7 +1025,7 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 - Keep Bun tests beside the TypeScript or TSX source they cover, as `name.test.ts` or `name.test.tsx` in the same directory. The inline `#[cfg(test)]` rule above is Rust-only; do not import `bun:test` into production frontend modules.
 
 ### Console design standard
-- Follow root `DESIGN.md` for all console UI: full-width pages, compact empty states, shared tables and pagination, and existing shadcn/ui controls. The separate prototype app is retired. The `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) points to this standard. Do not introduce the retained `web/packages/ds` package without an explicit product decision.
+- Follow root `DESIGN.md` for existing console UI: full-width pages, compact empty states, shared tables and pagination, and existing shadcn/ui controls. The separate "operator ink" prototype app is retired. `web/packages/ds` (`@temps-sdk/ds`) is a real, maintained package codifying these conventions into page/record/list/settings templates and a status vocabulary, built on `@temps-sdk/ui` -- see `web/packages/ds/docs/RULES.md` and `docs/design-system-handoff.md`; production `web/src` migration is tracked as follow-ups there, not assumed. The `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) covers which one applies to a given task.
 
 ### Critical React Rules
 
