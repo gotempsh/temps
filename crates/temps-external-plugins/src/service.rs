@@ -326,8 +326,26 @@ impl ExternalPluginsService {
                 });
             }
         };
+        let (candidate_actor_id, candidate_source_identity) =
+            match ExternalPluginManager::candidate_actor_binding(&pending) {
+                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
+                Err(reason) => {
+                    self.manager.discard_candidate(pending).await;
+                    return Err(ExternalPluginsError::CandidateRejected {
+                        name: candidate.name.clone(),
+                        version: candidate.version.clone(),
+                        reason,
+                    });
+                }
+            };
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        let activation_rollback = installer.capture_activation(&candidate).await?;
+        let activation_rollback = match installer.capture_activation(&candidate).await {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                self.manager.discard_candidate(pending).await;
+                return Err(error.into());
+            }
+        };
         if let Err(error) = installer.activate(&candidate).await {
             self.manager.discard_candidate(pending).await;
             let _ = installer.discard(&candidate).await;
@@ -335,7 +353,12 @@ impl ExternalPluginsService {
         }
         let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
         if let Err(error) = grant_service
-            .commit_binary_hash(&candidate.name, &candidate.sha256)
+            .commit_actor(
+                &candidate.name,
+                &candidate_actor_id,
+                &candidate.sha256,
+                &candidate_source_identity,
+            )
             .await
         {
             let first_install = activation_rollback.was_first_install();
@@ -352,7 +375,7 @@ impl ExternalPluginsService {
         }
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
-        let actor_id = grant_service.get(&candidate.name).await?.actor.id;
+        let actor_id = candidate_actor_id;
         Ok(RepositoryInstallOutcome {
             name: candidate.name,
             version: candidate.version,
@@ -740,7 +763,25 @@ impl ExternalPluginsService {
             }
         };
 
-        let activation_rollback = installer.capture_activation(&candidate).await?;
+        let (candidate_actor_id, candidate_source_identity) =
+            match ExternalPluginManager::candidate_actor_binding(&pending) {
+                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
+                Err(reason) => {
+                    self.manager.discard_candidate(pending).await;
+                    return Err(ExternalPluginsError::CandidateRejected {
+                        name: candidate.name.clone(),
+                        version: candidate.version.clone(),
+                        reason,
+                    });
+                }
+            };
+        let activation_rollback = match installer.capture_activation(&candidate).await {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                self.manager.discard_candidate(pending).await;
+                return Err(error.into());
+            }
+        };
         if let Err(error) = installer.activate(&candidate).await {
             self.manager.discard_candidate(pending).await;
             if let Err(cleanup_error) = installer.discard(&candidate).await {
@@ -754,7 +795,12 @@ impl ExternalPluginsService {
         }
         let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
         if let Err(error) = grant_service
-            .commit_binary_hash(&candidate.name, &candidate.sha256)
+            .commit_actor(
+                &candidate.name,
+                &candidate_actor_id,
+                &candidate.sha256,
+                &candidate_source_identity,
+            )
             .await
         {
             let first_install = activation_rollback.was_first_install();
@@ -771,7 +817,7 @@ impl ExternalPluginsService {
         }
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
-        let actor_id = grant_service.get(&candidate.name).await?.actor.id;
+        let actor_id = candidate_actor_id;
 
         if let Err(error) = crate::reporting::report_if_enabled(
             &self.db,

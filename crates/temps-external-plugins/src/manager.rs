@@ -605,6 +605,7 @@ impl ExternalPluginManager {
         instance_name: &str,
         data_name: &str,
         source_identity: String,
+        defer_actor_commit: bool,
     ) -> Result<ExternalPluginProcess, String> {
         let binary_name = binary_path
             .file_name()
@@ -948,6 +949,7 @@ impl ExternalPluginManager {
             manifest.host_permissions.clone(),
             expected_sha256.to_string(),
             source_identity,
+            defer_actor_commit,
             self.ai_service.clone(),
             self.audit_service.clone(),
             &auth_secret,
@@ -1008,6 +1010,7 @@ impl ExternalPluginManager {
                 expected_name,
                 expected_name,
                 source_identity,
+                false,
             )
             .await?;
         let manifest = process.manifest.clone();
@@ -1043,12 +1046,22 @@ impl ExternalPluginManager {
                 &instance_name,
                 expected_name,
                 source_identity,
+                true,
             )
             .await?;
         Ok(PendingPlugin {
             expected_name: expected_name.to_string(),
             process,
         })
+    }
+
+    pub(crate) fn candidate_actor_binding(pending: &PendingPlugin) -> Result<(&str, &str), String> {
+        pending
+            .process
+            .channel
+            .as_ref()
+            .map(PluginChannel::actor_binding)
+            .ok_or_else(|| "Candidate has no authenticated plugin channel".to_string())
     }
 
     /// Atomically swap the process table entry, then stop the old process.

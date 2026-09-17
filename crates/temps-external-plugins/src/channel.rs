@@ -46,6 +46,7 @@ pub struct PluginChannel {
     reader_task: JoinHandle<()>,
     grant_service: PluginGrantService,
     actor_id: String,
+    source_identity: String,
     host_permissions: Vec<PluginHostPermission>,
 }
 
@@ -64,16 +65,23 @@ impl PluginChannel {
         host_permissions: Vec<PluginHostPermission>,
         binary_sha256: String,
         source_identity: String,
+        defer_actor_commit: bool,
         ai_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_ai::AiService>>>>,
         audit_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
         auth_secret: &str,
     ) -> Option<Self> {
         let socket_path_str = socket_path.to_string_lossy().to_string();
         let grant_service = PluginGrantService::new(db.clone());
-        let actor = match grant_service
-            .ensure_actor(&plugin_name, &binary_sha256, &source_identity)
-            .await
-        {
+        let actor_result = if defer_actor_commit {
+            grant_service
+                .prepare_actor(&plugin_name, &source_identity)
+                .await
+        } else {
+            grant_service
+                .ensure_actor(&plugin_name, &binary_sha256, &source_identity)
+                .await
+        };
+        let actor = match actor_result {
             Ok(grants) => grants.actor,
             Err(error) => {
                 warn!(plugin = %plugin_name, error = %error, "Cannot bind durable plugin actor");
@@ -276,8 +284,13 @@ impl PluginChannel {
             reader_task,
             grant_service: channel_grants,
             actor_id: channel_actor_id,
+            source_identity,
             host_permissions: channel_permissions,
         })
+    }
+
+    pub(crate) fn actor_binding(&self) -> (&str, &str) {
+        (&self.actor_id, &self.source_identity)
     }
 
     /// Push a platform event to the plugin over the channel.

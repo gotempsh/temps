@@ -62,6 +62,49 @@ impl PluginGrantService {
         Self { db }
     }
 
+    /// Bind a candidate without mutating the durable actor. Same-source
+    /// upgrades reuse their actor; a different source receives a provisional,
+    /// default-deny identity until activation commits it.
+    pub async fn prepare_actor(
+        &self,
+        plugin_name: &str,
+        source_identity: &str,
+    ) -> Result<PluginGrants, GrantError> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id::text AS id,source_identity FROM external_plugin_actors WHERE plugin_name=$1 AND active=TRUE",
+                [plugin_name.into()],
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "prepare candidate actor",
+                source,
+            })?;
+        if let Some(row) = row {
+            let current_source: String =
+                row.try_get("", "source_identity")
+                    .map_err(|source| GrantError::Database {
+                        plugin_name: plugin_name.into(),
+                        operation: "decode candidate actor source",
+                        source,
+                    })?;
+            if current_source == source_identity {
+                return self.get(plugin_name).await;
+            }
+        }
+        Ok(PluginGrants {
+            actor: PluginActorInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: plugin_name.into(),
+                active: false,
+            },
+            config: PluginGrantConfig::default(),
+        })
+    }
+
     pub async fn ensure_actor(
         &self,
         plugin_name: &str,
@@ -162,6 +205,60 @@ impl PluginGrantService {
                 plugin_name: plugin_name.into(),
             });
         }
+        Ok(())
+    }
+
+    pub async fn commit_actor(
+        &self,
+        plugin_name: &str,
+        actor_id: &str,
+        sha256: &str,
+        source_identity: &str,
+    ) -> Result<(), GrantError> {
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "begin actor activation",
+                source,
+            })?;
+        transaction
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [plugin_name.into()],
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "lock actor activation",
+                source,
+            })?;
+        transaction.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM external_plugin_actors WHERE plugin_name=$1 AND (active=FALSE OR source_identity<>$2)",
+            [plugin_name.into(), source_identity.into()],
+        )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "rotate activated actor", source })?;
+        let result = transaction.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
+            [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into()],
+        )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "commit activated actor", source })?;
+        if result.rows_affected() != 1 {
+            return Err(GrantError::ActorChanged {
+                plugin_name: plugin_name.into(),
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "commit actor activation",
+                source,
+            })?;
         Ok(())
     }
 

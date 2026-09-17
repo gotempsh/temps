@@ -374,3 +374,168 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
     assert!(recreated.config.permissions.is_empty());
     eprintln!("Actor migration: populated up -> down (all three tables absent, users preserved) -> up passed");
 }
+
+#[tokio::test]
+async fn test_failed_different_source_candidate_preserves_actor_grants_and_usage() {
+    let Some(database) = boot_database().await else {
+        return;
+    };
+    let service = PluginGrantService::new(database.connection_arc());
+    let original = service
+        .ensure_actor(
+            "source-bound-plugin",
+            "sha256:old",
+            "repository:trusted/old",
+        )
+        .await
+        .expect("create original actor");
+    let granted = service
+        .update("source-bound-plugin", configured_grants())
+        .await
+        .expect("grant original actor");
+    assert!(service
+        .consume_ai_call(&granted, 1)
+        .await
+        .expect("consume original actor quota"));
+    assert!(service
+        .consume_ai_call(&granted, 1)
+        .await
+        .expect("consume second original actor quota"));
+    let same_source = service
+        .prepare_actor("source-bound-plugin", "repository:trusted/old")
+        .await
+        .expect("prepare same-source upgrade actor");
+    assert_eq!(same_source.actor.id, original.actor.id);
+    assert_eq!(
+        same_source.config.permissions,
+        configured_grants().permissions
+    );
+
+    let provisional = service
+        .prepare_actor("source-bound-plugin", "repository:trusted/replacement")
+        .await
+        .expect("prepare replacement actor");
+    let failed_commit = service
+        .commit_actor(
+            "source-bound-plugin",
+            "not-a-uuid",
+            "sha256:replacement",
+            "repository:trusted/replacement",
+        )
+        .await;
+    let preserved = service
+        .get("source-bound-plugin")
+        .await
+        .expect("reload original actor after rejected candidate");
+
+    assert_ne!(provisional.actor.id, original.actor.id);
+    assert!(matches!(failed_commit, Err(GrantError::Database { .. })));
+    assert!(!provisional.actor.active);
+    assert!(provisional.config.permissions.is_empty());
+    assert_eq!(preserved.actor.id, original.actor.id);
+    assert_eq!(
+        preserved.config.permissions,
+        configured_grants().permissions
+    );
+    assert!(service
+        .consume_ai_call(&preserved, 1)
+        .await
+        .expect("consume preserved quota after rejected candidate"));
+    assert!(!service
+        .consume_ai_call(&preserved, 1)
+        .await
+        .expect("preserved usage must keep the original daily limit exhausted"));
+}
+
+#[tokio::test]
+async fn test_successful_different_source_activation_rotates_to_default_deny_actor() {
+    let Some(database) = boot_database().await else {
+        return;
+    };
+    let service = PluginGrantService::new(database.connection_arc());
+    service
+        .ensure_actor(
+            "rotated-source-plugin",
+            "sha256:old",
+            "repository:trusted/old",
+        )
+        .await
+        .expect("create original actor");
+    let original = service
+        .update("rotated-source-plugin", configured_grants())
+        .await
+        .expect("grant original actor");
+    assert!(service
+        .consume_ai_call(&original, 1)
+        .await
+        .expect("consume original quota"));
+    let provisional = service
+        .prepare_actor("rotated-source-plugin", "repository:trusted/replacement")
+        .await
+        .expect("prepare replacement actor");
+
+    service
+        .commit_actor(
+            "rotated-source-plugin",
+            &provisional.actor.id,
+            "sha256:new",
+            "repository:trusted/replacement",
+        )
+        .await
+        .expect("commit replacement actor");
+    let replacement = service
+        .get("rotated-source-plugin")
+        .await
+        .expect("reload replacement actor");
+
+    assert_eq!(replacement.actor.id, provisional.actor.id);
+    assert!(replacement.config.permissions.is_empty());
+    assert!(!service
+        .consume_ai_call(&original, 1)
+        .await
+        .expect("old actor must be denied after rotation"));
+}
+
+#[tokio::test]
+async fn test_stale_same_source_candidate_cannot_commit_unbound_actor() {
+    let Some(database) = boot_database().await else {
+        return;
+    };
+    let service = PluginGrantService::new(database.connection_arc());
+    service
+        .ensure_actor(
+            "stale-candidate-plugin",
+            "sha256:old",
+            "repository:trusted/same",
+        )
+        .await
+        .expect("create current actor");
+    let current = service
+        .update("stale-candidate-plugin", configured_grants())
+        .await
+        .expect("grant current actor");
+    let stale_id = uuid::Uuid::new_v4().to_string();
+
+    let result = service
+        .commit_actor(
+            "stale-candidate-plugin",
+            &stale_id,
+            "sha256:stale",
+            "repository:trusted/same",
+        )
+        .await;
+    let preserved = service
+        .get("stale-candidate-plugin")
+        .await
+        .expect("reload current actor");
+
+    assert!(matches!(
+        result,
+        Err(GrantError::ActorChanged { plugin_name }) if plugin_name == "stale-candidate-plugin"
+    ));
+    assert_eq!(preserved.actor.id, current.actor.id);
+    assert_eq!(
+        preserved.config.permissions,
+        configured_grants().permissions
+    );
+}
