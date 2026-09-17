@@ -15,10 +15,7 @@ import {
   CredentialsEditorDialog,
   providerHasEditableCredentials,
 } from '@/components/git-providers/CredentialsEditorDialog'
-import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -41,17 +38,28 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { FeedbackAlert } from '@/components/ui/feedback-alert'
-import { TimeAgo } from '@/components/utils/TimeAgo'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useFeedback } from '@/hooks/useFeedback'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import {
+  Button,
+  Callout,
+  CopyAction,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   ArrowLeft,
-  CheckCircle2,
   Database,
   EllipsisVertical,
   ExternalLink,
@@ -59,7 +67,6 @@ import {
   Key,
   RefreshCw,
   Trash2,
-  XCircle,
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -180,7 +187,11 @@ export default function GitProviderDetail() {
       }
       // Failures that aren't a step-up challenge surface via toast.
       // RFC 7807 Problem Details puts the human message in `detail`.
-      const problem = error as { detail?: string; title?: string; message?: string }
+      const problem = error as {
+        detail?: string
+        title?: string
+        message?: string
+      }
       const detail =
         problem.detail || problem.title || problem.message || 'Unknown error'
       toast.error(`Failed to delete provider: ${detail}`)
@@ -258,52 +269,40 @@ export default function GitProviderDetail() {
 
   usePageTitle(provider ? `${provider.name} - Git Provider` : 'Git Provider')
 
+  const backAction = (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={() => navigate('/git-providers')}
+    >
+      <ArrowLeft className="mr-2 h-4 w-4" />
+      Back
+    </Button>
+  )
+
   if (isLoading) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 sm:p-6">
-          <div className="flex items-center gap-3">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => navigate('/git-providers')}
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <div className="h-8 w-48 bg-muted rounded animate-pulse" />
-          </div>
-          <div className="grid gap-6">
-            <div className="h-32 bg-muted rounded animate-pulse" />
-            <div className="h-24 bg-muted rounded animate-pulse" />
-          </div>
-        </div>
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-48" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3, 4].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={<Skeleton className="h-64 w-full" />}
+      />
     )
   }
 
   if (error || !provider) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 sm:p-6">
-          <div className="flex items-center gap-3">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => navigate('/git-providers')}
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <h1 className="text-2xl font-bold">Git Provider Not Found</h1>
-          </div>
-          <Alert variant="destructive">
-            <AlertTriangle className="h-4 w-4" />
-            <AlertDescription>
-              The git provider you&apos;re looking for doesn&apos;t exist or you
-              don&apos;t have access to it.
-            </AlertDescription>
-          </Alert>
-        </div>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertTriangle}
+        title="Git Provider Not Found"
+        description="The git provider you're looking for doesn't exist or you don't have access to it."
+        action={backAction}
+      />
     )
   }
 
@@ -348,239 +347,227 @@ export default function GitProviderDetail() {
     }
   }
 
-  return (
-    <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-4 sm:p-6">
-        {/* Header */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex items-start gap-3 min-w-0">
+  const verdict: { tone: StatusTone; label: string } = provider.is_active
+    ? { tone: 'ok', label: 'Active' }
+    : { tone: 'idle', label: 'Inactive' }
+
+  const facts: DetailFact[] = [
+    {
+      label: 'Type',
+      value: (
+        <span className="inline-flex items-center gap-1.5">
+          {getProviderIcon()}
+          {getProviderDisplayName()}
+        </span>
+      ),
+    },
+    { label: 'Auth method', value: getAuthMethodDisplayName() },
+    ...(provider.base_url
+      ? [
+          {
+            label: 'Base URL',
+            value: (
+              <span className="inline-flex min-w-0 items-center gap-1">
+                <Globe className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <span className="truncate font-mono">{provider.base_url}</span>
+                <CopyAction value={provider.base_url} />
+              </span>
+            ),
+          },
+        ]
+      : []),
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(provider.created_at)}>
+          {fmtRelativeTime(provider.created_at)}
+        </span>
+      ),
+    },
+    {
+      label: 'Updated',
+      value: (
+        <span title={fmtDateTime(provider.updated_at)}>
+          {fmtRelativeTime(provider.updated_at)}
+        </span>
+      ),
+    },
+  ]
+
+  const detail = (
+    <Detail
+      title={provider.name}
+      verdict={
+        <>
+          <Status tone={verdict.tone} label={verdict.label} />
+          {provider.is_default && <Badge variant="outline">Default</Badge>}
+        </>
+      }
+      actions={
+        <>
+          {backAction}
+          {isGitHubApp(provider) && (
             <Button
-              variant="ghost"
-              size="sm"
-              className="shrink-0"
-              onClick={() => navigate('/git-providers')}
+              onClick={() => handleInstallGitHubApp(provider)}
+              className="gap-2"
             >
-              <ArrowLeft className="h-4 w-4" />
+              <ExternalLink className="h-4 w-4" />
+              Install GitHub App
             </Button>
-            <div className="space-y-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                {getProviderIcon()}
-                <h1 className="text-xl sm:text-2xl font-bold truncate">{provider.name}</h1>
-                {provider.is_active ? (
-                  <Badge
-                    variant="secondary"
-                    className="flex items-center gap-1"
-                  >
-                    <CheckCircle2 className="h-3 w-3" />
-                    Active
-                  </Badge>
-                ) : (
-                  <Badge
-                    variant="destructive"
-                    className="flex items-center gap-1"
-                  >
-                    <XCircle className="h-3 w-3" />
-                    Inactive
-                  </Badge>
-                )}
-                {provider.is_default && (
-                  <Badge variant="outline">Default</Badge>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
-                <span>
-                  {getProviderDisplayName()} provider using{' '}
-                  {getAuthMethodDisplayName()}
-                </span>
-                {provider.base_url && (
-                  <span className="flex items-center gap-1 text-xs">
-                    <Globe className="h-3 w-3" />
-                    <span className="font-mono truncate max-w-[240px]">
-                      {provider.base_url}
-                    </span>
-                    <CopyButton
-                      value={provider.base_url}
-                      className="h-6 w-6 p-0"
-                    />
-                  </span>
-                )}
-                <span className="text-xs">
-                  Created <TimeAgo date={provider.created_at} />
-                </span>
-                <span className="text-xs">
-                  Updated <TimeAgo date={provider.updated_at} />
-                </span>
-              </div>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {isGitHubApp(provider) && (
-              <Button
-                onClick={() => handleInstallGitHubApp(provider)}
-                className="gap-2"
-              >
-                <ExternalLink className="h-4 w-4" />
-                Install GitHub App
+          )}
+          {isGitLabOAuth(provider) && (
+            <Button onClick={handleAuthorize} className="gap-2">
+              <ExternalLink className="h-4 w-4" />
+              Authorize
+            </Button>
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" className="h-9 w-9">
+                <EllipsisVertical className="h-4 w-4" />
+                <span className="sr-only">Provider actions</span>
               </Button>
-            )}
-            {isGitLabOAuth(provider) && (
-              <Button onClick={handleAuthorize} className="gap-2">
-                <ExternalLink className="h-4 w-4" />
-                Authorize
-              </Button>
-            )}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" className="h-9 w-9">
-                  <EllipsisVertical className="h-4 w-4" />
-                  <span className="sr-only">Provider actions</span>
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {providerHasEditableCredentials(provider) && (
-                  <DropdownMenuItem
-                    onSelect={(e) => {
-                      e.preventDefault()
-                      setShowCredentialsDialog(true)
-                    }}
-                  >
-                    <Key className="mr-2 h-4 w-4" />
-                    Edit Credentials
-                  </DropdownMenuItem>
-                )}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {providerHasEditableCredentials(provider) && (
                 <DropdownMenuItem
-                  className="text-destructive focus:text-destructive"
                   onSelect={(e) => {
                     e.preventDefault()
-                    setShowDeleteDialog(true)
+                    setShowCredentialsDialog(true)
                   }}
                 >
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete Provider
+                  <Key className="mr-2 h-4 w-4" />
+                  Edit Credentials
                 </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </div>
+              )}
+              <DropdownMenuItem
+                className="text-destructive focus:text-destructive"
+                onSelect={(e) => {
+                  e.preventDefault()
+                  setShowDeleteDialog(true)
+                }}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                Delete Provider
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </>
+      }
+      facts={facts}
+      main={
+        <>
+          {/* Feedback Alert */}
+          <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
 
-        {/* Feedback Alert */}
-        <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
+          {/* GitHub App Instructions - Only show if no connections */}
+          {isGitHubApp(provider) &&
+            (!connections || connections.length === 0) && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <GithubIcon className="h-5 w-5" />
+                    GitHub App Setup
+                  </CardTitle>
+                  <CardDescription>
+                    This provider uses GitHub App authentication for enhanced
+                    security and features.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="rounded-lg border bg-muted/30 p-4">
+                    <h4 className="font-medium mb-2">Installation Required</h4>
+                    <p className="text-sm text-muted-foreground mb-3">
+                      To use this GitHub provider, you need to install the
+                      GitHub App in your GitHub account or organization.
+                    </p>
+                    <Button
+                      onClick={() => handleInstallGitHubApp(provider)}
+                      className="gap-2"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                      Install GitHub App
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
-
-        {/* GitHub App Instructions - Only show if no connections */}
-        {isGitHubApp(provider) &&
-          (!connections || connections.length === 0) && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <GithubIcon className="h-5 w-5" />
-                  GitHub App Setup
-                </CardTitle>
-                <CardDescription>
-                  This provider uses GitHub App authentication for enhanced
-                  security and features.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="rounded-lg border bg-muted/30 p-4">
-                  <h4 className="font-medium mb-2">Installation Required</h4>
-                  <p className="text-sm text-muted-foreground mb-3">
-                    To use this GitHub provider, you need to install the GitHub
-                    App in your GitHub account or organization.
-                  </p>
-                  <Button
-                    onClick={() => handleInstallGitHubApp(provider)}
-                    className="gap-2"
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                    Install GitHub App
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
+          {/* Security Notice for PAT */}
+          {provider.auth_method === 'token' && (
+            <Callout tone="info" title="Personal Access Token">
+              This provider uses a Personal Access Token for authentication.
+              Tokens are stored securely and encrypted. For enhanced security
+              and automatic deployments, consider using GitHub App
+              authentication instead.
+            </Callout>
           )}
 
-        {/* Security Notice for PAT */}
-        {provider.auth_method === 'token' && (
+          {/* Git Connections */}
           <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Key className="h-5 w-5" />
-                Personal Access Token
+            <CardHeader className="flex flex-row items-center justify-between gap-2 py-3">
+              <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+                <Database className="h-4 w-4 text-muted-foreground" />
+                Connections
+                {connections && connections.length > 0 && (
+                  <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                    {connections.length}
+                  </Badge>
+                )}
               </CardTitle>
-              <CardDescription>
-                This provider uses a Personal Access Token for authentication.
-              </CardDescription>
             </CardHeader>
             <CardContent>
-              <Alert>
-                <AlertTriangle className="h-4 w-4" />
-                <AlertDescription>
-                  Personal Access Tokens are stored securely and encrypted. For
-                  enhanced security and automatic deployments, consider using
-                  GitHub App authentication instead.
-                </AlertDescription>
-              </Alert>
+              {connectionsLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <RefreshCw className="h-6 w-6 animate-spin" />
+                  <span className="ml-2">Loading connections...</span>
+                </div>
+              ) : !connections?.length ? (
+                <div className="text-center py-8 text-muted-foreground">
+                  <Database className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p className="text-lg font-medium mb-2">
+                    No connections found
+                  </p>
+                  <p className="text-sm mb-4">
+                    There are no Git connections associated with this provider
+                    yet.
+                  </p>
+                  {isGitHubApp(provider) && (
+                    <Button
+                      onClick={() => handleInstallGitHubApp(provider)}
+                      className="gap-2"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                      Install GitHub App
+                    </Button>
+                  )}
+                  {isGitLabOAuth(provider) && (
+                    <Button onClick={handleAuthorize} className="gap-2">
+                      <ExternalLink className="h-4 w-4" />
+                      Authorize
+                    </Button>
+                  )}
+                </div>
+              ) : (
+                <ConnectionsCompactList
+                  variant="single-line"
+                  connections={connections}
+                  provider={provider}
+                  onSyncRepository={handleSyncRepositories}
+                  isSyncing={syncMutation.isPending}
+                  onConnectionDeleted={refetchConnections}
+                />
+              )}
             </CardContent>
           </Card>
-        )}
+        </>
+      }
+    />
+  )
 
-        {/* Git Connections */}
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between gap-2 py-3">
-            <CardTitle className="flex items-center gap-2 text-sm font-semibold">
-              <Database className="h-4 w-4 text-muted-foreground" />
-              Connections
-              {connections && connections.length > 0 && (
-                <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
-                  {connections.length}
-                </Badge>
-              )}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {connectionsLoading ? (
-              <div className="flex items-center justify-center py-8">
-                <RefreshCw className="h-6 w-6 animate-spin" />
-                <span className="ml-2">Loading connections...</span>
-              </div>
-            ) : !connections?.length ? (
-              <div className="text-center py-8 text-muted-foreground">
-                <Database className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p className="text-lg font-medium mb-2">No connections found</p>
-                <p className="text-sm mb-4">
-                  There are no Git connections associated with this provider
-                  yet.
-                </p>
-                {isGitHubApp(provider) && (
-                  <Button
-                    onClick={() => handleInstallGitHubApp(provider)}
-                    className="gap-2"
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                    Install GitHub App
-                  </Button>
-                )}
-                {isGitLabOAuth(provider) && (
-                  <Button onClick={handleAuthorize} className="gap-2">
-                    <ExternalLink className="h-4 w-4" />
-                    Authorize
-                  </Button>
-                )}
-              </div>
-            ) : (
-              <ConnectionsCompactList
-                variant="single-line"
-                connections={connections}
-                provider={provider}
-                onSyncRepository={handleSyncRepositories}
-                isSyncing={syncMutation.isPending}
-                onConnectionDeleted={refetchConnections}
-              />
-            )}
-          </CardContent>
-        </Card>
-      </div>
+  return (
+    <>
+      {detail}
 
       {/* Edit Credentials Dialog */}
       <CredentialsEditorDialog
@@ -629,6 +616,6 @@ export default function GitProviderDetail() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </>
   )
 }
