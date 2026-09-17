@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState, type ReactNode } from 'react'
-import { AlertTriangle, Rocket } from 'lucide-react'
+import { AlertTriangle, Cpu, HardDrive, Rocket } from 'lucide-react'
 import {
   Button,
   Callout,
@@ -16,6 +16,7 @@ import {
   PageHeader,
   PageState,
   Picker,
+  ResourceStat,
   Status,
   STATUS_TONES,
   TimeChart,
@@ -80,6 +81,11 @@ export default function Components() {
           <LogLine content="Installing dependencies..." isHighlighted />
           <LogLine content="Build failed: timeout waiting for database connection" searchTerm="timeout" />
         </div>
+      </Block>
+
+      <Block title="ResourceStat">
+        <ResourceStat icon={Cpu} value={fmtPercent(0.42)} />
+        <ResourceStat icon={HardDrive} value={fmtBytes(6_710_886_400)} limit={` / ${fmtPercent(0.71)}`} />
       </Block>
 
       <Block title="Button (busy)">

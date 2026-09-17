@@ -14,6 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { ResourceStat, fmtBytes, fmtPercent } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   Box,
@@ -177,21 +178,19 @@ function ContainerRow({
           )}
           {running && metrics && (
             <>
-              <span className="inline-flex items-center gap-1 tabular-nums">
-                <Cpu className="size-3" aria-hidden="true" />
-                {formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)}
-              </span>
-              <span className="inline-flex items-center gap-1 tabular-nums">
-                <HardDrive className="size-3" aria-hidden="true" />
-                {formatBytes(metrics.memory_bytes)}
-                {(metrics.memory_limit_bytes ?? 0) > 0 &&
-                  metrics.memory_percent != null && (
-                    <span className="text-neutral-400 dark:text-neutral-500">
-                      {' '}
-                      / {metrics.memory_percent.toFixed(0)}%
-                    </span>
-                  )}
-              </span>
+              <ResourceStat
+                icon={Cpu}
+                value={formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)}
+              />
+              <ResourceStat
+                icon={HardDrive}
+                value={fmtBytes(metrics.memory_bytes)}
+                limit={
+                  (metrics.memory_limit_bytes ?? 0) > 0 && metrics.memory_percent != null
+                    ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
+                    : undefined
+                }
+              />
             </>
           )}
         </div>

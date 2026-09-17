@@ -64,6 +64,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
+| `ResourceStat` | `icon`, `value`, `limit?` | Inline CPU/memory/disk usage display | Honour-system |
 | `fmt.ts` | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)` | Any formatted number/date | Honour-system |
 | `notify` | `notify.ok(message, description?)`, `notify.fail(message, description?)` | Background events the user isn't watching (RULES.md § Notifications) | Honour-system |
 
@@ -169,3 +170,16 @@ this phase needs):
     `dangerouslySetInnerHTML`) is a genuinely different rendering path from
     the promoted `LogLine` primitive's plain-text children, so pointing them
     at `LogLine` isn't a trivial swap even once someone picks this up.
+12. Migrate the remaining ~10 CPU/memory/disk stat display call sites onto
+    `ResourceStat` (`ContainerList.tsx` is migrated as the first/reference
+    example — see its inline CPU/memory row): `ContainerHeaderBar.tsx`,
+    `storage/MonitoringCard.tsx`, `storage/ServiceResourcesPanel.tsx`
+    (its `Meter` also draws a progress bar with raw `bg-red-500`/
+    `bg-amber-500` colors — worth folding into `Status`'s tone vocabulary
+    when this is picked up, not just swapping the icon+value row),
+    `project/ProjectStorage.tsx`, `project/ProjectOverview.tsx`,
+    `monitoring/EnvironmentMetricsCard.tsx`, `ServerMonitoring.tsx`,
+    `pages/ServiceMonitoring.tsx`, `pages/settings/NodesPage.tsx` (its local
+    `MetricCard` also has a raw-color progress bar, same note as
+    `ServiceResourcesPanel`), `pages/Storage.tsx`. Not attempted this pass
+    beyond the one migrated site and the primitive itself.
