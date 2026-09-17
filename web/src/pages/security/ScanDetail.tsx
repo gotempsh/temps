@@ -10,7 +10,6 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { VulnerabilityResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -24,6 +23,16 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VulnerabilityList } from '@/components/vulnerabilities/VulnerabilityList'
 import { Input } from '@/components/ui/input'
+import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  useUrlState,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -217,29 +226,139 @@ export function ScanDetail() {
 
 function ScanLoadError({ slug, retry }: { slug?: string; retry: () => void }) {
   return (
-    <Card>
-      <CardContent className="space-y-4 py-8" role="alert">
-        <h2 className="text-lg font-semibold">Unable to load scan</h2>
-        <p className="text-sm text-muted-foreground">
-          The scan could not be displayed. Retry, or return to Security to
-          choose another scan.
-        </p>
+    <PageState
+      variant="failed"
+      icon={Shield}
+      title="Unable to load scan"
+      description="The scan could not be displayed. Retry, or return to Security to choose another scan."
+      action={
         <div className="flex gap-2">
           <Button onClick={retry}>Retry</Button>
           <Button variant="outline" asChild>
             <Link to={`/projects/${slug}/security`}>Back to Security</Link>
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      }
+    />
   )
+}
+
+function scanVerdict(scan: {
+  status: string
+  critical_count: number
+  high_count: number
+  medium_count: number
+  low_count: number
+}): { tone: StatusTone; label: string } {
+  if (scan.status === 'running' || scan.status === 'pending') {
+    return { tone: 'running', label: 'Scanning…' }
+  }
+  if (scan.status === 'failed') {
+    return { tone: 'error', label: 'Scan failed' }
+  }
+  const total =
+    scan.critical_count + scan.high_count + scan.medium_count + scan.low_count
+  if (total === 0) return { tone: 'ok', label: 'Clean' }
+  if (scan.critical_count > 0 || scan.high_count > 0) {
+    return { tone: 'error', label: `${total} vulnerabilities found` }
+  }
+  return { tone: 'warn', label: `${total} vulnerabilities found` }
+}
+
+function scanFacts(
+  scan: {
+    scanner_type: string
+    scanner_version?: string | null
+    branch?: string | null
+    commit_hash?: string | null
+    critical_count: number
+    high_count: number
+    medium_count: number
+    low_count: number
+  },
+  environmentName: string | undefined
+): DetailFact[] {
+  return [
+    {
+      label: 'Scanner',
+      value: scan.scanner_version
+        ? `${scan.scanner_type} v${scan.scanner_version}`
+        : scan.scanner_type,
+    },
+    { label: 'Environment', value: environmentName ?? '—' },
+    { label: 'Branch', value: scan.branch ?? '—' },
+    {
+      label: 'Commit',
+      value: scan.commit_hash ? (
+        <span className="font-mono">{scan.commit_hash.substring(0, 7)}</span>
+      ) : (
+        '—'
+      ),
+    },
+    {
+      label: 'Severity',
+      value:
+        scan.critical_count +
+          scan.high_count +
+          scan.medium_count +
+          scan.low_count ===
+        0 ? (
+          'Clean'
+        ) : (
+          <span className="inline-flex flex-wrap items-center gap-1">
+            {scan.critical_count > 0 && (
+              <Badge
+                variant="outline"
+                className="border-red-500/20 bg-red-500/10 text-red-500"
+              >
+                {scan.critical_count} Critical
+              </Badge>
+            )}
+            {scan.high_count > 0 && (
+              <Badge
+                variant="outline"
+                className="border-orange-500/20 bg-orange-500/10 text-orange-500"
+              >
+                {scan.high_count} High
+              </Badge>
+            )}
+            {scan.medium_count > 0 && (
+              <Badge
+                variant="outline"
+                className="border-yellow-500/20 bg-yellow-500/10 text-yellow-500"
+              >
+                {scan.medium_count} Medium
+              </Badge>
+            )}
+            {scan.low_count > 0 && (
+              <Badge
+                variant="outline"
+                className="border-blue-500/20 bg-blue-500/10 text-blue-500"
+              >
+                {scan.low_count} Low
+              </Badge>
+            )}
+          </span>
+        ),
+    },
+  ]
 }
 
 function ScanDetailContent() {
   const { slug, scanId } = useParams<{ slug: string; scanId: string }>()
-  const [searchQuery, setSearchQuery] = useState('')
-  const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set())
+  const { get, patch } = useUrlState<'q' | 'types' | 'tab'>()
+  const searchQuery = get('q') ?? ''
+  const selectedTypesParam = get('types') ?? ''
+  const selectedTypes = useMemo(
+    () => new Set(selectedTypesParam ? selectedTypesParam.split(',') : []),
+    [selectedTypesParam]
+  )
+  const activeTab = get('tab') ?? 'source-code'
   const [showTypeFilters, setShowTypeFilters] = useState(false)
+
+  const setSearchQuery = (value: string) => patch({ q: value || undefined })
+  const setSelectedTypes = (types: Set<string>) =>
+    patch({ types: types.size > 0 ? Array.from(types).join(',') : undefined })
 
   const {
     data: scan,
@@ -361,83 +480,52 @@ function ScanDetailContent() {
     )
   }
 
+  const backAction = (
+    <Button variant="outline" size="sm" asChild>
+      <Link to={`/projects/${slug}/security`}>
+        <ArrowLeft className="mr-2 h-4 w-4" />
+        Back to Security
+      </Link>
+    </Button>
+  )
+
   if (isScanLoading) {
     return (
-      <div className="space-y-6">
-        <Skeleton className="h-10 w-40" />
-        <Skeleton className="h-64 w-full max-w-2xl" />
-        <Skeleton className="h-96 w-full" />
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-56" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3, 4].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={<Skeleton className="h-96 w-full" />}
+      />
     )
   }
 
   if (!scan) {
     return (
-      <div className="space-y-6">
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <Shield className="h-12 w-12 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-medium mb-2">Scan not found</h3>
-            <p className="text-muted-foreground mb-4">
-              The requested vulnerability scan could not be found
-            </p>
-            <Button variant="outline" asChild>
-              <Link to={`/projects/${slug}/security`}>
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                Back to Security
-              </Link>
-            </Button>
-          </CardContent>
-        </Card>
-      </div>
+      <PageState
+        variant="empty"
+        icon={Shield}
+        title="Scan not found"
+        description="The requested vulnerability scan could not be found."
+        action={backAction}
+      />
     )
   }
 
   const totalVulnerabilities =
     scan.critical_count + scan.high_count + scan.medium_count + scan.low_count
+  const verdict = scanVerdict(scan)
 
   return (
-    <div className="space-y-4">
-      {/* Compact Scan Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 pb-3 border-b">
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 min-w-0">
-          <Button variant="ghost" size="sm" asChild className="pl-0 -ml-2">
-            <Link to={`/projects/${slug}/security`}>
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back
-            </Link>
-          </Button>
-          <div className="flex items-center gap-2">
-            <Shield className="h-5 w-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold">Vulnerability Scan</h1>
-          </div>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            {environment && <span>Environment: {environment.name}</span>}
-            <span className="text-muted-foreground/50">•</span>
-            <span>Scanner: {scan.scanner_type}</span>
-            {scan.scanner_version && (
-              <>
-                <span className="text-muted-foreground/50">•</span>
-                <span>v{scan.scanner_version}</span>
-              </>
-            )}
-            {scan.branch && (
-              <>
-                <span className="text-muted-foreground/50">•</span>
-                <span>Branch: {scan.branch}</span>
-              </>
-            )}
-            {scan.commit_hash && (
-              <>
-                <span className="text-muted-foreground/50">•</span>
-                <span className="font-mono">
-                  {scan.commit_hash.substring(0, 7)}
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-3 flex-wrap justify-end">
+    <Detail
+      title="Vulnerability Scan"
+      verdict={<Status tone={verdict.tone} label={verdict.label} />}
+      actions={
+        <>
+          {backAction}
           {/* Export button - only show if vulnerabilities exist */}
           {totalVulnerabilities > 0 && vulnerabilities.length > 0 && (
             <DropdownMenu>
@@ -517,321 +605,271 @@ function ScanDetailContent() {
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-
-          {scan.critical_count > 0 && (
-            <Badge
-              variant="outline"
-              className="bg-red-500/10 text-red-500 border-red-500/20"
-            >
-              {scan.critical_count} Critical
-            </Badge>
-          )}
-          {scan.high_count > 0 && (
-            <Badge
-              variant="outline"
-              className="bg-orange-500/10 text-orange-500 border-orange-500/20"
-            >
-              {scan.high_count} High
-            </Badge>
-          )}
-          {scan.medium_count > 0 && (
-            <Badge
-              variant="outline"
-              className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20"
-            >
-              {scan.medium_count} Medium
-            </Badge>
-          )}
-          {scan.low_count > 0 && (
-            <Badge
-              variant="outline"
-              className="bg-blue-500/10 text-blue-500 border-blue-500/20"
-            >
-              {scan.low_count} Low
-            </Badge>
-          )}
-          {totalVulnerabilities === 0 && (
-            <Badge
-              variant="outline"
-              className="bg-green-500/10 text-green-500 border-green-500/20"
-            >
-              Clean
-            </Badge>
-          )}
-        </div>
-      </div>
-
-      {/* Failed Scan Alert */}
-      {scan.status === 'failed' && (
-        <Card className="border-red-500/20 bg-red-500/5">
-          <CardContent className="flex items-start gap-4 py-6">
-            <div className="flex-shrink-0">
-              <div className="h-12 w-12 rounded-full bg-red-500/10 flex items-center justify-center">
-                <Shield className="h-6 w-6 text-red-500" />
-              </div>
-            </div>
-            <div className="flex-1">
-              <h3 className="text-lg font-semibold text-red-500 mb-2">
-                Scan Failed
-              </h3>
-              <p className="text-sm text-muted-foreground mb-4">
-                The vulnerability scan encountered an error and could not
-                complete.
-              </p>
-              {scan.error_message && (
-                <div className="bg-background/50 rounded-md p-4 border border-red-500/20">
-                  <p className="text-sm font-mono text-foreground whitespace-pre-wrap break-words">
+        </>
+      }
+      facts={scanFacts(scan, environment?.name)}
+      main={
+        <>
+          {/* Failed Scan Alert */}
+          {scan.status === 'failed' && (
+            <Callout tone="error" title="Scan failed">
+              <div className="space-y-3">
+                <p>
+                  The vulnerability scan encountered an error and could not
+                  complete.
+                </p>
+                {scan.error_message && (
+                  <div className="whitespace-pre-wrap break-words rounded-md border border-destructive/20 bg-background/50 p-4 font-mono text-xs text-foreground">
                     {scan.error_message}
-                  </p>
-                </div>
-              )}
-              <div className="mt-4">
-                <Button variant="outline" size="sm" asChild>
-                  <Link to={`/projects/${slug}/security`}>
-                    <ArrowLeft className="h-4 w-4 mr-2" />
-                    Back to Security
-                  </Link>
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Vulnerabilities Section */}
-      {scan.status === 'completed' && totalVulnerabilities > 0 && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <h2 className="text-xl font-semibold">Vulnerabilities</h2>
-            <div className="flex items-center gap-4">
-              <p className="text-sm text-muted-foreground whitespace-nowrap">
-                {filteredVulnerabilities.length} of {vulnerabilities.length}{' '}
-                {vulnerabilities.length === 1
-                  ? 'vulnerability'
-                  : 'vulnerabilities'}
-              </p>
-            </div>
-          </div>
-
-          {/* Search and Filter Bar */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              {/* Search Box */}
-              <div className="relative flex-1 max-w-md">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  type="text"
-                  placeholder="Search by CVE ID, title, package, severity..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-9"
-                />
-              </div>
-
-              {/* Type Filter Toggle */}
-              {vulnerabilityTypes.length > 0 && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowTypeFilters(!showTypeFilters)}
-                  className="gap-2"
-                >
-                  <Filter className="h-4 w-4" />
-                  Filter by type
-                  {selectedTypes.size > 0 && (
-                    <Badge
-                      variant="secondary"
-                      className="ml-1 h-5 px-1.5 text-xs"
-                    >
-                      {selectedTypes.size}
-                    </Badge>
-                  )}
-                </Button>
-              )}
-            </div>
-
-            {/* Collapsible Type Filter Badges */}
-            {showTypeFilters && vulnerabilityTypes.length > 0 && (
-              <div className="flex flex-wrap items-center gap-2 p-3 border rounded-md bg-muted/30">
-                <Button
-                  variant={selectedTypes.size === 0 ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setSelectedTypes(new Set())}
-                  className="h-7"
-                >
-                  All
-                </Button>
-                {vulnerabilityTypes.map((type) => {
-                  const isSelected = selectedTypes.has(type)
-                  const typeCount = vulnerabilities.filter(
-                    (v) => v.type === type
-                  ).length
-
-                  return (
-                    <Button
-                      key={type}
-                      variant={isSelected ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => {
-                        const newTypes = new Set(selectedTypes)
-                        if (isSelected) {
-                          newTypes.delete(type)
-                        } else {
-                          newTypes.add(type)
-                        }
-                        setSelectedTypes(newTypes)
-                      }}
-                      className="h-7"
-                    >
-                      {type}
-                      <Badge
-                        variant="secondary"
-                        className="ml-2 h-4 px-1.5 text-xs bg-background/50"
-                      >
-                        {typeCount}
-                      </Badge>
-                    </Button>
-                  )
-                })}
-                {selectedTypes.size > 0 && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setSelectedTypes(new Set())}
-                    className="h-7 text-muted-foreground hover:text-foreground"
-                  >
-                    Clear filters
-                  </Button>
+                  </div>
                 )}
               </div>
-            )}
-          </div>
+            </Callout>
+          )}
 
-          {/* Tabs for grouping vulnerabilities */}
-          <Tabs defaultValue="source-code" className="w-full">
-            <TabsList>
-              <TabsTrigger value="all">
-                All ({filteredVulnerabilities.length})
-              </TabsTrigger>
-              <TabsTrigger value="os-packages">
-                <Package className="h-4 w-4 mr-2" />
-                Container/OS ({groupedVulnerabilities.osPackages.length})
-              </TabsTrigger>
-              <TabsTrigger value="source-code">
-                <Code className="h-4 w-4 mr-2" />
-                Source Code ({groupedVulnerabilities.sourceCode.length})
-              </TabsTrigger>
-              {groupedVulnerabilities.other.length > 0 && (
-                <TabsTrigger value="other">
-                  Other ({groupedVulnerabilities.other.length})
-                </TabsTrigger>
-              )}
-            </TabsList>
+          {/* Vulnerabilities Section */}
+          {scan.status === 'completed' && totalVulnerabilities > 0 && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-4">
+                <h2 className="text-xl font-semibold">Vulnerabilities</h2>
+                <div className="flex items-center gap-4">
+                  <p className="text-sm text-muted-foreground whitespace-nowrap">
+                    {filteredVulnerabilities.length} of {vulnerabilities.length}{' '}
+                    {vulnerabilities.length === 1
+                      ? 'vulnerability'
+                      : 'vulnerabilities'}
+                  </p>
+                </div>
+              </div>
 
-            <TabsContent value="all" className="mt-4">
-              <VulnerabilityList
-                vulnerabilities={filteredVulnerabilities}
-                isLoading={isVulnerabilitiesLoading}
-                scanId={scan.id}
-                projectSlug={slug || ''}
-              />
-            </TabsContent>
+              {/* Search and Filter Bar */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  {/* Search Box */}
+                  <div className="relative flex-1 max-w-md">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      type="text"
+                      placeholder="Search by CVE ID, title, package, severity..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="pl-9"
+                    />
+                  </div>
 
-            <TabsContent value="os-packages" className="mt-4">
-              {groupedVulnerabilities.osPackages.length > 0 ? (
-                <VulnerabilityList
-                  vulnerabilities={groupedVulnerabilities.osPackages}
-                  isLoading={isVulnerabilitiesLoading}
-                  scanId={scan.id}
-                  projectSlug={slug || ''}
-                />
-              ) : (
+                  {/* Type Filter Toggle */}
+                  {vulnerabilityTypes.length > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowTypeFilters(!showTypeFilters)}
+                      className="gap-2"
+                    >
+                      <Filter className="h-4 w-4" />
+                      Filter by type
+                      {selectedTypes.size > 0 && (
+                        <Badge
+                          variant="secondary"
+                          className="ml-1 h-5 px-1.5 text-xs"
+                        >
+                          {selectedTypes.size}
+                        </Badge>
+                      )}
+                    </Button>
+                  )}
+                </div>
+
+                {/* Collapsible Type Filter Badges */}
+                {showTypeFilters && vulnerabilityTypes.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2 p-3 border rounded-md bg-muted/30">
+                    <Button
+                      variant={selectedTypes.size === 0 ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setSelectedTypes(new Set())}
+                      className="h-7"
+                    >
+                      All
+                    </Button>
+                    {vulnerabilityTypes.map((type) => {
+                      const isSelected = selectedTypes.has(type)
+                      const typeCount = vulnerabilities.filter(
+                        (v) => v.type === type
+                      ).length
+
+                      return (
+                        <Button
+                          key={type}
+                          variant={isSelected ? 'default' : 'outline'}
+                          size="sm"
+                          onClick={() => {
+                            const newTypes = new Set(selectedTypes)
+                            if (isSelected) {
+                              newTypes.delete(type)
+                            } else {
+                              newTypes.add(type)
+                            }
+                            setSelectedTypes(newTypes)
+                          }}
+                          className="h-7"
+                        >
+                          {type}
+                          <Badge
+                            variant="secondary"
+                            className="ml-2 h-4 px-1.5 text-xs bg-background/50"
+                          >
+                            {typeCount}
+                          </Badge>
+                        </Button>
+                      )
+                    })}
+                    {selectedTypes.size > 0 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSelectedTypes(new Set())}
+                        className="h-7 text-muted-foreground hover:text-foreground"
+                      >
+                        Clear filters
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Tabs for grouping vulnerabilities */}
+              <Tabs
+                value={activeTab}
+                onValueChange={(value) => patch({ tab: value })}
+                className="w-full"
+              >
+                <TabsList>
+                  <TabsTrigger value="all">
+                    All ({filteredVulnerabilities.length})
+                  </TabsTrigger>
+                  <TabsTrigger value="os-packages">
+                    <Package className="h-4 w-4 mr-2" />
+                    Container/OS ({groupedVulnerabilities.osPackages.length})
+                  </TabsTrigger>
+                  <TabsTrigger value="source-code">
+                    <Code className="h-4 w-4 mr-2" />
+                    Source Code ({groupedVulnerabilities.sourceCode.length})
+                  </TabsTrigger>
+                  {groupedVulnerabilities.other.length > 0 && (
+                    <TabsTrigger value="other">
+                      Other ({groupedVulnerabilities.other.length})
+                    </TabsTrigger>
+                  )}
+                </TabsList>
+
+                <TabsContent value="all" className="mt-4">
+                  <VulnerabilityList
+                    vulnerabilities={filteredVulnerabilities}
+                    isLoading={isVulnerabilitiesLoading}
+                    scanId={scan.id}
+                    projectSlug={slug || ''}
+                  />
+                </TabsContent>
+
+                <TabsContent value="os-packages" className="mt-4">
+                  {groupedVulnerabilities.osPackages.length > 0 ? (
+                    <VulnerabilityList
+                      vulnerabilities={groupedVulnerabilities.osPackages}
+                      isLoading={isVulnerabilitiesLoading}
+                      scanId={scan.id}
+                      projectSlug={slug || ''}
+                    />
+                  ) : (
+                    <Card>
+                      <CardContent className="flex flex-col items-center justify-center py-12">
+                        <Package className="h-12 w-12 text-muted-foreground mb-4" />
+                        <h3 className="text-lg font-medium mb-2">
+                          No container/OS vulnerabilities
+                        </h3>
+                        <p className="text-muted-foreground text-center">
+                          No vulnerabilities found in operating system or
+                          container packages
+                        </p>
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="source-code" className="mt-4">
+                  {groupedVulnerabilities.sourceCode.length > 0 ? (
+                    <VulnerabilityList
+                      vulnerabilities={groupedVulnerabilities.sourceCode}
+                      isLoading={isVulnerabilitiesLoading}
+                      scanId={scan.id}
+                      projectSlug={slug || ''}
+                    />
+                  ) : (
+                    <Card>
+                      <CardContent className="flex flex-col items-center justify-center py-12">
+                        <Code className="h-12 w-12 text-muted-foreground mb-4" />
+                        <h3 className="text-lg font-medium mb-2">
+                          No source code vulnerabilities
+                        </h3>
+                        <p className="text-muted-foreground text-center">
+                          No vulnerabilities found in application dependencies
+                        </p>
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
+
+                {groupedVulnerabilities.other.length > 0 && (
+                  <TabsContent value="other" className="mt-4">
+                    <VulnerabilityList
+                      vulnerabilities={groupedVulnerabilities.other}
+                      isLoading={isVulnerabilitiesLoading}
+                      scanId={scan.id}
+                      projectSlug={slug || ''}
+                    />
+                  </TabsContent>
+                )}
+              </Tabs>
+
+              {/* No results message */}
+              {searchQuery && filteredVulnerabilities.length === 0 && (
                 <Card>
                   <CardContent className="flex flex-col items-center justify-center py-12">
-                    <Package className="h-12 w-12 text-muted-foreground mb-4" />
+                    <Search className="h-12 w-12 text-muted-foreground mb-4" />
                     <h3 className="text-lg font-medium mb-2">
-                      No container/OS vulnerabilities
+                      No vulnerabilities found
                     </h3>
-                    <p className="text-muted-foreground text-center">
-                      No vulnerabilities found in operating system or container
-                      packages
+                    <p className="text-muted-foreground text-center mb-4">
+                      No vulnerabilities match your search query: &quot;
+                      {searchQuery}&quot;
                     </p>
+                    <Button
+                      variant="outline"
+                      onClick={() => setSearchQuery('')}
+                    >
+                      Clear search
+                    </Button>
                   </CardContent>
                 </Card>
               )}
-            </TabsContent>
+            </div>
+          )}
 
-            <TabsContent value="source-code" className="mt-4">
-              {groupedVulnerabilities.sourceCode.length > 0 ? (
-                <VulnerabilityList
-                  vulnerabilities={groupedVulnerabilities.sourceCode}
-                  isLoading={isVulnerabilitiesLoading}
-                  scanId={scan.id}
-                  projectSlug={slug || ''}
-                />
-              ) : (
-                <Card>
-                  <CardContent className="flex flex-col items-center justify-center py-12">
-                    <Code className="h-12 w-12 text-muted-foreground mb-4" />
-                    <h3 className="text-lg font-medium mb-2">
-                      No source code vulnerabilities
-                    </h3>
-                    <p className="text-muted-foreground text-center">
-                      No vulnerabilities found in application dependencies
-                    </p>
-                  </CardContent>
-                </Card>
-              )}
-            </TabsContent>
-
-            {groupedVulnerabilities.other.length > 0 && (
-              <TabsContent value="other" className="mt-4">
-                <VulnerabilityList
-                  vulnerabilities={groupedVulnerabilities.other}
-                  isLoading={isVulnerabilitiesLoading}
-                  scanId={scan.id}
-                  projectSlug={slug || ''}
-                />
-              </TabsContent>
-            )}
-          </Tabs>
-
-          {/* No results message */}
-          {searchQuery && filteredVulnerabilities.length === 0 && (
+          {/* No vulnerabilities message */}
+          {scan.status === 'completed' && totalVulnerabilities === 0 && (
             <Card>
               <CardContent className="flex flex-col items-center justify-center py-12">
-                <Search className="h-12 w-12 text-muted-foreground mb-4" />
+                <Shield className="h-12 w-12 text-green-500 mb-4" />
                 <h3 className="text-lg font-medium mb-2">
                   No vulnerabilities found
                 </h3>
-                <p className="text-muted-foreground text-center mb-4">
-                  No vulnerabilities match your search query: &quot;
-                  {searchQuery}&quot;
+                <p className="text-muted-foreground text-center">
+                  This scan completed successfully with no security
+                  vulnerabilities detected
                 </p>
-                <Button variant="outline" onClick={() => setSearchQuery('')}>
-                  Clear search
-                </Button>
               </CardContent>
             </Card>
           )}
-        </div>
-      )}
-
-      {/* No vulnerabilities message */}
-      {scan.status === 'completed' && totalVulnerabilities === 0 && (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <Shield className="h-12 w-12 text-green-500 mb-4" />
-            <h3 className="text-lg font-medium mb-2">
-              No vulnerabilities found
-            </h3>
-            <p className="text-muted-foreground text-center">
-              This scan completed successfully with no security vulnerabilities
-              detected
-            </p>
-          </CardContent>
-        </Card>
-      )}
-    </div>
+        </>
+      }
+    />
   )
 }
