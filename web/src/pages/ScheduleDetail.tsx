@@ -3,8 +3,6 @@
 
 'use client'
 
-import { PageHeader } from '@/components/layout/PageContainer'
-
 import {
   attachScheduleServicesMutation,
   deleteBackupScheduleMutation,
@@ -37,7 +35,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -74,8 +71,17 @@ import {
   runScheduleNow,
   type ScheduleRunSummary,
 } from '@/lib/schedule-runs'
+import {
+  Button,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  useUrlState,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import {
   AlertCircle,
   ArrowLeft,
@@ -91,7 +97,6 @@ import {
   Pencil,
   Play,
   Plus,
-  RotateCcw,
   Trash2,
   X,
 } from 'lucide-react'
@@ -161,22 +166,10 @@ function RunRow({ run }: { run: ScheduleRunSummary }) {
     <TableRow className="hover:bg-muted/50">
       <TableCell className="font-mono text-xs">
         {isLegacy ? (
-          <>
-            <span className="sm:hidden">
-              {format(new Date(run.started_at), 'MMM d HH:mm')}
-            </span>
-            <span className="hidden sm:inline">
-              {format(new Date(run.started_at), 'MMM d, yyyy HH:mm:ss')}
-            </span>
-          </>
+          fmtDateTime(run.started_at)
         ) : (
-          <Link to={detailUrl} className="flex hover:underline">
-            <span className="sm:hidden">
-              {format(new Date(run.started_at), 'MMM d HH:mm')}
-            </span>
-            <span className="hidden sm:inline">
-              {format(new Date(run.started_at), 'MMM d, yyyy HH:mm:ss')}
-            </span>
+          <Link to={detailUrl} className="hover:underline">
+            {fmtDateTime(run.started_at)}
           </Link>
         )}
       </TableCell>
@@ -231,7 +224,12 @@ export function ScheduleDetail() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
 
-  const [page, setPage] = useState(1)
+  // Run-history pagination lives in the URL (RULES.md "the URL is the
+  // state") so a refreshed or shared link reproduces the same page.
+  const { get: getRunsUrlState, patch: patchRunsUrlState } = useUrlState<'page'>()
+  const page = Math.max(1, Number(getRunsUrlState('page') ?? '1') || 1)
+  const setPage = (next: number) =>
+    patchRunsUrlState({ page: next <= 1 ? undefined : next })
   const pageSize = 20
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -416,6 +414,9 @@ export function ScheduleDetail() {
 
   // ── Render helpers ─────────────────────────────────────────────────────────
 
+  // The record recipe's facts grid already covers cron/backup type/retention/
+  // last run/next run (title -> verdict -> facts), so this card sticks to
+  // the config that didn't fit the 6-fact ceiling — no duplicated values.
   function renderScheduleConfigCard(s: BackupScheduleResponse) {
     return (
       <Card className="overflow-hidden shadow-none">
@@ -424,34 +425,10 @@ export function ScheduleDetail() {
             <CalendarDays className="h-5 w-5" />
             Configuration
           </CardTitle>
-          <CardDescription>Current settings for this schedule</CardDescription>
+          <CardDescription>Additional settings for this schedule</CardDescription>
         </CardHeader>
         <CardContent className="p-5">
           <dl className="divide-y [&>div]:py-3 [&>div:first-child]:pt-0 [&>div:last-child]:pb-0 [&_dt]:mb-1">
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Cron expression
-              </dt>
-              <dd className="break-all font-mono text-base sm:text-sm">
-                {s.schedule_expression}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Backup type
-              </dt>
-              <dd>
-                <Badge variant="outline">{s.backup_type}</Badge>
-              </dd>
-            </div>
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Retention
-              </dt>
-              <dd className="text-base sm:text-sm">
-                {s.retention_period} days
-              </dd>
-            </div>
             <div>
               <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                 Max runtime
@@ -470,26 +447,6 @@ export function ScheduleDetail() {
                 <dd className="text-base sm:text-sm">{s.description}</dd>
               </div>
             )}
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Last run
-              </dt>
-              <dd className="text-base sm:text-sm">
-                {s.last_run
-                  ? format(new Date(s.last_run), 'MMM d, yyyy HH:mm')
-                  : '—'}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Next run
-              </dt>
-              <dd className="text-base sm:text-sm">
-                {s.next_run
-                  ? format(new Date(s.next_run), 'MMM d, yyyy HH:mm')
-                  : '—'}
-              </dd>
-            </div>
             {s3Source && (
               <div>
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
@@ -505,23 +462,6 @@ export function ScheduleDetail() {
                 </dd>
               </div>
             )}
-            <div>
-              <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                Backup targets
-              </dt>
-              <dd className="text-base sm:text-sm">
-                {s.target_all_services ? (
-                  <span>
-                    All databases{' '}
-                    <span className="text-muted-foreground">
-                      (includes future databases automatically)
-                    </span>
-                  </span>
-                ) : (
-                  <span>Specific databases (configured below)</span>
-                )}
-              </dd>
-            </div>
             <div>
               <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                 Control plane backup
@@ -552,122 +492,113 @@ export function ScheduleDetail() {
 
   // ── Loading state ──────────────────────────────────────────────────────────
 
+  const backAction = (
+    <Button variant="ghost" size="sm" asChild>
+      <Link to="/backups">
+        <ArrowLeft className="mr-2 h-4 w-4" />
+        Back to Backups
+      </Link>
+    </Button>
+  )
+
   if (isLoadingSchedule) {
     return (
-      <div className="space-y-6">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-48 w-full" />
-        <Skeleton className="h-96 w-full" />
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-56" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={<Skeleton className="h-96 w-full" />}
+        aside={<Skeleton className="h-64 w-full" />}
+      />
     )
   }
 
   if (scheduleError && !schedule) {
     return (
-      <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
-        <AlertCircle className="h-8 w-8 text-destructive" />
-        <div>
-          <h2 className="text-lg font-semibold">Failed to load schedule</h2>
-          <p className="mt-1 text-base text-muted-foreground sm:text-sm">
-            {scheduleError instanceof Error
-              ? scheduleError.message
-              : 'An unexpected error occurred. Please try again.'}
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={() => void refetchSchedule()}>
-            <RotateCcw className="mr-2 h-4 w-4" />
-            Retry
-          </Button>
-          <Button variant="ghost" asChild>
-            <Link to="/backups">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to Backups
-            </Link>
-          </Button>
-        </div>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Couldn't load schedule"
+        description={
+          scheduleError instanceof Error
+            ? scheduleError.message
+            : 'An unexpected error occurred. Please try again.'
+        }
+        action={
+          <div className="flex gap-2">
+            <Button onClick={() => void refetchSchedule()}>Retry</Button>
+            {backAction}
+          </div>
+        }
+      />
     )
   }
 
   if (!schedule) {
     return (
-      <div className="flex flex-col items-center justify-center px-4 py-12 text-center">
-        <h2 className="text-lg font-semibold">Schedule Not Found</h2>
-        <p className="mt-1 text-base text-muted-foreground sm:text-sm">
-          The requested backup schedule could not be found.
-        </p>
-        <Button asChild className="mt-4">
-          <Link to="/backups">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Backups
-          </Link>
-        </Button>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Schedule not found"
+        description="The requested backup schedule could not be found."
+        action={backAction}
+      />
     )
   }
 
   // ── Main render ────────────────────────────────────────────────────────────
 
+  const SCHEDULE_STATUS_VERDICT: Record<'enabled' | 'disabled', { tone: StatusTone; label: string }> = {
+    enabled: { tone: 'ok', label: 'Enabled' },
+    disabled: { tone: 'idle', label: 'Disabled' },
+  }
+  const verdict = SCHEDULE_STATUS_VERDICT[schedule.enabled ? 'enabled' : 'disabled']
+
+  const facts: DetailFact[] = [
+    {
+      label: 'Cron expression',
+      value: <code className="font-mono text-xs break-all">{schedule.schedule_expression}</code>,
+    },
+    { label: 'Backup type', value: <Badge variant="outline">{schedule.backup_type}</Badge> },
+    { label: 'Retention', value: `${schedule.retention_period} days` },
+    {
+      label: 'Last run',
+      value: schedule.last_run ? fmtDateTime(schedule.last_run) : '—',
+    },
+    {
+      label: 'Next run',
+      value: schedule.next_run ? fmtDateTime(schedule.next_run) : '—',
+    },
+  ]
+
   return (
     <TooltipProvider>
-      <div className="space-y-6">
-        {/* ── Header ── */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex min-w-0 items-start gap-2 sm:items-center sm:gap-3">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="-ml-1 shrink-0 sm:hidden"
-              asChild
-              aria-label="Back"
-            >
-              <Link to={`/backups/s3-sources/${schedule.s3_source_id}`}>
-                <ArrowLeft className="h-4 w-4" />
-              </Link>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="hidden shrink-0 sm:inline-flex"
-              asChild
-            >
-              <Link to={`/backups/s3-sources/${schedule.s3_source_id}`}>
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                Back
-              </Link>
-            </Button>
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <DatabaseBackup className="h-5 w-5 shrink-0 text-muted-foreground" />
-                <PageHeader title={schedule.name} />
-                <Badge variant={schedule.enabled ? 'default' : 'secondary'}>
-                  {schedule.enabled ? 'Enabled' : 'Disabled'}
-                </Badge>
-              </div>
-            </div>
-          </div>
-
-          {/* ── Action row ── */}
-          <div className="flex items-center gap-2 sm:shrink-0">
+      <Detail
+        title={schedule.name}
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        facts={facts}
+        actions={
+          <>
+            {backAction}
             <Button
               variant="default"
               size="sm"
               className="shrink-0"
-              disabled={!schedule.enabled || runNowMutation.isPending}
+              disabled={!schedule.enabled}
               onClick={() => runNowMutation.mutate()}
               aria-label="Run now"
+              busy={runNowMutation.isPending}
+              busyLabel="Running…"
               title={
                 !schedule.enabled
                   ? 'Enable the schedule before running'
                   : 'Enqueue a backup immediately'
               }
             >
-              {runNowMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin sm:mr-2" />
-              ) : (
-                <Play className="h-4 w-4 sm:mr-2" />
-              )}
+              <Play className="h-4 w-4 sm:mr-2" />
               <span className="hidden sm:inline">Run now</span>
             </Button>
 
@@ -731,12 +662,10 @@ export function ScheduleDetail() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-          </div>
-        </div>
-
-        <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
-          <div className="min-w-0 space-y-4">
-            {' '}
+          </>
+        }
+        main={
+          <>
             {/* ── Run history table ── */}
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
@@ -800,7 +729,7 @@ export function ScheduleDetail() {
                         variant="outline"
                         size="sm"
                         disabled={page <= 1}
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
+                        onClick={() => setPage(Math.max(1, page - 1))}
                         aria-label="Previous page"
                       >
                         <ChevronLeft className="h-4 w-4" />
@@ -815,9 +744,7 @@ export function ScheduleDetail() {
                         variant="outline"
                         size="sm"
                         disabled={page >= totalPages}
-                        onClick={() =>
-                          setPage((p) => Math.min(totalPages, p + 1))
-                        }
+                        onClick={() => setPage(Math.min(totalPages, page + 1))}
                         aria-label="Next page"
                       >
                         <span className="hidden sm:mr-1 sm:inline">Next</span>
@@ -943,12 +870,10 @@ export function ScheduleDetail() {
                 </CardContent>
               </Card>
             )}
-          </div>
-          <aside className="min-w-0">
-            {renderScheduleConfigCard(schedule)}
-          </aside>
-        </div>
-      </div>
+          </>
+        }
+        aside={renderScheduleConfigCard(schedule)}
+      />
 
       {/* ── Attach services dialog ── */}
       <Dialog open={showAttachDialog} onOpenChange={setShowAttachDialog}>
