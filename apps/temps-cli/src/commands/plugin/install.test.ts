@@ -6,11 +6,37 @@ import {
   installBody,
   validateInstallResult,
   registerPluginInstallCommands,
+  installGrants,
 } from "./install.js";
 
 const repository = "https://github.com/gotempsh/temps-plugin-template";
 test("repo-only install omits name and ref for server auto-detection", () => {
   expect(installBody(repository, {})).toEqual({ repository_url: repository });
+});
+test("host permissions require explicit flags and preserve zero daily calls", () => {
+  expect(installGrants({})).toBeUndefined();
+  expect(
+    installBody(repository, {
+      grant: ["ai_generate", "ai_generate"],
+      aiDailyCalls: "0",
+      aiMaxTokens: "512",
+    }).grants,
+  ).toEqual({
+    permissions: ["ai_generate"],
+    ai_daily_call_limit: 0,
+    ai_max_output_tokens: 512,
+  });
+});
+test.each([
+  { grant: ["system_admin"] },
+  { aiDailyCalls: "100" },
+  { grant: ["ai_generate"], aiDailyCalls: "-1" },
+  { grant: ["ai_generate"], aiDailyCalls: "1.5" },
+  { grant: ["ai_generate"], aiDailyCalls: "10001" },
+  { grant: ["ai_generate"], aiMaxTokens: "0" },
+  { grant: ["ai_generate"], aiMaxTokens: "4097" },
+])("rejects invalid or implicit AI grants %j", (options) => {
+  expect(() => installGrants(options)).toThrow();
 });
 test("advanced overrides are preserved", () => {
   expect(installBody(repository, { name: "my-plugin", ref: "v1.0.0" })).toEqual(
@@ -55,4 +81,6 @@ test("install and update are discoverable with advanced ref options", () => {
   registerPluginInstallCommands(command);
   expect(command.commands.map((c) => c.name())).toEqual(["install", "update"]);
   expect(command.commands[0]?.helpInformation()).toContain("--ref");
+  expect(command.commands[0]?.helpInformation()).toContain("--grant");
+  expect(command.commands[1]?.helpInformation()).not.toContain("--grant");
 });

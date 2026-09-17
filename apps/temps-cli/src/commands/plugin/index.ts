@@ -7,12 +7,14 @@ import { promptConfirm } from "../../ui/prompts.js";
 import { TARGETS, validName, PluginPublishError } from "./model.js";
 import { buildPlugin, loadConfig, publishPlugin } from "./workflow.js";
 import { registerPluginInstallCommands } from "./install.js";
+import { registerPluginGrantCommands } from "./grants.js";
 
 export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
     .description("Create, install, update and build TypeScript plugins");
   registerPluginInstallCommands(plugin);
+  registerPluginGrantCommands(plugin);
   plugin.hook("preAction", () => {
     if (typeof Bun === "undefined")
       throw new PluginPublishError(

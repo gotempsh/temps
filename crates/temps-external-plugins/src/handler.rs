@@ -18,6 +18,268 @@ use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
 use crate::service::ExternalPluginsError;
 use crate::service::ExternalPluginsService;
+use temps_core::external_plugin::channel::{
+    PluginActorInfo, PluginAiCapability, PluginHostPermission,
+};
+
+fn grant_problem(error: crate::grants::GrantError) -> Problem {
+    match error {
+        crate::grants::GrantError::NotFound { .. } => {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Plugin Actor Not Found")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::Invalid { .. } => {
+            temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Plugin Grants")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::ActorChanged { .. } => {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Plugin Actor Changed")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::Database { .. } => {
+            tracing::error!(error = %error, "Plugin grant database operation failed");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin Grants Unavailable")
+                .with_detail("Plugin grants could not be read or saved. Please try again later.")
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginGrantsResponse {
+    pub actor: PluginActorInfo,
+    pub requested_permissions: Vec<PluginHostPermission>,
+    pub permissions: Vec<PluginHostPermission>,
+    pub ai: PluginAiCapability,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginGrantChangeAudit {
+    context: temps_core::audit::AuditContext,
+    target_plugin_actor: PluginActorInfo,
+    old_config: crate::grants::PluginGrantConfig,
+    new_config: crate::grants::PluginGrantConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginInstallGrantApprovalAudit {
+    context: temps_core::audit::AuditContext,
+    target_plugin_actor: PluginActorInfo,
+    approved_config: crate::grants::PluginGrantConfig,
+}
+
+impl temps_core::audit::AuditOperation for PluginInstallGrantApprovalAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_INSTALL_GRANTS_APPROVED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize plugin install grant approval audit: {error}")
+        })
+    }
+}
+
+impl temps_core::audit::AuditOperation for PluginGrantChangeAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_GRANTS_CHANGE_REQUESTED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize external-plugin grant audit: {error}")
+        })
+    }
+}
+
+#[utoipa::path(tag = "External Plugins", get, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+async fn get_plugin_grants(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<PluginGrantsResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    plugin_grants_response(&state, &name).await.map(Json)
+}
+
+#[utoipa::path(tag = "External Plugins", put, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), request_body = crate::grants::PluginGrantConfig, responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+async fn put_plugin_grants(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(name): Path<String>,
+    Json(config): Json<crate::grants::PluginGrantConfig>,
+) -> Result<Json<PluginGrantsResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ChangeExternalPluginGrants { name: name.clone() },
+    )
+    .await?;
+    let manifests = state.service.manifests().await;
+    let requested = manifests
+        .iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| &manifest.host_permissions)
+        .ok_or_else(|| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Plugin Not Found")
+                .with_detail(format!("Plugin '{name}' is not running"))
+        })?;
+    if config
+        .permissions
+        .iter()
+        .any(|permission| !requested.contains(permission))
+    {
+        return Err(temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Undeclared Plugin Permission")
+            .with_detail(
+                "A plugin can only receive permissions declared by its authenticated manifest",
+            ));
+    }
+    let old = state
+        .service
+        .plugin_grants(&name)
+        .await
+        .map_err(grant_problem)?;
+    let actor_id = old.actor.id.clone();
+    record_required_audit(
+        &state,
+        &PluginGrantChangeAudit {
+            context: audit_context(&auth, &metadata),
+            target_plugin_actor: old.actor,
+            old_config: old.config,
+            new_config: config.clone(),
+        },
+    )
+    .await?;
+    state
+        .service
+        .update_plugin_grants_for_actor(&name, &actor_id, config)
+        .await
+        .map_err(grant_problem)?;
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: "EXTERNAL_PLUGIN_GRANTS_CHANGED".into(),
+            plugin_name: Some(name.clone()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        },
+    )
+    .await;
+    plugin_grants_response(&state, &name).await.map(Json)
+}
+
+async fn plugin_grants_response(
+    state: &ExternalPluginsAppState,
+    name: &str,
+) -> Result<PluginGrantsResponse, Problem> {
+    let grants = state
+        .service
+        .plugin_grants(name)
+        .await
+        .map_err(grant_problem)?;
+    let requested_permissions = state
+        .service
+        .manifests()
+        .await
+        .into_iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| manifest.host_permissions)
+        .unwrap_or_default();
+    let configured = state.service.manager().ai_available().await;
+    Ok(PluginGrantsResponse {
+        actor: grants.actor,
+        requested_permissions,
+        permissions: grants.config.permissions,
+        ai: PluginAiCapability {
+            configured,
+            reason: (!configured).then(|| "No host AI provider is configured".to_string()),
+            setup_path: "/settings/ai-providers".into(),
+            daily_call_limit: grants.config.ai_daily_call_limit,
+            max_output_tokens: grants.config.ai_max_output_tokens,
+            max_prompt_bytes: crate::grants::MAX_PROMPT_BYTES,
+        },
+    })
+}
+
+async fn apply_install_grants(
+    state: &ExternalPluginsAppState,
+    context: &temps_core::audit::AuditContext,
+    name: &str,
+    actor_id: &str,
+    config: Option<crate::grants::PluginGrantConfig>,
+) -> Result<(), Problem> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let requested = state
+        .service
+        .manifests()
+        .await
+        .into_iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| manifest.host_permissions)
+        .ok_or_else(|| {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Plugin Grant Validation Unavailable")
+                .with_detail(format!(
+                    "Plugin '{name}' did not remain active after installation"
+                ))
+        })?;
+    if config
+        .permissions
+        .iter()
+        .any(|permission| !requested.contains(permission))
+    {
+        return Err(temps_core::problemdetails::new(StatusCode::BAD_REQUEST).with_title("Undeclared Plugin Permission").with_detail("The installation requested a permission the verified plugin manifest did not declare"));
+    }
+    record_required_audit(
+        state,
+        &PluginInstallGrantApprovalAudit {
+            context: context.clone(),
+            target_plugin_actor: PluginActorInfo {
+                id: actor_id.to_string(),
+                name: name.to_string(),
+                active: true,
+            },
+            approved_config: config.clone(),
+        },
+    )
+    .await?;
+    state
+        .service
+        .update_plugin_grants_for_actor(name, actor_id, config)
+        .await
+        .map_err(grant_problem)?;
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct InstallationReportingSettings {
@@ -389,6 +651,8 @@ pub struct InstallPluginRequest {
     /// Validated registry name only. URLs, paths, versions, and hashes are not
     /// accepted from HTTP callers.
     pub name: String,
+    #[serde(default)]
+    pub grants: Option<crate::grants::PluginGrantConfig>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -406,6 +670,8 @@ pub struct InstallRepositoryRequest {
     pub name: Option<String>,
     pub repository_url: String,
     pub ref_name: Option<String>,
+    #[serde(default)]
+    pub grants: Option<crate::grants::PluginGrantConfig>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -577,6 +843,10 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
         ExternalPluginsError::NotInstalled { .. } => {
             (StatusCode::NOT_FOUND, "Plugin Not Installed")
         }
+        ExternalPluginsError::Grant(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugin Actor Activation Failed",
+        ),
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
@@ -662,6 +932,9 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::CandidateRejected { name, version, .. } => {
             format!("Plugin '{name}' v{version} did not pass startup verification")
         }
+        ExternalPluginsError::Grant(_) => {
+            "The plugin actor identity could not be committed after activation".to_string()
+        }
     }
 }
 
@@ -730,6 +1003,7 @@ async fn install_plugin(
     request: Result<Json<InstallPluginRequest>, JsonRejection>,
 ) -> Result<Json<InstallPluginResponse>, Problem> {
     let Json(request) = request.map_err(install_request_problem)?;
+    let install_grants = request.grants.clone();
     permission_guard!(auth, SystemAdmin);
     temps_auth::require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
@@ -813,6 +1087,14 @@ async fn install_plugin(
             return Err(service_problem(&error));
         }
     };
+    apply_install_grants(
+        &state,
+        &context,
+        &outcome.name,
+        &outcome.actor_id,
+        install_grants,
+    )
+    .await?;
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -868,6 +1150,7 @@ async fn install_repository(
     request: Result<Json<InstallRepositoryRequest>, JsonRejection>,
 ) -> Result<Json<InstallRepositoryResponse>, Problem> {
     let Json(request) = request.map_err(install_request_problem)?;
+    let install_grants = request.grants.clone();
     permission_guard!(auth, SystemAdmin);
     temps_auth::require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
@@ -965,6 +1248,14 @@ async fn install_repository(
             return Err(service_problem(&error));
         }
     };
+    apply_install_grants(
+        &state,
+        &context,
+        &outcome.name,
+        &outcome.actor_id,
+        install_grants,
+    )
+    .await?;
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -1247,6 +1538,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route("/x/plugins/{name}/update", post(update_repository))
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
+        .route(
+            "/x/plugins/{name}/grants",
+            get(get_plugin_grants).put(put_plugin_grants),
+        )
 }
 
 #[derive(OpenApiTrait)]
@@ -1262,6 +1557,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         update_repository,
         uninstall_plugin,
         get_plugin_status,
+        get_plugin_grants,
+        put_plugin_grants,
     ),
     components(
         schemas(
@@ -1285,6 +1582,11 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::source_catalog::RepositoryScreenshot,
             crate::source_catalog::RepositoryValidation,
             PluginStatusResponse,
+            PluginGrantsResponse,
+            crate::grants::PluginGrantConfig,
+            PluginActorInfo,
+            PluginAiCapability,
+            PluginHostPermission,
             temps_core::ProblemDetails,
         )
     ),
@@ -1941,6 +2243,7 @@ mod tests {
             metadata(),
             Ok(Json(InstallPluginRequest {
                 name: "safe-plugin".to_string(),
+                grants: None,
             })),
         )
         .await
@@ -1998,6 +2301,7 @@ mod tests {
             metadata(),
             Ok(Json(InstallPluginRequest {
                 name: "../../escape".to_string(),
+                grants: None,
             })),
         )
         .await
@@ -2023,6 +2327,7 @@ mod tests {
             metadata(),
             Ok(Json(InstallPluginRequest {
                 name: "safe".to_string(),
+                grants: None,
             })),
         )
         .await
@@ -2053,6 +2358,7 @@ mod tests {
             metadata(),
             Ok(Json(InstallPluginRequest {
                 name: "safe-plugin".to_string(),
+                grants: None,
             })),
         )
         .await
@@ -2359,5 +2665,35 @@ mod tests {
         assert_eq!(json["loaded"], 2);
         assert_eq!(json["plugins"][0], "seo-analyzer");
         assert_eq!(json["plugins"][1], "monitoring");
+    }
+
+    #[tokio::test]
+    async fn plugin_grants_read_requires_system_admin() {
+        let error = get_plugin_grants(
+            user_auth(Role::User),
+            State(test_state()),
+            Path("safe-plugin".to_string()),
+        )
+        .await
+        .expect_err("grant discovery must require system administration");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn plugin_grants_write_requires_recent_sensitive_verification() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let mut state = test_state_with_audit(audit.clone());
+        state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+        let error = put_plugin_grants(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Path("safe-plugin".to_string()),
+            Json(crate::grants::PluginGrantConfig::default()),
+        )
+        .await
+        .expect_err("grant mutation must require sensitive verification");
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert!(audit.operations.lock().expect("audit lock").is_empty());
     }
 }

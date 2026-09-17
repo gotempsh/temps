@@ -11438,6 +11438,7 @@ export type InsightsResponse = {
 };
 
 export type InstallPluginRequest = {
+    grants?: null | PluginGrantConfig;
     /**
      * Validated registry name only. URLs, paths, versions, and hashes are not
      * accepted from HTTP callers.
@@ -11454,6 +11455,7 @@ export type InstallPluginResponse = {
 };
 
 export type InstallRepositoryRequest = {
+    grants?: null | PluginGrantConfig;
     name?: string | null;
     ref_name?: string | null;
     repository_url: string;
@@ -14896,6 +14898,21 @@ export type PlatformRelease = {
     url: string;
 };
 
+export type PluginActorInfo = {
+    active: boolean;
+    id: string;
+    name: string;
+};
+
+export type PluginAiCapability = {
+    configured: boolean;
+    daily_call_limit: number;
+    max_output_tokens: number;
+    max_prompt_bytes: number;
+    reason?: string | null;
+    setup_path: string;
+};
+
 /**
  * What a plugin is allowed to do with the platform API over the channel.
  *
@@ -14912,6 +14929,24 @@ export type PluginCatalogResponse = {
     reason?: string | null;
     source: string;
 };
+
+export type PluginGrantConfig = {
+    ai_daily_call_limit: number;
+    ai_max_output_tokens: number;
+    permissions: Array<PluginHostPermission>;
+};
+
+export type PluginGrantsResponse = {
+    actor: PluginActorInfo;
+    ai: PluginAiCapability;
+    permissions: Array<PluginHostPermission>;
+    requested_permissions: Array<PluginHostPermission>;
+};
+
+/**
+ * Host-owned permissions granted to one durable external-plugin actor.
+ */
+export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
 
 /**
  * The complete plugin manifest — the handshake contract.
@@ -14969,6 +15004,11 @@ export type PluginManifest = {
      * unidentifiable by setting this.
      */
     hide_header?: boolean;
+    /**
+     * Host-brokered operations requested by this plugin. These are requests,
+     * not authority: an administrator must grant each one separately.
+     */
+    host_permissions?: Array<PluginHostPermission>;
     /**
      * Unique plugin identifier (kebab-case, e.g., "backup-manager")
      */
@@ -62168,6 +62208,36 @@ export type ReloadPluginsResponses = {
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginGrantsData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/grants';
+};
+
+export type GetPluginGrantsResponses = {
+    200: PluginGrantsResponse;
+};
+
+export type GetPluginGrantsResponse = GetPluginGrantsResponses[keyof GetPluginGrantsResponses];
+
+export type PutPluginGrantsData = {
+    body: PluginGrantConfig;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/grants';
+};
+
+export type PutPluginGrantsResponses = {
+    200: PluginGrantsResponse;
+};
+
+export type PutPluginGrantsResponse = PutPluginGrantsResponses[keyof PutPluginGrantsResponses];
 
 export type GetPluginStatusData = {
     body?: never;

@@ -6125,6 +6125,15 @@ export type DeployFromImageUploadQuery = {
      * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
+    /**
+     * Client-generated UUID identifying this upload attempt. When a
+     * deployment already exists for this project, environment, and ID, that
+     * deployment is returned as-is instead of importing and deploying the
+     * image again — this makes a client retry after a lost response safe.
+     * Callers that omit it get no such protection (each call always creates
+     * a new deployment), so the CLI always sends one.
+     */
+    upload_request_id?: string | null;
 };
 
 export type DeployFromStaticRequest = {
@@ -11429,6 +11438,7 @@ export type InsightsResponse = {
 };
 
 export type InstallPluginRequest = {
+    grants?: null | PluginGrantConfig;
     /**
      * Validated registry name only. URLs, paths, versions, and hashes are not
      * accepted from HTTP callers.
@@ -11445,6 +11455,7 @@ export type InstallPluginResponse = {
 };
 
 export type InstallRepositoryRequest = {
+    grants?: null | PluginGrantConfig;
     name?: string | null;
     ref_name?: string | null;
     repository_url: string;
@@ -14887,6 +14898,21 @@ export type PlatformRelease = {
     url: string;
 };
 
+export type PluginActorInfo = {
+    active: boolean;
+    id: string;
+    name: string;
+};
+
+export type PluginAiCapability = {
+    configured: boolean;
+    daily_call_limit: number;
+    max_output_tokens: number;
+    max_prompt_bytes: number;
+    reason?: string | null;
+    setup_path: string;
+};
+
 /**
  * What a plugin is allowed to do with the platform API over the channel.
  *
@@ -14903,6 +14929,24 @@ export type PluginCatalogResponse = {
     reason?: string | null;
     source: string;
 };
+
+export type PluginGrantConfig = {
+    ai_daily_call_limit: number;
+    ai_max_output_tokens: number;
+    permissions: Array<PluginHostPermission>;
+};
+
+export type PluginGrantsResponse = {
+    actor: PluginActorInfo;
+    ai: PluginAiCapability;
+    permissions: Array<PluginHostPermission>;
+    requested_permissions: Array<PluginHostPermission>;
+};
+
+/**
+ * Host-owned permissions granted to one durable external-plugin actor.
+ */
+export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
 
 /**
  * The complete plugin manifest — the handshake contract.
@@ -14960,6 +15004,11 @@ export type PluginManifest = {
      * unidentifiable by setting this.
      */
     hide_header?: boolean;
+    /**
+     * Host-brokered operations requested by this plugin. These are requests,
+     * not authority: an administrator must grant each one separately.
+     */
+    host_permissions?: Array<PluginHostPermission>;
     /**
      * Unique plugin identifier (kebab-case, e.g., "backup-manager")
      */
@@ -51106,6 +51155,15 @@ export type DeployFromImageUploadData = {
          * Must start with '/'. When omitted, defaults to "/".
          */
         health_check_path?: string | null;
+        /**
+         * Client-generated UUID identifying this upload attempt. When a
+         * deployment already exists for this project, environment, and ID, that
+         * deployment is returned as-is instead of importing and deploying the
+         * image again — this makes a client retry after a lost response safe.
+         * Callers that omit it get no such protection (each call always creates
+         * a new deployment), so the CLI always sends one.
+         */
+        upload_request_id?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
@@ -51145,6 +51203,54 @@ export type DeployFromImageUploadResponses = {
 };
 
 export type DeployFromImageUploadResponse = DeployFromImageUploadResponses[keyof DeployFromImageUploadResponses];
+
+export type GetDeploymentByUploadRequestIdData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * The upload_request_id sent with the original upload request
+         */
+        upload_request_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}';
+};
+
+export type GetDeploymentByUploadRequestIdErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No deployment found yet for this upload attempt
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentByUploadRequestIdResponses = {
+    /**
+     * Deployment produced by this upload attempt
+     */
+    200: RemoteDeploymentResponse;
+};
+
+export type GetDeploymentByUploadRequestIdResponse = GetDeploymentByUploadRequestIdResponses[keyof GetDeploymentByUploadRequestIdResponses];
 
 export type DeployFromUploadedSourceData = {
     body: SourceArchiveUpload;
@@ -62039,6 +62145,36 @@ export type ReloadPluginsResponses = {
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginGrantsData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/grants';
+};
+
+export type GetPluginGrantsResponses = {
+    200: PluginGrantsResponse;
+};
+
+export type GetPluginGrantsResponse = GetPluginGrantsResponses[keyof GetPluginGrantsResponses];
+
+export type PutPluginGrantsData = {
+    body: PluginGrantConfig;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/grants';
+};
+
+export type PutPluginGrantsResponses = {
+    200: PluginGrantsResponse;
+};
+
+export type PutPluginGrantsResponse = PutPluginGrantsResponses[keyof PutPluginGrantsResponses];
 
 export type GetPluginStatusData = {
     body?: never;

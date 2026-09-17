@@ -10,7 +10,7 @@ import {
   type RepositorySelection,
 } from '@/lib/plugin-repository'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { client } from '@/api/client/client.gen'
+import { installRepository } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -25,15 +25,10 @@ import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import { toast } from 'sonner'
 import { useEffect } from 'react'
+import { PluginGrantFields } from './PluginGrantFields'
+import { emptyPluginGrants } from '@/lib/plugin-grants'
 
 export type { RepositorySelection } from '@/lib/plugin-repository'
-
-type InstallResult = {
-  name: string
-  version: string
-  source_commit: string
-  message: string
-}
 
 export function RepositoryInstall({
   disabled,
@@ -69,14 +64,7 @@ export function RepositoryInstall({
   const install = useMutation({
     mutationFn: async (values: Values) => {
       const body = repositoryInstallBody(values)
-      const response = await client.post<{ 200: InstallResult }, unknown, true>(
-        {
-          url: '/x/plugins/install/repository',
-          body,
-          headers: { 'Content-Type': 'application/json' },
-          throwOnError: true,
-        }
-      )
+      const response = await installRepository({ body, throwOnError: true })
       return response.data
     },
     onSuccess: async (result) => {
@@ -201,6 +189,33 @@ export function RepositoryInstall({
               </CollapsibleContent>
             </Collapsible>
           )}
+          <section
+            className="space-y-3 sm:col-span-2"
+            aria-label="Plugin permissions"
+          >
+            <h3 className="text-sm font-medium">Permissions</h3>
+            <Controller
+              control={form.control}
+              name="grants"
+              render={({ field }) => (
+                <PluginGrantFields
+                  value={field.value ?? emptyPluginGrants()}
+                  onChange={field.onChange}
+                  disabled={disabled || install.isPending}
+                />
+              )}
+            />
+            <p className="text-sm text-muted-foreground">
+              Approval applies only to permissions declared by the plugin. You
+              can change access later without restarting Temps.
+            </p>
+            {form.formState.errors.grants && (
+              <p role="alert" className="text-sm text-destructive">
+                Choose valid permissions, 0–10,000 daily AI calls, and 1–4,096
+                output tokens.
+              </p>
+            )}
+          </section>
           <div className="flex items-start gap-3 sm:col-span-2">
             <Controller
               control={form.control}

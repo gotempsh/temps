@@ -5,8 +5,34 @@ import { requireAuth } from "../../config/store.js";
 import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
 import { promptConfirm } from "../../ui/prompts.js";
 
-type Options = { name?: string; ref?: string; yes?: boolean };
-type InstallBody = { repository_url: string; name?: string; ref_name?: string };
+export type Options = {
+  name?: string;
+  ref?: string;
+  yes?: boolean;
+  grant?: readonly string[];
+  aiDailyCalls?: string;
+  aiMaxTokens?: string;
+};
+const HOST_PERMISSIONS = [
+  "ai_generate",
+  "projects_read",
+  "environments_read",
+  "deployments_read",
+  "events_read",
+  "api_read",
+  "api_write",
+] as const;
+type GrantConfig = {
+  permissions: (typeof HOST_PERMISSIONS)[number][];
+  ai_daily_call_limit: number;
+  ai_max_output_tokens: number;
+};
+type InstallBody = {
+  repository_url: string;
+  name?: string;
+  ref_name?: string;
+  grants?: GrantConfig;
+};
 type Result = {
   name: string;
   version: string;
@@ -35,10 +61,71 @@ export function installBody(repository: string, options: Options): InstallBody {
       "The optional plugin name must match the name declared by its package.",
     );
   validateRef(options.ref);
+  const grants = installGrants(options);
   return {
     repository_url: repository,
     ...(options.name === undefined ? {} : { name: options.name }),
     ...(options.ref === undefined ? {} : { ref_name: options.ref }),
+    ...(grants === undefined ? {} : { grants }),
+  };
+}
+
+export function installGrants(options: Options): GrantConfig | undefined {
+  if (
+    !options.grant &&
+    options.aiDailyCalls === undefined &&
+    options.aiMaxTokens === undefined
+  )
+    return undefined;
+  const permissions = [...new Set(options.grant ?? [])];
+  if (
+    permissions.some(
+      (permission) =>
+        !HOST_PERMISSIONS.includes(
+          permission as GrantConfig["permissions"][number],
+        ),
+    )
+  )
+    throw new PluginInstallError(
+      `Supported --grant values: ${HOST_PERMISSIONS.join(", ")}.`,
+    );
+  function limit(
+    value: string | undefined,
+    fallback: number,
+    min: number,
+    max: number,
+    flag: string,
+  ): number {
+    if (value === undefined) return fallback;
+    if (!/^\d+$/.test(value) || Number(value) < min || Number(value) > max)
+      throw new PluginInstallError(
+        `${flag} must be an integer between ${min} and ${max}.`,
+      );
+    return Number(value);
+  }
+  if (
+    (options.aiDailyCalls !== undefined || options.aiMaxTokens !== undefined) &&
+    !permissions.includes("ai_generate")
+  )
+    throw new PluginInstallError(
+      "AI limits require an explicit --grant ai_generate.",
+    );
+  return {
+    permissions: permissions as GrantConfig["permissions"],
+    ai_daily_call_limit: limit(
+      options.aiDailyCalls,
+      100,
+      0,
+      10000,
+      "--ai-daily-calls",
+    ),
+    ai_max_output_tokens: limit(
+      options.aiMaxTokens,
+      1024,
+      1,
+      4096,
+      "--ai-max-tokens",
+    ),
   };
 }
 
@@ -129,8 +216,24 @@ export function registerPluginInstallCommands(plugin: Command) {
       "-y, --yes",
       "Trust the repository and allow installation without prompting",
     )
+    .option(
+      "--grant <permissions...>",
+      "Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read",
+    )
+    .option(
+      "--ai-daily-calls <count>",
+      "Maximum AI attempts per day (0 pauses usage; default: 100)",
+    )
+    .option(
+      "--ai-max-tokens <count>",
+      "Maximum output tokens per AI call (1–4096; default: 1024)",
+    )
     .action(async (repository: string, options: Options) => {
       const body = installBody(repository, options);
+      if (body.grants)
+        console.log(
+          `Requested approvals: ${body.grants.permissions.join(", ") || "none"}. AI limits: ${body.grants.ai_daily_call_limit} calls/day, ${body.grants.ai_max_output_tokens} output tokens/call. The host only grants permissions declared by this plugin.`,
+        );
       if (await confirmTrust(options.yes))
         await send("/x/plugins/install/repository", body);
     });

@@ -9,8 +9,8 @@
  * Built for Bun -- compiled to a single binary via `bun build --compile`.
  *
  * Lifecycle:
- * 1. Parse CLI arguments (--socket-path, --auth-secret, --data-dir, etc.)
- * 2. Emit manifest to stdout (handshake phase 1)
+ * 1. Parse non-secret CLI arguments (--socket-path, --data-dir)
+ * 2. Emit protocol-2 hello and receive private launch configuration on stdin
  * 3. Start Bun.serve on Unix domain socket
  * 4. Emit ready to stdout (handshake phase 2)
  * 5. Accept WebSocket connection from host on /_temps/channel
@@ -28,6 +28,7 @@ import { PluginContext } from "./context.js";
 import { emitManifest, emitReady, PLUGIN_CHANNEL_PATH, extractAuthContext } from "./protocol.js";
 import { createEmbeddedUiHandler, type EmbeddedAssets } from "./ui.js";
 import { ArgsError, InitializationError } from "./errors.js";
+import { readLaunchConfig, authenticatedHostRequest, requiresHostAuthentication, validateHealthPath } from "./launch.js";
 
 /**
  * Run a Temps plugin. This is the main entry point.
@@ -57,9 +58,11 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   mkdirSync(args.dataDir, { recursive: true });
 
   const manifest = plugin.manifest();
+  validateHealthPath(manifest.health_path, manifest.name);
 
   // 2. Emit manifest (handshake phase 1)
   emitManifest(manifest);
+  const launch = await readLaunchConfig(Bun.stdin.stream(), manifest.name);
 
   // Ensure socket directory exists and clean up stale socket
   const socketDir = dirname(args.socketPath);
@@ -77,6 +80,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   // Track state
   let currentContext: PluginContext | undefined;
   let pluginReady = false;
+  let channelAccepted = false;
 
   // Embedded UI
   const embeddedAssets = plugin.embeddedUiAssets?.();
@@ -101,9 +105,18 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
     fetch(req: Request, server) {
       const url = new URL(req.url);
 
+      // Health discloses no caller data. Every other route, including public
+      // plugin routes forwarded by Temps, must carry the host assertion.
+      if (requiresHostAuthentication(url.pathname, manifest.health_path) &&
+          !authenticatedHostRequest(req.headers, launch.auth_secret)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
       // WebSocket upgrade for platform channel
       if (url.pathname === PLUGIN_CHANNEL_PATH) {
+        if (channelAccepted) return new Response("Channel already connected", { status: 409 });
         if (server.upgrade(req)) {
+          channelAccepted = true;
           return undefined as unknown as Response;
         }
         return new Response("WebSocket upgrade failed", { status: 500 });
@@ -188,7 +201,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   const ctx = new PluginContext({
     pluginName: manifest.name,
     dataDir: args.dataDir,
-    authSecret: args.authSecret,
+    authSecret: launch.auth_secret,
     client,
   });
   currentContext = ctx;
@@ -438,8 +451,8 @@ async function handleEventDelivery(
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv: string[]): PluginArgs {
-  const args: Partial<PluginArgs> = {};
+function parseArgs(argv: string[]): Pick<PluginArgs, "socketPath" | "dataDir"> {
+  const args: Partial<Pick<PluginArgs, "socketPath" | "dataDir">> = {};
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -451,13 +464,8 @@ function parseArgs(argv: string[]): PluginArgs {
         i++;
         break;
       case "--database-url":
-        args.databaseUrl = next;
-        i++;
-        break;
       case "--auth-secret":
-        args.authSecret = next;
-        i++;
-        break;
+        throw new ArgsError("Privileged launch values must arrive over the protocol 2 stdin handshake; update Temps");
       case "--data-dir":
         args.dataDir = next;
         i++;
@@ -468,12 +476,9 @@ function parseArgs(argv: string[]): PluginArgs {
   if (!args.socketPath) {
     throw new ArgsError("--socket-path is required");
   }
-  if (!args.authSecret) {
-    throw new ArgsError("--auth-secret is required");
-  }
   if (!args.dataDir) {
     throw new ArgsError("--data-dir is required");
   }
 
-  return args as PluginArgs;
+  return { socketPath: args.socketPath, dataDir: args.dataDir };
 }

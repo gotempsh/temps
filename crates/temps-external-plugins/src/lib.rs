@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod channel;
 pub mod event_listener;
+pub mod grants;
 pub mod handler;
 pub mod host_api;
 pub mod install;

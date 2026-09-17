@@ -16,6 +16,7 @@ temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
+temps-ai = { path = "../temps-ai" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
@@ -50,3 +51,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+temps-database = { path = "../temps-database" }
+temps-migrations = { path = "../temps-migrations" }

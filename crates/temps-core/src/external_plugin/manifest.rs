@@ -131,6 +131,10 @@ pub struct PluginManifest {
     /// through the console.
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
+    /// Host-brokered operations requested by this plugin. These are requests,
+    /// not authority: an administrator must grant each one separately.
+    #[serde(default)]
+    pub host_permissions: Vec<super::channel::PluginHostPermission>,
     /// Platform event types the plugin subscribes to.
     ///
     /// When specified, Temps will POST matching events to the plugin's
@@ -205,6 +209,7 @@ impl PluginManifest {
                 // auth explicitly, never by omission.
                 public_paths: Vec::new(),
                 capabilities: Vec::new(),
+                host_permissions: Vec::new(),
                 hide_header: false,
                 events: Vec::new(),
             },
@@ -261,6 +266,25 @@ impl PluginManifestBuilder {
     pub fn capability(mut self, capability: PluginCapability) -> Self {
         if !self.manifest.capabilities.contains(&capability) {
             self.manifest.capabilities.push(capability);
+        }
+        self
+    }
+
+    pub fn host_permission(mut self, permission: super::channel::PluginHostPermission) -> Self {
+        if !self.manifest.host_permissions.contains(&permission) {
+            self.manifest.host_permissions.push(permission);
+        }
+        self
+    }
+
+    pub fn host_permissions(
+        mut self,
+        permissions: impl IntoIterator<Item = super::channel::PluginHostPermission>,
+    ) -> Self {
+        for permission in permissions {
+            if !self.manifest.host_permissions.contains(&permission) {
+                self.manifest.host_permissions.push(permission);
+            }
         }
         self
     }

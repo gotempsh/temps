@@ -44,6 +44,39 @@ type OperationGroup = {
 
 const OPERATION_GROUPS: OperationGroup[] = [
   {
+    label: 'Plugins',
+    operations: [
+      {
+        value: 'EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED',
+        label: 'Plugin Operation Allowed',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_HOST_OPERATION_DENIED',
+        label: 'Plugin Operation Denied',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_HOST_OPERATION_SUCCEEDED',
+        label: 'Plugin Operation Completed',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_HOST_OPERATION_FAILED',
+        label: 'Plugin Operation Failed',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_GRANTS_CHANGED',
+        label: 'Plugin Permissions Changed',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_GRANTS_CHANGE_REQUESTED',
+        label: 'Plugin Permission Change Requested',
+      },
+      {
+        value: 'EXTERNAL_PLUGIN_INSTALL_GRANTS_APPROVED',
+        label: 'Plugin Installation Permissions Approved',
+      },
+    ],
+  },
+  {
     label: 'Authentication',
     operations: [
       { value: 'LOGIN_SUCCESS', label: 'Login Success' },
@@ -369,7 +402,7 @@ export function AuditLogs() {
   const hasFilters =
     !!dateRange || operation !== ALL_FILTER || selectedUserId !== ALL_FILTER
 
-  const operationOptions = useMemo(buildOperationOptions, [])
+  const operationOptions = useMemo(() => buildOperationOptions(), [])
 
   const userOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [

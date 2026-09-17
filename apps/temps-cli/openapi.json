@@ -24876,6 +24876,16 @@
       "InstallPluginRequest": {
         "additionalProperties": false,
         "properties": {
+          "grants": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            ]
+          },
           "name": {
             "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
             "type": "string"
@@ -24916,6 +24926,16 @@
       "InstallRepositoryRequest": {
         "additionalProperties": false,
         "properties": {
+          "grants": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            ]
+          },
           "name": {
             "type": [
               "string",
@@ -32938,6 +32958,64 @@
         ],
         "type": "object"
       },
+      "PluginActorInfo": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "active"
+        ],
+        "type": "object"
+      },
+      "PluginAiCapability": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "daily_call_limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_output_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_prompt_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path",
+          "daily_call_limit",
+          "max_output_tokens",
+          "max_prompt_bytes"
+        ],
+        "type": "object"
+      },
       "PluginCapability": {
         "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
         "enum": [
@@ -32973,6 +33051,74 @@
           "plugins"
         ],
         "type": "object"
+      },
+      "PluginGrantConfig": {
+        "properties": {
+          "ai_daily_call_limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ai_max_output_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "ai_daily_call_limit",
+          "ai_max_output_tokens"
+        ],
+        "type": "object"
+      },
+      "PluginGrantsResponse": {
+        "properties": {
+          "actor": {
+            "$ref": "#/components/schemas/PluginActorInfo"
+          },
+          "ai": {
+            "$ref": "#/components/schemas/PluginAiCapability"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          },
+          "requested_permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "actor",
+          "requested_permissions",
+          "permissions",
+          "ai"
+        ],
+        "type": "object"
+      },
+      "PluginHostPermission": {
+        "description": "Host-owned permissions granted to one durable external-plugin actor.",
+        "enum": [
+          "ai_generate",
+          "projects_read",
+          "environments_read",
+          "deployments_read",
+          "api_read",
+          "api_write",
+          "events_read"
+        ],
+        "type": "string"
       },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
@@ -33012,6 +33158,13 @@
           "hide_header": {
             "description": "Suppress the console's own header strip above this plugin's UI.\n\nThe console normally renders the plugin's icon, display name and\nversion above the iframe. For a plugin whose UI is a full working\nsurface with its own header, that is a second title bar competing\nfor the same vertical space — and vertical space is exactly what a\ndense full-page layout has none of. Opt out and the frame gets the\nfull height.\n\nThe nav entry still names the plugin, so nothing becomes\nunidentifiable by setting this.",
             "type": "boolean"
+          },
+          "host_permissions": {
+            "description": "Host-brokered operations requested by this plugin. These are requests,\nnot authority: an administrator must grant each one separately.",
+            "items": {
+              "$ref": "#/components/schemas/PluginHostPermission"
+            },
+            "type": "array"
           },
           "name": {
             "description": "Unique plugin identifier (kebab-case, e.g., \"backup-manager\")",
@@ -115744,6 +115897,84 @@
           }
         ],
         "summary": "Reload all external plugins.",
+        "tags": [
+          "External Plugins"
+        ]
+      }
+    },
+    "/x/plugins/{name}/grants": {
+      "get": {
+        "operationId": "get_plugin_grants",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginGrantsResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      },
+      "put": {
+        "operationId": "put_plugin_grants",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginGrantConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginGrantsResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Plugins"
         ]

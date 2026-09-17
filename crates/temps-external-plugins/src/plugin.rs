@@ -78,6 +78,14 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 queue,
                 db,
             ));
+            service
+                .manager()
+                .set_ai_service(context.require_service::<dyn temps_ai::AiService>())
+                .await;
+            service
+                .manager()
+                .set_audit_service(context.require_service::<dyn temps_core::AuditLogger>())
+                .await;
             // Kick off discovery + start in the background. When it
             // completes, the shared proxy router is swapped in and
             // `/x/<plugin>/...` routes start working.
