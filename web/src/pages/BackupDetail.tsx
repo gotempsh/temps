@@ -3,14 +3,11 @@
 
 'use client'
 
-import { PageHeader } from '@/components/layout/PageContainer'
-
 import {
   getBackupOptions,
   getS3SourceOptions,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -22,7 +19,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -30,7 +26,6 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Table,
   TableBody,
@@ -52,9 +47,21 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
-import { cn, formatBytes } from '@/lib/utils'
+import { cn } from '@/lib/utils'
+import {
+  Button,
+  Callout,
+  CopyAction,
+  Detail,
+  PageState,
+  Status,
+  fmtBytes,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import {
   AlertCircle,
   ArrowLeft,
@@ -65,7 +72,6 @@ import {
   FileArchive,
   HardDrive,
   Loader2,
-  RotateCcw,
   Trash2,
   XCircle,
 } from 'lucide-react'
@@ -103,78 +109,31 @@ function StatusIcon({ state }: { state: BackupState }) {
   const iconClass = 'h-4 w-4'
   switch (state) {
     case 'completed':
-      return <CheckCircle2 className={cn(iconClass, 'text-emerald-600')} />
+      return <CheckCircle2 className={cn(iconClass, 'text-success')} />
     case 'failed':
       return <XCircle className={cn(iconClass, 'text-destructive')} />
     case 'running':
-      return <Loader2 className={cn(iconClass, 'animate-spin text-blue-600')} />
+      return <Loader2 className={cn(iconClass, 'animate-spin text-primary')} />
     default:
       return <Clock className={cn(iconClass, 'text-muted-foreground')} />
   }
 }
 
+// Mirrors the record's own state — the Detail template's single verdict.
+const BACKUP_STATE_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+  completed: { tone: 'ok', label: 'Completed' },
+  failed: { tone: 'error', label: 'Failed' },
+  running: { tone: 'running', label: 'Running' },
+  pending: { tone: 'idle', label: 'Pending' },
+  cancelled: { tone: 'idle', label: 'Cancelled' },
+}
+function backupVerdict(state: BackupState): { tone: StatusTone; label: string } {
+  return BACKUP_STATE_VERDICT[state] ?? { tone: 'idle', label: state }
+}
+
 function StatusBadge({ state }: { state: BackupState }) {
-  // Leading-icon padding per design guidelines: vertical = left padding,
-  // larger right padding for visual balance. Shared across every variant
-  // so all the state pills size identically in the table.
-  const base = 'gap-1.5 py-1 pl-1 pr-2 capitalize font-normal'
-  switch (state) {
-    case 'completed':
-      return (
-        <Badge
-          variant="outline"
-          className={cn(
-            base,
-            'border-emerald-600/30 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
-          )}
-        >
-          <StatusIcon state={state} />
-          Completed
-        </Badge>
-      )
-    case 'failed':
-      // Muted red — tinted background + outlined border + colored text.
-      // The solid `destructive` variant clashes with the destructive-red
-      // error message that always sits in the next column for failed rows.
-      return (
-        <Badge
-          variant="outline"
-          className={cn(
-            base,
-            'border-destructive/30 bg-destructive/10 text-destructive dark:bg-destructive/20 dark:text-red-300'
-          )}
-        >
-          <StatusIcon state={state} />
-          Failed
-        </Badge>
-      )
-    case 'running':
-      return (
-        <Badge
-          variant="outline"
-          className={cn(
-            base,
-            'border-blue-600/30 bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300'
-          )}
-        >
-          <StatusIcon state={state} />
-          Running
-        </Badge>
-      )
-    default:
-      return (
-        <Badge
-          variant="outline"
-          className={cn(
-            base,
-            'border-muted-foreground/20 bg-muted/50 text-muted-foreground'
-          )}
-        >
-          <StatusIcon state={state} />
-          {state}
-        </Badge>
-      )
-  }
+  const verdict = backupVerdict(state)
+  return <Status tone={verdict.tone} label={verdict.label} />
 }
 
 function Stat({
@@ -206,7 +165,10 @@ function Stat({
   )
 }
 
-function Detail({
+// Page-local key/value row for the "Details" aside card. Named `FieldRow`
+// (not `Detail`) to avoid colliding with the `Detail` template imported
+// from `@temps-sdk/ds`.
+function FieldRow({
   label,
   children,
   copy,
@@ -229,11 +191,24 @@ function Detail({
         >
           {children}
         </div>
-        {copy ? (
-          <CopyButton value={copy} minimal className="h-8 w-8 shrink-0" />
-        ) : null}
+        {copy ? <CopyAction value={copy} label={`Copy ${label.toLowerCase()}`} /> : null}
       </dd>
     </div>
+  )
+}
+
+function BackupDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
+  return (
+    <Detail
+      title={<div className="h-7 w-56 animate-pulse rounded bg-muted" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3].map(() => ({
+        label: <div className="h-3 w-16 animate-pulse rounded bg-muted" />,
+        value: <div className="h-4 w-24 animate-pulse rounded bg-muted" />,
+      }))}
+      main={<div className="h-64 w-full animate-pulse rounded-lg bg-muted" />}
+      aside={<div className="h-80 w-full animate-pulse rounded-lg bg-muted" />}
+    />
   )
 }
 
@@ -351,56 +326,49 @@ export function BackupDetail() {
     },
   })
 
+  const backAction = (
+    <Button variant="ghost" size="sm" asChild>
+      <Link to={`/backups/s3-sources/${id}`}>
+        <ArrowLeft className="mr-2 h-4 w-4" />
+        Back
+      </Link>
+    </Button>
+  )
+
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-16">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-      </div>
-    )
+    return <BackupDetailSkeleton backAction={backAction} />
   }
 
   if (error && !backup) {
     return (
-      <div className="flex flex-col items-center justify-center gap-4 py-16">
-        <AlertCircle className="h-8 w-8 text-destructive" />
-        <div className="text-center">
-          <h2 className="text-lg font-semibold">Failed to load backup</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {error instanceof Error
-              ? error.message
-              : 'An unexpected error occurred. Please try again.'}
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={() => void refetch()}>
-            <RotateCcw className="mr-2 h-4 w-4" />
-            Retry
-          </Button>
-          <Button variant="ghost" asChild>
-            <Link to={`/backups/s3-sources/${id}`}>
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to S3 Source
-            </Link>
-          </Button>
-        </div>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Couldn't load backup"
+        description={
+          error instanceof Error
+            ? error.message
+            : 'An unexpected error occurred. Please try again.'
+        }
+        action={
+          <div className="flex gap-2">
+            <Button onClick={() => void refetch()}>Retry</Button>
+            {backAction}
+          </div>
+        }
+      />
     )
   }
 
   if (!backup) {
     return (
-      <div className="flex flex-col items-center justify-center py-16">
-        <h2 className="text-lg font-semibold">Backup not found</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          The requested backup could not be found.
-        </p>
-        <Button asChild className="mt-4">
-          <Link to={`/backups/s3-sources/${id}`}>
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to S3 Source
-          </Link>
-        </Button>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Backup not found"
+        description="The requested backup could not be found."
+        action={backAction}
+      />
     )
   }
 
@@ -431,450 +399,398 @@ export function BackupDetail() {
     ? createdByUser.name || createdByUser.username || createdByUser.email
     : `User #${backup.created_by}`
 
+  // These are deliberately different fields from the Overview stat row
+  // below (status/duration/size/type) — provenance and retention, not
+  // performance, so nothing is shown twice.
+  const facts: DetailFact[] = [
+    {
+      label: backup.external_service ? 'Service' : 'S3 source',
+      value: backup.external_service ? (
+        <Link to={`/storage/${backup.external_service.id}`} className="hover:underline">
+          {backup.external_service.name}
+        </Link>
+      ) : source ? (
+        <Link to={`/backups/s3-sources/${id}`} className="hover:underline">
+          {source.name}
+        </Link>
+      ) : (
+        '—'
+      ),
+    },
+    {
+      label: 'Created by',
+      value: createdByUser ? (
+        <Link to={`/settings/users/${createdByUser.id}`} className="hover:underline">
+          {createdByLabel}
+        </Link>
+      ) : (
+        createdByLabel
+      ),
+    },
+    {
+      label: 'Retained until',
+      value: backup.expires_at ? (
+        <span title={fmtDateTime(backup.expires_at)}>
+          {fmtRelativeTime(backup.expires_at)}
+        </span>
+      ) : (
+        'Kept until deleted'
+      ),
+    },
+    {
+      label: 'Compression',
+      value:
+        backup.compression_type && backup.compression_type !== 'none'
+          ? backup.compression_type
+          : 'Uncompressed',
+    },
+  ]
+
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <Button variant="ghost" size="sm" asChild>
-          <Link to={`/backups/s3-sources/${id}`}>
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back
-          </Link>
-        </Button>
-      </div>
-
-      <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
-        <div className="min-w-0 space-y-4">
-          {/* Overview */}
-          <Card className="overflow-hidden shadow-none">
-            <CardHeader className="border-b px-5 py-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div className="space-y-1.5 min-w-0">
-                  <PageHeader
-                    title={
-                      <span className="flex items-center gap-2">
-                        <FileArchive className="h-5 w-5 shrink-0" />
-                        <span className="truncate">
-                          Backup{' '}
-                          <span className="font-mono text-base text-muted-foreground">
-                            #{backup.backup_id.slice(0, 8)}
-                          </span>
-                        </span>
-                      </span>
-                    }
-                  />
-                  <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="inline-flex items-center gap-1.5">
-                      <Clock className="h-3.5 w-3.5" />
-                      <TimeAgo date={backup.started_at} />
-                    </span>
-                    <span aria-hidden>·</span>
-                    <span className="hidden sm:inline">
-                      {format(startedAt, 'PPp')}
-                    </span>
-                    <span className="sm:hidden">
-                      {format(startedAt, 'MMM d, p')}
-                    </span>
-                    {source ? (
-                      <>
-                        <span aria-hidden>·</span>
-                        <Link
-                          to={`/backups/s3-sources/${id}`}
-                          className="text-foreground hover:underline truncate"
-                        >
-                          {source.name}
-                        </Link>
-                      </>
-                    ) : null}
-                  </CardDescription>
-                </div>
-                <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
-                  <StatusBadge state={state} />
-                  <CopyButton value={backup.s3_location} className="gap-2">
-                    Copy S3 path
-                  </CopyButton>
-                  {/* Cancel — only live backups can be cancelled. Soft cancel:
-                    the DB row flips immediately + the engine sees the
-                    cancellation token on its next heartbeat tick. */}
-                  {(state === 'pending' || state === 'running') && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setShowCancelDialog(true)}
-                      disabled={cancelMutation.isPending}
-                      className="gap-2"
-                    >
-                      {cancelMutation.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Ban className="h-4 w-4" />
-                      )}
-                      Cancel
-                    </Button>
-                  )}
-                  {state !== 'pending' && state !== 'running' && (
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      onClick={() => setShowDeleteDialog(true)}
-                      disabled={deleteMutation.isPending}
-                      className="gap-2"
-                    >
-                      {deleteMutation.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Trash2 className="h-4 w-4" />
-                      )}
-                      Delete
-                    </Button>
-                  )}
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="p-5">
-              <div
-                role="list"
-                className="grid grid-cols-2 divide-x divide-y divide-border overflow-hidden rounded-md border border-border sm:grid-cols-4 sm:divide-y-0"
+    <>
+      <Detail
+        title={
+          <span className="flex items-center gap-2">
+            <FileArchive className="h-5 w-5 shrink-0" />
+            Backup{' '}
+            <span className="font-mono text-base text-muted-foreground">
+              #{backup.backup_id.slice(0, 8)}
+            </span>
+          </span>
+        }
+        description={
+          <span className="inline-flex items-center gap-1.5">
+            <Clock className="h-3.5 w-3.5" />
+            <TimeAgo date={backup.started_at} />
+            <span aria-hidden>·</span>
+            {fmtDateTime(backup.started_at)}
+          </span>
+        }
+        verdict={<StatusBadge state={state} />}
+        facts={facts}
+        actions={
+          <>
+            {backAction}
+            <CopyAction value={backup.s3_location}>Copy S3 path</CopyAction>
+            {/* Cancel — only live backups can be cancelled. Soft cancel:
+              the DB row flips immediately + the engine sees the
+              cancellation token on its next heartbeat tick. */}
+            {(state === 'pending' || state === 'running') && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowCancelDialog(true)}
+                busy={cancelMutation.isPending}
+                busyLabel="Cancelling…"
+                className="gap-2"
               >
-                <Stat
-                  icon={CheckCircle2}
-                  label="Status"
-                  value={
-                    <span className="inline-flex items-center gap-2 text-xl">
-                      <StatusIcon state={state} />
-                      <span className="capitalize">{state}</span>
-                    </span>
-                  }
-                  sub={
-                    completedAt ? (
-                      <>Finished {format(completedAt, 'p')}</>
-                    ) : state === 'running' ? (
-                      <>In progress</>
-                    ) : (
-                      <>—</>
-                    )
-                  }
-                />
-                <Stat
-                  icon={Clock}
-                  label="Duration"
-                  value={durationMs !== null ? formatDuration(durationMs) : '—'}
-                  sub={
-                    completedAt
-                      ? // Collapse `5:22 PM → 5:22 PM` to a single time when the
-                        // start and end land in the same minute (the common case
-                        // for sub-60s backups). Saves visual noise on narrow
-                        // screens.
-                        format(startedAt, 'p') === format(completedAt, 'p')
-                        ? format(startedAt, 'p')
-                        : `${format(startedAt, 'p')} → ${format(completedAt, 'p')}`
-                      : 'Not finished'
-                  }
-                />
-                <Stat
-                  icon={HardDrive}
-                  label="Size"
-                  value={
-                    displaySize ? (
-                      <span className="inline-flex items-baseline gap-2">
-                        <span>{formatBytes(displaySize)}</span>
-                        {isLiveSize ? (
-                          <span className="text-xs font-normal text-muted-foreground">
-                            so far
-                          </span>
-                        ) : null}
-                      </span>
-                    ) : (
-                      '—'
-                    )
-                  }
-                  sub={
-                    backup.compression_type &&
-                    backup.compression_type !== 'none'
-                      ? `${backup.compression_type} compression`
-                      : 'Uncompressed'
-                  }
-                />
-                <Stat
-                  icon={FileArchive}
-                  label="Type"
-                  value={
-                    <span className="capitalize">{backup.backup_type}</span>
-                  }
-                  sub={
-                    backup.file_count
-                      ? `${backup.file_count.toLocaleString()} files`
-                      : undefined
-                  }
-                />
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Error — only when present */}
-          {backup.error_message ? (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>Backup failed</AlertTitle>
-              <AlertDescription className="font-mono text-xs break-all">
-                {backup.error_message}
-              </AlertDescription>
-            </Alert>
-          ) : null}
-
-          {/* Services in this backup — only shown when children exist */}
-          {children.length > 0 ? (
+                <Ban className="h-4 w-4" />
+                Cancel
+              </Button>
+            )}
+            {state !== 'pending' && state !== 'running' && (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => setShowDeleteDialog(true)}
+                busy={deleteMutation.isPending}
+                busyLabel="Deleting…"
+                className="gap-2"
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </Button>
+            )}
+          </>
+        }
+        main={
+          <>
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
-                <CardTitle className="text-base font-semibold">
-                  Services in this backup
-                </CardTitle>
-                <CardDescription>
-                  External services whose data was captured in this backup run.
-                </CardDescription>
+                <CardTitle className="text-base font-semibold">Overview</CardTitle>
               </CardHeader>
               <CardContent className="p-0">
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Service</TableHead>
-                        <TableHead>Type</TableHead>
-                        <TableHead>State</TableHead>
-                        <TableHead className="hidden sm:table-cell">
-                          Size
-                        </TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Duration
-                        </TableHead>
-                        <TableHead className="hidden lg:table-cell">
-                          Error
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {children.map((child) => {
-                        const childStarted = new Date(child.started_at)
-                        const childFinished = child.finished_at
-                          ? new Date(child.finished_at)
-                          : null
-                        const childDurationMs = childFinished
-                          ? childFinished.getTime() - childStarted.getTime()
-                          : null
-                        // When the parent backup has finalized but the child is
-                        // still pending/running, the engine bailed before
-                        // updating the child row (typical: pre-flight S3 check
-                        // failed, parent was marked failed but children were
-                        // never visited). Surface the parent's state + error
-                        // instead of showing a stale "Pending" forever.
-                        const parentFinalized =
-                          state === 'failed' || state === 'cancelled'
-                        const childStale =
-                          child.state === 'pending' || child.state === 'running'
-                        const effectiveState =
-                          parentFinalized && childStale ? state : child.state
-                        const effectiveError =
-                          child.error_message ??
-                          (parentFinalized && childStale
-                            ? (backup.error_message ?? null)
-                            : null)
-                        return (
-                          <TableRow key={child.id}>
-                            <TableCell>
-                              <Link
-                                to={`/storage/${child.service_id}`}
-                                className="flex items-center gap-2 hover:underline"
-                              >
-                                <Database className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                <span className="font-medium">
-                                  {child.service_name}
-                                </span>
-                              </Link>
-                            </TableCell>
-                            <TableCell>
-                              <Badge variant="outline" className="capitalize">
-                                {child.service_type}
-                              </Badge>
-                            </TableCell>
-                            <TableCell>
-                              <StatusBadge state={effectiveState} />
-                            </TableCell>
-                            <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
-                              {child.size_bytes !== null
-                                ? formatBytes(child.size_bytes)
-                                : '—'}
-                            </TableCell>
-                            <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                              {childDurationMs !== null
-                                ? formatDuration(childDurationMs)
-                                : '—'}
-                            </TableCell>
-                            <TableCell className="hidden lg:table-cell max-w-[200px]">
-                              {effectiveError ? (
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="block truncate text-xs text-destructive cursor-help">
-                                        {effectiveError}
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent
-                                      side="top"
-                                      className="max-w-sm whitespace-pre-wrap break-words"
-                                    >
-                                      {effectiveError}
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                              ) : (
-                                <span className="text-muted-foreground">—</span>
-                              )}
-                            </TableCell>
-                          </TableRow>
-                        )
-                      })}
-                    </TableBody>
-                  </Table>
+                <div
+                  role="list"
+                  className="grid grid-cols-2 divide-x divide-y divide-border overflow-hidden sm:grid-cols-4 sm:divide-y-0"
+                >
+                  <Stat
+                    icon={CheckCircle2}
+                    label="Status"
+                    value={
+                      <span className="inline-flex items-center gap-2 text-xl">
+                        <StatusIcon state={state} />
+                        <span className="capitalize">{state}</span>
+                      </span>
+                    }
+                    sub={
+                      completedAt ? (
+                        <>Finished {fmtDateTime(completedAt)}</>
+                      ) : state === 'running' ? (
+                        <>In progress</>
+                      ) : (
+                        <>—</>
+                      )
+                    }
+                  />
+                  <Stat
+                    icon={Clock}
+                    label="Duration"
+                    value={durationMs !== null ? formatDuration(durationMs) : '—'}
+                    sub={
+                      completedAt
+                        ? `${fmtDateTime(startedAt)} → ${fmtDateTime(completedAt)}`
+                        : 'Not finished'
+                    }
+                  />
+                  <Stat
+                    icon={HardDrive}
+                    label="Size"
+                    value={
+                      displaySize ? (
+                        <span className="inline-flex items-baseline gap-2">
+                          <span>{fmtBytes(displaySize)}</span>
+                          {isLiveSize ? (
+                            <span className="text-xs font-normal text-muted-foreground">
+                              so far
+                            </span>
+                          ) : null}
+                        </span>
+                      ) : (
+                        '—'
+                      )
+                    }
+                    sub={
+                      backup.compression_type &&
+                      backup.compression_type !== 'none'
+                        ? `${backup.compression_type} compression`
+                        : 'Uncompressed'
+                    }
+                  />
+                  <Stat
+                    icon={FileArchive}
+                    label="Type"
+                    value={
+                      <span className="capitalize">{backup.backup_type}</span>
+                    }
+                    sub={
+                      backup.file_count
+                        ? `${backup.file_count.toLocaleString()} files`
+                        : undefined
+                    }
+                  />
                 </div>
               </CardContent>
             </Card>
-          ) : null}
-        </div>
-        <aside className="min-w-0 space-y-4">
-          {' '}
-          {/* Details */}
-          <Card className="overflow-hidden shadow-none">
-            <CardHeader className="border-b px-5 py-4">
-              <CardTitle className="text-base font-semibold">Details</CardTitle>
-              <CardDescription>
-                Storage, provenance, and integrity metadata for this backup.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="p-5">
-              <dl className="divide-y divide-border">
-                <Detail label="Backup ID" mono copy={backup.backup_id}>
-                  {backup.backup_id}
-                </Detail>
-                <Detail label="Location" mono copy={backup.s3_location}>
-                  {backup.s3_location}
-                </Detail>
-                {source ? (
-                  <Detail label="S3 source">
-                    <Link
-                      to={`/backups/s3-sources/${id}`}
-                      className="text-foreground hover:underline"
-                    >
-                      {source.name}
-                    </Link>{' '}
-                    <span className="text-muted-foreground">
-                      ({source.bucket_name})
-                    </span>
-                  </Detail>
-                ) : null}
-                {backup.external_service ? (
-                  <Detail label="Service">
-                    <Link
-                      to={`/storage/${backup.external_service.id}`}
-                      className="text-foreground hover:underline"
-                    >
-                      {backup.external_service.name}
-                    </Link>{' '}
-                    <span className="text-muted-foreground capitalize">
-                      ({backup.external_service.service_type})
-                    </span>
-                  </Detail>
-                ) : null}
-                <Detail label="Created by">
-                  {createdByUser ? (
-                    <Link
-                      to={`/settings/users/${createdByUser.id}`}
-                      className="text-foreground hover:underline"
-                    >
-                      {createdByLabel}
-                    </Link>
-                  ) : (
-                    createdByLabel
-                  )}
-                </Detail>
-                <Detail label="Started at">{format(startedAt, 'PPpp')}</Detail>
-                {completedAt ? (
-                  <Detail label="Finished at">
-                    {format(completedAt, 'PPpp')}
-                  </Detail>
-                ) : null}
-                {state === 'running' ? (
-                  <Detail label="Step">
-                    <span className="inline-flex items-center gap-2">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-600 shrink-0" />
-                      <span className="font-mono text-xs">
-                        {backup.current_step ?? 'starting…'}
-                      </span>
-                    </span>
-                  </Detail>
-                ) : null}
-                {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
-                  <Detail label="Attempt">
-                    {backup.attempts} of {backup.max_attempts ?? '?'}
-                  </Detail>
-                ) : null}
-                {typeof backup.max_runtime_secs === 'number' ? (
-                  <Detail label="Timeout">
-                    {formatTimeoutSecs(backup.max_runtime_secs)}
-                  </Detail>
-                ) : null}
-                <Detail label="Retained until">
-                  {backup.expires_at ? (
-                    <>
-                      {format(new Date(backup.expires_at), 'PPp')}{' '}
-                      <span className="text-muted-foreground">
-                        (<TimeAgo date={backup.expires_at} />)
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-muted-foreground">
-                      Kept until deleted
-                    </span>
-                  )}
-                </Detail>
-                {backup.schedule_id ? (
-                  <Detail label="Schedule">
-                    <Link
-                      to={`/backups/s3-sources/${id}`}
-                      className="text-foreground hover:underline"
-                    >
-                      Schedule #{backup.schedule_id}
-                    </Link>
-                  </Detail>
-                ) : null}
-                {backup.checksum ? (
-                  <Detail label="Checksum" mono copy={backup.checksum}>
-                    {backup.checksum}
-                  </Detail>
-                ) : null}
-              </dl>
-            </CardContent>
-          </Card>{' '}
-          {/* Tags */}
-          {backup.tags.length > 0 ? (
+
+            {backup.error_message ? (
+              <Callout tone="error" title="Backup failed">
+                <span className="break-all font-mono text-xs">{backup.error_message}</span>
+              </Callout>
+            ) : null}
+
+            {children.length > 0 ? (
+              <Card className="overflow-hidden shadow-none">
+                <CardHeader className="border-b px-5 py-4">
+                  <CardTitle className="text-base font-semibold">
+                    Services in this backup
+                  </CardTitle>
+                  <CardDescription>
+                    External services whose data was captured in this backup run.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Service</TableHead>
+                          <TableHead>Type</TableHead>
+                          <TableHead>State</TableHead>
+                          <TableHead className="hidden sm:table-cell">
+                            Size
+                          </TableHead>
+                          <TableHead className="hidden md:table-cell">
+                            Duration
+                          </TableHead>
+                          <TableHead className="hidden lg:table-cell">
+                            Error
+                          </TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {children.map((child) => {
+                          const childStarted = new Date(child.started_at)
+                          const childFinished = child.finished_at
+                            ? new Date(child.finished_at)
+                            : null
+                          const childDurationMs = childFinished
+                            ? childFinished.getTime() - childStarted.getTime()
+                            : null
+                          // When the parent backup has finalized but the child is
+                          // still pending/running, the engine bailed before
+                          // updating the child row (typical: pre-flight S3 check
+                          // failed, parent was marked failed but children were
+                          // never visited). Surface the parent's state + error
+                          // instead of showing a stale "Pending" forever.
+                          const parentFinalized =
+                            state === 'failed' || state === 'cancelled'
+                          const childStale =
+                            child.state === 'pending' || child.state === 'running'
+                          const effectiveState =
+                            parentFinalized && childStale ? state : child.state
+                          const effectiveError =
+                            child.error_message ??
+                            (parentFinalized && childStale
+                              ? (backup.error_message ?? null)
+                              : null)
+                          return (
+                            <TableRow key={child.id}>
+                              <TableCell>
+                                <Link
+                                  to={`/storage/${child.service_id}`}
+                                  className="flex items-center gap-2 hover:underline"
+                                >
+                                  <Database className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                  <span className="font-medium">
+                                    {child.service_name}
+                                  </span>
+                                </Link>
+                              </TableCell>
+                              <TableCell>
+                                <Badge variant="outline" className="capitalize">
+                                  {child.service_type}
+                                </Badge>
+                              </TableCell>
+                              <TableCell>
+                                <StatusBadge state={effectiveState} />
+                              </TableCell>
+                              <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
+                                {child.size_bytes !== null
+                                  ? fmtBytes(child.size_bytes)
+                                  : '—'}
+                              </TableCell>
+                              <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
+                                {childDurationMs !== null
+                                  ? formatDuration(childDurationMs)
+                                  : '—'}
+                              </TableCell>
+                              <TableCell className="hidden lg:table-cell max-w-[200px]">
+                                {effectiveError ? (
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="block truncate text-xs text-destructive cursor-help">
+                                          {effectiveError}
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent
+                                        side="top"
+                                        className="max-w-sm whitespace-pre-wrap break-words"
+                                      >
+                                        {effectiveError}
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                ) : (
+                                  <span className="text-muted-foreground">—</span>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+          </>
+        }
+        aside={
+          <>
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
-                <CardTitle className="text-base font-semibold">Tags</CardTitle>
+                <CardTitle className="text-base font-semibold">Details</CardTitle>
                 <CardDescription>
-                  Labels attached to this backup.
+                  Storage, provenance, and integrity metadata for this backup.
                 </CardDescription>
               </CardHeader>
               <CardContent className="p-5">
-                <div className="flex flex-wrap gap-2">
-                  {backup.tags.map((tag) => (
-                    <Badge key={tag} variant="secondary">
-                      {tag}
-                    </Badge>
-                  ))}
-                </div>
+                <dl className="divide-y divide-border">
+                  <FieldRow label="Backup ID" mono copy={backup.backup_id}>
+                    {backup.backup_id}
+                  </FieldRow>
+                  <FieldRow label="Location" mono copy={backup.s3_location}>
+                    {backup.s3_location}
+                  </FieldRow>
+                  <FieldRow label="Started at">{fmtDateTime(startedAt)}</FieldRow>
+                  {completedAt ? (
+                    <FieldRow label="Finished at">
+                      {fmtDateTime(completedAt)}
+                    </FieldRow>
+                  ) : null}
+                  {state === 'running' ? (
+                    <FieldRow label="Step">
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
+                        <span className="font-mono text-xs">
+                          {backup.current_step ?? 'starting…'}
+                        </span>
+                      </span>
+                    </FieldRow>
+                  ) : null}
+                  {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
+                    <FieldRow label="Attempt">
+                      {backup.attempts} of {backup.max_attempts ?? '?'}
+                    </FieldRow>
+                  ) : null}
+                  {typeof backup.max_runtime_secs === 'number' ? (
+                    <FieldRow label="Timeout">
+                      {formatTimeoutSecs(backup.max_runtime_secs)}
+                    </FieldRow>
+                  ) : null}
+                  {backup.schedule_id ? (
+                    <FieldRow label="Schedule">
+                      <Link
+                        to={`/backups/s3-sources/${id}`}
+                        className="text-foreground hover:underline"
+                      >
+                        Schedule #{backup.schedule_id}
+                      </Link>
+                    </FieldRow>
+                  ) : null}
+                  {backup.checksum ? (
+                    <FieldRow label="Checksum" mono copy={backup.checksum}>
+                      {backup.checksum}
+                    </FieldRow>
+                  ) : null}
+                </dl>
               </CardContent>
             </Card>
-          ) : null}
-        </aside>
-      </div>
+
+            {backup.tags.length > 0 ? (
+              <Card className="overflow-hidden shadow-none">
+                <CardHeader className="border-b px-5 py-4">
+                  <CardTitle className="text-base font-semibold">Tags</CardTitle>
+                  <CardDescription>
+                    Labels attached to this backup.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="p-5">
+                  <div className="flex flex-wrap gap-2">
+                    {backup.tags.map((tag) => (
+                      <Badge key={tag} variant="secondary">
+                        {tag}
+                      </Badge>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+          </>
+        }
+      />
 
       <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <AlertDialogContent>
@@ -945,6 +861,6 @@ export function BackupDetail() {
       </AlertDialog>
 
       {verificationDialog}
-    </div>
+    </>
   )
 }
