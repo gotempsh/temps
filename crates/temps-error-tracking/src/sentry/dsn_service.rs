@@ -2,12 +2,64 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
+use moka::future::Cache;
 use rand::RngExt;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
+use std::time::Duration;
 use temps_entities::{project_dsns, projects};
 
 use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
+
+/// Resolution-cache lifetime for the unauthenticated tunnel lookup. Mirrors
+/// `AnalyticsIngestKeyService`'s `RESOLVE_CACHE_TTL` (ADR-040 §2) so both
+/// public ingest surfaces age credentials identically.
+///
+/// Rotation and revocation evict the affected entry synchronously, so this TTL
+/// is a backstop for a missed invalidation, not the normal revocation latency.
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Bound on cached public keys. Cardinality is the number of *minted* DSNs,
+/// which is operator-created and small; the cap only matters while a flood of
+/// distinct forged keys is being absorbed as negative entries.
+const RESOLVE_CACHE_CAPACITY: u64 = 10_000;
+
+/// Shortest and longest public key this service will look up.
+///
+/// [`DSNService::generate_key`] mints 32 random bytes hex-encoded, i.e. 64
+/// lowercase hex characters, and that is what every Temps-issued DSN carries.
+/// The lower bound is the 32-character form classic Sentry DSNs use, kept
+/// because an operator may have migrated rows minted elsewhere; anything
+/// outside `[32, 64]` hex characters cannot be a `project_dsns.public_key`
+/// under any generation scheme this codebase has ever had.
+const MIN_PUBLIC_KEY_LEN: usize = 32;
+const MAX_PUBLIC_KEY_LEN: usize = 64;
+
+/// Whether `public_key` is shaped like a DSN public key at all.
+///
+/// Checked *before* the cache and *before* the database on the public tunnel
+/// route: this is the cheap half of the anti-amplification story, and it is
+/// what structurally guarantees a `tk_`/`dt_` secret pasted into `?sentry_key=`
+/// never reaches a query. It does not stop a bot generating valid-shaped
+/// garbage — that is the job of the global unresolved-credential budget in
+/// [`super::rate_limiter`].
+pub fn is_well_formed_public_key(public_key: &str) -> bool {
+    (MIN_PUBLIC_KEY_LEN..=MAX_PUBLIC_KEY_LEN).contains(&public_key.len())
+        && public_key.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// First characters of a public key, safe to log.
+///
+/// Enough to correlate a rejection with a specific key an operator is holding,
+/// far too little to replay: 6 hex characters is 24 bits of a 256-bit value.
+pub(crate) fn public_key_prefix(public_key: &str) -> &str {
+    let end = public_key
+        .char_indices()
+        .nth(6)
+        .map(|(idx, _)| idx)
+        .unwrap_or(public_key.len());
+    &public_key[..end]
+}
 
 /// Build a Sentry-compatible DSN string from the instance base URL.
 ///
@@ -33,11 +85,33 @@ fn build_dsn(base_url: &str, public_key: &str, project_id: i32) -> String {
 /// Service for managing Data Source Names (DSNs) for error tracking
 pub struct DSNService {
     db: Arc<DatabaseConnection>,
+    /// Public key -> resolved row, keyed by the raw key string, with negative
+    /// results (`None`) cached too.
+    ///
+    /// Stated precisely, because it is easy to overclaim: this only helps
+    /// against a *repeated* value — one typo'd key baked into a deployed
+    /// bundle costs one query, not one per pageview — and against a flood of
+    /// *distinct* forged values it does nothing except absorb them as
+    /// short-lived negative entries. The global unresolved-credential budget
+    /// in [`super::rate_limiter`] is what bounds that case.
+    resolve_cache: Cache<String, Option<project_dsns::Model>>,
 }
 
 impl DSNService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            resolve_cache: Cache::builder()
+                .max_capacity(RESOLVE_CACHE_CAPACITY)
+                .time_to_live(RESOLVE_CACHE_TTL)
+                .build(),
+        }
+    }
+
+    /// Drop a cached resolution so a rotated or revoked key stops working on
+    /// the very next request rather than after [`RESOLVE_CACHE_TTL`].
+    async fn invalidate_cached_key(&self, public_key: &str) {
+        self.resolve_cache.invalidate(public_key).await;
     }
 
     /// Generate a new DSN for a project
@@ -208,11 +282,14 @@ impl DSNService {
             .parse::<i32>()
             .map_err(|_| SentryIngesterError::InvalidDSN)?;
 
+        // Never log the key itself: a DSN public key is low-value but it is
+        // still a credential on the tunnel route, and application logs are
+        // shipped/retained far more widely than the one request that carried
+        // it. The prefix is enough to correlate.
         tracing::debug!(
-            "Parsed DSN - public_key: {}, project_id: {}, from path: {}",
-            public_key,
-            project_id,
-            url.path()
+            project_id = project_id,
+            public_key_prefix = public_key_prefix(&public_key),
+            "Parsed DSN"
         );
 
         Ok(ParsedDSN {
@@ -229,19 +306,18 @@ impl DSNService {
         parsed_dsn: &ParsedDSN,
     ) -> Result<(bool, Option<project_dsns::Model>), SentryIngesterError> {
         tracing::debug!(
-            "Validating DSN auth for project {} with public key {}",
-            parsed_dsn.project_id,
-            parsed_dsn.public_key
+            project_id = parsed_dsn.project_id,
+            public_key_prefix = public_key_prefix(&parsed_dsn.public_key),
+            "Validating DSN auth"
         );
 
-        let dsn = project_dsns::Entity::find()
+        let dsn = active_dsn_query()
             .filter(project_dsns::Column::ProjectId.eq(parsed_dsn.project_id))
             .filter(project_dsns::Column::PublicKey.eq(&parsed_dsn.public_key))
-            .filter(project_dsns::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await?;
 
-        tracing::debug!("DSN lookup result: {:?}", dsn.is_some());
+        tracing::debug!(found = dsn.is_some(), "DSN lookup result");
 
         match dsn {
             Some(dsn_record) => Ok((true, Some(dsn_record))),
@@ -255,10 +331,9 @@ impl DSNService {
         project_id: i32,
         public_key: &str,
     ) -> Result<ProjectDSN, SentryIngesterError> {
-        let dsn_record = project_dsns::Entity::find()
+        let dsn_record = active_dsn_query()
             .filter(project_dsns::Column::ProjectId.eq(project_id))
             .filter(project_dsns::Column::PublicKey.eq(public_key))
-            .filter(project_dsns::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await?
             .ok_or(SentryIngesterError::InvalidDSN)?;
@@ -284,16 +359,36 @@ impl DSNService {
         })
     }
 
-    /// Get project by public key
+    /// Resolve a DSN public key to its row, without a project id to check it
+    /// against — `public_key` is globally unique (`idx_project_dsns_public_key`),
+    /// so it identifies its project on its own.
+    ///
+    /// This is the lookup the unauthenticated browser tunnel route performs, so
+    /// it is layered like the analytics ingest-key equivalent: shape gate, then
+    /// cache (negative results included), then the database. `Ok(None)` means
+    /// "no such active DSN on a live project" and the caller must answer 401;
+    /// `Err` is reserved for genuine storage failures so a broken database is
+    /// never reported as a bad credential.
     pub async fn get_project_by_public_key(
         &self,
         public_key: &str,
     ) -> Result<Option<project_dsns::Model>, SentryIngesterError> {
-        let dsn = project_dsns::Entity::find()
+        if !is_well_formed_public_key(public_key) {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self.resolve_cache.get(public_key).await {
+            return Ok(cached);
+        }
+
+        let dsn = active_dsn_query()
             .filter(project_dsns::Column::PublicKey.eq(public_key))
-            .filter(project_dsns::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await?;
+
+        self.resolve_cache
+            .insert(public_key.to_string(), dsn.clone())
+            .await;
 
         Ok(dsn)
     }
@@ -316,6 +411,8 @@ impl DSNService {
         let new_public_key = self.generate_key(32);
         let new_secret_key = String::new(); // Deprecated
 
+        let previous_public_key = existing_dsn.public_key.clone();
+
         // Update DSN
         let mut dsn_update: project_dsns::ActiveModel = existing_dsn.into();
         dsn_update.public_key = Set(new_public_key.clone());
@@ -323,6 +420,12 @@ impl DSNService {
         dsn_update.updated_at = Set(Utc::now());
 
         let updated_dsn = dsn_update.update(self.db.as_ref()).await?;
+
+        // Evict synchronously so the retired key stops resolving immediately
+        // rather than after RESOLVE_CACHE_TTL. Rotation is a security action;
+        // "eventually" is the wrong latency for it.
+        self.invalidate_cached_key(&previous_public_key).await;
+        self.invalidate_cached_key(&updated_dsn.public_key).await;
 
         // Build new DSN string preserving scheme + host + port (see build_dsn).
         let dsn = build_dsn(base_url, &updated_dsn.public_key, project_id);
@@ -397,10 +500,16 @@ impl DSNService {
             .await?
             .ok_or(SentryIngesterError::InvalidDSN)?;
 
+        let revoked_public_key = dsn.public_key.clone();
+
         let mut dsn_update: project_dsns::ActiveModel = dsn.into();
         dsn_update.is_active = Set(false);
         dsn_update.updated_at = Set(Utc::now());
         dsn_update.update(self.db.as_ref()).await?;
+
+        // Revocation must take effect on the next request, not at the end of
+        // the cache window.
+        self.invalidate_cached_key(&revoked_public_key).await;
 
         Ok(())
     }
@@ -411,6 +520,22 @@ impl DSNService {
         let bytes: Vec<u8> = (0..length).map(|_| rng.random()).collect();
         hex::encode(bytes)
     }
+}
+
+/// Base query for every credential lookup: active DSN rows whose project is
+/// still live.
+///
+/// The `projects` join is not cosmetic. Project deletion is *soft*
+/// (`projects.is_deleted`), and it does not cascade to `project_dsns`, so
+/// without this an operator who deletes a project keeps ingesting into it
+/// forever through a DSN they can no longer see in the console — data
+/// accumulating under a project that, as far as every read path is concerned,
+/// does not exist.
+fn active_dsn_query() -> sea_orm::Select<project_dsns::Entity> {
+    project_dsns::Entity::find()
+        .filter(project_dsns::Column::IsActive.eq(true))
+        .inner_join(projects::Entity)
+        .filter(projects::Column::IsDeleted.eq(false))
 }
 
 #[cfg(test)]

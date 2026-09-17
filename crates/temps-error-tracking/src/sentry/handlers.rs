@@ -18,7 +18,7 @@ use tracing::debug;
 use utoipa::OpenApi;
 
 use crate::providers::{sentry::SentryProvider, AuthContext, ErrorProvider};
-use crate::sentry::dsn_service::DSNService;
+use crate::sentry::dsn_service::{public_key_prefix, DSNService};
 use crate::sentry::envelope::peek_envelope_dsn;
 use crate::sentry::rate_limiter::IngestRateLimiter;
 use crate::sentry::types::{SentryEventRequest, SentryEventResponse};
@@ -46,6 +46,13 @@ pub const SENTRY_TUNNEL_ROUTE_PATH: &str = "/_temps/sentry/envelope";
 /// credential). Matches the default assigned to newly created DSNs
 /// (see `dsn_service::generate_project_dsn`).
 const TUNNEL_DEFAULT_RATE_LIMIT_PER_MINUTE: i32 = 1000;
+
+/// Seconds a rate-limited ingest client should wait before retrying.
+///
+/// `IngestRateLimiter`'s window is a full minute, so one minute is the only
+/// value guaranteed to be past the rejection regardless of where in the window
+/// the client landed. Matches `temps-analytics`'s `INGEST_RETRY_AFTER_SECONDS`.
+const INGEST_RETRY_AFTER_SECONDS: &str = "60";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -168,11 +175,7 @@ async fn ingest_sentry_event(
         .check(auth.project_id, auth.rate_limit_per_minute)
         .await
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded".to_string(),
-        )
-            .into_response();
+        return rate_limited_response();
     }
 
     // Parse event using the provider
@@ -305,11 +308,7 @@ async fn ingest_sentry_envelope(
         .check(auth.project_id, auth.rate_limit_per_minute)
         .await
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded".to_string(),
-        )
-            .into_response();
+        return rate_limited_response();
     }
 
     // Fix #2: resolve the real client IP using proxy-trust logic.
@@ -342,7 +341,27 @@ async fn ingest_sentry_envelope(
 /// for authentication: the request must claim to come from the same host it
 /// resolves to, or it is rejected. That check is deliberately **skipped** on
 /// path 1 — a tunneled request from another origin is the entire point there,
-/// and the DSN is a stronger claim than a self-reported `Origin`.
+/// and the DSN is a stronger claim than a self-reported `Origin`. Path 1 does
+/// honour the DSN row's own `allowed_origins` list when the operator has set
+/// one (`403` when the `Origin` is off it); an empty or absent list, which is
+/// every row Temps mints today, permits any origin.
+///
+/// # Ordering, and why it matters
+///
+/// This route is unauthenticated and reachable from every domain a project is
+/// deployed to, so the expensive work is placed strictly after the cheap
+/// admission control:
+///
+/// 1. Shape gate + resolution cache + a global unresolved-credential budget,
+///    all before any database round trip (mirroring `temps-analytics`'s
+///    ADR-040 §2 defence).
+/// 2. Per-project rate limiting.
+/// 3. Only then `decompress_if_needed`, which can inflate up to
+///    `MAX_DECOMPRESSED_SIZE`.
+///
+/// The credential-free branch has to inflate the body to read an SDK-embedded
+/// DSN, so when `Host` has not already resolved the request that inflate is
+/// charged against the same global budget a forged key pays into.
 ///
 /// An *explicit* credential that does not resolve is a `401`, never a silent
 /// fall-through to `Host`: a typo'd key must fail loudly rather than land the
@@ -362,7 +381,7 @@ async fn ingest_sentry_envelope(
         (status = 204, description = "Host resolved to a route with no attributable project (sandbox/orphan)"),
         (status = 400, description = "Bad request"),
         (status = 401, description = "An explicit DSN key was presented but did not resolve"),
-        (status = 403, description = "Origin/Referer does not match the resolved host (Host-resolved requests only)"),
+        (status = 403, description = "Origin/Referer does not match the resolved host (Host-resolved requests), or the Origin is not in the DSN's allowed_origins (keyed requests)"),
         (status = 404, description = "Unknown host"),
         (status = 413, description = "Request body too large (exceeds 2 MiB)"),
         (status = 429, description = "Rate limit exceeded"),
@@ -376,116 +395,451 @@ async fn ingest_tunneled_envelope(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    // Decompression moves ahead of resolution because the embedded-DSN path
-    // has to read the (possibly gzipped) envelope header to find a credential.
-    // The 2 MiB body limit and the decompression-bomb guard both still apply
-    // before this point, so nothing unbounded is being expanded for an
-    // unauthenticated request that a smaller reordering would have rejected.
-    let decompressed_body = match decompress_if_needed(&headers, &body) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("Failed to decompress tunneled envelope: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to decompress envelope: {}", e),
-            )
-                .into_response();
+) -> Response {
+    let peer = connect_info.map(|ext| ext.0 .0);
+
+    // ── Path 1: an explicit credential was presented ────────────────────
+    //
+    // Answered without looking at the body at all. Everything below the
+    // credential check is gated on the credential resolving, so a forged key
+    // cannot buy a database round trip, and cannot buy the inflate either.
+    if let Some(key) = extract_dsn_key(&headers, &params) {
+        // Global, IP-independent backstop, checked *before* the lookup. The
+        // per-project buckets cannot cover a request that never resolved to a
+        // project — there is no bucket to charge — so without this every
+        // distinct forged key cost an uncached query on a route reachable
+        // from any customer domain. `DSNService`'s cache only helps on an
+        // exact repeated string.
+        if state.rate_limiter.unresolved_budget_exhausted().await {
+            tracing::warn!(
+                "Sentry tunnel: global unresolved-credential budget exhausted; rejecting a keyed request before any lookup"
+            );
+            return rate_limited_response();
         }
-    };
 
-    let auth = match resolve_tunnel_credential(&state, &headers, &params, &decompressed_body).await
-    {
-        TunnelCredential::Resolved(auth) => auth,
-        TunnelCredential::Rejected(reason) => return reason.into_response(),
-        TunnelCredential::Absent => {
-            let host = metadata.host.clone();
-            if host.is_empty() {
-                return (StatusCode::BAD_REQUEST, "Missing Host header".to_string())
-                    .into_response();
-            }
-
-            if !origin_matches_host(&headers, &host) {
+        let dsn = match state.dsn_service.get_project_by_public_key(&key).await {
+            Ok(Some(dsn)) => dsn,
+            Ok(None) => {
+                state.rate_limiter.record_unresolved_attempt().await;
+                // Prefix only: enough to correlate with a key an operator is
+                // holding, far too little to replay. (The old justification
+                // here — "it is already in `proxy_logs`" — was simply wrong:
+                // the proxy forwards `/api/_temps` straight through and does
+                // not log it.)
                 tracing::warn!(
-                    "Sentry tunnel: Origin/Referer does not match resolved host {}",
-                    host
+                    public_key_prefix = public_key_prefix(&key),
+                    "Sentry tunnel: presented DSN key did not match an active DSN"
+                );
+                return TunnelCredentialRejection::Unknown.into_response();
+            }
+            Err(e) => {
+                tracing::error!("Sentry tunnel: DSN lookup failed: {}", e);
+                return TunnelCredentialRejection::LookupFailed.into_response();
+            }
+        };
+
+        // An explicitly presented key that carries an allowlist is refused
+        // loudly when the origin is off it — the operator asked for that
+        // restriction and a silent fall-through to `Host` would quietly undo
+        // it.
+        match dsn_origin_verdict(&dsn, &headers) {
+            OriginVerdict::Allowed => {}
+            OriginVerdict::Denied => {
+                tracing::warn!(
+                    project_id = dsn.project_id,
+                    dsn_id = dsn.id,
+                    "Sentry tunnel: Origin is not in this DSN's allowed_origins"
                 );
                 return (
                     StatusCode::FORBIDDEN,
-                    "Origin does not match host".to_string(),
+                    "Origin is not allowed for this DSN".to_string(),
                 )
                     .into_response();
             }
-
-            // Exact + wildcard resolution, matching the precedence the proxy itself
-            // used to route this request here in the first place (`services.rs`'s
-            // `get_route_by_host`) — the narrower `get_route` (legacy map only)
-            // would 404 wildcard custom routes that the proxy successfully forwards.
-            let route = match state.route_table.get_route_by_host(&host) {
-                Some(route) => route,
-                None => {
-                    tracing::debug!("Sentry tunnel: host {} not found in route table", host);
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-            };
-
-            // A route without a project is a sandbox/orphaned route — nothing to
-            // attribute this to. Drop silently (204), mirroring how
-            // `record_event_metrics` (analytics) handles the same case.
-            let Some(project) = route.project.as_ref() else {
-                debug!(
-                    "Sentry tunnel: dropping envelope for host {} — route has no associated project",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-
-            AuthContext {
-                project_id: project.id,
-                environment_id: route.environment.as_ref().map(|e| e.id),
-                deployment_id: route.deployment.as_ref().map(|d| d.id),
-                // No DSN row was selected for this request — the fixed tunnel
-                // default below applies instead.
-                rate_limit_per_minute: None,
-            }
+            OriginVerdict::Malformed => return malformed_allowed_origins_response(),
         }
-    };
 
-    // One limit for both paths. A DSN row with no explicit limit falls back to
-    // the tunnel default rather than to "unlimited": this endpoint is reachable
-    // cross-origin from anywhere, so it always keeps a ceiling.
-    let rate_limit = auth
-        .rate_limit_per_minute
-        .filter(|limit| *limit > 0)
-        .unwrap_or(TUNNEL_DEFAULT_RATE_LIMIT_PER_MINUTE);
+        let auth = auth_from_dsn(&dsn);
+        if !state
+            .rate_limiter
+            .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+            .await
+        {
+            return rate_limited_response();
+        }
 
-    if !state
-        .rate_limiter
-        .check(auth.project_id, Some(rate_limit))
-        .await
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, "60")],
-            "Rate limit exceeded".to_string(),
-        )
-            .into_response();
+        // Decompression is deliberately last: it is by far the most expensive
+        // thing this route does (up to `MAX_DECOMPRESSED_SIZE` of inflate) and
+        // nothing above it needed the body.
+        let decompressed_body = match decompress_if_needed(&headers, &body) {
+            Ok(data) => data,
+            Err(e) => return decompression_failed_response(&e),
+        };
+
+        let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+        return process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip).await;
     }
 
-    let peer = connect_info.map(|ext| ext.0 .0);
+    // ── Path 2: no explicit credential ──────────────────────────────────
+    //
+    // `Host` is resolved first because it is an in-memory route-table lookup:
+    // it lets the ordinary same-origin case reach its own rate-limit bucket
+    // before anything is inflated. The SDK-embedded DSN, which does need the
+    // body, is consulted after — and still wins when it resolves, because a
+    // credential is a stronger claim than a `Host` the proxy forwarded here
+    // regardless of its value.
+    let host_scope = resolve_tunnel_host_scope(&state, &metadata, &headers);
+
+    let mut charged_project = None;
+    match &host_scope {
+        Ok(auth) => {
+            if !state
+                .rate_limiter
+                .check(auth.project_id, Some(effective_tunnel_rate_limit(auth)))
+                .await
+            {
+                return rate_limited_response();
+            }
+            charged_project = Some(auth.project_id);
+        }
+        Err(_) => {
+            // Nothing has authenticated this request and `Host` did not
+            // resolve it either, yet reading the SDK-embedded DSN out of the
+            // envelope header requires inflating the body. Charge that
+            // against the same global budget a forged key pays into, so the
+            // credential-free branch cannot be used as an unmetered inflate
+            // oracle. Only the *check* happens here; the attempt is recorded
+            // below, once the embedded DSN has also failed, so a legitimate
+            // zero-configuration app never burns budget.
+            if state.rate_limiter.unresolved_budget_exhausted().await {
+                tracing::warn!(
+                    "Sentry tunnel: global unresolved-credential budget exhausted; rejecting a credential-free request before decompression"
+                );
+                return rate_limited_response();
+            }
+        }
+    }
+
+    let decompressed_body = match decompress_if_needed(&headers, &body) {
+        Ok(data) => data,
+        Err(e) => return decompression_failed_response(&e),
+    };
+
+    let embedded = resolve_embedded_envelope_dsn(&state, &headers, &decompressed_body).await;
+
+    let auth = match embedded {
+        Some(dsn) => {
+            let auth = auth_from_dsn(&dsn);
+            // Skip a second charge when `Host` already resolved to the same
+            // project and paid for this request.
+            if charged_project != Some(auth.project_id)
+                && !state
+                    .rate_limiter
+                    .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+                    .await
+            {
+                return rate_limited_response();
+            }
+            auth
+        }
+        None => match host_scope {
+            Ok(auth) => auth,
+            Err(response) => {
+                // Confirmed: no credential, and no host either. This is the
+                // shape an abusive caller has, so it is what the global
+                // budget counts.
+                state.rate_limiter.record_unresolved_attempt().await;
+                return *response;
+            }
+        },
+    };
+
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
     process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip).await
 }
 
-/// Outcome of looking for a DSN credential on a tunneled request.
-enum TunnelCredential {
-    /// A credential was presented (or embedded) and resolved to a project.
-    Resolved(AuthContext),
-    /// No credential was offered — fall back to `Host` resolution.
-    Absent,
-    /// An explicit credential was presented and must not be ignored.
-    Rejected(TunnelCredentialRejection),
+/// 429 with the `Retry-After` a client needs to back off sensibly.
+///
+/// Every ingest route answers rate limiting identically: a browser SDK told
+/// only "too many requests" either hammers the endpoint or drops the data, and
+/// a self-hosted operator reading the network tab is left guessing.
+fn rate_limited_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, INGEST_RETRY_AFTER_SECONDS)],
+        "Rate limit exceeded".to_string(),
+    )
+        .into_response()
+}
+
+fn decompression_failed_response(error: &str) -> Response {
+    tracing::warn!("Failed to decompress tunneled envelope: {}", error);
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Failed to decompress envelope: {}", error),
+    )
+        .into_response()
+}
+
+/// A DSN row's `allowed_origins` column is JSON the operator controls, so a
+/// corrupt value is a third outcome distinct from allow/deny.
+enum OriginVerdict {
+    Allowed,
+    Denied,
+    Malformed,
+}
+
+/// 500 when a DSN's `allowed_origins` cannot be parsed.
+///
+/// Fails closed and loudly rather than treating a corrupt allowlist as "any
+/// origin", which would silently relax a restriction the operator set. Mirrors
+/// `AnalyticsIngestKeyError::MalformedAllowedOrigins`.
+fn malformed_allowed_origins_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "This DSN's allowed_origins is malformed; fix it in the project's error-tracking settings"
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// Whether this request's `Origin` satisfies the DSN row's `allowed_origins`.
+///
+/// An absent or empty list permits any origin and is not checked at all,
+/// including for a request with no `Origin` header (a `curl` or server-side
+/// caller). A non-empty list requires an exact scheme/host/port match.
+///
+/// Like the analytics equivalent this is a browser-enforced convenience
+/// control, not authentication — a non-browser client picks its own `Origin`
+/// or omits it. It exists so a key copy-pasted out of a page cannot casually
+/// be used from another site.
+///
+/// Today nothing in Temps writes this column; the console has no editor for it
+/// yet. It is enforced when present anyway, so the day an operator sets it
+/// (by hand, or through the editor that will land later) it takes effect
+/// rather than being silently ignored.
+fn dsn_origin_verdict(
+    dsn: &temps_entities::project_dsns::Model,
+    headers: &HeaderMap,
+) -> OriginVerdict {
+    let Some(raw) = dsn.allowed_origins.as_ref().filter(|v| !v.is_null()) else {
+        return OriginVerdict::Allowed;
+    };
+
+    let allowed: Vec<String> = match serde_json::from_value(raw.clone()) {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            tracing::warn!(
+                dsn_id = dsn.id,
+                project_id = dsn.project_id,
+                error = %e,
+                "DSN has a malformed allowed_origins column"
+            );
+            return OriginVerdict::Malformed;
+        }
+    };
+
+    if allowed.is_empty() {
+        return OriginVerdict::Allowed;
+    }
+
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(origin) = origin else {
+        // The list is non-empty and the browser sent nothing to match it
+        // against — fail closed rather than reading "absent" as "any".
+        return OriginVerdict::Denied;
+    };
+
+    if allowed
+        .iter()
+        .any(|candidate| origins_match(candidate.trim(), origin))
+    {
+        OriginVerdict::Allowed
+    } else {
+        OriginVerdict::Denied
+    }
+}
+
+/// Exact origin comparison: scheme, host and port must all match, with scheme
+/// and host compared case-insensitively (RFC 3986 / DNS) and port as written.
+///
+/// Deliberately a local copy of `temps_analytics::ingest_keys::is_origin_allowed`
+/// rather than a shared helper: importing it would add a crate edge from
+/// `temps-error-tracking` to the whole analytics umbrella (and its AI/embedding
+/// dependencies) for twenty lines of pure string comparison. The two are kept
+/// in step by their tests, which assert the same cases.
+fn origins_match(allowed: &str, origin: &str) -> bool {
+    fn split_scheme(origin: &str) -> (&str, &str) {
+        match origin.split_once("://") {
+            Some((scheme, authority)) => (scheme, authority),
+            None => ("", origin),
+        }
+    }
+
+    /// Split `host[:port]`, tolerating bracketed IPv6 literals (`[::1]`,
+    /// whose own colons must not be read as a port separator).
+    fn split_port(authority: &str) -> (&str, &str) {
+        match authority.rsplit_once(':') {
+            Some((host, port))
+                if !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+                    && !host.is_empty() =>
+            {
+                (host, port)
+            }
+            _ => (authority, ""),
+        }
+    }
+
+    let (allowed_scheme, allowed_authority) = split_scheme(allowed);
+    let (origin_scheme, origin_authority) = split_scheme(origin);
+    let (allowed_host, allowed_port) = split_port(allowed_authority);
+    let (origin_host, origin_port) = split_port(origin_authority);
+
+    allowed_scheme.eq_ignore_ascii_case(origin_scheme)
+        && allowed_host.eq_ignore_ascii_case(origin_host)
+        && allowed_port == origin_port
+}
+
+/// The ceiling applied to a tunneled request.
+///
+/// A DSN row with no explicit limit falls back to the tunnel default rather
+/// than to "unlimited": this endpoint is reachable cross-origin from anywhere,
+/// so it always keeps a ceiling.
+fn effective_tunnel_rate_limit(auth: &AuthContext) -> i32 {
+    auth.rate_limit_per_minute
+        .filter(|limit| *limit > 0)
+        .unwrap_or(TUNNEL_DEFAULT_RATE_LIMIT_PER_MINUTE)
+}
+
+/// Resolve a credential-free tunneled request from its `Host`.
+///
+/// Purely in-memory (route table + header comparison), so it is safe to run
+/// before the body is inflated. `Err` carries the response to send if nothing
+/// else resolves the request — boxed because an `http::Response` dwarfs the
+/// `Ok` variant and `clippy::result_large_err` is denied workspace-wide.
+fn resolve_tunnel_host_scope(
+    state: &AppState,
+    metadata: &temps_core::RequestMetadata,
+    headers: &HeaderMap,
+) -> Result<AuthContext, Box<Response>> {
+    let host = metadata.host.clone();
+    if host.is_empty() {
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "Missing Host header".to_string()).into_response(),
+        ));
+    }
+
+    // With no credential, an `Origin`/`Referer` check stands in for
+    // authentication: the request must claim to come from the host it
+    // resolves to.
+    if !origin_matches_host(headers, &host) {
+        tracing::warn!(
+            "Sentry tunnel: Origin/Referer does not match resolved host {}",
+            host
+        );
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "Origin does not match host".to_string(),
+            )
+                .into_response(),
+        ));
+    }
+
+    // Exact + wildcard resolution, matching the precedence the proxy itself
+    // used to route this request here in the first place (`services.rs`'s
+    // `get_route_by_host`) — the narrower `get_route` (legacy map only)
+    // would 404 wildcard custom routes that the proxy successfully forwards.
+    let Some(route) = state.route_table.get_route_by_host(&host) else {
+        tracing::debug!("Sentry tunnel: host {} not found in route table", host);
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
+    };
+
+    // A route without a project is a sandbox/orphaned route — nothing to
+    // attribute this to. Drop silently (204), mirroring how
+    // `record_event_metrics` (analytics) handles the same case.
+    let Some(project) = route.project.as_ref() else {
+        debug!(
+            "Sentry tunnel: dropping envelope for host {} — route has no associated project",
+            host
+        );
+        return Err(Box::new(StatusCode::NO_CONTENT.into_response()));
+    };
+
+    Ok(AuthContext {
+        project_id: project.id,
+        environment_id: route.environment.as_ref().map(|e| e.id),
+        deployment_id: route.deployment.as_ref().map(|d| d.id),
+        // No DSN row was selected for this request — the fixed tunnel default
+        // applies instead (see `effective_tunnel_rate_limit`).
+        rate_limit_per_minute: None,
+    })
+}
+
+/// Look for the `dsn` field browser SDKs embed in the envelope header whenever
+/// `Sentry.init({ tunnel })` is used.
+///
+/// Everything that fails here returns `None` and falls through to the `Host`
+/// path rather than rejecting: this value was *sniffed*, not presented, so an
+/// app tunneling a third-party DSN through Temps keeps working exactly as it
+/// did before. That includes an `allowed_origins` mismatch — refusing would
+/// change the behaviour of a request the operator never opted this endpoint
+/// into.
+async fn resolve_embedded_envelope_dsn(
+    state: &AppState,
+    headers: &HeaderMap,
+    decompressed_body: &Bytes,
+) -> Option<temps_entities::project_dsns::Model> {
+    let embedded = peek_envelope_dsn(decompressed_body)?;
+
+    let parsed = match state.dsn_service.parse_dsn(&embedded) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::debug!(
+                "Sentry tunnel: envelope header DSN is unparsable ({}), falling back to Host",
+                e
+            );
+            return None;
+        }
+    };
+
+    let dsn = match state.dsn_service.validate_dsn_auth(&parsed).await {
+        Ok((true, Some(dsn))) => dsn,
+        Ok(_) => {
+            tracing::debug!(
+                "Sentry tunnel: envelope header DSN for project {} did not match an active DSN, falling back to Host",
+                parsed.project_id
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Sentry tunnel: failed to validate envelope header DSN for project {}: {}",
+                parsed.project_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    match dsn_origin_verdict(&dsn, headers) {
+        OriginVerdict::Allowed => Some(dsn),
+        OriginVerdict::Denied | OriginVerdict::Malformed => {
+            tracing::warn!(
+                dsn_id = dsn.id,
+                project_id = dsn.project_id,
+                "Sentry tunnel: embedded envelope DSN rejected by allowed_origins, falling back to Host"
+            );
+            None
+        }
+    }
 }
 
 /// Why an explicitly presented tunnel credential was refused.
@@ -495,7 +849,7 @@ enum TunnelCredential {
 /// from "the lookup failed" (check the database), and collapsing both into one
 /// status would send them down the wrong path.
 enum TunnelCredentialRejection {
-    /// The key matched no active DSN row.
+    /// The key matched no active DSN row on a live project.
     Unknown,
     /// The key could not be checked at all.
     LookupFailed,
@@ -514,71 +868,6 @@ impl IntoResponse for TunnelCredentialRejection {
                 "Failed to validate DSN key".to_string(),
             )
                 .into_response(),
-        }
-    }
-}
-
-/// Resolve the tunnel request's DSN credential, if it carries one.
-async fn resolve_tunnel_credential(
-    state: &AppState,
-    headers: &HeaderMap,
-    params: &std::collections::HashMap<String, String>,
-    decompressed_body: &Bytes,
-) -> TunnelCredential {
-    // 1. Explicit credential. `public_key` is globally unique
-    //    (`idx_project_dsns_public_key`), so it identifies its project on its
-    //    own — no path `project_id` is needed or trusted here.
-    if let Some(key) = extract_dsn_key(headers, params) {
-        return match state.dsn_service.get_project_by_public_key(&key).await {
-            Ok(Some(dsn)) => TunnelCredential::Resolved(auth_from_dsn(&dsn)),
-            Ok(None) => {
-                // Never log the key itself — it is echoed into `proxy_logs`
-                // query strings already and does not need a second copy in the
-                // application log.
-                tracing::warn!("Sentry tunnel: presented DSN key did not match an active DSN");
-                TunnelCredential::Rejected(TunnelCredentialRejection::Unknown)
-            }
-            Err(e) => {
-                tracing::error!("Sentry tunnel: DSN lookup failed: {}", e);
-                TunnelCredential::Rejected(TunnelCredentialRejection::LookupFailed)
-            }
-        };
-    }
-
-    // 2. DSN embedded in the envelope header by the SDK's tunnel support.
-    //    Anything that fails here falls through to the Host path rather than
-    //    rejecting: this value was sniffed, not presented.
-    let Some(embedded) = peek_envelope_dsn(decompressed_body) else {
-        return TunnelCredential::Absent;
-    };
-
-    let parsed = match state.dsn_service.parse_dsn(&embedded) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            tracing::debug!(
-                "Sentry tunnel: envelope header DSN is unparsable ({}), falling back to Host",
-                e
-            );
-            return TunnelCredential::Absent;
-        }
-    };
-
-    match state.dsn_service.validate_dsn_auth(&parsed).await {
-        Ok((true, Some(dsn))) => TunnelCredential::Resolved(auth_from_dsn(&dsn)),
-        Ok(_) => {
-            tracing::debug!(
-                "Sentry tunnel: envelope header DSN for project {} did not match an active DSN, falling back to Host",
-                parsed.project_id
-            );
-            TunnelCredential::Absent
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Sentry tunnel: failed to validate envelope header DSN for project {}: {}",
-                parsed.project_id,
-                e
-            );
-            TunnelCredential::Absent
         }
     }
 }
@@ -795,9 +1084,18 @@ fn extract_dsn_key(
     headers: &HeaderMap,
     query_params: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    // Try query parameter first (used by some Sentry SDKs)
-    if let Some(key) = query_params.get("sentry_key") {
-        return Some(key.clone());
+    // Try query parameter first (used by some Sentry SDKs).
+    //
+    // An empty `?sentry_key=` is treated as *absent*, not as a credential that
+    // fails to resolve. Some SDK/proxy combinations emit the bare parameter
+    // when no DSN is configured, and answering 401 there would break the
+    // Host-resolved fallback for a request that presented nothing at all.
+    if let Some(key) = query_params
+        .get("sentry_key")
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key.to_string());
     }
 
     // Try X-Sentry-Auth header
@@ -809,8 +1107,11 @@ fn extract_dsn_key(
 
             for part in auth_str.split(',') {
                 let part = part.trim();
-                if part.starts_with("sentry_key=") {
-                    return Some(part.replace("sentry_key=", ""));
+                if let Some(key) = part.strip_prefix("sentry_key=") {
+                    let key = key.trim();
+                    if !key.is_empty() {
+                        return Some(key.to_string());
+                    }
                 }
             }
         }
@@ -819,8 +1120,11 @@ fn extract_dsn_key(
     // Try Authorization header as fallback
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("DSN ") {
-                return Some(auth_str.replace("DSN ", ""));
+            if let Some(key) = auth_str.strip_prefix("DSN ") {
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
         }
     }
@@ -1808,5 +2112,533 @@ mod tests {
 
         // Neither header present — default deny.
         assert!(!origin_matches_host(&HeaderMap::new(), "app.example.com"));
+    }
+
+    // === ADR-040 keyed tunnel: attribution, headers, origins, budget ===
+
+    /// Mint a second project with its own DSN in the same test database, so
+    /// the cross-project attribution cases below have a real "project B".
+    async fn create_second_project_with_dsn(ctx: &TestContext) -> (i32, String) {
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::Set;
+        use temps_entities::projects;
+        use uuid::Uuid;
+
+        let project = projects::ActiveModel {
+            name: Set("Second Project".to_string()),
+            repo_name: Set("second-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/second".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("second-project-{}", Uuid::new_v4())),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(ctx._db.connection())
+        .await
+        .unwrap();
+
+        let dsn = ctx
+            .app_state
+            .dsn_service
+            .generate_project_dsn(
+                project.id,
+                None,
+                None,
+                Some("Second DSN".to_string()),
+                "localhost",
+            )
+            .await
+            .unwrap();
+
+        (project.id, dsn.public_key)
+    }
+
+    async fn error_event_project_ids(ctx: &TestContext) -> Vec<i32> {
+        use sea_orm::{EntityTrait, QueryOrder};
+        temps_entities::error_events::Entity::find()
+            .order_by_asc(temps_entities::error_events::Column::Id)
+            .all(ctx._db.connection())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.project_id)
+            .collect()
+    }
+
+    /// The core security claim of keyed tunnel ingest: an **explicitly
+    /// presented** key decides the project, and a conflicting DSN embedded in
+    /// the envelope by the SDK cannot redirect the data to someone else's
+    /// project. Anyone can put any `dsn` string in an envelope header; only
+    /// the query parameter/header is a presented credential.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_explicit_key_wins_over_conflicting_embedded_dsn() {
+        let ctx = create_test_context().await;
+        let (project_b, key_b) = create_second_project_with_dsn(&ctx).await;
+        assert_ne!(ctx.project_id, project_b);
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        // Explicit key: project A. Embedded envelope DSN: project B.
+        let embedded_dsn_for_b = format!("https://{}@localhost/{}", key_b, project_b);
+        let response = server
+            .post(&format!(
+                "{}?sentry_key={}",
+                SENTRY_TUNNEL_ROUTE_PATH, ctx.dsn_key
+            ))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.hosted-elsewhere.example"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_with_dsn(&embedded_dsn_for_b)))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+
+        assert_eq!(
+            error_event_project_ids(&ctx).await,
+            vec![ctx.project_id],
+            "the explicitly presented key's project must own the event, not the embedded DSN's"
+        );
+    }
+
+    /// The tunnel route accepts the same credential carriers as `/envelope/`:
+    /// SDKs that cannot append a query string send `X-Sentry-Auth`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_accepts_x_sentry_auth_header() {
+        let ctx = create_test_context().await;
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
+        let response = server
+            .post(SENTRY_TUNNEL_ROUTE_PATH)
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.hosted-elsewhere.example"),
+            )
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(error_event_project_ids(&ctx).await, vec![ctx.project_id]);
+    }
+
+    /// …and `Authorization: DSN <key>`, the other carrier `extract_dsn_key`
+    /// understands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_accepts_authorization_dsn_header() {
+        let ctx = create_test_context().await;
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(SENTRY_TUNNEL_ROUTE_PATH)
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.hosted-elsewhere.example"),
+            )
+            .add_header(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_str(&format!("DSN {}", ctx.dsn_key)).unwrap(),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(error_event_project_ids(&ctx).await, vec![ctx.project_id]);
+    }
+
+    /// An empty `?sentry_key=` presented nothing, so it must behave like a
+    /// credential-free request (Host fallback) rather than 401-ing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_empty_sentry_key_falls_back_to_host() {
+        let ctx = create_test_context().await;
+        ctx.route_table
+            .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(&format!("{}?sentry_key=", SENTRY_TUNNEL_ROUTE_PATH))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.example.com"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://app.example.com"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "an empty sentry_key is absent, not invalid: {}",
+            response.text()
+        );
+    }
+
+    /// A key whose project has been soft-deleted must stop ingesting: project
+    /// deletion does not cascade to `project_dsns`, so without the `projects`
+    /// join the DSN would keep filling a project nothing can read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_soft_deleted_project_returns_401() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+        temps_entities::projects::Entity::update_many()
+            .col_expr(
+                temps_entities::projects::Column::IsDeleted,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(temps_entities::projects::Column::Id.eq(ctx.project_id))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(&format!(
+                "{}?sentry_key={}",
+                SENTRY_TUNNEL_ROUTE_PATH, ctx.dsn_key
+            ))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.hosted-elsewhere.example"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(error_event_project_ids(&ctx).await.is_empty());
+    }
+
+    /// `allowed_origins` is enforced when the row carries one: a matching
+    /// `Origin` is admitted…
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_allowed_origin_is_admitted() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+        temps_entities::project_dsns::Entity::update_many()
+            .col_expr(
+                temps_entities::project_dsns::Column::AllowedOrigins,
+                sea_orm::sea_query::Expr::value(serde_json::json!(["https://allowed.example.com"])),
+            )
+            .filter(temps_entities::project_dsns::Column::PublicKey.eq(ctx.dsn_key.clone()))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(&format!(
+                "{}?sentry_key={}",
+                SENTRY_TUNNEL_ROUTE_PATH, ctx.dsn_key
+            ))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.hosted-elsewhere.example"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://allowed.example.com"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+    }
+
+    /// …and an `Origin` off the list is a 403 rather than a silent
+    /// fall-through to `Host`, which would undo the restriction.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_disallowed_origin_returns_403() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+        ctx.route_table
+            .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
+        temps_entities::project_dsns::Entity::update_many()
+            .col_expr(
+                temps_entities::project_dsns::Column::AllowedOrigins,
+                sea_orm::sea_query::Expr::value(serde_json::json!(["https://allowed.example.com"])),
+            )
+            .filter(temps_entities::project_dsns::Column::PublicKey.eq(ctx.dsn_key.clone()))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let response = server
+            .post(&format!(
+                "{}?sentry_key={}",
+                SENTRY_TUNNEL_ROUTE_PATH, ctx.dsn_key
+            ))
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.example.com"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://evil.example.com"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+        assert!(error_event_project_ids(&ctx).await.is_empty());
+    }
+
+    /// A malformed key is rejected on shape alone — the `Ok(None)` below comes
+    /// back without the query ever being built, which is what keeps a flood of
+    /// junk from costing a round trip each.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_malformed_public_key_never_reaches_the_database() {
+        let ctx = create_test_context().await;
+
+        for candidate in [
+            "",
+            "short",
+            "tk_0123456789abcdef0123456789abcdef",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                !crate::sentry::dsn_service::is_well_formed_public_key(candidate),
+                "{candidate:?} must be rejected on shape"
+            );
+            assert!(
+                ctx.app_state
+                    .dsn_service
+                    .get_project_by_public_key(candidate)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{candidate:?} must not resolve"
+            );
+        }
+
+        // The real key still resolves — the gate is a shape check, not a ban.
+        assert!(ctx
+            .app_state
+            .dsn_service
+            .get_project_by_public_key(&ctx.dsn_key)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// The global unresolved-credential budget trips before the database is
+    /// consulted, and the 429 carries `Retry-After`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_unresolved_credential_flood_trips_the_global_budget() {
+        use crate::sentry::rate_limiter::UNRESOLVED_CREDENTIAL_LIMIT_PER_MINUTE;
+
+        let ctx = create_test_context().await;
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        // Distinct, well-shaped, non-existent keys: each one misses the
+        // resolution cache, which is exactly the case the budget exists for.
+        let mut unauthorized = 0;
+        let mut rate_limited = None;
+        for n in 0..(UNRESOLVED_CREDENTIAL_LIMIT_PER_MINUTE + 5) {
+            let key = format!("{:064x}", n + 1);
+            let response = server
+                .post(&format!("{}?sentry_key={}", SENTRY_TUNNEL_ROUTE_PATH, key))
+                .content_type("application/octet-stream")
+                .add_header(
+                    HeaderName::from_static("host"),
+                    HeaderValue::from_static("app.hosted-elsewhere.example"),
+                )
+                .bytes(Bytes::from(tunneled_envelope_without_dsn()))
+                .await;
+
+            match response.status_code() {
+                StatusCode::UNAUTHORIZED => unauthorized += 1,
+                StatusCode::TOO_MANY_REQUESTS => {
+                    rate_limited = Some(response);
+                    break;
+                }
+                other => panic!("unexpected status {other} on attempt {n}"),
+            }
+        }
+
+        assert_eq!(
+            unauthorized, UNRESOLVED_CREDENTIAL_LIMIT_PER_MINUTE,
+            "the budget must admit exactly its limit before tripping"
+        );
+        let rate_limited = rate_limited.expect("the flood must eventually be rate limited");
+        assert_eq!(
+            rate_limited
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(INGEST_RETRY_AFTER_SECONDS)
+        );
+    }
+
+    /// `/envelope/` and `/store/` answer a 429 the same way the tunnel route
+    /// does, so an SDK does not have to special-case which endpoint it hit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_envelope_endpoint_rate_limited_sets_retry_after() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+        temps_entities::project_dsns::Entity::update_many()
+            .col_expr(
+                temps_entities::project_dsns::Column::RateLimitPerMinute,
+                sea_orm::sea_query::Expr::value(1),
+            )
+            .filter(temps_entities::project_dsns::Column::PublicKey.eq(ctx.dsn_key.clone()))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        let app = configure_routes().with_state(ctx.app_state.clone());
+        let server = TestServer::new(app);
+        let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
+        let envelope = tunneled_envelope_without_dsn();
+
+        for _ in 0..2 {
+            let response = server
+                .post(&format!("/{}/envelope/", ctx.project_id))
+                .content_type("application/octet-stream")
+                .add_header(
+                    HeaderName::from_static("x-sentry-auth"),
+                    HeaderValue::from_str(&auth_header).unwrap(),
+                )
+                .bytes(Bytes::from(envelope.clone()))
+                .await;
+
+            if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    Some(INGEST_RETRY_AFTER_SECONDS),
+                    "a 429 must tell the client when to retry"
+                );
+                return;
+            }
+        }
+
+        panic!("expected the second request to be rate limited");
+    }
+
+    #[test]
+    fn test_origins_match() {
+        assert!(origins_match(
+            "https://app.example.com",
+            "https://app.example.com"
+        ));
+        // Scheme and host compare case-insensitively.
+        assert!(origins_match(
+            "HTTPS://APP.EXAMPLE.COM",
+            "https://app.example.com"
+        ));
+        // Scheme must match.
+        assert!(!origins_match(
+            "https://app.example.com",
+            "http://app.example.com"
+        ));
+        // Port is part of the origin.
+        assert!(origins_match(
+            "http://localhost:3000",
+            "http://localhost:3000"
+        ));
+        assert!(!origins_match(
+            "http://localhost:3000",
+            "http://localhost:3001"
+        ));
+        assert!(!origins_match("http://localhost:3000", "http://localhost"));
+        // A bracketed IPv6 literal's colons are not a port separator.
+        assert!(origins_match("http://[::1]:8080", "http://[::1]:8080"));
+        assert!(!origins_match("http://[::1]:8080", "http://[::1]:9090"));
+        // Suffix tricks do not match.
+        assert!(!origins_match(
+            "https://example.com",
+            "https://evil-example.com"
+        ));
+    }
+
+    #[test]
+    fn test_extract_dsn_key_treats_empty_values_as_absent() {
+        let empty_params = std::collections::HashMap::new();
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("sentry_key".to_string(), String::new());
+        assert_eq!(extract_dsn_key(&HeaderMap::new(), &params), None);
+
+        params.insert("sentry_key".to_string(), "   ".to_string());
+        assert_eq!(extract_dsn_key(&HeaderMap::new(), &params), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-sentry-auth"),
+            HeaderValue::from_static("Sentry sentry_key=,sentry_version=7"),
+        );
+        assert_eq!(extract_dsn_key(&headers, &empty_params), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("DSN "),
+        );
+        assert_eq!(extract_dsn_key(&headers, &empty_params), None);
     }
 }
