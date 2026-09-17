@@ -12,22 +12,26 @@
 //!    given source are fetched in a single [`MetricsStore::query_latest`] call.
 //! 3. Compares each value against the threshold using the rule's comparator.
 //! 4. If breaching:
-//!    - Records `breach_start[rule_id] = Instant::now()` on first breach.
+//!    - Persists `monitoring_alert_rules.breach_started_at` on first breach.
 //!    - If elapsed ≥ `for_duration_secs`: fires the alarm via
 //!      [`AlarmService::fire_alarm`] and records the returned alarm ID.
 //! 5. If not breaching:
-//!    - Clears `breach_start[rule_id]`.
+//!    - Clears `breach_started_at` back to NULL.
 //!    - If an alarm was previously fired for this rule, resolves it.
 //!
-//! # In-memory state
+//! # Persisted state
 //!
-//! Breach start times are stored in-memory only.  They are lost on restart,
-//! which is acceptable because a restart naturally resets the breach window.
-//! This prevents phantom alarms from firing immediately after a restart.
+//! Breach start times live on the rule row (`breach_started_at`), with an
+//! in-process `HashMap` in front of it purely as a cache.  They used to be
+//! in-memory only, which meant every restart — including every routine
+//! upgrade of the control plane — reset the breach clock to zero: a rule with
+//! a `for_duration_secs` longer than the instance's typical uptime between
+//! restarts could never fire at all.  The map is loaded from the database on
+//! startup, written on the transition into breach, and cleared on recovery.
 //!
-//! `firing_alarms` is repopulated from the database on startup so that
-//! already-firing alarms are not re-fired after a restart within the 5-minute
-//! cooldown window.
+//! `firing_alarms` is likewise repopulated from the database on startup so
+//! that already-firing alarms are not re-fired after a restart within the
+//! 5-minute cooldown window.
 //!
 //! # Default rule seeding
 //!
@@ -38,9 +42,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 #[cfg(test)]
 use sea_orm::Set;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -78,10 +83,13 @@ pub struct AlertEvaluator {
     db: Arc<DatabaseConnection>,
     store: Arc<dyn MetricsStore>,
     alarm_service: Arc<AlarmService>,
-    /// Tracks when each rule first entered a breaching state.
-    /// Key: `rule_id`, Value: `Instant` of first observed breach.
-    /// Lost on restart — that is intentional (prevents phantom alerts).
-    breach_start: Arc<RwLock<HashMap<i32, Instant>>>,
+    /// Cache of `monitoring_alert_rules.breach_started_at`.
+    /// Key: `rule_id`, Value: wall-clock time of the first observed breach.
+    ///
+    /// This is a cache, not the source of truth: the column is. It is loaded
+    /// from the database on startup so a restart resumes an in-progress
+    /// breach window instead of restarting it.
+    breach_start: Arc<RwLock<HashMap<i32, temps_core::UtcDateTime>>>,
     /// Tracks which alarm ID was fired for each rule so it can be resolved.
     /// Key: `rule_id`, Value: `alarm_id` returned by [`AlarmService::fire_alarm`].
     firing_alarms: Arc<RwLock<HashMap<i32, i32>>>,
@@ -124,6 +132,14 @@ impl AlertEvaluator {
         // alarms or lose track of alarms that need future resolution.
         if let Err(e) = self.load_firing_alarms_from_db().await {
             warn!("AlertEvaluator: failed to load firing alarms from DB on startup: {e}");
+        }
+
+        // Resume in-progress breach windows. Without this, a rule that needs
+        // N minutes of sustained breach restarts its clock on every restart
+        // and never reaches N on an instance that is redeployed more often
+        // than that.
+        if let Err(e) = self.load_breach_state_from_db().await {
+            warn!("AlertEvaluator: failed to load breach state from DB on startup: {e}");
         }
 
         // Back-seed default alert rules for every metrics-enabled service.
@@ -226,6 +242,79 @@ impl AlertEvaluator {
         Ok(())
     }
 
+    /// Load persisted breach start times into the in-memory cache.
+    ///
+    /// Only rules with a non-NULL `breach_started_at` are read, so this is a
+    /// single indexed-by-nothing but tiny query — rules are only breaching
+    /// while something is actually wrong.
+    async fn load_breach_state_from_db(&self) -> Result<(), String> {
+        let rows = monitoring_alert_rules::Entity::find()
+            .filter(monitoring_alert_rules::Column::BreachStartedAt.is_not_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| format!("load_breach_state_from_db: DB error: {e}"))?;
+
+        let restored = {
+            let mut guard = self.breach_start.write().await;
+            for rule in rows {
+                if let Some(started_at) = rule.breach_started_at {
+                    guard.insert(rule.id, started_at);
+                }
+            }
+            guard.len()
+        };
+
+        info!(
+            "AlertEvaluator: restored {} in-progress breach window(s) from DB",
+            restored
+        );
+
+        Ok(())
+    }
+
+    /// Persist the start of a breach window for `rule_id`.
+    ///
+    /// Written with `update_many` + `col_expr` so only the one column is
+    /// touched — the evaluator must never clobber a concurrent edit to the
+    /// rule's threshold, silence window or enabled flag.
+    async fn persist_breach_start(&self, rule_id: i32, started_at: temps_core::UtcDateTime) {
+        if let Err(e) = monitoring_alert_rules::Entity::update_many()
+            .col_expr(
+                monitoring_alert_rules::Column::BreachStartedAt,
+                Expr::value(started_at),
+            )
+            .filter(monitoring_alert_rules::Column::Id.eq(rule_id))
+            .exec(self.db.as_ref())
+            .await
+        {
+            // Non-fatal: the in-memory cache still tracks this window, so the
+            // alarm still fires on schedule for as long as this process
+            // lives. Only a restart before the next successful write loses it.
+            warn!(
+                rule_id,
+                "AlertEvaluator: failed to persist breach start: {e}"
+            );
+        }
+    }
+
+    /// Clear the persisted breach window for `rule_id`.
+    async fn clear_persisted_breach_start(&self, rule_id: i32) {
+        if let Err(e) = monitoring_alert_rules::Entity::update_many()
+            .col_expr(
+                monitoring_alert_rules::Column::BreachStartedAt,
+                Expr::value(Option::<temps_core::UtcDateTime>::None),
+            )
+            .filter(monitoring_alert_rules::Column::Id.eq(rule_id))
+            .exec(self.db.as_ref())
+            .await
+        {
+            // Non-fatal, but it does leave a stale start time behind: a
+            // restart would then treat the rule as having been breaching all
+            // along. The next recovery tick retries the clear.
+            warn!(rule_id, "AlertEvaluator: failed to clear breach start: {e}");
+        }
+    }
+
     /// Back-seed default alert rules for every external service that has
     /// `metrics_enabled = true`. Idempotent — `seed_default_rules` uses
     /// `INSERT … ON CONFLICT DO NOTHING`, so services that already have their
@@ -301,9 +390,23 @@ impl AlertEvaluator {
         // Prune stale in-memory state for rules that no longer exist.
         // This prevents unbounded growth when rules are deleted while firing.
         let active_ids: HashSet<i32> = rules.iter().map(|r| r.id).collect();
-        {
+        let dropped_breaches: Vec<i32> = {
             let mut bs = self.breach_start.write().await;
+            let dropped: Vec<i32> = bs
+                .keys()
+                .copied()
+                .filter(|k| !active_ids.contains(k))
+                .collect();
             bs.retain(|k, _| active_ids.contains(k));
+            dropped
+        };
+        // A rule that left the evaluated set (deleted, disabled or silenced)
+        // must not leave a stale `breach_started_at` behind: on the next
+        // restart that would be read back as an in-progress window and the
+        // rule would fire the instant it is re-enabled. Rows deleted outright
+        // take the column with them, so this is a harmless no-op for those.
+        for rule_id in dropped_breaches {
+            self.clear_persisted_breach_start(rule_id).await;
         }
         {
             let mut fa = self.firing_alarms.write().await;
@@ -467,14 +570,30 @@ impl AlertEvaluator {
         }
         let required_secs = rule.for_duration_secs.max(0) as u64;
 
-        let now = Instant::now();
+        let now = Utc::now();
 
-        // Record breach start if this is the first tick in breach.
-        let elapsed_secs = {
+        // Record breach start if this is the first tick in breach. The write
+        // lock is released before touching the database so a slow write can
+        // never block another rule's evaluation.
+        let (started_at, is_new_breach) = {
             let mut guard = self.breach_start.write().await;
-            let start = guard.entry(rule_id).or_insert(now);
-            start.elapsed().as_secs()
+            match guard.get(&rule_id) {
+                Some(existing) => (*existing, false),
+                None => {
+                    guard.insert(rule_id, now);
+                    (now, true)
+                }
+            }
         };
+
+        if is_new_breach {
+            self.persist_breach_start(rule_id, started_at).await;
+        }
+
+        // Saturating: a backwards wall-clock adjustment (NTP step, VM
+        // resume) must not wrap into a huge elapsed value and fire the alarm
+        // early — it just looks like the breach started later.
+        let elapsed_secs = (now - started_at).num_seconds().max(0) as u64;
 
         // Has the breach persisted long enough to fire?
         if elapsed_secs < required_secs {
@@ -594,8 +713,15 @@ impl AlertEvaluator {
     }
 
     /// Clear breach tracking for a rule (metric recovered or no data).
+    ///
+    /// Only writes to the database when the cache actually held a window, so
+    /// the overwhelmingly common case — a healthy rule evaluated every 30
+    /// seconds — issues no write at all.
     async fn clear_breach(&self, rule_id: i32) {
-        self.breach_start.write().await.remove(&rule_id);
+        let was_breaching = self.breach_start.write().await.remove(&rule_id).is_some();
+        if was_breaching {
+            self.clear_persisted_breach_start(rule_id).await;
+        }
     }
 
     /// Resolve project/environment/deployment IDs for a FireAlarmRequest.
@@ -1440,6 +1566,7 @@ mod tests {
             for_duration_secs: 60,
             enabled: true,
             silenced_until: None,
+            breach_started_at: None,
         }
     }
 
@@ -1711,13 +1838,166 @@ mod tests {
     }
 
     fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
-        let db = Arc::new(db);
+        evaluator_with_shared_db(Arc::new(db))
+    }
+
+    fn evaluator_with_shared_db(db: Arc<DatabaseConnection>) -> AlertEvaluator {
         let alarm_service = Arc::new(AlarmService::new(
             db.clone(),
             Arc::new(NoopNotifications),
             Arc::new(NoopQueue),
         ));
         AlertEvaluator::new(db, Arc::new(NoopStore), alarm_service)
+    }
+
+    /// Recover the mock connection's statement log.
+    ///
+    /// The evaluator (and the `AlarmService` it owns) hold the only other
+    /// `Arc` clones, so dropping it first leaves this the sole owner.
+    fn transaction_log(
+        evaluator: AlertEvaluator,
+        db: Arc<DatabaseConnection>,
+    ) -> Vec<sea_orm::Transaction> {
+        drop(evaluator);
+        Arc::try_unwrap(db)
+            .map_err(|_| "evaluator still holds a connection reference")
+            .expect("evaluator was dropped, so the connection must be uniquely owned")
+            .into_transaction_log()
+    }
+
+    // ── breach state persistence ───────────────────────────────────────────────
+
+    /// The breach clock has to outlive the process. Before this was persisted,
+    /// every restart reset it, so a rule with a `for_duration_secs` longer
+    /// than the instance's uptime between deploys could never fire.
+    #[tokio::test]
+    async fn restores_in_progress_breach_window_on_startup() {
+        let started_at = Utc::now() - chrono::Duration::minutes(10);
+        let breaching = monitoring_alert_rules::Model {
+            id: 42,
+            breach_started_at: Some(started_at),
+            ..make_rule(Some(1), None)
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![breaching]])
+            .into_connection();
+
+        let evaluator = evaluator_with_db(db);
+        evaluator
+            .load_breach_state_from_db()
+            .await
+            .expect("loading breach state from a mocked DB must succeed");
+
+        let restored = evaluator.breach_start.read().await;
+        assert_eq!(
+            restored.get(&42).copied(),
+            Some(started_at),
+            "an in-progress breach window must resume where it left off, not restart at zero"
+        );
+    }
+
+    /// Round trip: what the evaluator writes on the transition into breach is
+    /// exactly what a restarted evaluator reads back.
+    #[tokio::test]
+    async fn breach_start_round_trips_through_the_database() {
+        let started_at = Utc::now() - chrono::Duration::minutes(3);
+
+        let write_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let writer = evaluator_with_shared_db(write_db.clone());
+        writer.persist_breach_start(42, started_at).await;
+
+        let log = transaction_log(writer, write_db);
+        assert_eq!(log.len(), 1, "one targeted UPDATE, nothing else");
+        let sql = format!("{:?}", log[0]);
+        assert!(
+            sql.contains("breach_started_at"),
+            "the write must set the breach column: {sql}"
+        );
+        assert!(
+            !sql.contains("threshold") && !sql.contains("enabled"),
+            "the evaluator must not clobber operator-owned rule columns: {sql}"
+        );
+
+        // Now the read side, given the row that write produced.
+        let persisted = monitoring_alert_rules::Model {
+            id: 42,
+            breach_started_at: Some(started_at),
+            ..make_rule(Some(1), None)
+        };
+        let read_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![persisted]])
+            .into_connection();
+        let reader = evaluator_with_db(read_db);
+        reader
+            .load_breach_state_from_db()
+            .await
+            .expect("loading breach state from a mocked DB must succeed");
+
+        assert_eq!(
+            reader.breach_start.read().await.get(&42).copied(),
+            Some(started_at),
+            "the restored window must match the persisted one"
+        );
+    }
+
+    /// Recovery must clear the persisted window, otherwise a restart would
+    /// read back a stale start time and fire the alarm immediately.
+    #[tokio::test]
+    async fn recovery_clears_the_persisted_breach_window() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        evaluator
+            .breach_start
+            .write()
+            .await
+            .insert(42, Utc::now() - chrono::Duration::minutes(1));
+
+        evaluator.clear_breach(42).await;
+
+        assert!(
+            !evaluator.breach_start.read().await.contains_key(&42),
+            "the cache entry must be dropped on recovery"
+        );
+
+        let log = transaction_log(evaluator, db);
+        assert_eq!(log.len(), 1, "recovery must clear the column exactly once");
+        let sql = format!("{:?}", log[0]);
+        assert!(
+            sql.contains("breach_started_at"),
+            "recovery must null out the breach column: {sql}"
+        );
+    }
+
+    /// The common case — a healthy rule evaluated every 30 seconds — must not
+    /// issue a write. A clear-on-every-tick implementation would turn an idle
+    /// instance into a steady stream of pointless database writes.
+    #[tokio::test]
+    async fn clearing_a_rule_that_was_not_breaching_writes_nothing() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db.clone());
+
+        evaluator.clear_breach(42).await;
+
+        let log = transaction_log(evaluator, db);
+        assert!(
+            log.is_empty(),
+            "a rule that was never breaching must not touch the database: {log:?}"
+        );
     }
 
     /// A service-scoped rule must resolve its `service_id` into the alarm
