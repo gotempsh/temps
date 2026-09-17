@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, Select, Set, TransactionTrait,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,30 @@ use super::types::{validate_check_path, StatusPageError};
 /// observes the platform in its normal running state; every cycle after the
 /// first runs on the regular interval.
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
+/// How often the scheduler looks for monitors that have come due.
+///
+/// This is the *sweep* cadence, not the per-monitor check cadence — each
+/// monitor is probed on its own `check_interval_seconds`. The sweep only has
+/// to be fine-grained enough that a monitor is not checked much later than it
+/// asked for; at 15s a 30s monitor drifts by at most half an interval. The
+/// sweep itself is a single indexed query that usually returns nothing, so
+/// running it four times a minute costs far less than the old design, which
+/// probed every active monitor once a minute.
+const SCHEDULER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Floor for `status_monitors.check_interval_seconds`.
+///
+/// A monitor configured below this would probe the deployment harder than the
+/// scheduler sweeps, and each probe costs up to 4 HTTP attempts with backoff.
+/// Values under the floor are clamped rather than rejected so an existing row
+/// (or an import) can never wedge the scheduler into a hot loop.
+const MIN_CHECK_INTERVAL_SECS: i64 = 30;
+
+/// Interval used when a monitor's configured interval is missing or
+/// non-positive (`0` was the effective value for every row before the
+/// scheduler honoured the column at all).
+const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
 
 fn probe_url(
     public_url: &str,
@@ -101,21 +126,82 @@ impl HealthCheckService {
         })
     }
 
-    /// Run health checks for all active monitors
+    /// Resolve a monitor's configured interval into the value the scheduler
+    /// actually uses: non-positive values fall back to
+    /// [`DEFAULT_CHECK_INTERVAL_SECS`] and anything below
+    /// [`MIN_CHECK_INTERVAL_SECS`] is clamped up to it.
+    fn effective_check_interval_secs(check_interval_seconds: i32) -> i64 {
+        let configured = i64::from(check_interval_seconds);
+        if configured <= 0 {
+            DEFAULT_CHECK_INTERVAL_SECS
+        } else {
+            configured.max(MIN_CHECK_INTERVAL_SECS)
+        }
+    }
+
+    /// Select the active monitors that are due at `now`.
+    ///
+    /// `next_check_at IS NULL` means the monitor has never been scheduled
+    /// (rows predating the due column, or freshly created ones), so it is
+    /// treated as due — nothing needs a backfill to start being checked.
+    fn due_monitors_query(now: temps_core::UtcDateTime) -> Select<status_monitors::Entity> {
+        status_monitors::Entity::find()
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .filter(
+                Condition::any()
+                    .add(status_monitors::Column::NextCheckAt.is_null())
+                    .add(status_monitors::Column::NextCheckAt.lte(now)),
+            )
+    }
+
+    /// Stamp the monitor's next due time.
+    ///
+    /// Deliberately written through `update_many` + `col_expr` rather than an
+    /// `ActiveModel` save: `ActiveModelBehavior::before_save` bumps
+    /// `updated_at`, and `persist_check_if_current` uses `updated_at` as the
+    /// monitor's concurrency token. Saving an ActiveModel here would make
+    /// every check invalidate its own result.
+    ///
+    /// Called *before* the probe runs so that a probe which panics, times out
+    /// or exits early (paused deployment, missing environment) still yields
+    /// the slot instead of being re-selected by the very next sweep.
+    async fn schedule_next_check(db: &DatabaseConnection, monitor: &status_monitors::Model) {
+        let interval = Self::effective_check_interval_secs(monitor.check_interval_seconds);
+        let next_check_at = Utc::now() + chrono::Duration::seconds(interval);
+
+        if let Err(error) = status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(next_check_at),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .exec(db)
+            .await
+        {
+            // Non-fatal: the monitor stays due and is retried next sweep.
+            warn!(
+                monitor_id = monitor.id,
+                interval_secs = interval,
+                error = %error,
+                "Failed to stamp next_check_at for monitor; it will be re-selected next sweep"
+            );
+        }
+    }
+
+    /// Run health checks for every monitor that is currently due
     pub async fn run_all_checks(&self) -> Result<(), StatusPageError> {
         debug!("Starting health check cycle");
 
         // Single query: join monitors with environments to skip on-demand ones.
         // Health checks go through the proxy, which resets the idle timer and
         // would prevent scale-to-zero from ever triggering.
-        let monitors_with_envs = status_monitors::Entity::find()
-            .filter(status_monitors::Column::IsActive.eq(true))
+        let monitors_with_envs = Self::due_monitors_query(Utc::now())
             .find_also_related(environments::Entity)
             .all(self.db.as_ref())
             .await?;
 
         let total_monitors = monitors_with_envs.len();
-        debug!("Found {} active monitors to check", total_monitors);
+        debug!("Found {} due monitors to check", total_monitors);
 
         let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(monitors_with_envs);
 
@@ -210,6 +296,12 @@ impl HealthCheckService {
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
+        // Claim the monitor's next slot up front. Every early return below
+        // (no environment, no current deployment, paused deployment) would
+        // otherwise leave `next_check_at` in the past and have the monitor
+        // re-selected on every single sweep.
+        Self::schedule_next_check(db.as_ref(), &monitor).await;
+
         // Check if environment_id is set
         let env_id = monitor.environment_id.ok_or_else(|| {
             warn!("Monitor {} has no environment_id", monitor.id);
@@ -702,7 +794,8 @@ impl HealthCheckService {
     ///
     /// This scheduler:
     /// 1. Initializes monitors for all existing environments at startup
-    /// 2. Runs health checks every 60 seconds for all active monitors
+    /// 2. Sweeps every 15 seconds and checks the monitors that are due,
+    ///    honouring each monitor's own `check_interval_seconds`
     /// 3. Listens for MonitorCreated events and immediately checks new monitors
     ///
     /// The job_receiver parameter allows the scheduler to react to monitor creation
@@ -726,7 +819,7 @@ impl HealthCheckService {
         // Start the periodic check cycle
         let service_for_interval = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(SCHEDULER_SWEEP_INTERVAL);
             loop {
                 interval.tick().await;
                 let service = service_for_interval.clone();
@@ -925,6 +1018,7 @@ mod tests {
             check_interval_seconds: 60,
             is_active: true,
             is_managed: false,
+            next_check_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -963,6 +1057,62 @@ mod tests {
             force_https: None,
             last_activity_at: None,
         }
+    }
+
+    #[test]
+    fn interval_below_floor_is_clamped() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(5),
+            MIN_CHECK_INTERVAL_SECS
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(29),
+            MIN_CHECK_INTERVAL_SECS
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(-120),
+            DEFAULT_CHECK_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn unset_interval_falls_back_to_default() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(0),
+            DEFAULT_CHECK_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn configured_interval_above_floor_is_preserved() {
+        assert_eq!(HealthCheckService::effective_check_interval_secs(30), 30);
+        assert_eq!(HealthCheckService::effective_check_interval_secs(600), 600);
+    }
+
+    /// The whole point of the due column: the sweep must ask the database for
+    /// the monitors whose turn it is, not for every active monitor. A
+    /// regression here is invisible at runtime (checks still happen, just far
+    /// too often), so the predicate is asserted directly.
+    #[test]
+    fn due_query_selects_only_active_monitors_that_are_due() {
+        use sea_orm::{DbBackend, QueryTrait};
+
+        let sql = HealthCheckService::due_monitors_query(Utc::now())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(
+            sql.contains("\"is_active\" = TRUE"),
+            "sweep must stay limited to active monitors: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" IS NULL"),
+            "never-scheduled monitors must be treated as due: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" <="),
+            "the sweep must filter on the due time in SQL: {sql}"
+        );
     }
 
     #[test]

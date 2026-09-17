@@ -1324,6 +1324,7 @@ mod tests {
             check_interval_seconds: 60,
             is_active: true,
             is_managed: true,
+            next_check_at: None,
             created_at: now,
             updated_at: now,
         }

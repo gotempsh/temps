@@ -182,6 +182,12 @@ pub struct MonitorResponse {
     pub monitor_url: String, // The URL being monitored (constructed from environment)
     pub check_interval_seconds: i32,
     pub is_active: bool,
+    /// When the scheduler will next probe this monitor. Read-only: it is
+    /// maintained by the health-check scheduler, never accepted on write.
+    /// `null` means the monitor has not been scheduled yet and is due on the
+    /// next sweep.
+    #[schema(value_type = Option<String>, format = "date-time")]
+    pub next_check_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time")]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = "date-time")]
@@ -354,6 +360,7 @@ impl From<temps_entities::status_monitors::Model> for MonitorResponse {
             monitor_url: String::new(), // Will be populated by service layer
             check_interval_seconds: model.check_interval_seconds,
             is_active: model.is_active,
+            next_check_at: model.next_check_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
         }
