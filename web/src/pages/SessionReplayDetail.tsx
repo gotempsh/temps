@@ -9,12 +9,20 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { SessionReplayPlayer } from '@/components/session-replay/SessionReplayPlayer'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  Button,
+  Detail,
+  fmtDateTime,
+  fmtDuration,
+  fmtRelativeTime,
+  useUrlState,
+  type DetailFact,
+} from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -44,7 +52,7 @@ import {
   Type,
   User,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import { Link, useParams } from 'react-router'
 
 // Type definitions for event data
@@ -188,9 +196,8 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     slug: string
   }>()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [selectedEvent, setSelectedEvent] = useState<SessionEventDto | null>(
-    null
-  )
+  const { get, patch } = useUrlState<'event'>()
+  const selectedEventId = get('event')
 
   usePageTitle(`Session Replay - ${sessionId}`)
 
@@ -288,87 +295,65 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   // Loading skeleton
   if (isLoading) {
     return (
-      <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
-        {/* Header skeleton */}
-        <div className="mb-4 flex items-center justify-between">
-          <Skeleton className="h-9 w-32" />
-          <div className="flex items-center gap-3">
-            <Skeleton className="h-12 w-28" />
-            <Skeleton className="h-12 w-24" />
-            <Skeleton className="h-12 w-32" />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* Player skeleton */}
-          <div className="lg:col-span-2">
-            <Card>
-              <CardContent className="p-0">
-                <Skeleton className="h-[500px] w-full rounded-t-lg" />
-                <div className="p-4 space-y-3">
-                  <div className="flex items-center gap-2">
-                    <Skeleton className="h-10 w-10 rounded-full" />
-                    <Skeleton className="h-10 flex-1" />
-                  </div>
-                  <Skeleton className="h-2 w-full" />
+      <Detail
+        title={<Skeleton className="h-7 w-48" />}
+        actions={<Skeleton className="h-9 w-32" />}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-20" />,
+        }))}
+        main={
+          <Card>
+            <CardContent className="p-0">
+              <Skeleton className="h-[500px] w-full rounded-t-lg" />
+              <div className="space-y-3 p-4">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-10 w-10 rounded-full" />
+                  <Skeleton className="h-10 flex-1" />
                 </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Events timeline skeleton */}
-          <div className="lg:col-span-1 h-[calc(100vh-200px)]">
-            <Card className="h-full">
-              <CardHeader className="pb-3">
-                <div className="flex items-center justify-between">
-                  <Skeleton className="h-5 w-16" />
-                  <Skeleton className="h-5 w-32" />
+                <Skeleton className="h-2 w-full" />
+              </div>
+            </CardContent>
+          </Card>
+        }
+        aside={
+          <Card className="h-[calc(100vh-220px)]">
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between">
+                <Skeleton className="h-5 w-16" />
+                <Skeleton className="h-5 w-32" />
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {/* User info skeleton */}
+              <div className="flex items-center gap-2 border-b pb-3">
+                <Skeleton className="h-8 w-8 rounded-full" />
+                <div className="flex-1 space-y-1">
+                  <Skeleton className="h-4 w-24" />
+                  <Skeleton className="h-3 w-16" />
                 </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {/* User info skeleton */}
-                <div className="flex items-center gap-2 pb-3 border-b">
-                  <Skeleton className="h-8 w-8 rounded-full" />
-                  <div className="flex-1 space-y-1">
-                    <Skeleton className="h-4 w-24" />
-                    <Skeleton className="h-3 w-16" />
-                  </div>
+                <Skeleton className="h-4 w-4" />
+              </div>
+              {/* Event items skeleton */}
+              {Array.from({ length: 8 }).map((_, i) => (
+                <div key={i} className="flex items-start gap-3">
+                  <Skeleton className="h-4 w-12" />
                   <Skeleton className="h-4 w-4" />
-                </div>
-                {/* Event items skeleton */}
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <div key={i} className="flex items-start gap-3">
-                    <Skeleton className="h-4 w-12" />
-                    <Skeleton className="h-4 w-4" />
-                    <div className="flex-1 space-y-1">
-                      <Skeleton className="h-4 w-32" />
-                      <Skeleton className="h-3 w-full" />
-                    </div>
+                  <div className="flex-1 space-y-1">
+                    <Skeleton className="h-4 w-32" />
+                    <Skeleton className="h-3 w-full" />
                   </div>
-                ))}
-              </CardContent>
-            </Card>
-          </div>
-        </div>
-      </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        }
+      />
     )
   }
 
   // Calculate session stats
   const duration = sessionData?.session?.duration || 0
-  const formatDuration = (ms: number) => {
-    const seconds = Math.floor(ms / 1000)
-    const minutes = Math.floor(seconds / 60)
-    const hours = Math.floor(minutes / 60)
-
-    if (hours > 0) {
-      return `${hours}h ${minutes % 60}m`
-    } else if (minutes > 0) {
-      return `${minutes}m ${seconds % 60}s`
-    } else {
-      return `${seconds}s`
-    }
-  }
 
   // Helper function to format event data preview
   const formatEventDataPreview = (eventData: any): string => {
@@ -398,166 +383,156 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
       : String(data)
   }
 
+  const facts: DetailFact[] = [
+    { label: 'Duration', value: fmtDuration(duration) },
+    { label: 'Events', value: events.length },
+    {
+      label: 'Viewport',
+      value: `${sessionData?.session?.viewport_width || 0}×${sessionData?.session?.viewport_height || 0}`,
+    },
+    {
+      label: 'Started',
+      value: sessionData?.session?.created_at ? (
+        <span title={fmtDateTime(sessionData.session.created_at)}>
+          {fmtRelativeTime(sessionData.session.created_at)}
+        </span>
+      ) : (
+        '—'
+      ),
+    },
+  ]
+
   return (
-    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
-      <div className="mb-4 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button variant="ghost" size="sm" asChild>
-            <Link
-              to={`/projects/${project.slug}/analytics/visitors/${visitorId}`}
-            >
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Visitor
-            </Link>
-          </Button>
-        </div>
-
-        {/* Session Stats - Aligned to the right */}
-        <div className="flex items-center gap-3">
-          <Card className="border-0 shadow-none bg-muted/30">
-            <CardContent className="flex items-center gap-2 p-3">
-              <div className="text-xs text-muted-foreground">Duration</div>
-              <div className="font-semibold">{formatDuration(duration)}</div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-0 shadow-none bg-muted/30">
-            <CardContent className="flex items-center gap-2 p-3">
-              <div className="text-xs text-muted-foreground">Events</div>
-              <div className="font-semibold">{events.length}</div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-0 shadow-none bg-muted/30">
-            <CardContent className="flex items-center gap-2 p-3">
-              <div className="text-xs text-muted-foreground">Viewport</div>
-              <div className="font-semibold">
-                {sessionData?.session?.viewport_width || 0}×
-                {sessionData?.session?.viewport_height || 0}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left side - Session Replay Player */}
-        <div className="lg:col-span-2">
-          <SessionReplayPlayer
-            events={events}
-            sessionData={{
-              id: sessionId || '',
-              created_at: sessionData?.session?.created_at || '',
-              url: sessionData?.session?.url || '',
-              duration: sessionData?.session?.duration || 0,
-              event_count: events.length,
-              viewport_width: sessionData?.session?.viewport_width || 0,
-              viewport_height: sessionData?.session?.viewport_height || 0,
-            }}
-            isLoading={isLoading}
-            error={error ? 'Failed to load session replay events' : null}
-          />
-        </div>
-
-        {/* Right side - Events Timeline */}
-        <div className="lg:col-span-1 h-[calc(100vh-200px)]">
-          <Card className="h-full flex flex-col">
-            <CardHeader className="pb-3 flex-shrink-0">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">Events</CardTitle>
-                <Badge variant="secondary" className="text-xs">
-                  {events.length} captured ({groupedEvents.length} groups)
-                </Badge>
-              </div>
-            </CardHeader>
-            <CardContent className="flex-1 p-0 overflow-hidden">
-              <div className="flex flex-col h-full">
-                {/* User info */}
-                {visitorId && (
-                  <div className="px-4 pb-3 border-b flex-shrink-0">
-                    <Link
-                      to={`/projects/${project.slug}/analytics/visitors/${visitorId}`}
-                      className="flex items-center gap-2 hover:bg-muted/50 rounded-md p-2 -m-2 transition-colors"
-                    >
-                      <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
-                        <User className="h-4 w-4 text-primary" />
+    <Detail
+      title={sessionId ? `Session ${sessionId.slice(0, 8)}` : 'Session'}
+      actions={
+        <Button variant="ghost" size="sm" asChild>
+          <Link
+            to={`/projects/${project.slug}/analytics/visitors/${visitorId}`}
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to Visitor
+          </Link>
+        </Button>
+      }
+      facts={facts}
+      main={
+        <SessionReplayPlayer
+          events={events}
+          sessionData={{
+            id: sessionId || '',
+            created_at: sessionData?.session?.created_at || '',
+            url: sessionData?.session?.url || '',
+            duration: sessionData?.session?.duration || 0,
+            event_count: events.length,
+            viewport_width: sessionData?.session?.viewport_width || 0,
+            viewport_height: sessionData?.session?.viewport_height || 0,
+          }}
+          isLoading={isLoading}
+          error={error ? 'Failed to load session replay events' : null}
+        />
+      }
+      aside={
+        <Card className="flex h-[calc(100vh-220px)] flex-col">
+          <CardHeader className="flex-shrink-0 pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base">Events</CardTitle>
+              <Badge variant="secondary" className="text-xs">
+                {events.length} captured ({groupedEvents.length} groups)
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="flex-1 overflow-hidden p-0">
+            <div className="flex h-full flex-col">
+              {/* User info */}
+              {visitorId && (
+                <div className="flex-shrink-0 border-b px-4 pb-3">
+                  <Link
+                    to={`/projects/${project.slug}/analytics/visitors/${visitorId}`}
+                    className="-m-2 flex items-center gap-2 rounded-md p-2 transition-colors hover:bg-muted/50"
+                  >
+                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10">
+                      <User className="h-4 w-4 text-primary" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">
+                        {visitorId.slice(0, 12)}
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">
-                          {visitorId.slice(0, 12)}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          View User
-                        </div>
+                      <div className="text-xs text-muted-foreground">
+                        View User
                       </div>
-                      <ChevronRight className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                    </Link>
-                  </div>
-                )}
+                    </div>
+                    <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                  </Link>
+                </div>
+              )}
 
-                {/* Events list with fixed height */}
-                <ScrollArea className="flex-1 h-full">
-                  <div className="divide-y">
-                    {groupedEvents.map((group, index) => {
-                      const firstEvent = group.events[0]
-                      const firstEventData = firstEvent.data as any
-                      const Icon = getEventIcon(firstEvent)
-                      const color = getEventColor(firstEvent)
-                      const description = getEventDescription(firstEvent)
-                      const isSelected = selectedEvent?.id === firstEvent.id
+              {/* Events list with fixed height */}
+              <ScrollArea className="h-full flex-1">
+                <div className="divide-y">
+                  {groupedEvents.map((group, index) => {
+                    const firstEvent = group.events[0]
+                    const firstEventData = firstEvent.data as any
+                    const Icon = getEventIcon(firstEvent)
+                    const color = getEventColor(firstEvent)
+                    const description = getEventDescription(firstEvent)
+                    const isSelected = selectedEventId === String(firstEvent.id)
 
-                      return (
-                        <div
-                          key={`${group.startTime}-${index}`}
-                          className={`px-4 py-3 hover:bg-muted/50 cursor-pointer transition-colors ${
-                            isSelected ? 'bg-muted' : ''
-                          }`}
-                          onClick={() => setSelectedEvent(firstEvent)}
-                        >
-                          <div className="flex items-start gap-3">
-                            <div className="text-xs text-muted-foreground mt-0.5 w-12">
-                              {getRelativeTime(group.startTime)}
-                            </div>
-                            <Icon
-                              className={`h-4 w-4 mt-0.5 flex-shrink-0 ${color}`}
-                            />
-                            <div className="flex-1 min-w-0">
-                              <div className="text-sm font-medium">
-                                {description}
-                                {group.count > 1 && (
-                                  <span className="text-muted-foreground font-normal ml-1">
-                                    (×{group.count})
-                                  </span>
-                                )}
-                              </div>
-                              {firstEventData && (
-                                <div className="text-xs text-muted-foreground mt-1 font-mono truncate">
-                                  {formatEventDataPreview(firstEventData)}
-                                </div>
+                    return (
+                      <div
+                        key={`${group.startTime}-${index}`}
+                        className={`cursor-pointer px-4 py-3 transition-colors hover:bg-muted/50 ${
+                          isSelected ? 'bg-muted' : ''
+                        }`}
+                        onClick={() =>
+                          patch({
+                            event: isSelected ? undefined : firstEvent.id,
+                          })
+                        }
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="mt-0.5 w-12 text-xs text-muted-foreground">
+                            {getRelativeTime(group.startTime)}
+                          </div>
+                          <Icon
+                            className={`mt-0.5 h-4 w-4 flex-shrink-0 ${color}`}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium">
+                              {description}
+                              {group.count > 1 && (
+                                <span className="ml-1 font-normal text-muted-foreground">
+                                  (×{group.count})
+                                </span>
                               )}
                             </div>
+                            {firstEventData && (
+                              <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                                {formatEventDataPreview(firstEventData)}
+                              </div>
+                            )}
                           </div>
-
-                          {isSelected && firstEventData && (
-                            <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
-                              <pre className="text-xs overflow-x-auto">
-                                <HighlightedCode
-                                  code={formatEventData(firstEventData)}
-                                  language="json"
-                                />
-                              </pre>
-                            </div>
-                          )}
                         </div>
-                      )
-                    })}
-                  </div>
-                </ScrollArea>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-    </div>
+
+                        {isSelected && firstEventData && (
+                          <div className="ml-[60px] mt-3 rounded-md bg-muted/30 p-2">
+                            <pre className="overflow-x-auto text-xs">
+                              <HighlightedCode
+                                code={formatEventData(firstEventData)}
+                                language="json"
+                              />
+                            </pre>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </ScrollArea>
+            </div>
+          </CardContent>
+        </Card>
+      }
+    />
   )
 }
