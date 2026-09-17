@@ -208,19 +208,34 @@ export const recordEventMetricsMutation = (options?: Partial<Options<RecordEvent
 /**
  * Ingest a browser-tunneled Sentry envelope.
  *
- * No DSN credential — the project/environment/deployment are resolved from
- * the `Host` header via the proxy's route table, the same way
- * `/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via
- * `Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy
- * forwards to the console from any domain a project is deployed on
- * (`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without
- * per-domain DSN configuration.
+ * Two resolution paths, tried in this order:
  *
- * Since there is no credential, an `Origin`/`Referer` check stands in for
- * authentication: the request must claim to come from the same host it
- * resolves to, or it is rejected. This is weaker than a DSN (both are
- * visible to anyone who can read the page), but it closes the trivial case
- * of a script targeting an arbitrary victim domain with no recon at all.
+ * 1. **DSN credential.** An explicit `?sentry_key=` / `X-Sentry-Auth` /
+ * `Authorization: DSN` value, or — failing that — the `dsn` field browser
+ * SDKs embed in the envelope header whenever `Sentry.init({ tunnel })` is
+ * used. The credential alone decides the project; `Host` and `Origin` are
+ * not consulted. This is what makes the endpoint usable from an app Temps
+ * does not deploy, which by definition has no route-table entry at all.
+ * 2. **`Host`.** Unchanged legacy behaviour for same-origin, Temps-deployed
+ * apps: the project/environment/deployment are resolved from the `Host`
+ * header via the proxy's route table, the same way `/api/_temps/event`
+ * (analytics) resolves. The proxy forwards anything under `/api/_temps`
+ * to the console regardless of `Host`
+ * (`temps-proxy::services::ROUTE_PREFIX_TEMPS`), so it works on custom
+ * domains and previews without per-domain DSN configuration.
+ *
+ * On path 2 there is no credential, so an `Origin`/`Referer` check stands in
+ * for authentication: the request must claim to come from the same host it
+ * resolves to, or it is rejected. That check is deliberately **skipped** on
+ * path 1 — a tunneled request from another origin is the entire point there,
+ * and the DSN is a stronger claim than a self-reported `Origin`.
+ *
+ * An *explicit* credential that does not resolve is a `401`, never a silent
+ * fall-through to `Host`: a typo'd key must fail loudly rather than land the
+ * data under whichever project the `Host` happens to match. An *embedded*
+ * envelope DSN that does not resolve falls through to path 2, because that
+ * value was sniffed rather than presented — an app tunneling a third-party
+ * DSN through Temps keeps working exactly as it did before.
  */
 export const ingestTunneledEnvelopeMutation = (options?: Partial<Options<IngestTunneledEnvelopeData>>): UseMutationOptions<IngestTunneledEnvelopeResponse, DefaultError, Options<IngestTunneledEnvelopeData>> => {
     const mutationOptions: UseMutationOptions<IngestTunneledEnvelopeResponse, DefaultError, Options<IngestTunneledEnvelopeData>> = {

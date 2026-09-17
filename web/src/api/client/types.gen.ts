@@ -24753,7 +24753,12 @@ export type IngestTunneledEnvelopeData = {
      */
     body: string;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * DSN public key; resolves the project without consulting Host
+         */
+        sentry_key?: string;
+    };
     url: '/_temps/sentry/envelope';
 };
 
@@ -24763,7 +24768,11 @@ export type IngestTunneledEnvelopeErrors = {
      */
     400: unknown;
     /**
-     * Origin/Referer does not match the resolved host
+     * An explicit DSN key was presented but did not resolve
+     */
+    401: unknown;
+    /**
+     * Origin/Referer does not match the resolved host (Host-resolved requests only)
      */
     403: unknown;
     /**

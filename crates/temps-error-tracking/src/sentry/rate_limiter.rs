@@ -5,9 +5,9 @@
 //!
 //! Cardinality is bounded by the number of projects with error tracking
 //! enabled — not by visitor/IP, which is unbounded — so a plain
-//! `Mutex<HashMap>` is safe to hold here even though ingest is a public,
-//! unauthenticated-by-credential surface (the tunnel route resolves the
-//! project from `Host` with no DSN check). This is not the proxy hot path;
+//! `Mutex<HashMap>` is safe to hold here even though ingest is a public
+//! surface (the tunnel route resolves the project from a DSN when one is
+//! offered, and from `Host` otherwise). This is not the proxy hot path;
 //! it runs at the same order of magnitude as `temps-auth`'s per-IP limiter.
 
 use std::collections::HashMap;

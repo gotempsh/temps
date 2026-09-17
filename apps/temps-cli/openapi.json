@@ -54381,8 +54381,19 @@
     },
     "/_temps/sentry/envelope": {
       "post": {
-        "description": "No DSN credential — the project/environment/deployment are resolved from\nthe `Host` header via the proxy's route table, the same way\n`/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via\n`Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy\nforwards to the console from any domain a project is deployed on\n(`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without\nper-domain DSN configuration.\n\nSince there is no credential, an `Origin`/`Referer` check stands in for\nauthentication: the request must claim to come from the same host it\nresolves to, or it is rejected. This is weaker than a DSN (both are\nvisible to anyone who can read the page), but it closes the trivial case\nof a script targeting an arbitrary victim domain with no recon at all.",
+        "description": "Two resolution paths, tried in this order:\n\n1. **DSN credential.** An explicit `?sentry_key=` / `X-Sentry-Auth` /\n   `Authorization: DSN` value, or — failing that — the `dsn` field browser\n   SDKs embed in the envelope header whenever `Sentry.init({ tunnel })` is\n   used. The credential alone decides the project; `Host` and `Origin` are\n   not consulted. This is what makes the endpoint usable from an app Temps\n   does not deploy, which by definition has no route-table entry at all.\n2. **`Host`.** Unchanged legacy behaviour for same-origin, Temps-deployed\n   apps: the project/environment/deployment are resolved from the `Host`\n   header via the proxy's route table, the same way `/api/_temps/event`\n   (analytics) resolves. The proxy forwards anything under `/api/_temps`\n   to the console regardless of `Host`\n   (`temps-proxy::services::ROUTE_PREFIX_TEMPS`), so it works on custom\n   domains and previews without per-domain DSN configuration.\n\nOn path 2 there is no credential, so an `Origin`/`Referer` check stands in\nfor authentication: the request must claim to come from the same host it\nresolves to, or it is rejected. That check is deliberately **skipped** on\npath 1 — a tunneled request from another origin is the entire point there,\nand the DSN is a stronger claim than a self-reported `Origin`.\n\nAn *explicit* credential that does not resolve is a `401`, never a silent\nfall-through to `Host`: a typo'd key must fail loudly rather than land the\ndata under whichever project the `Host` happens to match. An *embedded*\nenvelope DSN that does not resolve falls through to path 2, because that\nvalue was sniffed rather than presented — an app tunneling a third-party\nDSN through Temps keeps working exactly as it did before.",
         "operationId": "ingest_tunneled_envelope",
+        "parameters": [
+          {
+            "description": "DSN public key; resolves the project without consulting Host",
+            "in": "query",
+            "name": "sentry_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
@@ -54404,8 +54415,11 @@
           "400": {
             "description": "Bad request"
           },
+          "401": {
+            "description": "An explicit DSN key was presented but did not resolve"
+          },
           "403": {
-            "description": "Origin/Referer does not match the resolved host"
+            "description": "Origin/Referer does not match the resolved host (Host-resolved requests only)"
           },
           "404": {
             "description": "Unknown host"

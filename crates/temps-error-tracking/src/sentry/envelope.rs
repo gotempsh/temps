@@ -213,6 +213,51 @@ pub enum EnvelopeItem {
     SessionAggregates(SessionAggregates),
 }
 
+/// Upper bound on the envelope header line inspected by [`peek_envelope_dsn`].
+///
+/// Sentry envelope headers are a few hundred bytes. Refusing to hand anything
+/// larger to `serde_json` keeps the tunnel's credential sniff O(1) on an
+/// ingest path that anyone on the internet can reach.
+const MAX_ENVELOPE_HEADER_PEEK_BYTES: usize = 8 * 1024;
+
+/// Minimal view of an envelope header used to recover the originating DSN.
+///
+/// Deliberately separate from [`EnvelopeHeaders`]: this is parsed *before*
+/// the envelope is authenticated, so it must stay as small and as cheap as
+/// possible, and it must not force the full envelope to be parsed twice.
+#[derive(Deserialize)]
+struct EnvelopeDsnPeek {
+    #[serde(default)]
+    dsn: Option<String>,
+}
+
+/// Read only the `dsn` field of an envelope header, without parsing the rest
+/// of the envelope.
+///
+/// Browser SDKs configured with `Sentry.init({ tunnel })` embed the full DSN
+/// in the envelope header precisely so the tunnel endpoint can tell which
+/// project the payload belongs to. Returns `None` when the header is absent,
+/// oversized, not valid UTF-8, not valid JSON, or carries no `dsn` field --
+/// every one of those is "no credential offered", never an error, because the
+/// caller falls back to `Host` resolution in that case.
+pub fn peek_envelope_dsn(data: &[u8]) -> Option<String> {
+    let header_line = match data.iter().position(|byte| *byte == b'\n') {
+        Some(index) => &data[..index],
+        None => data,
+    };
+
+    if header_line.is_empty() || header_line.len() > MAX_ENVELOPE_HEADER_PEEK_BYTES {
+        return None;
+    }
+
+    let header_line = std::str::from_utf8(header_line).ok()?.trim_end();
+
+    serde_json::from_str::<EnvelopeDsnPeek>(header_line)
+        .ok()?
+        .dsn
+        .filter(|dsn| !dsn.is_empty())
+}
+
 #[derive(Debug)]
 /// A parsed Sentry envelope
 pub struct Envelope {
@@ -380,6 +425,49 @@ fn apply_envelope_event_id(event: &mut Annotated<Event>, event_id: Option<EventI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_reads_dsn_from_envelope_header() {
+        let data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"dsn\":\"https://abc123@temps.example/7\"}\n{\"type\":\"event\"}\n{}\n";
+        assert_eq!(
+            peek_envelope_dsn(data.as_bytes()),
+            Some("https://abc123@temps.example/7".to_string())
+        );
+    }
+
+    #[test]
+    fn peek_returns_none_without_a_dsn_field() {
+        let data =
+            "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{}\n";
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn peek_returns_none_for_junk_input() {
+        assert_eq!(peek_envelope_dsn(b""), None);
+        assert_eq!(peek_envelope_dsn(b"not json\n{}\n"), None);
+        assert_eq!(peek_envelope_dsn(&[0xff, 0xfe, b'\n']), None);
+        // An empty `dsn` is "no credential offered", not an empty credential.
+        assert_eq!(peek_envelope_dsn(b"{\"dsn\":\"\"}\n"), None);
+    }
+
+    #[test]
+    fn peek_ignores_an_oversized_header_line() {
+        let mut data = format!(
+            "{{\"dsn\":\"https://abc123@temps.example/7\",\"pad\":\"{}\"}}",
+            "x".repeat(9000)
+        );
+        data.push('\n');
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn peek_does_not_read_past_the_header_line() {
+        // A `dsn` appearing in an item payload must never be mistaken for the
+        // envelope's own credential.
+        let data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{\"dsn\":\"https://forged@temps.example/1\"}\n";
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
 
     #[test]
     fn test_parse_simple_envelope() {
