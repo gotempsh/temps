@@ -98,8 +98,7 @@ export function EditBackupSchedule() {
   })
 
   // Seed form state from the loaded schedule (once).
-  useEffect(() => {
-    if (!schedule || seeded) return
+  if (schedule && !seeded) {
     setName(schedule.name)
     setDescription(schedule.description ?? '')
     setRetentionPeriod(schedule.retention_period)
@@ -117,16 +116,15 @@ export function EditBackupSchedule() {
     setSelectedPreset(preset ? preset.value : 'custom')
     setCustomCron(preset ? '' : schedule.schedule_expression)
     setSeeded(true)
-  }, [schedule, seeded])
+  }
 
   // Once we know the current explicit list, seed the picker with it. We
   // only do this the first time the list arrives so user edits stick.
   const [seededServices, setSeededServices] = useState(false)
-  useEffect(() => {
-    if (seededServices || !attachedServices) return
+  if (!seededServices && attachedServices) {
     setSelectedServiceIds(attachedServices.map((s) => s.id))
     setSeededServices(true)
-  }, [attachedServices, seededServices])
+  }
 
   useEffect(() => {
     setBreadcrumbs([
@@ -265,7 +263,7 @@ export function EditBackupSchedule() {
         <CardHeader>
           <CardTitle>Edit backup schedule</CardTitle>
           <CardDescription>
-            Update this schedule's name, cadence, or retention settings.
+            Update this schedule&apos;s name, cadence, or retention settings.
           </CardDescription>
         </CardHeader>
 
@@ -432,10 +430,10 @@ export function EditBackupSchedule() {
                       Also back up the Temps control plane
                     </Label>
                     <p className="text-xs text-muted-foreground">
-                      Includes Temps's own database (users, projects, service
-                      configs, audit logs, error groups). Recommended unless you
-                      use Temps purely as a backup orchestrator for external
-                      databases.
+                      Includes Temps&apos;s own database (users, projects,
+                      service configs, audit logs, error groups). Recommended
+                      unless you use Temps purely as a backup orchestrator for
+                      external databases.
                     </p>
                   </div>
                   <Switch

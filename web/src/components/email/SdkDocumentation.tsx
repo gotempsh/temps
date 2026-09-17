@@ -631,7 +631,7 @@ export function SdkDocumentation() {
             <p className="text-sm text-muted-foreground">
               Send an email. The domain is automatically extracted from the
               sender address. If the domain is verified, the email is sent;
-              otherwise, it's captured for viewing.
+              otherwise, it&apos;s captured for viewing.
             </p>
 
             <div className="space-y-2">

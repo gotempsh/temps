@@ -122,7 +122,7 @@ export function Revenue() {
     return opts
   }, [])
 
-  const events = eventsQuery.data ?? []
+  const events = useMemo(() => eventsQuery.data ?? [], [eventsQuery.data])
   const hasFilters =
     !!dateRange || projectFilter !== ALL_PROJECTS || typeFilter !== ALL_TYPES
 

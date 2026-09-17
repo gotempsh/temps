@@ -25,14 +25,13 @@ export function JsonEditor({
   const [localValue, setLocalValue] = React.useState(
     value || DEFAULT_JSON_VALUE
   )
-  const editorRef = React.useRef<any>(null)
-
-  React.useEffect(() => {
-    // Only update local value if it's different and not empty
-    if (value && value !== localValue) {
-      setLocalValue(value)
-    }
-  }, [value, localValue])
+  const [previousValue, setPreviousValue] = React.useState(value)
+  // Reconcile external replacements before rendering the editor, without an
+  // effect that can overwrite an edit while its parent update is pending.
+  if (previousValue !== value) {
+    setPreviousValue(value)
+    if (value) setLocalValue(value)
+  }
 
   const handleEditorChange = (newValue: string | undefined) => {
     const valueToUse = newValue || DEFAULT_JSON_VALUE
@@ -69,9 +68,7 @@ export function JsonEditor({
     }
   }
 
-  const handleEditorDidMount = (editor: any) => {
-    editorRef.current = editor
-
+  const handleEditorDidMount = () => {
     // Set initial validation
     if (onValidationChange) {
       handleEditorChange(localValue)

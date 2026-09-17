@@ -614,19 +614,16 @@ export function JsonSchemaForm({
   }
 
   // Partition fields into groups (only active when serviceType is provided).
-  const grouped = useMemo(() => {
-    const buckets: Record<FieldGroup, string[]> = {
-      basic: [],
-      connection: [],
-      credentials: [],
-      advanced: [],
-    }
-    propertyNames.forEach((name) => {
-      const group = resolveGroup(name, serviceType, managedByTemps)
-      buckets[group].push(name)
-    })
-    return buckets
-  }, [propertyNames, serviceType, managedByTemps])
+  const grouped: Record<FieldGroup, string[]> = {
+    basic: [],
+    connection: [],
+    credentials: [],
+    advanced: [],
+  }
+  propertyNames.forEach((name) => {
+    const group = resolveGroup(name, serviceType, managedByTemps)
+    grouped[group].push(name)
+  })
 
   const useGrouping = !!serviceType
   const hasAdvanced = grouped.advanced.length > 0

@@ -36,7 +36,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { EllipsisVertical, FileCode, Loader2, Plus, Wand2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   deleteSkillMutation,
@@ -274,9 +274,12 @@ function SkillDialog({
   const [description, setDescription] = useState('')
   const [content, setContent] = useState('')
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (skill?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (skill) {
         setSlug(skill.slug)
         setName(skill.name)
@@ -289,7 +292,7 @@ function SkillDialog({
         setContent('')
       }
     }
-  }, [open, skill])
+  }
 
   // Auto-generate slug from name
   const handleNameChange = (value: string) => {
@@ -335,7 +338,7 @@ function SkillDialog({
         toast.success('Skill created')
       }
       onSuccess()
-    } catch (err) {
+    } catch {
       toast.error(isEdit ? 'Failed to update skill' : 'Failed to create skill')
     } finally {
       setIsPending(false)

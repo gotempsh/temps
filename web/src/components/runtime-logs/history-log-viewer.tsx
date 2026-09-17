@@ -417,6 +417,7 @@ export default function HistoryLogViewer({
 }: {
   project: ProjectResponse
 }) {
+  'use no memo'
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedEnv, setSelectedEnv] = useState<string | undefined>()
   const [selectedService, setSelectedService] = useState<string | undefined>()
@@ -697,7 +698,10 @@ export default function HistoryLogViewer({
   // computed server-side independently of the active container/node/service
   // filter. Deriving from the (already-filtered) result lines would collapse the
   // list to the current selection, making it impossible to switch.
-  const sources = data?.available_sources ?? []
+  const sources = useMemo(
+    () => data?.available_sources ?? [],
+    [data?.available_sources]
+  )
 
   // Service options (all services in scope) — switching service no longer hides
   // the others.
@@ -777,6 +781,9 @@ export default function HistoryLogViewer({
     return lines.some((l) => dayKey(l.timestamp) !== first)
   }, [lines])
 
+  // TanStack Virtual deliberately returns mutable measurement functions; the
+  // React Compiler correctly leaves this component un-memoized.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: renderRows.length,
     getScrollElement: () => parentRef.current,

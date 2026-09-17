@@ -44,7 +44,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { EllipsisVertical, Loader2, Plus, Server } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   deleteMcpMutation,
@@ -305,9 +305,12 @@ function McpDialog({
   const [configText, setConfigText] = useState('')
   const [configError, setConfigError] = useState<string | null>(null)
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (mcp?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (mcp) {
         setSlug(mcp.slug)
         setName(mcp.name)
@@ -321,7 +324,7 @@ function McpDialog({
       }
       setConfigError(null)
     }
-  }, [open, mcp])
+  }
 
   const handleNameChange = (value: string) => {
     setName(value)
@@ -393,7 +396,7 @@ function McpDialog({
       }
       setConfigText('')
       onSuccess()
-    } catch (err) {
+    } catch {
       toast.error(
         isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
       )

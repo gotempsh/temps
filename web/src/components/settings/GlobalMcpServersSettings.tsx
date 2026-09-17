@@ -43,7 +43,7 @@ import {
   Plus,
   Server,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -345,9 +345,12 @@ function GlobalMcpDialog({
   const [configText, setConfigText] = useState('')
   const [configError, setConfigError] = useState<string | null>(null)
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (mcp?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (mcp) {
         setSlug(mcp.slug)
         setName(mcp.name)
@@ -361,7 +364,7 @@ function GlobalMcpDialog({
       }
       setConfigError(null)
     }
-  }, [open, mcp])
+  }
 
   const handleNameChange = (value: string) => {
     setName(value)

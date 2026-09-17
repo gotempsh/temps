@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useMemo, useState, useCallback, useRef, useEffect } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getLiveVisitorsListOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -37,6 +37,10 @@ import {
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { EarthGlobe, type ProjectedMarker } from './EarthGlobe'
+import {
+  activityFeedReducer,
+  initialActivityFeedState,
+} from './live-globe-activity'
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -163,6 +167,8 @@ function ActivityFeedItem({
     >
       {/* Event type icon */}
       <div className={`mt-0.5 flex-shrink-0 ${visitorColor}`}>
+        {/* The selector only returns module-level Lucide components. */}
+        {/* eslint-disable-next-line react-hooks/static-components */}
         <EventIcon className="h-4 w-4" />
       </div>
 
@@ -190,6 +196,8 @@ function ActivityFeedItem({
           {/* Device / browser */}
           {(event.browser || event.device_type) && (
             <span className="flex items-center gap-1">
+              {/* The selector only returns module-level Lucide components. */}
+              {/* eslint-disable-next-line react-hooks/static-components */}
               <DeviceIcon className="h-3 w-3" />
               {event.browser || event.device_type}
             </span>
@@ -235,12 +243,18 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
   const [selectedEnvironment, setSelectedEnvironment] = useState<
     number | undefined
   >(undefined)
-
-  // Cursor-based polling state for activity feed
-  const sinceIdRef = useRef<number | null>(null)
-  const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([])
-  const [newEventIds, setNewEventIds] = useState<Set<number>>(new Set())
-  const maxEvents = 100
+  const [activityFeed, dispatchActivityFeed] = useReducer(
+    activityFeedReducer,
+    initialActivityFeedState
+  )
+  const activityScope = `${project.id}:${selectedEnvironment ?? 'all'}`
+  if (activityFeed.scope !== activityScope) {
+    dispatchActivityFeed({ type: 'activate', scope: activityScope })
+  }
+  const scopedActivityFeed =
+    activityFeed.scope === activityScope
+      ? activityFeed
+      : { ...initialActivityFeedState, scope: activityScope }
 
   // Fetch live visitors for globe markers
   const { data: liveData } = useQuery({
@@ -261,7 +275,6 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
       {
         project_id: project.id,
         environment_id: selectedEnvironment,
-        since_id: sinceIdRef.current,
       },
     ],
     queryFn: async ({ signal }) => {
@@ -272,8 +285,8 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
           ...(selectedEnvironment != null
             ? { environment_id: selectedEnvironment }
             : {}),
-          ...(sinceIdRef.current != null
-            ? { since_id: sinceIdRef.current }
+          ...(scopedActivityFeed.sinceId != null
+            ? { since_id: scopedActivityFeed.sinceId }
             : {}),
         },
         signal,
@@ -284,42 +297,21 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
     refetchInterval: isPaused ? false : 3000,
   })
 
-  // Merge new activity events into the feed
   useEffect(() => {
     if (!activityData?.events?.length) return
-
-    setActivityEvents((prev) => {
-      const existingIds = new Set(prev.map((e) => e.id))
-      const newEvents = activityData.events.filter(
-        (e) => !existingIds.has(e.id)
-      )
-
-      if (newEvents.length === 0) return prev
-
-      // Track new event IDs for highlight animation
-      setNewEventIds(new Set(newEvents.map((e) => e.id)))
-
-      // Update cursor to highest ID
-      const maxId = Math.max(...activityData.events.map((e) => e.id))
-      if (sinceIdRef.current === null || maxId > sinceIdRef.current) {
-        sinceIdRef.current = maxId
-      }
-
-      // Merge and sort descending, cap at maxEvents
-      const merged = [...newEvents, ...prev]
-        .sort((a, b) => b.id - a.id)
-        .slice(0, maxEvents)
-
-      return merged
+    dispatchActivityFeed({
+      type: 'merge',
+      scope: activityScope,
+      events: activityData.events,
     })
 
-    // Clear highlight after animation
-    const timer = setTimeout(() => {
-      setNewEventIds(new Set())
+    const timer = window.setTimeout(() => {
+      dispatchActivityFeed({ type: 'clear-highlights', scope: activityScope })
     }, 2000)
+    return () => window.clearTimeout(timer)
+  }, [activityData, activityScope])
 
-    return () => clearTimeout(timer)
-  }, [activityData])
+  const activityEvents = scopedActivityFeed.events
 
   // Build visitor list for globe from live data
   const allVisitors = useMemo(() => {
@@ -505,7 +497,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
                 <ActivityFeedItem
                   key={event.id}
                   event={event}
-                  isNew={newEventIds.has(event.id)}
+                  isNew={scopedActivityFeed.newEventIds.has(event.id)}
                   projectSlug={project.slug}
                 />
               ))

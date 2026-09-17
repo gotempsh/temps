@@ -141,6 +141,8 @@ export function AddRoute() {
     name: 'domainInputType',
   })
   const watchedDomain = useWatch({ control: form.control, name: 'domain' })
+  const watchedHost = useWatch({ control: form.control, name: 'host' })
+  const watchedPort = useWatch({ control: form.control, name: 'port' })
 
   // Only show subdomain field when selecting a wildcard domain from the dropdown
   // When manually entering, users can type the full domain including wildcards
@@ -546,8 +548,7 @@ export function AddRoute() {
                         <strong>{watchedDomain || 'your domain'}</strong> will
                         be forwarded to{' '}
                         <strong>
-                          {form.watch('host') || 'host'}:
-                          {form.watch('port') || 'port'}
+                          {watchedHost || 'host'}:{watchedPort || 'port'}
                         </strong>
                       </p>
                       {watchedRouteType === 'http' && (

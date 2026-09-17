@@ -43,7 +43,7 @@ import {
   Plus,
   Wand2,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { createGlobalSkill, updateGlobalSkill } from '@/api/client/sdk.gen'
@@ -333,9 +333,12 @@ function GlobalSkillDialog({
   const [description, setDescription] = useState('')
   const [content, setContent] = useState('')
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (skill?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (skill) {
         setSlug(skill.slug)
         setName(skill.name)
@@ -348,7 +351,7 @@ function GlobalSkillDialog({
         setContent('')
       }
     }
-  }, [open, skill])
+  }
 
   const handleNameChange = (value: string) => {
     setName(value)

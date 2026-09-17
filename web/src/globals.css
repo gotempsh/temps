@@ -1,14 +1,14 @@
 /* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
 /* SPDX-License-Identifier: MIT OR Apache-2.0 */
 
+/* Import Google Fonts - Geist (Vercel's font family) */
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
+
 @import 'tailwindcss';
 @plugin '@tailwindcss/typography';
 
 @source '.';
-
-/* Import Google Fonts - Geist (Vercel's font family) */
-@import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
 
 @custom-variant dark (&:is(.dark *));
 

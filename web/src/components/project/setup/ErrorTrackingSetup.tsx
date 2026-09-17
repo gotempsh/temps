@@ -545,7 +545,6 @@ export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
   )
   const [selectedPlatform, setSelectedPlatform] =
     useState<PlatformId>(recommendedPlatform)
-  const [celebrate, setCelebrate] = useState(false)
 
   const { data: existingDsns, refetch: refetchDsns } = useQuery({
     ...listDsnsOptions({ path: { project_id: project.id } }),
@@ -592,25 +591,17 @@ export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
     refetchOnWindowFocus: false,
   })
 
+  const celebrate =
+    wizardStep === 'waiting' && hasErrorsData?.has_error_groups === true
+
   useEffect(() => {
-    if (
-      wizardStep === 'waiting' &&
-      hasErrorsData?.has_error_groups &&
-      !celebrate
-    ) {
-      setCelebrate(true)
+    if (celebrate) {
       const timer = setTimeout(() => {
         navigate(`/projects/${project.slug}/errors`)
       }, 1600)
       return () => clearTimeout(timer)
     }
-  }, [
-    wizardStep,
-    hasErrorsData?.has_error_groups,
-    celebrate,
-    navigate,
-    project.slug,
-  ])
+  }, [celebrate, navigate, project.slug])
 
   const platform = PLATFORMS.find((p) => p.id === selectedPlatform)!
 
@@ -925,7 +916,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
               onClick={() => setWizardStep('waiting')}
               disabled={!hasDsn && createDsn.isPending}
             >
-              I've installed it — start listening
+              I&apos;ve installed it — start listening
               <ArrowRight className="ml-2 size-4" />
             </Button>
           </div>
@@ -961,7 +952,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                     Waiting for your first exception…
                   </h3>
                   <p className="text-sm text-muted-foreground">
-                    Deploy or run your app, then throw a test error. We'll
+                    Deploy or run your app, then throw a test error. We&apos;ll
                     auto-redirect as soon as one arrives.
                   </p>
                 </div>

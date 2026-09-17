@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useMemo, useSyncExternalStore } from 'react'
 import {
   deleteView,
   listViews,
@@ -19,28 +19,36 @@ function emitChange(serviceId: string) {
 }
 
 export function useSavedViews(serviceId: string) {
-  const [views, setViews] = useState<SavedView[]>(() => listViews(serviceId))
-
-  useEffect(() => {
-    setViews(listViews(serviceId))
-    const onChange = (e: Event) => {
-      const detail = (e as CustomEvent<{ serviceId: string }>).detail
-      if (detail?.serviceId === serviceId) {
-        setViews(listViews(serviceId))
+  const subscribe = useCallback(
+    (notify: () => void) => {
+      const onChange = (e: Event) => {
+        const detail = (e as CustomEvent<{ serviceId: string }>).detail
+        if (detail?.serviceId === serviceId) {
+          notify()
+        }
       }
-    }
-    const onStorage = (e: StorageEvent) => {
-      if (e.key && e.key.startsWith('temps:data-browser:views')) {
-        setViews(listViews(serviceId))
+      const onStorage = (e: StorageEvent) => {
+        if (e.key === null || e.key.startsWith('temps:data-browser:views')) {
+          notify()
+        }
       }
-    }
-    window.addEventListener(CHANGE_EVENT, onChange)
-    window.addEventListener('storage', onStorage)
-    return () => {
-      window.removeEventListener(CHANGE_EVENT, onChange)
-      window.removeEventListener('storage', onStorage)
-    }
-  }, [serviceId])
+      window.addEventListener(CHANGE_EVENT, onChange)
+      window.addEventListener('storage', onStorage)
+      return () => {
+        window.removeEventListener(CHANGE_EVENT, onChange)
+        window.removeEventListener('storage', onStorage)
+      }
+    },
+    [serviceId]
+  )
+  // A primitive snapshot stays stable when listViews returns a new array with
+  // unchanged content. The store is bounded to 50 views per service.
+  const getSnapshot = useCallback(
+    () => JSON.stringify(listViews(serviceId)),
+    [serviceId]
+  )
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, () => '[]')
+  const views = useMemo<SavedView[]>(() => JSON.parse(snapshot), [snapshot])
 
   const save = useCallback(
     (view: Omit<SavedView, 'id' | 'createdAtMs' | 'lastUsedMs'>) => {

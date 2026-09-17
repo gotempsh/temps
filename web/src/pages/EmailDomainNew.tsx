@@ -486,7 +486,7 @@ function ConfigureStep({
               ) : mode === 'import' && discoverableDomains?.error ? (
                 <p className="flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-500">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                  Couldn't list domains from your provider (
+                  Couldn&apos;t list domains from your provider (
                   {discoverableDomains.error}). Enter the domain name manually
                   below.
                 </p>
@@ -498,7 +498,7 @@ function ConfigureStep({
                     className="underline underline-offset-2 hover:text-foreground"
                     onClick={() => setManualEntry(false)}
                   >
-                    Pick from your provider's domains instead
+                    Pick from your provider&apos;s domains instead
                   </button>
                 </p>
               ) : (

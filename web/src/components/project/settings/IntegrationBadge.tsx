@@ -47,6 +47,8 @@ export function IntegrationBadge({
               className
             )}
           >
+            {/* iconForServiceType only returns module-level icon components. */}
+            {/* eslint-disable-next-line react-hooks/static-components */}
             <Icon className="h-3 w-3" strokeWidth={2.25} />
           </span>
         </TooltipTrigger>

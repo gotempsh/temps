@@ -151,7 +151,6 @@ export async function rollbackPgUpgrade(
     } catch {
       problem['detail'] = response.statusText
     }
-    // eslint-disable-next-line @typescript-eslint/no-throw-literal
     throw problem
   }
   return (await response.json()) as PgUpgrade

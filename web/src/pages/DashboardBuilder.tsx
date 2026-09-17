@@ -36,9 +36,11 @@ import { AGGREGATIONS } from '@/components/metrics/metric-format'
 import {
   GroupByBuilder,
   LabelFilterBuilder,
+} from '@/components/metrics/LabelFilterBuilder'
+import {
   labelFiltersToTuples,
   tuplesToLabelFilters,
-} from '@/components/metrics/LabelFilterBuilder'
+} from '@/components/metrics/label-filters'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, GripVertical, Plus, Trash2 } from 'lucide-react'

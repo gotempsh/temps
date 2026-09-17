@@ -122,6 +122,7 @@ export function useLogStream({
   onError,
   maxLogs = DEFAULT_MAX_LOGS,
 }: UseLogStreamOptions): UseLogStreamReturn {
+  'use no memo'
   const [logs, setLogs] = useState<LiveLogLine[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
     'connecting' | 'connected' | 'complete' | 'error'
@@ -162,6 +163,9 @@ export function useLogStream({
     })
   }, [logs, searchTerm, selectedLevels])
 
+  // TanStack Virtual deliberately returns mutable measurement functions; the
+  // React Compiler correctly leaves this hook un-memoized.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,

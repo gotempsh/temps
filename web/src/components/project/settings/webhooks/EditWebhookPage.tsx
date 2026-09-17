@@ -101,7 +101,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
         enabled: webhook.enabled,
       })
     }
-  }, [webhook])
+  }, [form, webhook])
 
   const updateWebhook = useMutation({
     ...updateWebhookMutation(),

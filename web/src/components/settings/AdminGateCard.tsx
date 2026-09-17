@@ -20,7 +20,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2, Lock, Save, Shield } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 
 /**
@@ -41,14 +41,15 @@ export function AdminGateCard() {
   const [allowedHostsText, setAllowedHostsText] = useState('')
   const [trustForwardedFor, setTrustForwardedFor] = useState(false)
   const [dirty, setDirty] = useState(false)
+  const [loadedData, setLoadedData] = useState(data)
 
-  useEffect(() => {
-    if (!data) return
-    setAllowedIpsText((data.allowed_ips ?? []).join('\n'))
-    setAllowedHostsText((data.allowed_hosts ?? []).join('\n'))
-    setTrustForwardedFor(Boolean(data.trust_forwarded_for))
+  if (data !== loadedData) {
+    setLoadedData(data)
+    setAllowedIpsText((data?.allowed_ips ?? []).join('\n'))
+    setAllowedHostsText((data?.allowed_hosts ?? []).join('\n'))
+    setTrustForwardedFor(Boolean(data?.trust_forwarded_for))
     setDirty(false)
-  }, [data])
+  }
 
   const updateMutation = useMutation({
     ...patchAdminGateMutation(),
@@ -145,11 +146,11 @@ export function AdminGateCard() {
         <CardDescription>
           Restrict which hostnames and source IPs can reach the management
           surface (dashboard, <code>/api/projects</code>, etc.) through the
-          public load balancer. Hosts that don't match are served as normal LB
-          traffic — if they resolve to a deployed app it serves; otherwise they
-          404. Public ingest (<code>/api/_temps/*</code>) is always reachable
-          from any host. Empty lists = no restriction. Bare IPs are accepted as
-          /32 (or /128 for IPv6). CIDR allowed for ranges.
+          public load balancer. Hosts that don&apos;t match are served as normal
+          LB traffic — if they resolve to a deployed app it serves; otherwise
+          they 404. Public ingest (<code>/api/_temps/*</code>) is always
+          reachable from any host. Empty lists = no restriction. Bare IPs are
+          accepted as /32 (or /128 for IPv6). CIDR allowed for ranges.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

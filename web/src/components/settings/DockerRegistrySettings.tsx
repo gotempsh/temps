@@ -142,7 +142,7 @@ export function DockerRegistrySettings({
                 />
                 <p className="text-sm text-muted-foreground">
                   Registry password or API token. If masked (shown as ••••••••),
-                  it's already saved.
+                  it&apos;s already saved.
                 </p>
               </div>
             </div>

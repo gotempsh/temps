@@ -81,6 +81,8 @@ function ConnectionCard({
                 isSelected ? 'bg-primary/10' : 'bg-muted'
               )}
             >
+              {/* The selector only returns module-level provider icons. */}
+              {/* eslint-disable-next-line react-hooks/static-components */}
               <Icon className="h-5 w-5" />
             </div>
             <div>

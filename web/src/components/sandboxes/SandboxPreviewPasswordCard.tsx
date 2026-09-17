@@ -247,7 +247,7 @@ export function SandboxPreviewPasswordCard({
           )}
           {value.length > 0 && confirm.length > 0 && !confirmMatches && (
             <p className="text-[11px] text-destructive">
-              Passwords don't match.
+              Passwords don&apos;t match.
             </p>
           )}
           <div className="flex justify-end">

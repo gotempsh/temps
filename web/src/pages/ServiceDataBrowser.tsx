@@ -119,7 +119,14 @@ import {
   Type,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useDefaultLayout } from 'react-resizable-panels'
 import { useIsMobile } from '@/components/hooks/use-mobile'
 import {
@@ -160,6 +167,9 @@ export function ServiceDataBrowser() {
 
   // Tree state
   const [treeNodes, setTreeNodes] = useState<TreeNode[]>([])
+  const [treeSeedServiceId, setTreeSeedServiceId] = useState<string | null>(
+    null
+  )
   const [treeError, setTreeError] = useState<string | null>(null)
 
   // Sync state with URL params (for component logic that expects state)
@@ -189,7 +199,7 @@ export function ServiceDataBrowser() {
   )
 
   // Pagination state
-  const [page, setPage] = useState(1)
+  const [page, setPageState] = useState(1)
   /**
    * Row offset of the current page.
    *
@@ -203,6 +213,10 @@ export function ServiceDataBrowser() {
    * click rather than losing data.
    */
   const [dataOffset, setDataOffset] = useState(0)
+  const setPage = (nextPage: number) => {
+    setPageState(nextPage)
+    if (nextPage === 1) setDataOffset(0)
+  }
   const pageSize = 20
 
   // Data table filter and sort state
@@ -395,16 +409,6 @@ export function ServiceDataBrowser() {
       </ResizablePanelGroup>
     )
   }
-
-  // Apply filter handler
-  // Page 1 is always offset 0. Every other reset path in this file already
-  // calls `setPage(1)` (filter change, entity change, sort change, tab
-  // restore), so anchoring the offset to that here keeps the two in step
-  // without threading a second setter through nine call sites — and makes it
-  // impossible for a future reset to remember to reset one but not the other.
-  useEffect(() => {
-    if (page === 1) setDataOffset(0)
-  }, [page])
 
   const handleApplyFilter = () => {
     // If we have filter_schema, send the form data as JSON object
@@ -629,37 +633,43 @@ export function ServiceDataBrowser() {
   )
 
   // Helper function to get hierarchy capabilities for a given level
-  const getHierarchyCapabilities = (level: number) => {
-    if (!explorerSupport?.hierarchy || explorerSupport.hierarchy.length === 0) {
-      // Fallback: if no hierarchy, assume containers can contain both
-      return {
-        can_list_containers: true,
-        can_list_entities: true,
-        container_type: 'folder',
+  const getHierarchyCapabilities = useCallback(
+    (level: number) => {
+      if (
+        !explorerSupport?.hierarchy ||
+        explorerSupport.hierarchy.length === 0
+      ) {
+        // Fallback: if no hierarchy, assume containers can contain both
+        return {
+          can_list_containers: true,
+          can_list_entities: true,
+          container_type: 'folder',
+        }
       }
-    }
 
-    // Find the hierarchy level configuration
-    const hierarchyLevel = explorerSupport.hierarchy.find(
-      (h) => h.level === level
-    )
-    if (!hierarchyLevel) {
-      // If level not found, use the last level configuration
-      const lastLevel =
-        explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
-      return {
-        can_list_containers: lastLevel.can_list_containers,
-        can_list_entities: lastLevel.can_list_entities,
-        container_type: lastLevel.container_type,
+      // Find the hierarchy level configuration
+      const hierarchyLevel = explorerSupport.hierarchy.find(
+        (h) => h.level === level
+      )
+      if (!hierarchyLevel) {
+        // If level not found, use the last level configuration
+        const lastLevel =
+          explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
+        return {
+          can_list_containers: lastLevel.can_list_containers,
+          can_list_entities: lastLevel.can_list_entities,
+          container_type: lastLevel.container_type,
+        }
       }
-    }
 
-    return {
-      can_list_containers: hierarchyLevel.can_list_containers,
-      can_list_entities: hierarchyLevel.can_list_entities,
-      container_type: hierarchyLevel.container_type,
-    }
-  }
+      return {
+        can_list_containers: hierarchyLevel.can_list_containers,
+        can_list_entities: hierarchyLevel.can_list_entities,
+        container_type: hierarchyLevel.container_type,
+      }
+    },
+    [explorerSupport]
+  )
 
   // Helper function to get appropriate icon for container
   const getContainerIcon = (
@@ -754,15 +764,16 @@ export function ServiceDataBrowser() {
     enabled: !!id,
   })
 
-  // Initialize tree with root containers
-  useEffect(() => {
-    if (rootContainers && treeNodes.length === 0) {
-      // Root containers exist at depth 1 (e.g., databases in PostgreSQL)
-      // They should get the capabilities from hierarchy level 1 (what databases can do)
-      const containerDepth = 1
-      const hierarchyInfo = getHierarchyCapabilities(containerDepth)
-
-      const nodes: TreeNode[] = rootContainers.map((container) => ({
+  // Query data seeds the mutable expansion tree once per service. Guarding on
+  // the service key preserves user expansion across background query refetches
+  // while resetting synchronously if this component is reused for another
+  // service.
+  if (rootContainers && treeSeedServiceId !== id) {
+    const containerDepth = 1
+    const hierarchyInfo = getHierarchyCapabilities(containerDepth)
+    setTreeSeedServiceId(id ?? null)
+    setTreeNodes(
+      rootContainers.map((container) => ({
         name: container.name,
         path: container.name,
         type: 'container' as const,
@@ -780,9 +791,8 @@ export function ServiceDataBrowser() {
         metadata: (container.metadata ?? undefined) as
           Record<string, unknown> | undefined,
       }))
-      setTreeNodes(nodes)
-    }
-  }, [rootContainers, treeNodes.length, explorerSupport])
+    )
+  }
 
   // Warm the tree once so the command palette (⌘.) can fuzzy-find every
   // table without requiring the user to manually expand each schema. We
@@ -810,12 +820,7 @@ export function ServiceDataBrowser() {
       // Level 2 (e.g. schemas inside a database) — load children of any
       // container that itself can contain entities, so tables become
       // visible to the palette.
-      // Read the latest treeNodes via a setter trick.
-      let snapshot: TreeNode[] = []
-      setTreeNodes((prev) => {
-        snapshot = prev
-        return prev
-      })
+      const snapshot = treeNodesRef.current
       const queue: TreeNode[] = []
       const collect = (nodes: TreeNode[]) => {
         for (const n of nodes) {
@@ -973,17 +978,23 @@ export function ServiceDataBrowser() {
     entityFieldNames.size === 0 ||
     entityFieldNames.has(dataSortField)
   const effectiveSortField = sortFieldIsValid ? dataSortField : ''
+  const sortValidationKey = `${selectedPath}\0${selectedEntity}\0${[
+    ...entityFieldNames,
+  ].join('\0')}\0${dataSortField}`
+  const [validatedSortKey, setValidatedSortKey] = useState<string | null>(null)
 
   // Drop the stale field from state too, so the column header doesn't show a
-  // sort indicator for a column this table doesn't have.
-  useEffect(() => {
+  // sort indicator for a column this table doesn't have. This guarded render
+  // adjustment also normalizes the active tab before any query can use the
+  // invalid URL-backed field.
+  if (validatedSortKey !== sortValidationKey) {
+    setValidatedSortKey(sortValidationKey)
     if (dataSortField && !sortFieldIsValid) {
       setDataSortField('')
       setDataSortOrder('asc')
       commitActiveTab({ sortField: undefined, sortOrder: undefined })
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataSortField, sortFieldIsValid])
+  }
 
   // Load entity data when entity is selected or page changes
   // Skip for S3 objects as they should be downloaded, not queried
@@ -1119,7 +1130,7 @@ export function ServiceDataBrowser() {
   }
 
   // Load children for a node
-  const loadNodeChildren = async (nodePath: string) => {
+  async function loadNodeChildren(nodePath: string) {
     try {
       setTreeError(null) // Clear any previous errors
       let containersData: ContainerResponse[] = []
@@ -3590,35 +3601,43 @@ function EntityDataView({
   // Column visibility. Wide tables (30+ columns) forced horizontal scrolling
   // to read anything, so the operator picks what matters. Keyed by field name
   // and reset when the entity changes, since column names don't carry over.
-  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
-  useEffect(() => {
-    setHiddenColumns(new Set())
-  }, [entityInfo?.entity])
+  const [columnState, setColumnState] = useState(() => ({
+    entity: entityInfo?.entity,
+    hidden: new Set<string>(),
+  }))
+  if (columnState.entity !== entityInfo?.entity) {
+    setColumnState({ entity: entityInfo?.entity, hidden: new Set() })
+  }
+  const hiddenColumns = columnState.hidden
 
   const allFields: FieldResponse[] = queryResult?.fields ?? []
   const visibleFields = allFields.filter((f) => !hiddenColumns.has(f.name))
 
   const toggleColumn = (name: string) => {
-    setHiddenColumns((prev) => {
-      const next = new Set(prev)
+    setColumnState((previous) => {
+      const next = new Set(previous.hidden)
       if (next.has(name)) {
         next.delete(name)
       } else {
         // Never hide the last column — an empty table is a dead end with no
         // affordance to recover from.
-        if (allFields.length - next.size <= 1) return prev
+        if (allFields.length - next.size <= 1) return previous
         next.add(name)
       }
-      return next
+      return { ...previous, hidden: next }
     })
   }
 
   // Row detail. The index is into the current page's rows; cleared whenever a
   // new result set arrives so a stale index can't point at a different row.
-  const [detailRowIndex, setDetailRowIndex] = useState<number | null>(null)
-  useEffect(() => {
-    setDetailRowIndex(null)
-  }, [queryResult])
+  const [detailState, setDetailState] = useState(() => ({
+    result: queryResult,
+    index: null as number | null,
+  }))
+  if (detailState.result !== queryResult) {
+    setDetailState({ result: queryResult, index: null })
+  }
+  const detailRowIndex = detailState.index
   const detailRow =
     detailRowIndex !== null
       ? ((queryResult?.rows?.[detailRowIndex] as
@@ -4047,7 +4066,12 @@ function EntityDataView({
                         <>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
-                            onSelect={() => setHiddenColumns(new Set())}
+                            onSelect={() =>
+                              setColumnState((previous) => ({
+                                ...previous,
+                                hidden: new Set(),
+                              }))
+                            }
                           >
                             Show all
                           </DropdownMenuItem>
@@ -4191,7 +4215,12 @@ function EntityDataView({
                                 // Expanding a JSON cell used to open a panel
                                 // containing only that value, so you lost which
                                 // row it came from. Now it opens the whole row.
-                                onExpand={() => setDetailRowIndex(rowIndex)}
+                                onExpand={() =>
+                                  setDetailState((previous) => ({
+                                    ...previous,
+                                    index: rowIndex,
+                                  }))
+                                }
                               />
                             </td>
                           ))}
@@ -4208,7 +4237,12 @@ function EntityDataView({
                 <Sheet
                   open={detailRow !== null}
                   onOpenChange={(open) => {
-                    if (!open) setDetailRowIndex(null)
+                    if (!open) {
+                      setDetailState((previous) => ({
+                        ...previous,
+                        index: null,
+                      }))
+                    }
                   }}
                 >
                   <SheetContent className="w-full overflow-y-auto sm:max-w-xl">

@@ -105,7 +105,7 @@ export function DomainForm({
     useMemo(() => {
       if (!initialData?.domain) return { subdomain: '', selectedDomain: '' }
       return matchWildcardDomain(initialData.domain, wildcardDomains)
-    }, [initialData?.domain, wildcardDomains])
+    }, [initialData, wildcardDomains])
 
   const {
     subdomain: initialRedirectSubdomain,
@@ -113,7 +113,7 @@ export function DomainForm({
   } = useMemo(() => {
     if (!initialData?.redirect_to) return { subdomain: '', selectedDomain: '' }
     return matchWildcardDomain(initialData.redirect_to, wildcardDomains)
-  }, [initialData?.redirect_to, wildcardDomains])
+  }, [initialData, wildcardDomains])
 
   const [subdomain, setSubdomain] = useState(initialSubdomain)
   const [selectedDomain, setSelectedDomain] = useState(initialSelectedDomain)

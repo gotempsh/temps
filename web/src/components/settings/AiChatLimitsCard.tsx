@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { Loader2, Save, Timer } from 'lucide-react'
 
@@ -51,7 +51,7 @@ export function AiChatLimitsCard() {
   const {
     register,
     handleSubmit,
-    watch,
+    control,
     reset,
     formState: { isDirty, isSubmitting, errors },
   } = useForm<FormData>({
@@ -67,7 +67,7 @@ export function AiChatLimitsCard() {
     }
   }, [settings, reset])
 
-  const current = watch('turn_timeout_secs')
+  const current = useWatch({ control, name: 'turn_timeout_secs' })
 
   const onSubmit = async (data: FormData) => {
     try {

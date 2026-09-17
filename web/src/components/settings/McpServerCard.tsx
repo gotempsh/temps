@@ -123,10 +123,10 @@ export function McpServerCard() {
         <CardDescription>
           Lets AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code,
           Windsurf, Zed) connect to this Temps instance over the Model Context
-          Protocol — e.g. ask "list my Temps projects" or "deploy the latest
-          commit" and have the assistant call real tools against this instance.
-          Every write action still requires a separate confirmation before it
-          executes.
+          Protocol — e.g. ask &quot;list my Temps projects&quot; or &quot;deploy
+          the latest commit&quot; and have the assistant call real tools against
+          this instance. Every write action still requires a separate
+          confirmation before it executes.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

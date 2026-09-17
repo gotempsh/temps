@@ -26,11 +26,8 @@ import {
   useAlertStatus,
 } from './alert-status'
 import { useAnomalyBand } from './use-anomaly-band'
-import {
-  LabelFilterChips,
-  serializeLabelFilters,
-  tuplesToLabelFilters,
-} from './LabelFilterBuilder'
+import { LabelFilterChips } from './LabelFilterBuilder'
+import { serializeLabelFilters, tuplesToLabelFilters } from './label-filters'
 
 interface MetricTileProps {
   project: ProjectResponse
@@ -135,7 +132,7 @@ export function MetricTile({
     enabled: !!project.id && metricName.length > 0,
   })
 
-  const buckets = q.data?.data ?? []
+  const buckets = useMemo(() => q.data?.data ?? [], [q.data?.data])
   const isHistogram = buckets.some((b) => b.histogram_summary)
   const isGrouped = !!groupByParam
 

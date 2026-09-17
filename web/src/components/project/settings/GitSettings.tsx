@@ -1730,7 +1730,7 @@ function PublicPortsInline({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setDraft(cfg.publicPorts || cfg.public_ports || [])
     setDirty(false)
-  }, [project.preset_config])
+  }, [project.preset_config, cfg.publicPorts, cfg.public_ports])
 
   const update = (next: PublicRoute[]) => {
     setDraft(next)
@@ -2243,10 +2243,10 @@ function ExcludedServicesInline({
             service runs with all Linux container permissions dropped except a
             minimal set (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) most
             official images need to fix ownership on their data volume at
-            startup — that's granted automatically, nothing to configure. If a
-            service still fails with “Operation not permitted” errors, it needs
-            a capability outside that set; “Disable sandbox” restores Docker’s
-            normal runtime permissions for only that service.
+            startup — that&apos;s granted automatically, nothing to configure.
+            If a service still fails with “Operation not permitted” errors, it
+            needs a capability outside that set; “Disable sandbox” restores
+            Docker’s normal runtime permissions for only that service.
           </p>
         </div>
         <Button
@@ -2515,7 +2515,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
   const { data: providersData } = useQuery({ ...listGitProvidersOptions() })
   const providers = providersData || []
-  const connections = connectionsData?.connections ?? []
+  const connections = useMemo(
+    () => connectionsData?.connections ?? [],
+    [connectionsData?.connections]
+  )
 
   // Source mode: a connected provider (pick a repo) or a public URL. Default to
   // the connection flow whenever the user has any connected provider — a project
@@ -2710,7 +2713,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     } else {
       setDetectedComposeFile(null)
     }
-  }, [detectedPresetData])
+  }, [detectedPresetData, directory])
 
   const back = () => navigate(`/projects/${project.slug}/git`)
   const connectionBasePath = repositoryConnectionBasePath(project.slug)

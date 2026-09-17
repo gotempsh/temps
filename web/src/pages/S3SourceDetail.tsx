@@ -285,9 +285,7 @@ export function S3SourceDetail() {
   )
   // Clamp the page if the filter just shrunk the result set below the
   // current page.
-  useEffect(() => {
-    if (backupPage > backupTotalPages) setBackupPage(backupTotalPages)
-  }, [backupPage, backupTotalPages])
+  if (backupPage > backupTotalPages) setBackupPage(backupTotalPages)
 
   const pagedBackups = useMemo(() => {
     const start = (backupPage - 1) * BACKUP_PAGE_SIZE

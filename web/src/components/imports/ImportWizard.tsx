@@ -810,7 +810,7 @@ export function ImportWizard({
                         className="text-xs font-normal text-muted-foreground leading-tight"
                       >
                         Skip TLS certificate verification — needed for a
-                        self-signed certificate (e.g. Portainer's default
+                        self-signed certificate (e.g. Portainer&apos;s default
                         install). Only enable this if you trust the network path
                         to this instance.
                       </Label>

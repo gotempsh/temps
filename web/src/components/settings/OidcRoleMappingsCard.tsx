@@ -51,7 +51,7 @@ export function OidcRoleMappingsCard({
   const mappingsQuery = useQuery(
     listOidcRoleMappingsOptions({ path: { provider_id: providerId } })
   )
-  const mappings = mappingsQuery.data ?? []
+  const mappings = useMemo(() => mappingsQuery.data ?? [], [mappingsQuery.data])
 
   const [draftGroup, setDraftGroup] = useState('')
   const [draftRole, setDraftRole] = useState<'admin' | 'user'>('user')

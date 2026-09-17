@@ -127,7 +127,7 @@ export function LoginForm({
   }
 
   const startOidcLogin = (slug: string) => {
-    window.location.href = `/api/auth/oidc/login/${encodeURIComponent(slug)}`
+    window.location.assign(`/api/auth/oidc/login/${encodeURIComponent(slug)}`)
   }
 
   return (

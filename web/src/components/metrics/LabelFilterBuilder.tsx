@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  listMetricLabelKeysOptions,
-  listMetricLabelValuesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listMetricLabelValuesOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -29,7 +26,7 @@ import {
   Tag,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 // ── Label filters ────────────────────────────────────────────────────────────
 //
@@ -38,68 +35,8 @@ import { useEffect, useState } from 'react'
 // tile editor (scoping a tile's chart) — one filter-building UI and
 // autocomplete behavior for all three.
 
-export interface LabelFilter {
-  key: string
-  value: string
-}
-
-/** Serialize label filters to a compact, regen-ready URL string: `k=v,k2=v2`. */
-export function serializeLabelFilters(filters: LabelFilter[]): string {
-  return filters
-    .filter((f) => f.key.trim().length > 0)
-    .map((f) => `${f.key.trim()}=${f.value.trim()}`)
-    .join(',')
-}
-
-/**
- * Convert draft `{key,value}` rows into the API's ordered-tuple shape
- * (`CreateMetricAlertRequest`/`UpdateMetricAlertRequest`/`DashboardTile` all
- * carry `label_filters` this way), dropping incomplete rows with an empty key.
- */
-export function labelFiltersToTuples(
-  filters: LabelFilter[]
-): [string, string][] {
-  return filters
-    .filter((f) => f.key.trim().length > 0)
-    .map((f) => [f.key.trim(), f.value.trim()] as [string, string])
-}
-
-/** Convert the API's ordered-tuple shape back into draft `{key,value}` rows. */
-export function tuplesToLabelFilters(
-  tuples: readonly (readonly [string, string])[] | null | undefined
-): LabelFilter[] {
-  return (tuples ?? []).map(([key, value]) => ({ key, value }))
-}
-
-/**
- * Discover the attribute keys observed on a metric — powers both the label
- * filter key autocomplete below and the dashboard tile editor's "break down
- * by" key picker, so both stay on the exact same query shape/cache entry.
- * Disabled without a single metric selected (no attributes to inspect).
- */
-export function useMetricLabelKeys({
-  projectId,
-  metricName,
-  fromIso,
-  toIso,
-}: {
-  projectId: number
-  metricName: string
-  fromIso: string
-  toIso: string
-}) {
-  return useQuery({
-    ...listMetricLabelKeysOptions({
-      query: {
-        project_id: projectId,
-        metric_name: metricName,
-        start_time: fromIso,
-        end_time: toIso,
-      },
-    }),
-    enabled: !!projectId && metricName.length > 0,
-  })
-}
+import { serializeLabelFilters, type LabelFilter } from './label-filters'
+import { useMetricLabelKeys } from './use-metric-label-keys'
 
 export function LabelFilterBuilder({
   value,
@@ -127,10 +64,11 @@ export function LabelFilterBuilder({
   // the URL's complete set diverges from ours. Our own edits echo back equal, so
   // the in-progress drafts survive instead of being clobbered.
   const valueKey = serializeLabelFilters(value)
-  useEffect(() => {
+  const [previousValueKey, setPreviousValueKey] = useState(valueKey)
+  if (previousValueKey !== valueKey) {
+    setPreviousValueKey(valueKey)
     if (valueKey !== serializeLabelFilters(rows)) setRows(value)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [valueKey])
+  }
 
   const commit = (next: LabelFilter[]) => {
     setRows(next)

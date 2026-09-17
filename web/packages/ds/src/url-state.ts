@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -293,22 +293,23 @@ export function useUrlText(
   const [params] = useSearchParams()
   const patch = useUrlPatch()
   const fromUrl = params.get(key) ?? ''
-  const [draft, setDraft] = useState(fromUrl)
+  const [text, setText] = useState({
+    draft: fromUrl,
+    written: null as string | null,
+  })
   /* What this field last wrote, until the address catches up. While a write is
      in flight the URL walks through the letters already typed, and following it
      would rewind the box; once it arrives, the field is settled again and the
      address is the only thing it reads. */
-  const written = useRef<string | null>(null)
-  if (written.current === null) {
+  if (text.written === null) {
     // Settled: the address moved and it was not this field that moved it.
-    if (fromUrl !== draft) setDraft(fromUrl)
-  } else if (fromUrl === written.current) {
-    written.current = null
+    if (fromUrl !== text.draft) setText({ draft: fromUrl, written: null })
+  } else if (fromUrl === text.written) {
+    setText({ draft: fromUrl, written: null })
   }
   const set = useCallback(
     (next: string) => {
-      written.current = next
-      setDraft(next)
+      setText({ draft: next, written: next })
       patch({ ...also, [key]: next || null })
     },
     // `also` is written inline at the call site; comparing it by identity would
@@ -316,5 +317,5 @@ export function useUrlText(
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [patch, key]
   )
-  return [draft, set]
+  return [text.draft, set]
 }

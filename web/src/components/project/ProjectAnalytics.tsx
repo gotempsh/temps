@@ -331,24 +331,22 @@ function PagesTab({ project }: PagesTabProps) {
   const selectedPagePath = searchParams.get('path')
 
   // Restore date filter from URL search params (preserves context from overview)
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
-    () => {
-      const filter = searchParams.get('filter') as QuickFilter | null
-      const from = searchParams.get('from')
-      const to = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
+    const filter = searchParams.get('filter') as QuickFilter | null
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
 
-      if (filter === 'custom' && from && to) {
-        return {
-          quickFilter: 'custom',
-          dateRange: { from: new Date(from), to: new Date(to) },
-        }
+    if (filter === 'custom' && from && to) {
+      return {
+        quickFilter: 'custom',
+        dateRange: { from: new Date(from), to: new Date(to) },
       }
-      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-        return { quickFilter: filter, dateRange: undefined }
-      }
-      return { quickFilter: '24hours', dateRange: undefined }
     }
-  )
+    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+      return { quickFilter: filter, dateRange: undefined }
+    }
+    return { quickFilter: '24hours', dateRange: undefined }
+  }, [searchParams])
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -383,7 +381,6 @@ function PagesTab({ project }: PagesTabProps) {
   // Sync date filter to URL search params (preserves path param)
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
-      setDateFilter(next)
       const params = new URLSearchParams(searchParams)
       params.set('filter', next.quickFilter)
       if (
@@ -1218,24 +1215,22 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
   // Restore date filter from URL search params (enables browser back/forward)
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
-    () => {
-      const filter = searchParams.get('filter') as QuickFilter | null
-      const from = searchParams.get('from')
-      const to = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
+    const filter = searchParams.get('filter') as QuickFilter | null
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
 
-      if (filter === 'custom' && from && to) {
-        return {
-          quickFilter: 'custom',
-          dateRange: { from: new Date(from), to: new Date(to) },
-        }
+    if (filter === 'custom' && from && to) {
+      return {
+        quickFilter: 'custom',
+        dateRange: { from: new Date(from), to: new Date(to) },
       }
-      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-        return { quickFilter: filter, dateRange: undefined }
-      }
-      return { quickFilter: '24hours', dateRange: undefined }
     }
-  )
+    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+      return { quickFilter: filter, dateRange: undefined }
+    }
+    return { quickFilter: '24hours', dateRange: undefined }
+  }, [searchParams])
   const [pendingChartRange, setPendingChartRange] =
     React.useState<ChartDateRange | null>(null)
 
@@ -1243,7 +1238,6 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
       setPendingChartRange(null)
-      setDateFilter(next)
       const params = new URLSearchParams()
       params.set('filter', next.quickFilter)
       if (
@@ -1259,35 +1253,20 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     [setSearchParams]
   )
 
-  // Listen for popstate (browser back/forward) and restore date filter
-  React.useEffect(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      setDateFilter({
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      })
-    } else if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      setDateFilter({ quickFilter: filter, dateRange: undefined })
-    }
-  }, [searchParams])
-
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
   const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const [dateRangeRefreshKey, setDateRangeRefreshKey] = React.useState(0)
   // While the guided tour is showing off this page, don't yank the user to
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
   const queryClient = useQueryClient()
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
-  )
+  const { startDate, endDate } = React.useMemo(() => {
+    void dateRangeRefreshKey
+    return getDateRangeFromFilter(dateFilter)
+  }, [dateFilter, dateRangeRefreshKey])
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1325,7 +1304,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   }, [hasNoData, showSetupOverride, project.slug, navigate])
 
   const handleRefresh = React.useCallback(async () => {
-    setDateFilter((previous) => ({ ...previous }))
+    setDateRangeRefreshKey((current) => current + 1)
     setIsRefreshing(true)
     try {
       // Invalidate all analytics queries for this project
@@ -2426,7 +2405,6 @@ After implementation:
   }
 
   const [wizardStep, setWizardStep] = React.useState<WizardStepId>('framework')
-  const [celebrate, setCelebrate] = React.useState(false)
   const navigate = useNavigate()
 
   const { data: hasEventsData } = useQuery({
@@ -2436,15 +2414,17 @@ After implementation:
     refetchOnWindowFocus: false,
   })
 
+  const celebrate =
+    wizardStep === 'waiting' && hasEventsData?.has_events === true
+
   React.useEffect(() => {
-    if (wizardStep === 'waiting' && hasEventsData?.has_events && !celebrate) {
-      setCelebrate(true)
+    if (celebrate) {
       const timer = setTimeout(() => {
         navigate(`/projects/${project.slug}/analytics`)
       }, 1600)
       return () => clearTimeout(timer)
     }
-  }, [wizardStep, hasEventsData?.has_events, celebrate, navigate, project.slug])
+  }, [celebrate, navigate, project.slug])
 
   const steps = [
     { id: 'framework' as WizardStepId, label: 'Framework' },
@@ -2657,7 +2637,7 @@ After implementation:
               Back
             </Button>
             <Button onClick={() => setWizardStep('waiting')}>
-              I've installed it — start listening
+              I&apos;ve installed it — start listening
               <ArrowRight className="ml-2 size-4" />
             </Button>
           </div>
@@ -2693,8 +2673,8 @@ After implementation:
                     Waiting for your first event…
                   </h3>
                   <p className="text-sm text-muted-foreground">
-                    Deploy your app or run it locally. We'll auto-redirect as
-                    soon as an event arrives.
+                    Deploy your app or run it locally. We&apos;ll auto-redirect
+                    as soon as an event arrives.
                   </p>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -2711,7 +2691,7 @@ After implementation:
                 Not seeing anything? Double-check the setup.
               </summary>
               <ol className="mt-3 space-y-2 text-muted-foreground">
-                <li>1. Confirm the provider wraps your app's root.</li>
+                <li>1. Confirm the provider wraps your app&apos;s root.</li>
                 <li>
                   2. Check DevTools → Network for <code>/api/_temps</code>{' '}
                   requests.

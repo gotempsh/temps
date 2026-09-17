@@ -367,6 +367,7 @@ function containerSourceLabel(c: ContainerInfoResponse): string {
 }
 
 export default function LogViewer({ project }: { project: ProjectResponse }) {
+  'use no memo'
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
     'connecting' | 'connected' | 'error' | 'permanent_error'
@@ -483,6 +484,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   // row's real height to the virtualizer (estimateSize is just the initial
   // guess for off-screen rows). The row wrapper sets `ref` + `data-index` so
   // the virtualizer can measure it.
+  // TanStack Virtual deliberately returns mutable measurement functions; the
+  // React Compiler correctly leaves this component un-memoized.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,

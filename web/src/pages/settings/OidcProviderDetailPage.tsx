@@ -315,10 +315,12 @@ function ProviderEditor({
   testResult: OidcTestConnectionResponse | null
 }) {
   const [form, setForm] = useState(() => providerToFormValues(provider))
+  const [loadedProviderId, setLoadedProviderId] = useState(provider.id)
 
-  useEffect(() => {
+  if (provider.id !== loadedProviderId) {
+    setLoadedProviderId(provider.id)
     setForm(providerToFormValues(provider))
-  }, [provider.id])
+  }
 
   const handleSubmit = () => {
     if (!isOidcEditFormValid(form)) {

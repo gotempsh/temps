@@ -103,8 +103,8 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
     listTeamsOptions({ query: { page: 1, page_size: 100 } })
   )
 
-  const teams = teamsData?.teams ?? []
-  const grantList = grants ?? []
+  const teams = useMemo(() => teamsData?.teams ?? [], [teamsData?.teams])
+  const grantList = useMemo(() => grants ?? [], [grants])
 
   // Regranting an existing team is an upsert server-side, but offering it in
   // the "add" picker reads as a bug — the row is already in the table.
@@ -190,8 +190,8 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
             Teams with access
           </CardTitle>
           <CardDescription>
-            A member's permissions here are the narrower of their role in the
-            team and the role the team holds on this project.{' '}
+            A member&apos;s permissions here are the narrower of their role in
+            the team and the role the team holds on this project.{' '}
             {ROLE_ENFORCEMENT_NOTE}
           </CardDescription>
         </CardHeader>

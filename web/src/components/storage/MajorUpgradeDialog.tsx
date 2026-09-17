@@ -32,7 +32,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -137,7 +137,7 @@ export function MajorUpgradeDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, currentImage])
 
-  const toImage = form.watch('to_image')
+  const toImage = useWatch({ control: form.control, name: 'to_image' })
   const toOs = useMemo(() => detectOsFamily(toImage), [toImage])
   const osMismatch =
     fromOs !== 'unknown' && toOs !== 'unknown' && fromOs !== toOs

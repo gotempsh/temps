@@ -117,7 +117,10 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
     ...revenueListIntegrationsOptions({ path: { project_id: project.id } }),
   })
 
-  const integrations = integrationsQuery.data ?? []
+  const integrations = useMemo(
+    () => integrationsQuery.data ?? [],
+    [integrationsQuery.data]
+  )
   const hasIntegrations = integrations.length > 0
   const connectedProviders = useMemo(
     () => new Set(integrations.map((i) => i.provider)),
@@ -240,6 +243,7 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
       )}
 
       <ConnectProviderDialog
+        key={connectOpen ? 'connect-open' : 'connect-closed'}
         projectId={project.id}
         open={connectOpen}
         onOpenChange={setConnectOpen}
@@ -827,12 +831,14 @@ function IntegrationRow({
         </DropdownMenuContent>
       </DropdownMenu>
       <UpdateSecretDialog
+        key={updateSecretOpen ? 'update-secret-open' : 'update-secret-closed'}
         projectId={projectId}
         integration={integration}
         open={updateSecretOpen}
         onOpenChange={setUpdateSecretOpen}
       />
       <ConfigureIntegrationDialog
+        key={configureOpen ? 'configure-open' : 'configure-closed'}
         projectId={projectId}
         integration={integration}
         open={configureOpen}
@@ -859,9 +865,10 @@ function UpdateSecretDialog({
     path: { project_id: projectId },
   })
 
-  useEffect(() => {
-    if (open) setSigningSecret('')
-  }, [open])
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (nextOpen) setSigningSecret('')
+    onOpenChange(nextOpen)
+  }
 
   const update = useMutation({
     ...revenueUpdateSecretMutation(),
@@ -883,7 +890,7 @@ function UpdateSecretDialog({
     })
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>Update signing secret</DialogTitle>
@@ -948,16 +955,17 @@ function ConfigureIntegrationDialog({
     initial.meteredMode
   )
 
-  useEffect(() => {
-    if (open) {
-      const s = deriveConfigState(integration)
-      setPriceList(s.priceList)
-      setProductList(s.productList)
-      setVariantList(s.variantList)
-      setIncludeUnpriced(s.includeUnpriced)
-      setMeteredMode(s.meteredMode)
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (nextOpen) {
+      const next = deriveConfigState(integration)
+      setPriceList(next.priceList)
+      setProductList(next.productList)
+      setVariantList(next.variantList)
+      setIncludeUnpriced(next.includeUnpriced)
+      setMeteredMode(next.meteredMode)
     }
-  }, [open, integration])
+    onOpenChange(nextOpen)
+  }
 
   const update = useMutation({
     ...revenueUpdateConfigMutation(),
@@ -994,7 +1002,7 @@ function ConfigureIntegrationDialog({
   const isStripe = integration.provider === 'stripe'
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>Configure {integration.provider} filters</DialogTitle>
@@ -1046,7 +1054,7 @@ function ConfigureIntegrationDialog({
                   Include charges without a price reference
                   <span className="mt-0.5 block text-xs text-muted-foreground">
                     One-off charges (standalone <code>charge.succeeded</code>)
-                    don't carry a SKU. Default on.
+                    don&apos;t carry a SKU. Default on.
                   </span>
                 </span>
               </label>
@@ -1073,8 +1081,8 @@ function ConfigureIntegrationDialog({
                 </Select>
                 <p className="text-xs text-muted-foreground">
                   For metered/tiered/hybrid subscriptions, MRR is normally 0 at
-                  subscription events. "Derive from invoices" backfills MRR from
-                  each paid invoice line.
+                  subscription events. &quot;Derive from invoices&quot;
+                  backfills MRR from each paid invoice line.
                 </p>
               </div>
             </>
@@ -1257,15 +1265,6 @@ function ImportDataDialog({
   const [results, setResults] = useState<
     { kind: ImportKind; outcome: ImportOutcomeResponse }[]
   >([])
-
-  useEffect(() => {
-    if (open) {
-      setSubsFile(null)
-      setInvoicesFile(null)
-      setResults([])
-      setBusy(false)
-    }
-  }, [open])
 
   const canSubmit = !busy && (subsFile !== null || invoicesFile !== null)
 
@@ -1477,8 +1476,8 @@ function RecentEventsSection({
         </div>
       ) : events.length === 0 ? (
         <div className="rounded-md border p-4 text-sm text-muted-foreground">
-          No events yet. Send a test webhook from your provider's dashboard to
-          confirm the integration.
+          No events yet. Send a test webhook from your provider&apos;s dashboard
+          to confirm the integration.
         </div>
       ) : (
         <div className="flex flex-col divide-y rounded-md border">
@@ -1539,23 +1538,20 @@ function ConnectProviderDialog({
   const [signingSecret, setSigningSecret] = useState('')
   const [created, setCreated] = useState<IntegrationResponse | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  const effectiveProvider = provider || availableProviders[0]?.name || ''
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (nextOpen) {
       setProvider('')
       setSigningSecret('')
       setCreated(null)
     }
-  }, [open])
-
-  useEffect(() => {
-    if (!provider && availableProviders.length > 0) {
-      setProvider(availableProviders[0].name)
-    }
-  }, [availableProviders, provider])
+    onOpenChange(nextOpen)
+  }
 
   const selected: ProviderDescriptor | undefined = useMemo(
-    () => availableProviders.find((p) => p.name === provider),
-    [availableProviders, provider]
+    () => availableProviders.find((p) => p.name === effectiveProvider),
+    [availableProviders, effectiveProvider]
   )
 
   const create = useMutation({
@@ -1569,16 +1565,17 @@ function ConnectProviderDialog({
       toast.error(err.message || 'Failed to create integration'),
   })
 
-  const canSubmit = provider.length > 0 && signingSecret.trim().length > 0
+  const canSubmit =
+    effectiveProvider.length > 0 && signingSecret.trim().length > 0
 
   const handleCreate = () =>
     create.mutate({
       path: { project_id: projectId },
-      body: { provider, signing_secret: signingSecret },
+      body: { provider: effectiveProvider, signing_secret: signingSecret },
     })
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-lg">
         {created ? (
           <SuccessStep
@@ -1591,13 +1588,13 @@ function ConnectProviderDialog({
               <DialogTitle>Connect payment provider</DialogTitle>
               <DialogDescription>
                 Temps ingests webhooks from your provider. No API key needed —
-                you'll paste a URL into their dashboard.
+                you&apos;ll paste a URL into their dashboard.
               </DialogDescription>
             </DialogHeader>
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-1.5">
                 <Label>Provider</Label>
-                <Select value={provider} onValueChange={setProvider}>
+                <Select value={effectiveProvider} onValueChange={setProvider}>
                   <SelectTrigger>
                     <SelectValue placeholder="Select a provider" />
                   </SelectTrigger>
@@ -1617,7 +1614,7 @@ function ConnectProviderDialog({
                 </Select>
               </div>
 
-              {provider === 'stripe' && (
+              {effectiveProvider === 'stripe' && (
                 <StripeInstructions
                   recommendedEvents={selected?.recommended_events ?? []}
                 />
@@ -1672,8 +1669,8 @@ function StripeInstructions({
           <strong>Developers → Webhooks → Add endpoint</strong>.
         </li>
         <li>
-          Paste the URL we show you next, and copy Stripe's signing secret back
-          here.
+          Paste the URL we show you next, and copy Stripe&apos;s signing secret
+          back here.
         </li>
         {recommendedEvents.length > 0 && (
           <li>
@@ -1702,8 +1699,9 @@ function SuccessStep({
       <DialogHeader>
         <DialogTitle>Integration created</DialogTitle>
         <DialogDescription>
-          Paste this URL into your provider's webhook endpoint configuration.
-          Keep this URL secret — anyone with it can post signed events.
+          Paste this URL into your provider&apos;s webhook endpoint
+          configuration. Keep this URL secret — anyone with it can post signed
+          events.
         </DialogDescription>
       </DialogHeader>
       <div className="flex flex-col gap-3">

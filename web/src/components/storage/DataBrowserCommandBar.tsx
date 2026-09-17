@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import Fuse from 'fuse.js'
 import {
   CommandDialog,
@@ -74,6 +74,11 @@ export function DataBrowserCommandBar({
   supportsSql,
 }: DataBrowserCommandBarProps) {
   const [input, setInput] = useState('')
+  const [previousOpen, setPreviousOpen] = useState(open)
+  if (previousOpen !== open) {
+    setPreviousOpen(open)
+    if (open) setInput('')
+  }
   const { record, blend, store } = useFrecency()
 
   const fuse = useMemo(
@@ -127,11 +132,6 @@ export function DataBrowserCommandBar({
       )
       .slice(0, 8)
   }, [views, input])
-
-  // Reset input when opened
-  useEffect(() => {
-    if (open) setInput('')
-  }, [open])
 
   const iconFor = (t: CommandTarget) =>
     t.kind === 'entity' ? (
