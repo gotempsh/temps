@@ -11,19 +11,20 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Separator } from '@/components/ui/separator'
 import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import {
   getApiKey,
   deleteApiKey,
@@ -33,18 +34,25 @@ import {
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
+import {
   AlertCircle,
-  AlertTriangle,
   ArrowLeft,
-  Calendar,
   Check,
   Key,
-  RotateCcw,
   Shield,
-  Activity,
+  Trash2,
   X,
 } from 'lucide-react'
-import { format } from 'date-fns'
 import { toast } from 'sonner'
 
 // Helper component to display permissions with show more/less functionality
@@ -59,14 +67,14 @@ function PermissionsDisplay({ permissions }: PermissionsDisplayProps) {
 
   return (
     <>
-      <div className="flex flex-wrap gap-2 mt-2">
+      <div className="mt-2 flex flex-wrap gap-2">
         {displayPermissions.map((permission: string) => (
           <Badge key={permission} variant="secondary">
             {permission}
           </Badge>
         ))}
       </div>
-      <div className="flex items-center justify-between mt-2">
+      <div className="mt-2 flex items-center justify-between">
         <p className="text-sm text-muted-foreground">
           Total: {permissions.length} permission
           {permissions.length !== 1 ? 's' : ''}
@@ -75,7 +83,7 @@ function PermissionsDisplay({ permissions }: PermissionsDisplayProps) {
           <Button
             variant="ghost"
             size="sm"
-            className="text-sm h-auto p-0"
+            className="h-auto p-0 text-sm"
             onClick={() => setShowAll(!showAll)}
           >
             {showAll ? 'Show less' : `Show ${permissions.length - 10} more`}
@@ -86,12 +94,90 @@ function PermissionsDisplay({ permissions }: PermissionsDisplayProps) {
   )
 }
 
+function apiKeyVerdict(apiKey: { is_active: boolean }): {
+  tone: StatusTone
+  label: string
+} {
+  return apiKey.is_active
+    ? { tone: 'ok', label: 'Active' }
+    : { tone: 'idle', label: 'Inactive' }
+}
+
+function apiKeyFacts(apiKey: {
+  id: number
+  role_type: string
+  created_at: string
+  last_used_at?: string | null
+  expires_at?: string | null
+}): DetailFact[] {
+  return [
+    { label: 'ID', value: <span className="font-mono">{apiKey.id}</span> },
+    {
+      label: 'Access level',
+      value:
+        apiKey.role_type === 'custom' ? 'Custom Permissions' : apiKey.role_type,
+    },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(apiKey.created_at)}>
+          {fmtRelativeTime(apiKey.created_at)}
+        </span>
+      ),
+    },
+    {
+      label: 'Last used',
+      value: apiKey.last_used_at ? (
+        <span title={fmtDateTime(apiKey.last_used_at)}>
+          {fmtRelativeTime(apiKey.last_used_at)}
+        </span>
+      ) : (
+        'Never'
+      ),
+    },
+    {
+      label: 'Expires',
+      value: apiKey.expires_at ? (
+        <span title={fmtDateTime(apiKey.expires_at)}>
+          {fmtRelativeTime(apiKey.expires_at)}
+        </span>
+      ) : (
+        'Never'
+      ),
+    },
+  ]
+}
+
+function ApiKeyDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
+  return (
+    <Detail
+      title={<Skeleton className="h-7 w-48" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3, 4].map(() => ({
+        label: <Skeleton className="h-3 w-16" />,
+        value: <Skeleton className="h-4 w-24" />,
+      }))}
+      main={
+        <Card>
+          <CardHeader>
+            <Skeleton className="h-5 w-40" />
+            <Skeleton className="mt-2 h-4 w-64" />
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Skeleton className="h-14 w-full rounded-lg" />
+            <Skeleton className="h-14 w-full rounded-lg" />
+          </CardContent>
+        </Card>
+      }
+    />
+  )
+}
+
 export default function ApiKeyDetail() {
   usePageTitle('API Key Details')
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const queryClient = useQueryClient()
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
 
   const {
     data: apiKey,
@@ -153,12 +239,19 @@ export default function ApiKeyDetail() {
     },
   })
 
+  const backAction = (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={() => navigate('/settings/keys')}
+    >
+      <ArrowLeft className="mr-2 h-4 w-4" />
+      Back to API Keys
+    </Button>
+  )
+
   if (isLoading) {
-    return (
-      <div className="w-full min-w-0 space-y-6">
-        <div className="text-center py-8">Loading API key details...</div>
-      </div>
-    )
+    return <ApiKeyDetailSkeleton backAction={backAction} />
   }
 
   const isNotFound =
@@ -167,256 +260,142 @@ export default function ApiKeyDetail() {
 
   if (!apiKey && apiKeyError && !isNotFound) {
     return (
-      <div className="w-full min-w-0 space-y-6">
-        <div className="flex flex-col items-center justify-center gap-4 py-8 text-center">
-          <AlertCircle className="h-8 w-8 text-destructive" />
-          <div>
-            <h2 className="text-lg font-semibold">Failed to load API key</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {apiKeyError instanceof Error
-                ? apiKeyError.message
-                : 'An unexpected error occurred. Please try again.'}
-            </p>
-          </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Failed to load API key"
+        description={
+          apiKeyError instanceof Error
+            ? apiKeyError.message
+            : 'An unexpected error occurred. Please try again.'
+        }
+        action={
           <div className="flex gap-2">
             <Button variant="outline" onClick={() => void refetchApiKey()}>
-              <RotateCcw className="mr-2 h-4 w-4" />
               Retry
             </Button>
-            <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to API Keys
-            </Button>
+            {backAction}
           </div>
-        </div>
-      </div>
+        }
+      />
     )
   }
 
   if (!apiKey) {
     return (
-      <div className="w-full min-w-0 space-y-6">
-        <div className="text-center py-8">
-          <p>API key not found</p>
-          <Button onClick={() => navigate('/settings/keys')} className="mt-4">
-            Back to API Keys
-          </Button>
-        </div>
-      </div>
+      <PageState
+        variant="empty"
+        icon={Key}
+        title="API key not found"
+        description="This API key may have been deleted, or you may not have permission to view it."
+        action={backAction}
+      />
     )
   }
 
+  const verdict = apiKeyVerdict(apiKey)
+
   return (
-    <div className="w-full min-w-0 space-y-6">
-      {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            onClick={() => navigate('/settings/keys')}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div className="min-w-0">
-            <h1 className="truncate text-2xl font-semibold tracking-tight">
-              {apiKey.name}
-            </h1>
-            <p className="text-muted-foreground mt-1">
-              API key details and permissions
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={apiKey.is_active ? 'default' : 'secondary'}>
-            {apiKey.is_active ? 'Active' : 'Inactive'}
-          </Badge>
-        </div>
-      </div>
+    <Detail
+      title={apiKey.name}
+      description="API key details and permissions"
+      verdict={<Status tone={verdict.tone} label={verdict.label} />}
+      actions={
+        <>
+          {backAction}
+          {apiKey.is_active ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => deactivateMutation.mutate()}
+              busy={deactivateMutation.isPending}
+              busyLabel="Deactivating…"
+            >
+              <X className="mr-2 h-4 w-4" />
+              Deactivate
+            </Button>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => activateMutation.mutate()}
+              busy={activateMutation.isPending}
+              busyLabel="Activating…"
+            >
+              <Check className="mr-2 h-4 w-4" />
+              Activate
+            </Button>
+          )}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" size="sm">
+                <Trash2 className="mr-2 h-4 w-4" />
+                Delete
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete API Key</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Are you sure you want to delete &quot;{apiKey.name}&quot;?
+                  This action cannot be undone and will immediately invalidate
+                  all requests using this key.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  disabled={deleteMutation.isPending}
+                  onClick={() => deleteMutation.mutate()}
+                >
+                  {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </>
+      }
+      facts={apiKeyFacts(apiKey)}
+      main={
+        <>
+          {!apiKey.is_active && (
+            <Callout tone="warning" title="This API key is inactive">
+              It cannot be used for authentication until reactivated.
+            </Callout>
+          )}
 
-      {/* Status Alert */}
-      {!apiKey.is_active && (
-        <Alert>
-          <AlertTriangle className="h-4 w-4" />
-          <AlertDescription>
-            This API key is currently inactive and cannot be used for
-            authentication.
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {/* Basic Information */}
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
+          <Card>
+            <CardHeader>
               <CardTitle className="flex items-center gap-2">
-                <Key className="h-5 w-5" />
-                Basic Information
+                <Shield className="h-5 w-5" />
+                Permissions & Access
               </CardTitle>
-              <CardDescription>Overview of your API key</CardDescription>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {apiKey.is_active ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => deactivateMutation.mutate()}
-                  disabled={deactivateMutation.isPending}
-                >
-                  <X className="h-4 w-4 mr-2" />
-                  Deactivate
-                </Button>
-              ) : (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => activateMutation.mutate()}
-                  disabled={activateMutation.isPending}
-                >
-                  <Check className="h-4 w-4 mr-2" />
-                  Activate
-                </Button>
-              )}
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-2">
-            <div>
-              <Label className="text-muted-foreground">Name</Label>
-              <p className="font-medium">{apiKey.name}</p>
-            </div>
-            <div>
-              <Label className="text-muted-foreground">ID</Label>
-              <p className="font-mono text-sm">{apiKey.id}</p>
-            </div>
-            <div>
-              <Label className="text-muted-foreground">Created</Label>
-              <p className="flex items-center gap-2">
-                <Calendar className="h-4 w-4" />
-                {format(new Date(apiKey.created_at), 'MMM d, yyyy HH:mm')}
-              </p>
-            </div>
-            <div>
-              <Label className="text-muted-foreground">Last Used</Label>
-              <p className="flex items-center gap-2">
-                <Activity className="h-4 w-4" />
-                {apiKey.last_used_at
-                  ? format(new Date(apiKey.last_used_at), 'MMM d, yyyy HH:mm')
-                  : 'Never'}
-              </p>
-            </div>
-            {apiKey.expires_at && (
-              <div className="md:col-span-2">
-                <Label className="text-muted-foreground">Expires</Label>
-                <p className="flex items-center gap-2">
-                  <Calendar className="h-4 w-4" />
-                  {format(new Date(apiKey.expires_at), 'MMM d, yyyy HH:mm')}
+              <CardDescription>
+                Current permissions and access level
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div>
+                <Label className="text-muted-foreground">Permissions</Label>
+                <p className="mb-2 mt-1 text-xs text-muted-foreground">
+                  Permissions cannot be changed after creation. To change
+                  permissions, delete this key and create a new one.
                 </p>
+                <PermissionsDisplay
+                  permissions={
+                    apiKey.role_type === 'custom' && apiKey.permissions
+                      ? apiKey.permissions
+                      : permissionsData?.roles.find(
+                          (r) => r.name === apiKey.role_type
+                        )?.permissions || []
+                  }
+                />
               </div>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Permissions */}
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="h-5 w-5" />
-              Permissions & Access
-            </CardTitle>
-            <CardDescription>
-              Current permissions and access level
-            </CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div>
-            <Label className="text-muted-foreground">Access Level</Label>
-            <p className="font-medium mt-1">
-              {apiKey.role_type === 'custom'
-                ? 'Custom Permissions'
-                : apiKey.role_type}
-            </p>
-          </div>
-
-          <Separator />
-
-          <div>
-            <Label className="text-muted-foreground">Permissions</Label>
-            <p className="text-xs text-muted-foreground mt-1 mb-2">
-              Permissions cannot be changed after creation. To change
-              permissions, delete this key and create a new one.
-            </p>
-            <PermissionsDisplay
-              permissions={
-                apiKey.role_type === 'custom' && apiKey.permissions
-                  ? apiKey.permissions
-                  : permissionsData?.roles.find(
-                      (r) => r.name === apiKey.role_type
-                    )?.permissions || []
-              }
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Danger Zone */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-destructive">Danger Zone</CardTitle>
-          <CardDescription>
-            Irreversible and destructive actions
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-between p-4 border border-destructive/20 rounded-lg">
-            <div>
-              <h4 className="font-medium">Delete API Key</h4>
-              <p className="text-sm text-muted-foreground">
-                Once deleted, this API key cannot be recovered and will stop
-                working immediately.
-              </p>
-            </div>
-            <Button
-              variant="destructive"
-              onClick={() => setDeleteModalOpen(true)}
-            >
-              Delete Key
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Delete Confirmation Modal */}
-      <Dialog open={deleteModalOpen} onOpenChange={setDeleteModalOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete API Key</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete &quot;{apiKey.name}&quot;? This
-              action cannot be undone and will immediately invalidate all
-              requests using this key.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteModalOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => deleteMutation.mutate()}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
+            </CardContent>
+          </Card>
+        </>
+      }
+    />
   )
 }
