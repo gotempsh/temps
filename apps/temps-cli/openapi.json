@@ -5385,7 +5385,7 @@
         "properties": {
           "cpu_limit_cores": {
             "default": 0,
-            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\".",
+            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Read once at startup; a change\ntakes effect after `temps serve` restarts.",
             "example": 2,
             "format": "float",
             "minimum": 0,
@@ -5401,7 +5401,7 @@
           },
           "memory_limit_mb": {
             "default": 0,
-            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Docker enforces this as a hard cap — builds\nthat exceed it OOM-kill.",
+            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Same scope as `cpu_limit_cores`: applied only\nby the legacy builder, ignored by BuildKit, read once at startup.\nValues above 2047 MB are reduced to 2047 MB, the most the build API\naccepts through the client, with a warning in the server log.",
             "example": 2048,
             "format": "int32",
             "minimum": 0,
@@ -22588,7 +22588,7 @@
             ]
           },
           "scan_limit_reached": {
-            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found so far, but unread chunks may contain newer lines.\nNo cursor is returned because the partial results cannot be paginated safely.",
+            "description": "True means the scan budget was exhausted. Lines contain the newest\nmatches found in this scan window, but unread chunks may contain newer\nlines. `next_cursor` continues into another bounded scan window.",
             "type": "boolean"
           },
           "scanned_bytes": {

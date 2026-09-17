@@ -3787,6 +3787,7 @@ pub async fn create_project_from_template(
                 image_ref: runtime.image_ref.clone(),
                 health_check_path: runtime.health_check_path,
                 command: runtime.command,
+                recovery_of_deployment_id: None,
             });
         if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
             error!(

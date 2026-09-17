@@ -967,12 +967,14 @@ impl WorkflowExecutionService {
                         .await
                         .map(|d| d.state)
                         .unwrap_or_default();
-                    if current_state == "stopped" {
+                    if matches!(
+                        current_state.as_str(),
+                        "cancelled" | "stopped" | "completed" | "failed"
+                    ) {
                         info!(
-                            "Workflow for deployment {} ended with an error but \
-                             the deployment was already marked 'stopped' by a \
-                             concurrent rollback — preserving 'stopped'",
-                            deployment_id
+                            deployment_id,
+                            state = %current_state,
+                            "Workflow ended with an error after the deployment reached a terminal state; preserving that state"
                         );
                     } else {
                         // Update deployment status to failed with reason
@@ -3485,6 +3487,16 @@ mod tests {
         let cases = [
             (
                 "process was OOMKilled (exit code 137)",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+            ),
+            (
+                // The build job's out-of-memory explanation, whose only
+                // exit-code text is the ordinary 1 the build tool returned.
+                "Failed to build image: The build step most likely ran out of memory: the \
+                 kernel's OOM killer terminated 1 process on this host while the step ran; no \
+                 other build was running; the step exited with code 1 after one of its \
+                 processes was killed; host RAM 3902 MB",
                 DeploymentFailureStage::Resource,
                 DeploymentFailureCode::OutOfMemory,
             ),

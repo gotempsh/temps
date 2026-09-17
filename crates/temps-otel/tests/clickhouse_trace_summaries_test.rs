@@ -783,7 +783,7 @@ async fn has_traces_is_true_for_a_project_with_spans_and_false_otherwise() {
 
 #[tokio::test]
 async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
-    use temps_otel::storage::global_traces::{GlobalTraceQuery, TraceReadScope};
+    use temps_otel::storage::global_traces::{self, GlobalTraceQuery, TraceReadScope};
     let Some(h) = harness().await else { return };
     let now = Utc::now();
     let mut records = Vec::new();
@@ -838,6 +838,8 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
             })
             .collect(),
         summaries: true,
+        use_preaggregated_summaries: true,
+        lifetime_candidate_total: None,
         source_offset: 0,
     };
     let page = h.storage.global_trace_page(q.clone()).await.unwrap();
@@ -850,11 +852,39 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
     sorted.filter.sort_by = TraceSortField::Duration;
     let page = h.storage.global_trace_page(sorted).await.unwrap();
     assert_eq!(page.data[0].trace_id, "global-024");
-    let mut raw = q;
+    let mut raw = q.clone();
     raw.summaries = false;
     let page = h.storage.global_trace_page(raw).await.unwrap();
     assert_eq!(page.data[0].span_id, "root");
     assert_eq!(page.total, 45);
+
+    let bulk = (0..5_001)
+        .map(|index| {
+            span(
+                601,
+                &format!("global-bulk-{index:04}"),
+                "root",
+                None,
+                "GET /bulk",
+                "api",
+                SpanStatusCode::Ok,
+                index % 60 + 1,
+                1.0,
+                None,
+                &[],
+            )
+        })
+        .collect();
+    h.storage.store_spans(bulk).await.unwrap();
+    let mut deep = q;
+    deep.filter.offset = Some(5_000);
+    deep.source_offset = 0;
+    let stream = global_traces::clickhouse(&h.probe, &deep, None)
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &deep).await.unwrap();
+    assert_eq!(page.total, 5_046);
+    assert_eq!(page.data.len(), 20);
 }
 
 #[tokio::test]
@@ -882,6 +912,8 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
             })
             .collect(),
         summaries: true,
+        use_preaggregated_summaries: false,
+        lifetime_candidate_total: None,
         source_offset: 20,
     };
     let refs = BTreeMap::from([(701, "scope-a".into()), (702, "scope-b".into())]);
@@ -902,7 +934,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &raw).await.unwrap();
     assert_eq!(page.total, 45);
     assert_eq!(page.data[0].span_id, "root");
-    let mut filtered = q;
+    let mut filtered = q.clone();
     filtered.filter.offset = Some(0);
     filtered.source_offset = 0;
     filtered.filter.min_duration_ms = Some(40.0);
@@ -914,4 +946,47 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &filtered).await.unwrap();
     assert_eq!(page.total, 6);
     assert_eq!(page.data[0].trace_id, "cloud-39");
+
+    // Membership remains window-bounded, but a qualifying trace's values use
+    // all of its Cloud-held spans so they match local lifetime summaries in a
+    // mixed-source merge.
+    h.probe.query("INSERT INTO telemetry_spans VALUES ('scope-a', 'cloud-0', 'late-child', 'root', 'child outside window', 'worker', 'production', 'INTERNAL', 'ERROR', fromUnixTimestamp64Milli(1699999800000), 999.0)").execute().await.unwrap();
+    let mut lifetime = q;
+    lifetime.filter.offset = Some(0);
+    lifetime.filter.limit = Some(100);
+    lifetime.source_offset = 0;
+    lifetime.use_preaggregated_summaries = true;
+    let stream = global_traces::clickhouse(&h.probe, &lifetime, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &lifetime).await.unwrap();
+    let trace = page
+        .data
+        .iter()
+        .find(|trace| trace.trace_id == "cloud-0")
+        .expect("window member keeps its lifetime Cloud summary");
+    assert_eq!(trace.name, "GET /items");
+    assert_eq!(trace.start_ms, 1_699_999_800_000);
+    assert_eq!(trace.duration, 999.0);
+    assert_eq!(trace.span_count, 2);
+    assert_eq!(trace.error_count, 1);
+    assert_eq!(trace.status, "ERROR");
+
+    let mut past_end = lifetime.clone();
+    past_end.filter.offset = Some(100);
+    past_end.source_offset = 100;
+    let stream = global_traces::clickhouse(&h.probe, &past_end, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &past_end).await.unwrap();
+    assert!(page.data.is_empty());
+    assert_eq!(page.total, 45);
+
+    h.probe.query("INSERT INTO telemetry_spans SELECT 'scope-a', concat('over-budget-', toString(number)), 'root', '', 'GET /bulk', 'api', 'production', 'SERVER', 'OK', fromUnixTimestamp64Milli(1700000000000-number), 1.0 FROM numbers(5001)").execute().await.unwrap();
+    let stream = global_traces::clickhouse(&h.probe, &lifetime, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &lifetime).await.unwrap();
+    assert_eq!(page.total, 5_046);
+    assert_eq!(page.data.len(), 100);
 }

@@ -47,10 +47,131 @@ pub use platform::{
     normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
 };
 
+/// How the deployer linked an OOM kill to the failed build step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OomAttribution {
+    /// The step's own process was killed (exit status 137).
+    StepKilled,
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// and no other build was running.
+    VictimWasBuildStep,
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// while other builds were running; it died within seconds of this
+    /// step's failure, which is what a killed child of the step looks like,
+    /// but it could belong to one of the other builds.
+    VictimWasBuildStepConcurrent {
+        other_builds: usize,
+        seconds_before_failure: u32,
+    },
+    /// A process on the host was killed while this was the only build
+    /// running; the kernel log was not readable to confirm which one.
+    OnlyBuildRunning,
+}
+
+/// What the deployer observed about memory pressure around a failed build step.
+///
+/// Produced by `DockerRuntime` when a step's failure coincides with a kernel
+/// OOM kill on the build host or the step reports the SIGKILL exit status.
+/// The fields carry numbers so callers can explain the failure without
+/// re-deriving them; `Display` renders them as one factual sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildMemoryDiagnosis {
+    /// How the kill was linked to this build.
+    pub attribution: OomAttribution,
+    /// Command name of the killed process when the kernel log named it.
+    pub victim: Option<String>,
+    /// Processes the kernel's OOM killer terminated on the build host while
+    /// the build ran (`/proc/vmstat` `oom_kill` delta). `None` when the
+    /// counter is unavailable or the daemon is not on this host.
+    pub host_oom_kills: Option<u64>,
+    /// The failing step's exit status as reported by the builder.
+    pub exit_code: Option<i32>,
+    /// Total RAM of the build host in MB, when the daemon is on this host.
+    pub host_memory_mb: Option<u64>,
+    /// Per-build memory cap requested from the daemon, in MB.
+    pub requested_cap_mb: u64,
+    /// Whether the daemon applies that cap to build steps. Docker's BuildKit
+    /// builder ignores the memory and CPU options of the image build API, so
+    /// this is false on BuildKit hosts.
+    pub cap_enforced: bool,
+}
+
+impl std::fmt::Display for BuildMemoryDiagnosis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.attribution {
+            OomAttribution::StepKilled | OomAttribution::VictimWasBuildStep => {
+                write!(f, "The build step ran out of memory")?
+            }
+            OomAttribution::VictimWasBuildStepConcurrent { .. }
+            | OomAttribution::OnlyBuildRunning => {
+                write!(f, "The build step most likely ran out of memory")?
+            }
+        }
+        match self.host_oom_kills {
+            Some(1) => write!(
+                f,
+                ": the kernel's OOM killer terminated 1 process on this host while the step ran"
+            )?,
+            Some(n) if n > 1 => write!(
+                f,
+                ": the kernel's OOM killer terminated {n} processes on this host while the step ran"
+            )?,
+            _ => {}
+        }
+        if let Some(victim) = &self.victim {
+            write!(f, "; the killed process was `{victim}` in a build step")?;
+        }
+        match self.attribution {
+            OomAttribution::OnlyBuildRunning | OomAttribution::VictimWasBuildStep => {
+                write!(f, "; no other build was running")?
+            }
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds,
+                seconds_before_failure,
+            } => write!(
+                f,
+                ", killed {seconds_before_failure} s before this step failed while {other_builds} \
+                 other build(s) were running, so it may belong to one of them"
+            )?,
+            OomAttribution::StepKilled => {}
+        }
+        match self.exit_code {
+            Some(137) => write!(f, "; the step's process was killed (exit code 137)")?,
+            Some(code) => write!(
+                f,
+                "; the step exited with code {code} after one of its processes was killed"
+            )?,
+            None => {}
+        }
+        if let Some(mb) = self.host_memory_mb {
+            write!(f, "; host RAM {mb} MB")?;
+        }
+        if self.cap_enforced {
+            write!(f, "; per-build cap {} MB, enforced", self.requested_cap_mb)?;
+        } else {
+            write!(
+                f,
+                "; per-build cap {} MB requested from Docker but not enforced by BuildKit",
+                self.requested_cap_mb
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum BuilderError {
     #[error("Build failed: {0}")]
     BuildFailed(String),
+
+    /// A build step failed and the host or builder showed the step ran out
+    /// of memory. `message` is the builder's own error text, including the
+    /// `Build failed:` prefix when it came from the build stream.
+    #[error("{message}. {diagnosis}")]
+    BuildOutOfMemory {
+        message: String,
+        diagnosis: BuildMemoryDiagnosis,
+    },
 
     #[error("Build cancelled by user")]
     BuildCancelled,
@@ -1406,5 +1527,109 @@ CMD ["echo", "Hello from container"]
         assert_eq!(deserialized.memory_limit_mb, limits.memory_limit_mb);
 
         println!("✅ Serde compatibility test passed");
+    }
+
+    #[test]
+    fn build_memory_diagnosis_reads_as_one_factual_sentence() {
+        let buildkit = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStep,
+            victim: Some("node".into()),
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = buildkit.to_string();
+        assert!(
+            text.starts_with("The build step ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("terminated 1 process on this host"), "{text}");
+        assert!(
+            text.contains("the killed process was `node` in a build step"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
+        assert!(
+            text.contains("exited with code 1 after one of its processes was killed"),
+            "{text}"
+        );
+        assert!(text.contains("host RAM 3902 MB"), "{text}");
+        assert!(
+            text.contains("2047 MB requested from Docker but not enforced by BuildKit"),
+            "{text}"
+        );
+
+        let legacy = BuildMemoryDiagnosis {
+            attribution: OomAttribution::StepKilled,
+            victim: None,
+            host_oom_kills: Some(2),
+            exit_code: Some(137),
+            host_memory_mb: None,
+            requested_cap_mb: 512,
+            cap_enforced: true,
+        };
+        let text = legacy.to_string();
+        assert!(
+            text.starts_with("The build step ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("terminated 2 processes"), "{text}");
+        assert!(text.contains("killed (exit code 137)"), "{text}");
+        assert!(!text.contains("host RAM"), "{text}");
+        assert!(text.contains("per-build cap 512 MB, enforced"), "{text}");
+
+        let error = BuilderError::BuildOutOfMemory {
+            message: "process did not complete successfully: exit code: 137".into(),
+            diagnosis: legacy,
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("process did not complete successfully: exit code: 137. The build"),
+            "{text}"
+        );
+        assert!(text.contains("ran out of memory"), "{text}");
+
+        let hedged = BuildMemoryDiagnosis {
+            attribution: OomAttribution::OnlyBuildRunning,
+            victim: None,
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = hedged.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
+
+        let concurrent = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: 1,
+                seconds_before_failure: 0,
+            },
+            victim: Some("node".into()),
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = concurrent.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`node` in a build step, killed 0 s before this step failed while 1 other \
+                 build(s) were running, so it may belong to one of them"
+            ),
+            "{text}"
+        );
     }
 }

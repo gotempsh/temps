@@ -66,7 +66,7 @@ export function BuildLimitsPage() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
-      toast.success('Build limits saved — applies to the next build')
+      toast.success('Build limits saved, applied on the next temps serve start')
     } catch {
       toast.error('Failed to save build limits')
     }
@@ -143,7 +143,8 @@ export function BuildLimitsPage() {
                 })}
               />
               <p className="text-xs text-muted-foreground">
-                E.g. 2.0 = 2 cores. 0 = use legacy 50%-of-host default.
+                E.g. 2.0 = 2 cores. 0 = use legacy 50%-of-host default. Legacy
+                builder only; ignored by BuildKit.
               </p>
               {errors.build_limits?.cpu_limit_cores && (
                 <p className="text-xs text-destructive">
@@ -166,9 +167,11 @@ export function BuildLimitsPage() {
                 })}
               />
               <p className="text-xs text-muted-foreground">
-                Hard cap — builds that exceed this OOM-kill. 0 = use legacy
-                50%-of-host default. Note: Docker BuildKit caps memory at ~2 GB
-                (i32 max bytes); higher values are silently truncated.
+                0 = use legacy 50%-of-host default. Applied only by
+                Docker&apos;s legacy builder: BuildKit (the default) ignores
+                per-build CPU and memory caps, so build steps run uncapped on
+                BuildKit hosts. Values above 2047 MB are reduced to 2047 MB, the
+                most the build API accepts.
               </p>
               {errors.build_limits?.memory_limit_mb && (
                 <p className="text-xs text-destructive">
@@ -182,10 +185,10 @@ export function BuildLimitsPage() {
             <AlertCircle className="h-4 w-4" />
             <AlertTitle>How limits apply</AlertTitle>
             <AlertDescription>
-              Concurrency takes effect on the next plugin restart (i.e. next
+              All three settings take effect on the next
               <code className="mx-1 rounded bg-muted px-1">temps serve</code>
-              start). Per-build CPU/memory caps apply to the very next build —
-              no restart needed.
+              start. A build step that runs out of memory is reported as such in
+              the deployment log.
             </AlertDescription>
           </Alert>
         </CardContent>

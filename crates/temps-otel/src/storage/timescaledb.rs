@@ -9,7 +9,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement,
+    TransactionTrait,
+};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -243,6 +246,33 @@ impl S3LogArchiver {
 }
 
 impl TimescaleDbStorage {
+    async fn trace_summary_rebuild_pending(&self) -> StorageResult<bool> {
+        let state_exists = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass('otel_trace_summary_rebuild_state') IS NOT NULL AS present"
+                    .to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<bool>("", "present").ok())
+            .unwrap_or(false);
+        if !state_exists {
+            return Ok(false);
+        }
+        Ok(self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+                 WHERE NOT completed) AS pending"
+                    .to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<bool>("", "pending").ok())
+            .unwrap_or(false))
+    }
+
     pub fn new(db: Arc<DatabaseConnection>, s3_client: Option<Arc<S3LogArchiver>>) -> Self {
         Self {
             db,
@@ -441,7 +471,10 @@ impl TimescaleDbStorage {
     /// `timescaledb_storage_test.rs::duplicate_batch_insert_duplicates_rows`
     /// pins the current non-idempotent behaviour so this comment cannot go
     /// stale silently.
-    async fn batch_insert_spans(&self, spans: &[SpanRecord]) -> StorageResult<u64> {
+    async fn batch_insert_spans<C>(&self, db: &C, spans: &[SpanRecord]) -> StorageResult<u64>
+    where
+        C: ConnectionTrait,
+    {
         if spans.is_empty() {
             return Ok(0);
         }
@@ -516,8 +549,7 @@ impl TimescaleDbStorage {
             }
         }
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -544,15 +576,19 @@ impl TimescaleDbStorage {
     /// `span_count`/`error_count` add, `start_time` takes the LEAST, and
     /// `duration_ms` takes the GREATEST. The root span (parent_span_id IS NULL)
     /// owns `root_span_name`/`service_name`/`kind`/`deployment_environment`/
-    /// `deployment_id`; once a root has been recorded (`has_root = true`) a
-    /// later non-root span never overwrites those fields. If the root arrives
-    /// after some children, it claims them on its batch.
+    /// `deployment_id`; before a root arrives, the longest child span provides
+    /// a useful fallback identity. Once a root has been recorded (`has_root =
+    /// true`) a later non-root span never overwrites those fields.
     ///
     /// This runs on the ingest hot path but adds only one statement per batch
     /// (rows = distinct traces in the batch, not spans), against a small, hot,
-    /// index-cached table. Callers treat a failure here as non-fatal: the spans
-    /// are already durably stored, so a summary hiccup must not fail ingest.
-    async fn upsert_trace_summaries(&self, spans: &[SpanRecord]) -> StorageResult<u64> {
+    /// index-cached table. This statement runs in the same transaction as the
+    /// raw-span insert, so either both durable representations commit or
+    /// neither does.
+    async fn upsert_trace_summaries<C>(&self, db: &C, spans: &[SpanRecord]) -> StorageResult<u64>
+    where
+        C: ConnectionTrait,
+    {
         if spans.is_empty() {
             return Ok(0);
         }
@@ -567,8 +603,8 @@ impl TimescaleDbStorage {
         // a rootless later batch (has_root = false) keeps the stored values.
         let mut sql = String::from(
             "INSERT INTO otel_trace_summaries (
-                project_id, trace_id, root_span_name, service_name, kind,
-                deployment_environment, deployment_id, start_time, duration_ms,
+                project_id, trace_id, identity_span_id, root_span_name, service_name, kind,
+                deployment_environment, deployment_id, start_time, last_span_start_time, duration_ms,
                 span_count, error_count, has_root, last_seen
             ) VALUES ",
         );
@@ -579,9 +615,9 @@ impl TimescaleDbStorage {
             if i > 0 {
                 sql.push_str(", ");
             }
-            // 12 bound params per row; last_seen uses now() in SQL.
+            // 14 bound params per row; last_seen uses now() in SQL.
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now())",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now())",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -594,15 +630,18 @@ impl TimescaleDbStorage {
                 param_idx + 9,
                 param_idx + 10,
                 param_idx + 11,
+                param_idx + 12,
+                param_idx + 13,
             ));
-            param_idx += 12;
+            param_idx += 14;
 
             values.extend_from_slice(&[
                 d.project_id.into(),
                 d.trace_id.clone().into(),
-                // Empty-string defaults for root fields when this batch has no
-                // root yet; they won't overwrite a stored root because the
-                // ON CONFLICT clause guards on EXCLUDED.has_root.
+                d.identity_span_id.clone().into(),
+                // Root fields contain the longest-child fallback when the
+                // batch has no root. The conflict clause never lets a fallback
+                // overwrite an identity already supplied by a root.
                 d.root_span_name.clone().unwrap_or_default().into(),
                 d.root_service_name.clone().unwrap_or_default().into(),
                 d.root_kind
@@ -612,6 +651,7 @@ impl TimescaleDbStorage {
                 d.root_env.clone().into(),
                 d.root_deployment_id.into(),
                 d.start_time.into(),
+                d.last_span_start_time.into(),
                 d.max_duration_ms.into(),
                 d.span_count.into(),
                 d.error_count.into(),
@@ -624,25 +664,46 @@ impl TimescaleDbStorage {
                 span_count  = otel_trace_summaries.span_count + EXCLUDED.span_count,
                 error_count = otel_trace_summaries.error_count + EXCLUDED.error_count,
                 start_time  = LEAST(otel_trace_summaries.start_time, EXCLUDED.start_time),
+                last_span_start_time = GREATEST(otel_trace_summaries.last_span_start_time, EXCLUDED.last_span_start_time),
                 duration_ms = GREATEST(otel_trace_summaries.duration_ms, EXCLUDED.duration_ms),
                 last_seen   = now(),
-                -- Root identity: adopt this batch's root only if we don't have
-                -- one yet AND this batch brought one. Otherwise keep stored.
+                -- Identity: a root always replaces a fallback. Until a root
+                -- arrives, keep the identity of the longest span seen so a
+                -- rootless trace remains useful in list views.
                 has_root       = otel_trace_summaries.has_root OR EXCLUDED.has_root,
-                root_span_name = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                root_span_name = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
                                       THEN EXCLUDED.root_span_name ELSE otel_trace_summaries.root_span_name END,
-                service_name   = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                service_name   = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
                                       THEN EXCLUDED.service_name ELSE otel_trace_summaries.service_name END,
-                kind           = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                kind           = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
                                       THEN EXCLUDED.kind ELSE otel_trace_summaries.kind END,
-                deployment_environment = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                deployment_environment = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
                                       THEN EXCLUDED.deployment_environment ELSE otel_trace_summaries.deployment_environment END,
-                deployment_id  = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
-                                      THEN EXCLUDED.deployment_id ELSE otel_trace_summaries.deployment_id END",
+                deployment_id  = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
+                                      THEN EXCLUDED.deployment_id ELSE otel_trace_summaries.deployment_id END,
+                identity_span_id = CASE WHEN NOT otel_trace_summaries.has_root AND
+                                           (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                                            (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id) OR
+                                            otel_trace_summaries.root_span_name = '')
+                                      THEN EXCLUDED.identity_span_id ELSE otel_trace_summaries.identity_span_id END",
         );
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -808,6 +869,10 @@ struct P95Row {
 
 #[async_trait]
 impl OtelStorage for TimescaleDbStorage {
+    async fn global_lifetime_summaries_ready(&self) -> StorageResult<bool> {
+        Ok(!super::global_traces::trace_summary_rebuild_pending(&self.db).await?)
+    }
+
     async fn global_trace_stream(
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,
@@ -819,22 +884,33 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
-        let stored = self.batch_insert_spans(&spans).await?;
-
-        // Maintain the pre-aggregated trace-summary table that backs the list
-        // view. Fail-soft: the spans are already durably written, so a summary
-        // upsert error must not fail ingest — the worst case is a trace that's
-        // momentarily missing or stale in the list until its next span arrives
-        // (or until a backfill/reconcile runs). Log and continue.
-        if let Err(e) = self.upsert_trace_summaries(&spans).await {
-            warn!(
-                error = %e,
-                span_count = spans.len(),
-                "failed to upsert otel_trace_summaries; spans stored, summary will lag"
-            );
+        if spans.is_empty() {
+            return Ok(0);
         }
 
-        Ok(stored)
+        let transaction = self.db.begin().await?;
+        let result = async {
+            let stored = self.batch_insert_spans(&transaction, &spans).await?;
+            self.upsert_trace_summaries(&transaction, &spans).await?;
+            Ok::<_, OtelError>(stored)
+        }
+        .await;
+        match result {
+            Ok(stored) => {
+                transaction.commit().await?;
+                Ok(stored)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    error!(
+                        error = %rollback_error,
+                        span_count = spans.len(),
+                        "failed to roll back span and summary transaction"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
@@ -1654,7 +1730,7 @@ impl OtelStorage for TimescaleDbStorage {
     /// span-level filter the summary table can't satisfy (`attributes` or
     /// `name_pattern`); see `query_trace_summaries_from_spans`.
     async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>> {
-        if needs_span_level_filter(&query) {
+        if needs_span_level_filter(&query) || self.trace_summary_rebuild_pending().await? {
             return self.query_trace_summaries_from_spans(query).await;
         }
         self.query_trace_summaries_from_table(query).await
@@ -1663,7 +1739,7 @@ impl OtelStorage for TimescaleDbStorage {
     /// Count traces matching the query, for pagination. Mirrors the dispatch in
     /// `query_trace_summaries` so the count matches the listed rows exactly.
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
-        if needs_span_level_filter(&query) {
+        if needs_span_level_filter(&query) || self.trace_summary_rebuild_pending().await? {
             return self.count_traces_from_spans(query).await;
         }
         self.count_traces_from_table(query).await
@@ -1676,11 +1752,16 @@ impl OtelStorage for TimescaleDbStorage {
     /// is indexed on `project_id`, so `EXISTS (... LIMIT 1)` is an index
     /// lookup regardless of how many traces the project has accumulated.
     async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let table = if self.trace_summary_rebuild_pending().await? {
+            "otel_spans"
+        } else {
+            "otel_trace_summaries"
+        };
         let result = self
             .db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT EXISTS(SELECT 1 FROM otel_trace_summaries WHERE project_id = $1 LIMIT 1) AS has_traces",
+                format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE project_id = $1 LIMIT 1) AS has_traces"),
                 vec![project_id.into()],
             ))
             .await?;
@@ -1693,6 +1774,39 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
+        let rebuild_pending = self.trace_summary_rebuild_pending().await?;
+
+        // While the durable rebuild marker is pending, the summary table is
+        // explicitly not authoritative. A legacy trace may therefore be
+        // present in the raw hypertable without any summary row, including
+        // outside the normal seven-day direct-link fallback. Prefer
+        // correctness during this bounded maintenance window and scan the
+        // retained raw data for the requested trace. Once reconciliation
+        // completes, the indexed summary-derived window below is restored.
+        if rebuild_pending {
+            let results = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"
+                        SELECT project_id, deployment_id, service_name, service_version,
+                               deployment_environment, trace_id, span_id, parent_span_id,
+                               name, kind, start_time, end_time, duration_ms,
+                               status_code, status_message, attributes, events
+                        FROM otel_spans
+                        WHERE project_id = $1 AND trace_id = $2
+                        ORDER BY start_time ASC
+                    "#,
+                    vec![project_id.into(), trace_id.to_string().into()],
+                ))
+                .await?;
+
+            return Ok(results
+                .iter()
+                .filter_map(|row| parse_span_row(row).ok())
+                .collect());
+        }
+
         // Two-phase lookup. Phase 1: fetch the trace's time window from
         // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans
         // bounded to that window so hypertable chunk exclusion prunes the
@@ -2947,14 +3061,14 @@ impl OtelStorage for TimescaleDbStorage {
         // hypertable, so no native retention policy covers it. A summary row
         // can't outlive the spans it derives from, which `otel_spans` expires
         // at 90 days, so we sweep summaries on the same window here. This is a
-        // plain indexed DELETE on `start_time` (idx_otel_trace_summaries_start)
+        // plain indexed DELETE on `last_span_start_time`
         // and does not race any Timescale `drop_chunks` worker, since the
         // summary table has no chunks.
         let deleted = self
             .db
             .execute(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "DELETE FROM otel_trace_summaries WHERE start_time < now() - INTERVAL '90 days'"
+                "DELETE FROM otel_trace_summaries WHERE last_span_start_time < now() - INTERVAL '90 days'"
                     .to_string(),
             ))
             .await
@@ -3477,7 +3591,7 @@ impl TimescaleDbStorage {
     /// list/count queries. Returns `(where_sql, values, next_param_idx)`.
     ///
     /// All filters map to indexed `ts` columns:
-    /// - time window → `ts.start_time` (the trace's earliest span)
+    /// - time window → an indexed existence check for a span in the window
     /// - `status` → `ts.error_count > 0` / `= 0` (partial index for errors)
     /// - `min_duration_ms` → `ts.duration_ms` (the trace's longest span)
     /// - `environment_id` → `ts.deployment_id IN (SELECT … environment_id = ?)`
@@ -3503,15 +3617,29 @@ impl TimescaleDbStorage {
             values.push(min_dur.into());
             param_idx += 1;
         }
+        let mut time_clauses = Vec::new();
+        let has_start = query.start_time.is_some();
+        let has_end = query.end_time.is_some();
         if let Some(start) = query.start_time {
-            where_clauses.push(format!("ts.start_time >= ${param_idx}"));
+            where_clauses.push(format!("ts.last_span_start_time >= ${param_idx}"));
+            time_clauses.push(format!("window_span.start_time >= ${param_idx}"));
             values.push(start.into());
             param_idx += 1;
         }
         if let Some(end) = query.end_time {
             where_clauses.push(format!("ts.start_time <= ${param_idx}"));
+            time_clauses.push(format!("window_span.start_time <= ${param_idx}"));
             values.push(end.into());
             param_idx += 1;
+        }
+        // A single bound is represented exactly by the summary MIN/MAX. With
+        // both bounds, reject traces whose spans only straddle the window by
+        // building one time-pruned candidate trace set from raw spans.
+        if has_start && has_end {
+            where_clauses.push(format!(
+                "ts.trace_id IN (SELECT window_span.trace_id FROM otel_spans window_span WHERE window_span.project_id = $1 AND {} GROUP BY window_span.trace_id)",
+                time_clauses.join(" AND ")
+            ));
         }
         if let Some(deployment_id) = query.deployment_id {
             where_clauses.push(format!("ts.deployment_id = ${param_idx}"));
@@ -3982,15 +4110,17 @@ fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
 }
 
 /// One trace's worth of aggregates folded from a span batch, ready to upsert
-/// into `otel_trace_summaries`. The root fields are `Some` only when this batch
-/// carried the trace's root span (parent_span_id IS NULL); otherwise the upsert
-/// leaves the stored row's root identity untouched.
+/// into `otel_trace_summaries`. Until a root span arrives, the identity fields
+/// describe the longest child span in the batch so rootless traces still have
+/// a useful name and service in list views.
 #[derive(Debug, Clone, PartialEq)]
 struct TraceDelta {
     project_id: i32,
     trace_id: String,
     /// Earliest span start seen in this batch for the trace.
     start_time: DateTime<Utc>,
+    /// Latest span start seen in this batch for summary retention.
+    last_span_start_time: DateTime<Utc>,
     /// Longest span duration seen in this batch for the trace.
     max_duration_ms: f64,
     span_count: i64,
@@ -4001,6 +4131,9 @@ struct TraceDelta {
     root_env: Option<String>,
     root_deployment_id: Option<i32>,
     has_root: bool,
+    /// Used only while folding to choose a deterministic rootless fallback.
+    identity_duration_ms: f64,
+    identity_span_id: String,
 }
 
 /// Fold a span batch into one [`TraceDelta`] per distinct `(project_id,
@@ -4013,8 +4146,9 @@ struct TraceDelta {
 /// - `start_time` is the MIN and `max_duration_ms` the MAX across the batch
 ///   (combined with the stored row via LEAST/GREATEST on upsert).
 /// - The first root span encountered (parent_span_id IS NULL) sets the root
-///   identity fields; later spans never overwrite them within the batch. A
-///   batch with no root leaves all root fields `None` / `has_root = false`.
+///   identity fields; later spans never overwrite them within the batch. Until
+///   then, the longest child supplies the identity, with `span_id` as a stable
+///   tie-breaker both within and across ingest batches.
 ///
 /// Output order is deterministic (sorted by `(project_id, trace_id)`) so the
 /// generated multi-row INSERT and tests are stable.
@@ -4032,6 +4166,7 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
             project_id: s.project_id,
             trace_id: s.trace_id.clone(),
             start_time: s.start_time,
+            last_span_start_time: s.start_time,
             max_duration_ms: 0.0,
             span_count: 0,
             error_count: 0,
@@ -4041,6 +4176,8 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
             root_env: None,
             root_deployment_id: None,
             has_root: false,
+            identity_duration_ms: f64::NEG_INFINITY,
+            identity_span_id: String::new(),
         });
 
         entry.span_count += 1;
@@ -4050,9 +4187,18 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
         if s.start_time < entry.start_time {
             entry.start_time = s.start_time;
         }
+        if s.start_time > entry.last_span_start_time {
+            entry.last_span_start_time = s.start_time;
+        }
         if s.duration_ms > entry.max_duration_ms {
             entry.max_duration_ms = s.duration_ms;
         }
+        let should_use_fallback = !entry.has_root
+            && !is_root
+            && (entry.root_span_name.is_none()
+                || s.duration_ms > entry.identity_duration_ms
+                || (s.duration_ms == entry.identity_duration_ms
+                    && s.span_id < entry.identity_span_id));
         if is_root && !entry.has_root {
             // First root span in this batch wins the trace's identity.
             entry.has_root = true;
@@ -4061,6 +4207,16 @@ fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
             entry.root_kind = Some(s.kind.to_string());
             entry.root_env = s.resource.deployment_environment.clone();
             entry.root_deployment_id = s.deployment_id;
+            entry.identity_duration_ms = s.duration_ms;
+            entry.identity_span_id = s.span_id.clone();
+        } else if should_use_fallback {
+            entry.root_span_name = Some(s.name.clone());
+            entry.root_service_name = Some(s.resource.service_name.clone());
+            entry.root_kind = Some(s.kind.to_string());
+            entry.root_env = s.resource.deployment_environment.clone();
+            entry.root_deployment_id = s.deployment_id;
+            entry.identity_duration_ms = s.duration_ms;
+            entry.identity_span_id = s.span_id.clone();
         }
     }
 
@@ -4316,6 +4472,7 @@ mod tests {
         assert_eq!(a.error_count, 1);
         // start_time is the MIN (the root at +10s), duration the MAX (250ms).
         assert_eq!(a.start_time, ts(10));
+        assert_eq!(a.last_span_start_time, ts(12));
         assert_eq!(a.max_duration_ms, 250.0);
 
         let b = &deltas[1];
@@ -4348,20 +4505,23 @@ mod tests {
     }
 
     #[test]
-    fn fold_batch_without_root_leaves_root_fields_unset() {
-        // A batch of only child spans (late, before the root arrives). The
-        // delta must carry has_root=false so the upsert won't clobber a stored
-        // root identity with empty strings.
-        let spans = vec![
-            span(1, "T", "c1", Some("root"), 6, 100.0, SpanStatusCode::Ok),
-            span(1, "T", "c2", Some("root"), 7, 120.0, SpanStatusCode::Error),
-        ];
+    fn fold_batch_without_root_uses_longest_child_as_identity() {
+        // A rootless trace must still be identifiable in the summary-backed
+        // list. Equal-duration children use span_id for deterministic results.
+        let mut c1 = span(1, "T", "c1", Some("root"), 6, 120.0, SpanStatusCode::Ok);
+        c1.name = "shorter-id wins tie".to_string();
+        c1.resource.service_name = "worker-a".to_string();
+        let mut c2 = span(1, "T", "c2", Some("root"), 7, 120.0, SpanStatusCode::Error);
+        c2.name = "longer-id loses tie".to_string();
+        c2.resource.service_name = "worker-b".to_string();
+        let spans = vec![c2, c1];
         let deltas = fold_trace_deltas(&spans);
         assert_eq!(deltas.len(), 1);
         let d = &deltas[0];
         assert!(!d.has_root);
-        assert!(d.root_span_name.is_none());
-        assert!(d.root_kind.is_none());
+        assert_eq!(d.root_span_name.as_deref(), Some("shorter-id wins tie"));
+        assert_eq!(d.root_service_name.as_deref(), Some("worker-a"));
+        assert_eq!(d.root_kind.as_deref(), Some("SERVER"));
         // counts still accumulate for late spans
         assert_eq!(d.span_count, 2);
         assert_eq!(d.error_count, 1);
@@ -4686,9 +4846,12 @@ mod tests {
             ("start_time", start.into()),
             ("duration_ms", 1500.0_f64.into()),
         ]);
+        let rebuild_state_absent: BTreeMap<&str, sea_orm::Value> =
+            BTreeMap::from([("present", false.into())]);
 
         let conn = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![rebuild_state_absent]])
                 .append_query_results([vec![summary_row]])
                 .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
                 .into_connection(),
@@ -4702,8 +4865,12 @@ mod tests {
         let log = Arc::try_unwrap(conn)
             .unwrap_or_else(|_| panic!("connection still shared"))
             .into_transaction_log();
-        assert_eq!(log.len(), 2, "summary lookup + bounded span query");
-        let span_query = format!("{:?}", log[1]);
+        assert_eq!(
+            log.len(),
+            3,
+            "rebuild-state check + summary lookup + bounded span query"
+        );
+        let span_query = format!("{:?}", log[2]);
         assert!(
             span_query.contains("start_time >= $3"),
             "span query must be time-bounded, got: {span_query}"
@@ -4728,8 +4895,11 @@ mod tests {
         use sea_orm::{DatabaseBackend, MockDatabase};
         use std::collections::BTreeMap;
 
+        let rebuild_state_absent: BTreeMap<&str, sea_orm::Value> =
+            BTreeMap::from([("present", false.into())]);
         let conn = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![rebuild_state_absent]])
                 .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
                 .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
                 .into_connection(),
@@ -4743,8 +4913,12 @@ mod tests {
         let log = Arc::try_unwrap(conn)
             .unwrap_or_else(|_| panic!("connection still shared"))
             .into_transaction_log();
-        assert_eq!(log.len(), 2, "summary lookup + fallback span query");
-        let span_query = format!("{:?}", log[1]);
+        assert_eq!(
+            log.len(),
+            3,
+            "rebuild-state check + summary lookup + fallback span query"
+        );
+        let span_query = format!("{:?}", log[2]);
         assert!(
             span_query.contains("start_time >= $3") && span_query.contains("start_time <= $4"),
             "fallback query must be bounded to the recent window, got: {span_query}"

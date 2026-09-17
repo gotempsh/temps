@@ -893,7 +893,8 @@ impl AnalyticsEventsService {
     }
 
     /// Get the count of active visitors in real-time
-    /// Active visitors are defined as unique sessions with events in the last 5 minutes
+    /// Active visitors are defined as identified (non-anonymous, non-crawler) visitors
+    /// with events in the last 5 minutes -- matches the `get_live_visitors` list definition.
     pub async fn get_active_visitors_count(
         &self,
         project_id: i32,
@@ -901,12 +902,13 @@ impl AnalyticsEventsService {
         deployment_id: Option<i32>,
     ) -> Result<i64, EventsError> {
         // Define active window as last 5 minutes
-        let query = r#"SELECT COUNT(DISTINCT session_id)::bigint as active_visitors
+        let query = r#"SELECT COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint as active_visitors
 FROM events
 WHERE project_id = $1
   AND ($2::int IS NULL OR environment_id = $2)
   AND ($3::int IS NULL OR deployment_id = $3)
-  AND timestamp >= NOW() - INTERVAL '5 minutes'"#;
+  AND timestamp >= NOW() - INTERVAL '5 minutes'
+  AND is_crawler = false"#;
 
         #[derive(FromQueryResult)]
         struct ActiveVisitorsResult {
@@ -3185,6 +3187,177 @@ mod tests {
         println!("   - All hourly buckets present (including gaps)");
         println!("   - Counts accurate for existing data");
         println!("   - Zero counts for missing hours");
+    }
+
+    /// Regression for issue #1020: the active-visitors badge must count
+    /// identified visitors, not sessions, and must exclude crawlers/anonymous
+    /// traffic -- the same definition `get_live_visitors` uses. A visitor
+    /// active across 2 sessions (multi-tab), an anonymous session with no
+    /// `visitor_id`, and a crawler are all inside the 5-minute window: the
+    /// count must be 1, not 3.
+    #[tokio::test]
+    async fn test_active_visitors_count_counts_identified_visitors_not_sessions() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{deployments, environments, events, projects, visitor};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                // Only skip for an actually-missing container runtime --
+                // otherwise a real regression (e.g. a broken migration)
+                // would silently report as "skipped" instead of failing.
+                if !is_container_runtime_unavailable(&error.to_string()) {
+                    panic!("active-visitors count test setup failed: {error}");
+                }
+                eprintln!(
+                    "Skipping active-visitors count test: container runtime unavailable: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let _project = projects::ActiveModel {
+            id: Set(1),
+            name: Set("Test Project".to_string()),
+            repo_name: Set("test-project".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set("test-project".to_string()),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to create project");
+
+        let _environment = environments::ActiveModel {
+            id: Set(1),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("test".to_string()),
+            host: Set("test.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            project_id: Set(1),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to create environment");
+
+        let _deployment = deployments::ActiveModel {
+            id: Set(1),
+            project_id: Set(1),
+            environment_id: Set(1),
+            slug: Set("test-deployment".to_string()),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to create deployment");
+
+        let now = Utc::now();
+
+        let visitor1 = visitor::ActiveModel {
+            visitor_id: Set("visitor1".to_string()),
+            project_id: Set(1),
+            environment_id: Set(1),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to create visitor1");
+
+        let bot_visitor = visitor::ActiveModel {
+            visitor_id: Set("bot-visitor".to_string()),
+            project_id: Set(1),
+            environment_id: Set(1),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to create bot visitor");
+
+        let base = events::ActiveModel {
+            project_id: Set(1),
+            environment_id: Set(Some(1)),
+            deployment_id: Set(Some(1)),
+            event_type: Set("page_view".to_string()),
+            hostname: Set("test.com".to_string()),
+            pathname: Set("/".to_string()),
+            page_path: Set("/".to_string()),
+            href: Set("http://test.com/".to_string()),
+            ..Default::default()
+        };
+
+        // Same visitor, two tabs/sessions, both inside the window.
+        events::ActiveModel {
+            visitor_id: Set(Some(visitor1.id)),
+            session_id: Set(Some("session-tab-1".to_string())),
+            timestamp: Set(now - chrono::Duration::minutes(2)),
+            ..base.clone()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert tab-1 event");
+
+        events::ActiveModel {
+            visitor_id: Set(Some(visitor1.id)),
+            session_id: Set(Some("session-tab-2".to_string())),
+            timestamp: Set(now - chrono::Duration::minutes(1)),
+            ..base.clone()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert tab-2 event");
+
+        // Anonymous session, no visitor_id, inside the window.
+        events::ActiveModel {
+            visitor_id: Set(None),
+            session_id: Set(Some("session-anonymous".to_string())),
+            timestamp: Set(now - chrono::Duration::minutes(1)),
+            ..base.clone()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert anonymous event");
+
+        // Crawler, inside the window.
+        events::ActiveModel {
+            visitor_id: Set(Some(bot_visitor.id)),
+            session_id: Set(Some("session-bot".to_string())),
+            timestamp: Set(now - chrono::Duration::minutes(1)),
+            is_crawler: Set(true),
+            ..base
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert crawler event");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        let active_visitors = service
+            .get_active_visitors_count(1, None, None)
+            .await
+            .expect("Failed to get active visitors count");
+
+        assert_eq!(
+            active_visitors, 1,
+            "expected 1 identified visitor (multi-tab session counted once, \
+             anonymous and crawler sessions excluded), got {active_visitors}"
+        );
     }
 
     /// Verifies that `record_event` persists the bot/crawler classification

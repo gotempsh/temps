@@ -10,7 +10,7 @@ use sea_orm::{
 use std::sync::Arc;
 use thiserror::Error;
 
-use temps_entities::{deployment_containers, deployments, nodes};
+use temps_entities::{deployment_containers, deployments, environments, nodes};
 
 #[derive(Error, Debug)]
 pub enum NodeError {
@@ -859,6 +859,21 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
 
+        if deploys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let environment_ids: Vec<i32> = deploys
+            .iter()
+            .map(|deployment| deployment.environment_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let affected_environments = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(environment_ids))
+            .all(self.db.as_ref())
+            .await?;
+
         // For each deployment, count ALL active containers (on any node)
         let all_containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::DeploymentId.is_in(deployment_ids))
@@ -881,6 +896,10 @@ impl NodeService {
                 project_id: deploy.project_id,
                 environment_id: deploy.environment_id,
                 deployment_id: deploy.id,
+                is_current: affected_environments.iter().any(|environment| {
+                    environment.id == deploy.environment_id
+                        && environment.current_deployment_id == Some(deploy.id)
+                }),
                 containers_on_node: on_node,
                 total_active_containers: total,
             });
@@ -978,6 +997,9 @@ pub struct AffectedDeployment {
     pub project_id: i32,
     pub environment_id: i32,
     pub deployment_id: i32,
+    /// Whether this deployment is the environment's canonical serving
+    /// deployment according to `environments.current_deployment_id`.
+    pub is_current: bool,
     /// Number of active containers for this deployment on the affected node.
     pub containers_on_node: usize,
     /// Total number of active containers for this deployment across all nodes.
@@ -988,7 +1010,7 @@ impl AffectedDeployment {
     /// Returns true if removing containers on the affected node leaves zero replicas.
     /// In this case a full redeploy is needed to maintain availability.
     pub fn needs_redeploy(&self) -> bool {
-        self.total_active_containers <= self.containers_on_node
+        self.is_current && self.total_active_containers <= self.containers_on_node
     }
 }
 
@@ -1340,6 +1362,35 @@ mod tests {
             upload_request_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn sample_environment(
+        id: i32,
+        project_id: i32,
+        current_deployment_id: Option<i32>,
+    ) -> environments::Model {
+        environments::Model {
+            id,
+            name: format!("environment-{id}"),
+            slug: format!("environment-{id}"),
+            subdomain: format!("environment-{id}.example.com"),
+            last_deployment: None,
+            host: format!("environment-{id}.example.com"),
+            upstreams: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            project_id,
+            current_deployment_id,
+            branch: Some("main".to_string()),
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
         }
     }
 
@@ -1784,6 +1835,7 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 3,
             total_active_containers: 3,
         };
@@ -1796,6 +1848,7 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 1,
             total_active_containers: 4,
         };
@@ -1808,51 +1861,83 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 1,
             total_active_containers: 1,
         };
         assert!(dep.needs_redeploy());
     }
 
+    #[test]
+    fn test_needs_redeploy_historical_deployment_never_redeploys() {
+        // Arrange: every remaining replica belongs to a historical deployment
+        // on the failed node, which previously looked like a full outage.
+        let dep = AffectedDeployment {
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 9,
+            is_current: false,
+            containers_on_node: 2,
+            total_active_containers: 2,
+        };
+
+        // Act + Assert
+        assert!(!dep.needs_redeploy());
+    }
+
     // ── affected_deployments integration tests ─────────────────────
 
     #[tokio::test]
-    async fn test_affected_deployments_mixed_replicas() {
-        // Deployment 10: 2 containers on node 5, 4 total (has healthy replicas elsewhere)
-        // Deployment 20: 1 container on node 5, 1 total (needs redeploy)
-        let c1 = sample_container(1, 10, 5);
-        let c2 = sample_container(2, 10, 5);
-        let c3 = sample_container(3, 20, 5);
+    async fn test_affected_deployments_classifies_current_and_historical_with_counts() {
+        // Arrange: deployment 10 is current and has a healthy replica elsewhere.
+        // Deployment 20 is historical and has all of its replicas on the failed node.
+        let current_on_node = sample_container(1, 10, 5);
+        let historical_on_node = sample_container(2, 20, 5);
+        let current_elsewhere = sample_container(3, 10, 7);
 
-        let d1 = sample_deployment(10, 100, 200);
-        let d2 = sample_deployment(20, 100, 201);
-
-        // "All active containers" includes ones on other nodes
-        let c_other_node = sample_container(4, 10, 7); // deployment 10 on node 7
-        let c_other_node2 = sample_container(5, 10, 8); // deployment 10 on node 8
+        let current = sample_deployment(10, 100, 200);
+        let historical = sample_deployment(20, 100, 200);
+        let environment = sample_environment(200, 100, Some(10));
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // list_containers_for_node(5): containers on the draining node
-            .append_query_results(vec![vec![c1.clone(), c2.clone(), c3.clone()]])
+            .append_query_results(vec![vec![
+                current_on_node.clone(),
+                historical_on_node.clone(),
+            ]])
             // deployments query
-            .append_query_results(vec![vec![d1, d2]])
+            .append_query_results(vec![vec![current, historical]])
+            // environments query determines which deployment is canonical
+            .append_query_results(vec![vec![environment]])
             // all active containers for these deployment IDs
-            .append_query_results(vec![vec![c1, c2, c_other_node, c_other_node2, c3]])
+            .append_query_results(vec![vec![
+                current_on_node,
+                current_elsewhere,
+                historical_on_node,
+            ]])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
+        // Act
         let affected = service.affected_deployments(5).await.unwrap();
+
+        // Assert
         assert_eq!(affected.len(), 2);
 
-        let dep10 = affected.iter().find(|d| d.deployment_id == 10).unwrap();
-        assert_eq!(dep10.containers_on_node, 2);
-        assert_eq!(dep10.total_active_containers, 4);
-        assert!(!dep10.needs_redeploy()); // 2 remain on other nodes
+        let current = affected.iter().find(|d| d.deployment_id == 10).unwrap();
+        assert!(current.is_current);
+        assert_eq!(current.containers_on_node, 1);
+        assert_eq!(current.total_active_containers, 2);
+        assert!(!current.needs_redeploy());
 
-        let dep20 = affected.iter().find(|d| d.deployment_id == 20).unwrap();
-        assert_eq!(dep20.containers_on_node, 1);
-        assert_eq!(dep20.total_active_containers, 1);
-        assert!(dep20.needs_redeploy()); // all replicas on this node
+        let historical = affected.iter().find(|d| d.deployment_id == 20).unwrap();
+        assert!(!historical.is_current);
+        assert_eq!(historical.containers_on_node, 1);
+        assert_eq!(historical.total_active_containers, 1);
+        assert!(
+            !historical.needs_redeploy(),
+            "historical deployments must never trigger failover redeploys"
+        );
     }
 
     #[tokio::test]

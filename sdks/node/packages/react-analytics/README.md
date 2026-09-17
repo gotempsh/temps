@@ -62,7 +62,11 @@ export default function App({ children }) {
 ```tsx
 <TempsAnalyticsProvider
   // Core
-  basePath="/api/_temps"            // API endpoint (default)
+  basePath="/api/_temps"            // API endpoint (default). Can be an absolute
+                                     // URL on another origin -- see "Externally
+                                     // Hosted Apps" below
+  ingestKey={undefined}             // Keyed-ingest credential, only needed when
+                                     // Temps didn't deploy this app
   domain="example.com"              // Override detected hostname
   disabled={false}                  // Kill switch for analytics
 
@@ -491,6 +495,23 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   </TempsAnalyticsProvider>
 );
 ```
+
+## Externally Hosted Apps (Cross-Origin Ingest)
+
+If Temps isn't the platform hosting this app -- e.g. a Next.js app on a separate hosting platform talking to a self-hosted Temps backend on another domain -- point the provider at your Temps backend with an ingest key instead of the default same-origin `basePath`:
+
+```tsx
+<TempsAnalyticsProvider
+  basePath="https://api.your-domain.example.com/api/_temps"
+  ingestKey="pa_..."
+>
+  {children}
+</TempsAnalyticsProvider>
+```
+
+Mint the key with `bunx @temps-sdk/cli analytics keys create --project <id>` or from the project's Analytics settings in the Console. Session/visitor identity (`localStorage`-backed, generated automatically by `@temps-sdk/analytics-core`) is attached to every event and is what the backend attributes traffic to on this path, since no Temps-issued cookie exists cross-origin.
+
+For the full walkthrough -- routing through a same-origin proxy so the key never ships to the browser, `sendBeacon` header limitations, and Next.js-specific gotchas -- see [Externally Hosted Apps](https://temps.sh/docs/sdks#external-hosting) in the SDK docs.
 
 ## Environment Detection
 

@@ -110,6 +110,13 @@ pub(crate) fn truncate_sample_message(message: &str) -> String {
 /// ```
 #[async_trait]
 pub trait OtelStorage: Send + Sync {
+    /// Whether this backend can currently return bounded lifetime summaries.
+    /// Mixed-source routing uses this to keep every source on one semantic
+    /// contract without selecting an unbounded raw-span fallback.
+    async fn global_lifetime_summaries_ready(&self) -> StorageResult<bool> {
+        Ok(false)
+    }
+
     /// One storage-wide ordered cursor; implementations must never fan out by project.
     async fn global_trace_stream(
         &self,

@@ -14,7 +14,7 @@
 
 use sea_orm::{DatabaseBackend, MockDatabase};
 use std::sync::Arc;
-use temps_entities::{deployment_containers, deployments, nodes};
+use temps_entities::{deployment_containers, deployments, environments, nodes};
 
 use temps_deployments::services::node_scheduler::{NodeAssignment, NodeScheduler};
 use temps_deployments::services::node_service::{HeartbeatRequest, NodeService};
@@ -112,6 +112,35 @@ fn make_deployment(id: i32, project_id: i32, environment_id: i32) -> deployments
         upload_request_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+    }
+}
+
+fn make_environment(
+    id: i32,
+    project_id: i32,
+    current_deployment_id: Option<i32>,
+) -> environments::Model {
+    environments::Model {
+        id,
+        name: format!("environment-{id}"),
+        slug: format!("environment-{id}"),
+        subdomain: format!("environment-{id}.example.com"),
+        last_deployment: None,
+        host: format!("environment-{id}.example.com"),
+        upstreams: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        project_id,
+        current_deployment_id,
+        branch: Some("main".to_string()),
+        deleted_at: None,
+        deployment_config: None,
+        is_preview: false,
+        protected: false,
+        sleeping: false,
+        attack_mode: None,
+        force_https: None,
+        last_activity_at: None,
     }
 }
 
@@ -429,7 +458,8 @@ async fn test_heartbeat_preserves_draining_status() {
 
 #[tokio::test]
 async fn test_affected_deployments_identifies_needs_redeploy() {
-    // Deployment 10: all 2 replicas on node 5 → needs redeploy
+    // Deployment 10: all 2 replicas on node 5, and it's the environment's
+    // current deployment → needs redeploy
     // Deployment 20: 1 of 3 replicas on node 5 → does NOT need redeploy
     let c1 = make_container(1, 10, 5, "c1");
     let c2 = make_container(2, 10, 5, "c2");
@@ -438,12 +468,17 @@ async fn test_affected_deployments_identifies_needs_redeploy() {
     let d1 = make_deployment(10, 100, 200);
     let d2 = make_deployment(20, 100, 201);
 
+    // Deployment 10 is the environment's canonical serving deployment.
+    let e1 = make_environment(200, 100, Some(10));
+    let e2 = make_environment(201, 100, Some(20));
+
     let c4 = make_container(4, 20, 6, "c4");
     let c5 = make_container(5, 20, 7, "c5");
 
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![c1.clone(), c2.clone(), c3.clone()]])
         .append_query_results(vec![vec![d1, d2]])
+        .append_query_results(vec![vec![e1, e2]])
         .append_query_results(vec![vec![c1, c2, c3, c4, c5]])
         .into_connection();
 

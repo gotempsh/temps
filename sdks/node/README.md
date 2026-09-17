@@ -157,7 +157,10 @@ Every analytics request includes:
 - `domain`: Domain (configured or detected)
 - `event_data`: Additional event data
 - `request_id`: Request identifier (if available)
-- `session_id`: Session identifier (if available)
+- `sessionId`: Client-generated session identifier, persisted to `localStorage` and rolled over after 30 minutes of inactivity
+- `visitorId`: Client-generated visitor identifier, persisted to `localStorage`
+
+On a Temps-hosted app these are a fallback behind Temps' own server-issued session cookies. On an externally hosted app (a frontend Temps didn't deploy, talking to Temps via a [keyed ingest key](https://temps.sh/docs/sdks#external-hosting)) they're the primary identity signal, since no Temps-issued cookie exists cross-origin.
 
 ## Development
 

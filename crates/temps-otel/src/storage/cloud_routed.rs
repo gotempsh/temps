@@ -77,6 +77,13 @@ use crate::types::{
 /// consumers that inherit this decorator.
 #[async_trait]
 pub trait CloudSpanSource: Send + Sync {
+    async fn global_lifetime_candidate_count(
+        &self,
+        _query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<Option<u64>> {
+        Ok(None)
+    }
+
     async fn global_trace_stream(
         &self,
         _query: super::global_traces::GlobalTraceQuery,
@@ -283,13 +290,20 @@ impl OtelStorage for CloudRoutedOtelStorage {
         &self,
         mut query: super::global_traces::GlobalTraceQuery,
     ) -> StorageResult<super::global_traces::GlobalTracePage> {
-        if query.scopes.iter().all(|s| s.cloud) || query.scopes.iter().all(|s| !s.cloud) {
-            query.source_offset = query.filter.offset.unwrap_or(0);
+        if query.use_preaggregated_summaries && query.scopes.iter().any(|scope| !scope.cloud) {
+            let local_ready = self.local.global_lifetime_summaries_ready().await?;
+            align_global_trace_semantics(&mut query, local_ready);
         }
-        let mut local = query.clone();
-        local.scopes.retain(|s| !s.cloud);
-        let mut cloud = query.clone();
-        cloud.scopes.retain(|s| s.cloud);
+        if query.use_preaggregated_summaries && query.scopes.iter().any(|scope| scope.cloud) {
+            let mut cloud_query = query.clone();
+            cloud_query.scopes.retain(|scope| scope.cloud);
+            let candidate_total = self
+                .cloud
+                .global_lifetime_candidate_count(cloud_query)
+                .await?;
+            align_cloud_candidate_budget(&mut query, candidate_total);
+        }
+        let (local, cloud) = split_global_trace_query(&mut query);
         let local_read = async {
             if local.scopes.is_empty() {
                 Ok(super::global_traces::GlobalTraceStream::empty())
@@ -747,6 +761,45 @@ impl OtelStorage for CloudRoutedOtelStorage {
     }
 }
 
+fn align_global_trace_semantics(
+    query: &mut super::global_traces::GlobalTraceQuery,
+    local_lifetime_summaries_ready: bool,
+) {
+    query.use_preaggregated_summaries &= local_lifetime_summaries_ready;
+}
+
+fn align_cloud_candidate_budget(
+    query: &mut super::global_traces::GlobalTraceQuery,
+    candidate_total: Option<u64>,
+) {
+    match candidate_total {
+        Some(total) if total <= super::global_traces::MAX_LIFETIME_CANDIDATES => {
+            query.lifetime_candidate_total = Some(total);
+        }
+        Some(_) | None => align_global_trace_semantics(query, false),
+    }
+}
+
+fn split_global_trace_query(
+    query: &mut super::global_traces::GlobalTraceQuery,
+) -> (
+    super::global_traces::GlobalTraceQuery,
+    super::global_traces::GlobalTraceQuery,
+) {
+    let local_only = query.scopes.iter().all(|scope| !scope.cloud);
+    if query.scopes.iter().all(|scope| scope.cloud) || local_only {
+        query.source_offset = query.filter.offset.unwrap_or(0);
+    }
+    let mut local = query.clone();
+    local.scopes.retain(|scope| !scope.cloud);
+    // This count describes only the Cloud scopes and must never size or select
+    // a local ClickHouse page.
+    local.lifetime_candidate_total = None;
+    let mut cloud = query.clone();
+    cloud.scopes.retain(|scope| scope.cloud);
+    (local, cloud)
+}
+
 impl CloudRoutedOtelStorage {
     /// Resolve a multi-project span-stats query.
     ///
@@ -804,6 +857,35 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn global_query(cloud_scopes: &[bool]) -> super::super::global_traces::GlobalTraceQuery {
+        let from = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+        let to = from + chrono::Duration::hours(1);
+        super::super::global_traces::GlobalTraceQuery {
+            filter: TraceQuery {
+                limit: Some(20),
+                offset: Some(40),
+                ..Default::default()
+            },
+            scopes: cloud_scopes
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, cloud)| super::super::global_traces::TraceReadScope {
+                        project_id: index as i32 + 1,
+                        from,
+                        to,
+                        cloud: *cloud,
+                        window_clamped_at: None,
+                    },
+                )
+                .collect(),
+            summaries: true,
+            use_preaggregated_summaries: true,
+            lifetime_candidate_total: None,
+            source_offset: 0,
+        }
+    }
+
     /// Records which side a call landed on, so a test can assert routing
     /// without a database or a Cloud tenant.
     #[derive(Default)]
@@ -811,6 +893,58 @@ mod tests {
         query_spans: AtomicUsize,
         get_trace: AtomicUsize,
         has_traces: AtomicUsize,
+    }
+
+    #[test]
+    fn local_only_global_reads_keep_the_preaggregated_fast_path() {
+        let mut query = global_query(&[false, false]);
+
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert_eq!(query.source_offset, 40);
+        assert!(local.use_preaggregated_summaries);
+        assert_eq!(local.scopes.len(), 2);
+        assert!(cloud.scopes.is_empty());
+    }
+
+    #[test]
+    fn mixed_global_reads_keep_local_preaggregated_semantics() {
+        let mut query = global_query(&[false, true]);
+        query.lifetime_candidate_total = Some(42);
+
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert_eq!(query.source_offset, 0);
+        assert!(local.use_preaggregated_summaries);
+        assert_eq!(local.lifetime_candidate_total, None);
+        assert_eq!(local.scopes.len(), 1);
+        assert_eq!(cloud.lifetime_candidate_total, Some(42));
+        assert_eq!(cloud.scopes.len(), 1);
+    }
+
+    #[test]
+    fn mixed_global_reads_use_window_semantics_when_local_summaries_are_unavailable() {
+        let mut query = global_query(&[false, true]);
+
+        align_global_trace_semantics(&mut query, false);
+        let (local, cloud) = split_global_trace_query(&mut query);
+
+        assert!(!local.use_preaggregated_summaries);
+        assert!(!cloud.use_preaggregated_summaries);
+    }
+
+    #[test]
+    fn over_budget_cloud_catalog_falls_back_without_disabling_pagination() {
+        let mut query = global_query(&[false, true]);
+
+        align_cloud_candidate_budget(
+            &mut query,
+            Some(super::super::global_traces::MAX_LIFETIME_CANDIDATES + 1),
+        );
+
+        assert!(!query.use_preaggregated_summaries);
+        assert_eq!(query.filter.limit, Some(20));
+        assert_eq!(query.filter.offset, Some(40));
     }
 
     #[async_trait]

@@ -3,8 +3,9 @@
 
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    DatabaseTransaction, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -57,6 +58,52 @@ pub struct ContainerPresentationContext {
     pub environment_subdomain: String,
     pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
     pub resource_limits: ResolvedContainerResourceLimits,
+}
+
+/// Lock the environment row that orders deployment generations. All code paths
+/// that insert a deployment must take this lock before assigning `created_at`
+/// and inserting, so failover recovery can reliably detect newer user work.
+pub(crate) async fn lock_environment_for_deployment_generation(
+    transaction: &DatabaseTransaction,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<environments::Model, DbErr> {
+    environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::ProjectId.eq(project_id))
+        .filter(environments::Column::DeletedAt.is_null())
+        .lock(sea_orm::sea_query::LockType::Update)
+        .one(transaction)
+        .await?
+        .ok_or_else(|| {
+            DbErr::RecordNotFound(format!(
+                "environment {environment_id} for project {project_id} was not found or is deleted"
+            ))
+        })
+}
+
+/// Insert a deployment under the shared environment generation lock.
+pub(crate) async fn insert_deployment_with_generation_lock(
+    db: &temps_database::DbConnection,
+    project_id: i32,
+    environment_id: i32,
+    mut deployment: deployments::ActiveModel,
+) -> Result<deployments::Model, DbErr> {
+    let transaction = db.begin().await?;
+    lock_environment_for_deployment_generation(&transaction, project_id, environment_id).await?;
+    let generation_time = chrono::Utc::now();
+    deployment.created_at = Set(generation_time);
+    deployment.updated_at = Set(generation_time);
+    let deployment = deployment.insert(&transaction).await?;
+    transaction.commit().await?;
+    Ok(deployment)
+}
+
+struct PipelineTriggerOptions {
+    branch: Option<String>,
+    tag: Option<String>,
+    commit: Option<String>,
+    rollback_from_deployment_id: Option<i32>,
+    recovery_of_deployment_id: Option<i32>,
 }
 
 #[derive(Error, Debug)]
@@ -1691,8 +1738,18 @@ impl DeploymentService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(), DeploymentError> {
-        self.trigger_pipeline_inner(project_id, environment_id, branch, tag, commit, None)
-            .await
+        self.trigger_pipeline_inner(
+            project_id,
+            environment_id,
+            PipelineTriggerOptions {
+                branch,
+                tag,
+                commit,
+                rollback_from_deployment_id: None,
+                recovery_of_deployment_id: None,
+            },
+        )
+        .await
     }
 
     /// Internal pipeline trigger that also carries an optional rollback marker.
@@ -1702,10 +1759,7 @@ impl DeploymentService {
         &self,
         project_id: i32,
         environment_id: i32,
-        branch: Option<String>,
-        tag: Option<String>,
-        commit: Option<String>,
-        rollback_from_deployment_id: Option<i32>,
+        options: PipelineTriggerOptions,
     ) -> Result<(), DeploymentError> {
         info!("Triggering pipeline for project_id: {}", project_id);
         let project = projects::Entity::find_by_id(project_id)
@@ -1744,17 +1798,18 @@ impl DeploymentService {
         let git_push_job = temps_core::GitPushEventJob {
             owner: repo_owner,
             repo: repo_name,
-            branch: branch.clone(),
-            tag: tag.clone(),
-            commit: commit.clone().unwrap_or_default(),
+            branch: options.branch,
+            tag: options.tag,
+            commit: options.commit.unwrap_or_default(),
             project_id,
             // User-initiated trigger — bypasses environments.automatic_deploy.
             manual_trigger: true,
-            rollback_from_deployment_id,
+            rollback_from_deployment_id: options.rollback_from_deployment_id,
             // This trigger names a concrete environment (redeploy, rollback,
             // node-drain reschedule) — deploy to it directly instead of
             // re-inferring the target from the branch.
             target_environment_id: Some(environment_id),
+            recovery_of_deployment_id: options.recovery_of_deployment_id,
         };
 
         tracing::debug!(
@@ -1793,6 +1848,26 @@ impl DeploymentService {
         health_check_path: Option<String>,
         command: Option<Vec<String>>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_image_deployment_inner(
+            project_id,
+            target_environment_id,
+            image_ref,
+            health_check_path,
+            command,
+            None,
+        )
+        .await
+    }
+
+    async fn trigger_image_deployment_inner(
+        &self,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+        image_ref: String,
+        health_check_path: Option<String>,
+        command: Option<Vec<String>>,
+        recovery_of_deployment_id: Option<i32>,
+    ) -> Result<(), DeploymentError> {
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
                 "Image reference is missing".to_string(),
@@ -1812,6 +1887,7 @@ impl DeploymentService {
                     image_ref,
                     health_check_path,
                     command,
+                    recovery_of_deployment_id,
                 },
             ))
             .await
@@ -1830,6 +1906,35 @@ impl DeploymentService {
         project_id: i32,
         environment_id: i32,
         deployment_id: i32,
+    ) -> Result<(), DeploymentError> {
+        self.redeploy_environment_inner(project_id, environment_id, deployment_id, None)
+            .await
+    }
+
+    /// Redeploy a workload after its node went offline. Jobs emitted by this
+    /// path are serialized by the deployment processor so a failover fan-out
+    /// cannot saturate the build host.
+    pub async fn redeploy_environment_for_failover(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+    ) -> Result<(), DeploymentError> {
+        self.redeploy_environment_inner(
+            project_id,
+            environment_id,
+            deployment_id,
+            Some(deployment_id),
+        )
+        .await
+    }
+
+    async fn redeploy_environment_inner(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        recovery_of_deployment_id: Option<i32>,
     ) -> Result<(), DeploymentError> {
         // Use the deployment that owns the affected containers. Selecting the
         // newest row can race a concurrent failed/cancelled deploy and restore
@@ -1859,7 +1964,7 @@ impl DeploymentService {
             .and_then(|m| m.external_image_ref.clone())
         {
             return self
-                .trigger_image_deployment(
+                .trigger_image_deployment_inner(
                     project_id,
                     Some(environment_id),
                     image_ref,
@@ -1871,6 +1976,7 @@ impl DeploymentService {
                         .metadata
                         .as_ref()
                         .and_then(|metadata| metadata.command.clone()),
+                    recovery_of_deployment_id,
                 )
                 .await;
         }
@@ -1881,8 +1987,18 @@ impl DeploymentService {
             deploy.commit_sha.clone(),
         );
 
-        self.trigger_pipeline(project_id, environment_id, branch, tag, commit)
-            .await
+        self.trigger_pipeline_inner(
+            project_id,
+            environment_id,
+            PipelineTriggerOptions {
+                branch,
+                tag,
+                commit,
+                rollback_from_deployment_id: None,
+                recovery_of_deployment_id,
+            },
+        )
+        .await
     }
 
     pub async fn rollback_to_deployment(
@@ -2010,10 +2126,13 @@ impl DeploymentService {
             self.trigger_pipeline_inner(
                 project_id,
                 environment_id,
-                target_deployment.branch_ref.clone(),
-                target_deployment.tag_ref.clone(),
-                target_deployment.commit_sha.clone(),
-                Some(deployment_id),
+                PipelineTriggerOptions {
+                    branch: target_deployment.branch_ref.clone(),
+                    tag: target_deployment.tag_ref.clone(),
+                    commit: target_deployment.commit_sha.clone(),
+                    rollback_from_deployment_id: Some(deployment_id),
+                    recovery_of_deployment_id: None,
+                },
             )
             .await?;
 
@@ -2130,7 +2249,14 @@ impl DeploymentService {
             updated_at: Set(now),
         };
 
-        let rollback_deployment = new_deployment.insert(self.db.as_ref()).await.map_err(|e| {
+        let rollback_deployment = insert_deployment_with_generation_lock(
+            self.db.as_ref(),
+            project_id,
+            environment_id,
+            new_deployment,
+        )
+        .await
+        .map_err(|e| {
             DeploymentError::Other(format!("Failed to create rollback deployment: {}", e))
         })?;
 
@@ -2836,7 +2962,14 @@ impl DeploymentService {
             updated_at: Set(now),
         };
 
-        let promoted_deployment = new_deployment.insert(self.db.as_ref()).await.map_err(|e| {
+        let promoted_deployment = insert_deployment_with_generation_lock(
+            self.db.as_ref(),
+            project_id,
+            target_environment_id,
+            new_deployment,
+        )
+        .await
+        .map_err(|e| {
             DeploymentError::Other(format!("Failed to create promoted deployment: {}", e))
         })?;
 
@@ -8665,6 +8798,7 @@ mod tests {
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
         assert_eq!(job.command, Some(vec!["serve".to_string()]));
+        assert_eq!(job.recovery_of_deployment_id, None);
         Ok(())
     }
 
@@ -8716,6 +8850,85 @@ mod tests {
         assert_eq!(job.project_id, project.id);
         assert_eq!(job.target_environment_id, Some(environment.id));
         assert_eq!(job.image_ref, "registry.example/app:known-good");
+        assert_eq!(job.recovery_of_deployment_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_redeploy_environment_for_failover_marks_git_job_as_recovery(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping failover git queue marker integration test");
+            return Ok(());
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let service = create_deployment_service_for_test(db);
+        let mut receiver = service.queue_service.subscribe();
+
+        // Act
+        service
+            .redeploy_environment_for_failover(project.id, environment.id, deployment.id)
+            .await?;
+
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::GitPushEvent(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before GitPushEvent arrived: {e}"),
+            }
+        };
+
+        // Assert
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
+        assert_eq!(job.recovery_of_deployment_id, Some(deployment.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_redeploy_environment_for_failover_marks_image_job_as_recovery(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping failover image queue marker integration test");
+            return Ok(());
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let mut active: deployments::ActiveModel = deployment.clone().into();
+        active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.example/app:known-good".to_string()),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db);
+        let mut receiver = service.queue_service.subscribe();
+
+        // Act
+        service
+            .redeploy_environment_for_failover(project.id, environment.id, deployment.id)
+            .await?;
+
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {e}"),
+            }
+        };
+
+        // Assert
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
+        assert_eq!(job.image_ref, "registry.example/app:known-good");
+        assert_eq!(job.recovery_of_deployment_id, Some(deployment.id));
         Ok(())
     }
 

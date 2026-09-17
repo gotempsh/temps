@@ -272,6 +272,21 @@ fn bounded_limit(limit: Option<u64>) -> u64 {
 
 #[async_trait]
 impl CloudSpanSource for CloudTelemetrySpanSource {
+    async fn global_lifetime_candidate_count(
+        &self,
+        query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<Option<u64>> {
+        let refs = query
+            .scopes
+            .iter()
+            .map(|scope| Ok((scope.project_id, self.project_ref(scope.project_id)?)))
+            .collect::<StorageResult<BTreeMap<_, _>>>()?;
+        Ok(Some(
+            super::global_traces::cloud_lifetime_candidate_count(&self.client()?, &query, &refs)
+                .await?,
+        ))
+    }
+
     async fn global_trace_stream(
         &self,
         query: super::global_traces::GlobalTraceQuery,
@@ -316,6 +331,8 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
                 filter: query,
                 scopes: vec![scope],
                 summaries: true,
+                use_preaggregated_summaries: false,
+                lifetime_candidate_total: None,
             };
             let stream = self.global_trace_stream(q.clone()).await?;
             super::global_traces::merge(vec![stream], &q)

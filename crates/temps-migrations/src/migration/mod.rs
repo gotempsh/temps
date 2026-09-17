@@ -268,6 +268,7 @@ mod m20260914_000001_managed_daemon_digest_images;
 mod m20260915_000001_backfill_backup_expires_at;
 mod m20260915_000002_add_upload_request_id_to_deployments;
 mod m20260916_000001_external_plugin_actors;
+pub mod m20260916_000001_reconcile_otel_trace_summaries;
 
 pub struct Migrator;
 
@@ -594,6 +595,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260915_000001_backfill_backup_expires_at::Migration),
             Box::new(m20260915_000002_add_upload_request_id_to_deployments::Migration),
             Box::new(m20260916_000001_external_plugin_actors::Migration),
+            Box::new(m20260916_000001_reconcile_otel_trace_summaries::Migration),
         ]
     }
 }

@@ -243,23 +243,59 @@ impl CrossProjectTraceService {
             return Ok(HashMap::new());
         }
 
-        // Pick one root-owning summary per trace, from a sharing project only.
-        //   WHERE s.trace_id IN ($1, $2, …)
-        let mut sql = String::from(
-            "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.root_span_name, s.service_name \
-             FROM otel_trace_summaries s \
-             JOIN projects p ON p.id = s.project_id \
-             WHERE s.has_root = TRUE AND s.root_span_name <> '' \
-               AND p.cross_project_trace_sharing = TRUE \
-               AND s.trace_id IN (",
-        );
+        let state_exists = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass('otel_trace_summary_rebuild_state') IS NOT NULL AS present"
+                    .to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<bool>("", "present").ok())
+            .unwrap_or(false);
+        let rebuild_pending = if state_exists {
+            self.db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+                     WHERE NOT completed) AS pending"
+                        .to_string(),
+                ))
+                .await?
+                .and_then(|row| row.try_get::<bool>("", "pending").ok())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Pick one root per trace from sharing projects. While an upgrade is
+        // reconciling stale summaries, use raw roots so names remain correct.
+        let mut sql = if rebuild_pending {
+            String::from(
+                "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.name AS root_span_name, s.service_name \
+                 FROM otel_spans s JOIN projects p ON p.id = s.project_id \
+                 WHERE s.parent_span_id IS NULL AND s.name <> '' \
+                   AND p.cross_project_trace_sharing = TRUE AND s.trace_id IN (",
+            )
+        } else {
+            String::from(
+                "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.root_span_name, s.service_name \
+                 FROM otel_trace_summaries s JOIN projects p ON p.id = s.project_id \
+                 WHERE s.has_root = TRUE AND s.root_span_name <> '' \
+                   AND p.cross_project_trace_sharing = TRUE AND s.trace_id IN (",
+            )
+        };
         for i in 0..trace_ids.len() {
             if i > 0 {
                 sql.push_str(", ");
             }
             sql.push_str(&format!("${}", i + 1));
         }
-        sql.push_str(") ORDER BY s.trace_id, s.has_root DESC");
+        if rebuild_pending {
+            sql.push_str(") ORDER BY s.trace_id, s.duration_ms DESC, s.span_id ASC");
+        } else {
+            sql.push_str(") ORDER BY s.trace_id, s.has_root DESC");
+        }
 
         let values: Vec<sea_orm::Value> = trace_ids.iter().map(|t| t.clone().into()).collect();
 

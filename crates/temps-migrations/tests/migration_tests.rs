@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
     GenericImage, ImageExt,
 };
 
-use temps_migrations::Migrator;
+use temps_migrations::{Migrator, ReconcileOtelTraceSummariesMigration};
 
 /// Wait until the *real* PostgreSQL server is accepting connections.
 ///
@@ -5191,5 +5191,117 @@ async fn test_continuous_archive_source_migration_is_reversible() -> anyhow::Res
     Migrator::down(&db, Some(1)).await?;
     assert!(!column_exists(&db, "external_services", "continuous_archive_s3_source_id").await?);
     assert!(!column_exists(&db, "external_services", "continuous_archive_pinned_at").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping trace-summary reconciliation test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let create_name = "m20260603_000001_create_otel_trace_summaries";
+    let pre_create = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == create_name)
+        .unwrap_or_else(|| panic!("migration {create_name} not found"));
+    Migrator::up(&db, Some(pre_create as u32)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO otel_spans \
+         (project_id, service_name, trace_id, span_id, parent_span_id, name, kind, \
+          start_time, end_time, duration_ms, status_code, attributes, events) VALUES \
+         (77, 'gateway', 'cross-day', 'root', NULL, 'POST /jobs', 'SERVER', \
+          '2026-09-14 23:59:59+00', '2026-09-15 00:00:00+00', 10, 'OK', '{}', '[]'), \
+         (77, 'worker', 'cross-day', 'child', 'root', 'job', 'CONSUMER', \
+          '2026-09-15 00:00:01+00', '2026-09-15 00:00:02+00', 50, 'ERROR', '{}', '[]'), \
+         (77, 'worker-z', 'rootless', 'z-span', 'missing', 'z child', 'CLIENT', \
+          '2026-09-15 00:00:01+00', '2026-09-15 00:00:02+00', 30, 'OK', '{}', '[]'), \
+         (77, 'worker-a', 'rootless', 'a-span', 'missing', 'a child', 'PRODUCER', \
+          '2026-09-14 23:59:59+00', '2026-09-15 00:00:00+00', 30, 'OK', '{}', '[]')",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    let cross = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT identity_span_id, root_span_name, \
+                    last_span_start_time = TIMESTAMPTZ '2026-09-15 00:00:01+00' \
+                        AS last_span_start_matches, \
+                    span_count, error_count, has_root \
+             FROM otel_trace_summaries WHERE project_id = 77 AND trace_id = 'cross-day'"
+                .to_string(),
+        ))
+        .await?
+        .expect("cross-day summary exists");
+    assert_eq!(cross.try_get::<String>("", "identity_span_id")?, "root");
+    assert_eq!(cross.try_get::<String>("", "root_span_name")?, "POST /jobs");
+    assert!(cross.try_get::<bool>("", "last_span_start_matches")?);
+    assert_eq!(cross.try_get::<i64>("", "span_count")?, 2);
+    assert_eq!(cross.try_get::<i64>("", "error_count")?, 1);
+    assert!(cross.try_get::<bool>("", "has_root")?);
+
+    let manager = SchemaManager::new(&db);
+    ReconcileOtelTraceSummariesMigration.up(&manager).await?;
+    let count_before_damage: i64 = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::BIGINT AS count FROM otel_trace_summaries".to_string(),
+        ))
+        .await?
+        .expect("summary count row exists")
+        .try_get("", "count")?;
+    assert_eq!(
+        count_before_damage, 2,
+        "column-present path must be a no-op"
+    );
+
+    db.execute_unprepared(
+        "ALTER TABLE otel_trace_summaries DROP COLUMN identity_span_id; \
+         ALTER TABLE otel_trace_summaries DROP COLUMN last_span_start_time; \
+         DELETE FROM otel_trace_summaries WHERE trace_id = 'rootless'; \
+         UPDATE otel_trace_summaries SET span_count = 99, error_count = 99, \
+             root_span_name = 'stale' WHERE trace_id = 'cross-day'",
+    )
+    .await?;
+    ReconcileOtelTraceSummariesMigration.up(&manager).await?;
+    let state = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT watermark, completed FROM otel_trace_summary_rebuild_state \
+             WHERE singleton"
+                .to_string(),
+        ))
+        .await?
+        .expect("old schema must enqueue reconciliation");
+    assert!(state.try_get::<Option<i64>>("", "watermark")?.is_none());
+    assert!(!state.try_get::<bool>("", "completed")?);
     Ok(())
 }
