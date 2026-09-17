@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { useNavigate, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -28,11 +28,21 @@ import { toast } from 'sonner'
 
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Button,
+  CopyAction,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -72,21 +82,6 @@ import {
   type JobSummary,
 } from '@/components/sandboxes/helpers'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
-
-function statusVariant(
-  status: string
-): 'default' | 'secondary' | 'success' | 'warning' | 'destructive' | 'outline' {
-  switch (status) {
-    case 'running':
-      return 'success'
-    case 'stopped':
-      return 'warning'
-    case 'destroyed':
-      return 'destructive'
-    default:
-      return 'outline'
-  }
-}
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -180,14 +175,6 @@ const PRESET_CMDS: {
   },
 ]
 
-function formatDate(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString()
-  } catch {
-    return iso
-  }
-}
-
 function formatCountdown(iso: string, now: number): string {
   const diffMs = new Date(iso).getTime() - now
   if (diffMs <= 0) return 'expired'
@@ -200,19 +187,6 @@ function formatCountdown(iso: string, now: number): string {
   if (h >= 1) return `${h}h ${m}m`
   if (m >= 1) return `${m}m ${s}s`
   return `${s}s`
-}
-
-function formatAge(iso: string, now: number): string {
-  const diffMs = now - new Date(iso).getTime()
-  if (diffMs < 0) return formatDate(iso)
-  const secs = Math.floor(diffMs / 1000)
-  if (secs < 60) return `${secs}s ago`
-  const mins = Math.floor(secs / 60)
-  if (mins < 60) return `${mins}m ago`
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
 }
 
 function parseCommand(input: string): string[] {
@@ -430,57 +404,44 @@ export default function SandboxDetail() {
     return n >= 1 && n <= 65535
   }, [customPort])
 
+  const backAction = (
+    <Button variant="ghost" size="sm" onClick={() => navigate('/sandboxes')}>
+      <ArrowLeft className="mr-1.5 h-4 w-4" />
+      Back to sandboxes
+    </Button>
+  )
+
   if (isLoading) {
     return (
-      <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
-        <div className="h-4 w-40 rounded bg-muted animate-pulse" />
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-          <div className="space-y-2">
-            <div className="h-7 w-64 rounded bg-muted animate-pulse" />
-            <div className="h-3 w-48 rounded bg-muted animate-pulse" />
-          </div>
-          <div className="flex gap-2">
-            <div className="h-9 w-32 rounded bg-muted animate-pulse" />
-            <div className="h-9 w-24 rounded bg-muted animate-pulse" />
-          </div>
-        </div>
-        <Card>
-          <CardContent className="py-4">
-            <div className="h-10 w-full rounded bg-muted animate-pulse" />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="py-6 space-y-3">
-            <div className="h-8 w-full rounded bg-muted animate-pulse" />
-            <div className="h-20 w-full rounded bg-muted animate-pulse" />
-          </CardContent>
-        </Card>
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-56" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={
+          <>
+            <Skeleton className="h-14 w-full rounded-lg" />
+            <Skeleton className="h-40 w-full rounded-lg" />
+          </>
+        }
+        aside={<Skeleton className="h-32 w-full rounded-lg" />}
+      />
     )
   }
 
   if (isError || !sandbox) {
     return (
-      <div className="w-full p-4 sm:p-6 lg:p-8 space-y-4">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => navigate('/sandboxes')}
-        >
-          <ArrowLeft className="mr-1.5 h-4 w-4" />
-          Back to sandboxes
-        </Button>
-        <Card>
-          <CardContent className="py-12 text-center space-y-2">
-            <Box className="mx-auto h-8 w-8 text-destructive" />
-            <p className="text-sm font-medium">Sandbox not found</p>
-            <p className="text-xs text-muted-foreground">
-              {(error as Error)?.message ??
-                'This sandbox may have been deleted.'}
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+      <PageState
+        variant="failed"
+        icon={Box}
+        title="Sandbox not found"
+        description={
+          (error as Error)?.message ?? 'This sandbox may have been deleted.'
+        }
+        action={backAction}
+      />
     )
   }
 
@@ -495,68 +456,148 @@ export default function SandboxDetail() {
   const idleDeadlineReached =
     workspace && new Date(sandbox.expires_at).getTime() <= now
 
-  return (
-    <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
-      {/* Breadcrumb */}
-      <div className="flex items-center gap-1 text-sm text-muted-foreground">
-        <Link to="/sandboxes" className="hover:text-foreground">
-          Sandboxes
-        </Link>
-        <ChevronRight className="h-4 w-4" />
-        <span className="font-mono text-foreground truncate">{sandbox.id}</span>
-      </div>
+  // Mirrors `statusVariant` tone-for-tone — the Detail template's single
+  // verdict, derived from the record's own status field. Workspaces read
+  // "sleeping" rather than "stopped" since they wake on next access instead
+  // of requiring an explicit resume.
+  const SANDBOX_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+    running: { tone: 'ok', label: 'Running' },
+    stopped: { tone: 'warn', label: workspace ? 'Sleeping' : 'Stopped' },
+    destroyed: { tone: 'error', label: 'Destroyed' },
+  }
+  const verdict =
+    SANDBOX_STATUS_VERDICT[sandbox.status] ?? { tone: 'idle' as StatusTone, label: sandbox.status }
 
-      {/* Header: identity + primary actions (DESIGN.md §4.4) */}
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-        <div className="min-w-0 space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2 flex-wrap">
-            <span className="truncate">{sandbox.name}</span>
-            <Badge variant={statusVariant(sandbox.status)}>
-              {workspace && stopped ? 'sleeping' : sandbox.status}
-            </Badge>
-            {workspace && (
-              <Badge
-                variant="outline"
-                title="Persistent workspace: files survive idle compute suspension"
-              >
-                persistent workspace
-              </Badge>
-            )}
-            {sandbox.backend && (
-              <Badge
-                variant="secondary"
-                className="gap-1 font-normal"
-                title={
-                  sandbox.backend === 'firecracker'
-                    ? 'Hardware-virtualized microVM (KVM)'
-                    : 'Namespaced container'
-                }
-              >
-                {sandbox.backend === 'firecracker' ? (
-                  <Cpu className="h-3 w-3" />
-                ) : (
-                  <Box className="h-3 w-3" />
-                )}
-                {sandbox.backend === 'firecracker'
-                  ? 'Firecracker'
-                  : sandbox.backend === 'docker'
-                    ? 'Docker'
-                    : sandbox.backend}
-              </Badge>
-            )}
-          </h1>
-          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
-            <span className="truncate">{sandbox.id}</span>
-            <CopyButton
-              value={sandbox.id}
-              minimal
-              className="h-5 w-5 shrink-0"
-            />
+  const facts: DetailFact[] = [
+    {
+      label: 'Backend',
+      value: sandbox.backend ? (
+        <span
+          className="inline-flex items-center gap-1"
+          title={
+            sandbox.backend === 'firecracker'
+              ? 'Hardware-virtualized microVM (KVM)'
+              : 'Namespaced container'
+          }
+        >
+          {sandbox.backend === 'firecracker' ? (
+            <Cpu className="h-3 w-3" />
+          ) : (
+            <Box className="h-3 w-3" />
+          )}
+          {sandbox.backend === 'firecracker'
+            ? 'Firecracker'
+            : sandbox.backend === 'docker'
+              ? 'Docker'
+              : sandbox.backend}
+        </span>
+      ) : (
+        '—'
+      ),
+    },
+    {
+      label: 'Kind',
+      value: workspace ? 'Persistent workspace' : 'Ephemeral',
+    },
+    { label: 'Image', value: sandbox.image ?? 'platform default' },
+    { label: 'Work dir', value: sandbox.work_dir },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(sandbox.created_at)}>
+          {fmtRelativeTime(sandbox.created_at, now)}
+        </span>
+      ),
+    },
+  ]
+
+  const diskCard =
+    sandbox.backend === 'firecracker' ? (
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium">Disk</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center justify-between gap-4 text-sm">
+            <span className="text-muted-foreground">Root disk</span>
+            <div className="flex items-center gap-2">
+              <span>
+                {sandbox.disk_size_mb
+                  ? sandbox.disk_size_mb >= 1024
+                    ? `${(sandbox.disk_size_mb / 1024).toFixed(sandbox.disk_size_mb % 1024 ? 1 : 0)} GiB`
+                    : `${sandbox.disk_size_mb} MiB`
+                  : '1 GiB (default)'}
+              </span>
+              {!destroyed && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={resizeMutation.isPending}
+                  onClick={() => setResizeOpen(true)}
+                >
+                  {resizeMutation.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    'Resize'
+                  )}
+                </Button>
+              )}
+            </div>
           </div>
-        </div>
+        </CardContent>
+      </Card>
+    ) : null
 
-        {/* Primary action cluster — what the user actually came here to do */}
-        <div className="flex flex-wrap items-center gap-2">
+  const previewUrlCard = hasPreview ? (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-sm font-medium">
+            Preview URL template
+          </CardTitle>
+          <CopyAction
+            value={sandbox.preview_url_template}
+            minimal
+            className="h-6 w-6"
+          />
+        </div>
+      </CardHeader>
+      <CardContent className="text-sm">
+        <code className="block font-mono text-xs bg-muted px-2 py-1.5 rounded break-all">
+          {sandbox.preview_url_template}
+        </code>
+        <p className="text-xs text-muted-foreground mt-2">
+          Substitute <code className="font-mono">{'{port}'}</code> for any
+          port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
+          above to launch common dev-server ports directly.
+        </p>
+      </CardContent>
+    </Card>
+  ) : null
+
+  const aside = diskCard || previewUrlCard ? (
+    <>
+      {diskCard}
+      {previewUrlCard}
+    </>
+  ) : undefined
+
+  return (
+    <>
+      <Detail
+      title={sandbox.name}
+      description={
+        <span className="inline-flex flex-wrap items-center gap-1.5 font-mono text-xs">
+          {sandbox.id}
+          <CopyAction value={sandbox.id} label="Copy sandbox ID" />
+        </span>
+      }
+      verdict={<Status tone={verdict.tone} label={verdict.label} />}
+      facts={facts}
+      actions={
+        <>
+          {backAction}
           {hasPreview && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -626,7 +667,8 @@ export default function SandboxDetail() {
               onClick={() =>
                 pauseMutationHook.mutate({ path: { id: sandboxId } })
               }
-              disabled={pauseMutationHook.isPending}
+              busy={pauseMutationHook.isPending}
+              busyLabel="Stopping…"
             >
               <Square className="mr-1 h-4 w-4" />
               Stop
@@ -639,7 +681,8 @@ export default function SandboxDetail() {
               onClick={() =>
                 resumeMutationHook.mutate({ path: { id: sandboxId } })
               }
-              disabled={resumeMutationHook.isPending}
+              busy={resumeMutationHook.isPending}
+              busyLabel="Resuming…"
             >
               <Play className="mr-1 h-4 w-4" />
               Resume
@@ -680,9 +723,11 @@ export default function SandboxDetail() {
               <Trash2 className="h-4 w-4" />
             </Button>
           )}
-        </div>
-      </div>
-
+        </>
+      }
+      aside={aside}
+      main={
+        <>
       {/* Live status strip — countdown with inline extend actions */}
       {!destroyed && (
         <Card className={expired ? 'border-destructive/40' : undefined}>
@@ -711,14 +756,14 @@ export default function SandboxDetail() {
                     </div>
                     <div className="text-xs text-muted-foreground">
                       {workspace ? 'idle suspension' : 'expires'}{' '}
-                      {formatDate(sandbox.expires_at)}
+                      {fmtDateTime(sandbox.expires_at)}
                     </div>
                   </div>
                 </div>
                 <div className="h-8 w-px bg-border hidden sm:block" />
                 <div className="leading-tight">
                   <div className="text-sm tabular-nums">
-                    {formatAge(sandbox.created_at, now)}
+                    {fmtRelativeTime(sandbox.created_at, now)}
                   </div>
                   <div className="text-xs text-muted-foreground">created</div>
                 </div>
@@ -880,7 +925,7 @@ export default function SandboxDetail() {
                     </code>
                   )}
                 </div>
-                <CopyButton
+                <CopyAction
                   value={
                     execResult.stdout +
                     (execResult.stderr
@@ -924,80 +969,6 @@ export default function SandboxDetail() {
         </Card>
       )}
 
-      {/* Secondary: sandbox identity — collapsed, low-visual-weight */}
-      <div className="grid gap-4 grid-cols-1 md:grid-cols-2">
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium">Identity</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            <InfoRow label="Name" value={sandbox.name} />
-            <InfoRow
-              label="Image"
-              value={sandbox.image ?? 'platform default'}
-              mono
-            />
-            {sandbox.backend === 'firecracker' && (
-              <div className="flex items-start justify-between gap-4">
-                <span className="text-muted-foreground shrink-0">Disk</span>
-                <div className="flex items-center gap-2">
-                  <span className="text-right">
-                    {sandbox.disk_size_mb
-                      ? sandbox.disk_size_mb >= 1024
-                        ? `${(sandbox.disk_size_mb / 1024).toFixed(sandbox.disk_size_mb % 1024 ? 1 : 0)} GiB`
-                        : `${sandbox.disk_size_mb} MiB`
-                      : '1 GiB (default)'}
-                  </span>
-                  {!destroyed && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 px-2 text-xs"
-                      disabled={resizeMutation.isPending}
-                      onClick={() => setResizeOpen(true)}
-                    >
-                      {resizeMutation.isPending ? (
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                      ) : (
-                        'Resize'
-                      )}
-                    </Button>
-                  )}
-                </div>
-              </div>
-            )}
-            <InfoRow label="Work dir" value={sandbox.work_dir} mono />
-          </CardContent>
-        </Card>
-
-        {hasPreview && (
-          <Card>
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between gap-2">
-                <CardTitle className="text-sm font-medium">
-                  Preview URL template
-                </CardTitle>
-                <CopyButton
-                  value={sandbox.preview_url_template}
-                  minimal
-                  className="h-6 w-6"
-                />
-              </div>
-            </CardHeader>
-            <CardContent className="text-sm">
-              <code className="block font-mono text-xs bg-muted px-2 py-1.5 rounded break-all">
-                {sandbox.preview_url_template}
-              </code>
-              <p className="text-xs text-muted-foreground mt-2">
-                Substitute <code className="font-mono">{'{port}'}</code> for any
-                port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
-                above to launch common dev-server ports directly.
-              </p>
-            </CardContent>
-          </Card>
-        )}
-      </div>
-
       {/* Operations timeline — lifecycle events only, never shell activity. */}
       {events.length > 0 && (
         <Card>
@@ -1027,9 +998,9 @@ export default function SandboxDetail() {
                       </div>
                       <div
                         className="text-xs text-muted-foreground"
-                        title={new Date(e.at).toLocaleString()}
+                        title={fmtDateTime(e.at)}
                       >
-                        {formatAge(new Date(e.at).toISOString(), now)}
+                        {fmtRelativeTime(e.at, now)}
                       </div>
                     </div>
                   </li>
@@ -1050,8 +1021,10 @@ export default function SandboxDetail() {
           disabled={destroyed}
         />
       )}
-
-      {/* Resize dialog */}
+        </>
+      }
+    />
+  {/* Resize dialog */}
       <AlertDialog open={resizeOpen} onOpenChange={setResizeOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -1124,7 +1097,7 @@ export default function SandboxDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </>
   )
 }
 
@@ -1187,8 +1160,8 @@ function JobRow({
           </code>
         </div>
         <div className="flex items-center gap-3 shrink-0 text-xs text-muted-foreground">
-          <span title={formatDate(job.started_at)}>
-            {formatAge(job.started_at, now)}
+          <span title={fmtDateTime(job.started_at)}>
+            {fmtRelativeTime(job.started_at, now)}
           </span>
           <code className="font-mono hidden sm:inline">{job.id}</code>
         </div>
@@ -1307,7 +1280,7 @@ function JobLogsPanel({
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <div className="flex items-center gap-3">
           <code className="font-mono">{job.id}</code>
-          <CopyButton value={job.id} className="h-6 w-6" />
+          <CopyAction value={job.id} className="h-6 w-6" />
           {job.status === 'running' && connected && (
             <span className="flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -1337,27 +1310,6 @@ function JobLogsPanel({
           </pre>
         </div>
       )}
-    </div>
-  )
-}
-
-function InfoRow({
-  label,
-  value,
-  mono,
-}: {
-  label: string
-  value: React.ReactNode
-  mono?: boolean
-}) {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <span className="text-muted-foreground shrink-0">{label}</span>
-      <span
-        className={`text-right break-all ${mono ? 'font-mono text-xs' : ''}`}
-      >
-        {value}
-      </span>
     </div>
   )
 }
