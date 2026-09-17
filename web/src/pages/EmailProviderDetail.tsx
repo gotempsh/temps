@@ -19,7 +19,6 @@ import {
   deleteEmailProvider,
   problemMessage,
 } from '@/components/email/sharedUtils'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -31,8 +30,6 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   EmailProviderLogo,
@@ -41,11 +38,21 @@ import {
 } from '@/components/ui/email-provider-logo'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
-import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft, Globe, Plus, RotateCcw, Send, Trash2 } from 'lucide-react'
+import { AlertCircle, ArrowLeft, Globe, Plus, Send, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -77,18 +84,98 @@ async function fetchDomainsForProvider(
   return response.data ?? []
 }
 
-function Row({
-  label,
-  children,
-}: {
+// Mirrors StatusPill/DOMAIN_STATUS_VERDICT tone-for-tone — the Detail
+// template's single verdict, derived straight from is_active.
+function providerVerdict(provider: { is_active: boolean }): {
+  tone: StatusTone
   label: string
-  children: React.ReactNode
+} {
+  return provider.is_active
+    ? { tone: 'ok', label: 'Active' }
+    : { tone: 'idle', label: 'Inactive' }
+}
+
+function providerFacts(
+  provider: EmailProviderResponse,
+  domainsCount: number | undefined
+): DetailFact[] {
+  const facts: DetailFact[] = [
+    {
+      label: 'Type',
+      value: (
+        <span className="inline-flex items-center gap-1.5">
+          <EmailProviderLogo
+            provider={provider.provider_type as EmailProviderType}
+            size={14}
+          />
+          {getEmailProviderLabel(provider.provider_type as EmailProviderType)}
+        </span>
+      ),
+    },
+    {
+      label: 'Region',
+      value: <span className="font-mono">{provider.region}</span>,
+    },
+  ]
+  if (provider.provider_type === 'ses') {
+    facts.push({
+      label: 'SNS Topic ARN',
+      value: provider.sns_topic_arn ? (
+        <span className="break-all font-mono text-xs">
+          {provider.sns_topic_arn}
+        </span>
+      ) : (
+        'Not configured'
+      ),
+    })
+  }
+  facts.push(
+    { label: 'Domains', value: domainsCount ?? 0 },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(provider.created_at)}>
+          {fmtRelativeTime(provider.created_at)}
+        </span>
+      ),
+    },
+    {
+      label: 'Updated',
+      value: (
+        <span title={fmtDateTime(provider.updated_at)}>
+          {fmtRelativeTime(provider.updated_at)}
+        </span>
+      ),
+    }
+  )
+  return facts
+}
+
+function EmailProviderDetailSkeleton({
+  backAction,
+}: {
+  backAction: React.ReactNode
 }) {
   return (
-    <div className="grid grid-cols-3 gap-3 py-2.5 text-sm first:pt-0 last:pb-0">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="col-span-2 min-w-0">{children}</dd>
-    </div>
+    <Detail
+      title={<Skeleton className="h-7 w-56" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3].map(() => ({
+        label: <Skeleton className="h-3 w-16" />,
+        value: <Skeleton className="h-4 w-24" />,
+      }))}
+      main={
+        <Card>
+          <CardHeader>
+            <Skeleton className="h-5 w-32" />
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Skeleton className="h-14 w-full rounded-lg" />
+            <Skeleton className="h-14 w-full rounded-lg" />
+          </CardContent>
+        </Card>
+      }
+    />
   )
 }
 
@@ -153,57 +240,17 @@ export function EmailProviderDetail() {
     },
   })
 
+  const backAction = (
+    <Button variant="ghost" size="sm" asChild>
+      <Link to="/email?tab=providers">
+        <ArrowLeft className="mr-2 size-4" />
+        Back to providers
+      </Link>
+    </Button>
+  )
+
   if (isLoading) {
-    return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 sm:p-4 md:p-6">
-          <Skeleton className="h-8 w-32" />
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div className="flex min-w-0 items-start gap-3">
-              <Skeleton className="size-11 shrink-0 rounded-md" />
-              <div className="space-y-2">
-                <Skeleton className="h-7 w-56" />
-                <Skeleton className="h-4 w-72" />
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <Skeleton className="h-10 w-28" />
-              <Skeleton className="h-10 w-24" />
-            </div>
-          </div>
-          <div className="grid gap-6 lg:grid-cols-3">
-            <div className="space-y-6 lg:col-span-2">
-              <Card>
-                <CardHeader>
-                  <Skeleton className="h-5 w-32" />
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <Skeleton className="h-14 w-full rounded-lg" />
-                  <Skeleton className="h-14 w-full rounded-lg" />
-                </CardContent>
-              </Card>
-            </div>
-            <div className="space-y-6">
-              <Card>
-                <CardHeader>
-                  <Skeleton className="h-5 w-24" />
-                </CardHeader>
-                <CardContent>
-                  <div className="space-y-3">
-                    {[1, 2, 3, 4].map((i) => (
-                      <div key={i} className="grid grid-cols-3 gap-3">
-                        <Skeleton className="h-4 w-20" />
-                        <Skeleton className="col-span-2 h-4 w-full" />
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
+    return <EmailProviderDetailSkeleton backAction={backAction} />
   }
 
   const isNotFound =
@@ -213,103 +260,49 @@ export function EmailProviderDetail() {
 
   if (!provider && fetchError && !isNotFound) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <AlertCircle className="size-8 text-destructive" />
-          <h2 className="mt-3 text-lg font-semibold">Failed to load email provider</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {fetchError instanceof Error
-              ? fetchError.message
-              : 'An unexpected error occurred. Please try again.'}
-          </p>
-          <div className="mt-4 flex gap-2">
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Failed to load email provider"
+        description={
+          fetchError instanceof Error
+            ? fetchError.message
+            : 'An unexpected error occurred. Please try again.'
+        }
+        action={
+          <div className="flex gap-2">
             <Button variant="outline" onClick={() => void refetchProvider()}>
-              <RotateCcw className="mr-2 size-4" />
               Retry
             </Button>
-            <Button variant="ghost" asChild>
-              <Link to="/email?tab=providers">
-                <ArrowLeft className="mr-2 size-4" />
-                Back to providers
-              </Link>
-            </Button>
+            {backAction}
           </div>
-        </div>
-      </div>
+        }
+      />
     )
   }
 
   if (!provider) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <h2 className="text-lg font-semibold">Provider not found</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            The requested email provider could not be found.
-          </p>
-          <Button asChild className="mt-4">
-            <Link to="/email?tab=providers">
-              <ArrowLeft className="mr-2 size-4" />
-              Back to providers
-            </Link>
-          </Button>
-        </div>
-      </div>
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="Provider not found"
+        description="The requested email provider could not be found."
+        action={backAction}
+      />
     )
   }
 
+  const verdict = providerVerdict(provider)
+
   return (
-    <div className="flex-1 overflow-auto">
-      <div className="space-y-6 sm:p-4 md:p-6">
-        {/* Back link */}
-        <Button variant="ghost" size="sm" asChild className="-ml-2 w-fit">
-          <Link to="/email?tab=providers">
-            <ArrowLeft className="mr-2 size-4" />
-            Back to providers
-          </Link>
-        </Button>
-
-        {/* Header */}
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex min-w-0 items-start gap-3">
-            <div className="flex size-11 shrink-0 items-center justify-center rounded-md border bg-background">
-              <EmailProviderLogo
-                provider={provider.provider_type as EmailProviderType}
-                size={22}
-              />
-            </div>
-            <div className="min-w-0 space-y-1.5">
-              <h1 className="truncate text-xl font-semibold sm:text-2xl">
-                {provider.name}
-              </h1>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
-                <Badge variant={provider.is_active ? 'default' : 'secondary'}>
-                  {provider.is_active ? 'Active' : 'Inactive'}
-                </Badge>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="text-foreground">
-                    {getEmailProviderLabel(
-                      provider.provider_type as EmailProviderType
-                    )}
-                  </span>
-                  <Badge
-                    variant="outline"
-                    className="font-mono text-[10px] uppercase"
-                  >
-                    {provider.region}
-                  </Badge>
-                </span>
-                <span className="hidden sm:inline" aria-hidden>
-                  ·
-                </span>
-                <span>
-                  Added <TimeAgo date={provider.created_at} />
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
+    <>
+      <Detail
+        title={provider.name}
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        actions={
+          <>
+            {backAction}
             <Button variant="outline" onClick={() => setIsTestDialogOpen(true)}>
               <Send className="mr-2 size-4" />
               Send Test Email
@@ -347,12 +340,11 @@ export function EmailProviderDetail() {
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>
-          </div>
-        </div>
-
-        {/* Two-column layout: domains + tracking setup on left, overview on right */}
-        <div className="grid gap-6 lg:grid-cols-3">
-          <div className="space-y-6 lg:col-span-2">
+          </>
+        }
+        facts={providerFacts(provider, domains?.length)}
+        main={
+          <>
             {/* Domains using this provider */}
             <Card>
               <CardHeader>
@@ -373,15 +365,11 @@ export function EmailProviderDetail() {
                     <Skeleton className="h-12 w-full" />
                   </div>
                 ) : domainsError ? (
-                  <Alert variant="destructive">
-                    <AlertCircle className="h-4 w-4" />
-                    <AlertTitle>Failed to load domains</AlertTitle>
-                    <AlertDescription>
-                      {domainsError instanceof Error
-                        ? domainsError.message
-                        : 'Could not fetch domains for this provider.'}
-                    </AlertDescription>
-                  </Alert>
+                  <Callout tone="error" title="Failed to load domains">
+                    {domainsError instanceof Error
+                      ? domainsError.message
+                      : 'Could not fetch domains for this provider.'}
+                  </Callout>
                 ) : !domains || domains.length === 0 ? (
                   <EmptyState
                     icon={Globe}
@@ -409,7 +397,10 @@ export function EmailProviderDetail() {
                               {domain.domain}
                             </p>
                             <p className="mt-1 text-xs text-muted-foreground">
-                              Added <TimeAgo date={domain.created_at} />
+                              Added{' '}
+                              <span title={fmtDateTime(domain.created_at)}>
+                                {fmtRelativeTime(domain.created_at)}
+                              </span>
                             </p>
                           </div>
                           <StatusPill status={domain.status} />
@@ -423,59 +414,9 @@ export function EmailProviderDetail() {
 
             {/* Delivery event tracking — self-gates to SES providers only */}
             <EmailTrackingSetup providerId={provider.id} />
-          </div>
-
-          {/* Right column — overview */}
-          <div className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Overview</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <dl className="divide-y">
-                  <Row label="Type">
-                    {getEmailProviderLabel(
-                      provider.provider_type as EmailProviderType
-                    )}
-                  </Row>
-                  <Row label="Region">
-                    <span className="font-mono">{provider.region}</span>
-                  </Row>
-                  <Row label="Status">
-                    <Badge
-                      variant={provider.is_active ? 'default' : 'secondary'}
-                    >
-                      {provider.is_active ? 'Active' : 'Inactive'}
-                    </Badge>
-                  </Row>
-                  {provider.provider_type === 'ses' && (
-                    <Row label="SNS Topic ARN">
-                      {provider.sns_topic_arn ? (
-                        <span className="break-all font-mono text-xs">
-                          {provider.sns_topic_arn}
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground">
-                          Not configured
-                        </span>
-                      )}
-                    </Row>
-                  )}
-                  <Row label="Domains">
-                    <span className="tabular-nums">{domains?.length ?? 0}</span>
-                  </Row>
-                  <Row label="Created">
-                    <TimeAgo date={provider.created_at} />
-                  </Row>
-                  <Row label="Updated">
-                    <TimeAgo date={provider.updated_at} />
-                  </Row>
-                </dl>
-              </CardContent>
-            </Card>
-          </div>
-        </div>
-      </div>
+          </>
+        }
+      />
 
       <EditProviderDialog
         provider={provider}
@@ -492,6 +433,6 @@ export function EmailProviderDetail() {
         providerId={provider.id}
         onSuccess={() => {}}
       />
-    </div>
+    </>
   )
 }
