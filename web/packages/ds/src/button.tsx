@@ -21,20 +21,44 @@ export interface ButtonProps extends BaseButtonProps {
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ busy = false, busyLabel, children, className, onClick, ...props }, ref) => {
+  ({ busy = false, busyLabel, children, className, onClick, asChild, ...props }, ref) => {
+    const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+      if (busy) {
+        event.preventDefault()
+        return
+      }
+      onClick?.(event)
+    }
+
+    // `asChild` hands rendering to Radix `Slot`, which requires exactly one
+    // React element child to merge its props onto — the spinner/busyLabel
+    // composition below would add a sibling node and break that contract
+    // (a busy `asChild` button is also a contradiction in terms: `asChild`
+    // means "render as this other element", not "render a spinner inside
+    // it"), so pass `children` straight through unmodified in that case.
+    if (asChild) {
+      return (
+        <BaseButton
+          ref={ref}
+          asChild
+          aria-busy={busy}
+          aria-disabled={busy || props['aria-disabled']}
+          className={cn(busy && 'cursor-wait', className)}
+          onClick={handleClick}
+          {...props}
+        >
+          {children}
+        </BaseButton>
+      )
+    }
+
     return (
       <BaseButton
         ref={ref}
         aria-busy={busy}
         aria-disabled={busy || props['aria-disabled']}
         className={cn(busy && 'cursor-wait', className)}
-        onClick={(event) => {
-          if (busy) {
-            event.preventDefault()
-            return
-          }
-          onClick?.(event)
-        }}
+        onClick={handleClick}
         {...props}
       >
         {busy ? <Loader2 className="animate-spin" /> : null}
