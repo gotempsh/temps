@@ -23,7 +23,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import React, { useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 
 interface ErrorTimeSeriesChartProps {
   project: ProjectResponse
@@ -54,10 +54,14 @@ export function ErrorTimeSeriesChart({
     defaultBucket
   )
 
-  // Update selected bucket when time range changes
-  React.useEffect(() => {
+  // Reset the override only when the automatic bucket changes. Do this before
+  // rendering so the query never fetches the new range with the old bucket.
+  const [previousDefaultBucket, setPreviousDefaultBucket] =
+    useState(defaultBucket)
+  if (previousDefaultBucket !== defaultBucket) {
+    setPreviousDefaultBucket(defaultBucket)
     setSelectedBucket(defaultBucket)
-  }, [defaultBucket])
+  }
 
   const { data, isLoading, error } = useQuery({
     ...getErrorTimeSeriesOptions({

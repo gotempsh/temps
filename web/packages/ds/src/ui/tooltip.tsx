@@ -12,7 +12,9 @@ import { cn } from '../lib/cn'
  * and hoverable content is off for every tooltip, otherwise a pointer that
  * drifts down through the label leaves it open.
  */
-const TooltipProvider = (props: React.ComponentProps<typeof TooltipPrimitive.Provider>) => <TooltipPrimitive.Provider disableHoverableContent {...props} />
+const TooltipProvider = (
+  props: React.ComponentProps<typeof TooltipPrimitive.Provider>
+) => <TooltipPrimitive.Provider disableHoverableContent {...props} />
 
 const Tooltip = TooltipPrimitive.Root
 

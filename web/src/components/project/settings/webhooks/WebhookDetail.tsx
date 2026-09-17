@@ -116,12 +116,16 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => navigate(`/projects/${project.slug}/settings/webhooks`)}
+            onClick={() =>
+              navigate(`/projects/${project.slug}/settings/webhooks`)
+            }
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h2 className="text-2xl font-bold tracking-tight">Webhook Details</h2>
+            <h2 className="text-2xl font-bold tracking-tight">
+              Webhook Details
+            </h2>
           </div>
         </div>
         <ErrorAlert
@@ -155,7 +159,9 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => navigate(`/projects/${project.slug}/settings/webhooks`)}
+            onClick={() =>
+              navigate(`/projects/${project.slug}/settings/webhooks`)
+            }
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
@@ -221,9 +227,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              {deliveries?.length || 0}
-            </div>
+            <div className="text-2xl font-bold">{deliveries?.length || 0}</div>
             <p className="text-xs text-muted-foreground mt-1">
               Last 100 deliveries
             </p>

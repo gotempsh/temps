@@ -95,7 +95,8 @@ async function fetchAllEvents(params: {
   if (params.email_id) searchParams.set('email_id', params.email_id)
   if (params.event_type) searchParams.set('event_type', params.event_type)
   if (params.page) searchParams.set('page', params.page.toString())
-  if (params.page_size) searchParams.set('page_size', params.page_size.toString())
+  if (params.page_size)
+    searchParams.set('page_size', params.page_size.toString())
 
   const response = await fetch(`/api/emails/events?${searchParams}`)
   if (!response.ok) throw new Error('Failed to fetch events')
@@ -187,7 +188,13 @@ export function EmailAnalytics() {
     )
   }
 
-  const hasEvents = stats && (stats.delivered > 0 || stats.opened > 0 || stats.clicked > 0 || stats.bounced > 0 || stats.complained > 0)
+  const hasEvents =
+    stats &&
+    (stats.delivered > 0 ||
+      stats.opened > 0 ||
+      stats.clicked > 0 ||
+      stats.bounced > 0 ||
+      stats.complained > 0)
 
   return (
     <div className="space-y-6">
@@ -290,9 +297,15 @@ export function EmailAnalytics() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Event</TableHead>
-                      <TableHead className="hidden md:table-cell">Recipient</TableHead>
-                      <TableHead className="hidden md:table-cell">Details</TableHead>
-                      <TableHead className="hidden lg:table-cell">Source</TableHead>
+                      <TableHead className="hidden md:table-cell">
+                        Recipient
+                      </TableHead>
+                      <TableHead className="hidden md:table-cell">
+                        Details
+                      </TableHead>
+                      <TableHead className="hidden lg:table-cell">
+                        Source
+                      </TableHead>
                       <TableHead>Time</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -304,7 +317,10 @@ export function EmailAnalytics() {
                         onClick={() => navigate(`/email/${event.email_id}`)}
                       >
                         <TableCell>
-                          <EventBadge type={event.event_type} iconClassName="h-3.5 w-3.5" />
+                          <EventBadge
+                            type={event.event_type}
+                            iconClassName="h-3.5 w-3.5"
+                          />
                         </TableCell>
                         <TableCell className="hidden md:table-cell">
                           {event.recipient ? (
@@ -318,18 +334,24 @@ export function EmailAnalytics() {
                           )}
                         </TableCell>
                         <TableCell className="hidden md:table-cell max-w-[250px]">
-                          {(event.event_type === 'click' || event.event_type === 'clicked') && !!event.metadata?.url ? (
+                          {(event.event_type === 'click' ||
+                            event.event_type === 'clicked') &&
+                          !!event.metadata?.url ? (
                             <span className="text-xs text-muted-foreground truncate block flex items-center gap-1">
                               <Globe className="h-3 w-3 shrink-0" />
                               {String(event.metadata!.url)}
                             </span>
-                          ) : event.event_type === 'bounced' && !!event.metadata?.bounce_type ? (
+                          ) : event.event_type === 'bounced' &&
+                            !!event.metadata?.bounce_type ? (
                             <span className="text-xs text-muted-foreground">
                               {String(event.metadata!.bounce_type)}
-                              {event.metadata!.bounce_sub_type != null && ` / ${String(event.metadata!.bounce_sub_type)}`}
+                              {event.metadata!.bounce_sub_type != null &&
+                                ` / ${String(event.metadata!.bounce_sub_type)}`}
                             </span>
                           ) : (
-                            <span className="text-xs text-muted-foreground">--</span>
+                            <span className="text-xs text-muted-foreground">
+                              --
+                            </span>
                           )}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell">
@@ -358,7 +380,10 @@ export function EmailAnalytics() {
                     ))}
                     {events?.events.length === 0 && (
                       <TableRow>
-                        <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
+                        <TableCell
+                          colSpan={5}
+                          className="text-center text-muted-foreground py-8"
+                        >
                           No events match the selected filter.
                         </TableCell>
                       </TableRow>

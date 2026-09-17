@@ -37,7 +37,7 @@ import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FileLock2, Plus, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 
@@ -106,7 +106,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             </code>{' '}
             and never injected as environment variables. Read with e.g.{' '}
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
-              fs.readFileSync('/run/secrets/DB_PASSWORD', 'utf8')
+              fs.readFileSync(&apos;/run/secrets/DB_PASSWORD&apos;,
+              &apos;utf8&apos;)
             </code>
             . Docker Compose projects get the same mount in every service. A
             redeploy is required for new or updated secrets to take effect.
@@ -170,15 +171,17 @@ function composeServiceNamesFor(project: {
   preset_config?: unknown
 }): string[] {
   const cfg = (project.preset_config ?? {}) as Record<string, unknown>
-  const services = (cfg.composeServices ?? cfg.compose_services ?? []) as Array<{
+  const services = (cfg.composeServices ??
+    cfg.compose_services ??
+    []) as Array<{
     name?: string
   }>
   return Array.from(
     new Set(
       services
         .map((service) => service?.name)
-        .filter((name): name is string => typeof name === 'string' && !!name),
-    ),
+        .filter((name): name is string => typeof name === 'string' && !!name)
+    )
   ).sort()
 }
 
@@ -205,7 +208,7 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
     },
     onError: (err: Error) => {
       toast.error(
-        err instanceof Error ? err.message : 'Failed to delete secret',
+        err instanceof Error ? err.message : 'Failed to delete secret'
       )
     },
   })
@@ -277,7 +280,7 @@ interface CreateSecretDialogProps {
 // Default-select environments whose name matches production or preview.
 // Matches case-insensitively so "Production", "PROD", "Preview" all hit.
 function defaultEnvironmentSelection(
-  environments: Array<{ id: number; name: string }>,
+  environments: Array<{ id: number; name: string }>
 ): number[] {
   return environments
     .filter((e) => {
@@ -299,7 +302,7 @@ function CreateSecretDialog({
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
   const [environmentIds, setEnvironmentIds] = useState<number[]>(() =>
-    defaultEnvironmentSelection(environments),
+    defaultEnvironmentSelection(environments)
   )
   const [includeInPreview, setIncludeInPreview] = useState(false)
   // Empty means every service, matching the API. Restricting is opt-in so an
@@ -312,18 +315,15 @@ function CreateSecretDialog({
   // the dialog has already mounted. Only applies before the user has touched
   // the selection — once they've made an explicit choice, leave it alone.
   const [hasUserEditedEnvs, setHasUserEditedEnvs] = useState(false)
-  useEffect(() => {
-    if (!hasUserEditedEnvs) {
-      setEnvironmentIds(defaultEnvironmentSelection(environments))
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [environments])
+  const effectiveEnvironmentIds = hasUserEditedEnvs
+    ? environmentIds
+    : defaultEnvironmentSelection(environments)
 
   const createMutation = useMutation({
     ...createProjectSecretMutation(),
     onSuccess: () => {
       toast.success(
-        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`,
+        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`
       )
       onCreated()
       setKey('')
@@ -338,7 +338,7 @@ function CreateSecretDialog({
     },
     onError: (err: Error) => {
       toast.error(
-        err instanceof Error ? err.message : 'Failed to create secret',
+        err instanceof Error ? err.message : 'Failed to create secret'
       )
     },
   })
@@ -347,7 +347,7 @@ function CreateSecretDialog({
     let ok = true
     if (!KEY_PATTERN.test(key)) {
       setKeyError(
-        'Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _',
+        'Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _'
       )
       ok = false
     } else {
@@ -365,7 +365,7 @@ function CreateSecretDialog({
       body: {
         key,
         value,
-        environment_ids: environmentIds,
+        environment_ids: effectiveEnvironmentIds,
         include_in_preview: includeInPreview,
         compose_services: composeServices,
       },
@@ -430,13 +430,13 @@ function CreateSecretDialog({
                     className="flex items-center gap-2 text-sm cursor-pointer"
                   >
                     <Checkbox
-                      checked={environmentIds.includes(env.id)}
+                      checked={effectiveEnvironmentIds.includes(env.id)}
                       onCheckedChange={(checked) => {
                         setHasUserEditedEnvs(true)
                         setEnvironmentIds((prev) =>
                           checked
                             ? [...prev, env.id]
-                            : prev.filter((id) => id !== env.id),
+                            : prev.filter((id) => id !== env.id)
                         )
                       }}
                     />
@@ -454,9 +454,9 @@ function CreateSecretDialog({
               <Label>Compose services</Label>
               <p className="text-xs text-muted-foreground mt-2">
                 This secret will be mounted in every service. To restrict it to
-                specific containers — so a database or sidecar can't read an
-                application's credentials — sync this project's compose
-                services from Git settings, then edit the secret.
+                specific containers — so a database or sidecar can&apos;t read
+                an application&apos;s credentials — sync this project&apos;s
+                compose services from Git settings, then edit the secret.
               </p>
             </div>
           )}
@@ -475,7 +475,7 @@ function CreateSecretDialog({
                         setComposeServices((prev) =>
                           checked
                             ? [...prev, name]
-                            : prev.filter((s) => s !== name),
+                            : prev.filter((s) => s !== name)
                         )
                       }
                     />
@@ -485,8 +485,8 @@ function CreateSecretDialog({
                 <p className="text-xs text-muted-foreground">
                   Leave empty to mount this secret in every service. Selecting
                   services restricts it to those containers — the others get no
-                  file at all, so a database or sidecar can't read an
-                  application's credentials.
+                  file at all, so a database or sidecar can&apos;t read an
+                  application&apos;s credentials.
                 </p>
               </div>
             </div>

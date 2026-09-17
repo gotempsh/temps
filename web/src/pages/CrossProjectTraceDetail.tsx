@@ -70,7 +70,9 @@ function UnifiedSpanDetail({
       )}
 
       <div>
-        <h4 className="mb-2 text-xs font-medium text-muted-foreground">Timing</h4>
+        <h4 className="mb-2 text-xs font-medium text-muted-foreground">
+          Timing
+        </h4>
         <div className="grid grid-cols-2 gap-2 text-xs">
           <div>
             <span className="text-muted-foreground">Start:</span>
@@ -136,7 +138,8 @@ export default function CrossProjectTraceDetail() {
   }, [data])
 
   const projectName = (span: SpanRecord) =>
-    projectById.get(span.project_id)?.project_name ?? `Project ${span.project_id}`
+    projectById.get(span.project_id)?.project_name ??
+    `Project ${span.project_id}`
 
   // This view is global, so there is no single list it belongs to. The first
   // contributing project's trace list is the closest thing; before the trace
@@ -168,7 +171,8 @@ export default function CrossProjectTraceDetail() {
   const selectedSpan = useMemo(
     () =>
       selectedSpanId
-        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ?? null)
+        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ??
+          null)
         : null,
     [selectedSpanId, flatSpans]
   )
@@ -345,8 +349,7 @@ export default function CrossProjectTraceDetail() {
       <div
         className={cn(
           'grid gap-3',
-          showSidePanel &&
-            'md:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]'
+          showSidePanel && 'md:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]'
         )}
       >
         <Card className="min-w-0">

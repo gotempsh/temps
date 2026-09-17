@@ -31,7 +31,7 @@ const isConversationLiveStream = (pathname: string) =>
     pathname
   )
 const consoleKitEntry = path.resolve(
-  __dirname,
+  import.meta.dirname,
   'packages/console-kit/src/index.ts'
 )
 

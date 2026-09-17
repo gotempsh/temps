@@ -24,9 +24,7 @@ export function PageContainer({
       data-page-container
       className={cn('w-full px-4 py-6 sm:px-6 lg:px-8', className)}
     >
-      <div
-        className={cn('w-full min-w-0 space-y-6', innerClassName)}
-      >
+      <div className={cn('w-full min-w-0 space-y-6', innerClassName)}>
         {children}
       </div>
     </div>

@@ -19,7 +19,9 @@ use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
 use temps_core::{AutopilotTriggerJob, Job, JobQueue, JobReceiver};
-use temps_entities::{deployments, environments, status_checks, status_incidents, status_monitors};
+use temps_entities::{
+    deployments, environments, projects, status_checks, status_incidents, status_monitors,
+};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -105,6 +107,11 @@ pub struct OutageEvent {
     pub monitor_id: i32,
     pub monitor_name: String,
     pub project_id: i32,
+    /// Human-readable project slug (e.g. "my-app"), resolved once at event
+    /// construction time so notification providers never have to show the
+    /// raw `project_id` to a human. Falls back to `format!("project #{id}")`
+    /// if the project can't be looked up (e.g. deleted between checks).
+    pub project_slug: String,
     pub environment_id: Option<i32>,
     pub previous_status: MonitorStatus,
     pub current_status: MonitorStatus,
@@ -221,6 +228,27 @@ impl OutageDetectionService {
             .unwrap_or(false)
     }
 
+    /// Resolve a project's slug for display in human-facing notifications.
+    /// Degrades gracefully to `project #{id}` if the lookup fails or the
+    /// project no longer exists, rather than surfacing a raw numeric ID or
+    /// failing the whole outage-notification path over a missing name.
+    async fn project_slug(&self, project_id: i32) -> String {
+        match projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(project)) => project.slug,
+            Ok(None) => {
+                warn!("Project {} not found while resolving slug", project_id);
+                format!("project #{project_id}")
+            }
+            Err(e) => {
+                warn!("Failed to look up project {} slug: {}", project_id, e);
+                format!("project #{project_id}")
+            }
+        }
+    }
+
     /// Process a new status check and detect state transitions
     pub async fn process_check(
         &self,
@@ -286,6 +314,10 @@ impl OutageDetectionService {
                         monitor_id,
                         monitor_name: monitor.name.clone(),
                         project_id: monitor.project_id,
+                        // Filled in below, after the state lock is dropped —
+                        // resolving the slug requires an async DB lookup and
+                        // shouldn't happen while holding `monitor_states`.
+                        project_slug: String::new(),
                         environment_id: monitor.environment_id,
                         previous_status: prev.status,
                         current_status: status,
@@ -331,6 +363,8 @@ impl OutageDetectionService {
                         monitor_id,
                         monitor_name: monitor.name.clone(),
                         project_id: monitor.project_id,
+                        // Filled in below, after the state lock is dropped.
+                        project_slug: String::new(),
                         environment_id: monitor.environment_id,
                         previous_status: MonitorStatus::Operational,
                         current_status: status,
@@ -349,6 +383,10 @@ impl OutageDetectionService {
         drop(states);
 
         // Handle incident creation/resolution and notifications
+        let mut event = event;
+        if let Some(event) = event.as_mut() {
+            event.project_slug = self.project_slug(event.project_id).await;
+        }
         if let Some(ref event) = event {
             self.handle_outage_event(event).await?;
         }
@@ -744,6 +782,7 @@ impl OutageDetectionService {
                 ("monitor_id".to_string(), event.monitor_id.to_string()),
                 ("monitor_name".to_string(), event.monitor_name.clone()),
                 ("project_id".to_string(), event.project_id.to_string()),
+                ("project_slug".to_string(), event.project_slug.clone()),
                 ("incident_id".to_string(), incident_id.to_string()),
                 (
                     "status".to_string(),
@@ -782,6 +821,7 @@ impl OutageDetectionService {
                 ("monitor_id".to_string(), event.monitor_id.to_string()),
                 ("monitor_name".to_string(), event.monitor_name.clone()),
                 ("project_id".to_string(), event.project_id.to_string()),
+                ("project_slug".to_string(), event.project_slug.clone()),
                 ("status".to_string(), "recovered".to_string()),
             ]
             .into_iter()
@@ -1312,6 +1352,62 @@ mod tests {
         }
     }
 
+    fn make_project_model(id: i32, slug: &str) -> temps_entities::projects::Model {
+        let now = Utc::now();
+        temps_entities::projects::Model {
+            id,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            template_slug: None,
+            repo_name: "repo".to_string(),
+            repo_owner: "owner".to_string(),
+            directory: "/".to_string(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::Astro,
+            preset_config: None,
+            deployment_config: None,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            created_at: now,
+            updated_at: now,
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
+            cross_project_trace_sharing: true,
+        }
+    }
+
     fn make_deployment_model(id: i32, state: &str) -> temps_entities::deployments::Model {
         temps_entities::deployments::Model {
             id,
@@ -1393,6 +1489,7 @@ mod tests {
             monitor_id: 1,
             monitor_name: "API Health".to_string(),
             project_id: 1,
+            project_slug: "api-health-project".to_string(),
             environment_id,
             previous_status,
             current_status,
@@ -1694,6 +1791,9 @@ mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // process_check resolves the project slug for the outage event
+            // metadata before handing off to handle_outage_event.
+            .append_query_results(vec![vec![make_project_model(1, "test-project")]])
             // handle_outage_event's guard runs inside a transaction that
             // first takes an advisory lock (an exec, not a query) before
             // re-reading pause state: paused by now.

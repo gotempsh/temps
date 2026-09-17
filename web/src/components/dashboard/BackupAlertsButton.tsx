@@ -103,7 +103,10 @@ export function BackupAlertsButton() {
  * while the alert was open).
  */
 function alertHref(alert: BackupAlertResponse): string | null {
-  if (alert.kind === 'overdue_schedule' && alert.schedule_s3_source_id !== null) {
+  if (
+    alert.kind === 'overdue_schedule' &&
+    alert.schedule_s3_source_id !== null
+  ) {
     // Schedules are listed on the S3 source detail page that owns them.
     return `/backups/s3-sources/${alert.schedule_s3_source_id}`
   }
@@ -140,8 +143,10 @@ function AlertRow({
 
   const targetLabel =
     alert.kind === 'overdue_schedule'
-      ? alert.schedule_name ??
-        (alert.schedule_id !== null ? `Schedule #${alert.schedule_id}` : 'Unknown schedule')
+      ? (alert.schedule_name ??
+        (alert.schedule_id !== null
+          ? `Schedule #${alert.schedule_id}`
+          : 'Unknown schedule'))
       : alert.job_id !== null
         ? `Job #${alert.job_id}`
         : 'Unknown job'
@@ -185,9 +190,7 @@ function AlertRow({
   )
 
   if (href === null) {
-    return (
-      <div className="flex items-start gap-3 px-3 py-3">{body}</div>
-    )
+    return <div className="flex items-start gap-3 px-3 py-3">{body}</div>
   }
 
   return (

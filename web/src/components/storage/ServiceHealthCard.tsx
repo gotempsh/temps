@@ -69,7 +69,9 @@ export function ServiceHealthBadge({
       }
       title={data?.last_error ?? undefined}
     >
-      <span className={`inline-block h-2 w-2 rounded-full ${statusColor(status ?? 'unknown')}`} />
+      <span
+        className={`inline-block h-2 w-2 rounded-full ${statusColor(status ?? 'unknown')}`}
+      />
       {statusLabel(status)}
     </span>
   )
@@ -103,7 +105,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
           ? 'Service is operational'
           : snapshot.status === 'degraded'
             ? 'Service is degraded'
-            : 'Service is down',
+            : 'Service is down'
       )
     },
     onError: (err: Error) => {
@@ -201,7 +203,9 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
                 : `Service has failed ${data.consecutive_failures} check(s) in a row.`}
             </p>
             {data.last_error ? (
-              <p className="break-words text-xs opacity-80">{data.last_error}</p>
+              <p className="break-words text-xs opacity-80">
+                {data.last_error}
+              </p>
             ) : null}
           </AlertDescription>
         </Alert>
@@ -211,7 +215,9 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
           <AlertDescription className="space-y-1">
             <p className="font-medium">Service is degraded.</p>
             {data.last_error ? (
-              <p className="break-words text-xs opacity-80">{data.last_error}</p>
+              <p className="break-words text-xs opacity-80">
+                {data.last_error}
+              </p>
             ) : (
               <p className="text-xs opacity-80">
                 The last health check succeeded but the service responded

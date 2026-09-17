@@ -40,7 +40,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail ?? body.title ?? detail
     } catch {
       // fall through with statusText

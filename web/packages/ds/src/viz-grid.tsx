@@ -45,7 +45,13 @@ export type Rung = {
  *           { name: 'p99', value: 402, delta: '+18%', baseline: 'vs prior 24h', state: 'warn' }]} />
  * ```
  */
-export function PercentileLadder({ rungs, unit = 'ms', label, meta, className }: {
+export function PercentileLadder({
+  rungs,
+  unit = 'ms',
+  label,
+  meta,
+  className,
+}: {
   rungs: Rung[]
   unit?: string
   /** What the figure is of ("checkout latency"). Goes into the `aria-label`. */
@@ -64,24 +70,48 @@ export function PercentileLadder({ rungs, unit = 'ms', label, meta, className }:
           `role="img"` sentence sits on the wrapper, because putting it on the
           `<ol>` would strip the list semantics from every rung. */}
       <div role="img" aria-label={sentence}>
-      <ol className="op-rows text-xs">
-        {rungs.map((r) => (
-          <li key={r.name} className="relative grid grid-cols-[2.5rem_minmax(0,1fr)_auto] items-center gap-3 px-3 py-1.5">
-            <span aria-hidden className="absolute inset-y-1 left-0 bg-foreground/[0.06]" style={{ width: `${(r.value / max) * 100}%` }} />
-            <span className="relative op-label">{r.name}</span>
-            <span className="relative min-w-0">
-              <Num value={r.value} unit={unit} />
-              {r.state && r.state !== 'ok' && <span className={cn('ml-2 text-[11px]', GLYPH_CLASS[r.state])}><span aria-hidden>{GLYPH[r.state]}</span> over budget</span>}
-            </span>
-            {/* A delta never appears without the window it is measured against. */}
-            <span className="relative text-right font-mono text-[11px] text-muted-foreground">
-              {r.delta ? <><span className="text-foreground">{r.delta}</span> {r.baseline}</> : ''}
-            </span>
-          </li>
-        ))}
-      </ol>
+        <ol className="op-rows text-xs">
+          {rungs.map((r) => (
+            <li
+              key={r.name}
+              className="relative grid grid-cols-[2.5rem_minmax(0,1fr)_auto] items-center gap-3 px-3 py-1.5"
+            >
+              <span
+                aria-hidden
+                className="absolute inset-y-1 left-0 bg-foreground/[0.06]"
+                style={{ width: `${(r.value / max) * 100}%` }}
+              />
+              <span className="relative op-label">{r.name}</span>
+              <span className="relative min-w-0">
+                <Num value={r.value} unit={unit} />
+                {r.state && r.state !== 'ok' && (
+                  <span
+                    className={cn('ml-2 text-[11px]', GLYPH_CLASS[r.state])}
+                  >
+                    <span aria-hidden>{GLYPH[r.state]}</span> over budget
+                  </span>
+                )}
+              </span>
+              {/* A delta never appears without the window it is measured against. */}
+              <span className="relative text-right font-mono text-[11px] text-muted-foreground">
+                {r.delta ? (
+                  <>
+                    <span className="text-foreground">{r.delta}</span>{' '}
+                    {r.baseline}
+                  </>
+                ) : (
+                  ''
+                )}
+              </span>
+            </li>
+          ))}
+        </ol>
       </div>
-      {meta && <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">{meta}</p>}
+      {meta && (
+        <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+          {meta}
+        </p>
+      )}
     </div>
   )
 }
@@ -116,7 +146,14 @@ export type Cohort = {
  *   verdict="Week 1 holds 41% and flattens at 22% from week 4." />
  * ```
  */
-export function CohortGrid({ cohorts, periodLabel = 'period', label, verdict, meta, className }: {
+export function CohortGrid({
+  cohorts,
+  periodLabel = 'period',
+  label,
+  verdict,
+  meta,
+  className,
+}: {
   cohorts: Cohort[]
   /** What one column is ("week", "day", "month"). Column heads read `week 0`, `week 1` … */
   periodLabel?: string
@@ -128,49 +165,126 @@ export function CohortGrid({ cohorts, periodLabel = 'period', label, verdict, me
   const periods = Math.max(0, ...cohorts.map((c) => c.values.length))
   const [at, setAt] = useState<{ r: number; c: number } | null>(null)
   const cell = at ? cohorts[at.r].values[at.c] : undefined
-  const read = at && cell !== undefined
-    ? `${cohorts[at.r].label} · ${periodLabel} ${at.c} · ${fmtPct(cell)} of ${fmtNum(cohorts[at.r].size)}`
-    : at ? `${cohorts[at.r].label} · ${periodLabel} ${at.c} · not reached yet` : ''
-  const move = (dr: number, dc: number) => setAt((p) => {
-    const n = p ?? { r: 0, c: 0 }
-    return { r: Math.max(0, Math.min(cohorts.length - 1, n.r + dr)), c: Math.max(0, Math.min(periods - 1, n.c + dc)) }
-  })
+  const read =
+    at && cell !== undefined
+      ? `${cohorts[at.r].label} · ${periodLabel} ${at.c} · ${fmtPct(cell)} of ${fmtNum(cohorts[at.r].size)}`
+      : at
+        ? `${cohorts[at.r].label} · ${periodLabel} ${at.c} · not reached yet`
+        : ''
+  const move = (dr: number, dc: number) =>
+    setAt((p) => {
+      const n = p ?? { r: 0, c: 0 }
+      return {
+        r: Math.max(0, Math.min(cohorts.length - 1, n.r + dr)),
+        c: Math.max(0, Math.min(periods - 1, n.c + dc)),
+      }
+    })
   const sentence = `${label}, ${cohorts.length} cohorts by ${periods} ${periodLabel}s, ink density is the share retained. ${verdict.replace(/\.\s*$/, '')}.`
   return (
     <div className={cn('min-w-0 border bg-background', className)}>
       <div
-        role="group" tabIndex={0} aria-label={`${sentence} Use arrow keys to read a cell.`}
-        onFocus={() => setAt((p) => p ?? { r: 0, c: 0 })} onBlur={() => setAt(null)}
-        onKeyDown={(e) => { const k = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[e.key]; if (k) { e.preventDefault(); move(k[0], k[1]) } }}
+        role="group"
+        tabIndex={0}
+        aria-label={`${sentence} Use arrow keys to read a cell.`}
+        onFocus={() => setAt((p) => p ?? { r: 0, c: 0 })}
+        onBlur={() => setAt(null)}
+        onKeyDown={(e) => {
+          const k = {
+            ArrowUp: [-1, 0],
+            ArrowDown: [1, 0],
+            ArrowLeft: [0, -1],
+            ArrowRight: [0, 1],
+          }[e.key]
+          if (k) {
+            e.preventDefault()
+            move(k[0], k[1])
+          }
+        }}
         className="min-w-0 overflow-auto outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
       >
         <table className="w-full font-mono text-[11px]">
-          <caption className="op-label border-b px-3 py-1.5 text-left text-[9px]">{label} · {read || `${fmtNum(cohorts.reduce((a, c) => a + c.size, 0))} in ${cohorts.length} cohorts`}</caption>
+          <caption className="op-label border-b px-3 py-1.5 text-left text-[9px]">
+            {label} ·{' '}
+            {read ||
+              `${fmtNum(cohorts.reduce((a, c) => a + c.size, 0))} in ${cohorts.length} cohorts`}
+          </caption>
           <thead>
             <tr>
-              <th scope="col" className="op-label border-b px-2 py-1 text-left text-[9px]">cohort</th>
-              <th scope="col" className="op-label border-b px-2 py-1 text-right text-[9px]">size</th>
-              {Array.from({ length: periods }, (_, c) => <th key={c} scope="col" className="op-label border-b px-2 py-1 text-right text-[9px]">{periodLabel} {c}</th>)}
+              <th
+                scope="col"
+                className="op-label border-b px-2 py-1 text-left text-[9px]"
+              >
+                cohort
+              </th>
+              <th
+                scope="col"
+                className="op-label border-b px-2 py-1 text-right text-[9px]"
+              >
+                size
+              </th>
+              {Array.from({ length: periods }, (_, c) => (
+                <th
+                  key={c}
+                  scope="col"
+                  className="op-label border-b px-2 py-1 text-right text-[9px]"
+                >
+                  {periodLabel} {c}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody className="op-rows">
             {cohorts.map((co, r) => (
               <tr key={co.label}>
-                <th scope="row" className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground">{co.label}</th>
-                <td className="px-2 py-1 text-right tabular-nums text-muted-foreground">{fmtNum(co.size)}</td>
+                <th
+                  scope="row"
+                  className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground"
+                >
+                  {co.label}
+                </th>
+                <td className="px-2 py-1 text-right tabular-nums text-muted-foreground">
+                  {fmtNum(co.size)}
+                </td>
                 {Array.from({ length: periods }, (_, c) => {
                   const v = co.values[c]
                   return (
-                    <td key={c} onMouseEnter={() => setAt({ r, c })} onMouseLeave={() => setAt(null)}
-                      className={cn('relative px-2 py-1 text-right tabular-nums', at && at.r === r && at.c === c && 'outline outline-1 -outline-offset-1 outline-foreground')}>
-                      {v === undefined ? <span className="text-muted-foreground">–</span> : <>
-                        <span aria-hidden className="absolute inset-0" style={inkCell(v, 100)} />
-                        {/* The wash is black on both layers, so a dense cell needs the
+                    <td
+                      key={c}
+                      onMouseEnter={() => setAt({ r, c })}
+                      onMouseLeave={() => setAt(null)}
+                      className={cn(
+                        'relative px-2 py-1 text-right tabular-nums',
+                        at &&
+                          at.r === r &&
+                          at.c === c &&
+                          'outline outline-1 -outline-offset-1 outline-foreground'
+                      )}
+                    >
+                      {v === undefined ? (
+                        <span className="text-muted-foreground">–</span>
+                      ) : (
+                        <>
+                          <span
+                            aria-hidden
+                            className="absolute inset-0"
+                            style={inkCell(v, 100)}
+                          />
+                          {/* The wash is black on both layers, so a dense cell needs the
                             colour that reads on black — `--background` on paper, ink on
                             night. Flipping at the top step only left the 0.42 middle of
                             the ladder as a 50% grey that neither end could sit on. */}
-                        <span className="relative" style={inkStep(v, 100) >= 3 ? { color: 'var(--op-ink-on-dense)' } : undefined}>{fmtPct(v, { digits: 0 })}</span>
-                      </>}
+                          <span
+                            className="relative"
+                            style={
+                              inkStep(v, 100) >= 3
+                                ? { color: 'var(--op-ink-on-dense)' }
+                                : undefined
+                            }
+                          >
+                            {fmtPct(v, { digits: 0 })}
+                          </span>
+                        </>
+                      )}
                     </td>
                   )
                 })}
@@ -180,7 +294,17 @@ export function CohortGrid({ cohorts, periodLabel = 'period', label, verdict, me
         </table>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
-        <span className="flex items-center gap-1">0% {INK_STEPS.map((o, s) => <span key={s} className="block h-2 w-2" style={{ backgroundColor: 'var(--foreground)', opacity: o }} />)} 100%</span>
+        <span className="flex items-center gap-1">
+          0%{' '}
+          {INK_STEPS.map((o, s) => (
+            <span
+              key={s}
+              className="block h-2 w-2"
+              style={{ backgroundColor: 'var(--foreground)', opacity: o }}
+            />
+          ))}{' '}
+          100%
+        </span>
         <span>{meta ?? '– not reached yet'}</span>
       </div>
       <ReadoutLive text={read} />
@@ -219,7 +343,14 @@ export type DeltaRow = {
  *     threshold: { at: 1, state: 'error', label: 'budget 1%' } }]} />
  * ```
  */
-export function DeltaTable({ rows, before, after, label, meta, className }: {
+export function DeltaTable({
+  rows,
+  before,
+  after,
+  label,
+  meta,
+  className,
+}: {
   rows: DeltaRow[]
   /** What the "before" column is ("dep_91a", "previous 7d"). */
   before: string
@@ -230,10 +361,14 @@ export function DeltaTable({ rows, before, after, label, meta, className }: {
   meta?: ReactNode
   className?: string
 }) {
-  const pct = (r: DeltaRow) => (r.before ? ((r.after - r.before) / Math.abs(r.before)) * 100 : undefined)
+  const pct = (r: DeltaRow) =>
+    r.before ? ((r.after - r.before) / Math.abs(r.before)) * 100 : undefined
   const toneOf = (r: DeltaRow): State | undefined => {
     if (!r.threshold) return undefined
-    const over = r.better === 'higher' ? r.after < r.threshold.at : r.after > r.threshold.at
+    const over =
+      r.better === 'higher'
+        ? r.after < r.threshold.at
+        : r.after > r.threshold.at
     return over ? r.threshold.state : undefined
   }
   const caption = label ?? `${after} vs ${before}`
@@ -242,43 +377,108 @@ export function DeltaTable({ rows, before, after, label, meta, className }: {
       {/* Five columns of numbers do not fit a phone: the table scrolls inside
           its own frame rather than pushing the page sideways. */}
       <div className="min-w-0 overflow-auto">
-      <table className="w-full min-w-[22rem] text-xs">
-        <caption className="op-label border-b px-3 py-1.5 text-left text-[9px]">{caption}</caption>
-        <thead>
-          <tr>
-            <th scope="col" className="op-label border-b px-3 py-1 text-left text-[9px]">metric</th>
-            <th scope="col" className="op-label border-b px-3 py-1 text-right text-[9px]">{before}</th>
-            <th scope="col" className="op-label border-b px-3 py-1 text-right text-[9px]">{after}</th>
-            <th scope="col" className="op-label border-b px-3 py-1 text-right text-[9px]">delta</th>
-          </tr>
-        </thead>
-        <tbody className="op-rows">
-          {rows.map((r) => {
-            const d = pct(r)
-            const tone = toneOf(r)
-            return (
-              <tr key={r.metric}>
-                <th scope="row" className="px-3 py-1.5 text-left font-normal">
-                  {r.metric}
-                  {r.note && <span className="ml-2 text-[11px] text-muted-foreground">{r.note}</span>}
-                </th>
-                <td className="px-3 py-1.5 text-right"><Num value={r.before} unit={r.unit} className="text-muted-foreground" /></td>
-                <td className="px-3 py-1.5 text-right">
-                  <Num value={r.after} unit={r.unit} />
-                  {/* Tone arrives with a glyph and the threshold's own words, never alone. */}
-                  {tone && <span className={cn('ml-2 font-mono text-[11px]', GLYPH_CLASS[tone])}><span aria-hidden>{GLYPH[tone]}</span> {r.threshold?.label}</span>}
-                </td>
-                <td className={cn('px-3 py-1.5 text-right font-mono tabular-nums', tone ? GLYPH_CLASS[tone] : '')}>
-                  {d === undefined ? '–' : `${d >= 0 ? '+' : ''}${fmtNum(d, { digits: Math.abs(d) < 10 ? 1 : 0 })}%`}
-                  <span className="ml-1 text-[11px] text-muted-foreground">{r.better === 'lower' ? (r.after <= r.before ? 'better' : 'worse') : r.better === 'higher' ? (r.after >= r.before ? 'better' : 'worse') : ''}</span>
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+        <table className="w-full min-w-[22rem] text-xs">
+          <caption className="op-label border-b px-3 py-1.5 text-left text-[9px]">
+            {caption}
+          </caption>
+          <thead>
+            <tr>
+              <th
+                scope="col"
+                className="op-label border-b px-3 py-1 text-left text-[9px]"
+              >
+                metric
+              </th>
+              <th
+                scope="col"
+                className="op-label border-b px-3 py-1 text-right text-[9px]"
+              >
+                {before}
+              </th>
+              <th
+                scope="col"
+                className="op-label border-b px-3 py-1 text-right text-[9px]"
+              >
+                {after}
+              </th>
+              <th
+                scope="col"
+                className="op-label border-b px-3 py-1 text-right text-[9px]"
+              >
+                delta
+              </th>
+            </tr>
+          </thead>
+          <tbody className="op-rows">
+            {rows.map((r) => {
+              const d = pct(r)
+              const tone = toneOf(r)
+              return (
+                <tr key={r.metric}>
+                  <th scope="row" className="px-3 py-1.5 text-left font-normal">
+                    {r.metric}
+                    {r.note && (
+                      <span className="ml-2 text-[11px] text-muted-foreground">
+                        {r.note}
+                      </span>
+                    )}
+                  </th>
+                  <td className="px-3 py-1.5 text-right">
+                    <Num
+                      value={r.before}
+                      unit={r.unit}
+                      className="text-muted-foreground"
+                    />
+                  </td>
+                  <td className="px-3 py-1.5 text-right">
+                    <Num value={r.after} unit={r.unit} />
+                    {/* Tone arrives with a glyph and the threshold's own words, never alone. */}
+                    {tone && (
+                      <span
+                        className={cn(
+                          'ml-2 font-mono text-[11px]',
+                          GLYPH_CLASS[tone]
+                        )}
+                      >
+                        <span aria-hidden>{GLYPH[tone]}</span>{' '}
+                        {r.threshold?.label}
+                      </span>
+                    )}
+                  </td>
+                  <td
+                    className={cn(
+                      'px-3 py-1.5 text-right font-mono tabular-nums',
+                      tone ? GLYPH_CLASS[tone] : ''
+                    )}
+                  >
+                    {d === undefined
+                      ? '–'
+                      : `${d >= 0 ? '+' : ''}${fmtNum(d, { digits: Math.abs(d) < 10 ? 1 : 0 })}%`}
+                    <span className="ml-1 text-[11px] text-muted-foreground">
+                      {r.better === 'lower'
+                        ? r.after <= r.before
+                          ? 'better'
+                          : 'worse'
+                        : r.better === 'higher'
+                          ? r.after >= r.before
+                            ? 'better'
+                            : 'worse'
+                          : ''}
+                    </span>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
       </div>
-      <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">{meta ?? <>every delta is {after} against {before}</>}</p>
+      <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+        {meta ?? (
+          <>
+            every delta is {after} against {before}
+          </>
+        )}
+      </p>
     </div>
   )
 }

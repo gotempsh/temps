@@ -24,7 +24,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -84,8 +84,14 @@ export function PreviewEnvironmentsCard({
     },
   })
 
-  const previewEnabled = form.watch('enablePreviewEnvironments')
-  const onDemandEnabled = form.watch('previewEnvsOnDemand')
+  const previewEnabled = useWatch({
+    control: form.control,
+    name: 'enablePreviewEnvironments',
+  })
+  const onDemandEnabled = useWatch({
+    control: form.control,
+    name: 'previewEnvsOnDemand',
+  })
 
   const handleSave = async (values: FormValues) => {
     if (!project?.id) return

@@ -70,7 +70,8 @@ export function resolveProxyWindow(
 ): ResolvedProxyWindow {
   if (range === 'custom' && custom?.from && custom?.to) {
     const start = custom.from
-    const end = custom.to.getTime() >= custom.from.getTime() ? custom.to : custom.from
+    const end =
+      custom.to.getTime() >= custom.from.getTime() ? custom.to : custom.from
     const durationSeconds = Math.max(
       1,
       (end.getTime() - start.getTime()) / 1000

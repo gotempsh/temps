@@ -20,7 +20,10 @@ export const AI_PROVIDERS: { provider: string; agents: string[] }[] = [
     agents: ['ClaudeBot', 'Claude-SearchBot', 'Claude-User', 'anthropic-ai'],
   },
   { provider: 'Perplexity', agents: ['PerplexityBot', 'Perplexity-User'] },
-  { provider: 'Google', agents: ['GoogleOther', 'Googlebot', 'Gemini-Deep-Research'] },
+  {
+    provider: 'Google',
+    agents: ['GoogleOther', 'Googlebot', 'Gemini-Deep-Research'],
+  },
   { provider: 'Microsoft', agents: ['Bingbot'] },
   { provider: 'Apple', agents: ['Applebot', 'Applebot-Extended'] },
   { provider: 'Meta', agents: ['Meta-ExternalAgent', 'Meta-ExternalFetcher'] },

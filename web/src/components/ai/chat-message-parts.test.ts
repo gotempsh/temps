@@ -54,8 +54,16 @@ describe('complete tool visibility', () => {
     expect(toolExecutionState(tool)).toBe('running')
     expect(toolExecutionState({ ...tool, result: null })).toBe('running')
     expect(toolExecutionState({ ...tool, result: '' })).toBe('completed')
-    expect(toolExecutionState({ ...tool, result: '0 errors found' })).toBe('completed')
-    for (const result of ['{"is_error":true}', '{"error":"Permission denied"}', '{"status":"failed"}', '{"exit_code":7}', 'connection refused\nProcess exited with code 7.']) {
+    expect(toolExecutionState({ ...tool, result: '0 errors found' })).toBe(
+      'completed'
+    )
+    for (const result of [
+      '{"is_error":true}',
+      '{"error":"Permission denied"}',
+      '{"status":"failed"}',
+      '{"exit_code":7}',
+      'connection refused\nProcess exited with code 7.',
+    ]) {
       expect(toolExecutionState({ ...tool, result })).toBe('failed')
     }
   })

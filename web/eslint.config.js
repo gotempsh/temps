@@ -124,6 +124,26 @@ export default tseslint.config(
     },
   },
 
+  // Repository scripts execute under Node rather than in the browser.
+  {
+    files: ['**/scripts/**/*.{js,mjs,cjs,ts}'],
+    languageOptions: {
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
+
+  // React Three Fiber intentionally exposes Three.js properties as JSX
+  // intrinsic props; eslint-plugin-react only knows DOM property names.
+  {
+    files: ['src/components/analytics/EarthGlobe.tsx'],
+    rules: {
+      'react/no-unknown-property': 'off',
+    },
+  },
+
   // Prettier config to disable conflicting rules
   prettierConfig,
 )

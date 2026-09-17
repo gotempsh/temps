@@ -37,7 +37,8 @@ interface AnomalyBacktestProps {
 function fmtNum(v: number): string {
   if (!Number.isFinite(v)) return '—'
   const abs = Math.abs(v)
-  if (abs >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+  if (abs >= 1000)
+    return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
   if (abs >= 1) return v.toFixed(1)
   return v.toFixed(3)
 }
@@ -64,7 +65,7 @@ export function AnomalyBacktest({
       window_secs: windowSecs,
       detection_config: detectionConfig,
     }),
-    [projectId, metricName, aggregation, windowSecs, detectionConfig],
+    [projectId, metricName, aggregation, windowSecs, detectionConfig]
   )
   const bodyKey = JSON.stringify(body)
   const { mutate } = preview
@@ -158,8 +159,8 @@ export function AnomalyBacktest({
               <span className="font-medium text-foreground">
                 {breach_count}
               </span>{' '}
-              of the {chartData.length} evaluated points — the metric shifted
-              to a new level and never returned to the band, not a series of
+              of the {chartData.length} evaluated points — the metric shifted to
+              a new level and never returned to the band, not a series of
               separate spikes.
             </>
           ) : (
@@ -181,7 +182,10 @@ export function AnomalyBacktest({
               data={chartData}
               margin={{ top: 4, right: 8, bottom: 0, left: 0 }}
             >
-              <CartesianGrid strokeDasharray="3 3" className="stroke-border/40" />
+              <CartesianGrid
+                strokeDasharray="3 3"
+                className="stroke-border/40"
+              />
               <XAxis
                 dataKey="bucket"
                 tickFormatter={formatBucketLabel}

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { Loader2, Save, Timer } from 'lucide-react'
 
@@ -51,7 +51,7 @@ export function AiChatLimitsCard() {
   const {
     register,
     handleSubmit,
-    watch,
+    control,
     reset,
     formState: { isDirty, isSubmitting, errors },
   } = useForm<FormData>({
@@ -67,7 +67,7 @@ export function AiChatLimitsCard() {
     }
   }, [settings, reset])
 
-  const current = watch('turn_timeout_secs')
+  const current = useWatch({ control, name: 'turn_timeout_secs' })
 
   const onSubmit = async (data: FormData) => {
     try {
@@ -99,8 +99,8 @@ export function AiChatLimitsCard() {
           A turn is bounded by time, not by a number of steps, so the assistant
           can work a problem for as long as it needs rather than stopping after
           a fixed number of tool calls. This is the ceiling for one message: it
-          stops an unattended turn, and caps what a single message can cost.
-          You can always stop a turn yourself from the chat.
+          stops an unattended turn, and caps what a single message can cost. You
+          can always stop a turn yourself from the chat.
         </CardDescription>
       </CardHeader>
       <CardContent>

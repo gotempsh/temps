@@ -40,7 +40,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail ?? body.title ?? detail
     } catch {
       // fall through with statusText
@@ -57,7 +60,7 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
 export async function listExternalServiceBackups(
   serviceId: number,
   page = 1,
-  pageSize = 20,
+  pageSize = 20
 ): Promise<ServiceBackupListResponse> {
   const params = new URLSearchParams({
     page: String(page),
@@ -65,7 +68,7 @@ export async function listExternalServiceBackups(
   })
   const response = await fetch(
     `/api/backups/external-services/${serviceId}/backups?${params}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<ServiceBackupListResponse>(response)
 }
@@ -77,7 +80,7 @@ export async function listExternalServiceBackups(
 export function listExternalServiceBackupsOptions(
   serviceId: number | undefined,
   page = 1,
-  pageSize = 20,
+  pageSize = 20
 ) {
   return {
     queryKey: ['external-service-backups', serviceId, page, pageSize] as const,

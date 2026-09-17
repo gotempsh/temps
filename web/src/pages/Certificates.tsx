@@ -37,7 +37,8 @@ import {
 
 const PAGE_SIZE = 20
 
-type StatusVariant = 'default' | 'secondary' | 'success' | 'warning' | 'destructive'
+type StatusVariant =
+  'default' | 'secondary' | 'success' | 'warning' | 'destructive'
 
 interface StatusDisplay {
   label: string
@@ -200,7 +201,8 @@ export function Certificates() {
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
             <span className="hidden sm:inline">
-              {total} attempt{total === 1 ? '' : 's'} · page {page} / {totalPages}
+              {total} attempt{total === 1 ? '' : 's'} · page {page} /{' '}
+              {totalPages}
             </span>
             <span className="sm:hidden">
               {page} / {totalPages}
@@ -324,7 +326,9 @@ function CertificateDetailSheet({
                     : '—'}
                 </DetailField>
                 <DetailField label="Trigger">
-                  <span className="font-mono text-xs">{row.attempt.trigger}</span>
+                  <span className="font-mono text-xs">
+                    {row.attempt.trigger}
+                  </span>
                 </DetailField>
                 <DetailField label="Attempted">
                   {formatLocalDateTime(row.attempt.created_at)}

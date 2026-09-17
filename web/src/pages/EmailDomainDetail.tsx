@@ -89,7 +89,9 @@ import { problemMessage } from '@/components/email/sharedUtils'
 async function fetchDomain(id: number): Promise<EmailDomainWithDnsResponse> {
   const response = await getDomain({ path: { id } })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email domain'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email domain')
+    )
   }
   return response.data
 }
@@ -97,7 +99,9 @@ async function fetchDomain(id: number): Promise<EmailDomainWithDnsResponse> {
 async function fetchProviders(): Promise<EmailProviderResponse[]> {
   const response = await listEmailProviders()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email providers'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email providers')
+    )
   }
   return response.data ?? []
 }
@@ -105,7 +109,9 @@ async function fetchProviders(): Promise<EmailProviderResponse[]> {
 async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
   const response = await listDnsProviders()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch DNS providers'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch DNS providers')
+    )
   }
   return response.data ?? []
 }
@@ -118,15 +124,21 @@ async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
 async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
   const response = await getEmailStats({ query: { domain_id: domainId } })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email stats'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email stats')
+    )
   }
   return response.data
 }
 
-async function fetchAuthorizedProjects(domainId: number): Promise<AuthorizedEmailDomainProjectResponse[]> {
+async function fetchAuthorizedProjects(
+  domainId: number
+): Promise<AuthorizedEmailDomainProjectResponse[]> {
   const response = await listEmailDomainProjects({ path: { id: domainId } })
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch authorized projects'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch authorized projects')
+    )
   }
   return response.data ?? []
 }
@@ -148,7 +160,10 @@ function StatPanel({ stats }: { stats: { label: string; value: number }[] }) {
     <div className="@container rounded-lg border">
       <dl className="grid grid-cols-2 @min-3xl:grid-cols-7">
         {stats.map((stat) => (
-          <div key={stat.label} className={cn('space-y-1 p-4', STAT_DIVIDER_CLASSES)}>
+          <div
+            key={stat.label}
+            className={cn('space-y-1 p-4', STAT_DIVIDER_CLASSES)}
+          >
             <dt className="truncate text-sm font-medium text-muted-foreground">
               {stat.label}
             </dt>
@@ -184,12 +199,20 @@ export function EmailDomainDetail() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const { user } = useAuth()
-  const canManageAuthorizations = user?.role === 'admin' || user?.role === 'platform_admin'
+  const canManageAuthorizations =
+    user?.role === 'admin' || user?.role === 'platform_admin'
 
-  const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
-  const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
-  const [projectToRevoke, setProjectToRevoke] = useState<AuthorizedEmailDomainProjectResponse | null>(null)
-  const [projectToAuthorize, setProjectToAuthorize] = useState<number | null>(null)
+  const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<
+    number | null
+  >(null)
+  const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(
+    null
+  )
+  const [projectToRevoke, setProjectToRevoke] =
+    useState<AuthorizedEmailDomainProjectResponse | null>(null)
+  const [projectToAuthorize, setProjectToAuthorize] = useState<number | null>(
+    null
+  )
 
   const {
     data: domainDetails,
@@ -250,7 +273,9 @@ export function EmailDomainDetail() {
     mutationFn: async () => {
       const response = await verifyDomain({ path: { id: id! } })
       if (response.error || !response.data) {
-        throw new Error(problemMessage(response.error, 'Failed to verify email domain'))
+        throw new Error(
+          problemMessage(response.error, 'Failed to verify email domain')
+        )
       }
       return response.data
     },
@@ -259,12 +284,14 @@ export function EmailDomainDetail() {
       // (are_all_records_verified) — exclude them from the counts shown here
       // too, so the toast reflects the records that actually gate the status.
       const required = data.dns_records.filter(
-        r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+        (r) => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
       )
-      const verifiedCount = required.filter(r => r.status === 'verified').length
+      const verifiedCount = required.filter(
+        (r) => r.status === 'verified'
+      ).length
       const totalCount = required.length
-      const pendingCount = required.filter(r => r.status === 'pending').length
-      const failedCount = required.filter(r => r.status === 'failed').length
+      const pendingCount = required.filter((r) => r.status === 'pending').length
+      const failedCount = required.filter((r) => r.status === 'failed').length
 
       if (data.domain.status === 'verified') {
         toast.success('Domain verified', {
@@ -296,7 +323,9 @@ export function EmailDomainDetail() {
     mutationFn: async () => {
       const response = await deleteEmailDomain({ path: { id: id! } })
       if (response.error) {
-        throw new Error(problemMessage(response.error, 'Failed to delete email domain'))
+        throw new Error(
+          problemMessage(response.error, 'Failed to delete email domain')
+        )
       }
     },
     onSuccess: () => {
@@ -316,7 +345,9 @@ export function EmailDomainDetail() {
         body: { dns_provider_id: dnsProviderId },
       })
       if (response.error || !response.data) {
-        throw new Error(problemMessage(response.error, 'Failed to setup DNS records'))
+        throw new Error(
+          problemMessage(response.error, 'Failed to setup DNS records')
+        )
       }
       return response.data
     },
@@ -332,7 +363,9 @@ export function EmailDomainDetail() {
           description: `${data.records_created} of ${data.total_records} records were created.`,
         })
       } else {
-        toast.error('Failed to create DNS records', { description: data.message })
+        toast.error('Failed to create DNS records', {
+          description: data.message,
+        })
       }
     },
     onError: (err: Error) => {
@@ -353,26 +386,38 @@ export function EmailDomainDetail() {
 
   const authorizeProjectMutation = useMutation({
     mutationFn: async (projectId: number) => {
-      const response = await authorizeEmailDomainProject({ path: { id: id!, project_id: projectId } })
+      const response = await authorizeEmailDomainProject({
+        path: { id: id!, project_id: projectId },
+      })
       if (response.error) {
-        throw new Error(problemMessage(response.error, 'Failed to authorize project'))
+        throw new Error(
+          problemMessage(response.error, 'Failed to authorize project')
+        )
       }
     },
     onSuccess: () => {
       setProjectToAuthorize(null)
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
       toast.success('Project authorized', {
-        description: 'Deployments in this project can now send from this domain.',
+        description:
+          'Deployments in this project can now send from this domain.',
       })
     },
-    onError: (error: Error) => toast.error('Failed to authorize project', { description: error.message }),
+    onError: (error: Error) =>
+      toast.error('Failed to authorize project', {
+        description: error.message,
+      }),
   })
 
   const revokeProjectMutation = useMutation({
     mutationFn: async (projectId: number) => {
-      const response = await revokeEmailDomainProject({ path: { id: id!, project_id: projectId } })
+      const response = await revokeEmailDomainProject({
+        path: { id: id!, project_id: projectId },
+      })
       if (response.error) {
-        throw new Error(problemMessage(response.error, 'Failed to revoke project'))
+        throw new Error(
+          problemMessage(response.error, 'Failed to revoke project')
+        )
       }
     },
     onSuccess: () => {
@@ -380,7 +425,8 @@ export function EmailDomainDetail() {
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
       toast.success('Project access revoked')
     },
-    onError: (error: Error) => toast.error('Failed to revoke project', { description: error.message }),
+    onError: (error: Error) =>
+      toast.error('Failed to revoke project', { description: error.message }),
   })
 
   if (isLoading) {
@@ -469,9 +515,11 @@ export function EmailDomainDetail() {
   // overview panel and card description, consistent with DnsVerificationSummary
   // and the backend's are_all_records_verified gate.
   const requiredDnsRecords = dnsRecords.filter(
-    r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+    (r) => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
   )
-  const verifiedCount = requiredDnsRecords.filter(r => r.status === 'verified').length
+  const verifiedCount = requiredDnsRecords.filter(
+    (r) => r.status === 'verified'
+  ).length
   const totalCount = requiredDnsRecords.length
 
   return (
@@ -507,14 +555,21 @@ export function EmailDomainDetail() {
                 {provider && (
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-foreground">
-                      {getEmailProviderLabel(provider.provider_type as EmailProviderType)}
+                      {getEmailProviderLabel(
+                        provider.provider_type as EmailProviderType
+                      )}
                     </span>
-                    <Badge variant="outline" className="font-mono text-[10px] uppercase">
+                    <Badge
+                      variant="outline"
+                      className="font-mono text-[10px] uppercase"
+                    >
                       {provider.provider_type}
                     </Badge>
                   </span>
                 )}
-                <span className="hidden sm:inline" aria-hidden>·</span>
+                <span className="hidden sm:inline" aria-hidden>
+                  ·
+                </span>
                 <span>
                   Added <TimeAgo date={domain.created_at} />
                 </span>
@@ -537,7 +592,10 @@ export function EmailDomainDetail() {
             </Button>
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <Button variant="outline" className="text-destructive hover:text-destructive">
+                <Button
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                >
                   <Trash2 className="mr-2 size-4" />
                   Delete
                 </Button>
@@ -546,9 +604,10 @@ export function EmailDomainDetail() {
                 <AlertDialogHeader>
                   <AlertDialogTitle>Delete {domain.domain}?</AlertDialogTitle>
                   <AlertDialogDescription>
-                    This will permanently delete the domain and its DNS configuration
-                    from Temps. The DNS records in your registrar are not removed.
-                    Applications using this domain will no longer be able to send email.
+                    This will permanently delete the domain and its DNS
+                    configuration from Temps. The DNS records in your registrar
+                    are not removed. Applications using this domain will no
+                    longer be able to send email.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -598,7 +657,10 @@ export function EmailDomainDetail() {
                 { label: 'Captured', value: emailStats.captured },
                 { label: 'Queued', value: emailStats.queued },
                 { label: 'Sending', value: emailStats.sending },
-                { label: 'Delivery unknown', value: emailStats.delivery_unknown },
+                {
+                  label: 'Delivery unknown',
+                  value: emailStats.delivery_unknown,
+                },
                 { label: 'Failed', value: emailStats.failed },
               ]}
             />
@@ -639,8 +701,8 @@ export function EmailDomainDetail() {
                         Automatic DNS setup
                       </CardTitle>
                       <CardDescription>
-                        If you&apos;ve connected a DNS provider in Temps, we can create
-                        these records for you.
+                        If you&apos;ve connected a DNS provider in Temps, we can
+                        create these records for you.
                       </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">
@@ -660,7 +722,10 @@ export function EmailDomainDetail() {
                                 <div className="flex items-center gap-2">
                                   <Settings2 className="size-4" />
                                   <span>{p.name}</span>
-                                  <Badge variant="outline" className="ml-1 text-xs">
+                                  <Badge
+                                    variant="outline"
+                                    className="ml-1 text-xs"
+                                  >
                                     {p.provider_type}
                                   </Badge>
                                 </div>
@@ -698,7 +763,9 @@ export function EmailDomainDetail() {
                         <div className="space-y-3">
                           <Separator />
                           <Alert
-                            variant={dnsSetupResult.success ? 'default' : 'destructive'}
+                            variant={
+                              dnsSetupResult.success ? 'default' : 'destructive'
+                            }
                           >
                             {dnsSetupResult.success ? (
                               <CheckCircle2 className="size-4" />
@@ -754,23 +821,26 @@ export function EmailDomainDetail() {
                   <CardHeader>
                     <CardTitle>Manual DNS configuration</CardTitle>
                     <CardDescription>
-                      Prefer to do it yourself? Add the records above in your DNS
-                      provider, then click <span className="font-medium">Verify DNS</span>.
+                      Prefer to do it yourself? Add the records above in your
+                      DNS provider, then click{' '}
+                      <span className="font-medium">Verify DNS</span>.
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
                     <ol className="list-inside list-decimal space-y-1.5 text-sm text-muted-foreground">
                       <li>
-                        Log in to your domain registrar or DNS provider (Cloudflare,
-                        Route53, GoDaddy, etc.)
+                        Log in to your domain registrar or DNS provider
+                        (Cloudflare, Route53, GoDaddy, etc.)
                       </li>
                       <li>Navigate to the DNS management section</li>
                       <li>Add each record shown above with the exact values</li>
                       <li>
-                        Wait for DNS propagation (usually a few minutes, up to 48 hours)
+                        Wait for DNS propagation (usually a few minutes, up to
+                        48 hours)
                       </li>
                       <li>
-                        Come back here and click <span className="font-medium">Verify DNS</span>
+                        Come back here and click{' '}
+                        <span className="font-medium">Verify DNS</span>
                       </li>
                     </ol>
                   </CardContent>
@@ -828,7 +898,8 @@ export function EmailDomainDetail() {
                   Authorized projects
                 </CardTitle>
                 <CardDescription>
-                  Choose which project deployment tokens may send email from {domain.domain}.
+                  Choose which project deployment tokens may send email from{' '}
+                  {domain.domain}.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -856,41 +927,58 @@ export function EmailDomainDetail() {
                 ) : authorizationsError ? (
                   <Alert variant="destructive">
                     <AlertCircle className="size-4" />
-                    <AlertTitle>Could not load project authorizations</AlertTitle>
+                    <AlertTitle>
+                      Could not load project authorizations
+                    </AlertTitle>
                     <AlertDescription className="flex items-center justify-between gap-3">
                       <span>{authorizationsError.message}</span>
-                      <Button variant="outline" size="sm" onClick={() => refetchAuthorizations()}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => refetchAuthorizations()}
+                      >
                         Retry
                       </Button>
                     </AlertDescription>
                   </Alert>
                 ) : authorizedProjects.length === 0 ? (
                   <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                    No projects are authorized yet. Deployment tokens cannot send from this domain until you add one.
+                    No projects are authorized yet. Deployment tokens cannot
+                    send from this domain until you add one.
                   </div>
                 ) : (
                   <div className="divide-y rounded-md border">
-                    {authorizedProjects.map(project => (
-                      <div key={project.id} className="flex items-center justify-between gap-3 p-3">
+                    {authorizedProjects.map((project) => (
+                      <div
+                        key={project.id}
+                        className="flex items-center justify-between gap-3 p-3"
+                      >
                         <div className="min-w-0">
-                          <p className="truncate text-sm font-medium">{project.name}</p>
-                          <p className="truncate font-mono text-xs text-muted-foreground">{project.slug}</p>
+                          <p className="truncate text-sm font-medium">
+                            {project.name}
+                          </p>
+                          <p className="truncate font-mono text-xs text-muted-foreground">
+                            {project.slug}
+                          </p>
                         </div>
-                        {canManageAuthorizations && <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={revokeProjectMutation.isPending}
-                          onClick={() => setProjectToRevoke(project)}
-                        >
-                          Revoke
-                        </Button>}
+                        {canManageAuthorizations && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={revokeProjectMutation.isPending}
+                            onClick={() => setProjectToRevoke(project)}
+                          >
+                            Revoke
+                          </Button>
+                        )}
                       </div>
                     ))}
                   </div>
                 )}
                 {!canManageAuthorizations && (
                   <p className="text-sm text-muted-foreground">
-                    Only an instance or platform administrator can change sender-domain project access.
+                    Only an instance or platform administrator can change
+                    sender-domain project access.
                   </p>
                 )}
               </CardContent>
@@ -911,10 +999,15 @@ export function EmailDomainDetail() {
           <AlertDialogHeader>
             <AlertDialogTitle>Revoke project access?</AlertDialogTitle>
             <AlertDialogDescription>
-              <span className="font-medium text-foreground">{projectToRevoke?.name}</span>
-              {' '}will no longer be able to send email from{' '}
-              <span className="font-medium text-foreground">{domain.domain}</span>.
-              Existing deployments using this sender may begin failing immediately.
+              <span className="font-medium text-foreground">
+                {projectToRevoke?.name}
+              </span>{' '}
+              will no longer be able to send email from{' '}
+              <span className="font-medium text-foreground">
+                {domain.domain}
+              </span>
+              . Existing deployments using this sender may begin failing
+              immediately.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -923,7 +1016,9 @@ export function EmailDomainDetail() {
             </AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={revokeProjectMutation.isPending || projectToRevoke === null}
+              disabled={
+                revokeProjectMutation.isPending || projectToRevoke === null
+              }
               onClick={(event) => {
                 event.preventDefault()
                 if (projectToRevoke) {
@@ -931,7 +1026,9 @@ export function EmailDomainDetail() {
                 }
               }}
             >
-              {revokeProjectMutation.isPending ? 'Revoking...' : 'Revoke access'}
+              {revokeProjectMutation.isPending
+                ? 'Revoking...'
+                : 'Revoke access'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -947,14 +1044,19 @@ export function EmailDomainDetail() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Authorize project to send email?</AlertDialogTitle>
+            <AlertDialogTitle>
+              Authorize project to send email?
+            </AlertDialogTitle>
             <AlertDialogDescription>
               <span className="font-medium text-foreground">
                 {projectToAuthorizeName ?? 'This project'}
+              </span>{' '}
+              will be able to send email from{' '}
+              <span className="font-medium text-foreground">
+                {domain.domain}
               </span>
-              {' '}will be able to send email from{' '}
-              <span className="font-medium text-foreground">{domain.domain}</span>.
-              Every deployment token in that project gains this ability immediately.
+              . Every deployment token in that project gains this ability
+              immediately.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -962,7 +1064,10 @@ export function EmailDomainDetail() {
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              disabled={authorizeProjectMutation.isPending || projectToAuthorize === null}
+              disabled={
+                authorizeProjectMutation.isPending ||
+                projectToAuthorize === null
+              }
               onClick={(event) => {
                 event.preventDefault()
                 if (projectToAuthorize !== null) {
@@ -970,7 +1075,9 @@ export function EmailDomainDetail() {
                 }
               }}
             >
-              {authorizeProjectMutation.isPending ? 'Authorizing...' : 'Authorize'}
+              {authorizeProjectMutation.isPending
+                ? 'Authorizing...'
+                : 'Authorize'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -979,7 +1086,13 @@ export function EmailDomainDetail() {
   )
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
   return (
     <div className="grid grid-cols-3 gap-3 py-2.5 text-sm first:pt-0 last:pb-0">
       <dt className="font-medium">{label}</dt>

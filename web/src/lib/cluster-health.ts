@@ -56,11 +56,11 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
 }
 
 export async function getClusterHealth(
-  serviceId: number,
+  serviceId: number
 ): Promise<ClusterHealthReport> {
   const response = await fetch(
     `/api/external-services/${serviceId}/cluster-health`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<ClusterHealthReport>(response)
 }

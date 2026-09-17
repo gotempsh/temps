@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -36,7 +36,6 @@ import { useSearchParams } from 'react-router'
  * from here, so a filter box cannot drop letters.
  */
 const live = () => new URLSearchParams(window.location.search)
-
 
 /**
  * The query keys a screen may write. `p` is the route (which record) and is
@@ -89,7 +88,10 @@ export const KEPT_ON_NAVIGATION: readonly string[] = ['p', 'fresh', 'fail']
  * `keep` is the list of keys that are *not* view state and therefore survive
  * the navigation; it defaults to `KEPT_ON_NAVIGATION`.
  */
-export function forNewView(params: URLSearchParams, keep: Iterable<string> = KEPT_ON_NAVIGATION): URLSearchParams {
+export function forNewView(
+  params: URLSearchParams,
+  keep: Iterable<string> = KEPT_ON_NAVIGATION
+): URLSearchParams {
   const kept = new Set(keep)
   const next = new URLSearchParams()
   for (const [k, v] of params) if (kept.has(k)) next.append(k, v)
@@ -111,7 +113,11 @@ type Options<T extends string> = {
  * link: the value is always what the address says, and setting it back to the
  * fallback removes the key.
  */
-export function useUrlState<T extends string = string>(key: ViewKey, fallback: NoInfer<T>, options: Options<T> = {}): [T, (next: T) => void] {
+export function useUrlState<T extends string = string>(
+  key: ViewKey,
+  fallback: NoInfer<T>,
+  options: Options<T> = {}
+): [T, (next: T) => void] {
   const [params, setParams] = useSearchParams()
   const { values, push = false } = options
   const raw = params.get(key)
@@ -122,37 +128,49 @@ export function useUrlState<T extends string = string>(key: ViewKey, fallback: N
   }, [raw, fallback, values])
   const set = useCallback(
     (next: T) => {
-      setParams(() => {
-        const p = live()
-        if (next === fallback || next === '') p.delete(key)
-        else p.set(key, next)
-        return p
-      }, { replace: !push })
+      setParams(
+        () => {
+          const p = live()
+          if (next === fallback || next === '') p.delete(key)
+          else p.set(key, next)
+          return p
+        },
+        { replace: !push }
+      )
     },
-    [setParams, key, fallback, push],
+    [setParams, key, fallback, push]
   )
   return [value, set]
 }
 
 /** The same, for a key whose value is a number: the page of a ledger. */
-export function useUrlNumber(key: ViewKey, fallback: number, options: { push?: boolean } = {}): [number, (next: number) => void] {
+export function useUrlNumber(
+  key: ViewKey,
+  fallback: number,
+  options: { push?: boolean } = {}
+): [number, (next: number) => void] {
   const [params, setParams] = useSearchParams()
   const { push = false } = options
   const raw = params.get(key)
   const value = useMemo(() => {
     const n = Number(raw)
-    return raw !== null && Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback
+    return raw !== null && Number.isFinite(n) && n >= 1
+      ? Math.floor(n)
+      : fallback
   }, [raw, fallback])
   const set = useCallback(
     (next: number) => {
-      setParams(() => {
-        const p = live()
-        if (next === fallback) p.delete(key)
-        else p.set(key, String(next))
-        return p
-      }, { replace: !push })
+      setParams(
+        () => {
+          const p = live()
+          if (next === fallback) p.delete(key)
+          else p.set(key, String(next))
+          return p
+        },
+        { replace: !push }
+      )
     },
-    [setParams, key, fallback, push],
+    [setParams, key, fallback, push]
   )
   return [value, set]
 }
@@ -163,20 +181,26 @@ export function useUrlNumber(key: ViewKey, fallback: number, options: { push?: b
  * the reader on page 4 of the new filter for a frame, and would give `back`
  * two steps to undo one action.
  */
-export function useUrlPatch(): (next: Partial<Record<ViewKey, string | null>>, options?: { push?: boolean }) => void {
+export function useUrlPatch(): (
+  next: Partial<Record<ViewKey, string | null>>,
+  options?: { push?: boolean }
+) => void {
   const [, setParams] = useSearchParams()
   return useCallback(
     (next, options = {}) => {
-      setParams(() => {
-        const p = live()
-        for (const [k, v] of Object.entries(next)) {
-          if (v === null || v === '') p.delete(k)
-          else p.set(k, v)
-        }
-        return p
-      }, { replace: !options.push })
+      setParams(
+        () => {
+          const p = live()
+          for (const [k, v] of Object.entries(next)) {
+            if (v === null || v === '') p.delete(k)
+            else p.set(k, v)
+          }
+          return p
+        },
+        { replace: !options.push }
+      )
     },
-    [setParams],
+    [setParams]
   )
 }
 
@@ -188,7 +212,9 @@ export type UrlWindow = { from: string; to: string }
  * the chart, so it is view state like any other: linkable, and back where it
  * was after a reload.
  */
-export function useUrlWindow(key: ViewKey = 'sel'): [UrlWindow | null, (next: UrlWindow | null) => void] {
+export function useUrlWindow(
+  key: ViewKey = 'sel'
+): [UrlWindow | null, (next: UrlWindow | null) => void] {
   const [params, setParams] = useSearchParams()
   const raw = params.get(key)
   const value = useMemo<UrlWindow | null>(() => {
@@ -198,14 +224,17 @@ export function useUrlWindow(key: ViewKey = 'sel'): [UrlWindow | null, (next: Ur
   }, [raw])
   const set = useCallback(
     (next: UrlWindow | null) => {
-      setParams(() => {
-        const p = live()
-        if (!next) p.delete(key)
-        else p.set(key, `${next.from}~${next.to}`)
-        return p
-      }, { replace: true })
+      setParams(
+        () => {
+          const p = live()
+          if (!next) p.delete(key)
+          else p.set(key, `${next.from}~${next.to}`)
+          return p
+        },
+        { replace: true }
+      )
     },
-    [setParams, key],
+    [setParams, key]
   )
   return [value, set]
 }
@@ -219,23 +248,30 @@ export type UrlSort = { key: string; dir: 'asc' | 'desc' } | null
  * primitive. Only wire it on a ledger that sorts its own rows: a paged ledger
  * holds one page, and sorting that page would reorder 20 of N.
  */
-export function useUrlSort(key: ViewKey = 'sort'): [UrlSort, (next: UrlSort) => void] {
+export function useUrlSort(
+  key: ViewKey = 'sort'
+): [UrlSort, (next: UrlSort) => void] {
   const [params, setParams] = useSearchParams()
   const raw = params.get(key)
   const value = useMemo<UrlSort>(() => {
     if (!raw) return null
-    return raw.startsWith('-') ? { key: raw.slice(1), dir: 'desc' } : { key: raw, dir: 'asc' }
+    return raw.startsWith('-')
+      ? { key: raw.slice(1), dir: 'desc' }
+      : { key: raw, dir: 'asc' }
   }, [raw])
   const set = useCallback(
     (next: UrlSort) => {
-      setParams(() => {
-        const p = live()
-        if (!next) p.delete(key)
-        else p.set(key, next.dir === 'desc' ? `-${next.key}` : next.key)
-        return p
-      }, { replace: true })
+      setParams(
+        () => {
+          const p = live()
+          if (!next) p.delete(key)
+          else p.set(key, next.dir === 'desc' ? `-${next.key}` : next.key)
+          return p
+        },
+        { replace: true }
+      )
     },
-    [setParams, key],
+    [setParams, key]
   )
   return [value, set]
 }
@@ -250,32 +286,36 @@ export function useUrlSort(key: ViewKey = 'sort'): [UrlSort, (next: UrlSort) => 
  * the "clear" button under an empty ledger. There is still one truth: the
  * draft is only ever a repaint of what was just written.
  */
-export function useUrlText(key: ViewKey = 'f', also?: Partial<Record<ViewKey, string | null>>): [string, (next: string) => void] {
+export function useUrlText(
+  key: ViewKey = 'f',
+  also?: Partial<Record<ViewKey, string | null>>
+): [string, (next: string) => void] {
   const [params] = useSearchParams()
   const patch = useUrlPatch()
   const fromUrl = params.get(key) ?? ''
-  const [draft, setDraft] = useState(fromUrl)
+  const [text, setText] = useState({
+    draft: fromUrl,
+    written: null as string | null,
+  })
   /* What this field last wrote, until the address catches up. While a write is
      in flight the URL walks through the letters already typed, and following it
      would rewind the box; once it arrives, the field is settled again and the
      address is the only thing it reads. */
-  const written = useRef<string | null>(null)
-  if (written.current === null) {
+  if (text.written === null) {
     // Settled: the address moved and it was not this field that moved it.
-    if (fromUrl !== draft) setDraft(fromUrl)
-  } else if (fromUrl === written.current) {
-    written.current = null
+    if (fromUrl !== text.draft) setText({ draft: fromUrl, written: null })
+  } else if (fromUrl === text.written) {
+    setText({ draft: fromUrl, written: null })
   }
   const set = useCallback(
     (next: string) => {
-      written.current = next
-      setDraft(next)
+      setText({ draft: next, written: next })
       patch({ ...also, [key]: next || null })
     },
     // `also` is written inline at the call site; comparing it by identity would
     // rebuild the setter every render for no gain, so it is read as it is.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [patch, key],
+    [patch, key]
   )
-  return [draft, set]
+  return [text.draft, set]
 }

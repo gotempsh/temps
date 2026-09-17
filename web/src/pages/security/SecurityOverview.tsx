@@ -22,7 +22,14 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Shield, AlertTriangle, CheckCircle2, Play, Loader2, Clock } from 'lucide-react'
+import {
+  Shield,
+  AlertTriangle,
+  CheckCircle2,
+  Play,
+  Loader2,
+  Clock,
+} from 'lucide-react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { useEffect, type ReactNode } from 'react'
@@ -42,7 +49,10 @@ function getScanStatusBadge(scan: ScanResponse | undefined) {
 
   if (scan.status === 'running' || scan.status === 'pending') {
     return (
-      <Badge variant="outline" className="bg-blue-500/10 text-blue-500 border-blue-500/20">
+      <Badge
+        variant="outline"
+        className="bg-blue-500/10 text-blue-500 border-blue-500/20"
+      >
         <Loader2 className="h-3 w-3 mr-1 animate-spin" />
         Scanning...
       </Badge>
@@ -51,7 +61,10 @@ function getScanStatusBadge(scan: ScanResponse | undefined) {
 
   if (scan.status === 'failed') {
     return (
-      <Badge variant="outline" className="bg-red-500/10 text-red-500 border-red-500/20">
+      <Badge
+        variant="outline"
+        className="bg-red-500/10 text-red-500 border-red-500/20"
+      >
         <AlertTriangle className="h-3 w-3 mr-1" />
         Failed
       </Badge>
@@ -69,7 +82,10 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
 
   if (total === 0) {
     return (
-      <Badge variant="outline" className="bg-green-500/10 text-green-500 border-green-500/20">
+      <Badge
+        variant="outline"
+        className="bg-green-500/10 text-green-500 border-green-500/20"
+      >
         <CheckCircle2 className="h-3 w-3 mr-1" />
         Clean
       </Badge>
@@ -78,7 +94,10 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
 
   if (scan.critical_count > 0) {
     return (
-      <Badge variant="outline" className="bg-red-500/10 text-red-500 border-red-500/20">
+      <Badge
+        variant="outline"
+        className="bg-red-500/10 text-red-500 border-red-500/20"
+      >
         <AlertTriangle className="h-3 w-3 mr-1" />
         {scan.critical_count} Critical
       </Badge>
@@ -87,7 +106,10 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
 
   if (scan.high_count > 0) {
     return (
-      <Badge variant="outline" className="bg-orange-500/10 text-orange-500 border-orange-500/20">
+      <Badge
+        variant="outline"
+        className="bg-orange-500/10 text-orange-500 border-orange-500/20"
+      >
         <AlertTriangle className="h-3 w-3 mr-1" />
         {scan.high_count} High
       </Badge>
@@ -95,7 +117,10 @@ function getVulnerabilitySeverityBadge(scan: ScanResponse | undefined) {
   }
 
   return (
-    <Badge variant="outline" className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20">
+    <Badge
+      variant="outline"
+      className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20"
+    >
       {total} Vulnerabilities
     </Badge>
   )
@@ -136,17 +161,27 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
       if (scan.status === 'completed' && scan.completed_at) {
         const completedAt = new Date(scan.completed_at)
         const now = new Date()
-        const secondsSinceComplete = (now.getTime() - completedAt.getTime()) / 1000
+        const secondsSinceComplete =
+          (now.getTime() - completedAt.getTime()) / 1000
 
         // Only show toast if scan completed in the last 10 seconds (recently completed)
         if (secondsSinceComplete < 10) {
-          const total = scan.critical_count + scan.high_count + scan.medium_count + scan.low_count
+          const total =
+            scan.critical_count +
+            scan.high_count +
+            scan.medium_count +
+            scan.low_count
           if (total > 0) {
-            toast.warning(`Scan #${scan.id} completed with ${total} vulnerabilities found`, {
-              description: `${scan.critical_count} critical, ${scan.high_count} high, ${scan.medium_count} medium, ${scan.low_count} low`,
-            })
+            toast.warning(
+              `Scan #${scan.id} completed with ${total} vulnerabilities found`,
+              {
+                description: `${scan.critical_count} critical, ${scan.high_count} high, ${scan.medium_count} medium, ${scan.low_count} low`,
+              }
+            )
           } else {
-            toast.success(`Scan #${scan.id} completed with no vulnerabilities found`)
+            toast.success(
+              `Scan #${scan.id} completed with no vulnerabilities found`
+            )
           }
         }
       }
@@ -222,7 +257,9 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-12">
             <Shield className="h-12 w-12 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-medium mb-2">No environments configured</h3>
+            <h3 className="text-lg font-medium mb-2">
+              No environments configured
+            </h3>
             <p className="text-muted-foreground text-center">
               Create an environment to start running vulnerability scans
             </p>
@@ -255,7 +292,9 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
           {environments.map((env) => {
             const scan = scansByEnvironment.get(env.id)
             const statusBadge = getScanStatusBadge(scan)
-            const severityBadge = statusBadge ? null : getVulnerabilitySeverityBadge(scan)
+            const severityBadge = statusBadge
+              ? null
+              : getVulnerabilitySeverityBadge(scan)
 
             return (
               <TabsTrigger
@@ -279,14 +318,19 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
             triggerScan.variables?.body?.environment_id === env.id
 
           return (
-            <TabsContent key={env.id} value={env.id.toString()} className="mt-6">
+            <TabsContent
+              key={env.id}
+              value={env.id.toString()}
+              className="mt-6"
+            >
               {!scan ? (
                 <Card>
                   <CardContent className="flex flex-col items-center justify-center py-12">
                     <Shield className="h-12 w-12 text-muted-foreground mb-4" />
                     <h3 className="text-lg font-medium mb-2">No scans yet</h3>
                     <p className="text-muted-foreground text-center mb-6">
-                      Vulnerability scans will appear here after your first deployment to{' '}
+                      Vulnerability scans will appear here after your first
+                      deployment to{' '}
                       <span className="font-medium">{env.name}</span>
                     </p>
                     <TriggerScanButton
@@ -314,11 +358,14 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
                       <Clock className="h-4 w-4 text-blue-500" />
                       <AlertDescription className="text-blue-600 dark:text-blue-400">
                         <div className="flex items-center justify-between mb-2">
-                          <span className="font-medium">Scan #{scan.id} in progress...</span>
+                          <span className="font-medium">
+                            Scan #{scan.id} in progress...
+                          </span>
                           <Loader2 className="h-4 w-4 animate-spin" />
                         </div>
                         <p className="text-sm text-muted-foreground mb-2">
-                          This scan is currently running. Results will appear automatically when complete.
+                          This scan is currently running. Results will appear
+                          automatically when complete.
                         </p>
                         <Progress value={undefined} className="h-1" />
                       </AlertDescription>

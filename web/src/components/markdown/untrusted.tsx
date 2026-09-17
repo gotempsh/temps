@@ -32,13 +32,15 @@ import { cn } from '@/lib/utils'
 export const untrustedMarkdownImage: Pick<Components, 'img'> = {
   img({ node: _node, src, alt, ...props }) {
     const raw = typeof src === 'string' ? src : ''
-    let sameOrigin = false
-    try {
-      sameOrigin =
-        new URL(raw, window.location.href).origin === window.location.origin
-    } catch {
-      sameOrigin = false
-    }
+    const sameOrigin = (() => {
+      try {
+        return (
+          new URL(raw, window.location.href).origin === window.location.origin
+        )
+      } catch {
+        return false
+      }
+    })()
 
     if (sameOrigin) {
       return <img {...props} src={raw} alt={alt ?? ''} />
@@ -78,16 +80,18 @@ export const untrustedMarkdownImage: Pick<Components, 'img'> = {
 export const untrustedMarkdownLink: Pick<Components, 'a'> = {
   a({ node: _node, className, href, children, ...props }) {
     const raw = typeof href === 'string' ? href : ''
-    let external = true
-    let host = ''
-    try {
-      const url = new URL(raw, window.location.href)
-      external = url.origin !== window.location.origin
-      host = url.host
-    } catch {
-      // Unparsable: treat as external and show nothing extra.
-      external = true
-    }
+    const { external, host } = (() => {
+      try {
+        const url = new URL(raw, window.location.href)
+        return {
+          external: url.origin !== window.location.origin,
+          host: url.host,
+        }
+      } catch {
+        // Unparsable: treat as external and show nothing extra.
+        return { external: true, host: '' }
+      }
+    })()
 
     return (
       <a

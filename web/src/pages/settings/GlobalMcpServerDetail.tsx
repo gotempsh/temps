@@ -30,7 +30,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -62,15 +62,15 @@ export function GlobalMcpServerDetail() {
   const [configText, setConfigText] = useState('')
   const [configError, setConfigError] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [loadedMcp, setLoadedMcp] = useState(mcp)
 
-  useEffect(() => {
-    if (mcp) {
-      setName(mcp.name)
-      setDescription(mcp.description ?? '')
-      setConfigText(JSON.stringify(mcp.config, null, 2))
-      setConfigError(null)
-    }
-  }, [mcp])
+  if (mcp !== loadedMcp) {
+    setLoadedMcp(mcp)
+    setName(mcp?.name ?? '')
+    setDescription(mcp?.description ?? '')
+    setConfigText(mcp ? JSON.stringify(mcp.config, null, 2) : '')
+    setConfigError(null)
+  }
 
   const handleConfigChange = (value: string) => {
     setConfigText(value)

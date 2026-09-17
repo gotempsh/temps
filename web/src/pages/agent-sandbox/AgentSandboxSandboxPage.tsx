@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   AlertTriangle,
@@ -120,26 +121,27 @@ export function AgentSandboxSandboxPage() {
   )
   const [isDirty, setIsDirty] = useState(false)
 
-  const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null)
-  const [statusLoading, setStatusLoading] = useState(false)
   const [rebuilding, setRebuilding] = useState(false)
   const [buildLog, setBuildLog] = useState<string[]>([])
+  const [loadedSettings, setLoadedSettings] = useState(settings)
 
-  const fetchSandboxStatus = useCallback(async () => {
-    setStatusLoading(true)
-    try {
+  const {
+    data: sandboxStatus = null,
+    isFetching: statusLoading,
+    refetch: fetchSandboxStatus,
+  } = useQuery({
+    queryKey: ['sandbox-status'],
+    queryFn: async (): Promise<SandboxStatus | null> => {
       // TODO(sdk-regen): migrate once /settings/sandbox-status endpoint is
       // added to the generated SDK.
       const r = await fetch('/api/settings/sandbox-status')
-      if (r.ok) setSandboxStatus(await r.json())
-    } catch {
-      // tolerate older versions without the endpoint
-    } finally {
-      setStatusLoading(false)
-    }
-  }, [])
+      return r.ok ? ((await r.json()) as SandboxStatus) : null
+    },
+    retry: false,
+  })
 
-  useEffect(() => {
+  if (settings !== loadedSettings) {
+    setLoadedSettings(settings)
     if (settings?.agent_sandbox) {
       const s = settings.agent_sandbox
       setDefaultProvider(s.default_provider || 'claude_cli')
@@ -160,11 +162,7 @@ export function AgentSandboxSandboxPage() {
         ...settings.ai_workspace_file_limits,
       })
     }
-  }, [settings])
-
-  useEffect(() => {
-    fetchSandboxStatus()
-  }, [fetchSandboxStatus])
+  }
 
   const handleRebuildImage = async () => {
     setRebuilding(true)
@@ -288,7 +286,7 @@ export function AgentSandboxSandboxPage() {
             </CardTitle>
             <CardDescription>
               When sandbox is enabled, workflows run inside isolated Docker
-              containers. Code changes are contained and can't affect your
+              containers. Code changes are contained and can&apos;t affect your
               server.
             </CardDescription>
           </CardHeader>
@@ -299,7 +297,7 @@ export function AgentSandboxSandboxPage() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={fetchSandboxStatus}
+                  onClick={() => void fetchSandboxStatus()}
                   disabled={statusLoading}
                 >
                   {statusLoading ? (
@@ -670,8 +668,8 @@ export function AgentSandboxSandboxPage() {
                 }}
               />
               <p className="text-xs text-muted-foreground">
-                GitHub repo path. The repo must be accessible via the project's
-                git provider connection. Leave empty to disable.
+                GitHub repo path. The repo must be accessible via the
+                project&apos;s git provider connection. Leave empty to disable.
               </p>
             </div>
             <div className="space-y-2">

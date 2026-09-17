@@ -28,7 +28,10 @@ export const EMPTY = '–'
 /** A BCP 47 tag, a list of them, or nothing for the runtime's own locale. */
 export type Locale = string | string[] | undefined
 
-const nothing = (n: unknown): n is null | undefined => n === null || n === undefined || (typeof n === 'number' && !Number.isFinite(n))
+const nothing = (n: unknown): n is null | undefined =>
+  n === null ||
+  n === undefined ||
+  (typeof n === 'number' && !Number.isFinite(n))
 
 /**
  * A count or a measure, grouped for the operator's locale.
@@ -41,9 +44,17 @@ const nothing = (n: unknown): n is null | undefined => n === null || n === undef
  * fmtNum(null)             // "–"
  * ```
  */
-export function fmtNum(n: number | null | undefined, o: { locale?: Locale; digits?: number } = {}): string {
+export function fmtNum(
+  n: number | null | undefined,
+  o: { locale?: Locale; digits?: number } = {}
+): string {
   if (nothing(n)) return EMPTY
-  return new Intl.NumberFormat(o.locale, o.digits === undefined ? undefined : { minimumFractionDigits: o.digits, maximumFractionDigits: o.digits }).format(n)
+  return new Intl.NumberFormat(
+    o.locale,
+    o.digits === undefined
+      ? undefined
+      : { minimumFractionDigits: o.digits, maximumFractionDigits: o.digits }
+  ).format(n)
 }
 
 /**
@@ -57,7 +68,10 @@ export function fmtNum(n: number | null | undefined, o: { locale?: Locale; digit
  * fmtPct(31 / 4820, { basis: 'ratio' })    // "0.6%"
  * ```
  */
-export function fmtPct(n: number | null | undefined, o: { locale?: Locale; digits?: number; basis?: 'percent' | 'ratio' } = {}): string {
+export function fmtPct(
+  n: number | null | undefined,
+  o: { locale?: Locale; digits?: number; basis?: 'percent' | 'ratio' } = {}
+): string {
   if (nothing(n)) return EMPTY
   const digits = o.digits ?? 1
   const value = o.basis === 'ratio' ? n * 100 : n
@@ -81,14 +95,20 @@ const BINARY = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'] as const
  * fmtBytes(0)                           // "0 B"
  * ```
  */
-export function fmtBytes(n: number | null | undefined, o: { locale?: Locale; binary?: boolean; digits?: number } = {}): string {
+export function fmtBytes(
+  n: number | null | undefined,
+  o: { locale?: Locale; binary?: boolean; digits?: number } = {}
+): string {
   if (nothing(n)) return EMPTY
   const step = o.binary ? 1024 : 1000
   const units = o.binary ? BINARY : DECIMAL
   const sign = n < 0 ? '-' : ''
   let v = Math.abs(n)
   let i = 0
-  while (v >= step && i < units.length - 1) { v /= step; i += 1 }
+  while (v >= step && i < units.length - 1) {
+    v /= step
+    i += 1
+  }
   const digits = o.digits ?? (i === 0 ? 0 : v < 10 ? 1 : 0)
   return `${sign}${fmtNum(v, { locale: o.locale, digits })} ${units[i]}`
 }
@@ -104,7 +124,10 @@ export function fmtBytes(n: number | null | undefined, o: { locale?: Locale; bin
  * fmtDuration(2_472_000)  // "41m 12s"
  * ```
  */
-export function fmtDuration(ms: number | null | undefined, o: { locale?: Locale } = {}): string {
+export function fmtDuration(
+  ms: number | null | undefined,
+  o: { locale?: Locale } = {}
+): string {
   if (nothing(ms)) return EMPTY
   const sign = ms < 0 ? '-' : ''
   const abs = Math.abs(ms)
@@ -115,13 +138,15 @@ export function fmtDuration(ms: number | null | undefined, o: { locale?: Locale 
   if (s < 10) return `${sign}${n(s, 1)}s`
   if (s < 60) return `${sign}${n(Math.round(s))}s`
   const m = Math.floor(s / 60)
-  if (m < 60) return `${sign}${n(m)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`
+  if (m < 60)
+    return `${sign}${n(m)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`
   const h = Math.floor(m / 60)
   if (h < 24) return `${sign}${n(h)}h ${String(m % 60).padStart(2, '0')}m`
   return `${sign}${n(Math.floor(h / 24))}d ${h % 24}h`
 }
 
-const DATE = (d: Date | string | number): Date => (d instanceof Date ? d : new Date(d))
+const DATE = (d: Date | string | number): Date =>
+  d instanceof Date ? d : new Date(d)
 
 /**
  * A wall-clock time. Rendered in the reader's own zone by default, because
@@ -142,7 +167,16 @@ const DATE = (d: Date | string | number): Date => (d instanceof Date ? d : new D
  * fmtAbsolute('2026-09-01', { time: false })           // "Sep 1, 2026"
  * ```
  */
-export function fmtAbsolute(date: Date | string | number | null | undefined, o: { locale?: Locale; tz?: string; seconds?: boolean; year?: boolean; time?: boolean } = {}): string {
+export function fmtAbsolute(
+  date: Date | string | number | null | undefined,
+  o: {
+    locale?: Locale
+    tz?: string
+    seconds?: boolean
+    year?: boolean
+    time?: boolean
+  } = {}
+): string {
   if (date === null || date === undefined || date === '') return EMPTY
   const d = DATE(date)
   if (Number.isNaN(d.getTime())) return typeof date === 'string' ? date : EMPTY
@@ -184,12 +218,16 @@ export function fmtAbsolute(date: Date | string | number | null | undefined, o: 
  * fmtStamp('2026-12-06', { precision: 'day' })                     // "2026-12-06"
  * ```
  */
-export function fmtStamp(value: Date | string | null | undefined, o: { zone?: string; precision?: 'day' | 'minute' | 'second' } = {}): string {
+export function fmtStamp(
+  value: Date | string | null | undefined,
+  o: { zone?: string; precision?: 'day' | 'minute' | 'second' } = {}
+): string {
   if (value === null || value === undefined || value === '') return EMPTY
   const p = (n: number) => String(n).padStart(2, '0')
-  const raw = value instanceof Date
-    ? `${value.getFullYear()}-${p(value.getMonth() + 1)}-${p(value.getDate())}T${p(value.getHours())}:${p(value.getMinutes())}:${p(value.getSeconds())}`
-    : value.trim()
+  const raw =
+    value instanceof Date
+      ? `${value.getFullYear()}-${p(value.getMonth() + 1)}-${p(value.getDate())}T${p(value.getHours())}:${p(value.getMinutes())}:${p(value.getSeconds())}`
+      : value.trim()
   const [date, clock = ''] = raw.split('T')
   const time = clock.slice(0, o.precision === 'second' ? 8 : 5)
   const body = o.precision === 'day' || !time ? date : `${date} ${time}`
@@ -211,7 +249,11 @@ const DAY = 86_400_000
  * fmtRelative(t, now)  // "41m ago" · "10h ago" · "Sep 6 at 20:33"
  * ```
  */
-export function fmtRelative(date: Date | string | number | null | undefined, now: Date | number = Date.now(), o: { locale?: Locale; tz?: string } = {}): string {
+export function fmtRelative(
+  date: Date | string | number | null | undefined,
+  now: Date | number = Date.now(),
+  o: { locale?: Locale; tz?: string } = {}
+): string {
   if (date === null || date === undefined || date === '') return EMPTY
   const d = DATE(date)
   if (Number.isNaN(d.getTime())) return typeof date === 'string' ? date : EMPTY
@@ -219,7 +261,12 @@ export function fmtRelative(date: Date | string | number | null | undefined, now
   const abs = Math.abs(delta)
   if (abs >= DAY) return fmtAbsolute(d, o)
   const ago = delta <= 0
-  const body = abs < MINUTE ? `${Math.max(0, Math.round(abs / 1000))}s` : abs < HOUR ? `${Math.round(abs / MINUTE)}m` : `${Math.round(abs / HOUR)}h`
+  const body =
+    abs < MINUTE
+      ? `${Math.max(0, Math.round(abs / 1000))}s`
+      : abs < HOUR
+        ? `${Math.round(abs / MINUTE)}m`
+        : `${Math.round(abs / HOUR)}h`
   return ago ? `${body} ago` : `in ${body}`
 }
 
@@ -235,7 +282,12 @@ export function fmtRelative(date: Date | string | number | null | undefined, now
  * fmtCount(0, 'issue', 'issues')    // "0 issues"
  * ```
  */
-export function fmtCount(n: number | null | undefined, singular: string, plural = `${singular}s`, o: { locale?: Locale } = {}): string {
+export function fmtCount(
+  n: number | null | undefined,
+  singular: string,
+  plural = `${singular}s`,
+  o: { locale?: Locale } = {}
+): string {
   if (nothing(n)) return `${EMPTY} ${plural}`
   const rule = new Intl.PluralRules(o.locale).select(n)
   return `${fmtNum(n, { locale: o.locale })} ${rule === 'one' ? singular : plural}`

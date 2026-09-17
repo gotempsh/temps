@@ -53,7 +53,8 @@ const BEARER_TOKEN_RE =
 // length but conventionally 16+ chars each. Conservative on character set so
 // we don't match three-dotted version strings (e.g. 1.2.3) — bumping the
 // minimum size on each segment is what keeps this from over-matching.
-const JWT_RE = /\b([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\b/g
+const JWT_RE =
+  /\b([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\.([A-Za-z0-9_-]{8,})\b/g
 
 const SENSITIVE_VALUE_PATTERNS = [
   URL_WITH_USERINFO,
@@ -109,32 +110,32 @@ export function maskCredentialsInValue(value: string): string {
   if (!value) return value
   let out = value
 
-  out = out.replace(URL_WITH_USERINFO, (_match, prefix: string, secret: string) => {
-    return `${prefix}:${bullets(secret.length)}@`
-  })
-
   out = out.replace(
-    BEARER_TOKEN_RE,
-    (match, prefix: string, token: string) => {
-      // Heuristic: only redact when the prefix actually says Authorization
-      // or names a known scheme. Avoids mangling "log line 42 stack traces"
-      // that happen to have a long word after them.
-      if (!/Authorization|Bearer|Token|Basic|ApiKey|Api-Key/i.test(prefix)) {
-        return match
-      }
-      const tail = token.length > 6 ? token.slice(-4) : ''
-      return `${prefix}${bullets(token.length - tail.length)}${tail}`
-    },
+    URL_WITH_USERINFO,
+    (_match, prefix: string, secret: string) => {
+      return `${prefix}:${bullets(secret.length)}@`
+    }
   )
+
+  out = out.replace(BEARER_TOKEN_RE, (match, prefix: string, token: string) => {
+    // Heuristic: only redact when the prefix actually says Authorization
+    // or names a known scheme. Avoids mangling "log line 42 stack traces"
+    // that happen to have a long word after them.
+    if (!/Authorization|Bearer|Token|Basic|ApiKey|Api-Key/i.test(prefix)) {
+      return match
+    }
+    const tail = token.length > 6 ? token.slice(-4) : ''
+    return `${prefix}${bullets(token.length - tail.length)}${tail}`
+  })
 
   out = out.replace(
     JWT_RE,
     (_match, header: string, payload: string, signature: string) => {
       const sigTail = signature.length > 6 ? signature.slice(-4) : ''
       return `${header}.${bullets(payload.length)}.${bullets(
-        signature.length - sigTail.length,
+        signature.length - sigTail.length
       )}${sigTail}`
-    },
+    }
   )
 
   return out

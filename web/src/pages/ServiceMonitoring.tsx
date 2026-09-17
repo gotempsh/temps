@@ -1511,11 +1511,7 @@ export function ServiceMonitoring() {
               </h1>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Real-time metrics and performance monitoring
-                {freshnessSummary && (
-                  <span>
-                    {' '}· {freshnessSummary}
-                  </span>
-                )}
+                {freshnessSummary && <span> · {freshnessSummary}</span>}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">

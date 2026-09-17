@@ -961,7 +961,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [streamLogs, setStreamLogs] = useState<AgentRunLog[]>([])
-  const [isStreaming, setIsStreaming] = useState(false)
+  const [stoppedStreamKey, setStoppedStreamKey] = useState<string | null>(null)
   const [isRetrying, setIsRetrying] = useState(false)
   const [contextInput, setContextInput] = useState('')
   const [isSendingContext, setIsSendingContext] = useState(false)
@@ -1005,15 +1005,19 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     enabled: !!errorGroupId,
   })
 
+  const runPhase = data?.run?.phase || ''
+  const shouldStream = Boolean(
+    data?.run &&
+    (activeStatuses.has(data.run.status) || autofixerActivePhases.has(runPhase))
+  )
+  const streamKey = `${runId ?? ''}:${data?.run?.status ?? ''}:${runPhase}`
+  const isStreaming = shouldStream && stoppedStreamKey !== streamKey
+
   // SSE real-time streaming
   useEffect(() => {
     if (!runId || !data?.run) return
-    const phase = data.run.phase || ''
-    const shouldStream =
-      activeStatuses.has(data.run.status) || autofixerActivePhases.has(phase)
     if (!shouldStream) return
 
-    setIsStreaming(true)
     // Autofixer runs have their own SSE endpoint; regular runs use the generic one.
     const streamUrl =
       data.run.trigger_source_type === 'error_group'
@@ -1037,27 +1041,29 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     eventSource.addEventListener('status', () => {
       // Run completed / phase changed — close stream and refetch
       eventSource.close()
-      setIsStreaming(false)
+      setStoppedStreamKey(streamKey)
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
     })
 
     eventSource.onerror = () => {
       eventSource.close()
-      setIsStreaming(false)
+      setStoppedStreamKey(streamKey)
     }
 
     return () => {
       eventSource.close()
-      setIsStreaming(false)
     }
   }, [
     runId,
     data?.run?.status,
     data?.run?.phase,
     data?.run?.trigger_source_type,
+    data?.run,
     project.id,
     queryClient,
     runQueryOptions.queryKey,
+    shouldStream,
+    streamKey,
   ])
 
   if (isLoading) {

@@ -43,11 +43,13 @@ import {
   GroupByBuilder,
   LabelFilterBuilder,
   LabelFilterChips,
-  labelFiltersToTuples,
   MAX_GROUP_BY_KEYS,
+} from '@/components/metrics/LabelFilterBuilder'
+import {
+  labelFiltersToTuples,
   serializeLabelFilters,
   type LabelFilter,
-} from '@/components/metrics/LabelFilterBuilder'
+} from '@/components/metrics/label-filters'
 import {
   buildBreakdownData,
   type BreakdownModel,

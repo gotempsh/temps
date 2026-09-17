@@ -180,7 +180,11 @@ export default function GitProviderDetail() {
       }
       // Failures that aren't a step-up challenge surface via toast.
       // RFC 7807 Problem Details puts the human message in `detail`.
-      const problem = error as { detail?: string; title?: string; message?: string }
+      const problem = error as {
+        detail?: string
+        title?: string
+        message?: string
+      }
       const detail =
         problem.detail || problem.title || problem.message || 'Unknown error'
       toast.error(`Failed to delete provider: ${detail}`)
@@ -365,7 +369,9 @@ export default function GitProviderDetail() {
             <div className="space-y-1 min-w-0">
               <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                 {getProviderIcon()}
-                <h1 className="text-xl sm:text-2xl font-bold truncate">{provider.name}</h1>
+                <h1 className="text-xl sm:text-2xl font-bold truncate">
+                  {provider.name}
+                </h1>
                 {provider.is_active ? (
                   <Badge
                     variant="secondary"
@@ -465,7 +471,6 @@ export default function GitProviderDetail() {
 
         {/* Feedback Alert */}
         <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
-
 
         {/* GitHub App Instructions - Only show if no connections */}
         {isGitHubApp(provider) &&

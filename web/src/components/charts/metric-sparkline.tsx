@@ -48,7 +48,10 @@ export function MetricSparkline({
   return (
     <div className={cn('w-full', className)} style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={points} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+        <LineChart
+          data={points}
+          margin={{ top: 2, right: 0, left: 0, bottom: 2 }}
+        >
           <YAxis hide domain={['dataMin', 'dataMax']} />
           <Line
             type="monotone"

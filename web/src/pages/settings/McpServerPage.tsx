@@ -10,7 +10,10 @@ export function McpServerPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Settings', href: '/settings' }, { label: 'MCP Server' }])
+    setBreadcrumbs([
+      { label: 'Settings', href: '/settings' },
+      { label: 'MCP Server' },
+    ])
   }, [setBreadcrumbs])
 
   usePageTitle('MCP Server')

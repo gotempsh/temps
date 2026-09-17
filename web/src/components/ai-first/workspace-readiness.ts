@@ -71,7 +71,9 @@ export function workspaceStatusPresentation(
   if (workspace?.runtime_compatible === false) {
     return {
       label: 'Runtime update required',
-      detail: workspace.runtime_update_error ?? 'Open Workspace settings and update the runtime. Restarting the same image will not fix compatibility.',
+      detail:
+        workspace.runtime_update_error ??
+        'Open Workspace settings and update the runtime. Restarting the same image will not fix compatibility.',
       dot: 'bg-amber-500',
     }
   }

@@ -9,9 +9,7 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowRight, Database } from 'lucide-react'
 import { useNavigate } from 'react-router'
 
-interface EmptyStateStorageProps {}
-
-export default function EmptyStateStorage({}: EmptyStateStorageProps) {
+export default function EmptyStateStorage() {
   const navigate = useNavigate()
   const {
     data: providers,

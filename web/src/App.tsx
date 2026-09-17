@@ -599,9 +599,15 @@ const FullAppRoutes = () => {
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
-              <Route path="/sandboxes" element={<Sandboxes />} />
-              <Route path="/workspaces" element={<Sandboxes key="workspaces" workspacesOnly />} />
-              <Route path="/workspaces/:workspaceId" element={<WorkspaceDetail />} />
+                    <Route path="/sandboxes" element={<Sandboxes />} />
+                    <Route
+                      path="/workspaces"
+                      element={<Sandboxes key="workspaces" workspacesOnly />}
+                    />
+                    <Route
+                      path="/workspaces/:workspaceId"
+                      element={<WorkspaceDetail />}
+                    />
                     <Route
                       path="/sandboxes/:sandboxId"
                       element={<SandboxDetail />}

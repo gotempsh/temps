@@ -97,7 +97,7 @@ const PHASES: Array<{ id: string; label: string }> = [
 const OBJECT_STORE_FAMILY = new Set(['s3', 'rustfs', 'minio', 'blob'])
 function enginesCompatible(
   backupEngine: string | null | undefined,
-  targetEngine: string,
+  targetEngine: string
 ): boolean {
   const a = (backupEngine ?? '').toLowerCase()
   const b = targetEngine.toLowerCase()
@@ -118,7 +118,8 @@ export function ServiceRestore() {
     ...getServiceOptions({ path: { id: serviceId } }),
     enabled: Number.isFinite(serviceId),
   })
-  const service = (serviceDetails as ExternalServiceDetails | undefined)?.service
+  const service = (serviceDetails as ExternalServiceDetails | undefined)
+    ?.service
 
   const { data: caps } = useQuery({
     ...getRestoreCapabilitiesOptions({ path: { id: serviceId } }),
@@ -132,21 +133,30 @@ export function ServiceRestore() {
   })
   const defaultSource = useMemo(
     () =>
-      s3Sources?.find((s) => (s as { is_default?: boolean }).is_default === true),
-    [s3Sources],
+      s3Sources?.find(
+        (s) => (s as { is_default?: boolean }).is_default === true
+      ),
+    [s3Sources]
   )
 
   // ----- Local state --------------------------------------------------------
   const [selectedSourceId, setSelectedSourceId] = useState<number | undefined>()
-  const [selectedBackup, setSelectedBackup] = useState<SourceBackupEntry | undefined>()
+  const [selectedBackup, setSelectedBackup] = useState<
+    SourceBackupEntry | undefined
+  >()
   const [mode, setMode] = useState<Mode>('in_place')
-  const [newServiceName, setNewServiceName] = useState('')
+  // `undefined` means the suggestion has not been edited. An explicit empty
+  // string must stay empty so validation can reject a cleared name.
+  const [newServiceName, setNewServiceName] = useState<string | undefined>()
   const [pitrTargetTime, setPitrTargetTime] = useState('')
   const [pitrToNewService, setPitrToNewService] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [search, setSearch] = useState('')
   const [runningRunId, setRunningRunId] = useState<number | null>(null)
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
+  const effectiveSourceId = selectedSourceId ?? defaultSource?.id
+  const effectiveNewServiceName =
+    newServiceName ?? capabilities?.suggested_new_service_name ?? ''
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -161,20 +171,6 @@ export function ServiceRestore() {
     return () => setBreadcrumbs([])
   }, [service, serviceId, setBreadcrumbs])
 
-  // Default S3 source on first load
-  useEffect(() => {
-    if (defaultSource && selectedSourceId === undefined) {
-      setSelectedSourceId(defaultSource.id)
-    }
-  }, [defaultSource, selectedSourceId])
-
-  // Seed auto-suggested new service name from capabilities
-  useEffect(() => {
-    if (capabilities?.suggested_new_service_name && newServiceName === '') {
-      setNewServiceName(capabilities.suggested_new_service_name)
-    }
-  }, [capabilities?.suggested_new_service_name, newServiceName])
-
   // ----- Backups list ------------------------------------------------------
   const {
     data: backupIndex,
@@ -182,12 +178,16 @@ export function ServiceRestore() {
     error: backupsError,
     refetch: refetchBackups,
   } = useQuery({
-    ...listSourceBackupsOptions({ path: { id: selectedSourceId ?? 0 } }),
-    enabled: selectedSourceId !== undefined,
+    ...listSourceBackupsOptions({ path: { id: effectiveSourceId ?? 0 } }),
+    enabled: effectiveSourceId !== undefined,
   })
 
-  const allBackups: SourceBackupEntry[] =
-    (backupIndex as { backups?: SourceBackupEntry[] } | undefined)?.backups ?? []
+  const allBackups = useMemo<SourceBackupEntry[]>(
+    () =>
+      (backupIndex as { backups?: SourceBackupEntry[] } | undefined)?.backups ??
+      [],
+    [backupIndex]
+  )
 
   // Filter rule: the backup row's `engine` must be in the same engine family
   // as the target service. Today the only multi-engine family is the
@@ -219,26 +219,18 @@ export function ServiceRestore() {
   const [backupsPage, setBackupsPage] = useState(1)
   const backupsTotalPages = Math.max(
     1,
-    Math.ceil(filteredBackups.length / BACKUPS_PAGE_SIZE),
+    Math.ceil(filteredBackups.length / BACKUPS_PAGE_SIZE)
   )
 
-  useEffect(() => {
-    if (backupsPage > backupsTotalPages) {
-      setBackupsPage(backupsTotalPages)
-    }
-  }, [backupsPage, backupsTotalPages])
-
-  useEffect(() => {
-    setBackupsPage(1)
-  }, [search, selectedSourceId])
+  if (backupsPage > backupsTotalPages) setBackupsPage(backupsTotalPages)
 
   const paginatedBackups = useMemo(
     () =>
       filteredBackups.slice(
         (backupsPage - 1) * BACKUPS_PAGE_SIZE,
-        backupsPage * BACKUPS_PAGE_SIZE,
+        backupsPage * BACKUPS_PAGE_SIZE
       ),
-    [filteredBackups, backupsPage],
+    [filteredBackups, backupsPage]
   )
 
   const backupsPageWindow = useMemo(() => {
@@ -247,8 +239,8 @@ export function ServiceRestore() {
       1,
       Math.min(
         backupsPage - Math.floor(windowSize / 2),
-        backupsTotalPages - windowSize + 1,
-      ),
+        backupsTotalPages - windowSize + 1
+      )
     )
     return Array.from({ length: windowSize }, (_, idx) => start + idx)
   }, [backupsPage, backupsTotalPages])
@@ -267,7 +259,9 @@ export function ServiceRestore() {
     refetchInterval: (query) => {
       const row = query.state.data as RestoreRunView | undefined
       if (!row) return 2000
-      return row.status === 'completed' || row.status === 'failed' ? false : 2000
+      return row.status === 'completed' || row.status === 'failed'
+        ? false
+        : 2000
     },
   })
 
@@ -300,21 +294,15 @@ export function ServiceRestore() {
     },
     onError: (error, variables) => {
       if (
-        handleSensitiveActionError(error, () =>
-          startMutation.mutate(variables)
-        )
+        handleSensitiveActionError(error, () => startMutation.mutate(variables))
       ) {
         setShowDestructiveConfirm(false)
         return
       }
       const problem = error as { detail?: string; message?: string }
-      toast.error(
-        'Failed to start restore',
-        {
-          description:
-            problem.detail || problem.message || 'Unknown error',
-        }
-      )
+      toast.error('Failed to start restore', {
+        description: problem.detail || problem.message || 'Unknown error',
+      })
     },
   })
 
@@ -344,7 +332,7 @@ export function ServiceRestore() {
       ? {
           backup_location: selectedBackup.location,
           backup_engine: selectedBackup.engine,
-          s3_source_id: selectedSourceId,
+          s3_source_id: effectiveSourceId,
         }
       : { backup_id: selectedBackup.id }
     if (mode === 'in_place') return { ...base, mode: 'in_place' }
@@ -352,7 +340,7 @@ export function ServiceRestore() {
       return {
         ...base,
         mode: 'new_service',
-        name: newServiceName.trim(),
+        name: effectiveNewServiceName.trim(),
         parameter_overrides: {},
       }
     // pitr
@@ -362,7 +350,9 @@ export function ServiceRestore() {
       ...base,
       mode: 'pitr',
       to_new_service: pitrToNewService,
-      new_service_name: pitrToNewService ? newServiceName.trim() : undefined,
+      new_service_name: pitrToNewService
+        ? effectiveNewServiceName.trim()
+        : undefined,
       target: { kind: 'time', time: new Date(pitrTargetTime).toISOString() },
     }
   }
@@ -381,9 +371,9 @@ export function ServiceRestore() {
   }, [
     selectedBackup?.id,
     selectedBackup?.location,
-    selectedSourceId,
+    effectiveSourceId,
     mode,
-    newServiceName,
+    effectiveNewServiceName,
     pitrTargetTime,
     pitrToNewService,
     serviceId,
@@ -395,11 +385,13 @@ export function ServiceRestore() {
 
   const canSubmit = (() => {
     if (!selectedBackup) return false
-    if (mode === 'new_service' && newServiceName.trim().length === 0) return false
+    if (mode === 'new_service' && effectiveNewServiceName.trim().length === 0)
+      return false
     if (mode === 'pitr') {
       if (!pitrTargetTime || Number.isNaN(new Date(pitrTargetTime).getTime()))
         return false
-      if (pitrToNewService && newServiceName.trim().length === 0) return false
+      if (pitrToNewService && effectiveNewServiceName.trim().length === 0)
+        return false
       if (!selectedSupportsPitr) return false
     }
     if (!confirmOk) return false
@@ -415,7 +407,7 @@ export function ServiceRestore() {
       ? {
           backup_location: selectedBackup.location,
           backup_engine: selectedBackup.engine,
-          s3_source_id: selectedSourceId,
+          s3_source_id: effectiveSourceId,
         }
       : { backup_id: selectedBackup.id }
 
@@ -426,7 +418,7 @@ export function ServiceRestore() {
       body = {
         ...base,
         mode: 'new_service',
-        name: newServiceName.trim(),
+        name: effectiveNewServiceName.trim(),
         parameter_overrides: {},
       }
     } else {
@@ -434,7 +426,9 @@ export function ServiceRestore() {
         ...base,
         mode: 'pitr',
         to_new_service: pitrToNewService,
-        new_service_name: pitrToNewService ? newServiceName.trim() : undefined,
+        new_service_name: pitrToNewService
+          ? effectiveNewServiceName.trim()
+          : undefined,
         target: { kind: 'time', time: new Date(pitrTargetTime).toISOString() },
       }
     }
@@ -493,8 +487,11 @@ export function ServiceRestore() {
             <ArrowLeft className="h-4 w-4 mr-2" />
             Back to service
           </Button>
-          {runRow?.status === 'completed' && runRow.target_service_id != null ? (
-            <Button onClick={() => navigate(`/storage/${runRow.target_service_id}`)}>
+          {runRow?.status === 'completed' &&
+          runRow.target_service_id != null ? (
+            <Button
+              onClick={() => navigate(`/storage/${runRow.target_service_id}`)}
+            >
               <Database className="h-4 w-4 mr-2" />
               Open restored service
             </Button>
@@ -525,10 +522,11 @@ export function ServiceRestore() {
         </CardHeader>
         <CardContent>
           <Select
-            value={selectedSourceId?.toString()}
+            value={effectiveSourceId?.toString()}
             onValueChange={(v) => {
               setSelectedSourceId(Number(v))
               setSelectedBackup(undefined)
+              setBackupsPage(1)
             }}
           >
             <SelectTrigger className="max-w-md">
@@ -567,8 +565,8 @@ export function ServiceRestore() {
             Pick a backup
           </CardTitle>
           <CardDescription>
-            All {service.service_type} backups on this source. Backups
-            produced by a different service can be selected — useful for
+            All {service.service_type} backups on this source. Backups produced
+            by a different service can be selected — useful for
             disaster-recovery restores.
           </CardDescription>
         </CardHeader>
@@ -580,7 +578,10 @@ export function ServiceRestore() {
                 className="pl-8"
                 placeholder="Filter by origin service, UUID, or path…"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(e) => {
+                  setSearch(e.target.value)
+                  setBackupsPage(1)
+                }}
               />
             </div>
             <Button
@@ -639,9 +640,7 @@ export function ServiceRestore() {
                     return (
                       <TableRow
                         key={`${b.source}-${b.id}-${b.location}`}
-                        className={`cursor-pointer ${
-                          isSel ? 'bg-accent' : ''
-                        }`}
+                        className={`cursor-pointer ${isSel ? 'bg-accent' : ''}`}
                         onClick={() => setSelectedBackup(b)}
                       >
                         <TableCell>
@@ -691,7 +690,7 @@ export function ServiceRestore() {
                   Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
                   {Math.min(
                     backupsPage * BACKUPS_PAGE_SIZE,
-                    filteredBackups.length,
+                    filteredBackups.length
                   )}{' '}
                   of {filteredBackups.length} backups
                 </span>
@@ -747,9 +746,10 @@ export function ServiceRestore() {
             <Alert>
               <AlertTriangle className="h-4 w-4" />
               <AlertDescription>
-                This backup was produced by <strong>{selectedBackup?.origin_service_name}</strong>,
-                not <strong>{service.name}</strong>. Make sure you intend to
-                restore foreign data onto this service.
+                This backup was produced by{' '}
+                <strong>{selectedBackup?.origin_service_name}</strong>, not{' '}
+                <strong>{service.name}</strong>. Make sure you intend to restore
+                foreign data onto this service.
               </AlertDescription>
             </Alert>
           ) : null}
@@ -815,8 +815,8 @@ export function ServiceRestore() {
               <div className="flex-1">
                 <div className="font-medium">Clone into a new service</div>
                 <div className="text-xs text-muted-foreground mt-0.5">
-                  Provisions a sibling of <strong>{service.name}</strong> with the
-                  restored data. Original is untouched.
+                  Provisions a sibling of <strong>{service.name}</strong> with
+                  the restored data. Original is untouched.
                 </div>
               </div>
             </label>
@@ -854,7 +854,7 @@ export function ServiceRestore() {
               <Label htmlFor="new-service-name">New service name</Label>
               <Input
                 id="new-service-name"
-                value={newServiceName}
+                value={effectiveNewServiceName}
                 onChange={(e) => setNewServiceName(e.target.value)}
                 className="max-w-md"
               />
@@ -887,7 +887,9 @@ export function ServiceRestore() {
                 <Checkbox
                   id="pitr-new"
                   checked={pitrToNewService}
-                  onCheckedChange={(checked) => setPitrToNewService(checked === true)}
+                  onCheckedChange={(checked) =>
+                    setPitrToNewService(checked === true)
+                  }
                 />
                 <Label htmlFor="pitr-new" className="cursor-pointer">
                   Restore into a new service (leaves {service.name} untouched)
@@ -898,7 +900,7 @@ export function ServiceRestore() {
                   <Label htmlFor="pitr-new-name">New service name</Label>
                   <Input
                     id="pitr-new-name"
-                    value={newServiceName}
+                    value={effectiveNewServiceName}
                     onChange={(e) => setNewServiceName(e.target.value)}
                     className="max-w-md"
                   />
@@ -1064,10 +1066,11 @@ export function ServiceRestore() {
           <AlertDialogHeader>
             <AlertDialogTitle>Overwrite live database?</AlertDialogTitle>
             <AlertDialogDescription>
-              This restore will stop <strong>{service?.name ?? 'the service'}</strong>{' '}
-              and replace its entire dataset with the selected backup. All data
-              written since the backup was taken will be permanently lost.
-              This action cannot be undone.
+              This restore will stop{' '}
+              <strong>{service?.name ?? 'the service'}</strong> and replace its
+              entire dataset with the selected backup. All data written since
+              the backup was taken will be permanently lost. This action cannot
+              be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1082,7 +1085,9 @@ export function ServiceRestore() {
               disabled={startMutation.isPending}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {startMutation.isPending ? 'Starting restore…' : 'Yes, overwrite database'}
+              {startMutation.isPending
+                ? 'Starting restore…'
+                : 'Yes, overwrite database'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

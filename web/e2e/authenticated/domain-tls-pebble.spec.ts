@@ -53,13 +53,13 @@ function resolveHostDockerInternal(): string {
       .map((line) => line.trim().split(/\s+/)[0])
       .find((token) => /^\d{1,3}(\.\d{1,3}){3}$/.test(token ?? ''))
 
-  const baseArgs = [
-    'run',
-    '--rm',
-    '--network',
-    'temps-e2e-pebble-net',
+  const baseArgs = ['run', '--rm', '--network', 'temps-e2e-pebble-net']
+  const getentArgs = [
+    'alpine:latest',
+    'getent',
+    'hosts',
+    'host.docker.internal',
   ]
-  const getentArgs = ['alpine:latest', 'getent', 'hosts', 'host.docker.internal']
 
   try {
     const out = execFileSync('docker', [...baseArgs, ...getentArgs], {
@@ -73,12 +73,19 @@ function resolveHostDockerInternal(): string {
 
   const out = execFileSync(
     'docker',
-    [...baseArgs, '--add-host', 'host.docker.internal:host-gateway', ...getentArgs],
+    [
+      ...baseArgs,
+      '--add-host',
+      'host.docker.internal:host-gateway',
+      ...getentArgs,
+    ],
     { encoding: 'utf8' }
   )
   const ip = pickIpv4(out)
   if (!ip)
-    throw new Error(`could not resolve an IPv4 host.docker.internal: ${JSON.stringify(out)}`)
+    throw new Error(
+      `could not resolve an IPv4 host.docker.internal: ${JSON.stringify(out)}`
+    )
   return ip
 }
 

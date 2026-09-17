@@ -89,7 +89,7 @@ export function histogramQuantile(
   counts: number[],
   q: number,
   min?: number | null,
-  max?: number | null,
+  max?: number | null
 ): number {
   const total = counts.reduce((a, c) => a + c, 0)
   if (total === 0) return 0
@@ -152,7 +152,7 @@ export type BreakdownModel = {
 export function buildBreakdownData(
   buckets: MetricBucket[],
   isPercentile: boolean,
-  aggregation: string,
+  aggregation: string
 ): BreakdownModel {
   const rowsByBucket = new Map<string, Record<string, unknown>>()
   const totalByGroupKey = new Map<string, number>()
@@ -168,23 +168,23 @@ export function buildBreakdownData(
             hs.bucket_counts,
             percentileFromAgg(aggregation),
             hs.min,
-            hs.max,
+            hs.max
           )
         : (b.value ?? b.avg_value)
 
     const pairs = [...(b.series_key ?? [])].sort(([a], [b2]) =>
-      a.localeCompare(b2),
+      a.localeCompare(b2)
     )
     const groupKey = JSON.stringify(pairs)
     labelByGroupKey.set(
       groupKey,
       pairs.length > 0
         ? pairs.map(([k, v]) => `${k}=${v}`).join(', ')
-        : '(no labels)',
+        : '(no labels)'
     )
     totalByGroupKey.set(
       groupKey,
-      (totalByGroupKey.get(groupKey) ?? 0) + (value ?? 0),
+      (totalByGroupKey.get(groupKey) ?? 0) + (value ?? 0)
     )
 
     let byBucket = valuesByGroupKey.get(groupKey)

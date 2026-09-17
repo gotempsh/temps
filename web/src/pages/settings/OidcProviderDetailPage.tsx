@@ -210,9 +210,7 @@ export function OidcProviderDetailPage() {
                 {provider.name}
               </h1>
               <Badge variant="outline">{provider.template}</Badge>
-              {!provider.enabled && (
-                <Badge variant="secondary">Disabled</Badge>
-              )}
+              {!provider.enabled && <Badge variant="secondary">Disabled</Badge>}
             </div>
             <p className="text-sm text-muted-foreground">
               {provider.issuer_url}
@@ -317,10 +315,12 @@ function ProviderEditor({
   testResult: OidcTestConnectionResponse | null
 }) {
   const [form, setForm] = useState(() => providerToFormValues(provider))
+  const [loadedProviderId, setLoadedProviderId] = useState(provider.id)
 
-  useEffect(() => {
+  if (provider.id !== loadedProviderId) {
+    setLoadedProviderId(provider.id)
     setForm(providerToFormValues(provider))
-  }, [provider.id])
+  }
 
   const handleSubmit = () => {
     if (!isOidcEditFormValid(form)) {

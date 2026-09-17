@@ -43,7 +43,11 @@ describe('ApplicationWorkspaceSettingsPanel', () => {
   test('uses a responsive settings grid for full-page workspace detail', () => {
     const html = renderToStaticMarkup(
       <MemoryRouter>
-        <ApplicationWorkspaceSettingsPanel layout="page" applicationPublicId="app_example" initialWorkspace={workspace} />
+        <ApplicationWorkspaceSettingsPanel
+          layout="page"
+          applicationPublicId="app_example"
+          initialWorkspace={workspace}
+        />
       </MemoryRouter>
     )
     expect(html).toContain('lg:grid-cols-2')

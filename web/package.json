@@ -1,6 +1,7 @@
 {
   "name": "@temps-sdk/console",
   "private": true,
+  "type": "module",
   "workspaces": ["packages/*"],
   "version": "1.0.0",
   "description": "The Temps console — the full OSS web app, also exported as <TempsConsole> for downstream editions to consume whole.",
@@ -12,7 +13,7 @@
     "./app.css": "./src/globals.css",
     "./package.json": "./package.json",
     "./components/auth/login-form": "./src/components/auth/login-form.tsx",
-    "./contexts/AuthContext": "./src/contexts/AuthContext.tsx",
+    "./contexts/AuthContext": "./src/contexts/AuthContext.ts",
     "./lib/return-to": "./src/lib/return-to.ts",
     "./api/react-query": "./src/api/client/@tanstack/react-query.gen.ts"
   },

@@ -79,7 +79,7 @@ export function UserDetail() {
   // Separate query for stats — pull a larger recent batch so we can
   // compute "last login" / "failed logins" / "actions (30d)" without
   // depending on the paginated view above.
-  const { data: statsLogs } = useQuery({
+  const { data: statsLogs, dataUpdatedAt: statsUpdatedAt } = useQuery({
     ...listAuditLogsOptions({
       query: {
         limit: STATS_BATCH_SIZE,
@@ -95,8 +95,7 @@ export function UserDetail() {
 
   const stats = useMemo(() => {
     if (!statsLogs) return null
-    const now = Date.now()
-    const cutoff = now - STATS_WINDOW_MS
+    const cutoff = statsUpdatedAt - STATS_WINDOW_MS
     let actions30d = 0
     let failedLogins30d = 0
     let lastLogin: { at: number; city?: string; country?: string } | undefined
@@ -121,7 +120,7 @@ export function UserDetail() {
       }
     }
     return { actions30d, failedLogins30d, lastLogin, lastActivity }
-  }, [statsLogs])
+  }, [statsLogs, statsUpdatedAt])
 
   const userDisplayName = target?.user.name || target?.user.username || 'User'
 
