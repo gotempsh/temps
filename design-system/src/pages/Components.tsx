@@ -10,6 +10,7 @@ import {
   Field,
   FormErrors,
   Kbd,
+  LogLine,
   PageContainer,
   PageHeader,
   PageState,
@@ -70,6 +71,14 @@ export default function Components() {
       <Block title="Kbd">
         <Kbd keys="N" showOnMobile />
         <Kbd keys={['⌘', 'K']} showOnMobile />
+      </Block>
+
+      <Block title="LogLine">
+        <div className="w-full rounded-md border bg-background">
+          <LogLine content="Starting build for checkout-api@a1b2c3d" />
+          <LogLine content="Installing dependencies..." isHighlighted />
+          <LogLine content="Build failed: timeout waiting for database connection" searchTerm="timeout" />
+        </div>
       </Block>
 
       <Block title="Button (busy)">

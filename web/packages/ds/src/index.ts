@@ -12,6 +12,7 @@ export {
   type StatusProps,
 } from './status'
 export { Kbd } from './kbd'
+export { LogLine, type LogLineProps } from './log-line'
 export { Button, type ButtonProps } from './button'
 export { CopyAction } from './copy-action'
 export { Field, FormErrors, type FieldProps, type FormErrorsProps } from './field'
