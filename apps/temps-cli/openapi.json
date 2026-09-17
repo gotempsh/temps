@@ -32916,6 +32916,44 @@
         ],
         "type": "object"
       },
+      "PlatformFeatures": {
+        "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.",
+        "properties": {
+          "backups_local": {
+            "description": "Whether backups can be produced from services running on this host.\nRemote backups of worker-node services are unaffected.",
+            "type": "boolean"
+          },
+          "deployments_local": {
+            "description": "Whether application containers can be deployed onto this host.\n`false` in the control-plane profile: applications run on worker nodes\nthat joined the cluster with `temps join`.",
+            "type": "boolean"
+          },
+          "docker": {
+            "description": "Whether a Docker daemon answered a ping during startup.",
+            "type": "boolean"
+          },
+          "managed_services": {
+            "description": "Whether managed services (PostgreSQL, Redis, MariaDB, ...) can be\nprovisioned on this host.",
+            "type": "boolean"
+          },
+          "profile": {
+            "description": "Serve profile this process was started with: `\"full\"` or\n`\"control-plane\"`.",
+            "type": "string"
+          },
+          "sandboxes": {
+            "description": "Whether agent sandboxes / workspace previews run in this process.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "profile",
+          "deployments_local",
+          "managed_services",
+          "backups_local",
+          "sandboxes",
+          "docker"
+        ],
+        "type": "object"
+      },
       "PlatformInfo": {
         "description": "Platform compatibility information",
         "properties": {
@@ -88649,6 +88687,39 @@
           }
         ],
         "summary": "Get information about how the service is being accessed",
+        "tags": [
+          "Platform"
+        ]
+      }
+    },
+    "/platform/features": {
+      "get": {
+        "description": "Always present, in every profile — a client must be able to tell\n\"unavailable here, and here is why\" from \"endpoint does not exist\".",
+        "operationId": "get_platform_features",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformFeatures"
+                }
+              }
+            },
+            "description": "Capabilities of this server process"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report which capabilities this server process actually provides.",
         "tags": [
           "Platform"
         ]

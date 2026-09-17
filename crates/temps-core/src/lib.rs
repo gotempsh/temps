@@ -47,6 +47,7 @@ pub mod sandbox_runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod serve_profile;
 pub mod source_drop;
 pub mod static_files;
 pub mod telemetry;
@@ -59,6 +60,9 @@ pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
     SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy, SelfUpdateRestartMode, SelfUpdateStatus,
     SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+};
+pub use serve_profile::{
+    policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;

@@ -16,6 +16,7 @@ export const sections = [
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
   { title: 'How scheduling works', id: 'scheduling' },
+  { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
   { title: 'Mixed architectures', id: 'mixed-architectures' },
   { title: 'Current limitations', id: 'limitations' },
 ]
@@ -246,7 +247,7 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 When you deploy an application with multiple replicas, the **node scheduler** distributes containers across available nodes using **round-robin** scheduling:
 
 1. The scheduler queries all nodes with `status = "active"` and a heartbeat within the last 90 seconds
-2. If no active worker nodes exist, all replicas run locally on the control plane
+2. If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead
 3. If active workers exist, replicas are distributed evenly across all nodes (including local) in round-robin order
 4. Each container records which node it was assigned to in the database
 
@@ -255,6 +256,85 @@ The deployment job creates a `RemoteNodeDeployer` for each remote assignment, wh
 <Note>
 The scheduler currently uses simple round-robin. Label-based scheduling (e.g., "only deploy to nodes with `gpu=true`") is planned but not yet implemented — labels are stored but not used for filtering.
 </Note>
+
+---
+
+## A control plane that runs no workloads {{ anchor: true, id: 'control-plane-profile' }}
+
+By default the control plane is also a worker: it builds images, runs
+application containers, provisions managed databases and stores backups on its
+own disk, which is why `temps serve` requires a reachable Docker daemon.
+
+`--profile control-plane` separates the two roles. The process keeps the
+console, API, proxy, analytics, session replay, error tracking, OpenTelemetry,
+monitoring, status pages, alerts, domains and ACME, auth, teams,
+notifications, email, webhooks, feature flags, the job queue and the AI
+gateway — but it runs **no workloads of its own**. Applications run on worker
+nodes joined with `temps join`. **Docker is not required**, so this profile can
+run in a container with no Docker socket mounted.
+
+```bash
+temps serve --profile control-plane
+# or, equivalently:
+TEMPS_SERVE_PROFILE=control-plane temps serve
+```
+
+The default is `--profile full`, which is the behaviour described everywhere
+else in these docs and is unchanged.
+
+### What the control-plane profile turns off
+
+These plugins are not constructed at all — they hold no memory and start no
+background tasks:
+
+| Not started | Why | Where it happens instead |
+| --- | --- | --- |
+| Deployer local runtime setup | No app network, overlay or cluster-DNS reconciliation against a local daemon | The worker node's agent |
+| Managed-service reconcilers | Managed PostgreSQL/Redis/MariaDB run as containers on a host | A worker node, or an external database |
+| Key-value store (`kv`) | Managed Redis is a local container | A worker node |
+| Backups | Backup engines exec into containers on this host | The node that owns the service |
+| Log aggregator | Its collector tails containers on the local daemon | Worker-node logs reach the console through the deployments plugin's remote log source |
+| Vulnerability scanner | Scans images in the local image store | The node that builds the image |
+| Agent sandboxes and the sandbox API | Sandboxes are local containers | A `full`-profile host |
+| Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
+| On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
+
+Deployments, projects, environments and the whole console API keep working —
+they target worker nodes. The node scheduler will not produce a local
+placement in this profile: if no eligible worker node is available the
+deployment fails with a message saying so, rather than quietly assigning
+replicas to a host that cannot start them.
+
+```
+This control plane does not run application containers (serve profile
+'control-plane'), and no eligible worker node is available for the 2
+requested replica(s). Join a worker node with `temps join` — or run the
+control plane with `--profile full` if it should host workloads itself
+```
+
+### Asking the server what it provides
+
+Any client can read the running process's capabilities instead of probing
+endpoints and guessing:
+
+```bash
+curl -H "Authorization: Bearer $TEMPS_API_KEY" https://your-temps/api/platform/features
+```
+
+```json
+{
+  "profile": "control-plane",
+  "deployments_local": false,
+  "managed_services": false,
+  "backups_local": false,
+  "sandboxes": false,
+  "docker": false
+}
+```
+
+`docker` reports whether a daemon actually answered a ping at startup, which is
+deliberately separate from `profile`: mounting a socket into a control-plane
+container for diagnostics does not turn it into a worker.
 
 ---
 

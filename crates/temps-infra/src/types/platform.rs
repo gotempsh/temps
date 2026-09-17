@@ -15,6 +15,34 @@ pub struct PlatformInfo {
     pub platforms: Vec<String>,
 }
 
+/// Which capabilities this server process actually provides.
+///
+/// A client cannot tell "this build has no sandboxes" from "this process was
+/// started in a profile that does not run them" by probing endpoints — both
+/// look like failure. This endpoint answers the question directly so the
+/// console can render an honest, actionable state (what is unavailable, and
+/// why) instead of a dead button or an empty page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PlatformFeatures {
+    /// Serve profile this process was started with: `"full"` or
+    /// `"control-plane"`.
+    pub profile: String,
+    /// Whether application containers can be deployed onto this host.
+    /// `false` in the control-plane profile: applications run on worker nodes
+    /// that joined the cluster with `temps join`.
+    pub deployments_local: bool,
+    /// Whether managed services (PostgreSQL, Redis, MariaDB, ...) can be
+    /// provisioned on this host.
+    pub managed_services: bool,
+    /// Whether backups can be produced from services running on this host.
+    /// Remote backups of worker-node services are unaffected.
+    pub backups_local: bool,
+    /// Whether agent sandboxes / workspace previews run in this process.
+    pub sandboxes: bool,
+    /// Whether a Docker daemon answered a ping during startup.
+    pub docker: bool,
+}
+
 /// The mode the server is running in
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum ServerMode {

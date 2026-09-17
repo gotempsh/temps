@@ -217,6 +217,14 @@ impl TempsPlugin for DeployerPlugin {
         "deployer"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<bollard::Docker>(),
+            RequiredService::of::<temps_config::ConfigService>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -225,8 +233,31 @@ impl TempsPlugin for DeployerPlugin {
             // Create Docker client
             let docker = context.require_service::<bollard::Docker>();
 
-            // Check if buildkit is available
-            let use_buildkit = Self::detect_buildkit().await;
+            // Whether this process is allowed to build and run containers on
+            // its own daemon. Absent from the registry in embeddings that
+            // never register one, which keeps the single-binary behaviour.
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let local_workloads_enabled = local_workloads.local_workloads_enabled();
+            if !local_workloads_enabled {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; the deployer registers its \
+                     services for the deployment API but performs no daemon setup (no BuildKit \
+                     probe, no app network, no overlay or cluster-DNS reconciliation). \
+                     Applications run on worker nodes joined with `temps join`"
+                );
+            }
+
+            // Check if buildkit is available. Probing means talking to the
+            // daemon, which is exactly what a no-local-workloads profile must
+            // not do at boot.
+            let use_buildkit = if local_workloads_enabled {
+                Self::detect_buildkit().await
+            } else {
+                false
+            };
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
             // Load build limits and cluster-DNS settings. Only the control plane
@@ -289,11 +320,13 @@ impl TempsPlugin for DeployerPlugin {
             // Reconcile the app network and its metadata-egress rules during
             // every server start, even when cluster DNS is disabled and no new
             // deployment occurs after a Docker or firewall restart.
-            if let Err(error) = docker_runtime.ensure_network_exists().await {
-                tracing::warn!(
-                    error = %error,
-                    "Could not reconcile the app network during deployer startup"
-                );
+            if local_workloads_enabled {
+                if let Err(error) = docker_runtime.ensure_network_exists().await {
+                    tracing::warn!(
+                        error = %error,
+                        "Could not reconcile the app network during deployer startup"
+                    );
+                }
             }
 
             // A control-plane-hosted managed service must participate in the
@@ -304,13 +337,19 @@ impl TempsPlugin for DeployerPlugin {
             // The same idempotent operation is available at runtime through
             // `temps network setup-multi-node`, so enabling multi-node does not
             // require restarting this process.
-            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
-                spawn_control_plane_overlay_setup_watcher(
-                    db,
-                    docker.clone(),
-                    control_plane_private_address,
-                    std::env::var("TEMPS_UNDERLAY_DEV").ok(),
-                );
+            //
+            // Skipped when this process runs no workloads: there is no local
+            // container to give an overlay address to, and the watcher would
+            // otherwise retry against an absent daemon forever.
+            if local_workloads_enabled {
+                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                    spawn_control_plane_overlay_setup_watcher(
+                        db,
+                        docker.clone(),
+                        control_plane_private_address,
+                        std::env::var("TEMPS_UNDERLAY_DEV").ok(),
+                    );
+                }
             }
 
             // Learn the daemon's architecture once, up front: every later
@@ -319,7 +358,14 @@ impl TempsPlugin for DeployerPlugin {
             // architecture, which is wrong whenever `DOCKER_HOST` points at a
             // daemon on another machine. The scheduler and the pre-transfer
             // platform check both depend on this value being the daemon's.
-            match docker_runtime.refresh_daemon_platform().await {
+            match if local_workloads_enabled {
+                docker_runtime.refresh_daemon_platform().await
+            } else {
+                // Nothing is built or run here, so the daemon's architecture is
+                // not a scheduling input — and asking for it would be the one
+                // Docker round-trip this profile exists to avoid.
+                None
+            } {
                 Some(platform) => tracing::info!(
                     platform = %platform,
                     "Control-plane container platform detected"
@@ -352,7 +398,7 @@ impl TempsPlugin for DeployerPlugin {
             // DB (e.g. an embedded/test configuration) must skip DNS startup,
             // never fail the deployer plugin — do not promote this to
             // `require_service`.
-            if cluster_dns_enabled {
+            if cluster_dns_enabled && local_workloads_enabled {
                 tracing::info!(
                     "cluster DNS resolver enabled (AppSettings.cluster_dns.enabled=true); \
                      starting control-plane Hickory resolver"
@@ -380,6 +426,12 @@ impl TempsPlugin for DeployerPlugin {
                         ),
                     }
                 }
+            } else if cluster_dns_enabled {
+                tracing::info!(
+                    "cluster DNS is enabled in settings, but this process runs no local \
+                     containers, so the control-plane resolver is not started here; worker \
+                     nodes run their own"
+                );
             } else {
                 tracing::info!(
                     "cluster DNS resolver disabled (experimental beta, off by default — \

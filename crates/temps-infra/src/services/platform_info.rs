@@ -8,7 +8,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
-use crate::types::{NetworkInterface, PlatformInfo, PrivateIpInfo, PublicIpInfo, ServerMode};
+use crate::types::{
+    NetworkInterface, PlatformFeatures, PlatformInfo, PrivateIpInfo, PublicIpInfo, ServerMode,
+};
+
+/// Capabilities assumed when the serve bootstrap does not supply an explicit
+/// set: the historical single-binary control plane, which runs everything.
+fn default_features(docker: bool) -> PlatformFeatures {
+    PlatformFeatures {
+        profile: temps_core::PROFILE_FULL.to_string(),
+        deployments_local: true,
+        managed_services: true,
+        backups_local: true,
+        sandboxes: true,
+        docker,
+    }
+}
 
 /// Cached network information
 #[derive(Debug, Clone)]
@@ -20,24 +35,63 @@ struct CachedNetworkInfo {
 
 #[derive(Clone)]
 pub struct PlatformInfoService {
-    docker: Arc<Docker>,
+    /// `None` when this process has no Docker daemon handle (see
+    /// [`PlatformInfoService::without_docker`]). Everything except
+    /// [`PlatformInfoService::get_platform_info`] is daemon-independent.
+    docker: Option<Arc<Docker>>,
     network_cache: Arc<RwLock<Option<CachedNetworkInfo>>>,
     cache_duration: Duration,
+    features: PlatformFeatures,
 }
 
 impl PlatformInfoService {
     pub fn new(docker: Arc<Docker>) -> Self {
         Self {
-            docker,
+            docker: Some(docker),
             network_cache: Arc::new(RwLock::new(None)),
             cache_duration: Duration::from_secs(600), // Cache for 10 minutes
+            features: default_features(true),
         }
+    }
+
+    /// Build the service for a process with no Docker daemon handle.
+    ///
+    /// Network diagnostics, access-mode detection and the capabilities
+    /// endpoint all keep working; only the daemon-derived container platform
+    /// is unavailable, and it reports that as an error rather than guessing.
+    pub fn without_docker() -> Self {
+        Self {
+            docker: None,
+            network_cache: Arc::new(RwLock::new(None)),
+            cache_duration: Duration::from_secs(600),
+            features: default_features(false),
+        }
+    }
+
+    /// Replace the reported capability set. Called once at startup by the
+    /// serve bootstrap, which is the only place that knows the profile.
+    pub fn with_features(mut self, features: PlatformFeatures) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// Capabilities of this process, as served by `GET /platform/features`.
+    pub fn features(&self) -> &PlatformFeatures {
+        &self.features
     }
 
     pub async fn get_platform_info(&self) -> anyhow::Result<PlatformInfo> {
         info!("Getting platform info from Docker");
 
-        let info = self.docker.info().await?;
+        let docker = self.docker.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "container platform is unknown: this process has no Docker daemon handle \
+                 (serve profile '{}'). Worker nodes report their own architecture",
+                self.features.profile
+            )
+        })?;
+
+        let info = docker.info().await?;
 
         // Get OS type and architecture from Docker info
         let os_type = info.os_type.unwrap_or_else(|| "unknown".to_string());
@@ -402,5 +456,63 @@ fn is_private_ip(ip: &str) -> bool {
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_features_describe_the_full_profile() {
+        let service = PlatformInfoService::without_docker();
+        let features = service.features();
+
+        assert_eq!(features.profile, temps_core::PROFILE_FULL);
+        assert!(features.deployments_local);
+        assert!(features.managed_services);
+        assert!(features.backups_local);
+        assert!(features.sandboxes);
+        // No handle was supplied, so the daemon cannot be reported as present.
+        assert!(!features.docker);
+    }
+
+    #[test]
+    fn features_are_replaced_wholesale_by_the_bootstrap() {
+        let service = PlatformInfoService::without_docker().with_features(PlatformFeatures {
+            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
+            deployments_local: false,
+            managed_services: false,
+            backups_local: false,
+            sandboxes: false,
+            docker: false,
+        });
+
+        assert_eq!(
+            service.features().profile,
+            temps_core::PROFILE_CONTROL_PLANE
+        );
+        assert!(!service.features().deployments_local);
+    }
+
+    #[tokio::test]
+    async fn platform_info_without_a_daemon_explains_itself() {
+        let service = PlatformInfoService::without_docker().with_features(PlatformFeatures {
+            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
+            deployments_local: false,
+            managed_services: false,
+            backups_local: false,
+            sandboxes: false,
+            docker: false,
+        });
+
+        let error = service
+            .get_platform_info()
+            .await
+            .expect_err("no daemon handle is available")
+            .to_string();
+
+        assert!(error.contains("control-plane"), "{error}");
+        assert!(error.contains("Docker"), "{error}");
     }
 }

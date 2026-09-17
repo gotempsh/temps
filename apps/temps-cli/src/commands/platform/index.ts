@@ -6,6 +6,7 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   getPlatformInfo,
+  getPlatformFeatures,
   getAccessInfo,
   getPrivateIp,
   getPublicIp,
@@ -32,6 +33,12 @@ export function registerPlatformCommands(program: Command): void {
     .description('Get platform information')
     .option('--json', 'Output in JSON format')
     .action(platformInfoAction)
+
+  platform
+    .command('features')
+    .description('Show which capabilities the server process actually provides')
+    .option('--json', 'Output in JSON format')
+    .action(platformFeaturesAction)
 
   platform
     .command('access')
@@ -147,6 +154,56 @@ async function platformInfoAction(options: { json?: boolean }): Promise<void> {
   keyValue('OS Type', platformInfo.os_type)
   keyValue('Architecture', platformInfo.architecture)
   keyValue('Platforms', platformInfo.platforms.join(', ') || colors.muted('none'))
+  newline()
+}
+
+/**
+ * Report the server's serve profile and what it can actually do.
+ *
+ * Exists so "this server does not run containers" is distinguishable from
+ * "this endpoint is broken" without reading server logs — a control plane
+ * started with `--profile control-plane` deploys to worker nodes only, and
+ * nothing else in the CLI says so.
+ */
+async function platformFeaturesAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const features = await withSpinner('Fetching platform features...', async () => {
+    const { data, error } = await getPlatformFeatures({ client })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (!features) {
+    info('Platform features not available')
+    return
+  }
+
+  if (options.json) {
+    json(features)
+    return
+  }
+
+  const yesNo = (enabled: boolean) => (enabled ? colors.success('Yes') : colors.muted('No'))
+
+  newline()
+  header(`${icons.globe} Platform Features`)
+  keyValue('Serve profile', features.profile)
+  keyValue('Local deployments', yesNo(features.deployments_local))
+  keyValue('Managed services', yesNo(features.managed_services))
+  keyValue('Local backups', yesNo(features.backups_local))
+  keyValue('Agent sandboxes', yesNo(features.sandboxes))
+  keyValue('Docker daemon', yesNo(features.docker))
+
+  if (!features.deployments_local) {
+    newline()
+    info(
+      'This server runs no workloads of its own. Applications run on worker nodes joined with `temps join`.'
+    )
+  }
   newline()
 }
 

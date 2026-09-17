@@ -80,10 +80,37 @@ impl TempsPlugin for InfraPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Create Docker connection for platform detection
-            let docker = context.require_service::<bollard::Docker>();
+            // Docker is used for exactly one thing here: reading the
+            // daemon's os/arch. `get_service`, not `require_service` — a
+            // control plane with no daemon still needs every other platform
+            // endpoint, and the capabilities endpoint below is precisely how a
+            // client learns the daemon is absent.
+            let docker = context.get_service::<bollard::Docker>();
+            let docker_available = docker.is_some();
+
+            // The serve bootstrap is the only place that knows the profile;
+            // absent (embedded/test contexts) means the historical
+            // everything-enabled control plane.
+            let policy = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let features = crate::types::PlatformFeatures {
+                profile: policy.profile().to_string(),
+                deployments_local: policy.local_workloads_enabled(),
+                managed_services: policy.local_workloads_enabled(),
+                backups_local: policy.local_workloads_enabled(),
+                sandboxes: policy.local_workloads_enabled(),
+                docker: docker_available && policy.docker_available(),
+            };
+
             // Create PlatformInfoService
-            let platform_info_service = Arc::new(PlatformInfoService::new(docker.clone()));
+            let platform_info_service = Arc::new(
+                match docker {
+                    Some(docker) => PlatformInfoService::new(docker),
+                    None => PlatformInfoService::without_docker(),
+                }
+                .with_features(features),
+            );
             context.register_service(platform_info_service.clone());
 
             // Create DnsService

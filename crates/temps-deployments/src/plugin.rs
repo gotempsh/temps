@@ -58,6 +58,27 @@ impl TempsPlugin for DeploymentsPlugin {
         "deployments"
     }
 
+    /// The cross-crate services this plugin cannot be constructed without.
+    /// Declared so a serve profile that skips one of their providers fails at
+    /// startup with a list, instead of panicking inside `require_service`.
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_logs::LogService>(),
+            RequiredService::of::<temps_logs::DockerLogService>(),
+            RequiredService::of::<temps_config::ConfigService>(),
+            RequiredService::of::<bollard::Docker>(),
+            RequiredService::of::<dyn temps_deployer::ContainerDeployer>(),
+            RequiredService::of::<dyn temps_deployer::ImageBuilder>(),
+            RequiredService::of::<dyn temps_deployer::static_deployer::StaticDeployer>(),
+            RequiredService::of::<temps_screenshots::ScreenshotService>(),
+            RequiredService::of::<temps_providers::ExternalServiceManager>(),
+            RequiredService::of::<temps_error_tracking::DSNService>(),
+            RequiredService::of::<temps_blob::BlobService>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -70,6 +91,12 @@ impl TempsPlugin for DeploymentsPlugin {
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
             let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
             let docker = context.require_service::<bollard::Docker>();
+            // Whether this process may run containers itself. Absent in
+            // embeddings that never register one, which keeps the historical
+            // single-binary behaviour (see `LocalWorkloadPolicy::default`).
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
             let deployer = context.require_service::<dyn temps_deployer::ContainerDeployer>();
             let git_provider = context.require_service::<dyn temps_git::GitProviderManagerTrait>();
             let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
@@ -89,7 +116,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.clone(),
                 queue_service.clone(),
                 docker_log_service,
-                docker,
+                docker.clone(),
                 deployer.clone(),
                 encryption_service.clone(),
             ));
@@ -202,13 +229,24 @@ impl TempsPlugin for DeploymentsPlugin {
                 .with_image_retention(&image_retention)
                 .with_config_service(config_service.clone()),
             );
-            tokio::spawn({
-                let cleanup_service = docker_cleanup.clone();
-                async move {
-                    tracing::debug!("Starting Docker cleanup scheduler");
-                    cleanup_service.start_cleanup_scheduler().await;
-                }
-            });
+            // The cleanup scheduler prunes images, containers and build cache
+            // on THIS host's Docker daemon. With no local workloads there is
+            // nothing of ours on it to prune, so the nightly sweep would only
+            // wake up to fail against an absent socket.
+            if local_workloads.local_workloads_enabled() {
+                tokio::spawn({
+                    let cleanup_service = docker_cleanup.clone();
+                    async move {
+                        tracing::debug!("Starting Docker cleanup scheduler");
+                        cleanup_service.start_cleanup_scheduler().await;
+                    }
+                });
+            } else {
+                tracing::info!(
+                    "local workloads are disabled for this process; not starting the Docker \
+                     cleanup scheduler (worker nodes prune their own daemons)"
+                );
+            }
 
             // Get screenshot service (required)
             let screenshot_service =
@@ -218,11 +256,13 @@ impl TempsPlugin for DeploymentsPlugin {
             let static_deployer =
                 context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
-            // Create Docker client for container operations
-            let docker = Arc::new(
-                bollard::Docker::connect_with_local_defaults()
-                    .expect("Failed to connect to Docker"),
-            );
+            // Container operations reuse the process-wide Docker handle taken
+            // from the registry above. This used to open a SECOND client with
+            // `connect_with_local_defaults().expect(...)`, which both ignored
+            // the daemon the rest of the process was configured against
+            // (DOCKER_HOST) and turned an unreachable/absent socket into a
+            // panic in plugin registration instead of a typed startup error.
+            let docker = Arc::clone(&docker);
 
             // Late-bind the Compose executor onto DeploymentService now that
             // the Docker client exists (DeploymentService itself is
@@ -272,7 +312,11 @@ impl TempsPlugin for DeploymentsPlugin {
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
             let node_scheduler = Arc::new(
                 crate::services::NodeScheduler::new(node_service)
-                    .with_platform_source(image_builder.clone()),
+                    .with_platform_source(image_builder.clone())
+                    // Without this the `Local` slot stays in the pool even in a
+                    // profile with no Docker daemon, and a zero-node install
+                    // would place every replica on a host that cannot start it.
+                    .with_local_workloads_enabled(local_workloads.local_workloads_enabled()),
             );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 

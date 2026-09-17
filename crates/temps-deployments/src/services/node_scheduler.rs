@@ -201,6 +201,15 @@ pub struct NodeScheduler {
     /// that is exactly the wrong answer, and it would drive both the
     /// scheduling filter and the cross-build decision.
     platform_source: Option<Arc<dyn temps_deployer::ImageBuilder>>,
+    /// Whether the control plane may host application containers itself.
+    ///
+    /// `false` in the `control-plane` serve profile, where this process has no
+    /// Docker daemon and exists purely to orchestrate remote worker nodes.
+    /// `NodeAssignment::Local` is then never produced: a replica placed there
+    /// could never start, and the historical "no eligible node -> fall back to
+    /// Local" behaviour would turn a scheduling problem into a container that
+    /// silently never comes up.
+    local_workloads_enabled: bool,
 }
 
 impl NodeScheduler {
@@ -213,7 +222,24 @@ impl NodeScheduler {
             max_load_threshold: DEFAULT_MAX_LOAD_THRESHOLD,
             local_platform: None,
             platform_source: None,
+            local_workloads_enabled: true,
         }
+    }
+
+    /// Declare whether the control plane itself may host replicas.
+    ///
+    /// Wired from the serve profile's `LocalWorkloadPolicy`. When disabled,
+    /// scheduling with no eligible remote node returns
+    /// [`NodeError::LocalWorkloadsDisabled`] instead of silently assigning
+    /// every replica to a node that cannot run them.
+    pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
+    }
+
+    /// Whether this scheduler may place replicas on the control plane itself.
+    pub fn local_workloads_enabled(&self) -> bool {
+        self.local_workloads_enabled
     }
 
     /// Resolve the control plane's platform from the live image builder, so a
@@ -587,7 +613,20 @@ impl NodeScheduler {
         let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
         let local_matches_constraints =
             !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
-        let include_local = local_compatible && local_matches_constraints;
+        // Three independent reasons Local can drop out of the pool: it cannot
+        // run the image, it does not satisfy an explicit placement constraint,
+        // or this process is not allowed to run workloads at all.
+        let include_local =
+            self.local_workloads_enabled && local_compatible && local_matches_constraints;
+
+        // An explicit "deploy to the control plane" request (synthetic node ID
+        // 0) in a profile that runs no workloads is not a constraint the
+        // scheduler can satisfy by picking differently — say exactly that.
+        if targets_control_plane && !self.local_workloads_enabled {
+            return Err(NodeError::LocalWorkloadsDisabled {
+                requested_replicas: replica_count,
+            });
+        }
 
         if has_node_constraints && eligible_nodes.is_empty() && !include_local {
             let excluded = if architecture_exclusions.is_empty() {
@@ -618,6 +657,15 @@ impl NodeScheduler {
         }
 
         if eligible_nodes.is_empty() {
+            if !self.local_workloads_enabled {
+                // Distinct from NoCompatibleNode: nothing is wrong with the
+                // image or the cluster's architectures — this control plane
+                // simply does not run workloads, so the answer is "join a
+                // worker node", not "rebuild for another platform".
+                return Err(NodeError::LocalWorkloadsDisabled {
+                    requested_replicas: replica_count,
+                });
+            }
             if !include_local {
                 // Nowhere to put this: the control plane can't run the image
                 // or does not satisfy the explicit placement constraint, and
@@ -1147,6 +1195,105 @@ mod tests {
                 other.map(|o| o.assignments.len())
             ),
         }
+    }
+
+    // ── Local workloads disabled (control-plane serve profile) ───────────
+
+    fn control_plane_scheduler(nodes_list: Vec<nodes::Model>) -> NodeScheduler {
+        scheduler_with_nodes(nodes_list, "linux/amd64").with_local_workloads_enabled(false)
+    }
+
+    /// With no worker nodes at all, the historical behaviour is "everything is
+    /// Local". A control plane that cannot run containers must not pretend it
+    /// can: a `Local` assignment here produces a deployment marked successful
+    /// whose container never exists.
+    #[tokio::test]
+    async fn no_local_fallback_when_local_workloads_are_disabled() {
+        let scheduler = control_plane_scheduler(vec![]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &[])
+            .await;
+
+        match result {
+            Err(NodeError::LocalWorkloadsDisabled { requested_replicas }) => {
+                assert_eq!(requested_replicas, 2);
+            }
+            other => panic!(
+                "expected LocalWorkloadsDisabled, got {:?}",
+                other.map(|o| o.assignments)
+            ),
+        }
+    }
+
+    /// The error names the remedy an operator can act on.
+    #[tokio::test]
+    async fn local_workloads_disabled_error_points_at_temps_join() {
+        let scheduler = control_plane_scheduler(vec![]);
+
+        let message = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &[])
+            .await
+            .expect_err("no node can take this deployment")
+            .to_string();
+
+        assert!(message.contains("temps join"), "{message}");
+        assert!(message.contains("control-plane"), "{message}");
+    }
+
+    /// Disabling local workloads must not disable scheduling: remote workers
+    /// are the entire point of this profile.
+    #[tokio::test]
+    async fn remote_nodes_are_still_scheduled_when_local_is_disabled() {
+        let scheduler = control_plane_scheduler(vec![
+            make_node_with_arch(1, "worker-a", "linux/amd64"),
+            make_node_with_arch(2, "worker-b", "linux/amd64"),
+        ]);
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("two compatible workers can take two replicas")
+            .assignments;
+
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            assignments.iter().all(|a| !a.is_local()),
+            "no replica may be placed locally: {assignments:?}"
+        );
+    }
+
+    /// Explicitly targeting the control plane (synthetic node ID 0) gets the
+    /// specific error rather than a generic "no node matched your constraints".
+    #[tokio::test]
+    async fn explicit_control_plane_target_is_refused_with_the_specific_error() {
+        let scheduler =
+            control_plane_scheduler(vec![make_node_with_arch(1, "worker-a", "linux/amd64")]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(1, None, Some(&[0]), false, &[], &[])
+            .await;
+
+        assert!(
+            matches!(result, Err(NodeError::LocalWorkloadsDisabled { .. })),
+            "expected LocalWorkloadsDisabled for an explicit control-plane target"
+        );
+    }
+
+    /// The default is unchanged: an install with no workers still deploys
+    /// locally, exactly as before this flag existed.
+    #[tokio::test]
+    async fn local_workloads_are_enabled_by_default() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+        assert!(scheduler.local_workloads_enabled());
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &[])
+            .await
+            .expect("single-node installs keep deploying locally")
+            .assignments;
+
+        assert!(assignments.iter().all(|a| a.is_local()));
     }
 
     // ── Replica shortfall and exclusion reporting ────────────────────────

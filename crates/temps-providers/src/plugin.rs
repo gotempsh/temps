@@ -37,6 +37,15 @@ impl TempsPlugin for ProvidersPlugin {
         "providers"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_core::EncryptionService>(),
+            RequiredService::of::<bollard::Docker>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -73,6 +82,25 @@ impl TempsPlugin for ProvidersPlugin {
                 ExternalServicesEnvProvider::new(external_service_manager.clone(), db.clone()),
             );
             context.register_service(env_vars_provider);
+
+            // Managed-service containers live on THIS host's Docker daemon.
+            // A process that runs no local workloads has none to reconcile, so
+            // both background sweeps below are skipped entirely rather than
+            // left to retry against an absent daemon. The HTTP surface stays
+            // registered so the console can still list what exists and explain
+            // why provisioning is unavailable here.
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            if !local_workloads.local_workloads_enabled() {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; not starting managed-service \
+                     cluster reconcilers or standalone-service DNS reconciliation"
+                );
+                tracing::debug!("Providers plugin services registered successfully");
+                return Ok(());
+            }
 
             // Spawn role reconcilers for every cluster that's already
             // running. Without this, after a control-plane restart no

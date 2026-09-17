@@ -1445,6 +1445,12 @@ impl DeployImageJob {
                     }
                     | crate::services::node_service::NodeError::Validation {
                         ..
+                    }
+                    // This process runs no workloads and no worker node could
+                    // take the replicas. Degrading to Local would produce a
+                    // "successful" deployment whose containers never start.
+                    | crate::services::node_service::NodeError::LocalWorkloadsDisabled {
+                        ..
                     }),
                 ) => {
                     let msg = format!("Cannot schedule this deployment: {}", e);
@@ -1466,6 +1472,19 @@ impl DeployImageJob {
                 // some worker matches it would otherwise be started here and
                 // die with the very `exec format error` this feature exists to
                 // prevent.
+                // Same guard for the transient-failure path: the historical
+                // degrade-to-local fallback is only safe where local
+                // deployment is possible at all.
+                Err(e) if !scheduler.local_workloads_enabled() => {
+                    let msg = format!(
+                        "Cannot schedule this deployment: {}. This control plane does not run \
+                         application containers, so there is no local fallback — join a worker \
+                         node with `temps join`",
+                        e
+                    );
+                    self.log(context, format!("ERROR: {}", msg)).await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
+                }
                 Err(e) => {
                     self.ensure_local_can_run(&image_platforms, context, &e.to_string())
                         .await?;

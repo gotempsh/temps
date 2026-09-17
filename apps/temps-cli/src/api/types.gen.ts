@@ -14896,6 +14896,47 @@ export type PlanTarget = {
 };
 
 /**
+ * Which capabilities this server process actually provides.
+ *
+ * A client cannot tell "this build has no sandboxes" from "this process was
+ * started in a profile that does not run them" by probing endpoints — both
+ * look like failure. This endpoint answers the question directly so the
+ * console can render an honest, actionable state (what is unavailable, and
+ * why) instead of a dead button or an empty page.
+ */
+export type PlatformFeatures = {
+    /**
+     * Whether backups can be produced from services running on this host.
+     * Remote backups of worker-node services are unaffected.
+     */
+    backups_local: boolean;
+    /**
+     * Whether application containers can be deployed onto this host.
+     * `false` in the control-plane profile: applications run on worker nodes
+     * that joined the cluster with `temps join`.
+     */
+    deployments_local: boolean;
+    /**
+     * Whether a Docker daemon answered a ping during startup.
+     */
+    docker: boolean;
+    /**
+     * Whether managed services (PostgreSQL, Redis, MariaDB, ...) can be
+     * provisioned on this host.
+     */
+    managed_services: boolean;
+    /**
+     * Serve profile this process was started with: `"full"` or
+     * `"control-plane"`.
+     */
+    profile: string;
+    /**
+     * Whether agent sandboxes / workspace previews run in this process.
+     */
+    sandboxes: boolean;
+};
+
+/**
  * Platform compatibility information
  */
 export type PlatformInfo = {
@@ -45102,6 +45143,33 @@ export type GetAccessInfoResponses = {
 };
 
 export type GetAccessInfoResponse = GetAccessInfoResponses[keyof GetAccessInfoResponses];
+
+export type GetPlatformFeaturesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/platform/features';
+};
+
+export type GetPlatformFeaturesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetPlatformFeaturesResponses = {
+    /**
+     * Capabilities of this server process
+     */
+    200: PlatformFeatures;
+};
+
+export type GetPlatformFeaturesResponse = GetPlatformFeaturesResponses[keyof GetPlatformFeaturesResponses];
 
 export type GetPrivateIpData = {
     body?: never;

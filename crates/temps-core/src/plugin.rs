@@ -403,6 +403,42 @@ pub enum PluginError {
 
     #[error("OpenAPI schema merge failed: {0}")]
     OpenApiMergeFailed(String),
+
+    #[error(
+        "{plugin_count} registered plugin(s) require services that no registered plugin \
+         provides:\n{details}"
+    )]
+    MissingRequiredServices {
+        /// How many plugins reported at least one unmet requirement.
+        plugin_count: usize,
+        /// Pre-formatted `  - <plugin>: <service>, <service>` lines.
+        details: String,
+    },
+}
+
+/// A service a plugin cannot start without, declared up-front by
+/// [`TempsPlugin::required_services`].
+///
+/// The registry is keyed by [`TypeId`], but a `TypeId` is useless in an error
+/// message, so the human-readable `std::any::type_name` is carried alongside
+/// it. Build these with [`RequiredService::of`] rather than by hand so the two
+/// can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredService {
+    /// Key this service is registered under in the `ServiceRegistry`.
+    pub type_id: TypeId,
+    /// Fully-qualified type name, used verbatim in the startup error.
+    pub type_name: &'static str,
+}
+
+impl RequiredService {
+    /// Declare `T` as a hard requirement of the calling plugin.
+    pub fn of<T: Send + Sync + 'static + ?Sized>() -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            type_name: std::any::type_name::<T>(),
+        }
+    }
 }
 
 /// Core plugin trait that defines the plugin interface
@@ -418,6 +454,25 @@ pub trait TempsPlugin: Send + Sync {
         &'a self,
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
+
+    /// Services this plugin calls `require_service` for and cannot start
+    /// without.
+    ///
+    /// `require_service` panics when a service is absent, which turns a
+    /// perfectly ordinary configuration outcome -- "this build does not run
+    /// local containers, so nothing registered `bollard::Docker`" -- into a
+    /// mid-initialization panic naming a single type, with no indication of
+    /// which plugin wanted it or what else is missing. Declaring the
+    /// requirements here lets `PluginManager::initialize_plugins` check every
+    /// plugin at once, between phase 1 and phase 2, and report all of them in
+    /// one actionable error.
+    ///
+    /// Defaults to empty: the check is an additive safety net, not a second
+    /// dependency system, so a plugin that does not implement this behaves
+    /// exactly as before.
+    fn required_services(&self) -> Vec<RequiredService> {
+        Vec::new()
+    }
 
     /// Initialize plugin-managed services after all plugins are registered
     ///
@@ -679,6 +734,18 @@ impl ServiceRegistry {
             .cloned()
     }
 
+    /// Whether a service is registered under `type_id`.
+    ///
+    /// Takes an erased `TypeId` rather than a generic parameter so callers
+    /// holding a [`RequiredService`] (collected from a `dyn TempsPlugin`) can
+    /// ask the question at all -- the concrete type is long gone by then.
+    pub fn contains_type_id(&self, type_id: TypeId) -> bool {
+        self.services
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&type_id)
+    }
+
     /// Require a service - panics with helpful error if not available
     pub fn require<T: Send + Sync + 'static + ?Sized>(&self) -> Arc<T> {
         self.get::<T>().unwrap_or_else(|| {
@@ -829,6 +896,12 @@ impl ServiceRegistrationContext {
         self.service_registry.require::<T>()
     }
 
+    /// Whether a service is registered under `type_id`. See
+    /// [`ServiceRegistry::contains_type_id`].
+    pub fn contains_type_id(&self, type_id: TypeId) -> bool {
+        self.service_registry.contains_type_id(type_id)
+    }
+
     /// Create a read-only context for plugin operations
     pub fn create_plugin_context(&self) -> PluginContext {
         PluginContext::new(self.service_registry.clone(), self.state_registry.clone())
@@ -883,6 +956,12 @@ impl PluginManager {
             );
         }
 
+        // Between the phases: verify every declared requirement is actually in
+        // the registry. `require_service` would otherwise panic on the first
+        // missing one, half-way through phase 2, naming a bare type and
+        // leaving the operator to rediscover the rest one restart at a time.
+        self.verify_required_services()?;
+
         // Phase 2: Initialize plugin services (after all services are registered)
         // This allows plugins to access services from other plugins
         let plugin_context = self.context.create_plugin_context();
@@ -904,6 +983,39 @@ impl PluginManager {
         }
 
         Ok(())
+    }
+
+    /// Check every registered plugin's [`TempsPlugin::required_services`]
+    /// against the service registry and report ALL unmet requirements in one
+    /// error.
+    ///
+    /// Runs after phase 1 (service registration) so registration order is
+    /// irrelevant here: by this point every plugin that is going to provide
+    /// anything has provided it.
+    pub fn verify_required_services(&self) -> Result<(), PluginError> {
+        let mut lines: Vec<String> = Vec::new();
+
+        for plugin in &self.plugins {
+            let missing: Vec<&'static str> = plugin
+                .required_services()
+                .into_iter()
+                .filter(|required| !self.context.contains_type_id(required.type_id))
+                .map(|required| required.type_name)
+                .collect();
+
+            if !missing.is_empty() {
+                lines.push(format!("  - {}: {}", plugin.name(), missing.join(", ")));
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok(());
+        }
+
+        Err(PluginError::MissingRequiredServices {
+            plugin_count: lines.len(),
+            details: lines.join("\n"),
+        })
     }
 
     /// Build the complete application with routes, middleware, and OpenAPI as
@@ -1950,5 +2062,140 @@ mod split_application_tests {
             .as_ref()
             .and_then(|operation| operation.extensions.as_ref())
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod required_services_tests {
+    use super::*;
+
+    /// Marker service types. Only their `TypeId`s matter here.
+    struct DatabaseStub;
+    struct DockerStub;
+    struct ScreenshotStub;
+
+    struct ProviderPlugin;
+
+    impl TempsPlugin for ProviderPlugin {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            context: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async move {
+                context.register_service(Arc::new(DatabaseStub));
+                Ok(())
+            })
+        }
+    }
+
+    /// Declares two requirements; only one of them is ever provided.
+    struct ConsumerPlugin {
+        name: &'static str,
+    }
+
+    impl TempsPlugin for ConsumerPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn required_services(&self) -> Vec<RequiredService> {
+            vec![
+                RequiredService::of::<DatabaseStub>(),
+                RequiredService::of::<DockerStub>(),
+            ]
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _context: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn satisfied_requirements_pass() {
+        let mut manager = PluginManager::new();
+        manager
+            .service_context()
+            .register_service(Arc::new(DockerStub));
+        manager.register_plugin(Box::new(ProviderPlugin));
+        manager.register_plugin(Box::new(ConsumerPlugin { name: "consumer" }));
+
+        manager
+            .initialize_plugins()
+            .await
+            .expect("every required service is registered");
+    }
+
+    #[tokio::test]
+    async fn missing_requirement_fails_before_phase_two() {
+        let mut manager = PluginManager::new();
+        manager.register_plugin(Box::new(ProviderPlugin));
+        manager.register_plugin(Box::new(ConsumerPlugin { name: "consumer" }));
+
+        let error = manager
+            .initialize_plugins()
+            .await
+            .expect_err("DockerStub is never registered");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("consumer"),
+            "error must name the plugin that wanted the service: {message}"
+        );
+        assert!(
+            message.contains("DockerStub"),
+            "error must name the missing service: {message}"
+        );
+        assert!(
+            !message.contains("DatabaseStub"),
+            "satisfied requirements must not be reported as missing: {message}"
+        );
+    }
+
+    #[test]
+    fn every_unmet_requirement_is_reported_in_one_error() {
+        let mut manager = PluginManager::new();
+        manager.register_plugin(Box::new(ConsumerPlugin { name: "first" }));
+        manager.register_plugin(Box::new(ConsumerPlugin { name: "second" }));
+
+        let error = manager
+            .verify_required_services()
+            .expect_err("nothing is registered at all");
+
+        match error {
+            PluginError::MissingRequiredServices {
+                plugin_count,
+                details,
+            } => {
+                assert_eq!(plugin_count, 2, "one line per plugin: {details}");
+                assert!(details.contains("first"), "{details}");
+                assert!(details.contains("second"), "{details}");
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn plugins_without_declared_requirements_are_ignored() {
+        let mut manager = PluginManager::new();
+        manager.register_plugin(Box::new(ProviderPlugin));
+
+        manager
+            .verify_required_services()
+            .expect("the default impl declares nothing");
+    }
+
+    #[test]
+    fn registry_reports_registered_type_ids() {
+        let registry = ServiceRegistry::new();
+        assert!(!registry.contains_type_id(TypeId::of::<ScreenshotStub>()));
+        registry.register(Arc::new(ScreenshotStub));
+        assert!(registry.contains_type_id(TypeId::of::<ScreenshotStub>()));
     }
 }

@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use utoipa::OpenApi;
 
 use crate::services::PlatformInfoService;
-use crate::types::{PlatformInfo, ServiceAccessInfo};
+use crate::types::{PlatformFeatures, PlatformInfo, ServiceAccessInfo};
 
 /// Application state containing the platform info service
 pub trait InfraAppState: Send + Sync + 'static {
@@ -20,9 +20,15 @@ pub trait InfraAppState: Send + Sync + 'static {
 /// OpenAPI documentation for platform information endpoints
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_platform_info, get_public_ip, get_private_ip, get_access_info),
+    paths(
+        get_platform_info,
+        get_platform_features,
+        get_public_ip,
+        get_private_ip,
+        get_access_info
+    ),
     components(
-        schemas(PlatformInfo, ServiceAccessInfo)
+        schemas(PlatformFeatures, PlatformInfo, ServiceAccessInfo)
     ),
     tags(
         (name = "Platform", description = "Platform information and compatibility")
@@ -64,6 +70,35 @@ where
             })))
         }
     }
+}
+
+/// Report which capabilities this server process actually provides.
+///
+/// Always present, in every profile — a client must be able to tell
+/// "unavailable here, and here is why" from "endpoint does not exist".
+#[utoipa::path(
+    get,
+    path = "/platform/features",
+    responses(
+        (status = 200, description = "Capabilities of this server process", body = PlatformFeatures),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+    ),
+    tag = "Platform",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_platform_features<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+) -> Result<Json<PlatformFeatures>, Problem>
+where
+    T: InfraAppState,
+{
+    permission_guard!(auth, PlatformInfoRead);
+
+    debug!("Reporting platform features");
+
+    Ok(Json(app_state.platform_info_service().features().clone()))
 }
 
 /// Get public IP address of the server
@@ -206,6 +241,7 @@ where
 {
     Router::new()
         .route("/.well-known/temps.json", get(get_platform_info::<T>))
+        .route("/platform/features", get(get_platform_features::<T>))
         .route("/platform/public-ip", get(get_public_ip::<T>))
         .route("/platform/private-ip", get(get_private_ip::<T>))
         .route("/platform/access-info", get(get_access_info::<T>))
