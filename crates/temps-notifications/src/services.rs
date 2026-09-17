@@ -557,6 +557,30 @@ impl NotificationProvider for CloudflareProvider {
     }
 }
 
+/// Decide whether a metadata key should be shown in a human-facing render
+/// (Slack fields, email rows). Webhook payloads and persisted metadata keep
+/// every key — including raw numeric IDs — for correlation, since external
+/// integrations may depend on them. This filter only trims what a person
+/// reads: `_`-prefixed keys are channel-internal payloads (e.g. the email's
+/// `_chart_svg`), and a `<prefix>_id` key is redundant once the same
+/// metadata map already carries a `<prefix>_name` or `<prefix>_slug` twin.
+fn is_human_visible_metadata_key(
+    key: &str,
+    metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    if key.starts_with('_') {
+        return false;
+    }
+    if let Some(prefix) = key.strip_suffix("_id") {
+        let has_readable_twin = metadata.contains_key(&format!("{prefix}_name"))
+            || metadata.contains_key(&format!("{prefix}_slug"));
+        if has_readable_twin {
+            return false;
+        }
+    }
+    true
+}
+
 /// HTML-encode the five characters that can break element structure or inject
 /// new tags when user-controlled text is interpolated into an HTML template.
 fn html_escape(s: &str) -> String {
@@ -1162,7 +1186,7 @@ impl EmailProvider {
         let visible_metadata: Vec<(&String, &String)> = notification
             .metadata
             .iter()
-            .filter(|(k, _)| !k.starts_with('_'))
+            .filter(|(k, _)| is_human_visible_metadata_key(k, &notification.metadata))
             .collect();
         let metadata_html = if visible_metadata.is_empty() {
             String::new()
@@ -1516,9 +1540,7 @@ impl NotificationProvider for SlackProvider {
         let metadata_fields = notification
             .metadata
             .iter()
-            // `_`-prefixed keys are channel payloads (e.g. the email's `_chart_svg`),
-            // not human-facing fields — skip them here.
-            .filter(|(k, _)| !k.starts_with('_'))
+            .filter(|(k, _)| is_human_visible_metadata_key(k, &notification.metadata))
             .map(|(k, v)| {
                 serde_json::json!({
                     "title": slack_escape(k),
