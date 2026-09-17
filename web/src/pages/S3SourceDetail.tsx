@@ -3,8 +3,6 @@
 
 'use client'
 
-import { PageHeader } from '@/components/layout/PageContainer'
-
 import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
@@ -13,7 +11,10 @@ import {
   listBackupSchedulesOptions,
   listSourceBackupsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { BackupScheduleResponse } from '@/api/client/types.gen'
+import {
+  BackupScheduleResponse,
+  S3SourceResponse,
+} from '@/api/client/types.gen'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -25,7 +26,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -41,6 +41,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
   TableBody,
@@ -56,16 +57,27 @@ import {
   testS3SourceConnection,
 } from '@/lib/s3-sources'
 import { runScheduleNow } from '@/lib/schedule-runs'
-import { cn, formatBytes, isPitrCapableFormat } from '@/lib/utils'
+import { cn, isPitrCapableFormat } from '@/lib/utils'
 import {
   iconForServiceType,
   serviceTypeRouteForEngine,
 } from '@/lib/serviceIcons'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Input } from '@/components/ui/input'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import {
+  Button,
+  Detail,
+  PageState,
+  fmtBytes,
+  fmtDate,
+  fmtDateTime,
+  fmtRelativeTime,
+  useUrlState,
+  type DetailFact,
+} from '@temps-sdk/ds'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  AlertCircle,
   ArrowLeft,
   CalendarDays,
   CheckCircle2,
@@ -99,6 +111,32 @@ function formatTimeoutSecs(secs: number): string {
   if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`
   if (hours > 0) return `${hours}h`
   return `${minutes}m`
+}
+
+function sourceFacts(source: S3SourceResponse): DetailFact[] {
+  return [
+    {
+      label: 'Bucket',
+      value: <span className="font-mono">{source.bucket_name}</span>,
+    },
+    { label: 'Region', value: source.region },
+    {
+      label: 'Source',
+      value: source.managed_by_cloud
+        ? 'Temps Cloud'
+        : source.is_default
+          ? 'Default'
+          : 'Manual',
+    },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(source.created_at)}>
+          {fmtRelativeTime(source.created_at)}
+        </span>
+      ),
+    },
+  ]
 }
 
 export function S3SourceDetail() {
@@ -257,9 +295,20 @@ export function S3SourceDetail() {
   // Client-side filter + pagination over the recent-backups list. The list
   // is DB-first (ADR-014 §"Fast listings") and capped, so doing this on the
   // client is fine — no backend pagination needed yet. If/when the cap goes
-  // away, swap this for `?page=&page_size=` on the API.
-  const [backupSearch, setBackupSearch] = useState('')
-  const [backupPage, setBackupPage] = useState(1)
+  // away, swap this for `?page=&page_size=` on the API. Search text and page
+  // number live in the URL (not local state) so a filtered/paged view can be
+  // shared or survive a refresh.
+  const { get: getBackupsUrlState, patch: patchBackupsUrlState } = useUrlState<
+    'q' | 'page'
+  >()
+  const backupSearch = getBackupsUrlState('q') ?? ''
+  const backupPage = Number(getBackupsUrlState('page') ?? '1') || 1
+  const setBackupSearch = (value: string) =>
+    patchBackupsUrlState({ q: value || undefined })
+  const setBackupPage = (value: number | ((current: number) => number)) => {
+    const next = typeof value === 'function' ? value(backupPage) : value
+    patchBackupsUrlState({ page: next > 1 ? next : undefined })
+  }
   const BACKUP_PAGE_SIZE = 10
 
   const filteredBackups = useMemo(() => {
@@ -286,8 +335,12 @@ export function S3SourceDetail() {
   // Clamp the page if the filter just shrunk the result set below the
   // current page.
   useEffect(() => {
-    if (backupPage > backupTotalPages) setBackupPage(backupTotalPages)
-  }, [backupPage, backupTotalPages])
+    if (backupPage > backupTotalPages) {
+      patchBackupsUrlState({
+        page: backupTotalPages > 1 ? backupTotalPages : undefined,
+      })
+    }
+  }, [backupPage, backupTotalPages, patchBackupsUrlState])
 
   const pagedBackups = useMemo(() => {
     const start = (backupPage - 1) * BACKUP_PAGE_SIZE
@@ -314,78 +367,63 @@ export function S3SourceDetail() {
     deleteMutation.mutate({ path: { id: scheduleToDelete.id } })
   }
 
+  const backAction = (
+    <Button variant="outline" size="sm" asChild>
+      <Link to="/backups">
+        <ArrowLeft className="mr-2 h-4 w-4" />
+        Back to Backups
+      </Link>
+    </Button>
+  )
+
   if (isLoadingSource) {
     return (
-      <div className="flex items-center justify-center py-6">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-48" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={<Skeleton className="h-64 w-full" />}
+        aside={<Skeleton className="h-48 w-full rounded-lg" />}
+      />
     )
   }
 
   if (!source) {
     return (
-      <div className="flex flex-col items-center justify-center py-6">
-        <h2 className="text-lg font-semibold">S3 Source Not Found</h2>
-        <p className="text-sm text-muted-foreground">
-          The requested S3 source could not be found.
-        </p>
-        <Button asChild className="mt-4">
-          <Link to="/backups">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Backups
-          </Link>
-        </Button>
-      </div>
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="S3 source not found"
+        description="The requested S3 source could not be found."
+        action={backAction}
+      />
     )
   }
 
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
+  const detail = (
+    <Detail
+      title={source.name}
+      actions={
+        <>
+          {backAction}
           <Button
-            variant="ghost"
-            size="icon"
-            className="-ml-1 shrink-0 sm:hidden"
-            asChild
-            aria-label="Back"
-          >
-            <Link to="/backups">
-              <ArrowLeft className="h-4 w-4" />
-            </Link>
-          </Button>
-          <Button
-            variant="ghost"
+            variant="outline"
             size="sm"
-            className="hidden shrink-0 sm:inline-flex"
-            asChild
+            onClick={() => testConnectionMutation.mutate()}
+            busy={testConnectionMutation.isPending}
+            busyLabel="Testing…"
+            disabled={!sourceId}
           >
-            <Link to="/backups">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back
-            </Link>
+            <Plug className="mr-2 h-4 w-4" />
+            Test connection
           </Button>
-          <PageHeader title={source.name} />
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => testConnectionMutation.mutate()}
-          disabled={testConnectionMutation.isPending || !sourceId}
-          aria-label="Test connection"
-          title="Test connection"
-        >
-          {testConnectionMutation.isPending ? (
-            <Loader2 className="h-4 w-4 animate-spin sm:mr-2" />
-          ) : (
-            <Plug className="h-4 w-4 sm:mr-2" />
-          )}
-          <span className="hidden sm:inline">Test connection</span>
-        </Button>
-      </div>
-
-      <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
+        </>
+      }
+      facts={sourceFacts(source)}
+      main={
         <div className="min-w-0 space-y-4">
           <Card className="overflow-hidden shadow-none">
             <CardHeader className="border-b px-5 py-4 flex flex-row items-start justify-between gap-3 space-y-0">
@@ -543,18 +581,12 @@ export function S3SourceDetail() {
                           </TableCell>
                           <TableCell className="hidden whitespace-nowrap md:table-cell">
                             {schedule.last_run
-                              ? format(
-                                  new Date(schedule.last_run),
-                                  'MMM d, yyyy HH:mm'
-                                )
+                              ? fmtDateTime(schedule.last_run)
                               : '-'}
                           </TableCell>
                           <TableCell className="hidden whitespace-nowrap lg:table-cell">
                             {schedule.next_run
-                              ? format(
-                                  new Date(schedule.next_run),
-                                  'MMM d, yyyy HH:mm'
-                                )
+                              ? fmtDateTime(schedule.next_run)
                               : '-'}
                           </TableCell>
                           <TableCell
@@ -769,30 +801,22 @@ export function S3SourceDetail() {
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                                 <span className="font-mono">
-                                  {format(
-                                    new Date(backup.created_at),
-                                    'MMM d, yyyy p'
-                                  )}
+                                  {fmtDateTime(backup.created_at)}
                                 </span>
                                 {backup.size_bytes != null &&
                                 backup.size_bytes > 0 ? (
                                   <span className="inline-flex items-center gap-1">
                                     <HardDrive className="h-3 w-3" />
-                                    {formatBytes(backup.size_bytes)}
+                                    {fmtBytes(backup.size_bytes)}
                                   </span>
                                 ) : null}
                                 {backup.expires_at ? (
                                   <span
-                                    title={`Retention deletes this backup on ${format(
-                                      new Date(backup.expires_at),
-                                      'PPpp'
+                                    title={`Retention deletes this backup on ${fmtDateTime(
+                                      backup.expires_at
                                     )}`}
                                   >
-                                    Retained until{' '}
-                                    {format(
-                                      new Date(backup.expires_at),
-                                      'MMM d, yyyy'
-                                    )}
+                                    Retained until {fmtDate(backup.expires_at)}
                                   </span>
                                 ) : (
                                   <span title="No schedule retention applies to this backup, so it is kept until someone deletes it.">
@@ -883,78 +907,68 @@ export function S3SourceDetail() {
             </CardContent>
           </Card>
         </div>
-        <aside className="min-w-0">
-          <Card className="overflow-hidden shadow-none">
-            <CardHeader className="border-b px-5 py-4">
-              <CardTitle className="text-base font-semibold flex min-w-0 items-center gap-2">
-                <Database className="h-5 w-5 shrink-0" />
-                Connection
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-5">
-              <dl className="divide-y [&>div]:py-3 [&>div:first-child]:pt-0 [&>div:last-child]:pb-0 [&_dt]:mb-1">
+      }
+      aside={
+        <Card className="overflow-hidden shadow-none">
+          <CardHeader className="border-b px-5 py-4">
+            <CardTitle className="text-base font-semibold flex min-w-0 items-center gap-2">
+              <Database className="h-5 w-5 shrink-0" />
+              Connection
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-5">
+            <dl className="divide-y [&>div]:py-3 [&>div:first-child]:pt-0 [&>div:last-child]:pb-0 [&_dt]:mb-1">
+              {source.endpoint && (
                 <div className="min-w-0">
                   <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                    Bucket Name
+                    Endpoint URL
                   </dt>
                   <dd className="break-all text-base sm:text-sm">
-                    {source.bucket_name}
+                    {source.endpoint}
                   </dd>
                 </div>
-                <div className="min-w-0">
-                  <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                    Region
-                  </dt>
-                  <dd className="text-base sm:text-sm">{source.region}</dd>
-                </div>
-                {source.endpoint && (
-                  <div className="min-w-0">
-                    <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                      Endpoint URL
-                    </dt>
-                    <dd className="break-all text-base sm:text-sm">
-                      {source.endpoint}
-                    </dd>
-                  </div>
-                )}
-                <div className="min-w-0">
-                  <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                    Force Path Style
-                  </dt>
-                  <dd className="text-base sm:text-sm">
-                    <Badge
-                      variant={
-                        source.force_path_style ? 'default' : 'secondary'
-                      }
-                    >
-                      {source.force_path_style ? 'Enabled' : 'Disabled'}
-                    </Badge>
-                  </dd>
-                </div>
-                <div className="min-w-0">
-                  <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                    Access Key ID
-                  </dt>
-                  <dd className="truncate font-mono text-base sm:text-sm">
-                    &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
-                  </dd>
-                </div>
-                <div className="min-w-0">
-                  <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                    Secret Key
-                  </dt>
-                  <dd className="truncate font-mono text-base sm:text-sm">
-                    &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
-                  </dd>
-                </div>
-              </dl>
-            </CardContent>
-          </Card>
-        </aside>
-      </div>
+              )}
+              <div className="min-w-0">
+                <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+                  Force Path Style
+                </dt>
+                <dd className="text-base sm:text-sm">
+                  <Badge
+                    variant={source.force_path_style ? 'default' : 'secondary'}
+                  >
+                    {source.force_path_style ? 'Enabled' : 'Disabled'}
+                  </Badge>
+                </dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+                  Access Key ID
+                </dt>
+                <dd className="truncate font-mono text-base sm:text-sm">
+                  &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
+                </dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+                  Secret Key
+                </dt>
+                <dd className="truncate font-mono text-base sm:text-sm">
+                  &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
+                </dd>
+              </div>
+            </dl>
+          </CardContent>
+        </Card>
+      }
+    />
+  )
 
+  return (
+    <>
+      {detail}
       <AlertDialog
         open={scheduleToDelete !== null}
+
         onOpenChange={(open) => {
           if (!open && !deleteMutation.isPending) {
             setScheduleToDelete(null)
@@ -996,6 +1010,6 @@ export function S3SourceDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </>
   )
 }
