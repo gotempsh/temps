@@ -11,6 +11,7 @@ import {
   FormErrors,
   Kbd,
   LogLine,
+  notify,
   PageContainer,
   PageHeader,
   PageState,
@@ -96,6 +97,18 @@ export default function Components() {
 
       <Block title="CopyAction">
         <CopyAction value="tck_a1b2c3d4e5f6">tck_a1b2c3d4e5f6</CopyAction>
+      </Block>
+
+      <Block title="notify">
+        <Button variant="secondary" onClick={() => notify.ok('Deployment live')}>
+          Trigger notify.ok
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => notify.fail('Deployment failed', 'Build exited with code 1.')}
+        >
+          Trigger notify.fail
+        </Button>
       </Block>
 
       <Block title="Field / FormErrors">

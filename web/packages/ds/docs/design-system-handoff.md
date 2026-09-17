@@ -65,6 +65,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
 | `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
 | `fmt.ts` | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)` | Any formatted number/date | Honour-system |
+| `notify` | `notify.ok(message, description?)`, `notify.fail(message, description?)` | Background events the user isn't watching (RULES.md § Notifications) | Honour-system |
 
 ## Page templates + record recipe
 
@@ -150,3 +151,21 @@ this phase needs):
    path, a `Detail`-shaped skeleton for the loading path instead of ad hoc
    `Card`+`Skeleton` stacking, and `CopyAction` always as a sibling of the
    value it copies, never as its wrapper.
+10. Migrate the 181 files under `web/src` that call `sonner`'s
+    `toast.success`/`toast.error` directly (grep
+    `toast\.\(success\|error\)(` under `web/src`) onto `notify.ok`/
+    `notify.fail`. Not attempted this pass beyond adding the primitive and
+    its gallery demo — 181 call sites is a deliberate, separately-reviewed
+    migration, not a drive-by change.
+11. **`log-viewer.tsx` (1986 lines) and `history-log-viewer.tsx` (1378
+    lines)** (`web/src/components/runtime-logs/`) are complex, stateful,
+    real-time log-streaming engines — live tail during deployments,
+    virtualized scrolling, WebSocket/SSE data flow. They were explicitly
+    excluded from this pass by the user and are NOT touched, refactored, or
+    "consolidated" here. This is flagged as its own separate, larger,
+    higher-risk follow-up requiring dedicated review — not something to fold
+    into a routine primitive-promotion pass. Note: their inline
+    ANSI-HTML-based `<mark>` highlighting (rendered via
+    `dangerouslySetInnerHTML`) is a genuinely different rendering path from
+    the promoted `LogLine` primitive's plain-text children, so pointing them
+    at `LogLine` isn't a trivial swap even once someone picks this up.

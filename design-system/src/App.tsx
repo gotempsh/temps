@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { NavLink, Navigate, Route, Routes } from 'react-router'
+import { Toaster } from 'sonner'
 import { cn } from '@temps-sdk/ds'
 import Guide from './pages/Guide'
 import Components from './pages/Components'
@@ -49,6 +50,7 @@ export default function App() {
           <Route path="/settings" element={<ProjectSettings />} />
         </Routes>
       </main>
+      <Toaster position="top-center" />
     </div>
   )
 }

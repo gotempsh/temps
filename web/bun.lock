@@ -121,6 +121,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@temps-sdk/ui": "workspace:*",
+        "sonner": "^2.0.8",
       },
       "devDependencies": {
         "@types/react": "19.3.0",

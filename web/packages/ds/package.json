@@ -29,7 +29,8 @@
     "react-router": "^8.0.0"
   },
   "dependencies": {
-    "@temps-sdk/ui": "workspace:*"
+    "@temps-sdk/ui": "workspace:*",
+    "sonner": "^2.0.8"
   },
   "devDependencies": {
     "@types/react": "19.3.0",

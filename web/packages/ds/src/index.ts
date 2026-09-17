@@ -32,6 +32,7 @@ export {
   type TimeChartMarker,
 } from './time-chart'
 export { useUrlState, type UrlState, type UrlStateValue } from './url-state'
+export { notify } from './notify'
 export * from './fmt'
 
 export { Ledger, type LedgerColumn, type LedgerProps } from './templates/ledger'
