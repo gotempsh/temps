@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "useDefineForClassFields": true,
+    "paths": {
+      "@/*": ["../web/src/*"],
+      "react": ["../web/node_modules/@types/react"],
+      "react/*": ["../web/node_modules/@types/react/*"],
+      "react-dom": ["../web/node_modules/@types/react-dom"],
+      "react-dom/*": ["../web/node_modules/@types/react-dom/*"]
+    }
+  },
+  "include": ["src"]
+}

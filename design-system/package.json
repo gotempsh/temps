@@ -1,0 +1,28 @@
+{
+  "name": "temps-design-system-sandbox",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal Vite+React sandbox proving @temps-sdk/ds's primitives and templates work: a /guide (RULES/brand/handoff with live demos), a /components gallery, and three reference screens (Ledger, Detail, Settings) on invented fixture data. Not the migrated console — see web/packages/ds/docs/design-system-handoff.md's follow-ups for that.",
+  "workspaces": [
+    "../web/packages/*"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@temps-sdk/ds": "workspace:*",
+    "@temps-sdk/ui": "workspace:*",
+    "lucide-react": "^1.45.0",
+    "react-router": "^8.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^5.0.4",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.11"
+  }
+}
