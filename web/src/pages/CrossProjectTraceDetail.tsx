@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { Link, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { useQuery } from '@tanstack/react-query'
@@ -11,7 +11,6 @@ import type {
   ProjectRef,
   SpanRecord,
 } from '@/api/client/types.gen'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -31,8 +30,17 @@ import { buildSpanTree, flattenTree, traceWindow } from '@/utils/spanTree'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  useUrlState,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
+import {
   AlertCircle,
-  AlertTriangle,
   ArrowLeft,
   EyeOff,
   ExternalLink,
@@ -70,7 +78,9 @@ function UnifiedSpanDetail({
       )}
 
       <div>
-        <h4 className="mb-2 text-xs font-medium text-muted-foreground">Timing</h4>
+        <h4 className="mb-2 text-xs font-medium text-muted-foreground">
+          Timing
+        </h4>
         <div className="grid grid-cols-2 gap-2 text-xs">
           <div>
             <span className="text-muted-foreground">Start:</span>
@@ -136,7 +146,8 @@ export default function CrossProjectTraceDetail() {
   }, [data])
 
   const projectName = (span: SpanRecord) =>
-    projectById.get(span.project_id)?.project_name ?? `Project ${span.project_id}`
+    projectById.get(span.project_id)?.project_name ??
+    `Project ${span.project_id}`
 
   // This view is global, so there is no single list it belongs to. The first
   // contributing project's trace list is the closest thing; before the trace
@@ -164,11 +175,15 @@ export default function CrossProjectTraceDetail() {
     duration: traceDuration,
   } = useMemo(() => traceWindow(spans), [spans])
 
-  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
+  const { get: getUrlState, patch: patchUrlState } = useUrlState<'span'>()
+  const selectedSpanId = getUrlState('span')
+  const setSelectedSpanId = (spanId: string | null) =>
+    patchUrlState({ span: spanId ?? undefined })
   const selectedSpan = useMemo(
     () =>
       selectedSpanId
-        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ?? null)
+        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ??
+          null)
         : null,
     [selectedSpanId, flatSpans]
   )
@@ -179,63 +194,52 @@ export default function CrossProjectTraceDetail() {
     <ProjectDot projectId={span.project_id} name={projectName(span)} />
   )
 
+  const backAction = (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={() => goBack()}
+      className="gap-2"
+    >
+      <ArrowLeft className="h-4 w-4" />
+      Back
+    </Button>
+  )
+
   if (isPending) {
     return (
-      <div className="space-y-4">
-        <div className="flex items-center gap-3">
-          <Skeleton className="h-9 w-9" />
-          <Skeleton className="h-7 w-72" />
-        </div>
-        <Skeleton className="h-8 w-full max-w-md" />
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          {['duration', 'spans', 'projects', 'errors'].map((label) => (
-            <Skeleton key={`stat-skel-${label}`} className="h-20" />
-          ))}
-        </div>
-        <Skeleton className="h-96" />
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-72" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-16" />,
+        }))}
+        main={<Skeleton className="h-96 w-full" />}
+      />
     )
   }
 
   if (isError) {
     return (
-      <div className="space-y-4">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => goBack()}
-          className="gap-2"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          Back
-        </Button>
-        <Card>
-          <CardContent className="flex items-center gap-3 p-6 text-destructive">
-            <AlertCircle className="h-5 w-5" />
-            <span>
-              Failed to load unified trace:{' '}
-              {(error as ProblemDetails)?.detail ??
-                (error as ProblemDetails)?.title ??
-                'Unknown error'}
-            </span>
-          </CardContent>
-        </Card>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Failed to load unified trace"
+        description={
+          (error as ProblemDetails)?.detail ??
+          (error as ProblemDetails)?.title ??
+          'Unknown error'
+        }
+        action={backAction}
+      />
     )
   }
 
   if (spans.length === 0) {
     return (
       <div className="space-y-4">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => goBack()}
-          className="gap-2"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          Back
-        </Button>
+        {backAction}
         <EmptyState
           icon={Layers}
           title="No spans available"
@@ -246,153 +250,123 @@ export default function CrossProjectTraceDetail() {
   }
 
   const showSidePanel = !!selectedSpan
+  const verdict: { tone: StatusTone; label: string } =
+    data.error_count > 0
+      ? {
+          tone: 'error',
+          label: `${data.error_count} error${data.error_count === 1 ? '' : 's'}`,
+        }
+      : { tone: 'ok', label: 'No errors' }
+
+  const facts: DetailFact[] = [
+    { label: 'Duration', value: formatDuration(data.total_duration_ms) },
+    { label: 'Spans', value: data.span_count },
+    { label: 'Projects', value: data.projects.length },
+    {
+      label: 'Errors',
+      value: (
+        <span
+          className={cn(data.error_count > 0 && 'font-medium text-destructive')}
+        >
+          {data.error_count}
+        </span>
+      ),
+    },
+  ]
 
   return (
-    <div className="space-y-4">
-      {/* Header */}
-      <div className="flex items-center gap-2 sm:gap-3">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => goBack()}
-          className="shrink-0 gap-2"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          <span className="hidden sm:inline">Back</span>
-        </Button>
-        <div className="min-w-0 flex-1">
-          <h2 className="flex items-center gap-2 truncate text-base font-semibold sm:text-lg">
-            <Layers className="h-4 w-4 shrink-0 text-muted-foreground" />
-            Unified trace
-          </h2>
-          <p className="truncate font-mono text-xs text-muted-foreground sm:text-sm">
-            {data.trace_id}
-          </p>
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="mb-1 text-xs text-muted-foreground">Duration</p>
-            <p className="text-lg font-semibold">
-              {formatDuration(data.total_duration_ms)}
-            </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="mb-1 text-xs text-muted-foreground">Spans</p>
-            <p className="text-lg font-semibold">{data.span_count}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="mb-1 text-xs text-muted-foreground">Projects</p>
-            <p className="text-lg font-semibold">{data.projects.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="mb-1 text-xs text-muted-foreground">Errors</p>
-            <p
-              className={cn(
-                'text-lg font-semibold',
-                data.error_count > 0 && 'text-destructive'
+    <Detail
+      title="Unified trace"
+      description={<span className="font-mono text-xs">{data.trace_id}</span>}
+      verdict={<Status tone={verdict.tone} label={verdict.label} />}
+      actions={backAction}
+      facts={facts}
+      main={
+        <>
+          {/* Truncation callout */}
+          {data.truncated && (
+            <Callout tone="warning" title="Trace view truncated">
+              This view was truncated to stay within cross-project limits.
+              {data.truncated_projects.length > 0 && (
+                <>
+                  {' '}
+                  Spans from {data.truncated_projects.length} project
+                  {data.truncated_projects.length === 1 ? '' : 's'} were dropped
+                  (project id{data.truncated_projects.length === 1 ? '' : 's'}:{' '}
+                  {data.truncated_projects.join(', ')}).
+                </>
               )}
-            >
-              {data.error_count}
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+            </Callout>
+          )}
 
-      {/* Truncation callout */}
-      {data.truncated && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-200">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>
-            This view was truncated to stay within cross-project limits.
-            {data.truncated_projects.length > 0 && (
-              <>
-                {' '}
-                Spans from {data.truncated_projects.length} project
-                {data.truncated_projects.length === 1 ? '' : 's'} were dropped
-                (project id{data.truncated_projects.length === 1 ? '' : 's'}:{' '}
-                {data.truncated_projects.join(', ')}).
-              </>
+          {/* Redacted / opted-out note */}
+          {data.has_redacted_spans && (
+            <Callout tone="info" title="Some spans are hidden">
+              <span className="inline-flex items-center gap-1.5">
+                <EyeOff className="h-3.5 w-3.5 shrink-0" />
+                Some projects opted out of cross-project trace sharing, so their
+                spans are not shown here.
+              </span>
+            </Callout>
+          )}
+
+          {/* Project legend — decodes the per-span dots in the waterfall below. */}
+          <ProjectLegend projects={data.projects} />
+
+          {/* Waterfall + selected-span detail */}
+          <div
+            className={cn(
+              'grid gap-3',
+              showSidePanel &&
+                'md:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]'
             )}
-          </span>
-        </div>
-      )}
+          >
+            <Card className="min-w-0">
+              <CardContent className="p-0">
+                <SpanWaterfall
+                  flatSpans={flatSpans}
+                  traceStart={traceStart}
+                  traceEnd={traceEnd}
+                  traceDuration={traceDuration}
+                  selectedSpanId={selectedSpanId}
+                  onSelect={setSelectedSpanId}
+                  colorBy="status"
+                  renderRowBadge={renderRowBadge}
+                  className="h-[400px] sm:h-[600px]"
+                />
+              </CardContent>
+            </Card>
 
-      {/* Redacted / opted-out note */}
-      {data.has_redacted_spans && (
-        <div className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-          <EyeOff className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>
-            Some projects opted out of cross-project trace sharing, so their
-            spans are not shown here.
-          </span>
-        </div>
-      )}
-
-      {/* Project legend — decodes the per-span dots in the waterfall below. */}
-      <ProjectLegend projects={data.projects} />
-
-      {/* Waterfall + selected-span detail */}
-      <div
-        className={cn(
-          'grid gap-3',
-          showSidePanel &&
-            'md:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]'
-        )}
-      >
-        <Card className="min-w-0">
-          <CardContent className="p-0">
-            <SpanWaterfall
-              flatSpans={flatSpans}
-              traceStart={traceStart}
-              traceEnd={traceEnd}
-              traceDuration={traceDuration}
-              selectedSpanId={selectedSpanId}
-              onSelect={setSelectedSpanId}
-              colorBy="status"
-              renderRowBadge={renderRowBadge}
-              className="h-[400px] sm:h-[600px]"
-            />
-          </CardContent>
-        </Card>
-
-        {showSidePanel && selectedSpan && (
-          <Card className="min-w-0 md:sticky md:top-4 md:max-h-[600px] md:self-start md:overflow-auto">
-            <CardContent className="p-4">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <h3 className="truncate text-sm font-semibold">
-                  {selectedSpan.name}
-                </h3>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setSelectedSpanId(null)}
-                >
-                  Close
-                </Button>
-              </div>
-              <UnifiedSpanDetail
-                span={selectedSpan}
-                projectName={projectName(selectedSpan)}
-                projectSlug={
-                  projectById.get(selectedSpan.project_id)?.project_slug ??
-                  String(selectedSpan.project_id)
-                }
-                traceId={data.trace_id}
-              />
-            </CardContent>
-          </Card>
-        )}
-      </div>
-    </div>
+            {showSidePanel && selectedSpan && (
+              <Card className="min-w-0 md:sticky md:top-4 md:max-h-[600px] md:self-start md:overflow-auto">
+                <CardContent className="p-4">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <h3 className="truncate text-sm font-semibold">
+                      {selectedSpan.name}
+                    </h3>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setSelectedSpanId(null)}
+                    >
+                      Close
+                    </Button>
+                  </div>
+                  <UnifiedSpanDetail
+                    span={selectedSpan}
+                    projectName={projectName(selectedSpan)}
+                    projectSlug={
+                      projectById.get(selectedSpan.project_id)?.project_slug ??
+                      String(selectedSpan.project_id)
+                    }
+                    traceId={data.trace_id}
+                  />
+                </CardContent>
+              </Card>
+            )}
+          </div>
+        </>
+      }
+    />
   )
 }
