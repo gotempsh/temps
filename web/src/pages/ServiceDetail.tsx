@@ -32,9 +32,7 @@ import {
   PG_UPGRADE_PHASES,
   isTerminal,
 } from '@/lib/pg-upgrades'
-import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -64,11 +62,11 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
-import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -77,8 +75,21 @@ import {
   credentialValueForScope,
 } from '@/lib/credential-reveal-state'
 import { maskValue } from '@/lib/masking'
-import { formatBytes } from '@/lib/utils'
 import { iconForServiceType } from '@/lib/serviceIcons'
+import {
+  Button,
+  Callout,
+  CopyAction,
+  Detail,
+  PageState,
+  Status,
+  fmtBytes,
+  fmtDateTime,
+  fmtRelativeTime,
+  useUrlState,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   DropdownMenu,
@@ -114,7 +125,6 @@ import {
   XCircle,
   BarChart2,
 } from 'lucide-react'
-import { format } from 'date-fns'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -284,7 +294,15 @@ export function ServiceDetail() {
   // Replaces the previous multi-source fan-out that issued one slow S3 scan
   // per configured source on every page load.
   const serviceId = id ? parseInt(id) : undefined
-  const [backupsPage, setBackupsPage] = useState(1)
+  // Pagination lives in the URL (RULES.md "the URL is the state") so a
+  // refreshed or shared link reproduces the same backups page.
+  const { get: getBackupsUrlState, patch: patchBackupsUrlState } =
+    useUrlState<'backupsPage'>()
+  const backupsPage = Math.max(1, Number(getBackupsUrlState('backupsPage') ?? '1') || 1)
+  const setBackupsPage = useCallback(
+    (page: number) => patchBackupsUrlState({ backupsPage: page <= 1 ? undefined : page }),
+    [patchBackupsUrlState]
+  )
   const BACKUPS_PAGE_SIZE = 5
 
   const {
@@ -563,107 +581,104 @@ export function ServiceDetail() {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
+  const backAction = (
+    <Button variant="ghost" size="icon" asChild>
+      <Link to="/storage">
+        <ArrowLeft className="h-4 w-4" />
+      </Link>
+    </Button>
+  )
+
   if (isLoading) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="p-4 space-y-6 md:p-6">
-          <div className="h-8 w-32 bg-muted rounded animate-pulse" />
-          <Card>
-            <CardHeader>
-              <div className="space-y-2">
-                <div className="h-5 w-40 bg-muted rounded animate-pulse" />
-                <div className="h-4 w-24 bg-muted rounded animate-pulse" />
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                <div className="h-4 w-full bg-muted rounded animate-pulse" />
-                <div className="h-4 w-3/4 bg-muted rounded animate-pulse" />
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+      <Detail
+        title={<Skeleton className="h-7 w-56" />}
+        actions={backAction}
+        facts={[0, 1, 2, 3].map(() => ({
+          label: <Skeleton className="h-3 w-16" />,
+          value: <Skeleton className="h-4 w-24" />,
+        }))}
+        main={
+          <>
+            <Skeleton className="h-40 w-full rounded-lg" />
+            <Skeleton className="h-56 w-full rounded-lg" />
+          </>
+        }
+        aside={<Skeleton className="h-48 w-full rounded-lg" />}
+      />
     )
   }
 
   if (queryError || !service) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="p-4 space-y-6 md:p-6">
-          <div className="flex flex-col items-center justify-center py-12 text-center">
-            <p className="text-sm text-muted-foreground mb-4">
-              Failed to load service details
-            </p>
-            <Button
-              variant="outline"
-              onClick={() => refetch()}
-              className="gap-2"
-            >
-              <RefreshCcw className="h-4 w-4" />
-              Try again
-            </Button>
-          </div>
-        </div>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Couldn't load service"
+        description="This service may not exist, or you may not have permission to view it."
+        action={<Button onClick={() => void refetch()}>Retry</Button>}
+      />
     )
   }
 
-  return (
-    <div className="flex-1 overflow-auto">
-      <div className="p-4 space-y-6 md:p-6">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3">
-            <Link to="/storage">
-              <Button variant="ghost" size="icon">
-                <ArrowLeft className="h-4 w-4" />
-              </Button>
-            </Link>
-            <ServiceLogo
-              service={service.service.service_type}
-              className="h-8 w-8"
-            />
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-xl font-semibold sm:text-2xl">
-                  {service.service.name}
-                </h1>
-                <Badge
-                  variant={
-                    service.service.status === 'running'
-                      ? 'default'
-                      : service.service.status === 'stopped'
-                        ? 'secondary'
-                        : 'outline'
-                  }
-                  className="capitalize"
-                >
-                  {service.service.status}
-                </Badge>
-                {service.service.status === 'running' ? (
-                  <ServiceHealthBadge serviceId={parseInt(id!)} />
-                ) : null}
-                <Badge variant="outline" className="gap-1.5">
-                  <ServiceLogo
-                    service={service.service.service_type}
-                    className="h-3 w-3"
-                  />
-                  {service.service.service_type}
-                </Badge>
-                {service.service.topology === 'cluster' && (
-                  <Badge variant="outline" className="gap-1.5">
-                    <Server className="h-3 w-3" />
-                    Cluster
-                  </Badge>
-                )}
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Created <TimeAgo date={service.service.created_at} />
-              </p>
-            </div>
-          </div>
+  // Mirrors the Badge tone previously hand-rolled on the status pill —
+  // the Detail template's single verdict, derived from the record's own
+  // status field. `creating` maps to the `running` tone (spinner) since
+  // that's the tone family for "in progress".
+  const SERVICE_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+    running: { tone: 'ok', label: 'Running' },
+    stopped: { tone: 'idle', label: 'Stopped' },
+    creating: { tone: 'running', label: 'Creating' },
+    failed: { tone: 'error', label: 'Failed' },
+  }
+  const verdict =
+    SERVICE_STATUS_VERDICT[service.service.status] ?? { tone: 'idle' as StatusTone, label: service.service.status }
 
-          <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
+  const facts: DetailFact[] = [
+    {
+      label: 'Type',
+      value: (
+        <span className="inline-flex items-center gap-1.5">
+          <ServiceLogo service={service.service.service_type} className="h-3.5 w-3.5" />
+          {service.service.service_type}
+        </span>
+      ),
+    },
+    {
+      label: 'Topology',
+      value:
+        service.service.topology === 'cluster'
+          ? `Cluster (${service.service.members?.length ?? 0})`
+          : 'Standalone',
+    },
+    {
+      label: 'Health',
+      value:
+        service.service.status === 'running' ? (
+          <ServiceHealthBadge serviceId={parseInt(id!)} />
+        ) : (
+          '—'
+        ),
+    },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(service.service.created_at)}>
+          {fmtRelativeTime(service.service.created_at)}
+        </span>
+      ),
+    },
+  ]
+
+  return (
+    <>
+      <Detail
+        title={service.service.name}
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        facts={facts}
+        actions={
+          <>
+            {backAction}
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -889,25 +904,19 @@ export function ServiceDetail() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-          </div>
-        </div>
+          </>
+        }
+        main={
+          <>
+            {error ? <Callout tone="error">{error}</Callout> : null}
 
-        {error && (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-
-        <div className="grid gap-6">
-          {/*
-            Health is the highest-signal block on this page, so it sits
-            directly under the header. Linked Projects moved into the header
-            chip, so Configuration surfaces much sooner now.
-          */}
-          {service.service.status === 'running' ? (
-            <ServiceHealthCard serviceId={parseInt(id!)} />
-          ) : null}
+            {/*
+              Health is the highest-signal block on this page, so it sits
+              directly under the header.
+            */}
+            {service.service.status === 'running' ? (
+              <ServiceHealthCard serviceId={parseInt(id!)} />
+            ) : null}
 
           {/*
             Postgres-only WAL bloat / archive misconfiguration surface. Renders
@@ -938,39 +947,30 @@ export function ServiceDetail() {
           {/* Cluster Creation Progress */}
           {service.service.topology === 'cluster' &&
             service.service.status === 'creating' && (
-              <Alert>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <AlertDescription>
-                  <span className="font-medium">
-                    Creating cluster members...
-                  </span>{' '}
-                  This may take a minute. Members will appear below as they are
-                  provisioned.
-                </AlertDescription>
-              </Alert>
+              <Callout tone="info" title="Creating cluster members…">
+                This may take a minute. Members will appear below as they are
+                provisioned.
+              </Callout>
             )}
 
           {/* Cluster Creation Failed */}
           {service.service.topology === 'cluster' &&
             service.service.status === 'failed' && (
-              <Alert variant="destructive">
-                <AlertCircle className="h-4 w-4" />
-                <AlertDescription className="flex items-center justify-between gap-4">
-                  <div>
-                    <span className="font-medium">
-                      Cluster creation failed.
-                    </span>{' '}
+              <Callout tone="error" title="Cluster creation failed">
+                <div className="flex items-center justify-between gap-4">
+                  <span>
                     {(service.service as Record<string, unknown>).error_message
                       ? String(
                           (service.service as Record<string, unknown>)
                             .error_message
                         )
                       : 'An unknown error occurred.'}
-                  </div>
+                  </span>
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={retryCluster.isPending}
+                    busy={retryCluster.isPending}
+                    busyLabel="Retrying…"
                     onClick={() => {
                       // Reconstruct members from preserved service_members records,
                       // or send empty array to let the backend reconstruct.
@@ -993,15 +993,11 @@ export function ServiceDetail() {
                       })
                     }}
                   >
-                    {retryCluster.isPending ? (
-                      <Loader2 className="h-4 w-4 animate-spin mr-1" />
-                    ) : (
-                      <RefreshCcw className="h-4 w-4 mr-1" />
-                    )}
+                    <RefreshCcw className="h-4 w-4 mr-1" />
                     Retry
                   </Button>
-                </AlertDescription>
-              </Alert>
+                </div>
+              </Callout>
             )}
 
           {/* Cluster Members Section */}
@@ -1183,184 +1179,6 @@ export function ServiceDetail() {
             serviceName={service.service.name}
           />
 
-          {/* Service Configuration Section */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Configuration</CardTitle>
-              <CardDescription>Current service parameters</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {service.current_parameters &&
-              Object.keys(service.current_parameters).length > 0 ? (
-                <dl className="divide-y divide-border">
-                  {Object.entries(service.current_parameters).map(
-                    ([key, value]) => {
-                      const isSensitive =
-                        service.sensitive_parameters?.includes(key) ?? false
-                      const revealScope = parameterRevealScope
-                      const revealedParameter = revealedParameters[key]
-                      const revealedValue = credentialValueForScope(
-                        revealedParameter,
-                        revealScope
-                      )
-                      const isVisible =
-                        visibleParameters.has(key) &&
-                        revealedValue !== undefined
-                      const isRevealing =
-                        revealingParameters[key]?.scope === revealScope
-                      // Coerce non-primitive values to a JSON string so a
-                      // future structured sub-block (`resources`, etc.)
-                      // doesn't crash the page with "Objects are not valid
-                      // as a React child". Primitives render unchanged.
-                      const safeValue =
-                        value != null && typeof value === 'object'
-                          ? JSON.stringify(value)
-                          : value
-                      const displayValue = isSensitive
-                        ? isVisible
-                          ? (revealedValue ?? maskValue(safeValue))
-                          : maskValue(safeValue)
-                        : safeValue
-                      const hasValue = Boolean(safeValue)
-
-                      return (
-                        <div
-                          key={key}
-                          className="grid grid-cols-1 gap-1 py-3 sm:grid-cols-3 sm:gap-4"
-                        >
-                          <dt className="text-sm font-medium capitalize text-foreground">
-                            {key
-                              .replace(/_/g, ' ')
-                              .replace(/\b\w/g, (char) => char.toUpperCase())}
-                          </dt>
-                          <dd className="flex min-w-0 items-center gap-2 sm:col-span-2">
-                            <span className="min-w-0 flex-1 break-all font-mono text-sm text-muted-foreground tabular-nums">
-                              {hasValue ? (
-                                displayValue
-                              ) : (
-                                <span className="italic">Not set</span>
-                              )}
-                            </span>
-                            {hasValue && isSensitive && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 shrink-0"
-                                disabled={isRevealing}
-                                onClick={async () => {
-                                  if (isVisible) {
-                                    parameterRevealGuard.current.cancel(key)
-                                    setVisibleParameters((prev) => {
-                                      const next = new Set(prev)
-                                      next.delete(key)
-                                      return next
-                                    })
-                                    setRevealedParameters((prev) => {
-                                      const next = { ...prev }
-                                      delete next[key]
-                                      return next
-                                    })
-                                    return
-                                  }
-
-                                  const requestToken = crypto.randomUUID()
-                                  const revealRequest =
-                                    parameterRevealGuard.current.begin(key)
-                                  setRevealingParameters((prev) => ({
-                                    ...prev,
-                                    [key]: {
-                                      token: requestToken,
-                                      scope: revealScope,
-                                    },
-                                  }))
-                                  try {
-                                    const response =
-                                      await revealServiceParameter({
-                                        path: {
-                                          id: service.service.id,
-                                          param_name: key,
-                                        },
-                                        throwOnError: true,
-                                      })
-                                    if (
-                                      !parameterRevealGuard.current.isCurrent(
-                                        key,
-                                        revealRequest
-                                      )
-                                    ) {
-                                      return
-                                    }
-                                    setRevealedParameters((prev) => ({
-                                      ...prev,
-                                      [key]: {
-                                        value: response.data.value,
-                                        scope: revealScope,
-                                      },
-                                    }))
-                                    setVisibleParameters((prev) => {
-                                      const next = new Set(prev)
-                                      next.add(key)
-                                      return next
-                                    })
-                                  } catch {
-                                    toast.error(
-                                      `Failed to reveal ${key.replace(/_/g, ' ')}`
-                                    )
-                                  } finally {
-                                    if (
-                                      parameterRevealGuard.current.finish(
-                                        key,
-                                        revealRequest
-                                      )
-                                    ) {
-                                      setRevealingParameters((prev) => {
-                                        if (prev[key]?.token !== requestToken) {
-                                          return prev
-                                        }
-                                        const next = { ...prev }
-                                        delete next[key]
-                                        return next
-                                      })
-                                    }
-                                  }
-                                }}
-                                title={
-                                  isVisible ? 'Hide value' : 'Reveal value'
-                                }
-                              >
-                                {isRevealing ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : isVisible ? (
-                                  <EyeOff className="h-4 w-4" />
-                                ) : (
-                                  <Eye className="h-4 w-4" />
-                                )}
-                              </Button>
-                            )}
-                            {hasValue && (!isSensitive || isVisible) && (
-                              <CopyButton
-                                value={
-                                  isSensitive
-                                    ? (revealedValue ?? '')
-                                    : String(value)
-                                }
-                                minimal
-                                className="h-8 w-8 shrink-0"
-                              />
-                            )}
-                          </dd>
-                        </div>
-                      )
-                    }
-                  )}
-                </dl>
-              ) : (
-                <div className="text-sm text-muted-foreground">
-                  No parameters configured
-                </div>
-              )}
-            </CardContent>
-          </Card>
           {/* Backups Section */}
           <Card>
             <CardHeader>
@@ -1487,10 +1305,7 @@ export function ServiceDetail() {
                                 ·
                               </span>
                               <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
-                                {format(
-                                  new Date(backup.started_at),
-                                  'MMM d, p'
-                                )}
+                                {fmtDateTime(backup.started_at)}
                               </span>
                               {backup.backup_type ? (
                                 <Badge variant="outline" className="text-xs">
@@ -1534,7 +1349,7 @@ export function ServiceDetail() {
                               {backup.size_bytes && backup.size_bytes > 0 ? (
                                 <span className="inline-flex items-center gap-1">
                                   <HardDrive className="h-3 w-3" />
-                                  {formatBytes(backup.size_bytes)}
+                                  {fmtBytes(backup.size_bytes)}
                                 </span>
                               ) : null}
                               {durationLabel ? (
@@ -1603,7 +1418,7 @@ export function ServiceDetail() {
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => setBackupsPage((p) => Math.max(1, p - 1))}
+                      onClick={() => setBackupsPage(Math.max(1, backupsPage - 1))}
                       disabled={backupsPage === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
@@ -1628,9 +1443,7 @@ export function ServiceDetail() {
                       variant="outline"
                       size="sm"
                       onClick={() =>
-                        setBackupsPage((p) =>
-                          Math.min(backupsTotalPages, p + 1)
-                        )
+                        setBackupsPage(Math.min(backupsTotalPages, backupsPage + 1))
                       }
                       disabled={backupsPage === backupsTotalPages}
                     >
@@ -1640,48 +1453,6 @@ export function ServiceDetail() {
                   </div>
                 </div>
               )}
-            </CardContent>
-          </Card>
-
-          {/* Environment Variables Section */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Environment Variables</CardTitle>
-              <CardDescription>
-                Preview of environment variables available to projects using
-                this service
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {envVarsLoading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                  <span className="text-sm text-muted-foreground">
-                    Loading environment variables...
-                  </span>
-                </div>
-              ) : envVarsError ? (
-                <div className="text-center py-8">
-                  <AlertCircle className="h-8 w-8 mx-auto text-muted-foreground mb-2" />
-                  <p className="text-sm text-muted-foreground">
-                    Failed to load environment variables
-                  </p>
-                </div>
-              ) : envVars ? (
-                <>
-                  <EnvVariablesDisplay
-                    variables={envVars}
-                    showCopy={true}
-                    showMaskToggle={true}
-                    defaultMasked={true}
-                    maxHeight="20rem"
-                  />
-                  <p className="text-xs text-muted-foreground text-center mt-3">
-                    These variables are automatically available to projects that
-                    use this service
-                  </p>
-                </>
-              ) : null}
             </CardContent>
           </Card>
 
@@ -1767,8 +1538,233 @@ export function ServiceDetail() {
               </CardContent>
             </Card>
           ) : null}
-        </div>
-      </div>
+          </>
+        }
+        aside={
+          <>
+            {/* Service Configuration Section */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Configuration</CardTitle>
+                <CardDescription>Current service parameters</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {service.current_parameters &&
+                Object.keys(service.current_parameters).length > 0 ? (
+                  <dl className="divide-y divide-border">
+                    {Object.entries(service.current_parameters).map(
+                      ([key, value]) => {
+                        const isSensitive =
+                          service.sensitive_parameters?.includes(key) ?? false
+                        const revealScope = parameterRevealScope
+                        const revealedParameter = revealedParameters[key]
+                        const revealedValue = credentialValueForScope(
+                          revealedParameter,
+                          revealScope
+                        )
+                        const isVisible =
+                          visibleParameters.has(key) &&
+                          revealedValue !== undefined
+                        const isRevealing =
+                          revealingParameters[key]?.scope === revealScope
+                        // Coerce non-primitive values to a JSON string so a
+                        // future structured sub-block (`resources`, etc.)
+                        // doesn't crash the page with "Objects are not valid
+                        // as a React child". Primitives render unchanged.
+                        const safeValue =
+                          value != null && typeof value === 'object'
+                            ? JSON.stringify(value)
+                            : value
+                        const displayValue = isSensitive
+                          ? isVisible
+                            ? (revealedValue ?? maskValue(safeValue))
+                            : maskValue(safeValue)
+                          : safeValue
+                        const hasValue = Boolean(safeValue)
+
+                        return (
+                          <div
+                            key={key}
+                            className="grid grid-cols-1 gap-1 py-3 sm:grid-cols-3 sm:gap-4"
+                          >
+                            <dt className="text-sm font-medium capitalize text-foreground">
+                              {key
+                                .replace(/_/g, ' ')
+                                .replace(/\b\w/g, (char) => char.toUpperCase())}
+                            </dt>
+                            <dd className="flex min-w-0 items-center gap-2 sm:col-span-2">
+                              <span className="min-w-0 flex-1 break-all font-mono text-sm text-muted-foreground tabular-nums">
+                                {hasValue ? (
+                                  displayValue
+                                ) : (
+                                  <span className="italic">Not set</span>
+                                )}
+                              </span>
+                              {hasValue && isSensitive && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 shrink-0"
+                                  disabled={isRevealing}
+                                  onClick={async () => {
+                                    if (isVisible) {
+                                      parameterRevealGuard.current.cancel(key)
+                                      setVisibleParameters((prev) => {
+                                        const next = new Set(prev)
+                                        next.delete(key)
+                                        return next
+                                      })
+                                      setRevealedParameters((prev) => {
+                                        const next = { ...prev }
+                                        delete next[key]
+                                        return next
+                                      })
+                                      return
+                                    }
+
+                                    const requestToken = crypto.randomUUID()
+                                    const revealRequest =
+                                      parameterRevealGuard.current.begin(key)
+                                    setRevealingParameters((prev) => ({
+                                      ...prev,
+                                      [key]: {
+                                        token: requestToken,
+                                        scope: revealScope,
+                                      },
+                                    }))
+                                    try {
+                                      const response =
+                                        await revealServiceParameter({
+                                          path: {
+                                            id: service.service.id,
+                                            param_name: key,
+                                          },
+                                          throwOnError: true,
+                                        })
+                                      if (
+                                        !parameterRevealGuard.current.isCurrent(
+                                          key,
+                                          revealRequest
+                                        )
+                                      ) {
+                                        return
+                                      }
+                                      setRevealedParameters((prev) => ({
+                                        ...prev,
+                                        [key]: {
+                                          value: response.data.value,
+                                          scope: revealScope,
+                                        },
+                                      }))
+                                      setVisibleParameters((prev) => {
+                                        const next = new Set(prev)
+                                        next.add(key)
+                                        return next
+                                      })
+                                    } catch {
+                                      toast.error(
+                                        `Failed to reveal ${key.replace(/_/g, ' ')}`
+                                      )
+                                    } finally {
+                                      if (
+                                        parameterRevealGuard.current.finish(
+                                          key,
+                                          revealRequest
+                                        )
+                                      ) {
+                                        setRevealingParameters((prev) => {
+                                          if (prev[key]?.token !== requestToken) {
+                                            return prev
+                                          }
+                                          const next = { ...prev }
+                                          delete next[key]
+                                          return next
+                                        })
+                                      }
+                                    }
+                                  }}
+                                  title={
+                                    isVisible ? 'Hide value' : 'Reveal value'
+                                  }
+                                >
+                                  {isRevealing ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : isVisible ? (
+                                    <EyeOff className="h-4 w-4" />
+                                  ) : (
+                                    <Eye className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              )}
+                              {hasValue && (!isSensitive || isVisible) && (
+                                <CopyAction
+                                  value={
+                                    isSensitive
+                                      ? (revealedValue ?? '')
+                                      : String(value)
+                                  }
+                                  minimal
+                                  className="h-8 w-8 shrink-0"
+                                />
+                              )}
+                            </dd>
+                          </div>
+                        )
+                      }
+                    )}
+                  </dl>
+                ) : (
+                  <div className="text-sm text-muted-foreground">
+                    No parameters configured
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Environment Variables Section */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Environment Variables</CardTitle>
+                <CardDescription>
+                  Preview of environment variables available to projects using
+                  this service
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {envVarsLoading ? (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                    <span className="text-sm text-muted-foreground">
+                      Loading environment variables...
+                    </span>
+                  </div>
+                ) : envVarsError ? (
+                  <div className="text-center py-8">
+                    <AlertCircle className="h-8 w-8 mx-auto text-muted-foreground mb-2" />
+                    <p className="text-sm text-muted-foreground">
+                      Failed to load environment variables
+                    </p>
+                  </div>
+                ) : envVars ? (
+                  <>
+                    <EnvVariablesDisplay
+                      variables={envVars}
+                      showCopy={true}
+                      showMaskToggle={true}
+                      defaultMasked={true}
+                      maxHeight="20rem"
+                    />
+                    <p className="text-xs text-muted-foreground text-center mt-3">
+                      These variables are automatically available to projects that
+                      use this service
+                    </p>
+                  </>
+                ) : null}
+              </CardContent>
+            </Card>
+          </>
+        }
+      />
 
       <Dialog open={isStopDialogOpen} onOpenChange={setIsStopDialogOpen}>
         <DialogContent>
@@ -1793,11 +1789,9 @@ export function ServiceDetail() {
             <Button
               variant="destructive"
               onClick={handleStop}
-              disabled={stopService.isPending}
+              busy={stopService.isPending}
+              busyLabel="Stopping…"
             >
-              {stopService.isPending && (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              )}
               Stop Service
             </Button>
           </DialogFooter>
@@ -1842,14 +1836,10 @@ export function ServiceDetail() {
             <Button
               variant="destructive"
               onClick={handleDelete}
-              disabled={
-                deleteService.isPending ||
-                deleteConfirmName.trim() !== service.service.name
-              }
+              disabled={deleteConfirmName.trim() !== service.service.name}
+              busy={deleteService.isPending}
+              busyLabel="Deleting…"
             >
-              {deleteService.isPending && (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              )}
               Delete
             </Button>
           </DialogFooter>
@@ -1894,11 +1884,9 @@ export function ServiceDetail() {
                   memberId: memberToRemove.id,
                 })
               }
-              disabled={removeMember.isPending}
+              busy={removeMember.isPending}
+              busyLabel="Removing…"
             >
-              {removeMember.isPending && (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              )}
               Remove Member
             </Button>
           </DialogFooter>
@@ -1942,11 +1930,9 @@ export function ServiceDetail() {
                   memberId: memberToPromote.id,
                 })
               }
-              disabled={promoteMember.isPending}
+              busy={promoteMember.isPending}
+              busyLabel="Promoting…"
             >
-              {promoteMember.isPending && (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              )}
               Promote
             </Button>
           </DialogFooter>
@@ -2012,6 +1998,6 @@ export function ServiceDetail() {
           })
         }}
       />
-    </div>
+    </>
   )
 }
