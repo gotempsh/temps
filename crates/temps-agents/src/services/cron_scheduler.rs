@@ -52,16 +52,22 @@ impl AgentCronScheduler {
         }
     }
 
-    /// Process one tick: load all agents with cron schedules, check if they should fire now.
+    /// Process one tick: fire the cron-scheduled agents that have come due.
     async fn tick(&self) -> Result<(), String> {
         let now = Utc::now();
 
-        // Load all enabled agents across all projects
+        // Only the agents whose turn it is — the query excludes agents with
+        // no cron schedule entirely, so an instance with nothing scheduled
+        // does no work here at all.
         let agents = self
             .config_service
-            .list_all_enabled_agents()
+            .list_due_cron_agents(now)
             .await
-            .map_err(|e| format!("Failed to load agents: {}", e))?;
+            .map_err(|e| format!("Failed to load due agents: {}", e))?;
+
+        if agents.is_empty() {
+            return Ok(());
+        }
 
         let mut triggered = 0;
 
@@ -75,10 +81,29 @@ impl AgentCronScheduler {
 
             let cron_expr = match cron_expr {
                 Some(expr) if !expr.is_empty() => expr,
-                _ => continue, // No cron schedule configured
+                // The query's JSONB predicate already excluded agents with no
+                // `schedule.cron` key, so this only catches an empty string.
+                // Stamp a due time anyway so it stops being re-selected every
+                // minute.
+                _ => {
+                    self.reschedule(agent.id, now, None).await;
+                    continue;
+                }
             };
 
-            // Parse and check if the cron matches the current minute
+            let next_run_at = next_occurrence(cron_expr, &now);
+
+            // A NULL due time means "not computed yet": seed it and wait for
+            // the occurrence rather than firing immediately, so a newly
+            // created or newly edited agent can never fire off-schedule.
+            let was_seeded = agent.cron_next_run_at.is_none();
+            self.reschedule(agent.id, now, next_run_at).await;
+            if was_seeded {
+                continue;
+            }
+
+            // Belt and braces: the row was due per the query, but confirm the
+            // expression really matches this minute before spending a run.
             if !should_fire(cron_expr, &now) {
                 continue;
             }
@@ -115,7 +140,7 @@ impl AgentCronScheduler {
 
         if triggered > 0 {
             tracing::debug!(
-                "Agent cron tick: {} agent(s) triggered out of {} checked",
+                "Agent cron tick: {} agent(s) triggered out of {} due",
                 triggered,
                 agents.len()
             );
@@ -123,6 +148,48 @@ impl AgentCronScheduler {
 
         Ok(())
     }
+
+    /// Stamp when the agent is next due.
+    ///
+    /// `next_run_at` is `None` when the expression has no further occurrences
+    /// (or does not parse); the agent is pushed out by
+    /// [`UNSCHEDULABLE_RETRY`] instead of being left due forever, which would
+    /// have it re-selected on every tick. The retry is short enough that
+    /// fixing the expression takes effect promptly.
+    async fn reschedule(
+        &self,
+        agent_id: i32,
+        now: chrono::DateTime<Utc>,
+        next_run_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        let next_run_at = next_run_at.unwrap_or(now + UNSCHEDULABLE_RETRY);
+
+        if let Err(e) = self
+            .config_service
+            .set_cron_next_run_at(agent_id, next_run_at)
+            .await
+        {
+            // Non-fatal: the agent simply stays due and is retried next tick,
+            // which is the old (full-scan) behaviour for this one row.
+            tracing::warn!(
+                "Failed to record next cron run for agent {}: {:?}",
+                agent_id,
+                e
+            );
+        }
+    }
+}
+
+/// How long to defer an agent whose cron expression cannot produce a next
+/// occurrence (invalid, or entirely in the past).
+const UNSCHEDULABLE_RETRY: chrono::Duration = chrono::Duration::hours(1);
+
+/// Next time a 5-field cron expression fires after `now`, or `None` when the
+/// expression is invalid or has no further occurrences.
+fn next_occurrence(cron_expr: &str, now: &chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
+    let full_expr = format!("0 {} *", convert_dow(cron_expr));
+    let schedule = Schedule::from_str(&full_expr).ok()?;
+    schedule.after(now).next()
 }
 
 /// Convert standard cron DOW (0-6, 0=Sunday) to `cron` crate DOW (1-7, 1=Sunday).
@@ -322,6 +389,62 @@ mod tests {
         let now = Utc::now();
         assert!(!should_fire("invalid", &now));
         assert!(!should_fire("", &now));
+    }
+
+    // ── due-based scheduling ──────────────────────────────────────────────
+
+    /// The scheduler stamps this on every agent it looks at, so it has to
+    /// agree with `should_fire`: a value that lands before the next matching
+    /// minute would make the agent due again immediately and fire twice.
+    #[test]
+    fn next_occurrence_is_the_next_matching_minute() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 2, 10, 0, 0).unwrap();
+
+        assert_eq!(
+            next_occurrence("30 10 * * *", &now),
+            Some(Utc.with_ymd_and_hms(2026, 4, 2, 10, 30, 0).unwrap())
+        );
+        assert_eq!(
+            next_occurrence("0 0 * * *", &now),
+            Some(Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap()),
+            "a daily schedule already past for today must roll to tomorrow"
+        );
+    }
+
+    /// Firing on the current minute must push the due time to the *next*
+    /// occurrence, never leave it on the minute just handled — otherwise the
+    /// agent stays due and re-fires on every tick for the rest of the minute.
+    #[test]
+    fn next_occurrence_moves_past_the_minute_being_fired() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 2, 10, 0, 0).unwrap();
+        let next = next_occurrence("* * * * *", &now).expect("every-minute schedule always fires");
+
+        assert!(
+            next > now,
+            "due time must advance past the minute just fired, got {next}"
+        );
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 2, 10, 1, 0).unwrap());
+    }
+
+    #[test]
+    fn next_occurrence_honours_the_dow_conversion() {
+        // April 6, 2026 is a Monday; April 2 is a Thursday.
+        let thursday = Utc.with_ymd_and_hms(2026, 4, 2, 9, 0, 0).unwrap();
+        assert_eq!(
+            next_occurrence("0 9 * * 1", &thursday),
+            Some(Utc.with_ymd_and_hms(2026, 4, 6, 9, 0, 0).unwrap()),
+            "standard-cron DOW 1 means Monday"
+        );
+    }
+
+    /// An unparsable expression has no next occurrence. The scheduler must
+    /// be told so it can defer the agent instead of leaving it permanently
+    /// due and re-selecting it on every single tick.
+    #[test]
+    fn next_occurrence_is_none_for_an_invalid_expression() {
+        let now = Utc::now();
+        assert!(next_occurrence("invalid", &now).is_none());
+        assert!(next_occurrence("", &now).is_none());
     }
 
     #[test]

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -297,8 +300,75 @@ impl AgentConfigService {
         self.decrypt_agent_models(models)
     }
 
+    /// List the enabled, cron-scheduled agents that are due at `now`.
+    ///
+    /// The cron scheduler used to call [`Self::list_all_enabled_agents`] once
+    /// a minute, decrypt every agent's provider credentials, and then discard
+    /// all but the handful with a `schedule.cron` entry — 1,440 full table
+    /// scans a day on an instance where nothing may be scheduled at all.
+    ///
+    /// Two predicates narrow it at the database:
+    /// - the JSONB test excludes agents with no cron schedule outright, so
+    ///   they never come back and never need a due time;
+    /// - `cron_next_run_at IS NULL OR <= now` selects only the agents whose
+    ///   turn it is. NULL means "not computed yet" (new agent, or a schedule
+    ///   edit that reset it) and is seeded by the scheduler on that tick.
+    ///
+    /// Deliberately does **not** decrypt: the scheduler only reads
+    /// `trigger_config` and identifiers, and the executor re-loads the agent
+    /// with credentials when a run actually starts. Decrypting here would
+    /// mean touching every scheduled agent's secrets once a minute for no
+    /// reason.
+    pub async fn list_due_cron_agents(
+        &self,
+        now: temps_core::UtcDateTime,
+    ) -> Result<Vec<project_agents::Model>, AgentError> {
+        Self::due_cron_agents_query(now)
+            .all(self.db.as_ref())
+            .await
+            .map_err(AgentError::Database)
+    }
+
+    /// The due-selection predicate behind [`Self::list_due_cron_agents`],
+    /// split out so it can be asserted in a unit test without a database.
+    fn due_cron_agents_query(
+        now: temps_core::UtcDateTime,
+    ) -> sea_orm::Select<project_agents::Entity> {
+        project_agents::Entity::find()
+            .filter(project_agents::Column::Enabled.eq(true))
+            .filter(Expr::cust(
+                "(trigger_config -> 'schedule' ->> 'cron') IS NOT NULL",
+            ))
+            .filter(
+                Condition::any()
+                    .add(project_agents::Column::CronNextRunAt.is_null())
+                    .add(project_agents::Column::CronNextRunAt.lte(now)),
+            )
+    }
+
+    /// Record when a cron-scheduled agent is next due.
+    ///
+    /// Written with `update_many` + `col_expr` so the scheduler only ever
+    /// touches its own column: an ActiveModel save would round-trip (and
+    /// could re-encrypt or clobber) the agent's credentials and config.
+    pub async fn set_cron_next_run_at(
+        &self,
+        agent_id: i32,
+        next_run_at: temps_core::UtcDateTime,
+    ) -> Result<(), AgentError> {
+        project_agents::Entity::update_many()
+            .col_expr(
+                project_agents::Column::CronNextRunAt,
+                Expr::value(next_run_at),
+            )
+            .filter(project_agents::Column::Id.eq(agent_id))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(AgentError::Database)?;
+        Ok(())
+    }
+
     /// List all enabled agents across all projects.
-    /// Used by the cron scheduler to check schedules.
     pub async fn list_all_enabled_agents(&self) -> Result<Vec<project_agents::Model>, AgentError> {
         let models = project_agents::Entity::find()
             .filter(project_agents::Column::Enabled.eq(true))
@@ -481,6 +551,10 @@ impl AgentConfigService {
             }
             if let Some(trigger_config) = request.trigger_config {
                 active.trigger_config = Set(trigger_config);
+                // A schedule edit must not keep firing on the old schedule:
+                // clearing the due time has the cron scheduler recompute it from
+                // the new `trigger_config` on its next tick.
+                active.cron_next_run_at = Set(None);
             }
             if let Some(prompt) = request.prompt {
                 active.prompt = Set(Some(prompt));
@@ -863,6 +937,10 @@ impl AgentConfigService {
                 active.webhook_token = Set(None);
             }
             active.trigger_config = Set(trigger_config);
+            // A schedule edit must not keep firing on the old schedule:
+            // clearing the due time has the cron scheduler recompute it from
+            // the new `trigger_config` on its next tick.
+            active.cron_next_run_at = Set(None);
         }
         if let Some(prompt) = request.prompt {
             active.prompt = Set(Some(prompt));
@@ -983,6 +1061,10 @@ impl AgentConfigService {
                 active.name = Set(yaml_agent.name.clone());
                 active.description = Set(yaml_agent.description.clone());
                 active.trigger_config = Set(yaml_agent.trigger_config_json());
+                // A schedule edit must not keep firing on the old schedule:
+                // clearing the due time has the cron scheduler recompute it from
+                // the new `trigger_config` on its next tick.
+                active.cron_next_run_at = Set(None);
                 active.prompt = Set(yaml_agent.resolved_prompt().map(|s| s.to_string()));
                 active.ai_provider = Set(yaml_agent
                     .resolved_provider()
@@ -1096,6 +1178,35 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
+    /// The cron scheduler must ask the database for the agents whose turn it
+    /// is. It used to load every enabled agent — and decrypt every one of
+    /// their credentials — once a minute, then throw almost all of them away.
+    #[test]
+    fn due_cron_agents_query_narrows_to_scheduled_agents_that_are_due() {
+        use sea_orm::QueryTrait;
+
+        let sql = AgentConfigService::due_cron_agents_query(chrono::Utc::now())
+            .build(DatabaseBackend::Postgres)
+            .to_string();
+
+        assert!(
+            sql.contains("\"enabled\" = TRUE"),
+            "disabled agents must not be fetched: {sql}"
+        );
+        assert!(
+            sql.contains("(trigger_config -> 'schedule' ->> 'cron') IS NOT NULL"),
+            "agents with no cron schedule must be excluded in SQL, not in Rust: {sql}"
+        );
+        assert!(
+            sql.contains("\"cron_next_run_at\" IS NULL"),
+            "a never-scheduled agent must still be selected so it can be seeded: {sql}"
+        );
+        assert!(
+            sql.contains("\"cron_next_run_at\" <="),
+            "due selection must happen in SQL: {sql}"
+        );
+    }
+
     fn make_config(project_id: i32) -> project_agents::Model {
         project_agents::Model {
             id: 1,
@@ -1128,6 +1239,7 @@ mod tests {
             tools_config: None,
             webhook_id: None,
             webhook_token: None,
+            cron_next_run_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
