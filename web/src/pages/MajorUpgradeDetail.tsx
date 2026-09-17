@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -12,8 +11,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -37,9 +34,19 @@ import {
   type PgUpgrade,
   type PgUpgradePhase,
 } from '@/lib/pg-upgrades'
+import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  AlertTriangle,
   ArrowLeft,
   Ban,
   CheckCircle2,
@@ -53,21 +60,14 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 
-function statusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {
-  switch (status) {
-    case 'completed':
-      return 'default'
-    case 'failed':
-      return 'destructive'
-    case 'running':
-      return 'secondary'
-    case 'cancelled':
-      return 'outline'
-    case 'pending':
-      return 'outline'
-    default:
-      return 'outline'
-  }
+// Mirrors `statusVariant`'s old Badge mapping — the Detail template's single
+// verdict, derived from the record's own status field.
+const UPGRADE_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+  completed: { tone: 'ok', label: 'Completed' },
+  failed: { tone: 'error', label: 'Failed' },
+  running: { tone: 'running', label: 'Running' },
+  cancelled: { tone: 'idle', label: 'Cancelled' },
+  pending: { tone: 'idle', label: 'Pending' },
 }
 
 interface PhaseRowProps {
@@ -78,9 +78,9 @@ interface PhaseRowProps {
 function PhaseRow({ phase, state }: PhaseRowProps) {
   const icon =
     state === 'done' ? (
-      <CheckCircle2 className="h-4 w-4 text-green-600" />
+      <CheckCircle2 className="h-4 w-4 text-success" />
     ) : state === 'current' ? (
-      <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
+      <Loader2 className="h-4 w-4 animate-spin text-primary" />
     ) : state === 'failed' ? (
       <XCircle className="h-4 w-4 text-destructive" />
     ) : (
@@ -100,6 +100,26 @@ function PhaseRow({ phase, state }: PhaseRowProps) {
         {PHASE_LABELS[phase]}
       </span>
     </li>
+  )
+}
+
+function MajorUpgradeDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
+  return (
+    <Detail
+      title={<div className="h-7 w-56 animate-pulse rounded bg-muted" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3].map(() => ({
+        label: <div className="h-3 w-16 animate-pulse rounded bg-muted" />,
+        value: <div className="h-4 w-24 animate-pulse rounded bg-muted" />,
+      }))}
+      main={
+        <>
+          <div className="h-48 w-full animate-pulse rounded-lg bg-muted" />
+          <div className="h-64 w-full animate-pulse rounded-lg bg-muted" />
+        </>
+      }
+      aside={<div className="h-40 w-full animate-pulse rounded-lg bg-muted" />}
+    />
   )
 }
 
@@ -196,35 +216,42 @@ export function MajorUpgradeDetail() {
     },
   })
 
+  const backAction = (
+    <Button variant="ghost" size="icon" asChild>
+      <Link to={`/storage/${id}`}>
+        <ArrowLeft className="h-4 w-4" />
+      </Link>
+    </Button>
+  )
+
   if (!Number.isFinite(serviceIdNum) || !Number.isFinite(upgradeIdNum)) {
     return (
-      <div className="p-4 sm:p-6">
-        <Alert variant="destructive">
-          <AlertDescription>Invalid upgrade id.</AlertDescription>
-        </Alert>
-      </div>
+      <PageState
+        variant="failed"
+        icon={XCircle}
+        title="Invalid upgrade"
+        description="This upgrade id isn't valid."
+        action={backAction}
+      />
     )
   }
 
   if (upgradeQuery.isLoading) {
-    return (
-      <div className="p-6 flex items-center gap-2 text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Loading upgrade…
-      </div>
-    )
+    return <MajorUpgradeDetailSkeleton backAction={backAction} />
   }
 
   if (upgradeQuery.isError || !upgradeQuery.data) {
     return (
-      <div className="p-4 sm:p-6">
-        <Alert variant="destructive">
-          <AlertDescription>
-            {(upgradeQuery.error as Error | undefined)?.message ??
-              'Upgrade not found.'}
-          </AlertDescription>
-        </Alert>
-      </div>
+      <PageState
+        variant="failed"
+        icon={XCircle}
+        title="Couldn't load upgrade"
+        description={
+          (upgradeQuery.error as Error | undefined)?.message ??
+          'Upgrade not found.'
+        }
+        action={<Button onClick={() => void upgradeQuery.refetch()}>Retry</Button>}
+      />
     )
   }
 
@@ -240,176 +267,168 @@ export function MajorUpgradeDetail() {
     return 'pending'
   }
 
+  const verdict =
+    UPGRADE_STATUS_VERDICT[upgrade.status] ?? { tone: 'idle' as StatusTone, label: upgrade.status }
+
+  const facts: DetailFact[] = [
+    { label: 'Attempt', value: upgrade.attempt },
+    { label: 'Phase', value: PHASE_LABELS[upgrade.phase as PgUpgradePhase] ?? upgrade.phase },
+    {
+      label: 'Started',
+      value: upgrade.started_at ? (
+        <span title={fmtDateTime(upgrade.started_at)}>
+          {fmtRelativeTime(upgrade.started_at)}
+        </span>
+      ) : (
+        'Not started'
+      ),
+    },
+    {
+      label: 'Created',
+      value: (
+        <span title={fmtDateTime(upgrade.created_at)}>
+          {fmtRelativeTime(upgrade.created_at)}
+        </span>
+      ),
+    },
+  ]
+
   return (
-    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" asChild>
-            <Link to={`/storage/${id}`}>
-              <ArrowLeft className="h-4 w-4" />
-            </Link>
-          </Button>
-          <div>
-            <h1 className="text-2xl font-semibold">
-              Major Upgrade #{upgrade.id}
-            </h1>
-            <p className="text-sm text-muted-foreground">
-              PostgreSQL {upgrade.from_version} → {upgrade.to_version}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={statusVariant(upgrade.status)}>{upgrade.status}</Badge>
-          {upgrade.status === 'pending' || upgrade.status === 'running' ? (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => cancelMutation.mutate()}
-              disabled={cancelMutation.isPending}
-            >
-              {cancelMutation.isPending ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
+    <>
+      <Detail
+        title={`Major Upgrade #${upgrade.id}`}
+        description={`PostgreSQL ${upgrade.from_version} → ${upgrade.to_version}`}
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        facts={facts}
+        actions={
+          <>
+            {backAction}
+            {upgrade.status === 'pending' || upgrade.status === 'running' ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => cancelMutation.mutate()}
+                busy={cancelMutation.isPending}
+                busyLabel="Cancelling…"
+              >
                 <Ban className="h-4 w-4 mr-2" />
-              )}
-              Cancel
-            </Button>
-          ) : null}
-          {upgrade.status === 'failed' || upgrade.status === 'cancelled' ? (
-            <Button
-              size="sm"
-              onClick={() => retryMutation.mutate()}
-              disabled={retryMutation.isPending}
-            >
-              {retryMutation.isPending ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
+                Cancel
+              </Button>
+            ) : null}
+            {upgrade.status === 'failed' || upgrade.status === 'cancelled' ? (
+              <Button
+                size="sm"
+                onClick={() => retryMutation.mutate()}
+                busy={retryMutation.isPending}
+                busyLabel="Retrying…"
+              >
                 <RefreshCcw className="h-4 w-4 mr-2" />
-              )}
-              Retry
-            </Button>
-          ) : null}
-          {upgrade.status === 'completed' && upgrade.rollback_volume_name ? (
-            <Button
-              size="sm"
-              variant="destructive"
-              onClick={() => setShowRollbackDialog(true)}
-              disabled={rollbackMutation.isPending}
-            >
-              {rollbackMutation.isPending ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
+                Retry
+              </Button>
+            ) : null}
+            {upgrade.status === 'completed' && upgrade.rollback_volume_name ? (
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => setShowRollbackDialog(true)}
+                disabled={rollbackMutation.isPending}
+              >
                 <RotateCcw className="h-4 w-4 mr-2" />
-              )}
-              Roll back
-            </Button>
-          ) : null}
-        </div>
-      </div>
+                Roll back
+              </Button>
+            ) : null}
+          </>
+        }
+        main={
+          <>
+            {upgrade.error_message ? (
+              <Callout tone="error" title="Upgrade error">
+                <span className="break-all font-mono text-xs">{upgrade.error_message}</span>
+              </Callout>
+            ) : null}
 
-      {upgrade.error_message ? (
-        <Alert variant="destructive">
-          <AlertTriangle className="h-4 w-4" />
-          <AlertDescription className="font-mono text-xs break-all">
-            {upgrade.error_message}
-          </AlertDescription>
-        </Alert>
-      ) : null}
+            <Card>
+              <CardHeader>
+                <CardTitle>Phases</CardTitle>
+                <CardDescription>
+                  Each phase is idempotent; failures mark this row as failed at
+                  the phase shown, and a retry resumes from that same phase.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ul className="divide-y">
+                  {PG_UPGRADE_PHASES.map((phase, idx) => (
+                    <PhaseRow key={phase} phase={phase} state={phaseState(idx)} />
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
 
-      <div className="grid gap-6 md:grid-cols-3">
-        <Card>
-          <CardHeader>
-            <CardTitle>From</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <code className="text-xs break-all">{upgrade.from_image}</code>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>To</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <code className="text-xs break-all">{upgrade.to_image}</code>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Attempt</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-semibold">{upgrade.attempt}</div>
-            <p className="text-xs text-muted-foreground">
-              Retries preserve phase so work is not repeated.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+            <Card>
+              <CardHeader>
+                <CardTitle>Logs</CardTitle>
+                <CardDescription>
+                  JSONL log stream (<code className="text-xs">{upgrade.log_id}</code>).
+                  {isTerminal(upgrade.status)
+                    ? ' Streaming stopped.'
+                    : ' Auto-refreshing every 3s.'}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <pre className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all">
+                  {logsQuery.data?.content?.trim() || '(no log output yet)'}
+                </pre>
+              </CardContent>
+            </Card>
+          </>
+        }
+        aside={
+          <>
+            <Card>
+              <CardHeader>
+                <CardTitle>Images</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                <div>
+                  <p className="text-xs text-muted-foreground">From</p>
+                  <code className="text-xs break-all">{upgrade.from_image}</code>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground">To</p>
+                  <code className="text-xs break-all">{upgrade.to_image}</code>
+                </div>
+              </CardContent>
+            </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Phases</CardTitle>
-          <CardDescription>
-            Each phase is idempotent; failures mark this row as failed at the
-            phase shown, and a retry resumes from that same phase.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <ul className="divide-y">
-            {PG_UPGRADE_PHASES.map((phase, idx) => (
-              <PhaseRow
-                key={phase}
-                phase={phase}
-                state={phaseState(idx)}
-              />
-            ))}
-          </ul>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Logs</CardTitle>
-          <CardDescription>
-            JSONL log stream (<code className="text-xs">{upgrade.log_id}</code>).
-            {isTerminal(upgrade.status)
-              ? ' Streaming stopped.'
-              : ' Auto-refreshing every 3s.'}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <pre className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all">
-            {logsQuery.data?.content?.trim() || '(no log output yet)'}
-          </pre>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Rollback info</CardTitle>
-        </CardHeader>
-        <CardContent className="text-sm space-y-2">
-          <div>
-            <span className="text-muted-foreground">Pre-upgrade backup: </span>
-            {upgrade.pre_upgrade_backup_id ? (
-              <span className="font-mono">#{upgrade.pre_upgrade_backup_id}</span>
-            ) : (
-              <span className="text-muted-foreground">(not taken yet)</span>
-            )}
-          </div>
-          <div>
-            <span className="text-muted-foreground">Rollback volume: </span>
-            {upgrade.rollback_volume_name ? (
-              <code className="text-xs">{upgrade.rollback_volume_name}</code>
-            ) : (
-              <span className="text-muted-foreground">(not created yet)</span>
-            )}
-          </div>
-          <p className="text-xs text-muted-foreground">
-            The rollback volume is retained for 7 days before it is swept.
-          </p>
-        </CardContent>
-      </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>Rollback info</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm space-y-2">
+                <div>
+                  <span className="text-muted-foreground">Pre-upgrade backup: </span>
+                  {upgrade.pre_upgrade_backup_id ? (
+                    <span className="font-mono">#{upgrade.pre_upgrade_backup_id}</span>
+                  ) : (
+                    <span className="text-muted-foreground">(not taken yet)</span>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Rollback volume: </span>
+                  {upgrade.rollback_volume_name ? (
+                    <code className="text-xs">{upgrade.rollback_volume_name}</code>
+                  ) : (
+                    <span className="text-muted-foreground">(not created yet)</span>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  The rollback volume is retained for 7 days before it is swept.
+                </p>
+              </CardContent>
+            </Card>
+          </>
+        }
+      />
 
       <AlertDialog
         open={showRollbackDialog}
@@ -446,6 +465,6 @@ export function MajorUpgradeDetail() {
       </AlertDialog>
 
       {verificationDialog}
-    </div>
+    </>
   )
 }
