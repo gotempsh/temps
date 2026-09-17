@@ -145,11 +145,11 @@ export function AdminGateCard() {
         <CardDescription>
           Restrict which hostnames and source IPs can reach the management
           surface (dashboard, <code>/api/projects</code>, etc.) through the
-          public load balancer. Hosts that don't match are served as normal
-          LB traffic — if they resolve to a deployed app it serves; otherwise
-          they 404. Public ingest (<code>/api/_temps/*</code>) is always
-          reachable from any host. Empty lists = no restriction. Bare IPs are
-          accepted as /32 (or /128 for IPv6). CIDR allowed for ranges.
+          public load balancer. Hosts that don't match are served as normal LB
+          traffic — if they resolve to a deployed app it serves; otherwise they
+          404. Public ingest (<code>/api/_temps/*</code>) is always reachable
+          from any host. Empty lists = no restriction. Bare IPs are accepted as
+          /32 (or /128 for IPv6). CIDR allowed for ranges.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -161,8 +161,8 @@ export function AdminGateCard() {
               <code>TEMPS_ADMIN_ALLOWED_IPS</code> /{' '}
               <code>TEMPS_ADMIN_ALLOWED_HOSTS</code> /{' '}
               <code>TEMPS_ADMIN_TRUST_FORWARDED_FOR</code> are set on the
-              process — the lists below are read-only. Unset those env vars
-              and restart the server to manage the gate from this page.
+              process — the lists below are read-only. Unset those env vars and
+              restart the server to manage the gate from this page.
             </AlertDescription>
           </Alert>
         )}
@@ -213,8 +213,8 @@ export function AdminGateCard() {
             <p className="text-xs text-muted-foreground max-w-prose">
               When enabled, the gate uses the leftmost XFF entry as the client
               IP — but only when the immediate peer is loopback (127.0.0.0/8 or
-              ::1). Required when the admin listener sits behind a local
-              reverse proxy. External clients cannot spoof XFF.
+              ::1). Required when the admin listener sits behind a local reverse
+              proxy. External clients cannot spoof XFF.
             </p>
           </div>
           <Switch

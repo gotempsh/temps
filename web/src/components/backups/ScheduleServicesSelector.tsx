@@ -45,9 +45,7 @@ export function ScheduleServicesSelector({
     ...listServicesOptions({ query: { page_size: 100 } }),
   })
 
-  const visible = (services ?? []).filter(
-    (s) => !excludeIds.includes(s.id),
-  )
+  const visible = (services ?? []).filter((s) => !excludeIds.includes(s.id))
   const allSelected =
     visible.length > 0 && visible.every((s) => value.includes(s.id))
   const someSelected = visible.some((s) => value.includes(s.id))

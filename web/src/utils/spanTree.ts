@@ -72,12 +72,13 @@ export function buildSpanTree(spans: SpanRecord[]): SpanTreeNode[] {
  * hand-built, which is lossy but better than a zero-width bar.
  */
 export function spanDurationMs(span: SpanRecord): number {
-  if (typeof span.duration_ms === 'number' && Number.isFinite(span.duration_ms)) {
+  if (
+    typeof span.duration_ms === 'number' &&
+    Number.isFinite(span.duration_ms)
+  ) {
     return span.duration_ms
   }
-  return (
-    new Date(span.end_time).getTime() - new Date(span.start_time).getTime()
-  )
+  return new Date(span.end_time).getTime() - new Date(span.start_time).getTime()
 }
 
 /**

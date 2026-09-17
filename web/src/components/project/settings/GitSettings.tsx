@@ -2240,13 +2240,13 @@ function ExcludedServicesInline({
           <p className="text-xs text-muted-foreground mt-0.5">
             Uncheck a service to skip deploying it entirely — e.g. a raw
             database container, which won’t have Temps backup/restore. Every
-            service runs with all Linux container permissions dropped except
-            a minimal set (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) most
+            service runs with all Linux container permissions dropped except a
+            minimal set (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) most
             official images need to fix ownership on their data volume at
-            startup — that's granted automatically, nothing to configure. If
-            a service still fails with “Operation not permitted” errors, it
-            needs a capability outside that set; “Disable sandbox” restores
-            Docker’s normal runtime permissions for only that service.
+            startup — that's granted automatically, nothing to configure. If a
+            service still fails with “Operation not permitted” errors, it needs
+            a capability outside that set; “Disable sandbox” restores Docker’s
+            normal runtime permissions for only that service.
           </p>
         </div>
         <Button
@@ -2314,8 +2314,8 @@ function ExcludedServicesInline({
                       </TooltipTrigger>
                       <TooltipContent className="max-w-xs">
                         This looks like a database container — it won’t have
-                        Temps backup/restore. Consider excluding it and using
-                        a Temps-managed database instead.
+                        Temps backup/restore. Consider excluding it and using a
+                        Temps-managed database instead.
                       </TooltipContent>
                     </Tooltip>
                   )}

@@ -280,9 +280,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <div className="space-y-0.5 pr-4">
               <Label className="text-base">Cross-project trace sharing</Label>
               <p className="text-sm text-muted-foreground">
-                When on, this project&apos;s spans appear in other projects&apos; unified
-                cross-project traces. Turn off to keep this project&apos;s spans
-                private to itself.
+                When on, this project&apos;s spans appear in other
+                projects&apos; unified cross-project traces. Turn off to keep
+                this project&apos;s spans private to itself.
               </p>
             </div>
             <Switch

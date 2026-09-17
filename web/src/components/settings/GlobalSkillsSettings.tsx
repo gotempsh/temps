@@ -46,10 +46,7 @@ import {
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
-import {
-  createGlobalSkill,
-  updateGlobalSkill,
-} from '@/api/client/sdk.gen'
+import { createGlobalSkill, updateGlobalSkill } from '@/api/client/sdk.gen'
 import {
   deleteGlobalSkillMutation,
   listGlobalSkillsOptions,
@@ -396,9 +393,7 @@ function GlobalSkillDialog({
       }
       onSuccess()
     } catch {
-      toast.error(
-        isEdit ? 'Failed to update skill' : 'Failed to create skill'
-      )
+      toast.error(isEdit ? 'Failed to update skill' : 'Failed to create skill')
     } finally {
       setIsPending(false)
     }
@@ -459,8 +454,8 @@ function GlobalSkillDialog({
           <div className="space-y-2">
             <Label htmlFor="skill-content">Content</Label>
             <p className="text-xs text-muted-foreground">
-              The skill instructions in markdown. This becomes the SKILL.md
-              file content.
+              The skill instructions in markdown. This becomes the SKILL.md file
+              content.
             </p>
             <Textarea
               id="skill-content"

@@ -13,12 +13,7 @@ import {
   updateDashboardMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Form,
   FormControl,
@@ -48,12 +43,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, GripVertical, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import {
-  useFieldArray,
-  useForm,
-  useWatch,
-  type Control,
-} from 'react-hook-form'
+import { useFieldArray, useForm, useWatch, type Control } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
@@ -142,7 +132,7 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
         value: n,
         label: n,
       })),
-    [namesQuery.data],
+    [namesQuery.data]
   )
 
   // Bounds for the label-filter autocomplete — mirrors LabelFilterBuilder's own
@@ -347,11 +337,7 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
                   ? 'Save changes'
                   : 'Create dashboard'}
             </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => goBack()}
-            >
+            <Button type="button" variant="outline" onClick={() => goBack()}>
               Cancel
             </Button>
           </div>

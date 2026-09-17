@@ -99,8 +99,8 @@ export function AiChatLimitsCard() {
           A turn is bounded by time, not by a number of steps, so the assistant
           can work a problem for as long as it needs rather than stopping after
           a fixed number of tool calls. This is the ceiling for one message: it
-          stops an unattended turn, and caps what a single message can cost.
-          You can always stop a turn yourself from the chat.
+          stops an unattended turn, and caps what a single message can cost. You
+          can always stop a turn yourself from the chat.
         </CardDescription>
       </CardHeader>
       <CardContent>

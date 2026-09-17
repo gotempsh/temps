@@ -20,7 +20,11 @@ export function useEnterSubmit(onSubmit: () => void) {
       if (tag === 'textarea' || tag === 'button') return
 
       // Don't intercept if inside a select/combobox popover
-      if (target.closest('[role="listbox"]') || target.closest('[role="option"]')) return
+      if (
+        target.closest('[role="listbox"]') ||
+        target.closest('[role="option"]')
+      )
+        return
 
       e.preventDefault()
       onSubmit()

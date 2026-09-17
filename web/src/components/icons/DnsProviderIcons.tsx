@@ -162,7 +162,7 @@ export function NamecheapIcon({ className }: IconProps) {
 
 export function getDnsProviderIcon(
   providerType: string,
-  className = 'h-4 w-4',
+  className = 'h-4 w-4'
 ) {
   switch (providerType.toLowerCase()) {
     case 'cloudflare':

@@ -60,11 +60,20 @@ export interface SupportedImage {
 export function getSupportedImages(serviceType: string): SupportedImage[] {
   if (serviceType === 'postgres') {
     return [
-      { image: 'gotempsh/postgres-walg:18-bookworm', label: 'PostgreSQL 18 + WAL-G' },
-      { image: 'gotempsh/postgres-walg:17-bookworm', label: 'PostgreSQL 17 + WAL-G' },
+      {
+        image: 'gotempsh/postgres-walg:18-bookworm',
+        label: 'PostgreSQL 18 + WAL-G',
+      },
+      {
+        image: 'gotempsh/postgres-walg:17-bookworm',
+        label: 'PostgreSQL 17 + WAL-G',
+      },
       { image: 'gotempsh/pgvector-walg:pg18', label: 'pgvector 18 + WAL-G' },
       { image: 'gotempsh/pgvector-walg:pg17', label: 'pgvector 17 + WAL-G' },
-      { image: 'gotempsh/timescaledb-walg:pg18', label: 'TimescaleDB (PG 18) + WAL-G' },
+      {
+        image: 'gotempsh/timescaledb-walg:pg18',
+        label: 'TimescaleDB (PG 18) + WAL-G',
+      },
     ]
   }
   if (serviceType === 'redis') {
@@ -135,7 +144,9 @@ export function UpgradeServiceDialog({
     onError: (error: Error) => {
       toast.error('Failed to upgrade service', {
         description:
-          (error as any).detail || error.message || 'An unexpected error occurred',
+          (error as any).detail ||
+          error.message ||
+          'An unexpected error occurred',
       })
     },
   })
@@ -266,9 +277,9 @@ export function UpgradeServiceDialog({
                 <div className="rounded-lg border border-blue-500/20 bg-blue-500/10 p-3 flex gap-2">
                   <AlertCircle className="h-4 w-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
                   <p className="text-xs text-blue-700 dark:text-blue-300">
-                    WAL-G images provide streaming backups directly to S3
-                    with constant memory usage. PostgreSQL images also get
-                    continuous WAL archiving for point-in-time recovery.
+                    WAL-G images provide streaming backups directly to S3 with
+                    constant memory usage. PostgreSQL images also get continuous
+                    WAL archiving for point-in-time recovery.
                   </p>
                 </div>
               )}
@@ -280,9 +291,9 @@ export function UpgradeServiceDialog({
                   Important
                 </p>
                 <p className="text-xs text-yellow-700 dark:text-yellow-300">
-                  The service will be stopped during the upgrade. For
-                  PostgreSQL major version changes (e.g., 17 → 18), data
-                  migration runs automatically via pg_upgrade.
+                  The service will be stopped during the upgrade. For PostgreSQL
+                  major version changes (e.g., 17 → 18), data migration runs
+                  automatically via pg_upgrade.
                 </p>
               </div>
             </div>

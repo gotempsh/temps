@@ -20,13 +20,13 @@ type Section = NonNullable<OtelDashboardResponse['layout']>['sections'][number]
 
 /** Flatten a dashboard's sections to the (metric, aggregation) pairs it plots. */
 export function dashboardTiles(
-  sections: Section[] | undefined,
+  sections: Section[] | undefined
 ): { metricName: string; aggregation?: string }[] {
   return (sections ?? []).flatMap((s) =>
     (s.tiles ?? []).map((t) => ({
       metricName: t.metric_name,
       aggregation: t.aggregation,
-    })),
+    }))
   )
 }
 
@@ -59,7 +59,7 @@ export function DashboardStatusBadge({
       <span
         className={cn(
           'inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground',
-          className,
+          className
         )}
         title={`${rollup.watched} metric${rollup.watched === 1 ? '' : 's'} watched, none firing`}
       >
@@ -93,7 +93,7 @@ export function FiringCount({
       className={cn(
         'font-medium',
         rollup.level === 'alert' ? tone.alert : tone.warn,
-        className,
+        className
       )}
       // Severity must not rely on hue alone — spell it out for hover / AT.
       title={

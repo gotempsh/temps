@@ -45,7 +45,15 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft, Globe, Plus, RotateCcw, Send, Trash2 } from 'lucide-react'
+import {
+  AlertCircle,
+  ArrowLeft,
+  Globe,
+  Plus,
+  RotateCcw,
+  Send,
+  Trash2,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -216,7 +224,9 @@ export function EmailProviderDetail() {
       <div className="flex-1 overflow-auto">
         <div className="flex flex-col items-center justify-center py-16 text-center">
           <AlertCircle className="size-8 text-destructive" />
-          <h2 className="mt-3 text-lg font-semibold">Failed to load email provider</h2>
+          <h2 className="mt-3 text-lg font-semibold">
+            Failed to load email provider
+          </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             {fetchError instanceof Error
               ? fetchError.message

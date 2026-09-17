@@ -61,9 +61,9 @@ export function useAnomalyBand({
         (r) =>
           r.enabled &&
           r.metric_name === metricName &&
-          r.detection_config.kind === 'anomaly',
+          r.detection_config.kind === 'anomaly'
       ) ?? null,
-    [rules, metricName],
+    [rules, metricName]
   )
 
   const query = useQuery({
@@ -134,7 +134,6 @@ export function useAnomalyBand({
       })
     }
     // bandSeries is derived from points; points identity is stable per fetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, bandSeries])
 
   return { bandSeries, mergeBand }

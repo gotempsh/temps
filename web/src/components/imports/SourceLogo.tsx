@@ -16,19 +16,21 @@ import {
 import { Server } from 'lucide-react'
 
 /** Brand marks for import sources, keyed by the backend source id. */
-const BRAND_ICONS: Record<string, { path: string; hex: string; title: string }> =
-  {
-    docker: siDocker,
-    kubernetes: siKubernetes,
-    coolify: siCoolify,
-    caprover: siCaprover,
-    portainer: siPortainer,
-    vercel: siVercel,
-    railway: siRailway,
-    netlify: siNetlify,
-    render: siRender,
-    fly: siFlydotio,
-  }
+const BRAND_ICONS: Record<
+  string,
+  { path: string; hex: string; title: string }
+> = {
+  docker: siDocker,
+  kubernetes: siKubernetes,
+  coolify: siCoolify,
+  caprover: siCaprover,
+  portainer: siPortainer,
+  vercel: siVercel,
+  railway: siRailway,
+  netlify: siNetlify,
+  render: siRender,
+  fly: siFlydotio,
+}
 
 /** Near-black brand colors are invisible in dark mode — use the theme
  *  foreground for those instead of the fixed brand hex. */
@@ -65,8 +67,20 @@ export function SourceLogo({ source, className }: SourceLogoProps) {
   if (source === 'kamal') {
     // No simple-icons entry for Kamal — recognizable lettermark badge
     return (
-      <svg viewBox="0 0 24 24" role="img" aria-label="Kamal" className={className}>
-        <rect x="1" y="1" width="22" height="22" rx="5" className="fill-foreground" />
+      <svg
+        viewBox="0 0 24 24"
+        role="img"
+        aria-label="Kamal"
+        className={className}
+      >
+        <rect
+          x="1"
+          y="1"
+          width="22"
+          height="22"
+          rx="5"
+          className="fill-foreground"
+        />
         <text
           x="12"
           y="16.5"
@@ -90,7 +104,14 @@ export function SourceLogo({ source, className }: SourceLogoProps) {
         aria-label="Dokploy"
         className={className}
       >
-        <rect x="1" y="1" width="22" height="22" rx="5" className="fill-foreground" />
+        <rect
+          x="1"
+          y="1"
+          width="22"
+          height="22"
+          rx="5"
+          className="fill-foreground"
+        />
         <text
           x="12"
           y="16.5"

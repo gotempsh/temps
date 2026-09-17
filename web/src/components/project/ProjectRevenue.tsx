@@ -102,7 +102,7 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
   const [connectOpen, setConnectOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [importTarget, setImportTarget] = useState<IntegrationResponse | null>(
-    null,
+    null
   )
 
   useEffect(() => {
@@ -121,7 +121,7 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
   const hasIntegrations = integrations.length > 0
   const connectedProviders = useMemo(
     () => new Set(integrations.map((i) => i.provider)),
-    [integrations],
+    [integrations]
   )
 
   const providersQuery = useQuery({
@@ -313,13 +313,17 @@ function computeTrend(
     inverse?: boolean
     /** Formatter for the delta value. Defaults to `n.toLocaleString()`. */
     format?: (n: number) => string
-  } = {},
+  } = {}
 ): SummaryCard['trend'] | undefined {
   if (previous === undefined) return undefined
   const delta = current - previous
   const format = options.format ?? ((n) => n.toLocaleString())
   if (delta === 0) {
-    return { direction: 'flat', tone: 'neutral', label: 'no change vs yesterday' }
+    return {
+      direction: 'flat',
+      tone: 'neutral',
+      label: 'no change vs yesterday',
+    }
   }
   const direction: TrendDirection = delta > 0 ? 'up' : 'down'
   const isGood = options.inverse ? delta < 0 : delta > 0
@@ -357,7 +361,7 @@ function SummarySection({
 
     const newLast30d = customerBuckets.reduce(
       (sum, b) => sum + b.new_customers,
-      0,
+      0
     )
 
     // Previous-day comparisons come from the second-to-last bucket in each
@@ -392,7 +396,7 @@ function SummarySection({
         trend: computeTrend(
           data.current_arr_minor,
           prevMrrBucket ? prevMrrBucket.mrr_minor * 12 : undefined,
-          { format: formatMoneyDelta },
+          { format: formatMoneyDelta }
         ),
       },
       {
@@ -408,9 +412,7 @@ function SummarySection({
                     ? 'down'
                     : 'flat',
               tone:
-                latestCustomerBucket.new_customers > 0
-                  ? 'positive'
-                  : 'neutral',
+                latestCustomerBucket.new_customers > 0 ? 'positive' : 'neutral',
               label: `+${latestCustomerBucket.new_customers} new today`,
             }
           : undefined,
@@ -423,7 +425,7 @@ function SummarySection({
           ? computeTrend(
               latestCustomerBucket?.churned_customers ?? 0,
               prevCustomerBucket.churned_customers,
-              { inverse: true },
+              { inverse: true }
             )
           : latestCustomerBucket
             ? {
@@ -468,11 +470,7 @@ function SummarySection({
   )
 }
 
-function TrendChip({
-  trend,
-}: {
-  trend: NonNullable<SummaryCard['trend']>
-}) {
+function TrendChip({ trend }: { trend: NonNullable<SummaryCard['trend']> }) {
   const Icon =
     trend.direction === 'up'
       ? ArrowUpRight
@@ -518,7 +516,7 @@ function MrrChart({
         bucket: b.bucket,
         mrr: b.mrr_minor / 100,
       })),
-    [buckets],
+    [buckets]
   )
 
   return (
@@ -561,7 +559,9 @@ function MrrChart({
                 cursor={false}
                 content={
                   <ChartTooltipContent
-                    labelFormatter={(label) => formatBucketLabel(label as string)}
+                    labelFormatter={(label) =>
+                      formatBucketLabel(label as string)
+                    }
                     formatter={(value) => [
                       formatMinor((value as number) * 100, currency),
                       ' MRR',
@@ -572,8 +572,16 @@ function MrrChart({
               />
               <defs>
                 <linearGradient id="fillMrr" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="var(--color-mrr)" stopOpacity={0.4} />
-                  <stop offset="95%" stopColor="var(--color-mrr)" stopOpacity={0.05} />
+                  <stop
+                    offset="5%"
+                    stopColor="var(--color-mrr)"
+                    stopOpacity={0.4}
+                  />
+                  <stop
+                    offset="95%"
+                    stopColor="var(--color-mrr)"
+                    stopOpacity={0.05}
+                  />
                 </linearGradient>
               </defs>
               <Area
@@ -616,7 +624,7 @@ function CustomersChart({
         new: b.new_customers,
         churned: -b.churned_customers,
       })),
-    [buckets],
+    [buckets]
   )
 
   return (
@@ -624,9 +632,7 @@ function CustomersChart({
       <CardContent className="p-4">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-medium">Customer movement</h2>
-          <span className="text-xs text-muted-foreground">
-            New vs. churned
-          </span>
+          <span className="text-xs text-muted-foreground">New vs. churned</span>
         </div>
         {isLoading ? (
           <Skeleton className="h-[250px] w-full" />
@@ -734,7 +740,9 @@ function IntegrationRow({
   const rotate = useMutation({
     ...revenueRotateTokenMutation(),
     onSuccess: () => {
-      toast.success('Webhook token rotated. Update the URL in your provider dashboard.')
+      toast.success(
+        'Webhook token rotated. Update the URL in your provider dashboard.'
+      )
       queryClient.invalidateQueries({ queryKey: integrationsKey })
     },
     onError: (err: Error) =>
@@ -754,7 +762,7 @@ function IntegrationRow({
   const handleDelete = () => {
     if (
       confirm(
-        'Delete this integration? Historical events are preserved but new webhooks will be rejected.',
+        'Delete this integration? Historical events are preserved but new webhooks will be rejected.'
       )
     ) {
       remove.mutate({
@@ -783,8 +791,7 @@ function IntegrationRow({
           </Badge>
           {integration.last_event_at && (
             <span className="text-xs text-muted-foreground">
-              last event{' '}
-              <TimeAgo date={new Date(integration.last_event_at)} />
+              last event <TimeAgo date={new Date(integration.last_event_at)} />
             </span>
           )}
         </div>
@@ -813,10 +820,7 @@ function IntegrationRow({
             Configure filters
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onClick={handleDelete}
-            className="text-destructive"
-          >
+          <DropdownMenuItem onClick={handleDelete} className="text-destructive">
             <Trash2 className="mr-2 h-4 w-4" />
             Delete
           </DropdownMenuItem>
@@ -937,8 +941,12 @@ function ConfigureIntegrationDialog({
   const [priceList, setPriceList] = useState(initial.priceList)
   const [productList, setProductList] = useState(initial.productList)
   const [variantList, setVariantList] = useState(initial.variantList)
-  const [includeUnpriced, setIncludeUnpriced] = useState(initial.includeUnpriced)
-  const [meteredMode, setMeteredMode] = useState<MeteredMode>(initial.meteredMode)
+  const [includeUnpriced, setIncludeUnpriced] = useState(
+    initial.includeUnpriced
+  )
+  const [meteredMode, setMeteredMode] = useState<MeteredMode>(
+    initial.meteredMode
+  )
 
   useEffect(() => {
     if (open) {
@@ -1030,7 +1038,9 @@ function ConfigureIntegrationDialog({
                 <Checkbox
                   className="mt-0.5"
                   checked={includeUnpriced}
-                  onCheckedChange={(checked) => setIncludeUnpriced(checked === true)}
+                  onCheckedChange={(checked) =>
+                    setIncludeUnpriced(checked === true)
+                  }
                 />
                 <span>
                   Include charges without a price reference
@@ -1169,7 +1179,7 @@ function splitList(raw: string): string[] {
 
 function buildProviderConfig(
   provider: string,
-  state: ConfigState,
+  state: ConfigState
 ): ProviderConfig {
   if (provider === 'stripe') {
     return {
@@ -1207,13 +1217,13 @@ async function uploadRevenueCsv(
   projectId: number,
   integrationId: number,
   kind: ImportKind,
-  file: File,
+  file: File
 ): Promise<ImportOutcomeResponse> {
   const form = new FormData()
   form.append('file', file, file.name)
   const res = await fetch(
     `/api/projects/${projectId}/revenue/integrations/${integrationId}/import/${kind}`,
-    { method: 'POST', body: form, credentials: 'include' },
+    { method: 'POST', body: form, credentials: 'include' }
   )
   const text = await res.text()
   if (!res.ok) {
@@ -1270,7 +1280,7 @@ function ImportDataDialog({
           projectId,
           integration.id,
           'subscriptions',
-          subsFile,
+          subsFile
         )
         collected.push({ kind: 'subscriptions', outcome })
       }
@@ -1279,7 +1289,7 @@ function ImportDataDialog({
           projectId,
           integration.id,
           'invoices',
-          invoicesFile,
+          invoicesFile
         )
         collected.push({ kind: 'invoices', outcome })
       }
@@ -1287,14 +1297,14 @@ function ImportDataDialog({
 
       const totalInserted = collected.reduce(
         (sum, r) => sum + r.outcome.inserted,
-        0,
+        0
       )
       const totalUpdated = collected.reduce(
         (sum, r) => sum + r.outcome.updated,
-        0,
+        0
       )
       toast.success(
-        `Imported ${totalInserted} new, updated ${totalUpdated}. MRR refresh in progress.`,
+        `Imported ${totalInserted} new, updated ${totalUpdated}. MRR refresh in progress.`
       )
       // Refresh everything that depends on revenue data
       queryClient.invalidateQueries({ queryKey: ['revenue'] })
@@ -1317,14 +1327,16 @@ function ImportDataDialog({
         <DialogHeader>
           <DialogTitle>Import historical revenue</DialogTitle>
           <DialogDescription>
-            Upload CSV exports from your provider to backfill MRR and the revenue
-            chart. Existing webhook data is never overwritten.
+            Upload CSV exports from your provider to backfill MRR and the
+            revenue chart. Existing webhook data is never overwritten.
           </DialogDescription>
         </DialogHeader>
 
         {integration.provider === 'stripe' && (
           <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
-            <p className="font-medium text-foreground">How to export from Stripe</p>
+            <p className="font-medium text-foreground">
+              How to export from Stripe
+            </p>
             <ol className="mt-1 list-decimal space-y-1 pl-4">
               <li>
                 <strong>Subscriptions:</strong> Stripe Dashboard →{' '}
@@ -1376,7 +1388,11 @@ function ImportDataDialog({
         {results.length > 0 && (
           <div className="flex flex-col gap-2 rounded-md border bg-muted/20 p-3 text-xs">
             {results.map((r) => (
-              <ImportResultBlock key={r.kind} kind={r.kind} outcome={r.outcome} />
+              <ImportResultBlock
+                key={r.kind}
+                kind={r.kind}
+                outcome={r.outcome}
+              />
             ))}
           </div>
         )}
@@ -1407,8 +1423,8 @@ function ImportResultBlock({
       <div className="flex items-center justify-between">
         <span className="font-medium capitalize text-foreground">{kind}</span>
         <span className="text-muted-foreground">
-          {outcome.rows_read} rows · {outcome.inserted} new ·{' '}
-          {outcome.updated} updated · {skipped} skipped
+          {outcome.rows_read} rows · {outcome.inserted} new · {outcome.updated}{' '}
+          updated · {skipped} skipped
           {outcome.errors.length > 0
             ? ` · ${outcome.errors.length} error(s)`
             : ''}
@@ -1512,9 +1528,9 @@ function ConnectProviderDialog({
   const availableProviders = useMemo(
     () =>
       (providersQuery.data ?? []).filter(
-        (p) => !connectedProviders.has(p.name),
+        (p) => !connectedProviders.has(p.name)
       ),
-    [providersQuery.data, connectedProviders],
+    [providersQuery.data, connectedProviders]
   )
   const integrationsKey = revenueListIntegrationsQueryKey({
     path: { project_id: projectId },
@@ -1539,7 +1555,7 @@ function ConnectProviderDialog({
 
   const selected: ProviderDescriptor | undefined = useMemo(
     () => availableProviders.find((p) => p.name === provider),
-    [availableProviders, provider],
+    [availableProviders, provider]
   )
 
   const create = useMutation({

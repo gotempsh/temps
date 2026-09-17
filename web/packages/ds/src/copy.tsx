@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+} from 'react'
 import { Check, Copy, X } from 'lucide-react'
 import { cn } from './lib/cn'
 import { writeToClipboard } from './lib/clipboard'
@@ -25,7 +32,10 @@ export const COPY_HOLD_MS = 2000
 
 export function useCopy(
   value: string | (() => string),
-  { onCopied, hold = COPY_HOLD_MS }: { onCopied?: (value: string) => void; hold?: number } = {},
+  {
+    onCopied,
+    hold = COPY_HOLD_MS,
+  }: { onCopied?: (value: string) => void; hold?: number } = {}
 ) {
   const [state, setState] = useState<CopyState>('idle')
   const [reason, setReason] = useState<string | undefined>()
@@ -43,7 +53,11 @@ export function useCopy(
       onCopied?.(text)
     } catch (e) {
       setState('failed')
-      setReason(e instanceof Error && e.message ? e.message : 'The browser blocked the copy. Select the text and copy it by hand.')
+      setReason(
+        e instanceof Error && e.message
+          ? e.message
+          : 'The browser blocked the copy. Select the text and copy it by hand.'
+      )
     }
     timer.current = window.setTimeout(() => setState('idle'), hold)
   }, [value, onCopied, hold])
@@ -58,7 +72,13 @@ export function useCopy(
  * border, the hover and the states are the control's own.
  */
 export function CopyAction({
-  value, children, copiedLabel = 'copied', failedLabel = "couldn't copy", onCopied, className, ...rest
+  value,
+  children,
+  copiedLabel = 'copied',
+  failedLabel = "couldn't copy",
+  onCopied,
+  className,
+  ...rest
 }: {
   /** What goes to the clipboard, or a function that builds it at press time. */
   value: string | (() => string)
@@ -68,7 +88,10 @@ export function CopyAction({
   failedLabel?: ReactNode
   onCopied?: (value: string) => void
   className?: string
-} & Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'onClick' | 'value' | 'children'>) {
+} & Omit<
+  ButtonHTMLAttributes<HTMLButtonElement>,
+  'onClick' | 'value' | 'children'
+>) {
   const { state, reason, copy } = useCopy(value, { onCopied })
   return (
     <button
@@ -79,15 +102,40 @@ export function CopyAction({
       className={cn(
         'inline-flex h-6 items-center border px-2 text-[11px] hover:bg-muted',
         state === 'failed' && 'border-destructive text-destructive',
-        className,
+        className
       )}
       {...rest}
     >
       <span className="grid">
-        <span aria-hidden={state !== 'idle'} className={cn('inline-flex items-center gap-1 [grid-area:1/1]', state !== 'idle' && 'invisible')}>{children}</span>
-        <span role="status" aria-live="polite" className={cn('inline-flex items-center gap-1 [grid-area:1/1]', state === 'idle' && 'invisible')}>
-          {state === 'copied' && <><Check aria-hidden className="h-3 w-3" />{copiedLabel}</>}
-          {state === 'failed' && <><X aria-hidden className="h-3 w-3" />{failedLabel}</>}
+        <span
+          aria-hidden={state !== 'idle'}
+          className={cn(
+            'inline-flex items-center gap-1 [grid-area:1/1]',
+            state !== 'idle' && 'invisible'
+          )}
+        >
+          {children}
+        </span>
+        <span
+          role="status"
+          aria-live="polite"
+          className={cn(
+            'inline-flex items-center gap-1 [grid-area:1/1]',
+            state === 'idle' && 'invisible'
+          )}
+        >
+          {state === 'copied' && (
+            <>
+              <Check aria-hidden className="h-3 w-3" />
+              {copiedLabel}
+            </>
+          )}
+          {state === 'failed' && (
+            <>
+              <X aria-hidden className="h-3 w-3" />
+              {failedLabel}
+            </>
+          )}
         </span>
       </span>
     </button>

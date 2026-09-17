@@ -73,9 +73,7 @@ export function MetricCard({
         ) : (
           <p className="text-xs text-muted-foreground/60">&nbsp;</p>
         )}
-        {sparkline && !locked ? (
-          <div className="pt-2">{sparkline}</div>
-        ) : null}
+        {sparkline && !locked ? <div className="pt-2">{sparkline}</div> : null}
       </CardContent>
       {locked && (
         <div className="pointer-events-none absolute right-3 top-3">

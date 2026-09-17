@@ -12,7 +12,10 @@ import {
   type ImportEmailDomainRequest,
   type ListProviderDomainsResponse,
 } from '@/api/client'
-import { EmailProviderLogo, type EmailProviderType } from '@/components/ui/email-provider-logo'
+import {
+  EmailProviderLogo,
+  type EmailProviderType,
+} from '@/components/ui/email-provider-logo'
 import { problemMessage } from '@/components/email/sharedUtils'
 import { Button } from '@/components/ui/button'
 import {
@@ -97,12 +100,16 @@ async function createEmailDomain(
   }
   const response = await createEmailDomainSdk({ body })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to create email domain'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to create email domain')
+    )
   }
   return response.data
 }
 
-async function importEmailDomain(data: ImportDomainFormData): Promise<EmailDomainWithDns> {
+async function importEmailDomain(
+  data: ImportDomainFormData
+): Promise<EmailDomainWithDns> {
   const body: ImportEmailDomainRequest = {
     provider_id: data.provider_id,
     domain: data.domain,
@@ -127,7 +134,9 @@ async function importEmailDomain(data: ImportDomainFormData): Promise<EmailDomai
 async function listEmailProviders(): Promise<EmailProvider[]> {
   const response = await listEmailProvidersSdk()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email providers'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email providers')
+    )
   }
   return response.data ?? []
 }
@@ -135,7 +144,9 @@ async function listEmailProviders(): Promise<EmailProvider[]> {
 async function listDiscoverableDomains(
   providerId: number
 ): Promise<ListProviderDomainsResponse> {
-  const response = await listDiscoverableDomainsSdk({ path: { id: providerId } })
+  const response = await listDiscoverableDomainsSdk({
+    path: { id: providerId },
+  })
   if (response.error || !response.data) {
     throw new Error(
       problemMessage(response.error, 'Failed to list domains from provider')
@@ -162,10 +173,7 @@ function WizardStepIndicator({ currentStep }: { currentStep: WizardStep }) {
   const currentIndex = STEP_ORDER.indexOf(currentStep)
 
   return (
-    <ol
-      role="list"
-      className="flex items-center justify-center gap-2 sm:gap-4"
-    >
+    <ol role="list" className="flex items-center justify-center gap-2 sm:gap-4">
       {WIZARD_STEPS.map((step, index) => {
         const stepIndex = STEP_ORDER.indexOf(step.id)
         const isDone = stepIndex < currentIndex
@@ -360,11 +368,16 @@ function ConfigureStep({
             value={providerId?.toString() ?? ''}
             onValueChange={(value) => onProviderChange(parseInt(value))}
           >
-            <SelectTrigger id="provider-select" className={errors.provider_id ? 'border-destructive' : ''}>
+            <SelectTrigger
+              id="provider-select"
+              className={errors.provider_id ? 'border-destructive' : ''}
+            >
               {selectedProvider ? (
                 <div className="flex items-center gap-2">
                   <EmailProviderLogo
-                    provider={selectedProvider.provider_type as EmailProviderType}
+                    provider={
+                      selectedProvider.provider_type as EmailProviderType
+                    }
                     size={20}
                   />
                   <span>{selectedProvider.name}</span>
@@ -400,7 +413,9 @@ function ConfigureStep({
         {/* Domain — import mode with a discoverable list gets a searchable
             picker that fills in both fields at once; everything else falls
             back to manual entry. */}
-        {mode === 'import' && providerId !== undefined && isLoadingDiscoverableDomains ? (
+        {mode === 'import' &&
+        providerId !== undefined &&
+        isLoadingDiscoverableDomains ? (
           <div className="space-y-2">
             <Label>Domain</Label>
             <div className="h-10 animate-pulse rounded-md bg-muted" />
@@ -460,7 +475,9 @@ function ConfigureStep({
               {errors.domain && (
                 <p className="text-sm text-destructive">{errors.domain}</p>
               )}
-              {mode === 'import' && discoverableDomains && !discoverableDomains.supported ? (
+              {mode === 'import' &&
+              discoverableDomains &&
+              !discoverableDomains.supported ? (
                 <p className="text-sm text-muted-foreground">
                   {selectedProvider?.provider_type ?? 'This provider'} does not
                   support listing registered domains — enter the domain name as
@@ -469,8 +486,9 @@ function ConfigureStep({
               ) : mode === 'import' && discoverableDomains?.error ? (
                 <p className="flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-500">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                  Couldn't list domains from your provider ({discoverableDomains.error}).
-                  Enter the domain name manually below.
+                  Couldn't list domains from your provider (
+                  {discoverableDomains.error}). Enter the domain name manually
+                  below.
                 </p>
               ) : mode === 'import' && hasPickerOptions && manualEntry ? (
                 <p className="text-sm text-muted-foreground">
@@ -512,7 +530,9 @@ function ConfigureStep({
                   placeholder="12345678-1234-1234-1234-123456789012"
                   value={providerIdentityId}
                   onChange={(e) => onProviderIdentityIdChange(e.target.value)}
-                  className={errors.provider_identity_id ? 'border-destructive' : ''}
+                  className={
+                    errors.provider_identity_id ? 'border-destructive' : ''
+                  }
                   autoComplete="off"
                 />
                 {errors.provider_identity_id && (
@@ -572,7 +592,9 @@ function ReviewStep({
       <CardContent className="space-y-4">
         <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-3 text-sm">
           <dt className="text-muted-foreground">Mode</dt>
-          <dd className="font-medium capitalize">{mode === 'create' ? 'Create new' : 'Import existing'}</dd>
+          <dd className="font-medium capitalize">
+            {mode === 'create' ? 'Create new' : 'Import existing'}
+          </dd>
 
           <dt className="text-muted-foreground">Provider</dt>
           <dd>
@@ -598,7 +620,9 @@ function ReviewStep({
           {mode === 'import' && providerIdentityId && (
             <>
               <dt className="text-muted-foreground">Identity ID</dt>
-              <dd className="font-mono text-xs break-all">{providerIdentityId}</dd>
+              <dd className="font-mono text-xs break-all">
+                {providerIdentityId}
+              </dd>
             </>
           )}
         </dl>
@@ -660,11 +684,12 @@ export function EmailDomainNew() {
   // provider is chosen. Always resolves (never throws) per the endpoint's
   // contract: `supported`/`error` drive the manual-entry fallback in
   // ConfigureStep rather than an error boundary.
-  const { data: discoverableDomains, isLoading: isLoadingDiscoverableDomains } = useQuery({
-    queryKey: ['discoverable-domains', providerId],
-    queryFn: () => listDiscoverableDomains(providerId as number),
-    enabled: mode === 'import' && providerId !== undefined,
-  })
+  const { data: discoverableDomains, isLoading: isLoadingDiscoverableDomains } =
+    useQuery({
+      queryKey: ['discoverable-domains', providerId],
+      queryFn: () => listDiscoverableDomains(providerId as number),
+      enabled: mode === 'import' && providerId !== undefined,
+    })
 
   const createMutation = useMutation({
     mutationFn: createEmailDomain,
@@ -710,8 +735,7 @@ export function EmailDomainNew() {
 
   // Step 2 validation using the same Zod schemas
   const validateStep2 = (): boolean => {
-    const schema =
-      mode === 'create' ? createDomainSchema : importDomainSchema
+    const schema = mode === 'create' ? createDomainSchema : importDomainSchema
     const result = schema.safeParse({
       provider_id: providerId,
       domain,
@@ -735,9 +759,14 @@ export function EmailDomainNew() {
     // look up an existing identity by domain name alone, so without a UUID
     // here the import would fail server-side with a provisioning-sounding
     // error that doesn't describe this missing input at all.
-    if (mode === 'import' && isSelectedProviderScaleway && !providerIdentityId.trim()) {
+    if (
+      mode === 'import' &&
+      isSelectedProviderScaleway &&
+      !providerIdentityId.trim()
+    ) {
       setStep2Errors({
-        provider_identity_id: 'A Scaleway domain UUID is required to import this domain',
+        provider_identity_id:
+          'A Scaleway domain UUID is required to import this domain',
       })
       return false
     }
@@ -823,8 +852,9 @@ export function EmailDomainNew() {
                     How do you want to add this domain?
                   </h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    Choose whether you are registering a brand-new domain identity or
-                    bringing in one you already created in your provider console.
+                    Choose whether you are registering a brand-new domain
+                    identity or bringing in one you already created in your
+                    provider console.
                   </p>
                 </div>
                 <ChooseModeStep selected={mode} onSelect={setMode} />
@@ -857,7 +887,9 @@ export function EmailDomainNew() {
                     <CardContent className="pt-6 flex flex-col items-center gap-3 py-10">
                       <Globe className="size-8 text-muted-foreground" />
                       <div className="text-center">
-                        <p className="font-medium">No email providers configured</p>
+                        <p className="font-medium">
+                          No email providers configured
+                        </p>
                         <p className="mt-1 text-sm text-muted-foreground">
                           You need to add a provider before setting up a domain.{' '}
                           <button
@@ -881,7 +913,10 @@ export function EmailDomainNew() {
                     errors={step2Errors}
                     onProviderChange={(id) => {
                       setProviderId(id)
-                      setStep2Errors((prev) => ({ ...prev, provider_id: undefined }))
+                      setStep2Errors((prev) => ({
+                        ...prev,
+                        provider_id: undefined,
+                      }))
                     }}
                     onDomainChange={(value) => {
                       setDomain(value)

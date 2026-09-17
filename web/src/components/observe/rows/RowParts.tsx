@@ -29,7 +29,7 @@ export function ObserveRowShell({
         'group flex w-full items-center gap-3 px-4 py-2 text-left',
         'border-b border-border/50 last:border-b-0',
         'hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none',
-        'transition-colors',
+        'transition-colors'
       )}
     >
       <Timestamp ts={ts} />

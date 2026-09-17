@@ -31,8 +31,6 @@ export function ThemeWrapper({ children }: ThemeWrapperProps) {
   // overflowing by the mobile browser-chrome height — that mismatch was the
   // source of the extra vertical scroll + empty band on mobile.
   return (
-    <div className={`min-h-dvh bg-background ${resolvedTheme}`}>
-      {children}
-    </div>
+    <div className={`min-h-dvh bg-background ${resolvedTheme}`}>{children}</div>
   )
 }

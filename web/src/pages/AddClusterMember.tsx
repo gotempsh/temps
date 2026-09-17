@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { adminListNodesOptions, getServiceOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  adminListNodesOptions,
+  getServiceOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -98,7 +101,8 @@ function stepStatus(
   const stepIdx = order.indexOf(stepId)
   if (currentIdx < 0) return 'pending'
   if (stepIdx < currentIdx) return 'done'
-  if (stepIdx === currentIdx) return member.status === 'running' && stepId === 'done' ? 'done' : 'active'
+  if (stepIdx === currentIdx)
+    return member.status === 'running' && stepId === 'done' ? 'done' : 'active'
   return 'pending'
 }
 
@@ -228,8 +232,8 @@ export function AddClusterMember() {
           <CardTitle>Add Cluster Member</CardTitle>
           <CardDescription>
             Provision a new replica and register it with the existing
-            pg_auto_failover monitor. The role reconciler refreshes
-            role-aliased VIP records on its next tick.
+            pg_auto_failover monitor. The role reconciler refreshes role-aliased
+            VIP records on its next tick.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

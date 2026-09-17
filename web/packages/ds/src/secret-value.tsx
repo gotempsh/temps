@@ -14,7 +14,13 @@ import { cn } from './lib/cn'
  * a reveal is an API call that is audit-logged; keep the toggle so the log
  * has something to record.
  */
-export function SecretValue({ value, secret, revealed = false, onToggle, className }: {
+export function SecretValue({
+  value,
+  secret,
+  revealed = false,
+  onToggle,
+  className,
+}: {
   value: string
   secret: boolean
   revealed?: boolean
@@ -23,14 +29,40 @@ export function SecretValue({ value, secret, revealed = false, onToggle, classNa
 }) {
   const shown = !secret || revealed
   return (
-    <span className={cn('flex min-w-0 items-center gap-1 font-mono', className)}>
-      <span className={cn('min-w-0 truncate', !shown && 'tracking-wider text-muted-foreground')} aria-label={shown ? undefined : 'hidden secret value'}>{shown ? value : '••••••••••••'}</span>
+    <span
+      className={cn('flex min-w-0 items-center gap-1 font-mono', className)}
+    >
+      <span
+        className={cn(
+          'min-w-0 truncate',
+          !shown && 'tracking-wider text-muted-foreground'
+        )}
+        aria-label={shown ? undefined : 'hidden secret value'}
+      >
+        {shown ? value : '••••••••••••'}
+      </span>
       {secret && (
-        <button type="button" onClick={onToggle} aria-pressed={revealed} aria-label={revealed ? 'Hide value' : 'Reveal value'} title={revealed ? 'hide' : 'reveal'} className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground">
-          {revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-pressed={revealed}
+          aria-label={revealed ? 'Hide value' : 'Reveal value'}
+          title={revealed ? 'hide' : 'reveal'}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
+        >
+          {revealed ? (
+            <EyeOff className="h-3.5 w-3.5" />
+          ) : (
+            <Eye className="h-3.5 w-3.5" />
+          )}
         </button>
       )}
-      <CopyButton value={value} minimal label="Copy value" className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground" />
+      <CopyButton
+        value={value}
+        minimal
+        label="Copy value"
+        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+      />
     </span>
   )
 }

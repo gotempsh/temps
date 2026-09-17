@@ -34,7 +34,17 @@ import { Kbd } from './kbd'
  * `skin` is the token class to apply to the portal content, since dialogs
  * render outside the `.operator` root.
  */
-export function EchoDialog({ trigger, title, description, confirmWord, steps, onDone, destructive, skin = 'operator ink v1', stepMs = 600 }: {
+export function EchoDialog({
+  trigger,
+  title,
+  description,
+  confirmWord,
+  steps,
+  onDone,
+  destructive,
+  skin = 'operator ink v1',
+  stepMs = 600,
+}: {
   trigger: ReactNode
   /** Equivalent `temps` CLI command. Documented, not rendered. */
   echo?: string
@@ -58,27 +68,70 @@ export function EchoDialog({ trigger, title, description, confirmWord, steps, on
     const id = window.setInterval(() => {
       i += 1
       setStep(i)
-      if (i >= steps.length) { window.clearInterval(id); setPhase('done'); onDone() }
+      if (i >= steps.length) {
+        window.clearInterval(id)
+        setPhase('done')
+        onDone()
+      }
     }, stepMs)
   }
   return (
-    <AlertDialog onOpenChange={(o) => { if (!o) { setTyped(''); setPhase('idle'); setStep(0) } }}>
+    <AlertDialog
+      onOpenChange={(o) => {
+        if (!o) {
+          setTyped('')
+          setPhase('idle')
+          setStep(0)
+        }
+      }}
+    >
       <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
       <AlertDialogContent className={cn(skin, 'gap-0 p-0 sm:rounded')}>
         <div className="space-y-4 p-4">
           <AlertDialogHeader className="space-y-1">
-            <AlertDialogTitle className="text-sm font-semibold">{title}</AlertDialogTitle>
-            <AlertDialogDescription className="op-prose text-xs">{description}</AlertDialogDescription>
+            <AlertDialogTitle className="text-sm font-semibold">
+              {title}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="op-prose text-xs">
+              {description}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           {phase === 'idle' ? (
             <div className="space-y-1">
-              <label htmlFor={inputId} className="op-label">type the name to confirm</label>
+              <label htmlFor={inputId} className="op-label">
+                type the name to confirm
+              </label>
               <div className="flex items-center gap-2">
                 {/* The whole badge is the copy button: clicking the name copies it, same as clicking the icon. */}
-                <CopyButton value={confirmWord} minimal label={`Copy ${confirmWord}`} title={`Copy ${confirmWord}`} className="h-8 shrink-0 gap-1.5 border bg-muted pl-2 pr-1.5 font-mono text-xs font-normal hover:bg-background [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:text-muted-foreground">
-                  <span className="max-w-[40vw] truncate sm:max-w-56">{confirmWord}</span>
+                <CopyButton
+                  value={confirmWord}
+                  minimal
+                  label={`Copy ${confirmWord}`}
+                  title={`Copy ${confirmWord}`}
+                  className="h-8 shrink-0 gap-1.5 border bg-muted pl-2 pr-1.5 font-mono text-xs font-normal hover:bg-background [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:text-muted-foreground"
+                >
+                  <span className="max-w-[40vw] truncate sm:max-w-56">
+                    {confirmWord}
+                  </span>
                 </CopyButton>
-                <Input id={inputId} value={typed} onChange={(e) => setTyped(e.target.value)} placeholder={confirmWord} aria-invalid={typed.length > 0 && !ok} className={cn('h-8 min-w-0 flex-1 font-mono text-xs', typed.length > 0 && !ok && 'border-destructive')} autoComplete="off" onKeyDown={(e) => { if (e.key === 'Enter' && ok) { e.preventDefault(); run() } }} />
+                <Input
+                  id={inputId}
+                  value={typed}
+                  onChange={(e) => setTyped(e.target.value)}
+                  placeholder={confirmWord}
+                  aria-invalid={typed.length > 0 && !ok}
+                  className={cn(
+                    'h-8 min-w-0 flex-1 font-mono text-xs',
+                    typed.length > 0 && !ok && 'border-destructive'
+                  )}
+                  autoComplete="off"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && ok) {
+                      e.preventDefault()
+                      run()
+                    }
+                  }}
+                />
               </div>
             </div>
           ) : (
@@ -87,29 +140,69 @@ export function EchoDialog({ trigger, title, description, confirmWord, steps, on
                 <li key={s} className="flex h-7 items-center gap-2 px-2">
                   {/* The running step is marked by glyph and word, never by animation: motion is 100ms
                       transform/shadow/colour only, and a pulsing row reads as a fault. */}
-                  <span aria-hidden className={cn('w-3 text-center', i < step ? 'text-success' : i === step && phase === 'running' ? 'text-warning' : 'text-muted-foreground')}>
-                    {i < step ? '●' : i === step && phase === 'running' ? '◐' : '○'}
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'w-3 text-center',
+                      i < step
+                        ? 'text-success'
+                        : i === step && phase === 'running'
+                          ? 'text-warning'
+                          : 'text-muted-foreground'
+                    )}
+                  >
+                    {i < step
+                      ? '●'
+                      : i === step && phase === 'running'
+                        ? '◐'
+                        : '○'}
                   </span>
-                  <span className={cn(i > step && 'text-muted-foreground')}>{s}</span>
-                  <span className="ml-auto text-[10px] text-muted-foreground">{i < step ? 'done' : i === step && phase === 'running' ? 'running' : 'waiting'}</span>
+                  <span className={cn(i > step && 'text-muted-foreground')}>
+                    {s}
+                  </span>
+                  <span className="ml-auto text-[10px] text-muted-foreground">
+                    {i < step
+                      ? 'done'
+                      : i === step && phase === 'running'
+                        ? 'running'
+                        : 'waiting'}
+                  </span>
                 </li>
               ))}
             </ol>
           )}
           <AlertDialogFooter className="gap-2">
             {phase === 'done' ? (
-              <AlertDialogCancel className="h-8 text-xs">close</AlertDialogCancel>
+              <AlertDialogCancel className="h-8 text-xs">
+                close
+              </AlertDialogCancel>
             ) : (
               <>
-                <AlertDialogCancel className="h-8 text-xs" disabled={phase === 'running'}>cancel <Kbd keys="esc" className="ml-1 opacity-70" /></AlertDialogCancel>
+                <AlertDialogCancel
+                  className="h-8 text-xs"
+                  disabled={phase === 'running'}
+                >
+                  cancel <Kbd keys="esc" className="ml-1 opacity-70" />
+                </AlertDialogCancel>
                 <AlertDialogAction
                   disabled={!ok || phase === 'running'}
-                  onClick={(e) => { e.preventDefault(); run() }}
-                  className={cn('h-8 text-xs disabled:opacity-100', destructive
-                    ? 'op-fill-destructive disabled:border-destructive/40 disabled:bg-transparent disabled:text-destructive/60'
-                    : 'op-primary disabled:border disabled:border-foreground/40 disabled:bg-transparent disabled:text-foreground/60')}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    run()
+                  }}
+                  className={cn(
+                    'h-8 text-xs disabled:opacity-100',
+                    destructive
+                      ? 'op-fill-destructive disabled:border-destructive/40 disabled:bg-transparent disabled:text-destructive/60'
+                      : 'op-primary disabled:border disabled:border-foreground/40 disabled:bg-transparent disabled:text-foreground/60'
+                  )}
                 >
-                  {phase === 'running' ? `step ${Math.min(step + 1, steps.length)} of ${steps.length}` : title.toLowerCase()} {phase === 'idle' && <Kbd keys="⏎" className="ml-1 opacity-70" />}
+                  {phase === 'running'
+                    ? `step ${Math.min(step + 1, steps.length)} of ${steps.length}`
+                    : title.toLowerCase()}{' '}
+                  {phase === 'idle' && (
+                    <Kbd keys="⏎" className="ml-1 opacity-70" />
+                  )}
                 </AlertDialogAction>
               </>
             )}

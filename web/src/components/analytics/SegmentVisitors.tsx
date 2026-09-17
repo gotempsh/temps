@@ -23,7 +23,14 @@ import {
 } from '@/components/ui/table'
 import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { ArrowLeft, Bot, ChevronLeft, ChevronRight, Globe, User } from 'lucide-react'
+import {
+  ArrowLeft,
+  Bot,
+  ChevronLeft,
+  ChevronRight,
+  Globe,
+  User,
+} from 'lucide-react'
 import * as React from 'react'
 import { useNavigate } from 'react-router'
 import type { DimensionKey } from './DimensionList'
@@ -107,7 +114,8 @@ function countryCodeToFlag(countryCode: string | null | undefined): string {
 function formatLocation(visitor: VisitorInfo): string {
   const parts: string[] = []
   if (visitor.city) parts.push(visitor.city)
-  if (visitor.region && visitor.region !== visitor.city) parts.push(visitor.region)
+  if (visitor.region && visitor.region !== visitor.city)
+    parts.push(visitor.region)
   if (visitor.country) parts.push(visitor.country)
   return parts.join(', ') || 'Unknown'
 }
@@ -242,12 +250,18 @@ export function SegmentVisitors({
                 <TableRow>
                   <TableHead>Visitor</TableHead>
                   <TableHead>Last action</TableHead>
-                  <TableHead className="hidden md:table-cell">Location</TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Location
+                  </TableHead>
                   <TableHead className="hidden lg:table-cell">
                     Current page
                   </TableHead>
-                  <TableHead className="hidden lg:table-cell">Channel</TableHead>
-                  <TableHead className="hidden md:table-cell">First seen</TableHead>
+                  <TableHead className="hidden lg:table-cell">
+                    Channel
+                  </TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    First seen
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -257,7 +271,7 @@ export function SegmentVisitors({
                     className="cursor-pointer hover:bg-muted/50"
                     onClick={() =>
                       navigate(
-                        `/projects/${project.slug}/analytics/visitors/${visitor.id}`,
+                        `/projects/${project.slug}/analytics/visitors/${visitor.id}`
                       )
                     }
                   >
@@ -330,8 +344,9 @@ export function SegmentVisitors({
         <CardFooter className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm text-muted-foreground">
             <span className="hidden sm:inline">
-              Showing {offset + 1}–{Math.min(offset + visitors.length, totalCount)}{' '}
-              of {totalCount.toLocaleString()} visitor
+              Showing {offset + 1}–
+              {Math.min(offset + visitors.length, totalCount)} of{' '}
+              {totalCount.toLocaleString()} visitor
               {totalCount === 1 ? '' : 's'}
             </span>
             <span className="sm:hidden">

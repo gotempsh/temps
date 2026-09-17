@@ -2853,8 +2853,8 @@ export function GitProviderFlow({
                 <AlertDescription className="text-sm">
                   Webhooks for generic providers are not registered
                   automatically. After connecting, open the provider&apos;s
-                  detail page to find the webhook URL to add manually on your Git
-                  host.
+                  detail page to find the webhook URL to add manually on your
+                  Git host.
                 </AlertDescription>
               </Alert>
 

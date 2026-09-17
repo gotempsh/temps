@@ -129,14 +129,14 @@ export function StatusDot({
         <span
           className={cn(
             'absolute inline-flex size-full animate-ping rounded-full opacity-60',
-            meta.dotClass,
+            meta.dotClass
           )}
         />
       )}
       <span
         className={cn(
           'relative inline-flex size-2 rounded-full',
-          meta.dotClass,
+          meta.dotClass
         )}
         aria-hidden
       />
@@ -160,9 +160,7 @@ export function AlertStateBadge({
   if (state === 'firing') {
     return (
       <Badge variant="destructive" className="shrink-0">
-        {firingSeriesCount
-          ? `${firingSeriesCount} series firing`
-          : 'Firing'}
+        {firingSeriesCount ? `${firingSeriesCount} series firing` : 'Firing'}
       </Badge>
     )
   }

@@ -162,7 +162,9 @@ export function RepositoryCatalog({
               {catalog.data?.plugins.length === 0 ? (
                 <>
                   <p>No catalog plugins support this server’s platform yet.</p>
-                  <p>Compatible plugins will appear here when they are listed.</p>
+                  <p>
+                    Compatible plugins will appear here when they are listed.
+                  </p>
                 </>
               ) : (
                 <p>No matching plugins. Try another search or category.</p>

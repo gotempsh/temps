@@ -60,7 +60,8 @@ function ConnectionCard({
   onSelect: () => void
 }) {
   const Icon = getProviderIcon(provider?.provider_type || 'github')
-  const AccountIcon = connection.account_type === 'Organization' ? Building2 : User
+  const AccountIcon =
+    connection.account_type === 'Organization' ? Building2 : User
 
   return (
     <Card
@@ -127,7 +128,11 @@ function ConnectionCard({
   )
 }
 
-export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionStepProps) {
+export function GitConnectionStep({
+  onSuccess,
+  onBack,
+  onSkip,
+}: GitConnectionStepProps) {
   const [selectedConnection, setSelectedConnection] = useState<number | null>(
     null
   )
@@ -162,7 +167,8 @@ export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionSt
             Connect Git Provider (Optional)
           </h2>
           <p className="text-sm sm:text-base text-muted-foreground">
-            Connect your Git provider to deploy from private repositories, or skip to use public repos and templates
+            Connect your Git provider to deploy from private repositories, or
+            skip to use public repos and templates
           </p>
         </div>
 
@@ -174,7 +180,11 @@ export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionSt
 
         {onSkip && (
           <div className="flex items-center justify-center pt-4 border-t">
-            <Button variant="ghost" onClick={onSkip} className="text-muted-foreground">
+            <Button
+              variant="ghost"
+              onClick={onSkip}
+              className="text-muted-foreground"
+            >
               Skip for now - I&apos;ll use templates or public repos
               <ArrowRight className="h-4 w-4 ml-2" />
             </Button>
@@ -198,9 +208,7 @@ export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionSt
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-xl sm:text-2xl font-bold">
-          Select Git Connection
-        </h2>
+        <h2 className="text-xl sm:text-2xl font-bold">Select Git Connection</h2>
         <p className="text-sm sm:text-base text-muted-foreground">
           Choose an existing connection or add a new one
         </p>
@@ -270,7 +278,11 @@ export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionSt
             <div className="flex-1" />
             <div className="flex items-center gap-2">
               {onSkip && (
-                <Button variant="ghost" onClick={onSkip} className="text-muted-foreground">
+                <Button
+                  variant="ghost"
+                  onClick={onSkip}
+                  className="text-muted-foreground"
+                >
                   Skip
                 </Button>
               )}

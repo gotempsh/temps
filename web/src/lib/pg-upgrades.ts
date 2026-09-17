@@ -52,7 +52,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail || body.title || detail
     } catch {
       // fall through with statusText
@@ -71,29 +74,29 @@ export async function listPgUpgrades(serviceId: number): Promise<PgUpgrade[]> {
 
 export async function getPgUpgrade(
   serviceId: number,
-  upgradeId: number,
+  upgradeId: number
 ): Promise<PgUpgrade> {
   const response = await fetch(
     `/api/external-services/${serviceId}/upgrades/${upgradeId}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<PgUpgrade>(response)
 }
 
 export async function getPgUpgradeLogs(
   serviceId: number,
-  upgradeId: number,
+  upgradeId: number
 ): Promise<PgUpgradeLog> {
   const response = await fetch(
     `/api/external-services/${serviceId}/upgrades/${upgradeId}/logs`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow<PgUpgradeLog>(response)
 }
 
 export async function startPgUpgrade(
   serviceId: number,
-  body: StartPgUpgradeBody,
+  body: StartPgUpgradeBody
 ): Promise<PgUpgrade> {
   const response = await fetch(`/api/external-services/${serviceId}/upgrades`, {
     method: 'POST',
@@ -106,22 +109,22 @@ export async function startPgUpgrade(
 
 export async function retryPgUpgrade(
   serviceId: number,
-  upgradeId: number,
+  upgradeId: number
 ): Promise<PgUpgrade> {
   const response = await fetch(
     `/api/external-services/${serviceId}/upgrades/${upgradeId}/retry`,
-    { method: 'POST', credentials: 'include' },
+    { method: 'POST', credentials: 'include' }
   )
   return readJsonOrThrow<PgUpgrade>(response)
 }
 
 export async function cancelPgUpgrade(
   serviceId: number,
-  upgradeId: number,
+  upgradeId: number
 ): Promise<PgUpgrade> {
   const response = await fetch(
     `/api/external-services/${serviceId}/upgrades/${upgradeId}/cancel`,
-    { method: 'POST', credentials: 'include' },
+    { method: 'POST', credentials: 'include' }
   )
   return readJsonOrThrow<PgUpgrade>(response)
 }
@@ -135,11 +138,11 @@ export async function cancelPgUpgrade(
  */
 export async function rollbackPgUpgrade(
   serviceId: number,
-  upgradeId: number,
+  upgradeId: number
 ): Promise<PgUpgrade> {
   const response = await fetch(
     `/api/external-services/${serviceId}/upgrades/${upgradeId}/rollback`,
-    { method: 'POST', credentials: 'include' },
+    { method: 'POST', credentials: 'include' }
   )
   if (!response.ok) {
     let problem: Record<string, unknown> = { status: response.status }

@@ -81,9 +81,7 @@ export function DomainSelector({
             className
           )}
         >
-          <span className="truncate">
-            {value || placeholder}
-          </span>
+          <span className="truncate">{value || placeholder}</span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
@@ -165,20 +163,24 @@ function DomainStatusBadge({ status }: { status: string }) {
   const config: Record<string, { label: string; className: string }> = {
     active: {
       label: 'Active',
-      className: 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300',
+      className:
+        'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300',
     },
     // Still serving a live cert, but the last renewal failed — warn, don't alarm.
     active_renewal_failed: {
       label: 'Renewal failed',
-      className: 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300',
+      className:
+        'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300',
     },
     pending: {
       label: 'Pending',
-      className: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300',
+      className:
+        'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300',
     },
     pending_dns: {
       label: 'DNS',
-      className: 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300',
+      className:
+        'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300',
     },
     failed: {
       label: 'Failed',
@@ -192,7 +194,12 @@ function DomainStatusBadge({ status }: { status: string }) {
   }
 
   return (
-    <span className={cn('ml-2 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium', className)}>
+    <span
+      className={cn(
+        'ml-2 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
+        className
+      )}
+    >
       {label}
     </span>
   )

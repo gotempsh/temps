@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  AlertOctagon,
-  CircleDollarSign,
-  Network,
-  Workflow,
-} from 'lucide-react'
+import { AlertOctagon, CircleDollarSign, Network, Workflow } from 'lucide-react'
 import type { ObservabilityEvent } from '../types'
 import { ObserveRowShell, SeverityBadge, StatusBadge } from './RowParts'
 
@@ -97,7 +92,7 @@ export function ObserveRow({
 
 function formatAmount(
   minor: number,
-  currency: string | null | undefined,
+  currency: string | null | undefined
 ): string {
   const major = minor / 100
   if (!currency) return major.toFixed(2)

@@ -79,7 +79,8 @@ export function normalizeUrl(value: string): string | null {
   // This is tidiness rather than a boundary — the scheme check below is what
   // actually constrains the result, and a bare `evil.com` is accepted by design
   // (custom domains are user-supplied hostnames).
-  if (!hasScheme && /^[/\\]/.test(value.replace(/^[\u0000- ]+/, ''))) return null
+  if (!hasScheme && /^[/\\]/.test(value.replace(/^[\u0000- ]+/, '')))
+    return null
   const candidate = hasScheme ? value : `https://${value}`
   try {
     const { protocol } = new URL(candidate)

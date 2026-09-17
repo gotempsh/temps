@@ -60,8 +60,8 @@ describe('detectedPortForSelection', () => {
   })
 
   test('normalizes a trailing slash in nested preset paths', () => {
-    expect(
-      detectedPortForSelection(presets, 'dockerfile::apps/api/')
-    ).toBe(8080)
+    expect(detectedPortForSelection(presets, 'dockerfile::apps/api/')).toBe(
+      8080
+    )
   })
 })

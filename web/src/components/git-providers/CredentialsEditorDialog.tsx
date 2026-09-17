@@ -128,7 +128,7 @@ function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
 /** True when the provider's auth method has editable fields. Use to gate
  *  whether to show the "Edit Credentials" action in the UI. */
 export function providerHasEditableCredentials(
-  provider: ProviderResponse,
+  provider: ProviderResponse
 ): boolean {
   return fieldsForProvider(provider).length > 0
 }

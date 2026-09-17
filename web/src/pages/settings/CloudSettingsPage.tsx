@@ -78,9 +78,7 @@ export function CloudSettingsPage() {
   const reconcileBackupSource = useMutation(
     reconcileCloudBackupSourceMutation()
   )
-  const ensureBackupSchedule = useMutation(
-    ensureCloudBackupScheduleMutation()
-  )
+  const ensureBackupSchedule = useMutation(ensureCloudBackupScheduleMutation())
   const repointArchive = useMutation(repointContinuousArchiveSourceMutation())
   const form = useForm<EnrollmentForm>({
     resolver: zodResolver(enrollmentSchema),
@@ -153,7 +151,8 @@ export function CloudSettingsPage() {
   // nightly Cloud schedule can back it up. The endpoint is the same one the
   // service page uses; the status poll picks up the cleared conflict.
   const repointToCloud = async (conflict: ManagedBackupArchiveConflict) => {
-    const managedSourceId = status.data?.managed_backup_setup?.managed_s3_source_id
+    const managedSourceId =
+      status.data?.managed_backup_setup?.managed_s3_source_id
     if (managedSourceId == null) return
     try {
       await repointArchive.mutateAsync({
@@ -199,7 +198,9 @@ export function CloudSettingsPage() {
     queryClient.setQueryData(
       getCloudStatusOptions().queryKey,
       (current: CloudStatus | undefined) =>
-        current ? { ...current, managed_backup_setup: managedBackupSetup } : current
+        current
+          ? { ...current, managed_backup_setup: managedBackupSetup }
+          : current
     )
 
   const retryBackupSource = async () => {
@@ -699,7 +700,8 @@ function BackupScheduleStatus({
             )}
           </p>
           <p className="text-muted-foreground">
-            Runs <code className="font-mono">{schedule.schedule_expression}</code>,
+            Runs{' '}
+            <code className="font-mono">{schedule.schedule_expression}</code>,
             keeps each backup {schedule.retention_period} day
             {schedule.retention_period === 1 ? '' : 's'}. Next run: {nextRun}.
           </p>
@@ -776,11 +778,11 @@ function ArchiveConflicts({
       </AlertTitle>
       <AlertDescription className="space-y-3">
         <p>
-          These services keep their WAL or binlog archive on another S3
-          source, so the Cloud schedule cannot back them up and their runs
-          fail. Repointing moves archiving to Temps Cloud from now on; data
-          already archived stays under the old source and is no longer
-          replayable from here.
+          These services keep their WAL or binlog archive on another S3 source,
+          so the Cloud schedule cannot back them up and their runs fail.
+          Repointing moves archiving to Temps Cloud from now on; data already
+          archived stays under the old source and is no longer replayable from
+          here.
         </p>
         <ul className="space-y-2">
           {conflicts.map((conflict) => (

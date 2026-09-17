@@ -7,8 +7,12 @@ import { platformToolGroups } from './platform-tools'
 describe('platform tools AI discovery', () => {
   test('separates persistent contexts from standalone compute', () => {
     const items = platformToolGroups.flatMap((group) => group.items)
-    expect(items.find((item) => item.title === 'Workspaces')?.url).toBe('/workspaces')
-    expect(items.find((item) => item.title === 'Sandboxes')?.url).toBe('/sandboxes')
+    expect(items.find((item) => item.title === 'Workspaces')?.url).toBe(
+      '/workspaces'
+    )
+    expect(items.find((item) => item.title === 'Sandboxes')?.url).toBe(
+      '/sandboxes'
+    )
   })
   test('keeps harness setup discoverable without conflating built-in AI', () => {
     const automate = platformToolGroups.find(

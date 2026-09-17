@@ -141,7 +141,12 @@ export function LabelFilterBuilder({
     commit(rows.map((f, idx) => (idx === i ? { ...f, ...patch } : f)))
   const remove = (i: number) => commit(rows.filter((_, idx) => idx !== i))
 
-  const keysQuery = useMetricLabelKeys({ projectId, metricName, fromIso, toIso })
+  const keysQuery = useMetricLabelKeys({
+    projectId,
+    metricName,
+    fromIso,
+    toIso,
+  })
   const allKeys = keysQuery.data?.keys ?? []
 
   return (
@@ -421,9 +426,14 @@ export function GroupByBuilder({
    */
   cardinalityHint?: string
 }) {
-  const keysQuery = useMetricLabelKeys({ projectId, metricName, fromIso, toIso })
+  const keysQuery = useMetricLabelKeys({
+    projectId,
+    metricName,
+    fromIso,
+    toIso,
+  })
   const availableKeys = (keysQuery.data?.keys ?? []).filter(
-    (k) => !value.includes(k),
+    (k) => !value.includes(k)
   )
   const atMax = value.length >= MAX_GROUP_BY_KEYS
 
@@ -533,8 +543,7 @@ function GroupByCardinalityWarning({
         end_time: toIso,
       },
     }),
-    enabled:
-      !!projectId && metricName.length > 0 && labelKey.trim().length > 0,
+    enabled: !!projectId && metricName.length > 0 && labelKey.trim().length > 0,
   })
 
   const count = valuesQuery.data?.values.length ?? 0

@@ -26,13 +26,7 @@ import {
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { customAlphabet } from 'nanoid'
-import {
-  ChevronDown,
-  Eye,
-  EyeOff,
-  Loader2,
-  Sparkles,
-} from 'lucide-react'
+import { ChevronDown, Eye, EyeOff, Loader2, Sparkles } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { type FieldErrors, useForm } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -430,8 +424,7 @@ export function JsonSchemaForm({
     isRequired: boolean
   ) => {
     const revealed = revealedPasswords[fieldName] ?? false
-    const isGeneratable =
-      !isRequired && fieldName.toLowerCase() === 'password'
+    const isGeneratable = !isRequired && fieldName.toLowerCase() === 'password'
 
     return (
       <FormField
@@ -443,9 +436,7 @@ export function JsonSchemaForm({
             <div className="flex items-center justify-between gap-2">
               <FormLabel>
                 {humanizeLabel(fieldName)}
-                {isRequired && (
-                  <span className="text-destructive ml-1">*</span>
-                )}
+                {isRequired && <span className="text-destructive ml-1">*</span>}
               </FormLabel>
               {isGeneratable && (
                 <Button
@@ -603,7 +594,10 @@ export function JsonSchemaForm({
       if (nextFieldName && isPairedField(fieldName, nextFieldName)) {
         const nextProperty = schema.properties[nextFieldName]
         elements.push(
-          <div key={fieldName} className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div
+            key={fieldName}
+            className="grid grid-cols-1 sm:grid-cols-2 gap-4"
+          >
             {renderField(fieldName, property)}
             {renderField(nextFieldName, nextProperty)}
           </div>

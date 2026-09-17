@@ -72,7 +72,9 @@ async function fetchEmailStats(domainId?: number): Promise<EmailStats> {
     domainId !== undefined ? { query: { domain_id: domainId } } : undefined
   )
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email stats'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email stats')
+    )
   }
   return response.data
 }
@@ -80,7 +82,9 @@ async function fetchEmailStats(domainId?: number): Promise<EmailStats> {
 async function listEmailDomains(): Promise<EmailDomain[]> {
   const response = await listDomains2()
   if (response.error) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email domains')
+    )
   }
   return response.data ?? []
 }
@@ -163,11 +167,14 @@ export function EmailsSentList() {
 
   const totalPages = emails ? Math.ceil(emails.total / filters.page_size) : 0
 
-  const handleFilterChange = (key: string, value: string | number | undefined) => {
+  const handleFilterChange = (
+    key: string,
+    value: string | number | undefined
+  ) => {
     setFilters((prev) => ({
       ...prev,
       [key]: value,
-      page: key !== 'page' ? 1 : value as number, // Reset page when filters change
+      page: key !== 'page' ? 1 : (value as number), // Reset page when filters change
     }))
   }
 
@@ -239,7 +246,10 @@ export function EmailsSentList() {
         <Select
           value={filters.domain_id?.toString() ?? 'all'}
           onValueChange={(value) =>
-            handleFilterChange('domain_id', value === 'all' ? undefined : parseInt(value))
+            handleFilterChange(
+              'domain_id',
+              value === 'all' ? undefined : parseInt(value)
+            )
           }
         >
           <SelectTrigger className="w-full sm:w-[200px]">
@@ -304,13 +314,17 @@ export function EmailsSentList() {
                     onClick={() => navigate(`/email/${email.id}`)}
                   >
                     <TableCell className="max-w-[300px]">
-                      <div className="font-medium truncate">{email.subject}</div>
+                      <div className="font-medium truncate">
+                        {email.subject}
+                      </div>
                       <div className="text-xs text-muted-foreground truncate">
                         From: {email.from_address}
                       </div>
                     </TableCell>
                     <TableCell className="max-w-[200px]">
-                      <div className="truncate">{email.to_addresses.join(', ')}</div>
+                      <div className="truncate">
+                        {email.to_addresses.join(', ')}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={email.status} />
@@ -322,7 +336,9 @@ export function EmailsSentList() {
                           {email.open_count}
                         </span>
                       ) : (
-                        <span className="text-xs text-muted-foreground">--</span>
+                        <span className="text-xs text-muted-foreground">
+                          --
+                        </span>
                       )}
                     </TableCell>
                     <TableCell className="hidden md:table-cell">
@@ -332,7 +348,9 @@ export function EmailsSentList() {
                           {email.click_count}
                         </span>
                       ) : (
-                        <span className="text-xs text-muted-foreground">--</span>
+                        <span className="text-xs text-muted-foreground">
+                          --
+                        </span>
                       )}
                     </TableCell>
                     <TableCell className="text-muted-foreground">

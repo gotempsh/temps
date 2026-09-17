@@ -170,15 +170,17 @@ function composeServiceNamesFor(project: {
   preset_config?: unknown
 }): string[] {
   const cfg = (project.preset_config ?? {}) as Record<string, unknown>
-  const services = (cfg.composeServices ?? cfg.compose_services ?? []) as Array<{
+  const services = (cfg.composeServices ??
+    cfg.compose_services ??
+    []) as Array<{
     name?: string
   }>
   return Array.from(
     new Set(
       services
         .map((service) => service?.name)
-        .filter((name): name is string => typeof name === 'string' && !!name),
-    ),
+        .filter((name): name is string => typeof name === 'string' && !!name)
+    )
   ).sort()
 }
 
@@ -205,7 +207,7 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
     },
     onError: (err: Error) => {
       toast.error(
-        err instanceof Error ? err.message : 'Failed to delete secret',
+        err instanceof Error ? err.message : 'Failed to delete secret'
       )
     },
   })
@@ -277,7 +279,7 @@ interface CreateSecretDialogProps {
 // Default-select environments whose name matches production or preview.
 // Matches case-insensitively so "Production", "PROD", "Preview" all hit.
 function defaultEnvironmentSelection(
-  environments: Array<{ id: number; name: string }>,
+  environments: Array<{ id: number; name: string }>
 ): number[] {
   return environments
     .filter((e) => {
@@ -299,7 +301,7 @@ function CreateSecretDialog({
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
   const [environmentIds, setEnvironmentIds] = useState<number[]>(() =>
-    defaultEnvironmentSelection(environments),
+    defaultEnvironmentSelection(environments)
   )
   const [includeInPreview, setIncludeInPreview] = useState(false)
   // Empty means every service, matching the API. Restricting is opt-in so an
@@ -323,7 +325,7 @@ function CreateSecretDialog({
     ...createProjectSecretMutation(),
     onSuccess: () => {
       toast.success(
-        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`,
+        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`
       )
       onCreated()
       setKey('')
@@ -338,7 +340,7 @@ function CreateSecretDialog({
     },
     onError: (err: Error) => {
       toast.error(
-        err instanceof Error ? err.message : 'Failed to create secret',
+        err instanceof Error ? err.message : 'Failed to create secret'
       )
     },
   })
@@ -347,7 +349,7 @@ function CreateSecretDialog({
     let ok = true
     if (!KEY_PATTERN.test(key)) {
       setKeyError(
-        'Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _',
+        'Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _'
       )
       ok = false
     } else {
@@ -436,7 +438,7 @@ function CreateSecretDialog({
                         setEnvironmentIds((prev) =>
                           checked
                             ? [...prev, env.id]
-                            : prev.filter((id) => id !== env.id),
+                            : prev.filter((id) => id !== env.id)
                         )
                       }}
                     />
@@ -455,8 +457,8 @@ function CreateSecretDialog({
               <p className="text-xs text-muted-foreground mt-2">
                 This secret will be mounted in every service. To restrict it to
                 specific containers — so a database or sidecar can't read an
-                application's credentials — sync this project's compose
-                services from Git settings, then edit the secret.
+                application's credentials — sync this project's compose services
+                from Git settings, then edit the secret.
               </p>
             </div>
           )}
@@ -475,7 +477,7 @@ function CreateSecretDialog({
                         setComposeServices((prev) =>
                           checked
                             ? [...prev, name]
-                            : prev.filter((s) => s !== name),
+                            : prev.filter((s) => s !== name)
                         )
                       }
                     />

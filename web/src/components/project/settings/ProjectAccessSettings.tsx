@@ -359,9 +359,11 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
             <AlertDialogTitle>Revoke access?</AlertDialogTitle>
             <AlertDialogDescription>
               Members of{' '}
-              {grantToRevoke ? `"${teamName(grantToRevoke.team_id)}"` : 'this team'}{' '}
-              lose access to this project immediately, unless another team
-              also grants it to them.
+              {grantToRevoke
+                ? `"${teamName(grantToRevoke.team_id)}"`
+                : 'this team'}{' '}
+              lose access to this project immediately, unless another team also
+              grants it to them.
               {grantList.length === 1 &&
                 ' This is the last grant — revoking it makes the project open to everyone again.'}
             </AlertDialogDescription>

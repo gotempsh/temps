@@ -51,12 +51,7 @@ type PlatformId =
   | 'reactnative'
   | 'flutter'
 
-type CodeLanguage =
-  | 'javascript'
-  | 'typescript'
-  | 'python'
-  | 'go'
-  | 'text'
+type CodeLanguage = 'javascript' | 'typescript' | 'python' | 'go' | 'text'
 
 type PlatformCategory = 'fullstack' | 'frontend' | 'backend' | 'mobile'
 
@@ -444,7 +439,8 @@ end`,
     description: 'Spring Boot, Jakarta EE',
     category: 'backend',
     packageName: 'io.sentry:sentry-spring-boot-starter',
-    installCommand: '# Add to pom.xml or build.gradle\nio.sentry:sentry-spring-boot-starter-jakarta:7.14.0',
+    installCommand:
+      '# Add to pom.xml or build.gradle\nio.sentry:sentry-spring-boot-starter-jakarta:7.14.0',
     language: 'text',
     envVarName: 'SENTRY_DSN',
     dsnExpression: '${SENTRY_DSN}',
@@ -463,7 +459,7 @@ sentry.traces-sample-rate=1.0`,
     installCommand: 'composer require sentry/sentry',
     language: 'text',
     envVarName: 'SENTRY_DSN',
-    dsnExpression: '$_ENV[\'SENTRY_DSN\']',
+    dsnExpression: "$_ENV['SENTRY_DSN']",
     icon: <MonoLetterIcon letter="Ph" />,
     buildSnippet: (dsnExpr) => `<?php
 \\Sentry\\init([
@@ -693,12 +689,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
             const meta = CATEGORY_META[cat]
             return (
               <div key={cat} className="space-y-3">
-                <div
-                  className={cn(
-                    'border-l-4 pl-3 py-0.5',
-                    meta.accent
-                  )}
-                >
+                <div className={cn('border-l-4 pl-3 py-0.5', meta.accent)}>
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-semibold">{meta.label}</h3>
                     <span
@@ -733,9 +724,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                         </div>
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-1.5 flex-wrap">
-                            <p className="font-medium leading-none">
-                              {p.name}
-                            </p>
+                            <p className="font-medium leading-none">{p.name}</p>
                             {isRecommended &&
                               project.preset &&
                               PRESET_TO_PLATFORM[project.preset] && (
@@ -928,10 +917,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
           </div>
 
           <div className="flex items-center justify-between gap-3 pt-2">
-            <Button
-              variant="ghost"
-              onClick={() => setWizardStep('framework')}
-            >
+            <Button variant="ghost" onClick={() => setWizardStep('framework')}>
               <ArrowLeft className="mr-2 size-4" />
               Back
             </Button>
@@ -952,10 +938,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
             {hasErrorsData?.has_error_groups ? (
               <>
                 <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
-                  <Check
-                    className="size-7 text-emerald-500"
-                    strokeWidth={3}
-                  />
+                  <Check className="size-7 text-emerald-500" strokeWidth={3} />
                 </div>
                 <div className="space-y-1">
                   <h3 className="text-lg font-semibold">

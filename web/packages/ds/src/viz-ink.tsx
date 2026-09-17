@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useState, type CSSProperties, type ReactNode } from 'react'
+import {
+  useCallback,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react'
 import { cn } from './lib/cn'
 import { GLYPH, GLYPH_CLASS, type State } from './status'
 
@@ -29,19 +34,69 @@ import { GLYPH, GLYPH_CLASS, type State } from './status'
  */
 export function InkPatterns() {
   return (
-    <svg aria-hidden width={0} height={0} className="pointer-events-none absolute" focusable="false">
+    <svg
+      aria-hidden
+      width={0}
+      height={0}
+      className="pointer-events-none absolute"
+      focusable="false"
+    >
       <defs>
-        <pattern id="op-hatch" width={5} height={5} patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-          <line x1={0} y1={0} x2={0} y2={5} stroke="var(--foreground)" strokeWidth={1.6} opacity={0.55} />
+        <pattern
+          id="op-hatch"
+          width={5}
+          height={5}
+          patternUnits="userSpaceOnUse"
+          patternTransform="rotate(45)"
+        >
+          <line
+            x1={0}
+            y1={0}
+            x2={0}
+            y2={5}
+            stroke="var(--foreground)"
+            strokeWidth={1.6}
+            opacity={0.55}
+          />
         </pattern>
-        <pattern id="op-hatch-soft" width={6} height={6} patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-          <line x1={0} y1={0} x2={0} y2={6} stroke="var(--foreground)" strokeWidth={1} opacity={0.28} />
+        <pattern
+          id="op-hatch-soft"
+          width={6}
+          height={6}
+          patternUnits="userSpaceOnUse"
+          patternTransform="rotate(45)"
+        >
+          <line
+            x1={0}
+            y1={0}
+            x2={0}
+            y2={6}
+            stroke="var(--foreground)"
+            strokeWidth={1}
+            opacity={0.28}
+          />
         </pattern>
-        <pattern id="op-cross" width={5} height={5} patternUnits="userSpaceOnUse">
-          <path d="M0 0 L5 5 M5 0 L0 5" stroke="var(--foreground)" strokeWidth={0.9} opacity={0.5} />
+        <pattern
+          id="op-cross"
+          width={5}
+          height={5}
+          patternUnits="userSpaceOnUse"
+        >
+          <path
+            d="M0 0 L5 5 M5 0 L0 5"
+            stroke="var(--foreground)"
+            strokeWidth={0.9}
+            opacity={0.5}
+          />
         </pattern>
         <pattern id="op-dot" width={4} height={4} patternUnits="userSpaceOnUse">
-          <circle cx={1.5} cy={1.5} r={1} fill="var(--foreground)" opacity={0.5} />
+          <circle
+            cx={1.5}
+            cy={1.5}
+            r={1}
+            fill="var(--foreground)"
+            opacity={0.5}
+          />
         </pattern>
       </defs>
     </svg>
@@ -50,7 +105,12 @@ export function InkPatterns() {
 
 /** How a composition layer is filled. Four is the ceiling: a fifth pattern is noise. */
 export type InkLayerFill = 'solid' | 'hatch' | 'dot' | 'cross'
-export const INK_LAYER_ORDER: readonly InkLayerFill[] = ['solid', 'hatch', 'dot', 'cross']
+export const INK_LAYER_ORDER: readonly InkLayerFill[] = [
+  'solid',
+  'hatch',
+  'dot',
+  'cross',
+]
 /** The CSS/SVG paint for each fill. Ink only — a layer never carries a hue. */
 export const INK_FILL: Record<InkLayerFill, string> = {
   solid: 'var(--foreground)',
@@ -59,11 +119,25 @@ export const INK_FILL: Record<InkLayerFill, string> = {
   cross: 'url(#op-cross)',
 }
 /** Opacity that goes with the paint, so the four layers land on ≤3 greys. */
-export const INK_FILL_OPACITY: Record<InkLayerFill, number> = { solid: 0.8, hatch: 1, dot: 1, cross: 1 }
+export const INK_FILL_OPACITY: Record<InkLayerFill, number> = {
+  solid: 0.8,
+  hatch: 1,
+  dot: 1,
+  cross: 1,
+}
 /** The word a legend prints beside the swatch, so the pattern is named and not only shown. */
-export const INK_FILL_WORD: Record<InkLayerFill, string> = { solid: 'solid', hatch: 'hatched', dot: 'dotted', cross: 'cross-hatched' }
+export const INK_FILL_WORD: Record<InkLayerFill, string> = {
+  solid: 'solid',
+  hatch: 'hatched',
+  dot: 'dotted',
+  cross: 'cross-hatched',
+}
 /** State tone, for the one layer in a composition that *is* a state (5xx, error). */
-export const INK_TONE: Record<'ok' | 'warn' | 'error', string> = { ok: 'var(--success)', warn: 'var(--warning)', error: 'var(--destructive)' }
+export const INK_TONE: Record<'ok' | 'warn' | 'error', string> = {
+  ok: 'var(--success)',
+  warn: 'var(--warning)',
+  error: 'var(--destructive)',
+}
 
 /** Five density steps, the same ladder `CalendarHeatmap` uses. Index 0 is "none". */
 export const INK_STEPS = [0.06, 0.22, 0.42, 0.68, 1] as const
@@ -85,7 +159,10 @@ export function inkStep(value: number, max: number): 0 | 1 | 2 | 3 | 4 {
  * of hitting a 50% grey in the middle of the ladder.
  */
 export function inkCell(value: number, max: number): CSSProperties {
-  return { backgroundColor: 'var(--op-ink-wash, var(--foreground))', opacity: INK_STEPS[inkStep(value, max)] }
+  return {
+    backgroundColor: 'var(--op-ink-wash, var(--foreground))',
+    opacity: INK_STEPS[inkStep(value, max)],
+  }
 }
 
 /**
@@ -95,26 +172,49 @@ export function inkCell(value: number, max: number): CSSProperties {
  */
 export function useReadout(count: number) {
   const [i, setI] = useState<number | null>(null)
-  const step = useCallback((d: number) => setI((p) => Math.max(0, Math.min(count - 1, (p ?? (d > 0 ? -1 : count)) + d))), [count])
+  const step = useCallback(
+    (d: number) =>
+      setI((p) =>
+        Math.max(0, Math.min(count - 1, (p ?? (d > 0 ? -1 : count)) + d))
+      ),
+    [count]
+  )
   const regionProps = {
     role: 'group' as const,
     tabIndex: 0,
     onFocus: () => setI((p) => p ?? 0),
     onBlur: () => setI(null),
     onKeyDown: (e: React.KeyboardEvent) => {
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); step(-1) }
-      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); step(1) }
-      if (e.key === 'Home') { e.preventDefault(); setI(0) }
-      if (e.key === 'End') { e.preventDefault(); setI(count - 1) }
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        step(-1)
+      }
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        e.preventDefault()
+        step(1)
+      }
+      if (e.key === 'Home') {
+        e.preventDefault()
+        setI(0)
+      }
+      if (e.key === 'End') {
+        e.preventDefault()
+        setI(count - 1)
+      }
     },
-    className: 'outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring',
+    className:
+      'outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring',
   }
   return { i, setI, regionProps }
 }
 
 /** The live region that speaks the readout. Always rendered, even when empty. */
 export function ReadoutLive({ text }: { text: string }) {
-  return <span className="sr-only" aria-live="polite">{text}</span>
+  return (
+    <span className="sr-only" aria-live="polite">
+      {text}
+    </span>
+  )
 }
 
 /**
@@ -123,7 +223,15 @@ export function ReadoutLive({ text }: { text: string }) {
  * rows. A figure whose data is a series and which passes no `table` is a bug,
  * not a shortcut — `Figure` warns in dev.
  */
-export function Figure({ label, table, footer, legend, height, className, children }: {
+export function Figure({
+  label,
+  table,
+  footer,
+  legend,
+  height,
+  className,
+  children,
+}: {
   /** The `aria-label` sentence: what it is, over what range, and the verdict. */
   label: string
   /** The same data as rows. Omit only when the figure already *is* a table. */
@@ -144,27 +252,48 @@ export function Figure({ label, table, footer, legend, height, className, childr
           must still be hatched while the table view is open. */}
       <InkPatterns />
       {asTable && table ? (
-        <div style={height ? { height } : undefined} className="overflow-auto border">{table}</div>
+        <div
+          style={height ? { height } : undefined}
+          className="overflow-auto border"
+        >
+          {table}
+        </div>
       ) : (
-        <div role="img" aria-label={label} className="min-w-0">{children}</div>
+        <div role="img" aria-label={label} className="min-w-0">
+          {children}
+        </div>
       )}
       {(legend || table || footer) && (
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           {legend ?? <span />}
           {table && (
-            <button type="button" aria-pressed={asTable} onClick={() => setAsTable((v) => !v)} className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground">
+            <button
+              type="button"
+              aria-pressed={asTable}
+              onClick={() => setAsTable((v) => !v)}
+              className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground"
+            >
               {asTable ? 'chart' : 'table'}
             </button>
           )}
         </div>
       )}
-      {footer && <p className="flex flex-wrap items-center gap-x-3 font-mono text-[10px] text-muted-foreground">{footer}</p>}
+      {footer && (
+        <p className="flex flex-wrap items-center gap-x-3 font-mono text-[10px] text-muted-foreground">
+          {footer}
+        </p>
+      )}
     </div>
   )
 }
 
 /** The table view every `Figure` hands to its toggle: the same numbers as rows. */
-export function DataTable({ caption, head, rows, numeric = [] }: {
+export function DataTable({
+  caption,
+  head,
+  rows,
+  numeric = [],
+}: {
   caption: string
   head: ReactNode[]
   /** First cell of each row becomes its `<th scope="row">`. */
@@ -178,16 +307,43 @@ export function DataTable({ caption, head, rows, numeric = [] }: {
       <thead>
         <tr>
           {head.map((h, i) => (
-            <th key={i} scope="col" className={cn('op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-[9px]', numeric.includes(i) ? 'text-right' : 'text-left')}>{h}</th>
+            <th
+              key={i}
+              scope="col"
+              className={cn(
+                'op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-[9px]',
+                numeric.includes(i) ? 'text-right' : 'text-left'
+              )}
+            >
+              {h}
+            </th>
           ))}
         </tr>
       </thead>
       <tbody className="op-rows">
         {rows.map((r, i) => (
           <tr key={i}>
-            {r.map((c, j) => j === 0
-              ? <th key={j} scope="row" className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground">{c}</th>
-              : <td key={j} className={cn('px-2 py-1', numeric.includes(j) ? 'text-right tabular-nums' : '')}>{c}</td>)}
+            {r.map((c, j) =>
+              j === 0 ? (
+                <th
+                  key={j}
+                  scope="row"
+                  className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground"
+                >
+                  {c}
+                </th>
+              ) : (
+                <td
+                  key={j}
+                  className={cn(
+                    'px-2 py-1',
+                    numeric.includes(j) ? 'text-right tabular-nums' : ''
+                  )}
+                >
+                  {c}
+                </td>
+              )
+            )}
           </tr>
         ))}
       </tbody>
@@ -196,10 +352,20 @@ export function DataTable({ caption, head, rows, numeric = [] }: {
 }
 
 /** A state's glyph and word together — tone never arrives on its own. */
-export function StateWord({ state, children, className }: { state: State; children?: ReactNode; className?: string }) {
+export function StateWord({
+  state,
+  children,
+  className,
+}: {
+  state: State
+  children?: ReactNode
+  className?: string
+}) {
   return (
     <span className={cn('inline-flex items-center gap-1', className)}>
-      <span aria-hidden className={GLYPH_CLASS[state]}>{GLYPH[state]}</span>
+      <span aria-hidden className={GLYPH_CLASS[state]}>
+        {GLYPH[state]}
+      </span>
       <span>{children ?? state}</span>
     </span>
   )

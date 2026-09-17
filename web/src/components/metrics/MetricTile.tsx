@@ -100,7 +100,7 @@ export function MetricTile({
   const alertStatus = useAlertStatus(project.id)
   const status = alertStatus.statusFor(metricName, aggregation)
   const dynamicFiringCount = dynamicFiringSeriesCount(
-    alertStatus.rulesFor(metricName, aggregation),
+    alertStatus.rulesFor(metricName, aggregation)
   )
   const lineTone =
     status === 'alert' ? 'poor' : status === 'warn' ? 'warn' : 'primary'
@@ -157,11 +157,11 @@ export function MetricTile({
                   hs.bucket_counts,
                   percentileFromAgg(aggregation),
                   hs.min,
-                  hs.max,
+                  hs.max
                 )
               : (b.value ?? b.avg_value)
           return { bucket: b.bucket, label: formatBucketLabel(b.bucket), value }
-        }),
+        })
       ),
     }
   }, [buckets, isPercentile, aggregation, mergeBand, isGrouped])
@@ -170,7 +170,11 @@ export function MetricTile({
   const series: ThresholdLineSeries | ThresholdLineSeries[] =
     chartModel.kind === 'grouped'
       ? chartModel.series
-      : { dataKey: 'value', label: aggregationLabel(aggregation), tone: lineTone }
+      : {
+          dataKey: 'value',
+          label: aggregationLabel(aggregation),
+          tone: lineTone,
+        }
   const droppedSeriesCount =
     chartModel.kind === 'grouped' ? chartModel.droppedCount : 0
   const latest =

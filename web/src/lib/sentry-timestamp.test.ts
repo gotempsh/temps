@@ -15,9 +15,7 @@ describe('parseSentryTimestamp', () => {
   })
 
   test('parses RFC3339 timestamps with offset and nanosecond precision', () => {
-    const parsed = parseSentryTimestamp(
-      '2026-08-19T00:36:43.712074786+08:00'
-    )
+    const parsed = parseSentryTimestamp('2026-08-19T00:36:43.712074786+08:00')
 
     expect(parsed?.toISOString()).toBe('2026-08-18T16:36:43.712Z')
   })
@@ -40,8 +38,8 @@ describe('parseSentryTimestamp', () => {
   })
 
   test('returns milliseconds for timestamp comparisons and durations', () => {
-    expect(
-      sentryTimestampToMillis('2026-08-19T00:36:43.712074786+08:00')
-    ).toBe(1787071003712)
+    expect(sentryTimestampToMillis('2026-08-19T00:36:43.712074786+08:00')).toBe(
+      1787071003712
+    )
   })
 })

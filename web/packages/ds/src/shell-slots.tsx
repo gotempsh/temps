@@ -10,9 +10,22 @@ import { createContext, useContext, type ReactNode } from 'react'
  * so the screen keeps owning the content and the shell only owns the place.
  * Outside a shell (docs pages, demos) both components render inline.
  */
-export type ShellSlots = { crumb: HTMLElement | null; attention: HTMLElement | null }
+export type ShellSlots = {
+  crumb: HTMLElement | null
+  attention: HTMLElement | null
+}
 export const ShellSlotsContext = createContext<ShellSlots | null>(null)
-export function ShellSlotsProvider({ value, children }: { value: ShellSlots; children: ReactNode }) {
-  return <ShellSlotsContext.Provider value={value}>{children}</ShellSlotsContext.Provider>
+export function ShellSlotsProvider({
+  value,
+  children,
+}: {
+  value: ShellSlots
+  children: ReactNode
+}) {
+  return (
+    <ShellSlotsContext.Provider value={value}>
+      {children}
+    </ShellSlotsContext.Provider>
+  )
 }
 export const useShellSlots = () => useContext(ShellSlotsContext)

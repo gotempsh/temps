@@ -781,12 +781,16 @@ export function ImportWizard({
                   )}
                   {credentialFields.includes('deploy_yml') && (
                     <div className="space-y-2">
-                      <Label htmlFor="import-deploy-yml">config/deploy.yml</Label>
+                      <Label htmlFor="import-deploy-yml">
+                        config/deploy.yml
+                      </Label>
                       <Textarea
                         id="import-deploy-yml"
                         rows={10}
                         className="font-mono text-xs"
-                        placeholder={'service: my-app\nimage: my-user/my-app\nservers:\n  web:\n    - 192.168.0.1\n…'}
+                        placeholder={
+                          'service: my-app\nimage: my-user/my-app\nservers:\n  web:\n    - 192.168.0.1\n…'
+                        }
                         value={credentialDeployYml}
                         onChange={(e) => setCredentialDeployYml(e.target.value)}
                       />
@@ -807,8 +811,8 @@ export function ImportWizard({
                       >
                         Skip TLS certificate verification — needed for a
                         self-signed certificate (e.g. Portainer's default
-                        install). Only enable this if you trust the network
-                        path to this instance.
+                        install). Only enable this if you trust the network path
+                        to this instance.
                       </Label>
                     </div>
                   )}
@@ -1027,10 +1031,10 @@ export function ImportWizard({
             <Alert>
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                Optionally link a repository for automatic preset detection
-                and future git-push deploys. Image-only workloads and public
-                repositories deploy fine without one — the framework preset
-                and branch can be set manually on the next step.
+                Optionally link a repository for automatic preset detection and
+                future git-push deploys. Image-only workloads and public
+                repositories deploy fine without one — the framework preset and
+                branch can be set manually on the next step.
               </AlertDescription>
             </Alert>
 

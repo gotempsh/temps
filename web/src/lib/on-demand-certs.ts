@@ -68,7 +68,7 @@ const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
 
 export async function listOnDemandCerts(
   query: ListOnDemandCertsQuery,
-  signal?: AbortSignal,
+  signal?: AbortSignal
 ): Promise<ListOnDemandCertsResponse> {
   const { data } = await client.get<ListOnDemandCertsResponse, unknown, true>({
     security: [...BEARER_SECURITY],
@@ -82,7 +82,7 @@ export async function listOnDemandCerts(
 
 export async function getOnDemandCertStatus(
   hostname: string,
-  signal?: AbortSignal,
+  signal?: AbortSignal
 ): Promise<CertStatusResponse> {
   const { data } = await client.get<CertStatusResponse, unknown, true>({
     security: [...BEARER_SECURITY],
@@ -117,7 +117,7 @@ export function getOnDemandCertStatusOptions(hostname: string | undefined) {
 export function errorCategoryLabel(
   category: string | null | undefined,
   acmeResponseStatus?: string | null,
-  backoffUntil?: number | null,
+  backoffUntil?: number | null
 ): string | null {
   if (!category) return null
   const retry =

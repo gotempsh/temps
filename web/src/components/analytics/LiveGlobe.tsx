@@ -136,7 +136,11 @@ interface ActivityFeedItemProps {
   projectSlug: string
 }
 
-function ActivityFeedItem({ event, isNew, projectSlug }: ActivityFeedItemProps) {
+function ActivityFeedItem({
+  event,
+  isNew,
+  projectSlug,
+}: ActivityFeedItemProps) {
   const flag = countryCodeToFlag(event.country_code)
   const location = [event.city, event.country].filter(Boolean).join(', ')
   const timeAgo = getTimeAgo(event.timestamp)
@@ -485,9 +489,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
           </div>
 
           {/* Feed content */}
-          <div
-            className="flex-1 overflow-y-auto p-2 space-y-0.5 max-h-[300px] sm:max-h-[502px]"
-          >
+          <div className="flex-1 overflow-y-auto p-2 space-y-0.5 max-h-[300px] sm:max-h-[502px]">
             {activityEvents.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-center p-6">
                 <Zap className="h-8 w-8 text-muted-foreground/40 mb-3" />

@@ -89,7 +89,10 @@ export function MetricCorrelations({
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <CorrelationLink to={tracesHref} icon={<Network className="size-3.5" />}>
+          <CorrelationLink
+            to={tracesHref}
+            icon={<Network className="size-3.5" />}
+          >
             Traces
           </CorrelationLink>
           <CorrelationLink to={errorsHref} icon={<Bug className="size-3.5" />}>

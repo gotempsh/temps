@@ -49,7 +49,7 @@ export function OidcRoleMappingsCard({
     path: { provider_id: providerId },
   })
   const mappingsQuery = useQuery(
-    listOidcRoleMappingsOptions({ path: { provider_id: providerId } }),
+    listOidcRoleMappingsOptions({ path: { provider_id: providerId } })
   )
   const mappings = mappingsQuery.data ?? []
 
@@ -59,7 +59,7 @@ export function OidcRoleMappingsCard({
 
   const suggestedPriority = useMemo(
     () => nextDefaultPriority(mappings),
-    [mappings],
+    [mappings]
   )
 
   const createMapping = useMutation({
@@ -93,7 +93,7 @@ export function OidcRoleMappingsCard({
         return
       }
       toast.error(
-        error instanceof Error ? error.message : 'Failed to delete rule',
+        error instanceof Error ? error.message : 'Failed to delete rule'
       )
     },
   })
@@ -117,111 +117,120 @@ export function OidcRoleMappingsCard({
       <Card>
         <CardHeader>
           <CardTitle>Group → role mapping</CardTitle>
-        <CardDescription>
-          IdP groups from the configured group claim are matched in priority
-          order; first match wins. Use <code className="rounded bg-muted px-1">*</code>{' '}
-          as a fallback for any user. Unmatched users fall back to the provider
-          default role ({defaultRole}).
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {mappingsQuery.isLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading role mappings...
-          </div>
-        ) : mappings.length === 0 ? (
-          <div className="rounded-md border p-3 text-sm text-muted-foreground">
-            No rules yet. Users will receive the default role ({defaultRole})
-            unless the IdP sends a matching roles claim.
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {mappings.map((mapping) => (
-              <div
-                key={mapping.id}
-                className="flex items-center gap-2 rounded-lg border p-2"
-              >
-                <span className="w-12 text-xs text-muted-foreground">
-                  #{mapping.priority}
-                </span>
-                <code className="flex-1 rounded bg-muted px-2 py-1 font-mono text-xs">
-                  {mapping.idp_group}
-                </code>
-                <ArrowRight className="h-4 w-4 text-muted-foreground" />
-                <span className="w-20 rounded bg-primary/10 px-2 py-1 text-center font-mono text-xs text-primary">
-                  {mapping.role}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={deleteMapping.isPending}
-                  onClick={() => {
-                    if (
-                      !confirm(
-                        `Remove rule "${mapping.idp_group} → ${mapping.role}"?`,
-                      )
-                    ) {
-                      return
-                    }
-                    deleteMapping.mutate({
-                      path: { mapping_id: mapping.id },
-                    })
-                  }}
+          <CardDescription>
+            IdP groups from the configured group claim are matched in priority
+            order; first match wins. Use{' '}
+            <code className="rounded bg-muted px-1">*</code> as a fallback for
+            any user. Unmatched users fall back to the provider default role (
+            {defaultRole}).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {mappingsQuery.isLoading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading role mappings...
+            </div>
+          ) : mappings.length === 0 ? (
+            <div className="rounded-md border p-3 text-sm text-muted-foreground">
+              No rules yet. Users will receive the default role ({defaultRole})
+              unless the IdP sends a matching roles claim.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {mappings.map((mapping) => (
+                <div
+                  key={mapping.id}
+                  className="flex items-center gap-2 rounded-lg border p-2"
                 >
-                  <Trash2 className="h-4 w-4 text-destructive" />
-                </Button>
-              </div>
-            ))}
-          </div>
-        )}
+                  <span className="w-12 text-xs text-muted-foreground">
+                    #{mapping.priority}
+                  </span>
+                  <code className="flex-1 rounded bg-muted px-2 py-1 font-mono text-xs">
+                    {mapping.idp_group}
+                  </code>
+                  <ArrowRight className="h-4 w-4 text-muted-foreground" />
+                  <span className="w-20 rounded bg-primary/10 px-2 py-1 text-center font-mono text-xs text-primary">
+                    {mapping.role}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={deleteMapping.isPending}
+                    onClick={() => {
+                      if (
+                        !confirm(
+                          `Remove rule "${mapping.idp_group} → ${mapping.role}"?`
+                        )
+                      ) {
+                        return
+                      }
+                      deleteMapping.mutate({
+                        path: { mapping_id: mapping.id },
+                      })
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4 text-destructive" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
 
-        <div className="space-y-3 border-t pt-4">
-          <div className="grid items-end gap-2 md:grid-cols-[auto_1fr_auto_auto]">
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Priority</label>
-              <Input
-                type="number"
-                className="w-24"
-                value={draftPriority}
-                onChange={(event) =>
-                  setDraftPriority(Number.parseInt(event.target.value || '100', 10))
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">IdP group</label>
-              <Input
-                value={draftGroup}
-                onChange={(event) => setDraftGroup(event.target.value)}
-                placeholder="temps-admins (or * for any)"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Role</label>
-              <Select
-                value={draftRole}
-                onValueChange={(value: 'admin' | 'user') => setDraftRole(value)}
+          <div className="space-y-3 border-t pt-4">
+            <div className="grid items-end gap-2 md:grid-cols-[auto_1fr_auto_auto]">
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">
+                  Priority
+                </label>
+                <Input
+                  type="number"
+                  className="w-24"
+                  value={draftPriority}
+                  onChange={(event) =>
+                    setDraftPriority(
+                      Number.parseInt(event.target.value || '100', 10)
+                    )
+                  }
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">
+                  IdP group
+                </label>
+                <Input
+                  value={draftGroup}
+                  onChange={(event) => setDraftGroup(event.target.value)}
+                  placeholder="temps-admins (or * for any)"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">Role</label>
+                <Select
+                  value={draftRole}
+                  onValueChange={(value: 'admin' | 'user') =>
+                    setDraftRole(value)
+                  }
+                >
+                  <SelectTrigger className="w-28">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="admin">admin</SelectItem>
+                    <SelectItem value="user">user</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button
+                onClick={handleAdd}
+                disabled={createMapping.isPending || !draftGroup.trim()}
               >
-                <SelectTrigger className="w-28">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="admin">admin</SelectItem>
-                  <SelectItem value="user">user</SelectItem>
-                </SelectContent>
-              </Select>
+                <Plus className="mr-2 h-4 w-4" />
+                Add
+              </Button>
             </div>
-            <Button
-              onClick={handleAdd}
-              disabled={createMapping.isPending || !draftGroup.trim()}
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              Add
-            </Button>
           </div>
-        </div>
-      </CardContent>
+        </CardContent>
       </Card>
     </>
   )

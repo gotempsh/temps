@@ -210,9 +210,7 @@ export function DataBrowserCommandBar({
         )}
 
         {results.length > 0 && (
-          <CommandGroup
-            heading={input.trim() ? 'Matches' : 'Recent'}
-          >
+          <CommandGroup heading={input.trim() ? 'Matches' : 'Recent'}>
             {!input.trim() && results.length > 0 && (
               <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 flex items-center gap-1">
                 <Clock className="h-3 w-3" />
@@ -236,7 +234,10 @@ export function DataBrowserCommandBar({
                     <div className="truncate flex items-center gap-2">
                       <span className="font-medium">{t.name}</span>
                       {t.label && (
-                        <Badge variant="outline" className="text-[10px] h-4 px-1">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] h-4 px-1"
+                        >
                           {t.label}
                         </Badge>
                       )}

@@ -37,7 +37,8 @@ const buttonVariants = cva(
 )
 
 export interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+  extends
+    React.ButtonHTMLAttributes<HTMLButtonElement>,
     VariantProps<typeof buttonVariants> {
   asChild?: boolean
   /**
@@ -65,7 +66,20 @@ export interface ButtonProps
 const MIN_BUSY_MS = 400
 
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, asChild = false, busy = false, busyLabel, children, onClick, ...props }, ref) => {
+  (
+    {
+      className,
+      variant,
+      size,
+      asChild = false,
+      busy = false,
+      busyLabel,
+      children,
+      onClick,
+      ...props
+    },
+    ref
+  ) => {
     const Comp = asChild ? Slot : 'button'
 
     // Hold busy for MIN_BUSY_MS after it is set, so a 40ms answer still reads.
@@ -81,10 +95,17 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     if (asChild || busyLabel === undefined) {
       return (
         <Comp
-          className={cn(buttonVariants({ variant, size, className }), showBusy && !asChild && 'op-busy cursor-default')}
+          className={cn(
+            buttonVariants({ variant, size, className }),
+            showBusy && !asChild && 'op-busy cursor-default'
+          )}
           ref={ref}
           aria-busy={showBusy && !asChild ? true : undefined}
-          onClick={showBusy && !asChild ? (e: React.MouseEvent<HTMLButtonElement>) => e.preventDefault() : onClick}
+          onClick={
+            showBusy && !asChild
+              ? (e: React.MouseEvent<HTMLButtonElement>) => e.preventDefault()
+              : onClick
+          }
           {...props}
         >
           {children}
@@ -98,16 +119,39 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
        the longer one, so the button would still grow the first time it runs. */
     return (
       <Comp
-        className={cn(buttonVariants({ variant, size, className }), showBusy && 'op-busy cursor-default')}
+        className={cn(
+          buttonVariants({ variant, size, className }),
+          showBusy && 'op-busy cursor-default'
+        )}
         ref={ref}
         aria-busy={showBusy || undefined}
         // Not `disabled`: see the `busy` doc above. Clicks are swallowed instead.
-        onClick={showBusy ? (e: React.MouseEvent<HTMLButtonElement>) => e.preventDefault() : onClick}
+        onClick={
+          showBusy
+            ? (e: React.MouseEvent<HTMLButtonElement>) => e.preventDefault()
+            : onClick
+        }
         {...props}
       >
         <span className="grid">
-          <span aria-hidden={showBusy || undefined} className={cn('col-start-1 row-start-1 inline-flex items-center justify-center gap-2', showBusy && 'invisible')}>{children}</span>
-          <span aria-hidden={!showBusy || undefined} className={cn('col-start-1 row-start-1 inline-flex items-center justify-center gap-2', !showBusy && 'invisible')}>{busyLabel}</span>
+          <span
+            aria-hidden={showBusy || undefined}
+            className={cn(
+              'col-start-1 row-start-1 inline-flex items-center justify-center gap-2',
+              showBusy && 'invisible'
+            )}
+          >
+            {children}
+          </span>
+          <span
+            aria-hidden={!showBusy || undefined}
+            className={cn(
+              'col-start-1 row-start-1 inline-flex items-center justify-center gap-2',
+              !showBusy && 'invisible'
+            )}
+          >
+            {busyLabel}
+          </span>
         </span>
       </Comp>
     )

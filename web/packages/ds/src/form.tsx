@@ -19,7 +19,13 @@ export type FieldError = { id: string; label: string; message: string }
  * Renders nothing below `min` failures (one bad field is already marked in
  * place; a summary of one is a second sentence saying the same thing).
  */
-export function FormErrors({ errors, title, min = 2, onFocusField, className }: {
+export function FormErrors({
+  errors,
+  title,
+  min = 2,
+  onFocusField,
+  className,
+}: {
   errors: FieldError[]
   /** Overrides the counted sentence. Keep it a verdict, not a heading. */
   title?: string
@@ -37,11 +43,23 @@ export function FormErrors({ errors, title, min = 2, onFocusField, className }: 
     el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }
   return (
-    <Callout state="error" className={className}
-      title={title ?? `${errors.length} field${errors.length > 1 ? 's' : ''} to fix before this saves`}>
+    <Callout
+      state="error"
+      className={className}
+      title={
+        title ??
+        `${errors.length} field${errors.length > 1 ? 's' : ''} to fix before this saves`
+      }
+    >
       {errors.map((e) => (
         <span key={e.id} className="block">
-          <button type="button" onClick={() => focus(e.id)} className="text-foreground underline underline-offset-4 hover:text-foreground">{e.label}</button>
+          <button
+            type="button"
+            onClick={() => focus(e.id)}
+            className="text-foreground underline underline-offset-4 hover:text-foreground"
+          >
+            {e.label}
+          </button>
           <span> · {e.message}</span>
         </span>
       ))}

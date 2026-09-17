@@ -142,22 +142,30 @@ export function upsertMessageTool(
 }
 
 /** Read explicit failure receipts, never guess from words in ordinary output. */
-export function toolExecutionState(tool: ToolCall): 'running' | 'completed' | 'failed' {
+export function toolExecutionState(
+  tool: ToolCall
+): 'running' | 'completed' | 'failed' {
   if (tool.result == null) return 'running'
   try {
     const result = JSON.parse(tool.result)
-    if (result && typeof result === 'object' && (
-      result.is_error === true || result.isError === true ||
-      (typeof result.error === 'string' && result.error.length > 0) ||
-      result.status === 'failed' || result.status === 'error' ||
-      (typeof result.exit_code === 'number' && result.exit_code !== 0) ||
-      (typeof result.status === 'number' && result.status >= 400)
-    )) return 'failed'
+    if (
+      result &&
+      typeof result === 'object' &&
+      (result.is_error === true ||
+        result.isError === true ||
+        (typeof result.error === 'string' && result.error.length > 0) ||
+        result.status === 'failed' ||
+        result.status === 'error' ||
+        (typeof result.exit_code === 'number' && result.exit_code !== 0) ||
+        (typeof result.status === 'number' && result.status >= 400))
+    )
+      return 'failed'
   } catch {
     // Native command receipts include a trailing exit status outside JSON.
   }
-  const exit = tool.result.match(/(?:^|\n)Process exited with code (-?\d+)\.\s*$/)
-    ?? tool.result.match(/^Exit code (-?\d+)(?:\r?\n|$)/)
+  const exit =
+    tool.result.match(/(?:^|\n)Process exited with code (-?\d+)\.\s*$/) ??
+    tool.result.match(/^Exit code (-?\d+)(?:\r?\n|$)/)
   return exit && Number(exit[1]) !== 0 ? 'failed' : 'completed'
 }
 

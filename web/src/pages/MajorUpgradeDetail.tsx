@@ -53,7 +53,9 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 
-function statusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {
+function statusVariant(
+  status: string
+): 'default' | 'secondary' | 'destructive' | 'outline' {
   switch (status) {
     case 'completed':
       return 'default'
@@ -182,16 +184,14 @@ export function MajorUpgradeDetail() {
       setShowRollbackDialog(false)
     },
     onError: (error: unknown) => {
-      if (
-        handleSensitiveActionError(error, () => rollbackMutation.mutate())
-      ) {
+      if (handleSensitiveActionError(error, () => rollbackMutation.mutate())) {
         setShowRollbackDialog(false)
         return
       }
       const msg =
         error instanceof Error
           ? error.message
-          : (error as { detail?: string })?.detail ?? 'Unknown error'
+          : ((error as { detail?: string })?.detail ?? 'Unknown error')
       toast.error('Failed to roll back upgrade', { description: msg })
     },
   })
@@ -234,7 +234,8 @@ export function MajorUpgradeDetail() {
     if (upgrade.status === 'completed') return 'done'
     if (idx < currentPhaseIdx) return 'done'
     if (idx === currentPhaseIdx) {
-      if (upgrade.status === 'failed' || upgrade.status === 'cancelled') return 'failed'
+      if (upgrade.status === 'failed' || upgrade.status === 'cancelled')
+        return 'failed'
       return 'current'
     }
     return 'pending'
@@ -259,7 +260,9 @@ export function MajorUpgradeDetail() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <Badge variant={statusVariant(upgrade.status)}>{upgrade.status}</Badge>
+          <Badge variant={statusVariant(upgrade.status)}>
+            {upgrade.status}
+          </Badge>
           {upgrade.status === 'pending' || upgrade.status === 'running' ? (
             <Button
               size="sm"
@@ -357,11 +360,7 @@ export function MajorUpgradeDetail() {
         <CardContent>
           <ul className="divide-y">
             {PG_UPGRADE_PHASES.map((phase, idx) => (
-              <PhaseRow
-                key={phase}
-                phase={phase}
-                state={phaseState(idx)}
-              />
+              <PhaseRow key={phase} phase={phase} state={phaseState(idx)} />
             ))}
           </ul>
         </CardContent>
@@ -371,7 +370,8 @@ export function MajorUpgradeDetail() {
         <CardHeader>
           <CardTitle>Logs</CardTitle>
           <CardDescription>
-            JSONL log stream (<code className="text-xs">{upgrade.log_id}</code>).
+            JSONL log stream (<code className="text-xs">{upgrade.log_id}</code>
+            ).
             {isTerminal(upgrade.status)
               ? ' Streaming stopped.'
               : ' Auto-refreshing every 3s.'}
@@ -392,7 +392,9 @@ export function MajorUpgradeDetail() {
           <div>
             <span className="text-muted-foreground">Pre-upgrade backup: </span>
             {upgrade.pre_upgrade_backup_id ? (
-              <span className="font-mono">#{upgrade.pre_upgrade_backup_id}</span>
+              <span className="font-mono">
+                #{upgrade.pre_upgrade_backup_id}
+              </span>
             ) : (
               <span className="text-muted-foreground">(not taken yet)</span>
             )}
@@ -423,8 +425,8 @@ export function MajorUpgradeDetail() {
             <AlertDialogDescription>
               This will stop the live PostgreSQL container and replace its data
               volume with the pre-upgrade snapshot. The upgrade is reversed and
-              all data written after the upgrade was applied will be
-              permanently lost. This action cannot be undone.
+              all data written after the upgrade was applied will be permanently
+              lost. This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

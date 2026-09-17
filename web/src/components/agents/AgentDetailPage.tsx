@@ -65,16 +65,32 @@ function nextCronRun(cron: string | null | undefined): string | null {
   const parts = cron.split(' ')
   if (parts.length !== 5) return cron
   const [min, hour, , , dow] = parts
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  const days = [
+    'Sunday',
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+  ]
   const dayName = dow !== '*' ? days[parseInt(dow)] || dow : 'Daily'
   const time = `${hour.padStart(2, '0')}:${min.padStart(2, '0')} UTC`
   return `${dayName} at ${time}`
 }
 
-function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
+function PropertyRow({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
   return (
     <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-4">
-      <dt className="text-sm text-muted-foreground sm:w-40 sm:flex-shrink-0">{label}</dt>
+      <dt className="text-sm text-muted-foreground sm:w-40 sm:flex-shrink-0">
+        {label}
+      </dt>
       <dd className="text-sm">{children}</dd>
     </div>
   )
@@ -84,10 +100,18 @@ const triggerColors = {
   red: { enabled: 'bg-red-500/10 text-red-400', dot: 'bg-red-400' },
   purple: { enabled: 'bg-purple-500/10 text-purple-400', dot: 'bg-purple-400' },
   yellow: { enabled: 'bg-yellow-500/10 text-yellow-400', dot: 'bg-yellow-400' },
-  gray: { enabled: 'bg-muted text-muted-foreground', dot: 'bg-muted-foreground' },
+  gray: {
+    enabled: 'bg-muted text-muted-foreground',
+    dot: 'bg-muted-foreground',
+  },
 } as const
 
-function TriggerRow({ label, enabled, color, description }: {
+function TriggerRow({
+  label,
+  enabled,
+  color,
+  description,
+}: {
   label: string
   enabled?: boolean
   color: keyof typeof triggerColors
@@ -107,7 +131,9 @@ function TriggerRow({ label, enabled, color, description }: {
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium">{label}</span>
           {enabled ? (
-            <span className={`text-xs px-1.5 py-0.5 rounded ${colors.enabled}`}>On</span>
+            <span className={`text-xs px-1.5 py-0.5 rounded ${colors.enabled}`}>
+              On
+            </span>
           ) : (
             <span className="text-xs text-muted-foreground/50">Off</span>
           )}
@@ -131,17 +157,25 @@ function AgentProperties({ agent }: { agent: Agent }) {
         </CardHeader>
         <CardContent className="space-y-3">
           <PropertyRow label="Slug">
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{agent.slug}</code>
+            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+              {agent.slug}
+            </code>
           </PropertyRow>
           <PropertyRow label="Source">
             {agent.source === 'yaml' ? (
-              <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">YAML</span>
+              <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">
+                YAML
+              </span>
             ) : (
-              <span className="text-xs bg-muted px-1.5 py-0.5 rounded">Dashboard</span>
+              <span className="text-xs bg-muted px-1.5 py-0.5 rounded">
+                Dashboard
+              </span>
             )}
           </PropertyRow>
           <PropertyRow label="Status">
-            <span className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}>
+            <span
+              className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}
+            >
               {agent.enabled ? 'Active' : 'Disabled'}
             </span>
           </PropertyRow>
@@ -149,7 +183,9 @@ function AgentProperties({ agent }: { agent: Agent }) {
             <PropertyRow label="Description">{agent.description}</PropertyRow>
           )}
           <PropertyRow label="Deliverable">
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{agent.deliverable}</code>
+            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+              {agent.deliverable}
+            </code>
           </PropertyRow>
           <PropertyRow label="Created">
             {new Date(agent.created_at).toLocaleDateString(undefined, {
@@ -177,9 +213,13 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </PropertyRow>
           <PropertyRow label="API Key">
             {agent.api_key_set ? (
-              <span className="text-xs bg-green-500/10 text-green-400 px-1.5 py-0.5 rounded">Set</span>
+              <span className="text-xs bg-green-500/10 text-green-400 px-1.5 py-0.5 rounded">
+                Set
+              </span>
             ) : (
-              <span className="text-xs text-muted-foreground">Using system default</span>
+              <span className="text-xs text-muted-foreground">
+                Using system default
+              </span>
             )}
           </PropertyRow>
           {agent.prompt && (
@@ -191,7 +231,9 @@ function AgentProperties({ agent }: { agent: Agent }) {
           )}
           {!agent.prompt && (
             <PropertyRow label="Prompt">
-              <span className="text-muted-foreground text-xs">Default prompt for trigger type</span>
+              <span className="text-muted-foreground text-xs">
+                Default prompt for trigger type
+              </span>
             </PropertyRow>
           )}
         </CardContent>
@@ -252,8 +294,14 @@ function AgentProperties({ agent }: { agent: Agent }) {
           {cronSchedule && (
             <PropertyRow label="Schedule">
               <div className="flex flex-col gap-1">
-                <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{cronSchedule}</code>
-                {nextRun && <span className="text-xs text-muted-foreground">{nextRun}</span>}
+                <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+                  {cronSchedule}
+                </code>
+                {nextRun && (
+                  <span className="text-xs text-muted-foreground">
+                    {nextRun}
+                  </span>
+                )}
               </div>
             </PropertyRow>
           )}
@@ -277,12 +325,15 @@ function AgentProperties({ agent }: { agent: Agent }) {
                 <label className="text-xs text-muted-foreground">URL</label>
                 <div className="flex items-center gap-2">
                   <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1 overflow-x-auto">
-                    POST {window.location.origin}{agent.webhook_url}
+                    POST {window.location.origin}
+                    {agent.webhook_url}
                   </code>
                   <button
                     type="button"
                     onClick={() => {
-                      navigator.clipboard.writeText(`${window.location.origin}${agent.webhook_url}`)
+                      navigator.clipboard.writeText(
+                        `${window.location.origin}${agent.webhook_url}`
+                      )
                       toast.success('URL copied')
                     }}
                     className="text-muted-foreground hover:text-foreground p-1"
@@ -293,7 +344,9 @@ function AgentProperties({ agent }: { agent: Agent }) {
                 </div>
               </div>
               <div className="space-y-1.5">
-                <label className="text-xs text-muted-foreground">Token (header)</label>
+                <label className="text-xs text-muted-foreground">
+                  Token (header)
+                </label>
                 <div className="flex items-center gap-2">
                   <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1">
                     X-Webhook-Token: {agent.webhook_token ?? '***'}
@@ -314,7 +367,8 @@ function AgentProperties({ agent }: { agent: Agent }) {
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                Send a POST request with any JSON body. The body is passed as context to the workflow.
+                Send a POST request with any JSON body. The body is passed as
+                context to the workflow.
               </p>
             </div>
           )}
@@ -330,20 +384,16 @@ function AgentProperties({ agent }: { agent: Agent }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <PropertyRow label="Max turns">
-            {agent.max_turns}
-          </PropertyRow>
-          <PropertyRow label="Timeout">
-            {agent.timeout_seconds}s
-          </PropertyRow>
+          <PropertyRow label="Max turns">{agent.max_turns}</PropertyRow>
+          <PropertyRow label="Timeout">{agent.timeout_seconds}s</PropertyRow>
           <PropertyRow label="Daily budget">
             ${(agent.daily_budget_cents / 100).toFixed(2)}
           </PropertyRow>
-          <PropertyRow label="Cooldown">
-            {agent.cooldown_minutes}m
-          </PropertyRow>
+          <PropertyRow label="Cooldown">{agent.cooldown_minutes}m</PropertyRow>
           <PropertyRow label="Branch prefix">
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{agent.branch_prefix}</code>
+            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+              {agent.branch_prefix}
+            </code>
           </PropertyRow>
         </CardContent>
       </Card>
@@ -429,7 +479,9 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
             </Link>
           </Button>
           <h1 className="text-xl font-semibold">{agent.name}</h1>
-          <span className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}>
+          <span
+            className={`text-xs px-2 py-0.5 rounded ${agent.enabled ? 'bg-green-500/10 text-green-400' : 'bg-muted text-muted-foreground'}`}
+          >
             {agent.enabled ? 'Active' : 'Disabled'}
           </span>
         </div>
@@ -440,7 +492,7 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
               size="sm"
               onClick={() =>
                 navigate(
-                  `/projects/${project.slug}/agents/detail/${agentSlug}/edit`,
+                  `/projects/${project.slug}/agents/detail/${agentSlug}/edit`
                 )
               }
             >
@@ -509,13 +561,17 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
                   <TableRow
                     key={run.id}
                     className="cursor-pointer hover:bg-muted/50"
-                    onClick={() => navigate(`/projects/${project.slug}/agents/${run.id}`)}
+                    onClick={() =>
+                      navigate(`/projects/${project.slug}/agents/${run.id}`)
+                    }
                   >
                     <TableCell>
                       <AutopilotStatusBadge status={run.status} />
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
-                      {run.trigger_type === 'autofixer' ? 'Autofix' : run.trigger_type}
+                      {run.trigger_type === 'autofixer'
+                        ? 'Autofix'
+                        : run.trigger_type}
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-sm">
                       {run.pr_number ? `#${run.pr_number}` : '-'}

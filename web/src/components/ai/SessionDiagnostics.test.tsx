@@ -26,7 +26,11 @@ test('debug mode exposes session diagnostics without fetching until opened', () 
 })
 
 test('normal chat never renders session JSON or creates its diagnostics query', () => {
-  for (const path of ['/ai-first', '/ai-first?debug=false', '/ai-first?debug=1']) {
+  for (const path of [
+    '/ai-first',
+    '/ai-first?debug=false',
+    '/ai-first?debug=1',
+  ]) {
     const client = new QueryClient()
     const html = renderToStaticMarkup(
       <QueryClientProvider client={client}>

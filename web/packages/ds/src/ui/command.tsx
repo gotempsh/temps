@@ -28,7 +28,11 @@ interface CommandDialogProps extends DialogProps {
   contentClassName?: string
 }
 
-const CommandDialog = ({ children, contentClassName, ...props }: CommandDialogProps) => {
+const CommandDialog = ({
+  children,
+  contentClassName,
+  ...props
+}: CommandDialogProps) => {
   return (
     <Dialog {...props}>
       <DialogContent
@@ -45,8 +49,9 @@ const CommandDialog = ({ children, contentClassName, ...props }: CommandDialogPr
   )
 }
 
-interface CommandInputProps
-  extends React.ComponentPropsWithoutRef<typeof CommandPrimitive.Input> {
+interface CommandInputProps extends React.ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Input
+> {
   /** Replace the search icon with a text prompt (e.g. `>`) — the Operator
    * console treatment. Omit for the stock magnifier. */
   prompt?: React.ReactNode

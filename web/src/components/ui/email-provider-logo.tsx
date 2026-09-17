@@ -9,7 +9,11 @@ import { Mail } from 'lucide-react'
 export type EmailProviderType = 'ses' | 'scaleway' | 'smtp'
 
 interface ProviderConfig {
-  icon: React.ComponentType<{ className?: string; width?: number; height?: number }>
+  icon: React.ComponentType<{
+    className?: string
+    width?: number
+    height?: number
+  }>
   label: string
   color: string
 }
@@ -54,9 +58,7 @@ export function EmailProviderLogo({
   return (
     <div className={cn('flex items-center gap-2', className)} {...props}>
       <Icon className={config.color} width={size} height={size} />
-      {showLabel && (
-        <span className="font-medium">{config.label}</span>
-      )}
+      {showLabel && <span className="font-medium">{config.label}</span>}
     </div>
   )
 }

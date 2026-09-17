@@ -15,9 +15,7 @@ const CHANGE_EVENT = 'temps:data-browser:views:change'
 
 function emitChange(serviceId: string) {
   if (typeof window === 'undefined') return
-  window.dispatchEvent(
-    new CustomEvent(CHANGE_EVENT, { detail: { serviceId } })
-  )
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: { serviceId } }))
 }
 
 export function useSavedViews(serviceId: string) {

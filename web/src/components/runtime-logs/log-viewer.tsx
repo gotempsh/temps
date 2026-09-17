@@ -56,7 +56,13 @@ import { FilterBar } from './filter-bar'
 // the visual change to the row itself.
 type LiveLogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
 
-const LEVEL_OPTIONS: LiveLogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
+const LEVEL_OPTIONS: LiveLogLevel[] = [
+  'ERROR',
+  'WARN',
+  'INFO',
+  'DEBUG',
+  'TRACE',
+]
 
 const LEVEL_COLORS: Record<LiveLogLevel, string> = {
   ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
@@ -184,7 +190,7 @@ const LiveLogRow = memo(function LiveLogRow({
     const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     return html.replace(
       new RegExp(`(${escaped})`, 'gi'),
-      '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>',
+      '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>'
     )
   }, [parsed.message, searchTerm])
 
@@ -192,7 +198,7 @@ const LiveLogRow = memo(function LiveLogRow({
     <div
       className={cn(
         'flex items-start gap-2 py-0.5 px-2 font-mono text-xs select-text hover:bg-muted/50',
-        isHighlighted && 'bg-accent',
+        isHighlighted && 'bg-accent'
       )}
     >
       {columns.timestamp && (
@@ -205,7 +211,7 @@ const LiveLogRow = memo(function LiveLogRow({
           variant="outline"
           className={cn(
             'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
-            LEVEL_COLORS[parsed.level],
+            LEVEL_COLORS[parsed.level]
           )}
         >
           {parsed.level}
@@ -277,9 +283,7 @@ const INTERVAL_OPTIONS_MS = [5_000, 30_000, 60_000] as const
 type IntervalMs = (typeof INTERVAL_OPTIONS_MS)[number]
 
 type LogMode =
-  | { kind: 'live' }
-  | { kind: 'pause' }
-  | { kind: 'interval'; ms: IntervalMs }
+  { kind: 'live' } | { kind: 'pause' } | { kind: 'interval'; ms: IntervalMs }
 
 const DEFAULT_MODE: LogMode = { kind: 'live' }
 const DEFAULT_INTERVAL_MS: IntervalMs = 5_000
@@ -310,7 +314,10 @@ function loadPersistedMode(projectSlug: string): LogMode {
 function persistMode(projectSlug: string, mode: LogMode) {
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(modeStorageKey(projectSlug), JSON.stringify(mode))
+    window.localStorage.setItem(
+      modeStorageKey(projectSlug),
+      JSON.stringify(mode)
+    )
   } catch {
     // ignore — quota / disabled storage
   }
@@ -399,7 +406,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   // Refresh mode: Live (rAF every frame), Pause (never auto-flush), or
   // Interval (flush every N ms). Persisted per-project so users don't re-pick
   // it every visit.
-  const [mode, setMode] = useState<LogMode>(() => loadPersistedMode(project.slug))
+  const [mode, setMode] = useState<LogMode>(() =>
+    loadPersistedMode(project.slug)
+  )
   // Last interval the user picked, so toggling "Interval" remembers their
   // previous duration instead of resetting to 5s every time.
   const [lastIntervalMs, setLastIntervalMs] = useState<IntervalMs>(() => {
@@ -508,7 +517,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           environment_id: selectedTarget || 0,
         },
       }).queryKey,
-    [project.id, selectedTarget],
+    [project.id, selectedTarget]
   )
 
   const { data: containersData } = useQuery({
@@ -570,14 +579,14 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     if (selectedContainer === ALL_CONTAINERS) return
 
     const stillExists = containers.some(
-      (c) => c.container_id === selectedContainer,
+      (c) => c.container_id === selectedContainer
     )
     if (!selectedContainer || !stillExists) {
       // Default to the combined "All containers" view when there's more than
       // one replica/container — that's the natural multi-node default. A
       // single-container project just selects that container.
       setSelectedContainer(
-        containers.length > 1 ? ALL_CONTAINERS : containers[0].container_id,
+        containers.length > 1 ? ALL_CONTAINERS : containers[0].container_id
       )
     }
   }, [containersData, selectedContainer])
@@ -588,7 +597,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const selectedContainerServiceName = useMemo(() => {
     if (!selectedContainer) return null
     const container = containersData?.containers?.find(
-      (c) => c.container_id === selectedContainer,
+      (c) => c.container_id === selectedContainer
     )
     return container?.service_name ?? container?.container_name ?? null
   }, [containersData, selectedContainer])
@@ -602,7 +611,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const isAllContainers = selectedContainer === ALL_CONTAINERS
   const allContainersList = useMemo(
     () => containersData?.containers ?? [],
-    [containersData],
+    [containersData]
   )
   // Stable signature of the container set so the multi-WS effect doesn't churn
   // on every 3s container-list refetch (which returns a fresh object).
@@ -612,7 +621,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         .map((c) => c.container_id)
         .sort()
         .join(','),
-    [allContainersList],
+    [allContainersList]
   )
   const tooManyForAll =
     isAllContainers && allContainersList.length > MAX_LIVE_ALL_CONTAINERS
@@ -625,7 +634,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
   const toggleLevel = useCallback((level: LiveLogLevel) => {
     setSelectedLevels((prev) =>
-      prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level],
+      prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level]
     )
   }, [])
 
@@ -736,7 +745,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         }
       }
     },
-    [flushPending],
+    [flushPending]
   )
 
   // Drive the Interval mode poll + countdown. Also drives the 1Hz "now" tick
@@ -884,8 +893,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     if (isAllContainers) return
 
     // Build a source-only signature (everything that affects what stream we
-     // connect to, excluding mode). If only mode changed since the last run,
-     // we're toggling Live/Pause/Interval and must keep the visible logs.
+    // connect to, excluding mode). If only mode changed since the last run,
+    // we're toggling Live/Pause/Interval and must keep the visible logs.
     const sourceSig = JSON.stringify({
       p: project.id,
       e: selectedTarget,
@@ -1223,7 +1232,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     // N×tail lines of backlog at once.
     const perTail = Math.max(
       50,
-      Math.floor(Math.min(tail, 800) / containers.length),
+      Math.floor(Math.min(tail, 800) / containers.length)
     )
 
     const openOne = (c: ContainerInfoResponse) => {
@@ -1363,7 +1372,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
       wsRef.current.onerror = () => {
         // Try to extract more details from the error event
-        let errorMessage = 'Connection failed'
+        const errorMessage = 'Connection failed'
         setErrorMessage(errorMessage)
         wsRef.current?.close()
 
@@ -1677,7 +1686,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                   'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
                   selectedLevels.includes(level)
                     ? LEVEL_COLORS[level]
-                    : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted',
+                    : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted'
                 )}
               >
                 {level}
@@ -1735,7 +1744,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                   <Timer className="h-3.5 w-3.5" />
                   Every{' '}
                   {formatIntervalLabel(
-                    mode.kind === 'interval' ? mode.ms : lastIntervalMs,
+                    mode.kind === 'interval' ? mode.ms : lastIntervalMs
                   )}
                 </Button>
                 <DropdownMenu>
@@ -1769,9 +1778,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
             {/* Status: buffered count, countdown, manual flush */}
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              {mode.kind === 'pause' && (
-                <span>Paused · stream closed</span>
-              )}
+              {mode.kind === 'pause' && <span>Paused · stream closed</span>}
               {mode.kind === 'live' && (
                 <span className="flex items-center gap-2">
                   <span>
@@ -1797,7 +1804,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                     {nextTickAt != null
                       ? `Next refresh in ${Math.max(
                           0,
-                          Math.ceil((nextTickAt - now) / 1000),
+                          Math.ceil((nextTickAt - now) / 1000)
                         )}s`
                       : 'Refreshing…'}
                     {bufferedCount > 0 &&
@@ -1884,12 +1891,12 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               <div className="text-center max-w-md px-4">
                 <AlertCircle className="h-12 w-12 mx-auto mb-3 opacity-50" />
                 <p className="text-sm">
-                  Too many containers ({allContainersList.length}) to stream live
-                  at once.
+                  Too many containers ({allContainersList.length}) to stream
+                  live at once.
                 </p>
                 <p className="text-xs mt-1">
-                  Pick a single container above, or use the History tab to search
-                  across all of them.
+                  Pick a single container above, or use the History tab to
+                  search across all of them.
                 </p>
               </div>
             </div>
@@ -1966,9 +1973,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                         raw={entry.raw}
                         columns={columns}
                         searchTerm={searchTerm}
-                        isHighlighted={
-                          virtualRow.index === currentMatchIndex
-                        }
+                        isHighlighted={virtualRow.index === currentMatchIndex}
                         serviceLabel={
                           entry.source ?? selectedContainerServiceName
                         }

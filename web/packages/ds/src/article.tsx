@@ -49,7 +49,10 @@ function slug(text: string): string {
  * first edit and takes the reader to the wrong place. So the headings are
  * whatever the body actually rendered, and a heading with no id gets one.
  */
-function useHeadings(root: React.RefObject<HTMLElement | null>, enabled: boolean): ArticleHeading[] {
+function useHeadings(
+  root: React.RefObject<HTMLElement | null>,
+  enabled: boolean
+): ArticleHeading[] {
   const [items, setItems] = useState<ArticleHeading[]>([])
   useEffect(() => {
     const el = root.current
@@ -72,7 +75,10 @@ function useHeadings(root: React.RefObject<HTMLElement | null>, enabled: boolean
         found.push({ id, text, level: h.tagName === 'H2' ? 2 : 3 })
       }
       setItems((prev) =>
-        prev.length === found.length && prev.every((p, i) => p.id === found[i].id) ? prev : found,
+        prev.length === found.length &&
+        prev.every((p, i) => p.id === found[i].id)
+          ? prev
+          : found
       )
     }
     read()
@@ -105,7 +111,9 @@ function useCurrent(items: ArticleHeading[]): string | undefined {
       }
       setCurrent(active)
     }
-    const onScroll = () => { if (!frame) frame = window.requestAnimationFrame(measure) }
+    const onScroll = () => {
+      if (!frame) frame = window.requestAnimationFrame(measure)
+    }
     measure()
     window.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('resize', onScroll)
@@ -131,8 +139,18 @@ function useCurrent(items: ArticleHeading[]): string | undefined {
  * from the keyboard and every heading is addressable.
  */
 export function Article({
-  title, lede, author, date, readingMinutes, toc = true, children, aside, footer,
-  backHref, backLabel = 'all posts', className,
+  title,
+  lede,
+  author,
+  date,
+  readingMinutes,
+  toc = true,
+  children,
+  aside,
+  footer,
+  backHref,
+  backLabel = 'all posts',
+  className,
 }: {
   title: string
   lede?: ReactNode
@@ -155,14 +173,22 @@ export function Article({
   const body = useRef<HTMLDivElement>(null)
   const items = useHeadings(body, toc)
   const current = useCurrent(items)
-  const when = useMemo(() => (date instanceof Date ? date : new Date(date)), [date])
+  const when = useMemo(
+    () => (date instanceof Date ? date : new Date(date)),
+    [date]
+  )
   const showRail = toc && items.length > 1
 
   return (
-    <article className={cn('mx-auto w-full max-w-6xl px-4 py-10 sm:px-8', className)}>
+    <article
+      className={cn('mx-auto w-full max-w-6xl px-4 py-10 sm:px-8', className)}
+    >
       {backHref ? (
         <p className="mb-8">
-          <a href={backHref} className="op-label inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground">
+          <a
+            href={backHref}
+            className="op-label inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground"
+          >
             <ArrowLeft aria-hidden className="h-3.5 w-3.5" /> {backLabel}
           </a>
         </p>
@@ -172,10 +198,16 @@ export function Article({
         <h1 className="op-h1">{title}</h1>
         {lede ? <p className="op-lede">{lede}</p> : null}
         <p className="mt-5 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-xs text-muted-foreground">
-          {author.mark ? <span className="inline-flex size-4 shrink-0 items-center">{author.mark}</span> : null}
+          {author.mark ? (
+            <span className="inline-flex size-4 shrink-0 items-center">
+              {author.mark}
+            </span>
+          ) : null}
           <span className="text-foreground">{author.name}</span>
           <span aria-hidden>·</span>
-          <time dateTime={when.toISOString()}>{fmtAbsolute(when, { time: false })}</time>
+          <time dateTime={when.toISOString()}>
+            {fmtAbsolute(when, { time: false })}
+          </time>
           {readingMinutes ? (
             <>
               <span aria-hidden>·</span>
@@ -185,8 +217,15 @@ export function Article({
         </p>
       </header>
 
-      <div className={cn('mt-8 grid gap-x-10 gap-y-8', showRail && 'lg:grid-cols-[minmax(0,1fr)_15rem]')}>
-        <div ref={body} className="op-prose min-w-0">{children}</div>
+      <div
+        className={cn(
+          'mt-8 grid gap-x-10 gap-y-8',
+          showRail && 'lg:grid-cols-[minmax(0,1fr)_15rem]'
+        )}
+      >
+        <div ref={body} className="op-prose min-w-0">
+          {children}
+        </div>
         {showRail ? (
           <nav aria-label="On this page" className="min-w-0 lg:order-last">
             <div className="sticky top-6 border-t pt-3 lg:border-t-0 lg:border-l lg:pl-4 lg:pt-0">
@@ -199,7 +238,9 @@ export function Article({
                       aria-current={current === it.id ? 'true' : undefined}
                       className={cn(
                         'block hover:text-foreground',
-                        current === it.id ? 'font-medium text-foreground' : 'text-muted-foreground',
+                        current === it.id
+                          ? 'font-medium text-foreground'
+                          : 'text-muted-foreground'
                       )}
                     >
                       {it.text}
@@ -217,11 +258,19 @@ export function Article({
 
       {(footer || backHref) && (
         <footer className="mt-12 border-t pt-5">
-          {footer ? <div className="max-w-[var(--op-measure)] text-sm text-muted-foreground">{footer}</div> : null}
+          {footer ? (
+            <div className="max-w-[var(--op-measure)] text-sm text-muted-foreground">
+              {footer}
+            </div>
+          ) : null}
           {backHref ? (
             <p className={cn(footer && 'mt-4')}>
-              <a href={backHref} className="op-label inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground">
-                <ArrowLeft aria-hidden className="h-3.5 w-3.5" /> back to {backLabel}
+              <a
+                href={backHref}
+                className="op-label inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground"
+              >
+                <ArrowLeft aria-hidden className="h-3.5 w-3.5" /> back to{' '}
+                {backLabel}
               </a>
             </p>
           ) : null}
@@ -242,7 +291,11 @@ export function Article({
  * rather than wrapping a command across two lines.
  */
 export function CodeBlock({
-  code, lang, filename, copy = true, className,
+  code,
+  lang,
+  filename,
+  copy = true,
+  className,
 }: {
   code: string
   /** The language word, shown in the label row: `bash`, `ts`, `sql`. */
@@ -256,14 +309,24 @@ export function CodeBlock({
     <div className={cn('mt-4 border', className)}>
       <div className="flex items-center gap-2 border-b px-3 py-1.5">
         <span className="op-label text-muted-foreground">{lang}</span>
-        {filename ? <span className="truncate font-mono text-[11px]">{filename}</span> : null}
+        {filename ? (
+          <span className="truncate font-mono text-[11px]">{filename}</span>
+        ) : null}
         {copy ? (
-          <CopyAction value={code} className="ms-auto h-6" aria-label={`Copy ${label}`}>
+          <CopyAction
+            value={code}
+            className="ms-auto h-6"
+            aria-label={`Copy ${label}`}
+          >
             copy
           </CopyAction>
         ) : null}
       </div>
-      <pre tabIndex={0} data-allow-overflow className="op-inset m-0 overflow-x-auto border-0 p-3 font-mono text-[12px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
+      <pre
+        tabIndex={0}
+        data-allow-overflow
+        className="op-inset m-0 overflow-x-auto border-0 p-3 font-mono text-[12px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+      >
         <code>{code}</code>
       </pre>
     </div>
@@ -282,7 +345,13 @@ export function CodeBlock({
  * the box so the text under the figure does not jump when it loads.
  */
 export function ImageFigure({
-  src, dark, alt, caption, width, height, className,
+  src,
+  dark,
+  alt,
+  caption,
+  width,
+  height,
+  className,
 }: {
   src: string
   /** The night-mode file. Omit only when the picture has no theme. */
@@ -295,8 +364,22 @@ export function ImageFigure({
 }) {
   return (
     <figure className={cn('min-w-0', className)}>
-      <img src={src} alt={alt} width={width} height={height} data-theme={dark ? 'light' : undefined} />
-      {dark ? <img src={dark} alt={alt} width={width} height={height} data-theme="dark" /> : null}
+      <img
+        src={src}
+        alt={alt}
+        width={width}
+        height={height}
+        data-theme={dark ? 'light' : undefined}
+      />
+      {dark ? (
+        <img
+          src={dark}
+          alt={alt}
+          width={width}
+          height={height}
+          data-theme="dark"
+        />
+      ) : null}
       <figcaption>{caption}</figcaption>
     </figure>
   )

@@ -17,12 +17,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import {
-  ChevronLeft,
-  ChevronRight,
-  Globe,
-  Monitor,
-} from 'lucide-react'
+import { ChevronLeft, ChevronRight, Globe, Monitor } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { EventBadge, EventIcon } from './shared'
 import { parseUserAgent, problemMessage } from './sharedUtils'
@@ -46,7 +41,9 @@ async function fetchEmailEvents(
     query: eventType ? { event_type: eventType } : undefined,
   })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email events'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email events')
+    )
   }
   return response.data
 }
@@ -201,7 +198,6 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                       </span>
                     )}
                   </div>
-
                 </div>
               </div>
             ))}

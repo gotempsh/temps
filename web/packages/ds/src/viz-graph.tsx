@@ -29,7 +29,19 @@ export type PathNode = {
   note?: string
 }
 
-function PathBranch({ node, parentCount, depth, dropAlert, onOpen }: { node: PathNode; parentCount: number; depth: number; dropAlert: number; onOpen?: (n: PathNode) => void }) {
+function PathBranch({
+  node,
+  parentCount,
+  depth,
+  dropAlert,
+  onOpen,
+}: {
+  node: PathNode
+  parentCount: number
+  depth: number
+  dropAlert: number
+  onOpen?: (n: PathNode) => void
+}) {
   const [open, setOpen] = useState(depth < 1)
   const share = parentCount ? (node.count / parentCount) * 100 : 0
   const exits = node.exits ?? 0
@@ -37,24 +49,93 @@ function PathBranch({ node, parentCount, depth, dropAlert, onOpen }: { node: Pat
   const kids = node.children ?? []
   return (
     <li>
-      <div className="flex min-w-0 items-center gap-2 px-3 py-1.5" style={{ paddingLeft: `${0.75 + depth * 1.25}rem` }}>
-        <button type="button" disabled={!kids.length} aria-expanded={kids.length ? open : undefined} onClick={() => setOpen((o) => !o)}
-          className={cn('flex min-w-0 flex-1 items-center gap-1.5 text-left', kids.length && 'hover:text-foreground')}>
-          {kids.length
-            ? <ChevronRight aria-hidden className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
-            : <span aria-hidden className="w-3 shrink-0 text-center text-muted-foreground">·</span>}
+      <div
+        className="flex min-w-0 items-center gap-2 px-3 py-1.5"
+        style={{ paddingLeft: `${0.75 + depth * 1.25}rem` }}
+      >
+        <button
+          type="button"
+          disabled={!kids.length}
+          aria-expanded={kids.length ? open : undefined}
+          onClick={() => setOpen((o) => !o)}
+          className={cn(
+            'flex min-w-0 flex-1 items-center gap-1.5 text-left',
+            kids.length && 'hover:text-foreground'
+          )}
+        >
+          {kids.length ? (
+            <ChevronRight
+              aria-hidden
+              className={cn(
+                'h-3 w-3 shrink-0 text-muted-foreground transition-transform',
+                open && 'rotate-90'
+              )}
+            />
+          ) : (
+            <span
+              aria-hidden
+              className="w-3 shrink-0 text-center text-muted-foreground"
+            >
+              ·
+            </span>
+          )}
           <span className="min-w-0 truncate font-mono">{node.label}</span>
-          {node.note && <span className="shrink-0 text-[11px] text-muted-foreground">{node.note}</span>}
+          {node.note && (
+            <span className="shrink-0 text-[11px] text-muted-foreground">
+              {node.note}
+            </span>
+          )}
         </button>
-        <span className="shrink-0 font-mono tabular-nums">{fmtNum(node.count)}</span>
-        <span className="w-12 shrink-0 text-right font-mono tabular-nums text-muted-foreground">{fmtPct(share, { digits: share < 10 ? 1 : 0 })}</span>
-        {/* Drop-off is the number the reader came for, so it is the only thing on the row that can turn red. */}
-        <span className={cn('w-20 shrink-0 text-right font-mono tabular-nums', drop >= dropAlert ? 'text-destructive' : 'text-muted-foreground')}>
-          {exits ? <>{drop >= dropAlert && <span aria-hidden className="mr-1">×</span>}{fmtPct(drop, { digits: 0 })} left</> : ''}
+        <span className="shrink-0 font-mono tabular-nums">
+          {fmtNum(node.count)}
         </span>
-        {onOpen && <button type="button" onClick={() => onOpen(node)} className="shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground">open</button>}
+        <span className="w-12 shrink-0 text-right font-mono tabular-nums text-muted-foreground">
+          {fmtPct(share, { digits: share < 10 ? 1 : 0 })}
+        </span>
+        {/* Drop-off is the number the reader came for, so it is the only thing on the row that can turn red. */}
+        <span
+          className={cn(
+            'w-20 shrink-0 text-right font-mono tabular-nums',
+            drop >= dropAlert ? 'text-destructive' : 'text-muted-foreground'
+          )}
+        >
+          {exits ? (
+            <>
+              {drop >= dropAlert && (
+                <span aria-hidden className="mr-1">
+                  ×
+                </span>
+              )}
+              {fmtPct(drop, { digits: 0 })} left
+            </>
+          ) : (
+            ''
+          )}
+        </span>
+        {onOpen && (
+          <button
+            type="button"
+            onClick={() => onOpen(node)}
+            className="shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground"
+          >
+            open
+          </button>
+        )}
       </div>
-      {open && kids.length > 0 && <ul className="op-rows border-t border-[var(--op-rule-soft)]">{kids.map((k) => <PathBranch key={k.label} node={k} parentCount={node.count} depth={depth + 1} dropAlert={dropAlert} onOpen={onOpen} />)}</ul>}
+      {open && kids.length > 0 && (
+        <ul className="op-rows border-t border-[var(--op-rule-soft)]">
+          {kids.map((k) => (
+            <PathBranch
+              key={k.label}
+              node={k}
+              parentCount={node.count}
+              depth={depth + 1}
+              dropAlert={dropAlert}
+              onOpen={onOpen}
+            />
+          ))}
+        </ul>
+      )}
     </li>
   )
 }
@@ -75,7 +156,15 @@ function PathBranch({ node, parentCount, depth, dropAlert, onOpen }: { node: Pat
  *   reach /pricing leave without opening /signup." />
  * ```
  */
-export function PathTree({ root, label, verdict, dropAlert = 50, onOpen, meta, className }: {
+export function PathTree({
+  root,
+  label,
+  verdict,
+  dropAlert = 50,
+  onOpen,
+  meta,
+  className,
+}: {
   root: PathNode
   label: string
   verdict: string
@@ -88,7 +177,10 @@ export function PathTree({ root, label, verdict, dropAlert = 50, onOpen, meta, c
   const total = root.count
   const steps = useMemo(() => {
     let n = 0
-    const walk = (x: PathNode) => { n += 1; (x.children ?? []).forEach(walk) }
+    const walk = (x: PathNode) => {
+      n += 1
+      ;(x.children ?? []).forEach(walk)
+    }
     walk(root)
     return n
   }, [root])
@@ -97,13 +189,33 @@ export function PathTree({ root, label, verdict, dropAlert = 50, onOpen, meta, c
       <div className="flex items-center gap-3 border-b px-3 py-1.5">
         <span className="op-label min-w-0 flex-1 truncate">{label}</span>
         <span className="op-label shrink-0 text-[9px]">sessions</span>
-        <span className="op-label w-12 shrink-0 text-right text-[9px]">of above</span>
-        <span className="op-label w-20 shrink-0 text-right text-[9px]">drop-off</span>
+        <span className="op-label w-12 shrink-0 text-right text-[9px]">
+          of above
+        </span>
+        <span className="op-label w-20 shrink-0 text-right text-[9px]">
+          drop-off
+        </span>
       </div>
-      <ul className="op-rows" aria-label={`${label}. ${verdict.replace(/\.\s*$/, '')}. ${fmtNum(total)} sessions across ${steps} steps.`}>
-        <PathBranch node={root} parentCount={total} depth={0} dropAlert={dropAlert} onOpen={onOpen} />
+      <ul
+        className="op-rows"
+        aria-label={`${label}. ${verdict.replace(/\.\s*$/, '')}. ${fmtNum(total)} sessions across ${steps} steps.`}
+      >
+        <PathBranch
+          node={root}
+          parentCount={total}
+          depth={0}
+          dropAlert={dropAlert}
+          onOpen={onOpen}
+        />
       </ul>
-      <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">{meta ?? <>{fmtNum(total)} sessions · share is of the step above · × drop-off at or above {dropAlert}%</>}</p>
+      <p className="border-t px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+        {meta ?? (
+          <>
+            {fmtNum(total)} sessions · share is of the step above · × drop-off
+            at or above {dropAlert}%
+          </>
+        )}
+      </p>
     </div>
   )
 }
@@ -127,7 +239,13 @@ export type TopoNode = {
   facts?: string
 }
 /** An edge. `relay` is drawn dashed because it is a different kind of reach, not a worse one. */
-export type TopoLink = { from: string; to: string; kind?: 'direct' | 'relay' | 'call'; label?: string; state?: State }
+export type TopoLink = {
+  from: string
+  to: string
+  kind?: 'direct' | 'relay' | 'call'
+  label?: string
+  state?: State
+}
 
 /**
  * Nodes and the links between them: a cluster (control plane, workers, their
@@ -148,7 +266,16 @@ export type TopoLink = { from: string; to: string; kind?: 'direct' | 'relay' | '
  *   verdict="hetzner-3 has not sent a heartbeat for 4 minutes." />
  * ```
  */
-export function Topology({ nodes, links, label, verdict, onOpen, height = 260, meta, className }: {
+export function Topology({
+  nodes,
+  links,
+  label,
+  verdict,
+  onOpen,
+  height = 260,
+  meta,
+  className,
+}: {
   nodes: TopoNode[]
   links: TopoLink[]
   label: string
@@ -159,33 +286,73 @@ export function Topology({ nodes, links, label, verdict, onOpen, height = 260, m
   className?: string
 }) {
   const [hot, setHot] = useState<string | null>(null)
-  const layers = useMemo(() => [...new Set(nodes.map((n) => n.layer))].sort((a, b) => a - b), [nodes])
+  const layers = useMemo(
+    () => [...new Set(nodes.map((n) => n.layer))].sort((a, b) => a - b),
+    [nodes]
+  )
   const at = useMemo(() => {
     const m = new Map<string, { x: number; y: number }>()
     layers.forEach((l, li) => {
       const row = nodes.filter((n) => n.layer === l)
-      row.forEach((n, i) => m.set(n.id, { x: ((i + 0.5) / row.length) * 100, y: ((li + 0.5) / layers.length) * 100 }))
+      row.forEach((n, i) =>
+        m.set(n.id, {
+          x: ((i + 0.5) / row.length) * 100,
+          y: ((li + 0.5) / layers.length) * 100,
+        })
+      )
     })
     return m
   }, [nodes, layers])
   const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes])
-  const linksOf = (id: string) => links.filter((l) => l.from === id || l.to === id)
+  const linksOf = (id: string) =>
+    links.filter((l) => l.from === id || l.to === id)
   const sentence = `${label}: ${nodes.length} nodes on ${layers.length} rows, ${links.length} links. ${verdict.replace(/\.\s*$/, '')}. The list below has every node and its links.`
   return (
     <div className={cn('min-w-0 space-y-2', className)}>
       {/* The graph clips rather than pushing the page sideways on a phone: it is
           the second view, and the list under it carries every fact in full. */}
-      <div role="img" aria-label={sentence} className="relative min-w-0 overflow-hidden border bg-background" style={{ height }}>
-        <svg aria-hidden viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full">
+      <div
+        role="img"
+        aria-label={sentence}
+        className="relative min-w-0 overflow-hidden border bg-background"
+        style={{ height }}
+      >
+        <svg
+          aria-hidden
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          className="absolute inset-0 h-full w-full"
+        >
           {links.map((l, i) => {
-            const a = at.get(l.from), b = at.get(l.to)
+            const a = at.get(l.from),
+              b = at.get(l.to)
             if (!a || !b) return null
             const on = hot === l.from || hot === l.to
             return (
-              <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} vectorEffect="non-scaling-stroke"
-                stroke={l.state === 'error' ? 'var(--destructive)' : l.state === 'warn' ? 'var(--warning)' : 'var(--foreground)'}
-                strokeOpacity={on ? 1 : 0.35} strokeWidth={on ? 1.5 : 1}
-                strokeDasharray={l.kind === 'relay' ? '4 3' : l.kind === 'call' ? '1 3' : undefined} />
+              <line
+                key={i}
+                x1={a.x}
+                y1={a.y}
+                x2={b.x}
+                y2={b.y}
+                vectorEffect="non-scaling-stroke"
+                stroke={
+                  l.state === 'error'
+                    ? 'var(--destructive)'
+                    : l.state === 'warn'
+                      ? 'var(--warning)'
+                      : 'var(--foreground)'
+                }
+                strokeOpacity={on ? 1 : 0.35}
+                strokeWidth={on ? 1.5 : 1}
+                strokeDasharray={
+                  l.kind === 'relay'
+                    ? '4 3'
+                    : l.kind === 'call'
+                      ? '1 3'
+                      : undefined
+                }
+              />
             )
           })}
         </svg>
@@ -196,49 +363,122 @@ export function Topology({ nodes, links, label, verdict, onOpen, height = 260, m
         {nodes.map((n) => {
           const p = at.get(n.id)!
           return (
-            <span key={n.id} aria-hidden onMouseEnter={() => setHot(n.id)} onMouseLeave={() => setHot(null)}
+            <span
+              key={n.id}
+              aria-hidden
+              onMouseEnter={() => setHot(n.id)}
+              onMouseLeave={() => setHot(null)}
               onClick={() => onOpen?.(n)}
-              className={cn('absolute block max-w-[min(18rem,46%)] -translate-x-1/2 -translate-y-1/2 border bg-background px-2 py-1 text-left text-xs shadow-[2px_2px_0_0_var(--foreground)]', hot === n.id && 'bg-muted', onOpen && 'cursor-pointer hover:bg-muted')}
-              style={{ left: `${p.x}%`, top: `${p.y}%` }}>
+              className={cn(
+                'absolute block max-w-[min(18rem,46%)] -translate-x-1/2 -translate-y-1/2 border bg-background px-2 py-1 text-left text-xs shadow-[2px_2px_0_0_var(--foreground)]',
+                hot === n.id && 'bg-muted',
+                onOpen && 'cursor-pointer hover:bg-muted'
+              )}
+              style={{ left: `${p.x}%`, top: `${p.y}%` }}
+            >
               <span className="flex min-w-0 items-center gap-1.5 font-mono">
-                <span className={cn('shrink-0', GLYPH_CLASS[n.state])}>{GLYPH[n.state]}</span>
+                <span className={cn('shrink-0', GLYPH_CLASS[n.state])}>
+                  {GLYPH[n.state]}
+                </span>
                 <span className="truncate">{n.label}</span>
               </span>
-              <span className="block truncate font-mono text-[10px] text-muted-foreground">{n.kind}{n.facts ? ` · ${n.facts}` : ''}</span>
+              <span className="block truncate font-mono text-[10px] text-muted-foreground">
+                {n.kind}
+                {n.facts ? ` · ${n.facts}` : ''}
+              </span>
             </span>
           )
         })}
       </div>
       <ul className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-muted-foreground">
-        {(['direct', 'relay', 'call'] as const).filter((k) => links.some((l) => (l.kind ?? 'direct') === k)).map((k) => (
-          <li key={k} className="flex items-center gap-1.5">
-            <svg aria-hidden width={18} height={6} viewBox="0 0 18 6" className="shrink-0"><line x1={0} y1={3} x2={18} y2={3} stroke="var(--foreground)" strokeWidth={1} strokeDasharray={k === 'relay' ? '4 3' : k === 'call' ? '1 3' : undefined} /></svg>{k}
-          </li>
-        ))}
+        {(['direct', 'relay', 'call'] as const)
+          .filter((k) => links.some((l) => (l.kind ?? 'direct') === k))
+          .map((k) => (
+            <li key={k} className="flex items-center gap-1.5">
+              <svg
+                aria-hidden
+                width={18}
+                height={6}
+                viewBox="0 0 18 6"
+                className="shrink-0"
+              >
+                <line
+                  x1={0}
+                  y1={3}
+                  x2={18}
+                  y2={3}
+                  stroke="var(--foreground)"
+                  strokeWidth={1}
+                  strokeDasharray={
+                    k === 'relay' ? '4 3' : k === 'call' ? '1 3' : undefined
+                  }
+                />
+              </svg>
+              {k}
+            </li>
+          ))}
       </ul>
       {/* The list is the view that carries the keyboard, the numbers and the state words. */}
       <ol className="op-rows border bg-background text-xs">
         {nodes.map((n) => (
           <li key={n.id}>
-            <button type="button" disabled={!onOpen} onMouseEnter={() => setHot(n.id)} onMouseLeave={() => setHot(null)} onFocus={() => setHot(n.id)} onBlur={() => setHot(null)} onClick={() => onOpen?.(n)}
-              className={cn('grid w-full grid-cols-1 items-center gap-x-3 px-3 py-1.5 text-left sm:grid-cols-[minmax(0,1fr)_minmax(0,auto)]', onOpen && 'hover:bg-muted/60', hot === n.id && 'bg-muted/60')}>
+            <button
+              type="button"
+              disabled={!onOpen}
+              onMouseEnter={() => setHot(n.id)}
+              onMouseLeave={() => setHot(null)}
+              onFocus={() => setHot(n.id)}
+              onBlur={() => setHot(null)}
+              onClick={() => onOpen?.(n)}
+              className={cn(
+                'grid w-full grid-cols-1 items-center gap-x-3 px-3 py-1.5 text-left sm:grid-cols-[minmax(0,1fr)_minmax(0,auto)]',
+                onOpen && 'hover:bg-muted/60',
+                hot === n.id && 'bg-muted/60'
+              )}
+            >
               <span className="min-w-0">
                 <span className="flex min-w-0 items-center gap-1.5 font-mono">
-                  <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[n.state])}>{GLYPH[n.state]}</span>
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'w-3 shrink-0 text-center',
+                      GLYPH_CLASS[n.state]
+                    )}
+                  >
+                    {GLYPH[n.state]}
+                  </span>
                   <span className="truncate">{n.label}</span>
-                  <span className="shrink-0 text-[11px] text-muted-foreground">{n.kind}</span>
+                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                    {n.kind}
+                  </span>
                 </span>
-                {n.facts && <span className="block truncate pl-[1.125rem] font-mono text-[11px] text-muted-foreground">{n.facts}</span>}
+                {n.facts && (
+                  <span className="block truncate pl-[1.125rem] font-mono text-[11px] text-muted-foreground">
+                    {n.facts}
+                  </span>
+                )}
               </span>
               {/* The links wrap rather than squeezing the name out of existence. */}
               <span className="min-w-0 font-mono text-[11px] text-muted-foreground sm:text-right">
-                {linksOf(n.id).map((l) => `${l.kind ?? 'direct'} ${byId.get(l.from === n.id ? l.to : l.from)?.label ?? '?'}`).join(' · ') || 'no links'}
+                {linksOf(n.id)
+                  .map(
+                    (l) =>
+                      `${l.kind ?? 'direct'} ${byId.get(l.from === n.id ? l.to : l.from)?.label ?? '?'}`
+                  )
+                  .join(' · ') || 'no links'}
               </span>
             </button>
           </li>
         ))}
       </ol>
-      <p className="font-mono text-[10px] text-muted-foreground">{meta ?? <>{nodes.length} nodes · {links.length} links · the graph and the list are the same rows</>}</p>
+      <p className="font-mono text-[10px] text-muted-foreground">
+        {meta ?? (
+          <>
+            {nodes.length} nodes · {links.length} links · the graph and the list
+            are the same rows
+          </>
+        )}
+      </p>
     </div>
   )
 }

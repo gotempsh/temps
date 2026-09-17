@@ -77,11 +77,7 @@ import {
   DataBrowserTabs,
   type BrowserTab,
 } from '@/components/storage/DataBrowserTabs'
-import {
-  decodeTabs,
-  encodeTabs,
-  makeTabId,
-} from '@/lib/data-browser-tabs'
+import { decodeTabs, encodeTabs, makeTabId } from '@/lib/data-browser-tabs'
 import { useSavedViews } from '@/hooks/useSavedViews'
 import type { SavedView } from '@/lib/data-browser-views'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -172,7 +168,6 @@ export function ServiceDataBrowser() {
 
   // Track the last expanded path to avoid re-expanding
   const lastExpandedPathRef = useRef<string>('')
-
 
   // Live mirror of `treeNodes`. The URL-restore effect below walks the path
   // one level at a time, loading each level's children as it goes; it must
@@ -390,12 +385,7 @@ export function ServiceDataBrowser() {
       >
         {/* Numbers are pixels in v4; the string maxSize is a percentage, so
             the tree can never crowd out the table it exists to navigate. */}
-        <ResizablePanel
-          id="tree"
-          defaultSize={320}
-          minSize={220}
-          maxSize="50"
-        >
+        <ResizablePanel id="tree" defaultSize={320} minSize={220} maxSize="50">
           {sidebar}
         </ResizablePanel>
         <ResizableHandle withHandle className="mx-3" />
@@ -788,8 +778,7 @@ export function ServiceDataBrowser() {
         entityCountHint:
           (container.entity_count_hint as 'small' | 'large' | null) || null,
         metadata: (container.metadata ?? undefined) as
-          | Record<string, unknown>
-          | undefined,
+          Record<string, unknown> | undefined,
       }))
       setTreeNodes(nodes)
     }
@@ -980,7 +969,9 @@ export function ServiceDataBrowser() {
     [entityInfo]
   )
   const sortFieldIsValid =
-    !dataSortField || entityFieldNames.size === 0 || entityFieldNames.has(dataSortField)
+    !dataSortField ||
+    entityFieldNames.size === 0 ||
+    entityFieldNames.has(dataSortField)
   const effectiveSortField = sortFieldIsValid ? dataSortField : ''
 
   // Drop the stale field from state too, so the column header doesn't show a
@@ -1244,8 +1235,7 @@ export function ServiceDataBrowser() {
                   (container.entity_count_hint as 'small' | 'large' | null) ||
                   null,
                 metadata: (container.metadata ?? undefined) as
-                  | Record<string, unknown>
-                  | undefined,
+                  Record<string, unknown> | undefined,
               })
             })
 
@@ -1607,9 +1597,7 @@ export function ServiceDataBrowser() {
           </div>
 
           {/* Main content skeleton */}
-          <div
-            className="flex-1 flex flex-col min-w-0 px-4 md:px-0"
-          >
+          <div className="flex-1 flex flex-col min-w-0 px-4 md:px-0">
             <div className="flex-1 overflow-y-auto space-y-6 pt-2">
               {/* Entity info card */}
               <Card>
@@ -2068,111 +2056,114 @@ export function ServiceDataBrowser() {
             // row values butt straight up against it.
             className="min-h-0 flex-1 overflow-y-auto pt-2 pr-3"
           >
-          {selectedEntity ? (
-            // Show entity data
-            <EntityDataView
-              entityInfo={entityInfo}
-              entityInfoLoading={entityInfoLoading}
-              queryResult={queryEntityData.data}
-              queryLoading={queryEntityData.isPending}
-              queryError={queryEntityData.error}
-              page={page}
-              pageSize={pageSize}
-              rowOffset={dataOffset}
-              onPageChange={(p) => {
-                // Advance by the rows actually received, not by pageSize. A
-                // byte-truncated page returns fewer rows than requested while
-                // more remain at this offset; stepping by pageSize would skip
-                // them without a trace. Going back steps by pageSize, which can
-                // re-show a few rows after a truncated page — harmless, whereas
-                // the other direction loses data.
-                setDataOffset((prev) => {
-                  if (p <= 1) return 0
-                  if (p > page) {
-                    return (
-                      prev + (queryEntityData.data?.returned_count ?? pageSize)
-                    )
-                  }
-                  return Math.max(0, prev - pageSize)
-                })
-                setPage(p)
-                commitActiveTab({ page: p })
-              }}
-              dataFilterInput={dataFilterInput}
-              onDataFilterInputChange={setDataFilterInput}
-              filterFormData={filterFormData}
-              onFilterFormDataChange={setFilterFormData}
-              appliedFilter={dataFilter}
-              onApplyFilter={handleApplyFilter}
-              onClearFilter={handleClearFilter}
-              dataSortField={effectiveSortField}
-              dataSortOrder={dataSortOrder}
-              explorerSupport={explorerSupport}
-              onSort={(field: string) => {
-                let nextField = dataSortField
-                let nextOrder: 'asc' | 'desc'
-                if (dataSortField === field) {
-                  nextOrder = dataSortOrder === 'asc' ? 'desc' : 'asc'
-                  setDataSortOrder(nextOrder)
-                } else {
-                  nextField = field
-                  nextOrder = 'asc'
-                  setDataSortField(nextField)
-                  setDataSortOrder(nextOrder)
-                }
-                setPage(1) // Reset to first page when sorting
-                commitActiveTab({
-                  sortField: nextField || undefined,
-                  sortOrder: nextField ? nextOrder : undefined,
-                  page: 1,
-                })
-              }}
-              onRefresh={() => {
-                if (selectedEntity && selectedPath && id) {
-                  queryEntityData.mutate({
-                    path: {
-                      service_id: parseInt(id),
-                      path: selectedPath,
-                      entity: selectedEntity,
-                    },
-                    body: {
-                      limit: pageSize,
-                      offset: dataOffset,
-                      sort_by: effectiveSortField || undefined,
-                      sort_order: effectiveSortField ? dataSortOrder : undefined,
-                      filters: dataFilter || undefined,
-                    },
+            {selectedEntity ? (
+              // Show entity data
+              <EntityDataView
+                entityInfo={entityInfo}
+                entityInfoLoading={entityInfoLoading}
+                queryResult={queryEntityData.data}
+                queryLoading={queryEntityData.isPending}
+                queryError={queryEntityData.error}
+                page={page}
+                pageSize={pageSize}
+                rowOffset={dataOffset}
+                onPageChange={(p) => {
+                  // Advance by the rows actually received, not by pageSize. A
+                  // byte-truncated page returns fewer rows than requested while
+                  // more remain at this offset; stepping by pageSize would skip
+                  // them without a trace. Going back steps by pageSize, which can
+                  // re-show a few rows after a truncated page — harmless, whereas
+                  // the other direction loses data.
+                  setDataOffset((prev) => {
+                    if (p <= 1) return 0
+                    if (p > page) {
+                      return (
+                        prev +
+                        (queryEntityData.data?.returned_count ?? pageSize)
+                      )
+                    }
+                    return Math.max(0, prev - pageSize)
                   })
-                }
-              }}
-              getEntityIcon={getEntityIcon}
-              isObjectStore={isObjectStore}
-              formatFileSize={formatFileSize}
-              formatDate={formatDate}
-              serviceId={id || ''}
-              containerPath={selectedPath}
-              entityName={selectedEntity}
-              onNavigateToContainer={(path) => navigateTo(path)}
-            />
-          ) : selectedPath ? (
-            renderContainerContent()
-          ) : (
-            // Show welcome message
-            <Card>
-              <CardHeader>
-                <CardTitle>Welcome to Data Browser</CardTitle>
-                <CardDescription>
-                  Select a container from the sidebar to get started
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground">
-                  Use the tree navigation on the left to browse through
-                  containers, schemas, and tables.
-                </p>
-              </CardContent>
-            </Card>
-          )}
+                  setPage(p)
+                  commitActiveTab({ page: p })
+                }}
+                dataFilterInput={dataFilterInput}
+                onDataFilterInputChange={setDataFilterInput}
+                filterFormData={filterFormData}
+                onFilterFormDataChange={setFilterFormData}
+                appliedFilter={dataFilter}
+                onApplyFilter={handleApplyFilter}
+                onClearFilter={handleClearFilter}
+                dataSortField={effectiveSortField}
+                dataSortOrder={dataSortOrder}
+                explorerSupport={explorerSupport}
+                onSort={(field: string) => {
+                  let nextField = dataSortField
+                  let nextOrder: 'asc' | 'desc'
+                  if (dataSortField === field) {
+                    nextOrder = dataSortOrder === 'asc' ? 'desc' : 'asc'
+                    setDataSortOrder(nextOrder)
+                  } else {
+                    nextField = field
+                    nextOrder = 'asc'
+                    setDataSortField(nextField)
+                    setDataSortOrder(nextOrder)
+                  }
+                  setPage(1) // Reset to first page when sorting
+                  commitActiveTab({
+                    sortField: nextField || undefined,
+                    sortOrder: nextField ? nextOrder : undefined,
+                    page: 1,
+                  })
+                }}
+                onRefresh={() => {
+                  if (selectedEntity && selectedPath && id) {
+                    queryEntityData.mutate({
+                      path: {
+                        service_id: parseInt(id),
+                        path: selectedPath,
+                        entity: selectedEntity,
+                      },
+                      body: {
+                        limit: pageSize,
+                        offset: dataOffset,
+                        sort_by: effectiveSortField || undefined,
+                        sort_order: effectiveSortField
+                          ? dataSortOrder
+                          : undefined,
+                        filters: dataFilter || undefined,
+                      },
+                    })
+                  }
+                }}
+                getEntityIcon={getEntityIcon}
+                isObjectStore={isObjectStore}
+                formatFileSize={formatFileSize}
+                formatDate={formatDate}
+                serviceId={id || ''}
+                containerPath={selectedPath}
+                entityName={selectedEntity}
+                onNavigateToContainer={(path) => navigateTo(path)}
+              />
+            ) : selectedPath ? (
+              renderContainerContent()
+            ) : (
+              // Show welcome message
+              <Card>
+                <CardHeader>
+                  <CardTitle>Welcome to Data Browser</CardTitle>
+                  <CardDescription>
+                    Select a container from the sidebar to get started
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-sm text-muted-foreground">
+                    Use the tree navigation on the left to browse through
+                    containers, schemas, and tables.
+                  </p>
+                </CardContent>
+              </Card>
+            )}
           </div>
         </div>
       )}
@@ -2364,17 +2355,17 @@ function TreeNodeComponent({
           size-3.5 (7px). */}
       {node.isExpanded && node.children && node.children.length > 0 && (
         <div className="ml-[15px] border-l border-border pl-2">
-        <TreeView
-          nodes={node.children}
-          level={level + 1}
-          onToggle={onToggle}
-          onNodeClick={onNodeClick}
-          onOpenInNewTab={onOpenInNewTab}
-          selectedPath={selectedPath}
-          selectedEntity={selectedEntity}
-          getContainerIcon={getContainerIcon}
-          getEntityIcon={getEntityIcon}
-        />
+          <TreeView
+            nodes={node.children}
+            level={level + 1}
+            onToggle={onToggle}
+            onNodeClick={onNodeClick}
+            onOpenInNewTab={onOpenInNewTab}
+            selectedPath={selectedPath}
+            selectedEntity={selectedEntity}
+            getContainerIcon={getContainerIcon}
+            getEntityIcon={getEntityIcon}
+          />
         </div>
       )}
     </div>
@@ -2521,7 +2512,9 @@ function DynamicFilterBuilder({
           <Checkbox
             id={fieldName}
             checked={value || false}
-            onCheckedChange={(checked) => handleFieldChange(fieldName, checked === true)}
+            onCheckedChange={(checked) =>
+              handleFieldChange(fieldName, checked === true)
+            }
           />
           <Label htmlFor={fieldName} className="font-normal">
             {title}
@@ -2608,7 +2601,8 @@ function ContainerOverview({
     return typeof v === 'string' ? v : undefined
   }
   const size = num('size_bytes')
-  if (size !== undefined) facts.push({ label: 'Size', value: formatFileSize(size) })
+  if (size !== undefined)
+    facts.push({ label: 'Size', value: formatFileSize(size) })
   const entityCount = num('entity_count')
   if (entityCount !== undefined)
     facts.push({ label: 'Tables', value: entityCount.toLocaleString() })
@@ -3044,194 +3038,201 @@ function ContainerEntitiesView({
           <>
             <div className="-my-2 overflow-x-auto">
               <div className="inline-block min-w-full py-2 align-middle">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b">
-                    <th className="whitespace-nowrap p-3 text-left font-medium">
-                      Name
-                    </th>
-                    {isObjectStore() ? (
-                      <>
-                        <th className="whitespace-nowrap p-3 text-left font-medium">
-                          Content type
-                        </th>
-                        <th className="whitespace-nowrap p-3 text-left font-medium">
-                          Size
-                        </th>
-                        <th className="whitespace-nowrap p-3 text-left font-medium">
-                          Last modified
-                        </th>
-                        <th className="whitespace-nowrap p-3 text-right font-medium">
-                          <span className="sr-only">Actions</span>
-                        </th>
-                      </>
-                    ) : (
-                      <>
-                        {showTypeColumn && (
-                          <th className="whitespace-nowrap p-3 text-left font-medium">
-                            Type
-                          </th>
-                        )}
-                        {showRowsColumn && (
-                          <th className="whitespace-nowrap p-3 text-right font-medium">
-                            Rows
-                          </th>
-                        )}
-                        {showSizeColumn && (
-                          <th className="whitespace-nowrap p-3 text-right font-medium">
-                            Size
-                          </th>
-                        )}
-                      </>
-                    )}
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleEntities.map((entity: EntityResponse, idx: number) => (
-                    <tr
-                      key={`${entity.name}-${idx}`}
-                      className="border-b last:border-0 hover:bg-muted/30"
-                    >
-                      <td className="p-3">
-                        {/* The name is the link. A row whose only affordance
-                            is a button at the far right reads as inert —
-                            people click the thing they came for. */}
-                        <button
-                          type="button"
-                          onClick={() => openEntity(entity.name)}
-                          className="flex items-center gap-2 text-left hover:underline"
-                        >
-                          <span className="shrink-0 [&>svg]:size-4">
-                            {getEntityIcon(entity.entity_type)}
-                          </span>
-                          <span className="font-mono text-xs">
-                            {entity.name}
-                          </span>
-                        </button>
-                      </td>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b">
+                      <th className="whitespace-nowrap p-3 text-left font-medium">
+                        Name
+                      </th>
                       {isObjectStore() ? (
                         <>
-                          <td className="p-3 text-xs">
-                            {(entity as any).metadata?.content_type ||
-                              (entity as any).content_type ||
-                              '-'}
-                          </td>
-                          <td className="p-3 text-xs">
-                            {(entity as any).size_bytes !== undefined
-                              ? formatFileSize((entity as any).size_bytes)
-                              : '-'}
-                          </td>
-                          <td className="p-3 text-xs">
-                            {(entity as any).last_modified
-                              ? formatDate((entity as any).last_modified)
-                              : '-'}
-                          </td>
-                          <td className="p-3 text-right">
-                            <div className="flex items-center justify-end gap-1">
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-8 px-2"
-                                onClick={async () => {
-                                  try {
-                                    const response = await downloadObject({
-                                      path: {
-                                        service_id: parseInt(serviceId),
-                                        path: containerPath,
-                                        entity: entity.name,
-                                      },
-                                    })
-
-                                    // Ensure we have a Blob
-                                    let blob: Blob
-                                    const data = response.data as any
-                                    if (data instanceof Blob) {
-                                      blob = data
-                                    } else if (typeof data === 'string') {
-                                      // Convert string to Blob
-                                      blob = new Blob([data], {
-                                        type: 'application/octet-stream',
-                                      })
-                                    } else if (data) {
-                                      // Convert other data types to JSON string then Blob
-                                      const jsonStr = JSON.stringify(data)
-                                      blob = new Blob([jsonStr], {
-                                        type: 'application/json',
-                                      })
-                                    } else {
-                                      throw new Error(
-                                        'No data received from server'
-                                      )
-                                    }
-
-                                    const url = window.URL.createObjectURL(blob)
-                                    const a = document.createElement('a')
-                                    a.href = url
-                                    a.download = entity.name
-                                    document.body.appendChild(a)
-                                    a.click()
-                                    window.URL.revokeObjectURL(url)
-                                    document.body.removeChild(a)
-                                  } catch (error) {
-                                    console.error(
-                                      'Failed to download object:',
-                                      error
-                                    )
-                                  }
-                                }}
-                                title="Download"
-                              >
-                                <Download className="h-4 w-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-8 px-2"
-                                onClick={() => {
-                                  setSelectedEntityForInfo(entity.name)
-                                }}
-                                title="View Info"
-                              >
-                                <Eye className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          </td>
+                          <th className="whitespace-nowrap p-3 text-left font-medium">
+                            Content type
+                          </th>
+                          <th className="whitespace-nowrap p-3 text-left font-medium">
+                            Size
+                          </th>
+                          <th className="whitespace-nowrap p-3 text-left font-medium">
+                            Last modified
+                          </th>
+                          <th className="whitespace-nowrap p-3 text-right font-medium">
+                            <span className="sr-only">Actions</span>
+                          </th>
                         </>
                       ) : (
                         <>
                           {showTypeColumn && (
-                            <td className="p-3 text-xs text-muted-foreground">
-                              {entity.entity_type === 'BASE TABLE'
-                                ? 'table'
-                                : (entity.entity_type ?? '—').toLowerCase()}
-                            </td>
+                            <th className="whitespace-nowrap p-3 text-left font-medium">
+                              Type
+                            </th>
                           )}
                           {showRowsColumn && (
-                            <td className="p-3 text-right text-xs tabular-nums">
-                              {entity.row_count === null ||
-                              entity.row_count === undefined ? (
-                                <span className="text-muted-foreground">—</span>
-                              ) : (
-                                entity.row_count.toLocaleString()
-                              )}
-                            </td>
+                            <th className="whitespace-nowrap p-3 text-right font-medium">
+                              Rows
+                            </th>
                           )}
                           {showSizeColumn && (
-                            <td className="p-3 text-right text-xs tabular-nums">
-                              {entity.size_bytes === null ||
-                              entity.size_bytes === undefined ? (
-                                <span className="text-muted-foreground">—</span>
-                              ) : (
-                                formatFileSize(entity.size_bytes)
-                              )}
-                            </td>
+                            <th className="whitespace-nowrap p-3 text-right font-medium">
+                              Size
+                            </th>
                           )}
                         </>
                       )}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {visibleEntities.map(
+                      (entity: EntityResponse, idx: number) => (
+                        <tr
+                          key={`${entity.name}-${idx}`}
+                          className="border-b last:border-0 hover:bg-muted/30"
+                        >
+                          <td className="p-3">
+                            {/* The name is the link. A row whose only affordance
+                            is a button at the far right reads as inert —
+                            people click the thing they came for. */}
+                            <button
+                              type="button"
+                              onClick={() => openEntity(entity.name)}
+                              className="flex items-center gap-2 text-left hover:underline"
+                            >
+                              <span className="shrink-0 [&>svg]:size-4">
+                                {getEntityIcon(entity.entity_type)}
+                              </span>
+                              <span className="font-mono text-xs">
+                                {entity.name}
+                              </span>
+                            </button>
+                          </td>
+                          {isObjectStore() ? (
+                            <>
+                              <td className="p-3 text-xs">
+                                {(entity as any).metadata?.content_type ||
+                                  (entity as any).content_type ||
+                                  '-'}
+                              </td>
+                              <td className="p-3 text-xs">
+                                {(entity as any).size_bytes !== undefined
+                                  ? formatFileSize((entity as any).size_bytes)
+                                  : '-'}
+                              </td>
+                              <td className="p-3 text-xs">
+                                {(entity as any).last_modified
+                                  ? formatDate((entity as any).last_modified)
+                                  : '-'}
+                              </td>
+                              <td className="p-3 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-8 px-2"
+                                    onClick={async () => {
+                                      try {
+                                        const response = await downloadObject({
+                                          path: {
+                                            service_id: parseInt(serviceId),
+                                            path: containerPath,
+                                            entity: entity.name,
+                                          },
+                                        })
+
+                                        // Ensure we have a Blob
+                                        let blob: Blob
+                                        const data = response.data as any
+                                        if (data instanceof Blob) {
+                                          blob = data
+                                        } else if (typeof data === 'string') {
+                                          // Convert string to Blob
+                                          blob = new Blob([data], {
+                                            type: 'application/octet-stream',
+                                          })
+                                        } else if (data) {
+                                          // Convert other data types to JSON string then Blob
+                                          const jsonStr = JSON.stringify(data)
+                                          blob = new Blob([jsonStr], {
+                                            type: 'application/json',
+                                          })
+                                        } else {
+                                          throw new Error(
+                                            'No data received from server'
+                                          )
+                                        }
+
+                                        const url =
+                                          window.URL.createObjectURL(blob)
+                                        const a = document.createElement('a')
+                                        a.href = url
+                                        a.download = entity.name
+                                        document.body.appendChild(a)
+                                        a.click()
+                                        window.URL.revokeObjectURL(url)
+                                        document.body.removeChild(a)
+                                      } catch (error) {
+                                        console.error(
+                                          'Failed to download object:',
+                                          error
+                                        )
+                                      }
+                                    }}
+                                    title="Download"
+                                  >
+                                    <Download className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-8 px-2"
+                                    onClick={() => {
+                                      setSelectedEntityForInfo(entity.name)
+                                    }}
+                                    title="View Info"
+                                  >
+                                    <Eye className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              {showTypeColumn && (
+                                <td className="p-3 text-xs text-muted-foreground">
+                                  {entity.entity_type === 'BASE TABLE'
+                                    ? 'table'
+                                    : (entity.entity_type ?? '—').toLowerCase()}
+                                </td>
+                              )}
+                              {showRowsColumn && (
+                                <td className="p-3 text-right text-xs tabular-nums">
+                                  {entity.row_count === null ||
+                                  entity.row_count === undefined ? (
+                                    <span className="text-muted-foreground">
+                                      —
+                                    </span>
+                                  ) : (
+                                    entity.row_count.toLocaleString()
+                                  )}
+                                </td>
+                              )}
+                              {showSizeColumn && (
+                                <td className="p-3 text-right text-xs tabular-nums">
+                                  {entity.size_bytes === null ||
+                                  entity.size_bytes === undefined ? (
+                                    <span className="text-muted-foreground">
+                                      —
+                                    </span>
+                                  ) : (
+                                    formatFileSize(entity.size_bytes)
+                                  )}
+                                </td>
+                              )}
+                            </>
+                          )}
+                        </tr>
+                      )
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
 
@@ -3242,7 +3243,9 @@ function ContainerEntitiesView({
               <div className="mt-4 flex items-center justify-between">
                 <div className="text-sm/6 text-muted-foreground">
                   {count} {entityNoun} shown
-                  {total !== null && total !== undefined && ` of ${total} total`}
+                  {total !== null &&
+                    total !== undefined &&
+                    ` of ${total} total`}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
@@ -3439,8 +3442,7 @@ function ContainerEntitiesView({
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription>
                       Failed to load key value:{' '}
-                      {(queryKeyValue.error as any)?.detail ||
-                        'Unknown error'}
+                      {(queryKeyValue.error as any)?.detail || 'Unknown error'}
                     </AlertDescription>
                   </Alert>
                 )}
@@ -3620,8 +3622,7 @@ function EntityDataView({
   const detailRow =
     detailRowIndex !== null
       ? ((queryResult?.rows?.[detailRowIndex] as
-          | Record<string, unknown>
-          | undefined) ?? null)
+          Record<string, unknown> | undefined) ?? null)
       : null
   const [isFilterExpanded, setIsFilterExpanded] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
@@ -3745,107 +3746,109 @@ function EntityDataView({
       {entityInfo && (
         <div>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-              <div className="min-w-0">
-                {/* Breadcrumb inline with the name rather than stacked above
+            <div className="min-w-0">
+              {/* Breadcrumb inline with the name rather than stacked above
                     it. Path, title and type on three separate rows spent a
                     third of the header restating one identity; the parent
                     segments are muted and clickable, the entity is the
                     emphasis. Also the only way back up — the header's arrow
                     exits to the service page, several levels too far. */}
-                <h2 className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-lg/7 font-semibold sm:text-base/6">
-                  <span className="shrink-0 [&>svg]:size-4">
-                    {getEntityIcon(entityInfo.entity_type)}
-                  </span>
-                  {containerPath &&
-                    containerPath.split('/').map((segment, index, segments) => {
-                      const target = segments.slice(0, index + 1).join('/')
-                      return (
-                        <span
-                          key={target}
-                          className="flex items-center gap-1.5 font-normal text-muted-foreground"
+              <h2 className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-lg/7 font-semibold sm:text-base/6">
+                <span className="shrink-0 [&>svg]:size-4">
+                  {getEntityIcon(entityInfo.entity_type)}
+                </span>
+                {containerPath &&
+                  containerPath.split('/').map((segment, index, segments) => {
+                    const target = segments.slice(0, index + 1).join('/')
+                    return (
+                      <span
+                        key={target}
+                        className="flex items-center gap-1.5 font-normal text-muted-foreground"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToContainer?.(target)}
+                          className="rounded-sm hover:text-foreground hover:underline"
                         >
-                          <button
-                            type="button"
-                            onClick={() => onNavigateToContainer?.(target)}
-                            className="rounded-sm hover:text-foreground hover:underline"
-                          >
-                            {segment}
-                          </button>
-                          <span aria-hidden="true">/</span>
-                        </span>
-                      )
-                    })}
-                  <span className="truncate">{entityInfo.entity}</span>
-                </h2>
-                {/* Everything that was spread across two card descriptions
-                    and a standalone badge, on one muted line. */}
-                <p className="mt-0.5 text-base/6 text-muted-foreground sm:text-sm/6">
-                  {entityInfo.entity_type === 'BASE TABLE'
-                    ? 'table'
-                    : entityInfo.entity_type}
-                  {!isObjectStore() && entityInfo.fields && (
-                    <> · {entityInfo.fields.length} fields</>
-                  )}
-                  {queryResult?.total_count !== undefined && (
-                    <>
-                      {' '}
-                      · <span className="tabular-nums">
-                        {queryResult.total_count.toLocaleString()}
-                      </span>{' '}
-                      rows
-                    </>
-                  )}
-                  {queryResult?.execution_time_ms !== undefined && (
-                    <>
-                      {' '}
-                      · <span className="tabular-nums">
-                        {queryResult.execution_time_ms}ms
+                          {segment}
+                        </button>
+                        <span aria-hidden="true">/</span>
                       </span>
+                    )
+                  })}
+                <span className="truncate">{entityInfo.entity}</span>
+              </h2>
+              {/* Everything that was spread across two card descriptions
+                    and a standalone badge, on one muted line. */}
+              <p className="mt-0.5 text-base/6 text-muted-foreground sm:text-sm/6">
+                {entityInfo.entity_type === 'BASE TABLE'
+                  ? 'table'
+                  : entityInfo.entity_type}
+                {!isObjectStore() && entityInfo.fields && (
+                  <> · {entityInfo.fields.length} fields</>
+                )}
+                {queryResult?.total_count !== undefined && (
+                  <>
+                    {' '}
+                    ·{' '}
+                    <span className="tabular-nums">
+                      {queryResult.total_count.toLocaleString()}
+                    </span>{' '}
+                    rows
+                  </>
+                )}
+                {queryResult?.execution_time_ms !== undefined && (
+                  <>
+                    {' '}
+                    ·{' '}
+                    <span className="tabular-nums">
+                      {queryResult.execution_time_ms}ms
+                    </span>
+                  </>
+                )}
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {/* Download button for S3 objects */}
+              {isObjectStore() && entityInfo.entity_type === 'object' && (
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={handleDownload}
+                  disabled={isDownloading}
+                  className="gap-2"
+                >
+                  {isDownloading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Downloading...
+                    </>
+                  ) : (
+                    <>
+                      <Download className="h-4 w-4" />
+                      Download
                     </>
                   )}
-                </p>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {/* Download button for S3 objects */}
-                {isObjectStore() && entityInfo.entity_type === 'object' && (
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={handleDownload}
-                    disabled={isDownloading}
-                    className="gap-2"
-                  >
-                    {isDownloading ? (
-                      <>
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Downloading...
-                      </>
-                    ) : (
-                      <>
-                        <Download className="h-4 w-4" />
-                        Download
-                      </>
-                    )}
-                  </Button>
-                )}
-                {!isObjectStore() && entityInfo.fields && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setShowSchema(!showSchema)}
-                  >
-                    {showSchema ? 'Hide' : 'Show'} schema
-                  </Button>
-                )}
-                {/* Only show Refresh button for non-S3-objects */}
-                {!(isObjectStore() && entityInfo.entity_type === 'object') && (
-                  <Button variant="ghost" size="sm" onClick={onRefresh}>
-                    <RefreshCcw className="size-4" />
-                    <span className="sr-only">Refresh</span>
-                  </Button>
-                )}
-              </div>
+                </Button>
+              )}
+              {!isObjectStore() && entityInfo.fields && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowSchema(!showSchema)}
+                >
+                  {showSchema ? 'Hide' : 'Show'} schema
+                </Button>
+              )}
+              {/* Only show Refresh button for non-S3-objects */}
+              {!(isObjectStore() && entityInfo.entity_type === 'object') && (
+                <Button variant="ghost" size="sm" onClick={onRefresh}>
+                  <RefreshCcw className="size-4" />
+                  <span className="sr-only">Refresh</span>
+                </Button>
+              )}
             </div>
+          </div>
 
           {/* Show object metadata for S3 objects */}
           {isObjectStore() &&
@@ -4180,10 +4183,7 @@ function EntityDataView({
                           className="border-b last:border-0 hover:bg-muted/30"
                         >
                           {visibleFields.map((field: FieldResponse) => (
-                            <td
-                              key={field.name}
-                              className="p-3 align-middle"
-                            >
+                            <td key={field.name} className="p-3 align-middle">
                               <SmartCell
                                 value={row[field.name]}
                                 fieldType={field.field_type}
@@ -4253,7 +4253,10 @@ function EntityDataView({
                                 </span>
                               ) : isStructured ? (
                                 <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
-                                  <HighlightedCode code={text} language="json" />
+                                  <HighlightedCode
+                                    code={text}
+                                    language="json"
+                                  />
                                 </pre>
                               ) : (
                                 <span className="font-mono text-xs break-all">

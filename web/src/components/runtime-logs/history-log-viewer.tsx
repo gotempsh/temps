@@ -6,7 +6,6 @@
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
-
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,

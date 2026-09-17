@@ -180,7 +180,8 @@ export function SpanWaterfall({
         const spanDuration = spanDurationMs(node.span)
         // The bar owns the full track now that the duration has its own
         // column, so nothing has to be reserved for a floating label.
-        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * 100 : 0
+        const leftPct =
+          traceDuration > 0 ? (spanStart / traceDuration) * 100 : 0
         const widthPct =
           traceDuration > 0
             ? Math.max(
@@ -200,7 +201,9 @@ export function SpanWaterfall({
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  onClick={() => onSelect(isSelected ? null : node.span.span_id)}
+                  onClick={() =>
+                    onSelect(isSelected ? null : node.span.span_id)
+                  }
                   className={cn(
                     'flex w-full min-w-[360px] items-center border-b px-3 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[560px] sm:px-4',
                     rowClassName?.(node.span),
@@ -215,7 +218,9 @@ export function SpanWaterfall({
                       <span
                         role="button"
                         tabIndex={0}
-                        aria-label={isCollapsed ? 'Expand span' : 'Collapse span'}
+                        aria-label={
+                          isCollapsed ? 'Expand span' : 'Collapse span'
+                        }
                         onClick={(e) => {
                           e.stopPropagation()
                           toggleCollapse(node.span.span_id)
@@ -278,7 +283,9 @@ export function SpanWaterfall({
                 <div className="space-y-1">
                   <p className="font-medium">{node.span.name}</p>
                   {svc && <p className="text-xs">Service: {svc}</p>}
-                  <p className="text-xs">Duration: {formatDuration(spanDuration)}</p>
+                  <p className="text-xs">
+                    Duration: {formatDuration(spanDuration)}
+                  </p>
                   <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
                 </div>
               </TooltipContent>
