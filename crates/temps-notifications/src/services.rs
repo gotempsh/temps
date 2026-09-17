@@ -5034,4 +5034,89 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
 
         test_db.cleanup().await;
     }
+
+    #[test]
+    fn human_visible_metadata_hides_underscore_prefixed_keys() {
+        let metadata: std::collections::HashMap<String, String> =
+            [("_chart_svg".to_string(), "<svg/>".to_string())]
+                .into_iter()
+                .collect();
+
+        assert!(!is_human_visible_metadata_key("_chart_svg", &metadata));
+    }
+
+    #[test]
+    fn human_visible_metadata_hides_id_when_name_twin_present() {
+        let metadata: std::collections::HashMap<String, String> = [
+            ("project_id".to_string(), "19".to_string()),
+            ("project_name".to_string(), "my-app".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(!is_human_visible_metadata_key("project_id", &metadata));
+        assert!(is_human_visible_metadata_key("project_name", &metadata));
+    }
+
+    #[test]
+    fn human_visible_metadata_hides_id_when_slug_twin_present() {
+        let metadata: std::collections::HashMap<String, String> = [
+            ("deployment_id".to_string(), "10".to_string()),
+            ("deployment_slug".to_string(), "deploy-10".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(!is_human_visible_metadata_key("deployment_id", &metadata));
+        assert!(is_human_visible_metadata_key("deployment_slug", &metadata));
+    }
+
+    #[test]
+    fn human_visible_metadata_keeps_id_without_readable_twin() {
+        // `scan_id` has no name/slug counterpart, so it must stay visible —
+        // it's the only identifier a human has for correlating the alert.
+        let metadata: std::collections::HashMap<String, String> =
+            [("scan_id".to_string(), "42".to_string())]
+                .into_iter()
+                .collect();
+
+        assert!(is_human_visible_metadata_key("scan_id", &metadata));
+    }
+
+    #[test]
+    fn slack_send_omits_ids_with_readable_twins_but_keeps_others() {
+        let notification = Notification {
+            id: "test-outage".to_string(),
+            title: "Monitor is down".to_string(),
+            message: "Monitor 'prod' is down".to_string(),
+            notification_type: NotificationType::Error,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: vec![
+                ("monitor_id".to_string(), "22".to_string()),
+                ("monitor_name".to_string(), "production Monitor".to_string()),
+                ("project_id".to_string(), "19".to_string()),
+                ("project_slug".to_string(), "my-app".to_string()),
+                ("incident_id".to_string(), "5".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            bypass_throttling: false,
+        };
+
+        let visible_keys: std::collections::HashSet<&str> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| is_human_visible_metadata_key(k, &notification.metadata))
+            .map(|(k, _)| k.as_str())
+            .collect();
+
+        assert!(!visible_keys.contains("monitor_id"));
+        assert!(!visible_keys.contains("project_id"));
+        assert!(visible_keys.contains("monitor_name"));
+        assert!(visible_keys.contains("project_slug"));
+        // No readable twin exists for incident_id, so it must remain visible.
+        assert!(visible_keys.contains("incident_id"));
+    }
 }
