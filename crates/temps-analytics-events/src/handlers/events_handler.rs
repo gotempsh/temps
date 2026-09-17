@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use temps_analytics::ingest_keys::{
     extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    AnalyticsIngestKeyService, AnalyticsIngestRateLimiter, ANALYTICS_INGEST_KEY_HEADER,
+    stamp_retry_after_on_rate_limited, AnalyticsIngestKeyService, AnalyticsIngestRateLimiter,
+    ANALYTICS_INGEST_KEY_HEADER,
 };
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
@@ -1338,6 +1339,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/event", post(record_event_metrics))
+        .layer(axum::middleware::map_response(
+            stamp_retry_after_on_rate_limited,
+        ))
         .layer(public_ingest_cors())
 }
 

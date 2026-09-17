@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use temps_analytics::ingest_keys::{
     extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    ANALYTICS_INGEST_KEY_HEADER,
+    stamp_retry_after_on_rate_limited, ANALYTICS_INGEST_KEY_HEADER,
 };
 use temps_auth::{project_access_guard, AuthContext, Permission, RequireAuth};
 use temps_core::problemdetails::Problem;
@@ -255,6 +255,9 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
+        .layer(axum::middleware::map_response(
+            stamp_retry_after_on_rate_limited,
+        ))
         .layer(public_ingest_cors())
 }
 
