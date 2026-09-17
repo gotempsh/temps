@@ -4,61 +4,65 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-
 import { getEmailOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
 import { EmailResponse } from '@/api/client/types.gen'
 import { EmailEventTimeline } from '@/components/email/EmailEventTimeline'
-import { StatusBadge } from '@/components/email/shared'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  Button,
+  Callout,
+  CopyAction,
+  Detail,
+  PageContainer,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtDuration,
+  fmtNumber,
+  fmtRelativeTime,
+  useUrlState,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import {
   AlertCircle,
   ArrowLeft,
   Code,
   Eye,
   FileText,
-  Mail,
   MousePointerClick,
-  Tag,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router'
 
-function HeadersDisplay({
-  headers,
-}: {
-  headers: Record<string, string> | null | undefined
-}) {
-  if (!headers || Object.keys(headers).length === 0) {
-    return (
-      <p className="text-sm text-muted-foreground">
-        No custom headers were set for this email.
-      </p>
-    )
+// A small, page-local key-value list. Used here for both the custom-headers
+// aside panel and the "Message details" card in `main` — genuinely a
+// one-off pattern so far (no other migrated detail page needs it yet); per
+// the design-system skill's "Adding a primitive" procedure, promote this to
+// a package export once a second page actually needs it, not before.
+function KeyValueList({ items }: { items: { key: string; value: ReactNode }[] }) {
+  if (items.length === 0) {
+    return <p className="text-sm text-muted-foreground">Nothing to show.</p>
   }
-
-  const entries = Object.entries(headers)
-
   return (
-    <div className="space-y-2">
-      {entries.map(([key, value]) => (
-        <div key={key} className="flex items-start gap-2 text-sm">
-          <span className="font-medium min-w-[140px] text-muted-foreground">
-            {key}:
-          </span>
-          <span className="font-mono text-xs break-all">{value}</span>
+    <dl className="divide-y divide-border text-sm">
+      {items.map((item) => (
+        <div
+          key={item.key}
+          className="flex flex-col gap-1 py-2 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:gap-4"
+        >
+          <dt className="w-28 shrink-0 text-muted-foreground">{item.key}</dt>
+          <dd className="min-w-0 flex-1 break-all font-mono text-xs">{item.value}</dd>
         </div>
       ))}
-    </div>
+    </dl>
   )
 }
 
@@ -158,9 +162,9 @@ function SourceView({
   return (
     <div className="relative">
       <div className="absolute top-2 right-2 z-10">
-        <CopyButton
+        <CopyAction
           value={content}
-          className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md bg-background/80 backdrop-blur-sm"
+          className="bg-background/80 backdrop-blur-sm"
         />
       </div>
       <div className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
@@ -175,10 +179,74 @@ function SourceView({
   )
 }
 
+// Mirrors `StatusBadge` (components/email/shared.tsx) tone-for-tone rather
+// than inventing a new severity ordering, then layers the most informative
+// tracking signal on top of a "sent" status — an open/click is a stronger,
+// more current signal than a bare "sent" for the Detail template's verdict.
+const EMAIL_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+  sent: { tone: 'ok', label: 'Sent' },
+  queued: { tone: 'idle', label: 'Queued' },
+  sending: { tone: 'running', label: 'Sending' },
+  failed: { tone: 'error', label: 'Failed' },
+  captured: { tone: 'idle', label: 'Captured' },
+  delivery_unknown: { tone: 'warn', label: 'Delivery unknown' },
+}
+
+function emailVerdict(email: EmailResponse): { tone: StatusTone; label: string } {
+  if (email.status === 'sent') {
+    if (email.track_clicks && email.click_count > 0) {
+      return { tone: 'ok', label: 'Clicked' }
+    }
+    if (email.track_opens && email.open_count > 0) {
+      return { tone: 'ok', label: 'Opened' }
+    }
+  }
+  return EMAIL_STATUS_VERDICT[email.status] ?? { tone: 'idle', label: email.status }
+}
+
+function emailFacts(email: EmailResponse): DetailFact[] {
+  const facts: DetailFact[] = [
+    {
+      label: 'From',
+      value: email.from_name
+        ? `${email.from_name} <${email.from_address}>`
+        : email.from_address,
+    },
+    { label: 'To', value: email.to_addresses.join(', ') },
+  ]
+
+  const deliveredAt = email.sent_at ?? email.created_at
+  facts.push({
+    label: email.sent_at ? 'Sent' : 'Created',
+    value: fmtDateTime(deliveredAt),
+  })
+
+  if (email.sent_at) {
+    const tookMs = new Date(email.sent_at).getTime() - new Date(email.created_at).getTime()
+    if (tookMs > 0) {
+      facts.push({ label: 'Took', value: fmtDuration(tookMs) })
+    }
+  }
+
+  if (email.track_opens) {
+    facts.push({ label: 'Opens', value: fmtNumber(email.open_count) })
+  }
+  if (email.track_clicks) {
+    facts.push({ label: 'Clicks', value: fmtNumber(email.click_count) })
+  }
+
+  // The record recipe caps facts at 6 — From/To/Sent/Took/Opens/Clicks is
+  // already exactly that ceiling in the fullest case, but stay defensive.
+  return facts.slice(0, 6)
+}
+
 function EmailDetailContent({ email }: { email: EmailResponse }) {
   const hasHtml = !!email.html_body
   const hasText = !!email.text_body
-  const defaultTab = hasHtml ? 'preview' : hasText ? 'text' : 'details'
+  const defaultTab = hasHtml ? 'preview' : hasText ? 'text' : undefined
+
+  const { get, patch } = useUrlState<'tab'>()
+  const activeTab = get('tab') ?? defaultTab ?? 'preview'
 
   const { data: trackingLinks } = useQuery({
     queryKey: ['email-tracking-links', email.id],
@@ -191,226 +259,89 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
       })
       return res.data ?? []
     },
-    enabled: !!(email as any).track_clicks,
+    enabled: !!email.track_clicks,
   })
 
+  const messageDetails: { key: string; value: ReactNode }[] = []
+  if (email.cc_addresses && email.cc_addresses.length > 0) {
+    messageDetails.push({ key: 'CC', value: email.cc_addresses.join(', ') })
+  }
+  if (email.bcc_addresses && email.bcc_addresses.length > 0) {
+    messageDetails.push({ key: 'BCC', value: email.bcc_addresses.join(', ') })
+  }
+  if (email.reply_to) {
+    messageDetails.push({ key: 'Reply-To', value: email.reply_to })
+  }
+  if (email.tags && email.tags.length > 0) {
+    messageDetails.push({
+      key: 'Tags',
+      value: (
+        <div className="flex flex-wrap gap-1 font-sans">
+          {email.tags.map((tag) => (
+            <Badge key={tag} variant="outline">
+              {tag}
+            </Badge>
+          ))}
+        </div>
+      ),
+    })
+  }
+  if (email.provider_message_id) {
+    messageDetails.push({
+      key: 'Provider Message ID',
+      value: (
+        <span className="inline-flex items-center gap-1">
+          <code className="break-all">{email.provider_message_id}</code>
+          <CopyAction value={email.provider_message_id} label="Copy provider message ID" />
+        </span>
+      ),
+    })
+  }
+
+  const hasTrackingDetail =
+    (email.track_opens && email.first_opened_at) ||
+    (email.track_clicks && email.first_clicked_at) ||
+    (trackingLinks && trackingLinks.length > 0)
+
   return (
-    <div className="space-y-6">
-      {/* Email Metadata */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Mail className="h-5 w-5" />
-            Email Information
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                  From
-                </h4>
-                <p className="text-sm font-medium">
-                  {email.from_name
-                    ? `${email.from_name} <${email.from_address}>`
-                    : email.from_address}
-                </p>
-              </div>
+    <>
+      {email.error_message ? (
+        <Callout tone="error" title="Delivery error">
+          {email.error_message}
+        </Callout>
+      ) : null}
 
-              <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                  To
-                </h4>
-                <div className="flex flex-wrap gap-1">
-                  {email.to_addresses.map((addr) => (
-                    <Badge
-                      key={addr}
-                      variant="secondary"
-                      className="font-mono text-xs"
-                    >
-                      {addr}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-
-              {email.cc_addresses && email.cc_addresses.length > 0 && (
-                <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                    CC
-                  </h4>
-                  <div className="flex flex-wrap gap-1">
-                    {email.cc_addresses.map((addr) => (
-                      <Badge
-                        key={addr}
-                        variant="outline"
-                        className="font-mono text-xs"
-                      >
-                        {addr}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {email.bcc_addresses && email.bcc_addresses.length > 0 && (
-                <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                    BCC
-                  </h4>
-                  <div className="flex flex-wrap gap-1">
-                    {email.bcc_addresses.map((addr) => (
-                      <Badge
-                        key={addr}
-                        variant="outline"
-                        className="font-mono text-xs"
-                      >
-                        {addr}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {email.reply_to && (
-                <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                    Reply-To
-                  </h4>
-                  <p className="text-sm font-mono">{email.reply_to}</p>
-                </div>
-              )}
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                  Status
-                </h4>
-                <StatusBadge status={email.status} />
-              </div>
-
-              <div>
-                <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                  {email.sent_at ? 'Sent At' : 'Created At'}
-                </h4>
-                <p className="text-sm">
-                  {format(new Date(email.sent_at || email.created_at), 'PPpp')}
-                </p>
-              </div>
-
-              {email.provider_message_id && (
-                <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                    Provider Message ID
-                  </h4>
-                  <div className="flex items-center gap-2">
-                    <code className="text-xs font-mono bg-muted px-2 py-1 rounded break-all">
-                      {email.provider_message_id}
-                    </code>
-                    <CopyButton
-                      value={email.provider_message_id}
-                      className="h-6 w-6 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {email.tags && email.tags.length > 0 && (
-                <div>
-                  <h4 className="text-sm font-medium text-muted-foreground mb-1 flex items-center gap-1">
-                    <Tag className="h-3 w-3" />
-                    Tags
-                  </h4>
-                  <div className="flex flex-wrap gap-1">
-                    {email.tags.map((tag) => (
-                      <Badge key={tag} variant="outline">
-                        {tag}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Subject */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Subject</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-lg font-medium">{email.subject}</p>
-        </CardContent>
-      </Card>
-
-      {/* Error Message */}
-      {email.error_message && (
-        <Card className="border-destructive">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base text-destructive flex items-center gap-2">
-              <AlertCircle className="h-4 w-4" />
-              Error
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm text-destructive">{email.error_message}</p>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Tracking Stats */}
-      {(email.track_opens || email.track_clicks) && (
+      {hasTrackingDetail ? (
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base flex items-center gap-2">
-              <Eye className="h-4 w-4" />
+              <MousePointerClick className="h-4 w-4" />
               Tracking
             </CardTitle>
           </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              {email.track_opens && (
-                <>
-                  <div className="space-y-1">
-                    <p className="text-xs text-muted-foreground flex items-center gap-1">
-                      <Eye className="h-3 w-3" />
-                      Opens
-                    </p>
-                    <p className="text-2xl font-bold">{email.open_count}</p>
-                    {email.first_opened_at && (
-                      <p className="text-xs text-muted-foreground">
-                        First: {format(new Date(email.first_opened_at), 'PPp')}
-                      </p>
-                    )}
-                  </div>
-                </>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              {email.track_opens && email.first_opened_at && (
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground">First opened</p>
+                  <p title={fmtDateTime(email.first_opened_at)}>
+                    {fmtRelativeTime(email.first_opened_at)}
+                  </p>
+                </div>
               )}
-              {email.track_clicks && (
-                <>
-                  <div className="space-y-1">
-                    <p className="text-xs text-muted-foreground flex items-center gap-1">
-                      <MousePointerClick className="h-3 w-3" />
-                      Clicks
-                    </p>
-                    <p className="text-2xl font-bold">{email.click_count}</p>
-                    {email.first_clicked_at && (
-                      <p className="text-xs text-muted-foreground">
-                        First: {format(new Date(email.first_clicked_at), 'PPp')}
-                      </p>
-                    )}
-                  </div>
-                </>
+              {email.track_clicks && email.first_clicked_at && (
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground">First clicked</p>
+                  <p title={fmtDateTime(email.first_clicked_at)}>
+                    {fmtRelativeTime(email.first_clicked_at)}
+                  </p>
+                </div>
               )}
             </div>
 
-            {/* Per-link click breakdown */}
             {trackingLinks && trackingLinks.length > 0 && (
-              <div className="mt-4 border-t pt-4">
-                <p className="text-sm font-medium mb-2">Link Clicks</p>
+              <div className="border-t pt-4">
+                <p className="text-sm font-medium mb-2">Link clicks</p>
                 <div className="space-y-2">
                   {trackingLinks.map((link) => (
                     <div
@@ -440,22 +371,20 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
             )}
           </CardContent>
         </Card>
-      )}
+      ) : null}
 
-      {/* Event Timeline */}
-      {(email.track_opens || email.track_clicks) && (
-        <EmailEventTimeline emailId={email.id} />
-      )}
-
-      {/* Email Content */}
-      {(hasHtml || hasText) && (
+      {defaultTab ? (
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-base">Email Content</CardTitle>
+            <CardTitle className="text-base">Email content</CardTitle>
           </CardHeader>
           <CardContent>
-            <Tabs defaultValue={defaultTab} className="w-full">
-              <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 mb-4 h-auto">
+            <Tabs
+              value={activeTab}
+              onValueChange={(v) => patch({ tab: v })}
+              className="w-full"
+            >
+              <TabsList className="grid w-full grid-cols-2 sm:grid-cols-3 mb-4 h-auto">
                 {hasHtml && (
                   <TabsTrigger value="preview" className="gap-2">
                     <Eye className="h-4 w-4" />
@@ -474,9 +403,6 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                     Plain Text
                   </TabsTrigger>
                 )}
-                <TabsTrigger value="headers" className="gap-2">
-                  Headers
-                </TabsTrigger>
               </TabsList>
 
               {hasHtml && (
@@ -496,93 +422,47 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                   <TextPreview text={email.text_body!} />
                 </TabsContent>
               )}
-
-              <TabsContent value="headers" className="mt-0">
-                <div className="border rounded-lg p-4 bg-muted/30">
-                  <HeadersDisplay headers={email.headers} />
-                </div>
-              </TabsContent>
             </Tabs>
           </CardContent>
         </Card>
-      )}
+      ) : null}
 
-      {/* Technical Details */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Technical Details</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
-            <div>
-              <span className="text-muted-foreground">Email ID:</span>
-              <div className="flex items-center gap-2 mt-1">
-                <code className="font-mono text-xs bg-muted px-2 py-1 rounded break-all">
-                  {email.id}
-                </code>
-                <CopyButton
-                  value={email.id}
-                  className="h-6 w-6 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
-                />
-              </div>
-            </div>
-            {email.domain_id && (
-              <div>
-                <span className="text-muted-foreground">Domain ID:</span>
-                <p className="font-mono text-xs mt-1">{email.domain_id}</p>
-              </div>
-            )}
-            {email.project_id && (
-              <div>
-                <span className="text-muted-foreground">Project ID:</span>
-                <p className="font-mono text-xs mt-1">{email.project_id}</p>
-              </div>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+      {messageDetails.length > 0 ? (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Message details</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <KeyValueList items={messageDetails} />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {(email.track_opens || email.track_clicks) && (
+        <EmailEventTimeline emailId={email.id} />
+      )}
+    </>
   )
 }
 
-function LoadingSkeleton() {
+function EmailDetailSkeleton({ backAction }: { backAction: ReactNode }) {
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-6 w-40" />
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-3/4" />
-              <Skeleton className="h-4 w-1/2" />
-            </div>
-            <div className="space-y-4">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-3/4" />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-6 w-24" />
-        </CardHeader>
-        <CardContent>
-          <Skeleton className="h-8 w-full" />
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-6 w-32" />
-        </CardHeader>
-        <CardContent>
-          <Skeleton className="h-[300px] w-full" />
-        </CardContent>
-      </Card>
-    </div>
+    <Detail
+      title={<Skeleton className="h-7 w-64" />}
+      description={<Skeleton className="mt-1 h-4 w-40" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3].map(() => ({
+        label: <Skeleton className="h-3 w-12" />,
+        value: <Skeleton className="h-4 w-20" />,
+      }))}
+      main={
+        <>
+          <Skeleton className="h-56 w-full rounded-lg" />
+          <Skeleton className="h-40 w-full rounded-lg" />
+        </>
+      }
+      aside={<Skeleton className="h-48 w-full rounded-lg" />}
+    />
   )
 }
 
@@ -594,6 +474,7 @@ export function EmailDetail() {
     data: email,
     isLoading,
     error,
+    refetch,
   } = useQuery({
     ...getEmailOptions({
       path: { id: id! },
@@ -610,61 +491,65 @@ export function EmailDetail() {
     ])
   }, [setBreadcrumbs, email?.subject])
 
+  const backAction = (
+    <Button variant="ghost" size="sm" asChild>
+      <Link to="/email?tab=emails">
+        <ArrowLeft className="h-4 w-4 mr-2" />
+        Back to Emails
+      </Link>
+    </Button>
+  )
+
   if (isLoading) {
-    return (
-      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-        <div className="flex items-center gap-4">
-          <Button variant="ghost" size="sm" asChild>
-            <Link to="/email?tab=emails">
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Emails
-            </Link>
-          </Button>
-        </div>
-        <LoadingSkeleton />
-      </div>
-    )
+    return <EmailDetailSkeleton backAction={backAction} />
   }
 
   if (error || !email) {
     return (
-      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-        <div className="flex items-center gap-4">
-          <Button variant="ghost" size="sm" asChild>
-            <Link to="/email?tab=emails">
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Emails
-            </Link>
-          </Button>
-        </div>
-        <Card className="border-destructive">
-          <CardContent className="pt-6">
-            <div className="flex items-center gap-2 text-destructive">
-              <AlertCircle className="h-5 w-5" />
-              <p>
-                Failed to load email details. The email may not exist or you may
-                not have permission to view it.
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      <PageContainer>
+        <div className="flex items-center gap-4">{backAction}</div>
+        <PageState
+          variant="failed"
+          icon={AlertCircle}
+          title="Couldn't load email"
+          description="This email may not exist, or you may not have permission to view it."
+          action={<Button onClick={() => void refetch()}>Retry</Button>}
+        />
+      </PageContainer>
     )
   }
 
-  return (
-    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-      <div className="flex items-center gap-4">
-        <Button variant="ghost" size="sm" asChild>
-          <Link to="/email?tab=emails">
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back to Emails
-          </Link>
-        </Button>
-      </div>
+  const verdict = emailVerdict(email)
+  const headerItems: { key: string; value: ReactNode }[] = email.headers
+    ? Object.entries(email.headers).map(([key, value]) => ({ key, value }))
+    : []
 
-      <EmailDetailContent email={email} />
-    </div>
+  return (
+    <Detail
+      title={email.subject}
+      description={
+        <span className="inline-flex flex-wrap items-center gap-1.5">
+          <code className="font-mono text-xs">{email.id}</code>
+          <CopyAction value={email.id} label="Copy email ID" />
+          {email.project_id != null && <span>· project #{email.project_id}</span>}
+          {email.domain_id != null && <span>· domain #{email.domain_id}</span>}
+        </span>
+      }
+      verdict={<Status tone={verdict.tone} label={verdict.label} />}
+      actions={backAction}
+      facts={emailFacts(email)}
+      main={<EmailDetailContent email={email} />}
+      aside={
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Headers</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <KeyValueList items={headerItems} />
+          </CardContent>
+        </Card>
+      }
+    />
   )
 }
 

@@ -15,15 +15,15 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { fmtDateTime, fmtRelativeTime, useUrlState } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import {
   ChevronLeft,
   ChevronRight,
   Globe,
   Monitor,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { EventBadge, EventIcon } from './shared'
 import { parseUserAgent, problemMessage } from './sharedUtils'
 
@@ -52,8 +52,12 @@ async function fetchEmailEvents(
 }
 
 export function EmailEventTimeline({ emailId }: { emailId: string }) {
-  const [eventType, setEventType] = useState<string | undefined>()
-  const [page, setPage] = useState(1)
+  // Tab/filter/page state lives in the URL (RULES.md "the URL is the state")
+  // so a refreshed or shared link reproduces the same filtered/paginated
+  // view instead of silently resetting to page 1 / "all events".
+  const { get, patch } = useUrlState<'eventType' | 'page'>()
+  const eventType = get('eventType') ?? undefined
+  const page = Math.max(1, Number(get('page') ?? '1') || 1)
   const pageSize = 20
 
   const {
@@ -127,8 +131,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
           <Select
             value={eventType ?? 'all'}
             onValueChange={(v) => {
-              setEventType(v === 'all' ? undefined : v)
-              setPage(1)
+              patch({ eventType: v === 'all' ? undefined : v, page: undefined })
             }}
           >
             <SelectTrigger className="w-[140px] h-8 text-xs">
@@ -174,8 +177,11 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <EventBadge type={event.event_type} />
-                    <span className="text-xs text-muted-foreground">
-                      {format(new Date(event.created_at), 'PPp')}
+                    <span
+                      className="text-xs text-muted-foreground"
+                      title={fmtDateTime(event.created_at)}
+                    >
+                      {fmtRelativeTime(event.created_at)}
                     </span>
                   </div>
 
@@ -219,7 +225,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                 variant="outline"
                 size="sm"
                 className="h-7 text-xs"
-                onClick={() => setPage((p) => p - 1)}
+                onClick={() => patch({ page: page - 1 })}
                 disabled={page === 1}
               >
                 <ChevronLeft className="h-3 w-3" />
@@ -231,7 +237,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                 variant="outline"
                 size="sm"
                 className="h-7 text-xs"
-                onClick={() => setPage((p) => p + 1)}
+                onClick={() => patch({ page: page + 1 })}
                 disabled={page >= totalPages}
               >
                 <ChevronRight className="h-3 w-3" />

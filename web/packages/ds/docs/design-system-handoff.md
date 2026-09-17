@@ -129,3 +129,23 @@ this phase needs):
    the console-wide conventions this package doesn't yet enforce outside its
    own sandbox — reconcile the two documents once migration (follow-ups 1-3)
    is underway.
+9. Migrate the ~20 remaining `web/src/pages` detail screens that still stack
+   raw `<Card>` blocks with no template, no record recipe, and no
+   `useUrlState` — the same disease `EmailDetail.tsx` had before this pass.
+   By `<Card>` count (highest first): `EmailDomainDetail.tsx` (30),
+   `ServiceDetail.tsx` (28), `SandboxDetail.tsx` (28),
+   `MajorUpgradeDetail.tsx` (26), `AgentSandboxProviderDetail.tsx` (24),
+   `RequestLogDetail.tsx` (22), `ScheduleDetail.tsx` (20),
+   `BackupDetail.tsx` (19), `DnsProviderDetail.tsx` (17),
+   `IpGeolocationDetail.tsx`/`SessionReplayDetail.tsx`/`ApiKeyDetail.tsx`
+   (15-16), plus `security/ScanDetail.tsx`, `S3SourceDetail.tsx`,
+   `GitProviderDetail.tsx`, `EmailProviderDetail.tsx`,
+   `CrossProjectTraceDetail.tsx` (14 each). `EmailDetail.tsx` is the first of
+   these migrated and is the reference example for the rest: `Detail`
+   template with a single verdict `Status` derived from the record's own
+   status field (not a duplicated badge), 4-6 facts with each value owned by
+   exactly one slot, `useUrlState` for every tab/filter/page instead of local
+   `useState`, `PageState` (`failed`, with a retry action) for the error
+   path, a `Detail`-shaped skeleton for the loading path instead of ad hoc
+   `Card`+`Skeleton` stacking, and `CopyAction` always as a sibling of the
+   value it copies, never as its wrapper.
