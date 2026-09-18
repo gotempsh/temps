@@ -27,6 +27,8 @@ export interface DetailProps {
   main: ReactNode
   /** Secondary content: related resources, metadata, a timeline. */
   aside?: ReactNode
+  /** Use inside an existing page shell, such as SettingsLayout. */
+  embedded?: boolean
   className?: string
 }
 
@@ -45,9 +47,11 @@ export function Detail({
   main,
   aside,
   className,
+  embedded = false,
 }: DetailProps) {
+  const Container = embedded ? 'div' : PageContainer
   return (
-    <PageContainer className={className}>
+    <Container className={cn(embedded && 'w-full min-w-0 space-y-6', className)}>
       <PageHeader title={title} description={description} verdict={verdict} actions={actions} />
       {facts.length > 0 ? (
         <dl
@@ -67,6 +71,6 @@ export function Detail({
         <div className="min-w-0 space-y-6 lg:col-span-2">{main}</div>
         {aside ? <div className="min-w-0 space-y-6">{aside}</div> : null}
       </div>
-    </PageContainer>
+    </Container>
   )
 }

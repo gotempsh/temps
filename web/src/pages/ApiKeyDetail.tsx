@@ -151,6 +151,7 @@ function apiKeyFacts(apiKey: {
 function ApiKeyDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
   return (
     <Detail
+      embedded
       title={<Skeleton className="h-7 w-48" />}
       actions={backAction}
       facts={[0, 1, 2, 3, 4].map(() => ({
@@ -297,6 +298,7 @@ export default function ApiKeyDetail() {
 
   return (
     <Detail
+      embedded
       title={apiKey.name}
       description="API key details and permissions"
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
