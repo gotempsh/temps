@@ -14,7 +14,12 @@ export default function DeploymentDetail() {
       title={`${deployment.service} · ${deployment.branch}`}
       description="Deployment detail"
       verdict={<Status tone={deployment.status} label={deployment.statusLabel} />}
-      actions={<CopyAction value={deployment.id}>{deployment.id}</CopyAction>}
+      actions={
+        <span className="inline-flex items-center gap-1 rounded-md border border-dashed bg-muted/40 py-1 pl-2 pr-1 font-mono text-sm">
+          {deployment.id}
+          <CopyAction value={deployment.id} label="Copy deployment id" />
+        </span>
+      }
       facts={[
         { label: 'Commit', value: <span className="font-mono">{deployment.commit}</span> },
         { label: 'Author', value: deployment.author },
