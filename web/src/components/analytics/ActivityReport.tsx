@@ -1,13 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm, useFieldArray, useWatch, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { Link } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, Loader2, Sparkles } from 'lucide-react'
+import {
+  AlertCircle,
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  Globe,
+  Loader2,
+  Sparkles,
+  Target,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import {
   getActivityStatusOptions,
@@ -422,6 +431,7 @@ function ActivitySettingsForm({
     daily_enabled: dailyEnabled,
   }
   const [editing, setEditing] = useState(false)
+  const [choosingGoal, setChoosingGoal] = useState(false)
   useEffect(() => {
     if (editing) form.setFocus('application_context')
   }, [editing, form])
@@ -491,6 +501,7 @@ function ActivitySettingsForm({
         aiProvider={status.ai_provider ?? null}
         aiModel={status.ai_model ?? null}
         disabled={busy}
+        onResultsChange={setChoosingGoal}
         onSelect={(goal) => {
           form.setValue('application_context', goal.goal, {
             shouldDirty: true,
@@ -502,6 +513,7 @@ function ActivitySettingsForm({
         }}
       />
       <details
+        hidden={choosingGoal}
         open={editing}
         onToggle={(event) => setEditing(event.currentTarget.open)}
       >
@@ -853,6 +865,7 @@ function GoalSuggestions({
   aiModel,
   disabled,
   onSelect,
+  onResultsChange,
 }: {
   projectId: number
   environment?: EnvironmentResponse
@@ -863,6 +876,7 @@ function GoalSuggestions({
   aiProvider: string | null
   aiModel: string | null
   disabled: boolean
+  onResultsChange: (choosing: boolean) => void
   onSelect: (goal: ActivityGoal) => void
 }) {
   const domains = useQuery({
@@ -875,6 +889,13 @@ function GoalSuggestions({
     resolver: zodResolver(discoverySchema),
     defaultValues: { url: '' },
   })
+  const [step, setStep] = useState<'website' | 'goals' | 'selected'>('website')
+  const [selectedGoal, setSelectedGoal] = useState<ActivityGoal | null>(null)
+  const resultsHeading = useRef<HTMLHeadingElement>(null)
+  useEffect(() => {
+    onResultsChange(step === 'goals')
+    if (step === 'goals') resultsHeading.current?.focus()
+  }, [step, onResultsChange])
   const [requestedUrl, setRequestedUrl] = useState<string | null>(null)
   const selectedDomain = domains.data?.find(
     (domain) => domain.domain === sourceDomain
@@ -888,13 +909,14 @@ function GoalSuggestions({
   }, [resolvedUrl, form])
   const suggest = useMutation({
     ...suggestActivityGoalsMutation(),
-
+    onSuccess: () => setStep('goals'),
     onError: (error) => toast.error(errorMessage(error)),
   })
   return (
     <section aria-label="Website analysis">
       <div className="space-y-4">
         <form
+          hidden={step !== 'website'}
           className="space-y-3"
           onSubmit={form.handleSubmit((data) => {
             setRequestedUrl(data.url)
@@ -1018,32 +1040,96 @@ function GoalSuggestions({
             </AlertDescription>
           </Alert>
         )}
-        {suggest.data && (
-          <div className="space-y-3">
-            <p className="text-sm font-medium">Suggested goals</p>
-            <p className="break-all text-xs text-muted-foreground">
-              Based on {requestedUrl}
-            </p>
-            {suggest.data.goals.map((goal) => (
-              <button
+        {step === 'selected' && selectedGoal && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Check className="h-5 w-5 shrink-0 text-primary" />
+              <p className="font-medium">{selectedGoal.title}</p>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={disabled}
+              onClick={() => setStep('goals')}
+            >
+              Change goal
+            </Button>
+          </div>
+        )}
+        {step === 'goals' && suggest.data && (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <Button
                 type="button"
-                key={goal.title}
+                variant="ghost"
+                size="sm"
                 disabled={disabled}
-                className="block w-full rounded-lg border p-4 text-left hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={() => {
-                  onSelect(goal)
-                }}
+                onClick={() => setStep('website')}
               >
-                <span className="block font-medium">{goal.title}</span>
-                <span className="mt-1 block text-sm">{goal.goal}</span>
-                <span className="mt-2 block text-xs text-muted-foreground">
-                  Why this fits: {goal.rationale}
-                </span>
-                <span className="mt-1 block text-xs text-muted-foreground">
-                  Tracking to check: {goal.missing_signals}
-                </span>
-              </button>
-            ))}
+                <ArrowLeft className="mr-2 h-4 w-4" /> Change website
+              </Button>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Globe className="h-4 w-4 shrink-0" />
+                  <span className="break-all">{requestedUrl}</span>
+                </div>
+                <h2
+                  ref={resultsHeading}
+                  tabIndex={-1}
+                  className="text-xl font-semibold tracking-tight focus:outline-none"
+                >
+                  Suggested goals
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Choose what you want to understand about your visitors.
+                </p>
+              </div>
+            </div>
+            <div className="grid gap-4 xl:grid-cols-2">
+              {suggest.data.goals.map((goal, index) => (
+                <article
+                  key={goal.title}
+                  className="flex min-w-0 flex-col rounded-lg border bg-card p-5"
+                >
+                  <div className="mb-4 flex items-center justify-between">
+                    <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary/10 text-primary">
+                      <Target className="h-5 w-5" />
+                    </span>
+                    <span className="text-xs tabular-nums text-muted-foreground">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                  </div>
+                  <h3 className="font-semibold">{goal.title}</h3>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {goal.goal}
+                  </p>
+                  <details className="mt-4 text-xs text-muted-foreground">
+                    <summary className="cursor-pointer">Why this goal?</summary>
+                    <p className="mt-2">{goal.rationale}</p>
+                    <p className="mt-2">
+                      <span className="font-medium">Tracking to check:</span>{' '}
+                      {goal.missing_signals}
+                    </p>
+                  </details>
+                  <div className="mt-auto pt-5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full justify-between"
+                      aria-label={`Choose ${goal.title}`}
+                      disabled={disabled}
+                      onClick={() => {
+                        setSelectedGoal(goal)
+                        setStep('selected')
+                        onSelect(goal)
+                      }}
+                    >
+                      Choose this goal <ArrowRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </article>
+              ))}
+            </div>
             <details>
               <summary className="cursor-pointer text-xs text-muted-foreground">
                 Public pages read ({suggest.data.pages_read.length})

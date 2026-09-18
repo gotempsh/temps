@@ -240,8 +240,15 @@ for (const width of [390, 1280]) {
     await page
       .getByRole('button', { name: 'Analyze website', exact: true })
       .click()
+    await expect(page.getByLabel('Website', { exact: true })).toBeHidden()
     await expect(
-      page.getByText('Why this fits: Your site has installation documentation.')
+      page.getByText('Report settings', { exact: true })
+    ).toBeHidden()
+    await page.getByText('Why this goal?', { exact: true }).click()
+    await expect(
+      page.getByText('Your site has installation documentation.', {
+        exact: true,
+      })
     ).toBeVisible()
     await page
       .getByRole('button', { name: /Understand documentation readers/ })
@@ -471,6 +478,18 @@ for (const width of [390, 1280]) {
                 rationale: 'The website has guides.',
                 missing_signals: 'Track article reads.',
               },
+              {
+                title: 'Product evaluation',
+                goal: 'Find visitors exploring pricing and comparing deployment options.',
+                rationale: 'The website includes pricing and comparison pages.',
+                missing_signals: 'Track trial starts.',
+              },
+              {
+                title: 'Setup progress',
+                goal: 'Understand where visitors get stuck while setting up their first project.',
+                rationale: 'The documentation includes installation guides.',
+                missing_signals: 'Track successful deployments.',
+              },
             ],
           },
         })
@@ -492,8 +511,32 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: /Documentation interest/ })
     ).toBeVisible()
     expect(previewCalls).toBe(0)
+    await expect(page.getByLabel('Website', { exact: true })).toBeHidden()
+    await expect(
+      page.getByRole('heading', { name: 'Suggested goals' })
+    ).toBeFocused()
     await page.screenshot({ path: `/tmp/temps-website-results-${width}.png` })
-    await openSettings(page)
+    await page.getByRole('button', { name: 'Change website' }).click()
+    await expect(page.getByLabel('Website', { exact: true })).toBeVisible()
+    await page
+      .getByRole('button', { name: 'Analyze website', exact: true })
+      .click()
+    await page
+      .getByRole('button', { name: /Choose Documentation interest/ })
+      .click()
+    await expect(
+      page.getByLabel('What do you want to understand?', { exact: true })
+    ).toBeVisible()
+    await page.getByRole('button', { name: 'Change goal' }).click()
+    await expect(
+      page.getByRole('heading', { name: 'Suggested goals' })
+    ).toBeVisible()
+    await page
+      .getByRole('button', {
+        name: 'Choose Documentation interest',
+        exact: true,
+      })
+      .click()
     await expect(
       page.getByText('No visitor activity in the last 24 hours.', {
         exact: true,
