@@ -5,6 +5,7 @@ import { useEffect, useId, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { GlobalLogLine } from '@/api/client/types.gen'
+import { logEnvironmentLabel } from '@/lib/log-environment'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Search, X } from 'lucide-react'
@@ -19,10 +20,12 @@ export function LogQueryInput({
   params,
   text,
   lines,
+  environmentLabels = {},
   onChange,
 }: {
   params: URLSearchParams
   text: string
+  environmentLabels?: Record<string, string>
   lines: GlobalLogLine[]
   onChange: (patch: Record<string, string | undefined>) => void
 }) {
@@ -88,7 +91,7 @@ export function LogQueryInput({
     })),
     env: [...new Set(lines.map((l) => l.env).filter(Boolean))].map((value) => ({
       value,
-      label: value,
+      label: logEnvironmentLabel(value, environmentLabels),
     })),
     node: [
       ...new Map(
@@ -119,7 +122,7 @@ export function LogQueryInput({
           .filter((v) => `${v.value} ${v.label}`.toLowerCase().includes(needle))
           .map((v) => ({
             value: `${key}:${quoteLogValue(v.value)}`,
-            label: `${key}:${quoteLogValue(key === 'project' ? v.label : v.value)}`,
+            label: `${key}:${quoteLogValue(key === 'project' || key === 'env' ? v.label : v.value)}`,
             hint: v.label === v.value ? '' : v.label,
             keyOnly: false,
           }))
@@ -135,6 +138,19 @@ export function LogQueryInput({
     if (result.error !== undefined) {
       setError(result.error)
       return
+    }
+    const environment = result.patch.env
+    if (environment && !environmentLabels[environment]) {
+      const matches = Object.entries(environmentLabels).filter(
+        ([, slug]) => slug === environment
+      )
+      if (matches.length > 1) {
+        setError(
+          'This environment exists in multiple projects. Choose a project first.'
+        )
+        return
+      }
+      if (matches.length === 1) result.patch.env = matches[0][0]
     }
     onChange(result.patch)
     setDraft(result.patch.q ?? '')
@@ -177,7 +193,7 @@ export function LogQueryInput({
               aria-label={`Edit ${token.key} filter`}
               onClick={() => {
                 setDraft(
-                  `${text ? `${text} ` : ''}${token.key}:${quoteLogValue(token.value)}`
+                  `${text ? `${text} ` : ''}${token.key}:${quoteLogValue(token.key === 'env' ? (environmentLabels[token.value] ?? token.value) : token.value)}`
                 )
                 setOpen(true)
                 setError('')
@@ -188,15 +204,17 @@ export function LogQueryInput({
               {token.key === 'project'
                 ? (choices.find((p) => String(p.id) === token.value)?.name ??
                   token.value)
-                : token.key === 'level'
-                  ? token.value.toLowerCase()
-                  : token.value}
+                : token.key === 'env'
+                  ? logEnvironmentLabel(token.value, environmentLabels)
+                  : token.key === 'level'
+                    ? token.value.toLowerCase()
+                    : token.value}
             </button>
             <Button
               variant="ghost"
               size="icon"
               className="size-6 shrink-0"
-              aria-label={`Clear ${token.key === 'env' ? 'environment' : token.key}: ${token.value}`}
+              aria-label={`Clear ${token.key === 'env' ? 'environment' : token.key}: ${token.key === 'env' ? logEnvironmentLabel(token.value, environmentLabels) : token.value}`}
               onClick={() => onChange({ [token.param]: undefined })}
             >
               <X className="size-3" />

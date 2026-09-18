@@ -4,7 +4,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { useGlobalView } from '@/hooks/useGlobalView'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueries } from '@tanstack/react-query'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { searchGlobalLogs } from '@/api/client/sdk.gen'
 import type { GlobalLogSource, LogLevel } from '@/api/client/types.gen'
 import { QueryContent } from '@/components/observability/GlobalPage'
@@ -76,6 +77,28 @@ export default function GlobalLogs() {
   const ready = !query.error && !query.isPending
   const incomplete = ready && !!query.data?.scan_limit_reached
   const lines = ready ? (query.data?.lines ?? []) : []
+  const environmentProjects = [
+    ...new Set([
+      ...(view.projectId ? [view.projectId] : []),
+      ...lines.flatMap((line) =>
+        line.project_id != null ? [line.project_id] : []
+      ),
+    ]),
+  ]
+  const environmentQueries = useQueries({
+    queries: environmentProjects.map((project_id) => ({
+      ...getEnvironmentsOptions({ path: { project_id } }),
+      staleTime: 60_000,
+    })),
+  })
+  const environmentLabels = Object.fromEntries(
+    environmentQueries.flatMap((query) =>
+      (query.data ?? []).map((environment) => [
+        String(environment.id),
+        environment.slug,
+      ])
+    )
+  )
   const status = incomplete ? (
     <Callout tone="warning" title="Scan limit reached">
       {lines.length ? 'Showing partial results. ' : ''}
@@ -100,6 +123,7 @@ export default function GlobalLogs() {
       />
       <LogExplorer
         lines={lines}
+        environmentLabels={environmentLabels}
         onFilter={filter}
         onInspect={() => setAuto(false)}
         status={status}
@@ -109,6 +133,7 @@ export default function GlobalLogs() {
               params={view.params}
               text={view.search}
               lines={lines}
+              environmentLabels={environmentLabels}
               onChange={filter}
             />
             <div className="flex flex-wrap items-center gap-2">

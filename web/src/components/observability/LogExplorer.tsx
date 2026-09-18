@@ -17,6 +17,8 @@ import {
 } from '@/components/ui/table'
 import { Download, WrapText, X, Columns3 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { logEnvironmentLabel } from '@/lib/log-environment'
+import { LogLevelBadge } from '@temps-sdk/ds'
 
 import { Input } from '@/components/ui/input'
 import {
@@ -30,22 +32,18 @@ import { groupLogLines } from '@/lib/log-explorer'
 
 type Patch = Record<string, string | undefined>
 const identity = (line: GlobalLogLine) => `${line.chunk_id}:${line.line_offset}`
-const tone = (level: string) =>
-  level === 'ERROR'
-    ? 'text-destructive'
-    : level === 'WARN'
-      ? 'text-amber-600 dark:text-amber-400'
-      : 'text-muted-foreground'
 
 /** Dense cross-project log list with page-scoped facets and an adjacent record inspector. */
 export function LogExplorer({
   lines,
+  environmentLabels = {},
   onFilter,
   toolbar,
   footer,
   status,
   onInspect,
 }: {
+  environmentLabels?: Record<string, string>
   lines: GlobalLogLine[]
   onFilter: (patch: Patch) => void
   toolbar?: ReactNode
@@ -78,7 +76,7 @@ export function LogExplorer({
   const inspector = useRef<HTMLHeadingElement>(null)
   const opener = useRef<HTMLButtonElement | null>(null)
   const [selected, setSelected] = useState<string>()
-  const [wrap, setWrap] = useState(false)
+  const wrap = params.get('wrap') === '1'
   useEffect(() => {
     if (selected) inspector.current?.focus()
   }, [selected])
@@ -107,7 +105,10 @@ export function LogExplorer({
       key: 'env',
       values: lines
         .filter((entry) => entry.env)
-        .map((entry) => ({ value: entry.env, label: entry.env })),
+        .map((entry) => ({
+          value: entry.env,
+          label: logEnvironmentLabel(entry.env, environmentLabels),
+        })),
     },
     {
       title: 'Node',
@@ -220,7 +221,7 @@ export function LogExplorer({
               variant="ghost"
               size="sm"
               aria-pressed={wrap}
-              onClick={() => setWrap((value) => !value)}
+              onClick={() => presentation('wrap', wrap ? '0' : '1')}
             >
               <WrapText className="mr-1.5 size-3.5" />
               Wrap
@@ -245,7 +246,7 @@ export function LogExplorer({
                 {mode === 'patterns' ? 'Exact repeated messages' : 'Services'}{' '}
                 on this loaded page. Select a row to inspect an example.
               </p>
-              <Table>
+              <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
                     <TableHead>
@@ -257,11 +258,17 @@ export function LogExplorer({
                 </TableHeader>
                 <TableBody>
                   {groups.map((group) => (
-                    <TableRow key={group.id} className="border-0 even:bg-muted/20">
+                    <TableRow
+                      key={group.id}
+                      className="border-0 even:bg-muted/20"
+                    >
                       <TableCell className="max-w-sm">
                         <button
                           type="button"
-                          className="w-full truncate text-left font-mono text-[11px] hover:underline"
+                          className={cn(
+                            'block w-full text-left font-mono text-[11px] hover:underline',
+                            wrap ? 'whitespace-pre-wrap break-all' : 'truncate'
+                          )}
                           onClick={(event) => {
                             opener.current = event.currentTarget
                             onInspect?.()
@@ -327,13 +334,8 @@ export function LogExplorer({
                           { hour12: false, timeZone: 'UTC' }
                         )}
                       </TableCell>
-                      <TableCell
-                        className={cn(
-                          'py-1.5 font-mono text-[11px]',
-                          tone(entry.level)
-                        )}
-                      >
-                        {entry.level}
+                      <TableCell className="py-1.5 font-mono text-[11px]">
+                        <LogLevelBadge level={entry.level} />
                       </TableCell>
                       <TableCell className="hidden py-1.5 md:table-cell">
                         <p
@@ -378,7 +380,10 @@ export function LogExplorer({
                               ? entry.deploy_id
                               : column === 'node'
                                 ? entry.node_name
-                                : entry.env) ?? '—'}
+                                : logEnvironmentLabel(
+                                    entry.env,
+                                    environmentLabels
+                                  )) ?? '—'}
                           </TableCell>
                         ))}
                     </TableRow>
@@ -414,9 +419,9 @@ export function LogExplorer({
               <X className="size-4" />
             </Button>
           </div>
-          <p className={cn('mb-1 font-mono text-xs', tone(line.level))}>
-            {line.level}
-          </p>
+          <div className="mb-1">
+            <LogLevelBadge level={line.level} />
+          </div>
           <time
             className="text-xs text-muted-foreground"
             dateTime={line.timestamp}
@@ -435,7 +440,7 @@ export function LogExplorer({
           <dl className="my-4 space-y-3 text-xs">
             {[
               ['Source', line.owner],
-              ['Environment', line.env],
+              ['Environment', logEnvironmentLabel(line.env, environmentLabels)],
               ['Service', line.service],
               ['Node', line.node_name],
               ['Container', line.container_id],
