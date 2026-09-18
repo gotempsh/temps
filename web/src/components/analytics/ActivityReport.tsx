@@ -132,10 +132,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
             <Alert>
               <Sparkles className="h-4 w-4" />
               <AlertDescription>
-                No AI Gateway provider is ready. Connect one to turn page visits
-                and custom events into a daily explanation of visitor activity.
-                For example: “Readers explored migration guides, then checked
-                pricing.”{' '}
+                Connect an AI provider to summarize visitor activity.{' '}
                 <Link className="underline" to={data.setup_url}>
                   Configure AI provider
                 </Link>
@@ -145,14 +142,8 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
           {!status.isFetching && !data.has_recent_activity && (
             <Alert>
               <AlertDescription>
-                <strong>
-                  No tracked visitor activity in this environment in the last 24
-                  hours.
-                </strong>{' '}
-                There is nothing to analyze yet. You can discover goals and edit
-                your setup now. Preview becomes available after a visitor
-                records a page view or custom event. Bots and visitors without
-                tracked events are excluded.
+                <strong>No visitor activity in the last 24 hours.</strong> Set
+                up your report while you wait.
               </AlertDescription>
             </Alert>
           )}
@@ -184,8 +175,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                       : 'Recent visitor activity'}
                   </CardTitle>
                   <CardDescription>
-                    Analyzes the previous 24 hours in the selected environment.
-                    Anonymous visitors are included.
+                    Last 24 hours · Up to 20 visitors
                     {report?.environment_id &&
                       ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
                   </CardDescription>
@@ -217,15 +207,10 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               </div>
             </CardHeader>
             <CardContent className="space-y-5">
-              <p className="text-sm text-muted-foreground">
-                A sample of up to 20 recently active visitors from the last 24
-                hours. Each category links back to observed activity.
-              </p>
               {data.selected_environment_id !==
                 data.settings.environment_id && (
                 <p className="text-sm text-muted-foreground">
-                  Save your environment selection before running the saved
-                  report.
+                  Save this environment to run its report.
                 </p>
               )}
               {data.next_run_at && (
@@ -243,8 +228,8 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               {!report ? (
                 <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
                   {data.has_recent_activity
-                    ? 'Describe what you want to understand above, then preview your visitors. Temps will suggest categories and show the activity behind them.'
-                    : 'Waiting for visitor activity. This page checks for new activity automatically.'}
+                    ? 'Preview your visitors to see a report.'
+                    : 'Waiting for visitor activity.'}
                 </div>
               ) : (
                 <>
@@ -263,8 +248,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                     </p>
                     {report.sampled && (
                       <p className="text-sm text-amber-700 dark:text-amber-400">
-                        Sampled report: some visitors or events were excluded by
-                        the run limits. These counts do not represent all
+                        Sampled report: counts cover this sample, not all
                         traffic.
                       </p>
                     )}
@@ -496,17 +480,11 @@ function ActivitySettingsForm({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>
-          What would you like to understand about your visitors?
-        </CardTitle>
-        <CardDescription>
-          Start with suggestions from your deployed app, or describe it
-          yourself. Preview real visitor activity before enabling reports.
-        </CardDescription>
+        <CardTitle>Report setup</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="space-y-2">
-          <Label htmlFor="activity-environment">Analyze activity from</Label>
+          <Label htmlFor="activity-environment">Environment</Label>
           {environmentLoading ? (
             <Skeleton className="h-10 w-full" />
           ) : (
@@ -534,10 +512,6 @@ function ActivitySettingsForm({
               </SelectContent>
             </Select>
           )}
-          <p className="text-sm text-muted-foreground">
-            Only this environment’s visitors and events are analyzed. Daily
-            reports use your saved selection.
-          </p>
           {environmentError && (
             <p role="alert" className="text-sm text-destructive">
               Could not load environments. Refresh the page to try again.
@@ -603,7 +577,7 @@ function ActivitySettingsForm({
           <fieldset disabled={busy} className="space-y-5 disabled:opacity-60">
             <div className="space-y-2">
               <Label htmlFor="activity-context">
-                Your application and goal
+                What do you want to understand?
               </Label>
               <Textarea
                 id="activity-context"
@@ -612,21 +586,27 @@ function ActivitySettingsForm({
                 {...form.register('application_context', {
                   onChange: () => setHasSetup(false),
                 })}
-                placeholder="We sell a self-hosted deployment platform. Help me understand who’s reading to learn, who’s considering migrating, and who’s struggling to get started."
+                placeholder="e.g. Which visitors are exploring our product, and who needs help?"
                 aria-invalid={!!form.formState.errors.application_context}
-                aria-describedby="activity-goal-help"
+                aria-describedby={
+                  form.formState.errors.application_context
+                    ? 'activity-goal-help'
+                    : undefined
+                }
               />
-              <p
-                id="activity-goal-help"
-                className="text-sm text-muted-foreground"
-              >
-                {form.formState.errors.application_context?.message ??
-                  'You can refine this description and preview again before saving.'}
-              </p>
+              {form.formState.errors.application_context && (
+                <p
+                  id="activity-goal-help"
+                  role="alert"
+                  className="text-sm text-destructive"
+                >
+                  {form.formState.errors.application_context.message}
+                </p>
+              )}
             </div>
             {hasSetup && (
               <div className="space-y-2">
-                <p className="text-sm font-medium">Categories for this setup</p>
+                <p className="text-sm font-medium">Categories</p>
                 <div className="flex flex-wrap gap-2">
                   {values.categories.map((category, index) => (
                     <Badge
@@ -639,10 +619,6 @@ function ActivitySettingsForm({
                   ))}
                   <Badge variant="outline">Insufficient evidence</Badge>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  Categories can overlap. Reading a page alone does not confirm
-                  intent.
-                </p>
               </div>
             )}
             <details>
@@ -755,14 +731,17 @@ function ActivitySettingsForm({
                     />
                   )}
                 />
-                <span>Allow analysis using my configured AI provider.</span>
+                <span>Share visitor activity with my AI provider.</span>
               </label>
-              <p className="text-xs text-muted-foreground">
-                Your description, categories, page paths, titles, event names,
-                timestamps, and selected properties will be sent to it. These
-                fields may contain personal information. Database visitor IDs,
-                IP addresses, and URL query strings are excluded.
-              </p>
+              <details className="text-xs text-muted-foreground">
+                <summary className="cursor-pointer">What’s shared?</summary>
+                <p className="mt-2">
+                  Your goal, categories, page paths and titles, events,
+                  timestamps, and selected properties. These may contain
+                  personal information. Visitor IDs, IP addresses, and URL query
+                  strings are excluded.
+                </p>
+              </details>
             </div>
             {preview.isError && (
               <Alert variant="destructive">
@@ -825,14 +804,7 @@ function ActivitySettingsForm({
             </div>
             {preview.isPending && (
               <p role="status" className="text-sm text-muted-foreground">
-                Suggesting categories and checking recent activity. Your saved
-                setup and schedule stay unchanged.
-              </p>
-            )}
-            {hasSetup && (
-              <p className="text-xs text-muted-foreground">
-                Saved categories are reused for future reports. Daily reporting
-                starts only when you enable it.
+                Analyzing recent activity…
               </p>
             )}
           </fieldset>
@@ -914,11 +886,6 @@ function GoalSuggestions({
         {selectedGoal ? ` · ${selectedGoal}` : ''}
       </summary>
       <div className="mt-4 space-y-4">
-        <p className="text-sm text-muted-foreground">
-          Temps reads up to four public pages from its server and up to 30
-          tracked event names to suggest useful questions about your visitors.
-          No login credentials are used.
-        </p>
         <form
           className="space-y-3"
           onSubmit={form.handleSubmit((data) => {
@@ -938,9 +905,7 @@ function GoalSuggestions({
             className="space-y-3"
           >
             <div className="space-y-2">
-              <Label htmlFor="activity-website">
-                Website used to suggest goals
-              </Label>
+              <Label htmlFor="activity-website">Website</Label>
               <Select
                 value={
                   sourceUrl !== null ? 'custom' : (sourceDomain ?? 'primary')
@@ -970,10 +935,6 @@ function GoalSuggestions({
                   <SelectItem value="custom">Use another URL</SelectItem>
                 </SelectContent>
               </Select>
-              <p className="text-xs text-muted-foreground">
-                This website supplies context for goal suggestions. Visitor
-                activity still comes from the selected environment.
-              </p>
               {domains.isError && (
                 <p className="text-sm text-muted-foreground">
                   Could not load attached domains. You can use the primary URL
@@ -1025,8 +986,7 @@ function GoalSuggestions({
                 )}
               />
               <span>
-                Allow sending public page content and tracked event names to my
-                AI provider to suggest goals.
+                Share public pages and event names with my AI provider.
               </span>
             </label>
             {form.formState.errors.share && (
@@ -1039,9 +999,7 @@ function GoalSuggestions({
                 type="submit"
                 disabled={!configured || !environment || !resolvedUrl}
               >
-                {suggest.isPending
-                  ? 'Reading your app…'
-                  : 'Suggest goals from my app'}
+                {suggest.isPending ? 'Reading your app…' : 'Suggest goals'}
               </Button>
               <Button
                 type="button"

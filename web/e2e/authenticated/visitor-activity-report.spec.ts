@@ -204,11 +204,9 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('list', { name: 'Activity report setup steps' })
     ).toHaveCount(0)
+    await page.getByRole('switch', { name: /Share public pages/ }).check()
     await page
-      .getByRole('switch', { name: /Allow sending public page content/ })
-      .check()
-    await page
-      .getByRole('button', { name: 'Suggest goals from my app', exact: true })
+      .getByRole('button', { name: 'Suggest goals', exact: true })
       .click()
     await expect(
       page.getByText('Why this fits: Your site has installation documentation.')
@@ -218,7 +216,7 @@ for (const width of [390, 1280]) {
       .click()
     await expect(
       page.getByRole('textbox', {
-        name: 'Your application and goal',
+        name: 'What do you want to understand?',
         exact: true,
       })
     ).toHaveValue(
@@ -226,10 +224,13 @@ for (const width of [390, 1280]) {
     )
     expect(saved).toBe(false)
     await expect(
-      page.getByRole('switch', { name: /Allow analysis/ })
+      page.getByRole('switch', { name: /Share visitor activity/ })
     ).not.toBeChecked()
     await page
-      .getByRole('textbox', { name: 'Your application and goal', exact: true })
+      .getByRole('textbox', {
+        name: 'What do you want to understand?',
+        exact: true,
+      })
       .scrollIntoViewIfNeeded()
     await page.screenshot({
       path: `/tmp/temps-activity-onboarding-${width}.png`,
@@ -237,7 +238,7 @@ for (const width of [390, 1280]) {
     await expect(page.getByLabel('Category 1 name')).not.toBeVisible()
     await page.getByText('Advanced settings', { exact: true }).click()
     await page.getByLabel('Custom event property keys (optional)').fill('topic')
-    await page.getByRole('switch', { name: /Allow analysis/ }).check()
+    await page.getByRole('switch', { name: /Share visitor activity/ }).check()
     await page.getByRole('button', { name: 'Preview my visitors' }).click()
     await expect(page.getByText(report.summary)).toBeVisible()
     expect(saved).toBe(false)
@@ -245,7 +246,7 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: 'Run saved settings' })
     ).toBeDisabled()
-    await expect(page.getByText('Categories for this setup')).toBeVisible()
+    await expect(page.getByText('Categories', { exact: true })).toBeVisible()
     await page.getByRole('button', { name: 'Preview my visitors' }).click()
     await expect(
       page.getByText(/Your saved setup has not changed/)
@@ -272,7 +273,7 @@ for (const width of [390, 1280]) {
       }
       await dailySwitch.setChecked(dailyEnabled)
       await page
-        .getByLabel('Your application and goal', { exact: true })
+        .getByLabel('What do you want to understand?', { exact: true })
         .fill(
           'We provide application hosting. Understand documentation readers and their next steps.'
         )
@@ -314,7 +315,7 @@ for (const width of [390, 1280]) {
     })
 
     // Revocation must be saveable, and must prevent future runs.
-    await page.getByRole('switch', { name: /Allow analysis/ }).uncheck()
+    await page.getByRole('switch', { name: /Share visitor activity/ }).uncheck()
     await page
       .getByRole('button', { name: 'Save settings', exact: true })
       .click()
@@ -363,7 +364,7 @@ test('activity analysis is discoverable before an AI provider is configured', as
   ).toHaveAttribute('href', '/settings/ai-providers')
   await expect(
     page.getByRole('textbox', {
-      name: 'Your application and goal',
+      name: 'What do you want to understand?',
       exact: true,
     })
   ).toBeVisible()
@@ -418,12 +419,9 @@ for (const width of [390, 1280]) {
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
     await expect(
-      page.getByText(
-        'No tracked visitor activity in this environment in the last 24 hours.',
-        {
-          exact: true,
-        }
-      )
+      page.getByText('No visitor activity in the last 24 hours.', {
+        exact: true,
+      })
     ).toBeVisible()
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
@@ -433,12 +431,15 @@ for (const width of [390, 1280]) {
     ).toHaveCount(0)
     await expect(
       page.getByRole('textbox', {
-        name: 'Your application and goal',
+        name: 'What do you want to understand?',
         exact: true,
       })
     ).toBeEditable()
     await page
-      .getByRole('textbox', { name: 'Your application and goal', exact: true })
+      .getByRole('textbox', {
+        name: 'What do you want to understand?',
+        exact: true,
+      })
       .press('Control+Enter')
     expect(previewCalls).toBe(0)
     await page.screenshot({
@@ -454,12 +455,9 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: 'Run saved settings' })
     ).toBeEnabled()
     await expect(
-      page.getByText(
-        'No tracked visitor activity in this environment in the last 24 hours.',
-        {
-          exact: true,
-        }
-      )
+      page.getByText('No visitor activity in the last 24 hours.', {
+        exact: true,
+      })
     ).toHaveCount(0)
   })
 }
@@ -513,10 +511,10 @@ for (const width of [390, 1280]) {
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
     const environment = page.getByRole('combobox', {
-      name: 'Analyze activity from',
+      name: 'Environment',
     })
     const website = page.getByRole('combobox', {
-      name: 'Website used to suggest goals',
+      name: 'Website',
     })
     const url = page.getByRole('textbox', {
       name: 'Public application URL',
@@ -530,10 +528,9 @@ for (const width of [390, 1280]) {
     await expect(url).toHaveCount(0)
     await expect(website).toContainText('https://app-staging.example.com')
     await expect(
-      page.getByText(
-        'No tracked visitor activity in this environment in the last 24 hours.',
-        { exact: true }
-      )
+      page.getByText('No visitor activity in the last 24 hours.', {
+        exact: true,
+      })
     ).toBeVisible()
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
