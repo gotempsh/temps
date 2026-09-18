@@ -286,9 +286,10 @@ for (const width of [1440, 390]) {
         })
     )
     await page.goto('/logs')
-    await expect(
-      page.getByText(/Scan limit reached · showing partial results/)
-    ).toBeVisible()
+    const warning = page.getByRole('status').filter({ hasText: 'Scan limit reached' })
+    await expect(warning).toBeVisible()
+    await expect(warning).toContainText('Showing partial results.')
+    await expect(warning).toContainText('Use Next page to continue')
     await expect(
       page.getByRole('cell', { name: 'Checkout request failed', exact: false })
     ).toBeVisible()
