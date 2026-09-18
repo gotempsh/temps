@@ -1,17 +1,26 @@
 ---
 name: temps-plugin
 description: >
-  Design, build, test, and distribute external Temps plugins with TypeScript/Bun or Rust.
+  Design, build, test, and distribute external Temps plugins with TypeScript/Bun;
+  provide development and local-testing guidance for existing Rust plugins.
   Use for creating a plugin, adding an embedded console UI or deployment-event automation,
   testing host permissions and AI, installing from GitHub, or submitting a plugin to the
-  public catalog. Covers the authoring lifecycle; not in-process TempsPlugin backend crates.
+  public catalog. End-to-end publishing covers TypeScript GitHub-source plugins, not Rust
+  native-package releases or in-process TempsPlugin backend crates.
 ---
 
 # Create and ship a Temps plugin
 
-Deliver a working external plugin, an installable source repository, and evidence of
+For TypeScript/Bun, deliver a working external plugin, an installable source repository, and evidence of
 what was verified. Continue an existing project when provided; preserve its identity,
 storage, and user changes. Publishing is a separate outcome from building or installing.
+
+Rust support here is limited to development and local simulator testing. Rust distribution
+requires the separate signed native npm-package/catalog pipeline, which this skill does
+not teach. Do not route a Cargo repository through the TypeScript GitHub installer or
+suggest copying/symlinking a binary into the host plugin directory. If Rust publication is
+requested, establish the supported native release procedure before claiming an end-to-end
+plan; do not silently change the user's implementation language.
 
 ## 1. Establish the contract
 
@@ -76,7 +85,7 @@ embed assets, and test its real proxy path. For deployment automation, subscribe
 `deployment.succeeded`, keep receipt handling quick, and use bounded persistent jobs,
 idempotency, cancellation and explicit environment/project settings.
 
-## 4. Prove it works at three levels
+## 4. Verify the TypeScript lifecycle at three levels
 
 1. **Unit and integration checks:** success, validation, failures, persistence/restart,
    bounded work, and relevant security cases. Typecheck and compile the actual binary.
@@ -92,7 +101,7 @@ provider calls or a full host installation. A received event is not proof the jo
 Do not label end-to-end verification complete unless the installed workflow was exercised;
 record a concrete limitation when that environment is unavailable.
 
-## 5. Distribute, list, and maintain
+## 5. Distribute, list, and maintain TypeScript plugins
 
 The default workflow is **GitHub repository → reviewed source installation → catalog PR**.
 No npm publication, cloud publisher token, or registry signing key is needed for this path.

@@ -89,7 +89,7 @@ Test `--role reader` as well as admin. Read the report/state after emitting an e
 receipts only prove delivery. Stop the owned runner with Ctrl-C; retain only intended
 plugin data. Keep session auth, fixture secrets and generated databases out of commits.
 
-## Rust alternative
+## Rust development and local testing only
 
 Use a compatible pinned `temps-plugin-sdk` release/revision and the official Rust examples
 in `gotempsh/plugins`. Implement `ExternalPlugin`; let `temps_plugin_sdk::main!` own the
@@ -97,9 +97,28 @@ runtime. Do not register duplicate SDK health routes or block a running Tokio ex
 with `block_on`. Follow the SDK's async initialization pattern. Use contextual `thiserror`
 errors, compile the UI before embedding, and check/test the affected crate.
 
-The GitHub TypeScript source installer is not a general Rust build service. For Rust,
-verify the target host's supported binary installation/distribution path rather than
-claiming the TypeScript template's catalog build validates a Cargo project.
+Build and test the crate, then supply the resulting executable to the same local simulator:
+
+```sh
+cargo check -p your-plugin
+cargo test -p your-plugin
+cargo build --release -p your-plugin
+bunx --bun @temps-sdk/cli plugin dev ./target/release/your-plugin --session rust-authoring
+```
+
+Replace the package/binary names with the actual Cargo configuration. Build required UI
+assets first using that project's documented build process. Simulator verification is local
+runtime evidence, not installation or publication.
+
+Stop this Rust branch of the skill at a tested executable. The GitHub source installer only
+builds TypeScript with Bun; it does not build Cargo projects. Manual copying or symlinking
+of a Rust binary into the Temps plugin directory is not the supported installation path.
+Rust distribution requires native executables packaged into platform-specific npm packages
+and authenticated through the separate signed catalog pipeline. This reference does not
+provide that release procedure. Do not invoke the TypeScript `plugin publish` builder for
+a Cargo project or claim that the GitHub discovery catalog validates its binary release.
+When asked to publish Rust, consult the matching native-package publisher/installer
+instructions and establish that pipeline explicitly as a separate task.
 
 ## Evidence to retain
 

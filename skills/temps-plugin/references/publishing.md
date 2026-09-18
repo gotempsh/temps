@@ -1,5 +1,9 @@
 # Source distribution and catalog listing
 
+This reference covers TypeScript/Bun GitHub-source distribution only. Rust native-package
+publication is outside its scope; see the development reference for the local-testing
+boundary. Do not apply the steps below to a Cargo project.
+
 Prefer the current GitHub-source workflow for new TypeScript plugins. Verify the target
 host supports it; older releases may only support binary/signed-catalog installation.
 Current authoritative instructions:
