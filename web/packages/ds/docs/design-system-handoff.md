@@ -328,7 +328,7 @@ this phase needs):
     left as a follow-up (each has its own step-count/validation/branching
     logic worth reviewing individually rather than a mechanical swap):
     `AddDomain.tsx`, `ApiKeyCreate.tsx`, `AddDnsProvider.tsx`,
-    `AddEmailProvider.tsx`, `AddClusterMember.tsx`,
+    `AddClusterMember.tsx`,
     `CreateServiceNew.tsx`,
     `NewProject.tsx`, `Setup.tsx`. `EmailDomainNew.tsx` also hand-rolls its
     own step indicator (a comment there says it took the visual pattern
@@ -338,3 +338,7 @@ this phase needs):
 Notification setup (`AddNotificationProvider.tsx`) now uses `Wizard`, native
 provider buttons, URL-restored non-secret step/provider selection, a grouped
 footer, and inline mutation errors. Credentials stay in the form.
+
+Transactional email setup (`AddEmailProvider.tsx`) now uses the shared wizard
+and footer. Its SES/Scaleway/SMTP forms and validation remain intact; non-secret
+step/provider state is in the URL, while credentials remain local.
