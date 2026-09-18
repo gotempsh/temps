@@ -279,6 +279,10 @@ export type ActivitySettings = {
 
 export type ActivityStatus = {
     configured: boolean;
+    /**
+     * Whether tracked non-crawler visitor events exist in the previous 24 hours.
+     */
+    has_recent_activity: boolean;
     last_error?: string | null;
     next_run_at?: string | null;
     report?: null | ActivityReport;

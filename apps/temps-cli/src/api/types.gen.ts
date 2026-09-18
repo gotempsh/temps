@@ -62,6 +62,11 @@ export type ActiveVisitorsResponse = {
     window_minutes: number;
 };
 
+export type ActivityCategory = {
+    description: string;
+    name: string;
+};
+
 /**
  * Daily activity count for a single day
  */
@@ -155,6 +160,36 @@ export type ActivityEvent = {
     visitor_id?: number | null;
 };
 
+export type ActivityEvidence = {
+    event: string;
+    path: string;
+    properties: Array<ActivityProperty>;
+    /**
+     * Local to this report, not a database event ID.
+     */
+    reference: number;
+    timestamp: string;
+    title?: string | null;
+};
+
+export type ActivityGoal = {
+    goal: string;
+    missing_signals: string;
+    rationale: string;
+    title: string;
+};
+
+export type ActivityGoals = {
+    goals: Array<ActivityGoal>;
+    model: string;
+    pages_read: Array<string>;
+};
+
+export type ActivityGoalsRequest = {
+    share_with_ai: boolean;
+    url: string;
+};
+
 /**
  * Query parameters for activity graph endpoint
  */
@@ -193,6 +228,68 @@ export type ActivityGraphResponse = {
      * Total count of activities across all days
      */
     total_count: number;
+};
+
+export type ActivityPreview = {
+    report: ActivityReport;
+    settings: ActivitySettings;
+};
+
+/**
+ * An unsaved onboarding preview. Sharing is explicit and scheduling is never inferred.
+ */
+export type ActivityPreviewRequest = {
+    goal: string;
+    property_keys?: Array<string>;
+    share_activity_with_ai: boolean;
+};
+
+export type ActivityProperty = {
+    key: string;
+    value: string;
+};
+
+export type ActivityReport = {
+    categories: Array<ActivityCategory>;
+    completed_at: string;
+    events_considered: number;
+    model?: string | null;
+    sampled: boolean;
+    settings_revision: number;
+    started_at: string;
+    summary: string;
+    visitors: Array<VisitorActivityAssessment>;
+    window_end: string;
+    window_start: string;
+};
+
+export type ActivitySettings = {
+    application_context: string;
+    categories: Array<ActivityCategory>;
+    daily_enabled: boolean;
+    /**
+     * Only these event-property keys may be sent to the provider.
+     */
+    property_keys: Array<string>;
+    /**
+     * Explicit permission to send the selected analytics fields to the configured AI provider.
+     */
+    share_activity_with_ai: boolean;
+};
+
+export type ActivityStatus = {
+    configured: boolean;
+    /**
+     * Whether tracked non-crawler visitor events exist in the previous 24 hours.
+     */
+    has_recent_activity: boolean;
+    last_error?: string | null;
+    next_run_at?: string | null;
+    report?: null | ActivityReport;
+    running: boolean;
+    settings: ActivitySettings;
+    settings_revision: number;
+    setup_url: string;
 };
 
 /**
@@ -24212,6 +24309,13 @@ export type ViewsOverTimeQuery = {
     start_date: string;
 };
 
+export type VisitorActivityAssessment = {
+    categories: Array<string>;
+    evidence: Array<ActivityEvidence>;
+    explanation: string;
+    visitor_id: number;
+};
+
 export type VisitorDetails = {
     city?: string | null;
     country?: string | null;
@@ -47807,6 +47911,134 @@ export type SilenceAlarmResponses = {
      */
     200: unknown;
 };
+
+export type GetActivityStatusData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity';
+};
+
+export type GetActivityStatusResponses = {
+    200: ActivityStatus;
+};
+
+export type GetActivityStatusResponse = GetActivityStatusResponses[keyof GetActivityStatusResponses];
+
+export type SaveActivitySettingsData = {
+    body: ActivitySettings;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity';
+};
+
+export type SaveActivitySettingsResponses = {
+    /**
+     * Settings saved
+     */
+    204: void;
+};
+
+export type SaveActivitySettingsResponse = SaveActivitySettingsResponses[keyof SaveActivitySettingsResponses];
+
+export type SuggestActivityGoalsData = {
+    body: ActivityGoalsRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/goals';
+};
+
+export type SuggestActivityGoalsErrors = {
+    /**
+     * Invalid public URL or consent missing
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Busy
+     */
+    409: unknown;
+    /**
+     * Site scan or AI suggestion failed
+     */
+    502: unknown;
+    /**
+     * AI provider missing
+     */
+    503: unknown;
+};
+
+export type SuggestActivityGoalsResponses = {
+    200: ActivityGoals;
+};
+
+export type SuggestActivityGoalsResponse = SuggestActivityGoalsResponses[keyof SuggestActivityGoalsResponses];
+
+export type PreviewActivityReportData = {
+    body: ActivityPreviewRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/preview';
+};
+
+export type PreviewActivityReportErrors = {
+    /**
+     * Invalid goal or sharing disabled
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Analysis busy or preview cooling down
+     */
+    409: unknown;
+    /**
+     * AI preview failed
+     */
+    502: unknown;
+    /**
+     * AI provider not configured
+     */
+    503: unknown;
+};
+
+export type PreviewActivityReportResponses = {
+    200: ActivityPreview;
+};
+
+export type PreviewActivityReportResponse = PreviewActivityReportResponses[keyof PreviewActivityReportResponses];
+
+export type RunActivityReportData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/run';
+};
+
+export type RunActivityReportResponses = {
+    200: ActivityReport;
+};
+
+export type RunActivityReportResponse = RunActivityReportResponses[keyof RunActivityReportResponses];
 
 export type ListAnalyticsIngestKeysData = {
     body?: never;

@@ -56,7 +56,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
   const options = getActivityStatusOptions({ path: { project_id: project.id } })
   const status = useQuery({
     ...options,
-    refetchInterval: (query) => (query.state.data?.running ? 3000 : false),
+    refetchInterval: (query) => (query.state.data?.running ? 3000 : 30_000),
   })
   const [preview, setPreview] = useState<ActivityPreview | null>(null)
   const [category, setCategory] = useState<string | null>(null)
@@ -124,6 +124,19 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               </AlertDescription>
             </Alert>
           )}
+          {!data.has_recent_activity && (
+            <Alert>
+              <AlertDescription>
+                <strong>
+                  No tracked visitor activity in the last 24 hours.
+                </strong>{' '}
+                There is nothing to analyze yet. You can discover goals and edit
+                your setup now. Preview becomes available after a visitor
+                records a page view or custom event. Bots and visitors without
+                tracked events are excluded.
+              </AlertDescription>
+            </Alert>
+          )}
           <ActivitySettingsForm
             key={data.settings_revision}
             projectId={project.id}
@@ -151,24 +164,26 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                     environments. Anonymous visitors are included.
                   </CardDescription>
                 </div>
-                <Button
-                  disabled={
-                    !data.configured ||
-                    !data.settings_revision ||
-                    !data.settings.share_activity_with_ai ||
-                    !!running
-                  }
-                  onClick={() =>
-                    run.mutate({ path: { project_id: project.id } })
-                  }
-                >
-                  {running ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Sparkles className="mr-2 h-4 w-4" />
-                  )}
-                  {running ? 'Analyzing…' : 'Run saved settings'}
-                </Button>
+                {data.has_recent_activity && (
+                  <Button
+                    disabled={
+                      !data.configured ||
+                      !data.settings_revision ||
+                      !data.settings.share_activity_with_ai ||
+                      !!running
+                    }
+                    onClick={() =>
+                      run.mutate({ path: { project_id: project.id } })
+                    }
+                  >
+                    {running ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="mr-2 h-4 w-4" />
+                    )}
+                    {running ? 'Analyzing…' : 'Run saved settings'}
+                  </Button>
+                )}
               </div>
             </CardHeader>
             <CardContent className="space-y-5">
@@ -190,9 +205,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               )}
               {!report ? (
                 <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
-                  Describe what you want to understand above, then preview your
-                  visitors. Temps will suggest categories and show the activity
-                  behind them.
+                  {data.has_recent_activity
+                    ? 'Describe what you want to understand above, then preview your visitors. Temps will suggest categories and show the activity behind them.'
+                    : 'Waiting for visitor activity. This page checks for new activity automatically.'}
                 </div>
               ) : (
                 <>
@@ -471,6 +486,7 @@ function ActivitySettingsForm({
         <form
           className="space-y-5"
           onSubmit={form.handleSubmit((data) => {
+            if (!status.has_recent_activity) return
             onPreview(null)
             preview.mutate({
               path: { project_id: projectId },
@@ -659,19 +675,23 @@ function ActivitySettingsForm({
               </Alert>
             )}
             <div className="flex flex-wrap gap-2">
-              <Button
-                type="submit"
-                disabled={!status.configured || !values.share_activity_with_ai}
-              >
-                {preview.isPending ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : (
-                  <Sparkles className="mr-2 h-4 w-4" />
-                )}
-                {preview.isPending
-                  ? 'Preparing preview…'
-                  : 'Preview my visitors'}
-              </Button>
+              {status.has_recent_activity && (
+                <Button
+                  type="submit"
+                  disabled={
+                    !status.configured || !values.share_activity_with_ai
+                  }
+                >
+                  {preview.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-2 h-4 w-4" />
+                  )}
+                  {preview.isPending
+                    ? 'Preparing preview…'
+                    : 'Preview my visitors'}
+                </Button>
+              )}
               {hasSetup && (
                 <>
                   <Button

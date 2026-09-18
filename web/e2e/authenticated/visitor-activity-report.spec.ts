@@ -62,6 +62,7 @@ for (const width of [390, 1280]) {
           await route.fulfill({
             json: {
               configured: true,
+              has_recent_activity: true,
               setup_url: '/settings/ai-providers',
               settings,
               settings_revision: saved ? 1 : 0,
@@ -296,6 +297,7 @@ test('activity analysis is discoverable before an AI provider is configured', as
       route.fulfill({
         json: {
           configured: false,
+          has_recent_activity: true,
           setup_url: '/settings/ai-providers',
           settings_revision: 0,
           running: false,
@@ -326,3 +328,87 @@ test('activity analysis is discoverable before an AI provider is configured', as
     page.getByRole('button', { name: 'Run saved settings' })
   ).toBeDisabled()
 })
+
+for (const width of [390, 1280]) {
+  test(`empty activity explains the wait and hides analysis actions at ${width}px`, async ({
+    page,
+  }) => {
+    const { projects } = await (await page.request.get('/api/projects')).json()
+    test.skip(!projects[0], 'Requires a test project')
+    const project = projects[0]
+    await page.setViewportSize({ width, height: 1000 })
+    let hasActivity = false
+    let previewCalls = 0
+    await page.route(
+      `**/api/projects/${project.id}/analytics/activity`,
+      (route) =>
+        route.fulfill({
+          json: {
+            configured: true,
+            has_recent_activity: hasActivity,
+            setup_url: '/settings/ai-providers',
+            settings_revision: 1,
+            running: false,
+            next_run_at: null,
+            last_error: null,
+            report: null,
+            settings: {
+              application_context: 'Understand readers of our documentation',
+              categories: [
+                { name: 'Learning', description: 'Reading documentation' },
+              ],
+              property_keys: [],
+              daily_enabled: false,
+              share_activity_with_ai: true,
+            },
+          },
+        })
+    )
+    await page.route(
+      `**/api/projects/${project.id}/analytics/activity/preview`,
+      (route) => {
+        previewCalls += 1
+        return route.fulfill({ status: 500 })
+      }
+    )
+    await page.goto(`/projects/${project.slug}/analytics/activity`)
+    await expect(
+      page.getByText('No tracked visitor activity in the last 24 hours.', {
+        exact: true,
+      })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Preview my visitors' })
+    ).toHaveCount(0)
+    await expect(
+      page.getByRole('button', { name: 'Run saved settings' })
+    ).toHaveCount(0)
+    await expect(
+      page.getByRole('textbox', {
+        name: 'Your application and goal',
+        exact: true,
+      })
+    ).toBeEditable()
+    await page
+      .getByRole('textbox', { name: 'Your application and goal', exact: true })
+      .press('Control+Enter')
+    expect(previewCalls).toBe(0)
+    await page.screenshot({
+      path: `/tmp/temps-empty-activity-${width}.png`,
+      fullPage: true,
+    })
+    hasActivity = true
+    await page.reload()
+    await expect(
+      page.getByRole('button', { name: 'Preview my visitors' })
+    ).toBeEnabled()
+    await expect(
+      page.getByRole('button', { name: 'Run saved settings' })
+    ).toBeEnabled()
+    await expect(
+      page.getByText('No tracked visitor activity in the last 24 hours.', {
+        exact: true,
+      })
+    ).toHaveCount(0)
+  })
+}

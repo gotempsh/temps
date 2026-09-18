@@ -221,6 +221,21 @@
         ],
         "type": "object"
       },
+      "ActivityCategory": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "type": "object"
+      },
       "ActivityDay": {
         "description": "Daily activity count for a single day",
         "properties": {
@@ -370,6 +385,110 @@
         ],
         "type": "object"
       },
+      "ActivityEvidence": {
+        "properties": {
+          "event": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "properties": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityProperty"
+            },
+            "type": "array"
+          },
+          "reference": {
+            "description": "Local to this report, not a database event ID.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "reference",
+          "timestamp",
+          "path",
+          "event",
+          "properties"
+        ],
+        "type": "object"
+      },
+      "ActivityGoal": {
+        "additionalProperties": false,
+        "properties": {
+          "goal": {
+            "type": "string"
+          },
+          "missing_signals": {
+            "type": "string"
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "goal",
+          "rationale",
+          "missing_signals"
+        ],
+        "type": "object"
+      },
+      "ActivityGoals": {
+        "properties": {
+          "goals": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityGoal"
+            },
+            "type": "array"
+          },
+          "model": {
+            "type": "string"
+          },
+          "pages_read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "goals",
+          "pages_read",
+          "model"
+        ],
+        "type": "object"
+      },
+      "ActivityGoalsRequest": {
+        "properties": {
+          "share_with_ai": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "share_with_ai"
+        ],
+        "type": "object"
+      },
       "ActivityGraphQuery": {
         "description": "Query parameters for activity graph endpoint",
         "properties": {
@@ -428,6 +547,214 @@
           "total_count",
           "start_date",
           "end_date"
+        ],
+        "type": "object"
+      },
+      "ActivityPreview": {
+        "properties": {
+          "report": {
+            "$ref": "#/components/schemas/ActivityReport"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ActivitySettings"
+          }
+        },
+        "required": [
+          "settings",
+          "report"
+        ],
+        "type": "object"
+      },
+      "ActivityPreviewRequest": {
+        "description": "An unsaved onboarding preview. Sharing is explicit and scheduling is never inferred.",
+        "properties": {
+          "goal": {
+            "type": "string"
+          },
+          "property_keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "share_activity_with_ai": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "goal",
+          "share_activity_with_ai"
+        ],
+        "type": "object"
+      },
+      "ActivityProperty": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ActivityReport": {
+        "properties": {
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityCategory"
+            },
+            "type": "array"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "events_considered": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sampled": {
+            "type": "boolean"
+          },
+          "settings_revision": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "visitors": {
+            "items": {
+              "$ref": "#/components/schemas/VisitorActivityAssessment"
+            },
+            "type": "array"
+          },
+          "window_end": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_start": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "started_at",
+          "completed_at",
+          "window_start",
+          "window_end",
+          "settings_revision",
+          "categories",
+          "summary",
+          "sampled",
+          "events_considered",
+          "visitors"
+        ],
+        "type": "object"
+      },
+      "ActivitySettings": {
+        "properties": {
+          "application_context": {
+            "type": "string"
+          },
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityCategory"
+            },
+            "type": "array"
+          },
+          "daily_enabled": {
+            "type": "boolean"
+          },
+          "property_keys": {
+            "description": "Only these event-property keys may be sent to the provider.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "share_activity_with_ai": {
+            "description": "Explicit permission to send the selected analytics fields to the configured AI provider.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "application_context",
+          "categories",
+          "property_keys",
+          "daily_enabled",
+          "share_activity_with_ai"
+        ],
+        "type": "object"
+      },
+      "ActivityStatus": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "has_recent_activity": {
+            "description": "Whether tracked non-crawler visitor events exist in the previous 24 hours.",
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ActivityReport"
+              }
+            ]
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ActivitySettings"
+          },
+          "settings_revision": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "setup_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "has_recent_activity",
+          "configured",
+          "setup_url",
+          "settings",
+          "settings_revision",
+          "running"
         ],
         "type": "object"
       },
@@ -52750,6 +53077,36 @@
         ],
         "type": "object"
       },
+      "VisitorActivityAssessment": {
+        "properties": {
+          "categories": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityEvidence"
+            },
+            "type": "array"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "visitor_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "visitor_id",
+          "categories",
+          "explanation",
+          "evidence"
+        ],
+        "type": "object"
+      },
       "VisitorDetails": {
         "properties": {
           "city": {
@@ -92890,6 +93247,240 @@
         ]
       }
     },
+    "/projects/{project_id}/analytics/activity": {
+      "get": {
+        "operationId": "get_activity_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Visitor Activity"
+        ]
+      },
+      "put": {
+        "operationId": "save_activity_settings",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivitySettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Settings saved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Visitor Activity"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/activity/goals": {
+      "post": {
+        "operationId": "suggest_activity_goals",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivityGoalsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityGoals"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid public URL or consent missing"
+          },
+          "403": {
+            "description": "Access denied"
+          },
+          "409": {
+            "description": "Busy"
+          },
+          "502": {
+            "description": "Site scan or AI suggestion failed"
+          },
+          "503": {
+            "description": "AI provider missing"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Visitor Activity"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/activity/preview": {
+      "post": {
+        "operationId": "preview_activity_report",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivityPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityPreview"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid goal or sharing disabled"
+          },
+          "403": {
+            "description": "Access denied"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "Analysis busy or preview cooling down"
+          },
+          "502": {
+            "description": "AI preview failed"
+          },
+          "503": {
+            "description": "AI provider not configured"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Visitor Activity"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/activity/run": {
+      "post": {
+        "operationId": "run_activity_report",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityReport"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Visitor Activity"
+        ]
+      }
+    },
     "/projects/{project_id}/analytics/ingest-keys": {
       "get": {
         "description": "Includes revoked keys: revocation is soft, and an operator investigating\n\"which key sent this?\" needs to see the rows that no longer work. Every\n`public_key` is returned unmasked — see [`create_analytics_ingest_key`].",
@@ -117282,6 +117873,10 @@
     {
       "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
       "name": "Analytics Ingest Keys"
+    },
+    {
+      "description": "AI interpretation of recent visitor activity",
+      "name": "Visitor Activity"
     },
     {
       "description": "Cron jobs management API",

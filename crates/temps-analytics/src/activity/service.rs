@@ -179,10 +179,31 @@ impl ActivityService {
         .map_err(|e| Self::db_error(project_id, "read settings", e))
     }
 
+    async fn has_recent_activity(&self, project_id: i32) -> Result<bool, ActivityError> {
+        let end = Utc::now();
+        self.db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM events e
+             JOIN visitor v ON v.id = e.visitor_id AND v.project_id = e.project_id
+             WHERE e.project_id = $1 AND e.timestamp >= $2 AND e.timestamp < $3
+               AND NOT e.is_crawler AND NOT v.is_crawler LIMIT 1",
+                [
+                    project_id.into(),
+                    (end - chrono::Duration::hours(24)).into(),
+                    end.into(),
+                ],
+            ))
+            .await
+            .map(|row| row.is_some())
+            .map_err(|e| Self::db_error(project_id, "check recent visitor activity", e))
+    }
+
     pub async fn status(&self, project_id: i32) -> Result<ActivityStatus, ActivityError> {
         self.project_exists(project_id).await?;
         let row = self.stored(project_id).await?;
         let mut status = ActivityStatus {
+            has_recent_activity: self.has_recent_activity(project_id).await?,
             configured: self.ai.is_available_for(Some("gateway")).await,
             setup_url: "/settings/ai-providers".into(),
             settings: ActivitySettings::default(),
@@ -292,6 +313,12 @@ impl ActivityService {
         self.project_exists(project_id).await?;
         if !self.ai.is_available_for(Some("gateway")).await {
             return Err(ActivityError::Unavailable { project_id });
+        }
+        if !self.has_recent_activity(project_id).await? {
+            return Err(ActivityError::Validation {
+                project_id,
+                reason: "No tracked visitor activity in the last 24 hours. Preview becomes available after a visitor records a page view or event.".into(),
+            });
         }
         let _admission = self.acquire_interactive_admission(project_id)?;
         let _permit = self
@@ -1283,6 +1310,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_activity_handles_presence_absence_and_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![
+            BTreeMap::from([("present".to_string(), sea_orm::Value::Int(Some(1)))]),
+        ]]);
+        assert!(service(db, false, false)
+            .has_recent_activity(1)
+            .await
+            .unwrap());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]);
+        assert!(!service(db, false, false)
+            .has_recent_activity(1)
+            .await
+            .unwrap());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("offline".into())]);
+        assert!(matches!(
+            service(db, false, false).has_recent_activity(1).await,
+            Err(ActivityError::Database {
+                project_id: 1,
+                operation: "check recent visitor activity",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn status_missing_project_is_not_found() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<temps_entities::projects::Model>::new()]);
@@ -1431,6 +1485,22 @@ mod tests {
         svc.save(1, config.clone()).await.unwrap();
         let initial = svc.status(1).await.unwrap();
         assert!(initial.configured);
+        assert!(initial.has_recent_activity);
+        // Old, crawler, ghost and other-project activity cannot unlock preview.
+        db.execute_unprepared("UPDATE events SET is_crawler = TRUE WHERE project_id = 1 AND visitor_id = 1;
+            INSERT INTO events (timestamp, project_id, environment_id, visitor_id, session_id, hostname, pathname, page_path, href, event_type, is_crawler)
+            VALUES (NOW() - INTERVAL '25 hours', 1, 1, 1, 'activity-1', 'example.test', '/old', '/old', 'https://example.test/old', 'pageview', FALSE)").await.unwrap();
+        assert!(!svc.status(1).await.unwrap().has_recent_activity);
+        assert!(matches!(
+            svc.preview(1, preview_request()).await,
+            Err(ActivityError::Validation { .. })
+        ));
+        db.execute_unprepared(
+            "DELETE FROM events WHERE project_id = 1 AND pathname = '/old';
+            UPDATE events SET is_crawler = FALSE WHERE project_id = 1 AND visitor_id = 1",
+        )
+        .await
+        .unwrap();
         assert!(initial.report.is_none());
 
         // A real run interrupted after its production claim must not consume

@@ -136,6 +136,8 @@ pub struct ActivityReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActivityStatus {
+    /// Whether tracked non-crawler visitor events exist in the previous 24 hours.
+    pub has_recent_activity: bool,
     pub configured: bool,
     pub setup_url: String,
     pub settings: ActivitySettings,
