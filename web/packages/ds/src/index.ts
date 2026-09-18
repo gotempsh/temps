@@ -16,6 +16,7 @@ export {
 export { Kbd } from './kbd'
 export { LogLine, type LogLineProps } from './log-line'
 export { ResourceStat, type ResourceStatProps } from './resource-stat'
+export { CompactRow, type CompactRowProps } from './compact-row'
 export { Button, type ButtonProps } from './button'
 export { CopyAction } from './copy-action'
 export { Field, FormErrors, type FieldProps, type FormErrorsProps } from './field'

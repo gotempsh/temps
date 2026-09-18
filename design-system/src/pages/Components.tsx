@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState, type ReactNode } from 'react'
-import { AlertTriangle, Cpu, HardDrive, Rocket } from 'lucide-react'
+import { AlertTriangle, CircleDollarSign, Cpu, HardDrive, Network, Rocket } from 'lucide-react'
 import {
   Article,
   Button,
   Callout,
+  CompactRow,
   CopyAction,
   DataTable,
   Field,
@@ -83,6 +84,29 @@ export default function Components() {
           <LogLine content="Starting build for checkout-api@a1b2c3d" />
           <LogLine content="Installing dependencies..." isHighlighted />
           <LogLine content="Build failed: timeout waiting for database connection" searchTerm="timeout" />
+        </div>
+      </Block>
+
+      <Block title="CompactRow">
+        <div className="w-full rounded-md border">
+          <CompactRow
+            timestamp={new Date(Date.now() - 3 * 60_000).toISOString()}
+            icon={<Network className="h-3.5 w-3.5" />}
+            primary={
+              <>
+                <span className="font-mono text-xs">POST</span>{' '}
+                <span>/api/checkout/session</span>
+              </>
+            }
+            secondary="checkout-api.internal"
+            meta={<span className="font-mono tabular-nums">214ms</span>}
+          />
+          <CompactRow
+            timestamp={new Date(Date.now() - 41 * 60_000).toISOString()}
+            icon={<CircleDollarSign className="h-3.5 w-3.5 text-emerald-500" />}
+            primary="checkout.completed"
+            meta={<span className="font-mono tabular-nums text-emerald-600">$48.00</span>}
+          />
         </div>
       </Block>
 
