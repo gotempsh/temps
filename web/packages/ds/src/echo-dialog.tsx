@@ -14,6 +14,7 @@ import {
   Input,
 } from '@temps-sdk/ui'
 import { Button } from './button'
+import { CopyAction } from './copy-action'
 import { cn } from './lib/cn'
 
 export interface EchoDialogProps {
@@ -73,15 +74,19 @@ export function EchoDialog({
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
         <div className="space-y-2">
-          <label htmlFor={inputId} className="text-sm text-muted-foreground">
+          <div className="text-sm text-muted-foreground">
             Type{' '}
-            <span className="rounded border border-dashed bg-muted/40 px-1 font-mono font-semibold text-foreground">
-              {phrase}
+            <span className="inline-flex items-center gap-1 align-middle">
+              <span className="rounded border border-dashed bg-muted/40 px-1 font-mono font-semibold text-foreground">
+                {phrase}
+              </span>
+              <CopyAction value={phrase} label="Copy confirmation name" />
             </span>{' '}
             to confirm.
-          </label>
+          </div>
           <Input
             id={inputId}
+            aria-label={`Type ${phrase} to confirm`}
             value={value}
             onChange={(e) => setValue(e.target.value)}
             autoComplete="off"
