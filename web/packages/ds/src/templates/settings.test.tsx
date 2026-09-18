@@ -3,6 +3,7 @@
 
 import { expect, test } from 'bun:test'
 import { Children, isValidElement, type FormEvent } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { Settings } from './settings'
 
 for (const state of [
@@ -23,3 +24,9 @@ for (const state of [
     expect(prevented).toBe(!allowed)
   })
 }
+
+test('invalid dirty forms show an inert save button', () => {
+  const html = renderToStaticMarkup(<Settings title="Settings" dirty errors={{Name: 'Required'}} onSubmit={() => {}}>{null}</Settings>)
+  expect(html).toContain('aria-disabled="true"')
+  expect(html).toContain('pointer-events-none opacity-50')
+})

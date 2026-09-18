@@ -40,12 +40,13 @@ export function Settings({
   onCancel,
   className,
 }: SettingsProps) {
+  const canSave = dirty && !Object.values(errors).some(Boolean)
   return (
     <PageContainer className={className}>
       <PageHeader title={title} description={description} />
       <form
         onSubmit={(event) => {
-          if (saving || !dirty || Object.values(errors).some(Boolean)) {
+          if (saving || !canSave) {
             event.preventDefault()
             return
           }
@@ -65,8 +66,8 @@ export function Settings({
             type="submit"
             busy={saving}
             busyLabel="Saving…"
-            aria-disabled={!dirty || Object.values(errors).some(Boolean)}
-            className={cn(!dirty && !saving && 'pointer-events-none opacity-50')}
+            aria-disabled={!canSave}
+            className={cn(!canSave && !saving && 'pointer-events-none opacity-50')}
           >
             Save changes
           </Button>
