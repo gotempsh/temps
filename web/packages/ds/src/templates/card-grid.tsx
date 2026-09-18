@@ -4,7 +4,7 @@
 import type { ReactNode } from 'react'
 import { Skeleton } from '@temps-sdk/ui'
 import { PageContainer, PageHeader } from '../page-header'
-import { Button } from '../button'
+import { ResponsivePagination, type ResponsivePaginationProps } from '../responsive-pagination'
 import { cn } from '../lib/cn'
 
 export interface CardGridProps<T> {
@@ -22,11 +22,7 @@ export interface CardGridProps<T> {
   loadingCount?: number
   /** Rendered instead of the grid when `items` is empty and not loading — pass a `PageState`. */
   empty?: ReactNode
-  pagination?: {
-    page: number
-    pageCount: number
-    onPageChange: (page: number) => void
-  }
+  pagination?: ResponsivePaginationProps
   className?: string
   /** Grid column classes. Defaults to the console's existing card-grid breakpoints. */
   gridClassName?: string
@@ -77,35 +73,7 @@ export function CardGrid<T>({
             : items.map((item) => <div key={keyFn(item)}>{renderCard(item)}</div>)}
         </div>
       )}
-      {pagination && pagination.pageCount > 1 ? (
-        <div className="flex items-center justify-between text-sm text-muted-foreground">
-          <span>
-            Page {pagination.page} of {pagination.pageCount}
-          </span>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page <= 1}
-              className={cn(pagination.page <= 1 && 'pointer-events-none opacity-50')}
-              onClick={() => pagination.onPageChange(pagination.page - 1)}
-            >
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page >= pagination.pageCount}
-              className={cn(
-                pagination.page >= pagination.pageCount && 'pointer-events-none opacity-50',
-              )}
-              onClick={() => pagination.onPageChange(pagination.page + 1)}
-            >
-              Next
-            </Button>
-          </div>
-        </div>
-      ) : null}
+      {pagination ? <ResponsivePagination {...pagination} /> : null}
     </PageContainer>
   )
 }

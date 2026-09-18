@@ -355,3 +355,12 @@ and explicit failed/empty/not-set-up states. Team lookup failures preserve
 existing grants, access refresh failures retain cached rows, and both requests
 have independent retries. Grant/revoke dialogs, role descriptions, and the
 last-grant warning retain their existing permission semantics.
+
+### Review follow-up: page shells and pagination
+
+`Detail embedded` reuses a parent page shell (for example `SettingsLayout`); use
+it for loading and loaded states alike. Standalone details retain their own shell.
+`DataTable`, `Ledger`, and `CardGrid` accept `ResponsivePaginationProps` in their
+`pagination` prop: `page`, `pageSize`, `total`, `totalPages`, and `onPageChange`,
+plus optional page-size controls. Supply real API counts, never inferred totals.
+`ResponsivePagination` is now owned by the package; the console path re-exports it.

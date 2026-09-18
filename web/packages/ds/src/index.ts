@@ -53,6 +53,8 @@ export {
   serializeTimeRange,
   type DateTimeRangeValue,
 } from './date-time-range'
-export { ResponsivePagination, type ResponsivePaginationProps } from '../../../src/components/ui/responsive-pagination'
+export { ResponsivePagination, type ResponsivePaginationProps } from './responsive-pagination'
 
 export { GitProviderMark, type GitProviderMarkProps } from './git-provider-mark'
+
+export { clampPage } from './lib/pagination'

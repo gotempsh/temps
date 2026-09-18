@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ReactNode } from 'react'
+import type { ResponsivePaginationProps } from '../responsive-pagination'
 import { PageContainer, PageHeader } from '../page-header'
 import { DataTable, type DataTableColumn } from './data-table'
 
@@ -20,11 +21,7 @@ export interface LedgerProps<T> {
   isLoading?: boolean
   /** Rendered instead of the table when `rows` is empty and not loading — pass a `PageState`. */
   empty?: ReactNode
-  pagination?: {
-    page: number
-    pageCount: number
-    onPageChange: (page: number) => void
-  }
+  pagination?: ResponsivePaginationProps
   className?: string
 }
 

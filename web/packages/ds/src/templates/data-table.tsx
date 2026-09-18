@@ -11,7 +11,7 @@ import {
   TableRow,
   Skeleton,
 } from '@temps-sdk/ui'
-import { Button } from '../button'
+import { ResponsivePagination, type ResponsivePaginationProps } from '../responsive-pagination'
 import { cn } from '../lib/cn'
 
 export interface DataTableColumn<T> {
@@ -31,11 +31,7 @@ export interface DataTableProps<T> {
   isLoading?: boolean
   /** Accessible name when the surrounding heading does not label the table. */
   'aria-label'?: string
-  pagination?: {
-    page: number
-    pageCount: number
-    onPageChange: (page: number) => void
-  }
+  pagination?: ResponsivePaginationProps
   className?: string
 }
 
@@ -111,44 +107,7 @@ export function DataTable<T>({
           </TableBody>
         </Table>
       </div>
-      {pagination && pagination.pageCount > 1 ? (
-        <div className="flex items-center justify-between text-sm text-muted-foreground">
-          <span>
-            Page {pagination.page} of {pagination.pageCount}
-          </span>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page <= 1}
-              className={cn(
-                pagination.page <= 1 && 'pointer-events-none opacity-50'
-              )}
-              onClick={() => {
-                if (pagination.page > 1)
-                  pagination.onPageChange(pagination.page - 1)
-              }}
-            >
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              aria-disabled={pagination.page >= pagination.pageCount}
-              className={cn(
-                pagination.page >= pagination.pageCount &&
-                  'pointer-events-none opacity-50'
-              )}
-              onClick={() => {
-                if (pagination.page < pagination.pageCount)
-                  pagination.onPageChange(pagination.page + 1)
-              }}
-            >
-              Next
-            </Button>
-          </div>
-        </div>
-      ) : null}
+      {pagination ? <ResponsivePagination {...pagination} /> : null}
     </div>
   )
 }
