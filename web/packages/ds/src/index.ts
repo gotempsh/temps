@@ -4,6 +4,8 @@
 export { cn } from './lib/cn'
 
 export { PageContainer, PageHeader, type PageContainerProps, type PageHeaderProps } from './page-header'
+export { ProjectAvatar, type ProjectAvatarProps } from './project-avatar'
+export { Article, type ArticleProps } from './article'
 export {
   Status,
   StatusDot,

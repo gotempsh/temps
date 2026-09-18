@@ -4,6 +4,7 @@
 import { useState, type ReactNode } from 'react'
 import { AlertTriangle, Cpu, HardDrive, Rocket } from 'lucide-react'
 import {
+  Article,
   Button,
   Callout,
   CopyAction,
@@ -16,6 +17,7 @@ import {
   PageHeader,
   PageState,
   Picker,
+  ProjectAvatar,
   ResourceStat,
   Status,
   STATUS_TONES,
@@ -102,7 +104,10 @@ export default function Components() {
       </Block>
 
       <Block title="CopyAction">
-        <CopyAction value="tck_a1b2c3d4e5f6">tck_a1b2c3d4e5f6</CopyAction>
+        <span className="inline-flex items-center gap-1 rounded-md border border-dashed bg-muted/40 py-1 pl-2 pr-1 font-mono text-sm">
+          tck_a1b2c3d4e5f6
+          <CopyAction value="tck_a1b2c3d4e5f6" label="Copy API key" />
+        </span>
       </Block>
 
       <Block title="notify">
@@ -151,7 +156,7 @@ export default function Components() {
             title="AI error triage isn't configured"
             requirement="No AI provider configured for this project."
             example="Once configured, a failing deploy would get a one-line root-cause summary here."
-            settingsHref="#"
+            settingsHref="/settings/ai"
             settingsLabel="Open AI settings"
           />
           <PageState
@@ -162,6 +167,22 @@ export default function Components() {
             description="The request timed out. Try again."
           />
         </div>
+      </Block>
+
+      <Block title="Article">
+        <Article className="max-w-none">
+          <p>
+            Long-form content — release notes, postmortems, docs — read top
+            to bottom rather than scanned for facts. Built on Tailwind
+            Typography, restyled to stay inside the token system.
+          </p>
+          <h3>A heading</h3>
+          <p>
+            Body copy, <code>inline code</code>, and{' '}
+            <a href="/guide">a link</a> all pick up token colors instead of
+            the plugin's defaults.
+          </p>
+        </Article>
       </Block>
 
       <Block title="EchoDialog">
@@ -183,9 +204,21 @@ export default function Components() {
         <Picker
           className="w-full max-w-sm"
           items={[
-            { value: 'checkout-api', label: 'checkout-api' },
-            { value: 'marketing-site', label: 'marketing-site' },
-            { value: 'worker-pool', label: 'worker-pool' },
+            {
+              value: 'checkout-api',
+              label: 'checkout-api',
+              icon: <ProjectAvatar name="checkout-api" className="size-5" />,
+            },
+            {
+              value: 'marketing-site',
+              label: 'marketing-site',
+              icon: <ProjectAvatar name="marketing-site" className="size-5" />,
+            },
+            {
+              value: 'worker-pool',
+              label: 'worker-pool',
+              icon: <ProjectAvatar name="worker-pool" className="size-5" />,
+            },
           ]}
           value={picked}
           onValueChange={setPicked}
