@@ -216,3 +216,18 @@ test("preview permission snapshot matches production role permissions and wire n
     expect(actual.sort()).toEqual(expected.sort());
   }
 });
+
+
+test("deployment ordering compares instants across offsets and fractional precision", async () => {
+  const defaults = parseFixtures();
+  const timestamps = ["2026-01-01T12:00:00+02:00", "2026-01-01T10:30:00Z", "2026-01-01T10:30:00.000001Z", "2026-01-01T10:30:00.1Z"];
+  const host = new MockHost("example", "actor", ["deployments_read"], parseFixtures({
+    deployments: timestamps.map((created_at, i) => ({ ...defaults.deployments[0], id: i + 1, created_at })),
+  }));
+  const rows = await host.call("list_deployments", { project_id: 1, limit: 3 }) as { id: number }[];
+  expect(rows.map(row => row.id)).toEqual([4, 3, 2]);
+  expect(await host.call("get_last_deployment", { project_id: 1 })).toMatchObject({ id: 4 });
+  for (const created_at of ["invalid", "2026-01-01", "2026-01-01T10:30:00", "2026-99-01T10:30:00Z"]) {
+    expect(() => parseFixtures({ deployments: [{ ...defaults.deployments[0], created_at }] })).toThrow("RFC3339");
+  }
+});

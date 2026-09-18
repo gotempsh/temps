@@ -4,9 +4,8 @@ import {
   mkdir,
   lstat,
   chmod,
-  readFile,
+  open,
   rename,
-  writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -46,15 +45,18 @@ export async function privateDirectory(path: string) {
 }
 export async function saveState(path: string, value: unknown) {
   const temp = `${path}.${crypto.randomUUID()}.tmp`;
-  await writeFile(temp, JSON.stringify(value) + "\n", {
-    flag: "wx",
-    mode: 0o600,
-  });
+  // Node open retains exclusive creation and 0600 mode; Bun handles file I/O.
+  const file = await open(temp, "wx", 0o600);
+  try {
+    await Bun.write(Bun.file(file.fd), JSON.stringify(value) + "\n");
+  } finally {
+    await file.close();
+  }
   await rename(temp, path);
 }
 export async function loadState(path: string): Promise<unknown | undefined> {
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    return await Bun.file(path).json();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new DevError(

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Run after `bun run build`: bun run scripts/test-plugin-dev-package.ts
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sessionPaths } from "../src/commands/plugin/dev/session.js";
@@ -33,7 +33,7 @@ try {
   await run(["bun", "pm", "pack", "--destination", join(temp, "pack")], root);
   const pkg = await Bun.file(join(root, "package.json")).json();
   const tarball = join(temp, "pack", `temps-sdk-cli-${pkg.version}.tgz`);
-  await writeFile(
+  await Bun.write(
     join(temp, "package.json"),
     JSON.stringify({
       private: true,

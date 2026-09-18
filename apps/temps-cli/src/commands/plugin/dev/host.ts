@@ -2,6 +2,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { DevError, grants, integer, record } from "./model.js";
 import type { PluginHostPermission } from "./model.js";
+// Compare instants, retaining fractional precision beyond JavaScript milliseconds.
+function newestFirst(a: Record<string, unknown>, b: Record<string, unknown>) {
+  const left = String(a.created_at);
+  const right = String(b.created_at);
+  const delta = Date.parse(right) - Date.parse(left);
+  if (delta) return delta;
+  const fraction = (value: string) => /\.(\d+)/.exec(value)?.[1]?.slice(3) ?? "";
+  const l = fraction(left);
+  const r = fraction(right);
+  const width = Math.max(l.length, r.length);
+  return r.padEnd(width, "0").localeCompare(l.padEnd(width, "0"));
+}
 export interface Fixtures {
   version: 1;
   projects: Record<string, unknown>[];
@@ -118,6 +130,11 @@ export function parseFixtures(value: unknown = {}): Fixtures {
       throw new DevError(
         "Fixture deployment references an unknown environment_id or mismatched project_id.",
       );
+  for (const row of d) {
+    const timestamp = String(row.created_at);
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(timestamp) || !Number.isFinite(Date.parse(timestamp)))
+      throw new DevError(`Fixture deployment ${row.id} created_at must be an RFC3339 timestamp.`);
+  }
   const ai = value.ai ?? {};
   if (
     !record(ai) ||
@@ -239,9 +256,7 @@ export class MockHost {
       rows = rows.filter((r) => r.environment_id === id);
     }
     if (method === "get_last_deployment") {
-      const latest = [...rows].sort((a, b) =>
-        String(b.created_at).localeCompare(String(a.created_at)),
-      )[0];
+      const latest = [...rows].sort(newestFirst)[0];
       if (!latest)
         throw new DevError(
           "No deployment fixture matches the project/environment.",
@@ -251,7 +266,7 @@ export class MockHost {
     }
     if (method !== "list_deployments") return rows;
     return [...rows]
-      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .sort(newestFirst)
       .slice(0, Math.min(integer(params.limit ?? 20, "limit", 0), 100));
   }
   private async generate(params: Record<string, unknown>) {
