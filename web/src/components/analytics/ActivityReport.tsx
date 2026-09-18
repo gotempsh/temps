@@ -1086,15 +1086,19 @@ function GoalSuggestions({
               {suggest.data.goals.map((goal, index) => (
                 <article
                   key={goal.title}
-                  className="flex min-w-0 flex-col rounded-lg border bg-card p-5"
+                  className={`flex min-w-0 flex-col rounded-lg border bg-card p-5 ${index === 0 ? 'border-primary' : ''}`}
                 >
                   <div className="mb-4 flex items-center justify-between">
                     <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary/10 text-primary">
                       <Target className="h-5 w-5" />
                     </span>
-                    <span className="text-xs tabular-nums text-muted-foreground">
-                      {String(index + 1).padStart(2, '0')}
-                    </span>
+                    {index === 0 ? (
+                      <Badge>Recommended</Badge>
+                    ) : (
+                      <span className="text-xs tabular-nums text-muted-foreground">
+                        {String(index + 1).padStart(2, '0')}
+                      </span>
+                    )}
                   </div>
                   <h3 className="font-semibold">{goal.title}</h3>
                   <p className="mt-2 text-sm text-muted-foreground">
@@ -1111,7 +1115,7 @@ function GoalSuggestions({
                   <div className="mt-auto pt-5">
                     <Button
                       type="button"
-                      variant="outline"
+                      variant={index === 0 ? 'default' : 'outline'}
                       className="w-full justify-between"
                       aria-label={`Choose ${goal.title}`}
                       disabled={disabled}
@@ -1121,7 +1125,10 @@ function GoalSuggestions({
                         onSelect(goal)
                       }}
                     >
-                      Choose this goal <ArrowRight className="h-4 w-4" />
+                      {index === 0
+                        ? 'Use recommended goal'
+                        : 'Choose this goal'}
+                      <ArrowRight className="h-4 w-4" />
                     </Button>
                   </div>
                 </article>

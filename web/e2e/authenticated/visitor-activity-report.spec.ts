@@ -510,6 +510,16 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('button', { name: /Documentation interest/ })
     ).toBeVisible()
+    await expect(page.getByText('Recommended', { exact: true })).toHaveCount(1)
+    const recommended = page
+      .getByRole('article')
+      .filter({ hasText: 'Recommended' })
+    await expect(
+      recommended.getByRole('heading', { name: 'Documentation interest' })
+    ).toBeVisible()
+    await expect(recommended.getByRole('button')).toHaveText(
+      'Use recommended goal'
+    )
     expect(previewCalls).toBe(0)
     await expect(page.getByLabel('Website', { exact: true })).toBeHidden()
     await expect(
@@ -788,12 +798,10 @@ test('website analysis shows the actual failure and allows retry', async ({
     .getByRole('button', { name: 'Analyze website', exact: true })
     .click()
   await expect(
-    page
-      .getByRole('alert')
-      .filter({
-        hasText:
-          'Please wait 30 seconds before requesting more goal suggestions.',
-      })
+    page.getByRole('alert').filter({
+      hasText:
+        'Please wait 30 seconds before requesting more goal suggestions.',
+    })
   ).toBeVisible()
   await expect(
     page.getByRole('button', { name: 'Analyze website', exact: true })
