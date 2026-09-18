@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Field, Settings } from '@temps-sdk/ds'
 import { Input } from '@temps-sdk/ui'
 
@@ -10,10 +10,13 @@ const INITIAL = { name: 'checkout-api', notifyEmail: '' }
 /** Reference screen for the `Settings` template: `Field`s + sticky save bar. */
 export default function ProjectSettings() {
   const [values, setValues] = useState(INITIAL)
+  const [baseline, setBaseline] = useState(INITIAL)
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
 
-  const dirty = values.name !== INITIAL.name || values.notifyEmail !== INITIAL.notifyEmail
+  const dirty = values.name !== baseline.name || values.notifyEmail !== baseline.notifyEmail
 
   const errors: Record<string, string | undefined> = {
     name: values.name.trim().length === 0 ? 'Project name is required.' : undefined,
@@ -28,15 +31,17 @@ export default function ProjectSettings() {
   return (
     <Settings
       title="Project settings"
-      description="General configuration for this project."
+      description="Try editing, validation, and saving. Changes stay in this example only."
       errors={errors}
       dirty={dirty && !hasErrors}
       saving={saving}
       onSubmit={(e) => {
         e.preventDefault()
-        if (hasErrors) return
+        if (hasErrors || !dirty || saving) return
+        setSaved(false)
         setSaving(true)
-        setTimeout(() => {
+        timer.current = setTimeout(() => {
+          setBaseline(values)
           setSaving(false)
           setSaved(true)
         }, 900)
@@ -46,6 +51,7 @@ export default function ProjectSettings() {
         {(fieldProps) => (
           <Input
             {...fieldProps}
+            readOnly={saving}
             value={values.name}
             onChange={(e) => setValues((v) => ({ ...v, name: e.target.value }))}
           />
@@ -60,6 +66,7 @@ export default function ProjectSettings() {
         {(fieldProps) => (
           <Input
             {...fieldProps}
+            readOnly={saving}
             type="email"
             placeholder="you@example.com"
             value={values.notifyEmail}
@@ -67,7 +74,9 @@ export default function ProjectSettings() {
           />
         )}
       </Field>
-      {saved ? <p className="text-sm text-success">Saved.</p> : null}
+      <p role="status" className="text-sm text-muted-foreground">
+        {saving ? 'Saving sample changes…' : dirty ? 'You have unsaved changes.' : saved ? 'Sample changes saved.' : 'No unsaved changes.'}
+      </p>
     </Settings>
   )
 }

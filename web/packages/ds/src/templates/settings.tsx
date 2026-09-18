@@ -44,7 +44,13 @@ export function Settings({
     <PageContainer className={className}>
       <PageHeader title={title} description={description} />
       <form
-        onSubmit={onSubmit}
+        onSubmit={(event) => {
+          if (saving || !dirty || Object.values(errors).some(Boolean)) {
+            event.preventDefault()
+            return
+          }
+          onSubmit(event)
+        }}
         className="space-y-6 pb-20"
       >
         <FormErrors errors={errors} />
@@ -59,7 +65,7 @@ export function Settings({
             type="submit"
             busy={saving}
             busyLabel="Saving…"
-            aria-disabled={!dirty}
+            aria-disabled={!dirty || Object.values(errors).some(Boolean)}
             className={cn(!dirty && !saving && 'pointer-events-none opacity-50')}
           >
             Save changes

@@ -23,7 +23,7 @@ export interface ButtonProps extends BaseButtonProps {
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
   ({ busy = false, busyLabel, children, className, onClick, asChild, ...props }, ref) => {
     const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
-      if (busy) {
+      if (busy || props['aria-disabled'] === true || props['aria-disabled'] === 'true') {
         event.preventDefault()
         return
       }
@@ -39,13 +39,13 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     if (asChild) {
       return (
         <BaseButton
+          {...props}
           ref={ref}
           asChild
           aria-busy={busy}
           aria-disabled={busy || props['aria-disabled']}
           className={cn(busy && 'cursor-wait', className)}
           onClick={handleClick}
-          {...props}
         >
           {children}
         </BaseButton>
@@ -54,14 +54,14 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
 
     return (
       <BaseButton
+        {...props}
         ref={ref}
         aria-busy={busy}
         aria-disabled={busy || props['aria-disabled']}
         className={cn(busy && 'cursor-wait', className)}
         onClick={handleClick}
-        {...props}
       >
-        {busy ? <Loader2 className="animate-spin" /> : null}
+        {busy ? <Loader2 className="animate-spin" aria-hidden /> : null}
         {busy ? (busyLabel ?? children) : children}
       </BaseButton>
     )
