@@ -20,7 +20,7 @@ use utoipa::OpenApi;
 use crate::providers::{sentry::SentryProvider, AuthContext, ErrorProvider};
 use crate::sentry::dsn_service::{public_key_prefix, DSNService};
 use crate::sentry::envelope::peek_envelope_dsn;
-use crate::sentry::rate_limiter::IngestRateLimiter;
+use crate::sentry::rate_limiter::{Admission, IngestRateLimiter};
 use crate::sentry::types::{SentryEventRequest, SentryEventResponse};
 use crate::services::error_tracking_service::ErrorTrackingService;
 use temps_geo::IpAddressService;
@@ -489,24 +489,28 @@ async fn ingest_tunneled_envelope(
     // resolves, because a credential is a stronger claim than a `Host` the
     // proxy forwarded here regardless of its value.
     //
-    // Only *peeked*, not charged, at this point: `Host` and the embedded DSN
-    // can legitimately disagree on the project (a third-party DSN tunneled
-    // through an app Temps also hosts), and the request is ultimately
-    // attributed — and billed against exactly one rate-limit bucket — to
-    // whichever one wins below. Charging `Host`'s bucket here and the DSN's
-    // bucket again once it wins would let one tunneled request drain a
-    // project's budget for traffic it never actually received.
+    // `Host` and the embedded DSN can legitimately disagree on the project (a
+    // third-party DSN tunneled through an app Temps also hosts), so the gate
+    // below *reserves* a slot in `Host`'s bucket — a real, consumed
+    // reservation, not a non-consuming peek, because concurrent requests all
+    // observing the same free peek slot and all proceeding into a 10 MiB
+    // inflate is exactly the amplification this route exists to prevent — and
+    // that reservation is precisely released and re-charged against the
+    // correct project below once the embedded DSN has actually been read, so
+    // one tunneled request still never drains two buckets for one event.
     let host_scope = resolve_tunnel_host_scope(&state, &metadata, &headers);
 
+    let mut host_reservation: Option<(i32, Admission)> = None;
     match &host_scope {
         Ok(auth) => {
-            if !state
+            let admission = state
                 .rate_limiter
-                .peek(auth.project_id, Some(effective_tunnel_rate_limit(auth)))
-                .await
-            {
+                .check_reserving(auth.project_id, Some(effective_tunnel_rate_limit(auth)))
+                .await;
+            if admission == Admission::Denied {
                 return rate_limited_response();
             }
+            host_reservation = Some((auth.project_id, admission));
         }
         Err(_) => {
             // Nothing has authenticated this request and `Host` did not
@@ -547,14 +551,55 @@ async fn ingest_tunneled_envelope(
         },
     };
 
-    // The one and only charge for this request, against whichever project it
-    // actually ended up attributed to — see the comment above `host_scope`.
-    if !state
-        .rate_limiter
-        .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
-        .await
-    {
-        return rate_limited_response();
+    // Reconcile the tentative `Host` reservation with the project the request
+    // was actually attributed to.
+    match host_reservation {
+        // `Host` reserved (or was unlimited) against exactly the project the
+        // request ended up attributed to — that reservation *is* the one and
+        // only charge for this request.
+        Some((reserved_project_id, _)) if reserved_project_id == auth.project_id => {}
+        // The embedded DSN redirected attribution to a different project:
+        // give `Host`'s project its slot back — it received no data — and
+        // charge the project that actually did.
+        Some((reserved_project_id, Admission::Reserved(marker))) => {
+            state
+                .rate_limiter
+                .release(reserved_project_id, marker)
+                .await;
+            if !state
+                .rate_limiter
+                .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+                .await
+            {
+                return rate_limited_response();
+            }
+        }
+        // `Host` had no configured limit (nothing was reserved) but the
+        // embedded DSN's project does — that project still needs its own
+        // charge; `Host`'s unlimited quota does not cover it.
+        Some((_, Admission::Unlimited)) => {
+            if !state
+                .rate_limiter
+                .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+                .await
+            {
+                return rate_limited_response();
+            }
+        }
+        Some((_, Admission::Denied)) => {
+            unreachable!("a Denied admission returns 429 immediately above and is never stored")
+        }
+        // `Host` never resolved at all; the embedded DSN is the only
+        // authority for this request and has not been charged yet.
+        None => {
+            if !state
+                .rate_limiter
+                .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+                .await
+            {
+                return rate_limited_response();
+            }
+        }
     }
 
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);

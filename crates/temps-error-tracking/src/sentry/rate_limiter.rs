@@ -41,6 +41,20 @@ const UNRESOLVED_CREDENTIAL_BUCKET: i32 = 0;
 /// `temps-analytics`'s `UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE` exactly.
 pub const UNRESOLVED_CREDENTIAL_LIMIT_PER_MINUTE: i32 = 300;
 
+/// Result of [`IngestRateLimiter::check_reserving`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// The project has no configured limit; nothing was reserved because
+    /// there is nothing to reserve against.
+    Unlimited,
+    /// A slot was reserved at this instant. Pass to [`IngestRateLimiter::release`]
+    /// to undo it if the reservation turns out to be against the wrong
+    /// project.
+    Reserved(Instant),
+    /// The bucket is at capacity; the request must be rejected.
+    Denied,
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestRateLimiter {
     entries: Arc<Mutex<HashMap<i32, Vec<Instant>>>>,
@@ -84,17 +98,65 @@ impl IngestRateLimiter {
         true
     }
 
-    /// Read-only variant of [`Self::check`]: reports whether `project_id` has
-    /// remaining budget without consuming a slot.
+    /// Like [`Self::check`], but the caller may not yet know the *final*
+    /// project a request will be billed to — the tunnel handler resolves a
+    /// tentative project from `Host` before it has decompressed the body to
+    /// read an SDK-embedded DSN, which can name a different project.
     ///
-    /// Used to gate expensive work (decompression) on a *tentative* project
-    /// attribution before the final one is known, without charging that
-    /// project for a request it may turn out not to receive — see the tunnel
-    /// handler's `Host`-then-embedded-DSN resolution, where the two can
-    /// legitimately disagree. The actual charge always happens exactly once,
-    /// against whichever project the request is finally attributed to, via
-    /// [`Self::check`].
-    pub async fn peek(&self, project_id: i32, limit_per_minute: Option<i32>) -> bool {
+    /// This still reserves a slot (unlike a non-consuming peek, which lets
+    /// unbounded concurrent requests all observe the same remaining slot and
+    /// all proceed into the expensive work behind the gate — the exact
+    /// mistake this replaces), but returns the marker for that reservation
+    /// so the caller can [`Self::release`] it precisely if the tentative
+    /// project turns out to be wrong, then [`Self::check`] the real one.
+    pub async fn check_reserving(
+        &self,
+        project_id: i32,
+        limit_per_minute: Option<i32>,
+    ) -> Admission {
+        let limit = match limit_per_minute {
+            Some(limit) if limit > 0 => limit as usize,
+            _ => return Admission::Unlimited,
+        };
+
+        let now = Instant::now();
+        let window_start = now - WINDOW;
+
+        let mut entries = self.entries.lock().await;
+        let timestamps = entries.entry(project_id).or_default();
+        timestamps.retain(|t| *t > window_start);
+
+        if timestamps.len() >= limit {
+            return Admission::Denied;
+        }
+
+        timestamps.push(now);
+        Admission::Reserved(now)
+    }
+
+    /// Undo a reservation made by [`Self::check_reserving`] for `project_id`.
+    ///
+    /// Removes the exact `marker` timestamp rather than e.g. the bucket's
+    /// last entry, so it cannot accidentally free a *different* concurrent
+    /// request's slot — `Instant` has sub-microsecond resolution on every
+    /// platform this runs on, so two reservations for the same project
+    /// colliding on the same instant is not a realistic concern.
+    pub async fn release(&self, project_id: i32, marker: Instant) {
+        let mut entries = self.entries.lock().await;
+        if let Some(timestamps) = entries.get_mut(&project_id) {
+            if let Some(pos) = timestamps.iter().position(|t| *t == marker) {
+                timestamps.remove(pos);
+            }
+        }
+    }
+
+    /// Read-only inspection of `project_id`'s remaining budget, without
+    /// consuming a slot. For tests and observability only — **not** an
+    /// admission gate: a peek that says "allowed" reserves nothing, so
+    /// concurrent callers can all observe the same remaining slot and all
+    /// proceed. [`Self::check_reserving`] is what gates expensive work.
+    #[cfg(test)]
+    pub(crate) async fn peek(&self, project_id: i32, limit_per_minute: Option<i32>) -> bool {
         let limit = match limit_per_minute {
             Some(limit) if limit > 0 => limit as usize,
             _ => return true,
@@ -204,5 +266,74 @@ mod tests {
             assert!(limiter.check(1, Some(0)).await);
             assert!(limiter.check(1, Some(-1)).await);
         }
+    }
+
+    /// `check_reserving` must actually consume a slot — the defect this
+    /// replaces (a non-consuming peek) let unbounded concurrent callers all
+    /// observe "still room" and all proceed, because nothing about a peek
+    /// changes what the next peek sees.
+    #[tokio::test]
+    async fn check_reserving_actually_reserves_a_slot() {
+        let limiter = IngestRateLimiter::new();
+
+        assert!(matches!(
+            limiter.check_reserving(1, Some(1)).await,
+            Admission::Reserved(_)
+        ));
+        // The single slot is now taken: a second reservation attempt for the
+        // same project, in the same window, must be denied.
+        assert_eq!(limiter.check_reserving(1, Some(1)).await, Admission::Denied);
+    }
+
+    #[tokio::test]
+    async fn check_reserving_is_unlimited_for_none_or_non_positive_limits() {
+        let limiter = IngestRateLimiter::new();
+        assert_eq!(limiter.check_reserving(1, None).await, Admission::Unlimited);
+        assert_eq!(
+            limiter.check_reserving(1, Some(0)).await,
+            Admission::Unlimited
+        );
+    }
+
+    /// `release` frees exactly the marker it is given, and nothing else —
+    /// it must not free a slot some other concurrent request holds.
+    #[tokio::test]
+    async fn release_frees_only_the_given_marker() {
+        let limiter = IngestRateLimiter::new();
+
+        let first = match limiter.check_reserving(1, Some(2)).await {
+            Admission::Reserved(marker) => marker,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        let second = match limiter.check_reserving(1, Some(2)).await {
+            Admission::Reserved(marker) => marker,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        // Bucket is now full (2/2).
+        assert_eq!(limiter.check_reserving(1, Some(2)).await, Admission::Denied);
+
+        limiter.release(1, first).await;
+        // One slot freed: exactly one more reservation succeeds.
+        assert!(matches!(
+            limiter.check_reserving(1, Some(2)).await,
+            Admission::Reserved(_)
+        ));
+        assert_eq!(limiter.check_reserving(1, Some(2)).await, Admission::Denied);
+
+        limiter.release(1, second).await;
+        assert!(matches!(
+            limiter.check_reserving(1, Some(2)).await,
+            Admission::Reserved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_of_an_unknown_marker_is_a_harmless_no_op() {
+        let limiter = IngestRateLimiter::new();
+        limiter.release(1, Instant::now()).await;
+        assert!(matches!(
+            limiter.check_reserving(1, Some(1)).await,
+            Admission::Reserved(_)
+        ));
     }
 }
