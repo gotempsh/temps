@@ -11,7 +11,10 @@ use tracing::{debug, info};
 use utoipa::OpenApi;
 
 use crate::services::{PlatformInfoError, PlatformInfoService};
-use crate::types::{PlatformFeatures, PlatformInfo, ServiceAccessInfo};
+use crate::types::{
+    NetworkInterface, PlatformFeatures, PlatformInfo, PrivateIpInfo, PublicIpInfo,
+    ServiceAccessInfo,
+};
 
 // ---------------------------------------------------------------------------
 // Error conversion: PlatformInfoError -> Problem (RFC 7807)
@@ -70,7 +73,14 @@ pub trait InfraAppState: Send + Sync + 'static {
         get_access_info
     ),
     components(
-        schemas(PlatformFeatures, PlatformInfo, ServiceAccessInfo)
+        schemas(
+            PlatformFeatures,
+            PlatformInfo,
+            ServiceAccessInfo,
+            PublicIpInfo,
+            PrivateIpInfo,
+            NetworkInterface
+        )
     ),
     tags(
         (name = "Platform", description = "Platform information and compatibility")
@@ -99,7 +109,7 @@ pub struct PlatformInfoApiDoc;
 pub async fn get_platform_info<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PlatformInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -113,9 +123,7 @@ where
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({
-        "platforms": platform_info.platforms
-    })))
+    Ok(Json(platform_info))
 }
 
 /// Report which capabilities this server process actually provides.
@@ -152,7 +160,7 @@ where
     get,
     path = "/platform/public-ip",
     responses(
-        (status = 200, description = "Successfully retrieved public IP address"),
+        (status = 200, description = "Successfully retrieved public IP address", body = PublicIpInfo),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -162,7 +170,7 @@ where
 pub async fn get_public_ip<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PublicIpInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -170,19 +178,12 @@ where
 
     info!("Getting public IP address");
 
-    let ip_info = app_state.platform_info_service().get_public_ip().await;
-
-    if let Some(ip) = ip_info.ip {
-        Ok(Json(serde_json::json!({
-            "ip": ip,
-            "source": ip_info.source
-        })))
-    } else {
-        Ok(Json(serde_json::json!({
-            "error": ip_info.error.unwrap_or_else(|| "Unable to determine public IP address".to_string()),
-            "ip": null
-        })))
+    let mut ip_info = app_state.platform_info_service().get_public_ip().await;
+    if ip_info.ip.is_none() && ip_info.error.is_none() {
+        ip_info.error = Some("Unable to determine public IP address".to_string());
     }
+
+    Ok(Json(ip_info))
 }
 
 /// Get private/local IP address of the server
@@ -190,7 +191,7 @@ where
     get,
     path = "/platform/private-ip",
     responses(
-        (status = 200, description = "Successfully retrieved private IP address"),
+        (status = 200, description = "Successfully retrieved private IP address", body = PrivateIpInfo),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Failed to enumerate network interfaces"),
@@ -201,7 +202,7 @@ where
 pub async fn get_private_ip<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
-) -> Result<impl IntoResponse, Problem>
+) -> Result<Json<PrivateIpInfo>, Problem>
 where
     T: InfraAppState,
 {
@@ -215,11 +216,7 @@ where
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({
-        "primary_ip": ip_info.primary_ip,
-        "ipv4_addresses": ip_info.ipv4_addresses,
-        "ipv6_addresses": ip_info.ipv6_addresses
-    })))
+    Ok(Json(ip_info))
 }
 
 /// Get information about how the service is being accessed
