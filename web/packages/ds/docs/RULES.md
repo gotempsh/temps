@@ -97,6 +97,31 @@ outside this package's scope).
 Numbers, bytes, durations, relative/absolute time → `fmt.ts`. No hand-written
 `toFixed`/`Intl` calls scattered across screens.
 
+## Collection states
+
+Keep the section heading and filter controls mounted while data changes.
+
+- First request pending: `DataTable isLoading`, with an accessible table name
+  (`aria-label`). Keep the real column headings; never show empty copy yet.
+- Successful response with no records: compact `PageState` `empty`, explaining
+  what creates the first record.
+- No filter matches: compact `PageState` `empty`, naming the active filter and
+  offering a working clear-filter action. Do not imply no records exist.
+- Request failed with no usable data: compact `PageState` `failed`, naming what
+  could not load and providing a retry of that request.
+- Background refresh failed: keep the last usable rows and filters visible;
+  add a `Callout` explaining the data may be stale, with a retry action.
+- Multiple independent requests: one panel's failure must not erase another
+  panel's usable content. Use separate query states.
+
+Keep errors, empty content, and loading in the collection's usual location.
+Do not nest a second bordered empty-state panel inside a table surface.
+`DataTable` owns its border and horizontal scroll; `PageState` can replace
+it or sit inside an existing surface without adding another border.
+
+Example: sandbox `/table-states` has shareable scenarios, working retries,
+and filtering. Production reference: `CronJobDetail.tsx`.
+
 ## Charts
 
 `TimeChart` (wraps `ThresholdLineChart`) for every time series. Don't hand-roll

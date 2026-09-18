@@ -1,10 +1,25 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { NavLink, Navigate, Route, Routes } from 'react-router'
+import {
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from 'react-router'
 import { Toaster } from 'sonner'
-import { cn } from '@temps-sdk/ds'
+import { cn, Field } from '@temps-sdk/ds'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@temps-sdk/ui'
 import Guide from './pages/Guide'
+import TableStates from './pages/TableStates'
 import Components from './pages/Components'
 import DeploymentsLedger from './pages/DeploymentsLedger'
 import DeploymentDetail from './pages/DeploymentDetail'
@@ -26,6 +41,7 @@ const NAV_SECTIONS = [
     label: 'Reference screens',
     items: [
       { to: '/ledger', label: 'Ledger — Deployments' },
+      { to: '/table-states', label: 'DataTable — Request states' },
       { to: '/detail', label: 'Detail — Deployment' },
       { to: '/settings', label: 'Settings — Project' },
       { to: '/card-grid', label: 'CardGrid — Projects' },
@@ -37,11 +53,41 @@ const NAV_SECTIONS = [
 ]
 
 export default function App() {
+  const { pathname } = useLocation()
+  const navigate = useNavigate()
   return (
-    <div className="flex min-h-screen bg-background text-foreground">
-      <aside className="flex w-56 shrink-0 flex-col border-r">
-        <div className="border-b px-4 py-3 text-sm font-semibold">@temps-sdk/ds</div>
-        <nav className="flex-1 space-y-4 overflow-y-auto px-2 py-3">
+    <div className="flex min-h-screen flex-col md:flex-row bg-background text-foreground">
+      <aside className="flex w-full md:w-56 shrink-0 flex-col border-b md:border-b-0 md:border-r">
+        <div className="border-b px-4 py-3 text-sm font-semibold">
+          @temps-sdk/ds
+        </div>
+        <div className="p-4 md:hidden">
+          <Field label="Explore examples">
+            {(props) => (
+              <Select
+                value={pathname === '/' ? '/guide' : pathname}
+                onValueChange={(value) => navigate(value)}
+              >
+                <SelectTrigger {...props}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {NAV_SECTIONS.flatMap((section) => section.items).map(
+                    (item) => (
+                      <SelectItem key={item.to} value={item.to}>
+                        {item.label}
+                      </SelectItem>
+                    ),
+                  )}
+                </SelectContent>
+              </Select>
+            )}
+          </Field>
+        </div>
+        <nav
+          aria-label="Design system"
+          className="hidden md:block flex-1 space-y-4 overflow-y-auto px-2 py-3"
+        >
           {NAV_SECTIONS.map((section) => (
             <div key={section.label}>
               <div className="px-2 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -74,6 +120,7 @@ export default function App() {
           <Route path="/" element={<Navigate to="/guide" replace />} />
           <Route path="/guide" element={<Guide />} />
           <Route path="/components" element={<Components />} />
+          <Route path="/table-states" element={<TableStates />} />
           <Route path="/ledger" element={<DeploymentsLedger />} />
           <Route path="/detail" element={<DeploymentDetail />} />
           <Route path="/settings" element={<ProjectSettings />} />

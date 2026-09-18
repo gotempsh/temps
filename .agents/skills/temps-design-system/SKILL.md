@@ -25,11 +25,11 @@ consumers, and was deleted. Never reference it, its mockups, or its styling.
 ## Scope boundary — read this before touching `web/src`
 
 `@temps-sdk/ds` is real and lint-enforced, but **production migration of
-`web/src` has not happened.** Do not assume an existing screen should move
+`web/src` is partial.** Do not assume an existing screen should move
 onto the new templates just because it fits one. The numbered follow-ups in
 `design-system-handoff.md` (≈39 hand-rolled page headers, ≥14 stat-tile/chart
 call sites, `empty-placeholder`/`empty-state` consolidation, `useGlobalView`)
-are tracked, not scheduled. Migrating one of them is a deliberate task with
+track remaining work; completed references are noted in the handoff. Migrating one of them is a deliberate task with
 its own review, not a drive-by change bundled into unrelated work.
 
 What IS in scope without asking:
@@ -95,7 +95,7 @@ bun run tokens:check     # fails on tokens.json / tokens.css / globals.css drift
 bun run audit:records --dir src   # (via lint) raw hex/oklch/px/ms scan
 
 cd design-system
-bun install && bun run build   # sandbox app: /guide, /components, 3 reference screens
+bun run build   # sandbox app; see handoff workspace-install caveat before installing
 ```
 
 ## Adding a primitive
@@ -123,4 +123,4 @@ bun install && bun run build   # sandbox app: /guide, /components, 3 reference s
 | Record recipe order, "not set up" copy actually being concrete | Honour-system — review by eye |
 | Color used only for state, never decoration | Honour-system |
 | Correct template chosen for a screen's data shape | Honour-system — this skill's classification procedure |
-| Production `web/src` migration follow-ups | Not started; tracked, not enforced |
+| Production `web/src` migration follow-ups | Partially migrated; remaining sites tracked, not enforced |

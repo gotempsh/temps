@@ -137,3 +137,37 @@ export const PROJECTS: ProjectFixture[] = [
     deployCount: 19,
   },
 ]
+
+export interface CronExecutionFixture {
+  id: string
+  path: string
+  executedAt: string
+  statusCode: number
+  durationMs: number
+  error?: string
+}
+
+export const CRON_EXECUTIONS: CronExecutionFixture[] = [
+  {
+    id: 'run-3',
+    path: '/tasks/cleanup',
+    executedAt: '2026-09-18T10:00:00Z',
+    statusCode: 200,
+    durationMs: 250,
+  },
+  {
+    id: 'run-2',
+    path: '/tasks/digest',
+    executedAt: '2026-09-18T09:30:00Z',
+    statusCode: 503,
+    durationMs: 1200,
+    error: 'Service unavailable',
+  },
+  {
+    id: 'run-1',
+    path: '/tasks/cleanup',
+    executedAt: '2026-09-18T09:00:00Z',
+    statusCode: 204,
+    durationMs: 180,
+  },
+]

@@ -29,8 +29,20 @@ bun workspace and whatever bundler the consumer already uses (rsbuild for
 ```
 bun install                        # from web/, resolves the workspace package
 cd web/packages/ds && bun run lint # typecheck + tokens:check + audit:records
-cd design-system && bun install && bun run build   # sandbox typechecks/builds
+cd design-system && bun run build   # uses existing sandbox dependencies
 ```
+
+### Workspace install caveat
+
+The sandbox currently has its own workspace root. Running `bun install`
+there can create `web/packages/ds/node_modules` links that shadow the
+console's hoisted `react-router`, causing a runtime "must be used within a
+Router" error despite a passing typecheck. Use existing dependencies when
+building the sandbox. If a fresh sandbox install is needed, install there
+first, then remove the generated `web/packages/ds/node_modules` directory
+and run `bun install` from `web/` to restore console dependency resolution.
+Restart the dev servers afterward. This is a documented workaround; merging
+both workspace roots remains open work.
 
 ## Tokens
 
@@ -69,7 +81,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `notify` | `notify.ok(message, description?)`, `notify.fail(message, description?)` | Background events the user isn't watching (RULES.md § Notifications) | Honour-system |
 | `Article` | `children` | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail` | Honour-system |
 | `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
-| `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `isLoading?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
+| `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
 | `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
 | `Wizard` | `title`, `description`, `currentStep`, `steps`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
 
@@ -105,6 +117,26 @@ horizontally. `Picker` is fully keyboard-filterable from focus; shortcuts get
 a visible `Kbd` badge next to their control — never a keyboard-only entry
 point (repo-wide discoverability rule, `CLAUDE.md`).
 
+## Collection-state reference
+
+Sandbox `/table-states` demonstrates an embedded execution history with
+URL-backed scenario and task-path filters. Switch between loaded, initial
+loading, successful empty, failed, and refresh-failed states. Retry recovers
+the sample request without clearing the filter; a filter with no matches has
+its own clear action. All records are invented and no API is called.
+
+`DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
+The caller owns request errors, empty/no-match copy, filters, and retries.
+Give the table an accessible name with `aria-label`. Prefer a real link in
+the identity column over row-click-only navigation. Loading cells retain
+column visibility/alignment classes. Pagination boundary controls guard
+keyboard activation as well as pointer interaction.
+
+Use `RULES.md` → Collection states when migrating another embedded table.
+`CronJobDetail.tsx` is the production reference for independent requests and
+retaining cached data after refresh failures. The sandbox controls simulate
+states; production retry actions must call the relevant query's `refetch`.
+
 ## Tests / enforcement
 
 Lint only, by explicit user decision for this phase (no Playwright visual
@@ -119,7 +151,7 @@ this phase needs):
 | Record recipe order, "not set up" copy quality, color-as-state discipline | — | Yes — see `RULES.md` |
 | Sandbox screens actually use the templates | — | Yes (reviewed by hand this pass) |
 
-## Follow-ups (numbered, honest — none of these are done)
+## Follow-ups (numbered; partial progress noted per item)
 
 1. Migrate the ~39 files that hand-roll `className="flex items-center
    justify-between"` instead of `PageHeader` (grep
@@ -151,19 +183,16 @@ this phase needs):
    the console-wide conventions this package doesn't yet enforce outside its
    own sandbox — reconcile the two documents once migration (follow-ups 1-3)
    is underway.
-9. Migrate the ~20 remaining `web/src/pages` detail screens that still stack
-   raw `<Card>` blocks with no template, no record recipe, and no
-   `useUrlState` — the same disease `EmailDetail.tsx` had before this pass.
-   By `<Card>` count (highest first): `EmailDomainDetail.tsx` (30),
-   `ServiceDetail.tsx` (28), `SandboxDetail.tsx` (28),
-   `MajorUpgradeDetail.tsx` (26), `AgentSandboxProviderDetail.tsx` (24),
-   `RequestLogDetail.tsx` (22), `ScheduleDetail.tsx` (20),
-   `BackupDetail.tsx` (19), `DnsProviderDetail.tsx` (17),
-   `IpGeolocationDetail.tsx`/`SessionReplayDetail.tsx`/`ApiKeyDetail.tsx`
-   (15-16), plus `security/ScanDetail.tsx`, `S3SourceDetail.tsx`,
-   `GitProviderDetail.tsx`, `EmailProviderDetail.tsx`,
-   `CrossProjectTraceDetail.tsx` (14 each). `EmailDetail.tsx` is the first of
-   these migrated and is the reference example for the rest: `Detail`
+9. Continue the remaining detail-screen migrations. Seventeen production
+   pages now use `Detail`: `EmailDetail`, `EmailDomainDetail`, `ServiceDetail`,
+   `SandboxDetail`, `MajorUpgradeDetail`, `RequestLogDetail`, `ScheduleDetail`,
+   `BackupDetail`, `DnsProviderDetail`, `IpGeolocationDetail`,
+   `SessionReplayDetail`, `ApiKeyDetail`, `security/ScanDetail`,
+   `S3SourceDetail`, `GitProviderDetail`, `EmailProviderDetail`, and
+   `CrossProjectTraceDetail`. `agent-sandbox/AgentSandboxProviderDetail.tsx`
+   remains from the original high-card-count candidate list; assess its
+   provider-editing behavior before migrating it.
+   `EmailDetail.tsx` is the canonical reference: `Detail`
    template with a single verdict `Status` derived from the record's own
    status field (not a duplicated badge), 4-6 facts with each value owned by
    exactly one slot, `useUrlState` for every tab/filter/page instead of local
