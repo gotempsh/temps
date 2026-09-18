@@ -23,6 +23,49 @@ use crate::{
 /// control plane receives the worker's contextual timeout response.
 const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 
+/// Slightly exceeds the worker's 30-minute pull-and-inspect deadline for the
+/// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
+/// see the worker's own timeout response rather than a client-side cutoff.
+const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+
+/// Registry credentials to forward to the worker's `POST /agent/images/pull`
+/// call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
+/// for field; `temps-deployer` does not depend on `temps-agent` (the same
+/// reason `import_image` below builds its own request rather than sharing a
+/// DTO type), so this struct only needs to serialize to the JSON body the
+/// agent handler already deserializes.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RemotePullCredentials {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// **Never logged or included in error messages.**
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// **Never logged or included in error messages.**
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_address: Option<String>,
+}
+
+/// Wire body for `POST /agent/images/pull`, mirroring
+/// `temps_agent::PullImageRequest`.
+#[derive(Serialize)]
+struct RemotePullImageRequest {
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials: Option<RemotePullCredentials>,
+}
+
+/// Wire response from `POST /agent/images/pull`, mirroring
+/// `temps_agent::PullImageResponse`.
+#[derive(Deserialize)]
+struct RemotePullImageResponse {
+    image_id: String,
+    #[allow(dead_code)]
+    digest: Option<String>,
+}
+
 /// Response envelope from the agent API.
 #[derive(Deserialize)]
 struct AgentResponse<T> {
@@ -382,6 +425,87 @@ impl RemoteNodeDeployer {
         });
         self.agent_post(&format!("/agent/containers/{}/exec", container_id), &body)
             .await
+    }
+
+    /// Ask this worker to pull `image` directly from its registry via
+    /// `POST /agent/images/pull`, instead of the control plane `docker save`-ing
+    /// the image and streaming a tar to [`ImageBuilder::import_image`].
+    ///
+    /// This is the path used for registry-sourced deploys so a control-plane
+    /// process with no Docker client of its own (the control-plane serve
+    /// profile) can still get an image onto a worker node — the worker does
+    /// all the Docker work itself. Returns the resolved image ID reported by
+    /// the worker's Docker daemon.
+    ///
+    /// Uses a request-scoped timeout matching the worker's own 30-minute pull
+    /// deadline, mirroring [`Self::import_image`]'s handling of its long-running
+    /// transfer.
+    pub async fn pull_image_from_registry(
+        &self,
+        image: &str,
+        credentials: Option<RemotePullCredentials>,
+    ) -> Result<String, DeployerError> {
+        tracing::info!(
+            node = %self.node_name,
+            image = %image,
+            has_credentials = credentials.is_some(),
+            "Requesting remote pull from registry"
+        );
+
+        let request = RemotePullImageRequest {
+            image: image.to_string(),
+            credentials,
+        };
+
+        let url = format!("{}/agent/images/pull", self.agent_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_PULL_REQUEST_TIMEOUT)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Failed to reach agent on node {} at {}: {}",
+                    self.node_name, url, e
+                ))
+            })?;
+
+        let status = response.status();
+        let body: AgentResponse<RemotePullImageResponse> = response.json().await.map_err(|e| {
+            DeployerError::NetworkError(format!(
+                "Invalid response from node {} during image pull at {}: {}",
+                self.node_name, url, e
+            ))
+        })?;
+
+        if !body.success {
+            return Err(DeployerError::DeploymentFailed(format!(
+                "Image pull for '{}' failed on node {} ({}): {}",
+                image,
+                self.node_name,
+                status,
+                body.error.unwrap_or_default()
+            )));
+        }
+
+        let data = body.data.ok_or_else(|| {
+            DeployerError::DeploymentFailed(format!(
+                "Agent on node {} returned success but no data pulling '{}' at {}",
+                self.node_name, image, url
+            ))
+        })?;
+
+        tracing::info!(
+            node = %self.node_name,
+            image = %image,
+            image_id = %data.image_id,
+            "Image pulled successfully on remote node"
+        );
+
+        Ok(data.image_id)
     }
 }
 
@@ -1210,6 +1334,154 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             DeployerError::NetworkError(msg) => {
+                assert!(
+                    msg.contains("test-node"),
+                    "Error should mention node name: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected NetworkError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_image_from_registry_returns_image_id_on_success() {
+        let url = spawn_fake_agent(
+            r#"{"success":true,"data":{"image_id":"sha256:abc123","digest":"sha256:def456"},"error":null}"#,
+        )
+        .await;
+
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".to_string(), "worker-1".to_string()).unwrap();
+
+        let image_id = deployer
+            .pull_image_from_registry("ghcr.io/acme/app:v1", None)
+            .await
+            .expect("pull should succeed against a mock agent reporting success");
+
+        assert_eq!(image_id, "sha256:abc123");
+    }
+
+    #[tokio::test]
+    async fn pull_image_from_registry_sends_image_and_credentials_in_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let body = r#"{"success":true,"data":{"image_id":"sha256:private","digest":null},"error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            request_text
+        });
+
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-private".to_string(),
+        )
+        .expect("create remote deployer");
+
+        let credentials = RemotePullCredentials {
+            username: Some("deployer".to_string()),
+            password: Some("hunter2".to_string()),
+            identity_token: None,
+            server_address: Some("registry.internal".to_string()),
+        };
+
+        let image_id = deployer
+            .pull_image_from_registry("registry.internal/app:v2", Some(credentials))
+            .await
+            .expect("pull should succeed");
+        assert_eq!(image_id, "sha256:private");
+
+        let request_text = server.await.expect("mock agent task");
+        assert!(
+            request_text.contains("POST /agent/images/pull"),
+            "expected the pull endpoint to be hit, got: {request_text}"
+        );
+        assert!(request_text.contains("registry.internal/app:v2"));
+        assert!(request_text.contains("\"username\":\"deployer\""));
+        assert!(request_text.contains("\"password\":\"hunter2\""));
+        assert!(request_text.contains("registry.internal"));
+    }
+
+    #[tokio::test]
+    async fn pull_image_from_registry_maps_agent_error_to_deployment_failed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"registry authentication failed"}"#;
+            let response = format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .expect("create remote deployer");
+
+        let result = deployer
+            .pull_image_from_registry("ghcr.io/private/app:latest", None)
+            .await;
+
+        match result {
+            Err(DeployerError::DeploymentFailed(msg)) => {
+                assert!(
+                    msg.contains("registry authentication failed"),
+                    "error should surface the agent's message: {msg}"
+                );
+            }
+            other => panic!("Expected DeploymentFailed, got {:?}", other),
+        }
+        server.await.expect("mock agent task");
+    }
+
+    #[tokio::test]
+    async fn pull_image_from_registry_unreachable_returns_network_error() {
+        let deployer = RemoteNodeDeployer::new(
+            "https://192.0.2.1:3100".to_string(), // Non-routable (TEST-NET-1) address
+            "token".to_string(),
+            "test-node".to_string(),
+        )
+        .unwrap();
+
+        let result = deployer
+            .pull_image_from_registry("ghcr.io/acme/app:v1", None)
+            .await;
+
+        match result {
+            Err(DeployerError::NetworkError(msg)) => {
                 assert!(
                     msg.contains("test-node"),
                     "Error should mention node name: {}",
