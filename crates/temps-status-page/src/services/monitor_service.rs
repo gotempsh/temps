@@ -17,8 +17,9 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use super::types::{
-    validate_check_path, CreateMonitorRequest, MonitorResponse, MonitorStatus, StatusCheckResponse,
-    StatusPageError, UpdateMonitorRequest, UptimeDataPoint, UptimeHistoryResponse,
+    normalize_check_interval_seconds, validate_check_path, CreateMonitorRequest, MonitorResponse,
+    MonitorStatus, StatusCheckResponse, StatusPageError, UpdateMonitorRequest, UptimeDataPoint,
+    UptimeHistoryResponse, DEFAULT_CHECK_INTERVAL_SECS,
 };
 
 const USER_CREATED_MONITOR_BOOTSTRAP_MESSAGE: &str =
@@ -422,7 +423,19 @@ impl MonitorService {
             name: Set(request.name),
             monitor_type: Set(request.monitor_type),
             check_path: Set(request.check_path),
-            check_interval_seconds: Set(request.check_interval_seconds.unwrap_or(60)),
+            // Normalise at the write boundary rather than storing the
+            // request verbatim and letting the scheduler silently clamp it.
+            // `0`, `-120` and `i32::MAX` all used to round-trip through the
+            // API unchanged while the scheduler ran the monitor on a
+            // completely different cadence, so `GET /monitors/{id}` reported
+            // an interval that was never honoured. Clamped (not rejected) so
+            // an import can never fail on an out-of-range value; the response
+            // below carries the clamped value back to the caller.
+            check_interval_seconds: Set(normalize_check_interval_seconds(
+                request
+                    .check_interval_seconds
+                    .unwrap_or(DEFAULT_CHECK_INTERVAL_SECS),
+            )),
             is_active: Set(true),
             is_managed: Set(false),
             ..Default::default()
@@ -1479,6 +1492,66 @@ mod tests {
         assert_eq!(monitor.environment_id, Some(environment.id));
         assert_eq!(monitor.check_interval_seconds, 60);
         assert!(monitor.is_active);
+    }
+
+    /// The API must not accept an interval it has no intention of honouring.
+    /// Before this, `0`/`-120`/`5` round-tripped verbatim while the scheduler
+    /// silently ran the monitor on a different cadence, so the response
+    /// advertised a check frequency that never happened.
+    #[tokio::test]
+    async fn create_monitor_clamps_out_of_range_intervals_and_returns_the_clamped_value() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+
+        // (requested, expected stored + returned)
+        let cases = [
+            (Some(5), 30),    // below the floor -> floor
+            (Some(29), 30),   // just below the floor -> floor
+            (Some(0), 60),    // "unset" sentinel -> default
+            (Some(-120), 60), // nonsense -> default
+            (None, 60),       // omitted -> default
+            (Some(600), 600), // in range -> untouched
+            (Some(30), 30),   // exactly the floor -> untouched
+        ];
+
+        for (index, (requested, expected)) in cases.into_iter().enumerate() {
+            let monitor = service
+                .create_monitor(
+                    project.id,
+                    CreateMonitorRequest {
+                        name: format!("clamp-{index}"),
+                        monitor_type: "web".to_string(),
+                        environment_id: environment.id,
+                        check_interval_seconds: requested,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("out-of-range intervals are clamped, never rejected");
+
+            assert_eq!(
+                monitor.check_interval_seconds, expected,
+                "requested {requested:?} must be reported back as {expected}"
+            );
+
+            let stored = status_monitors::Entity::find_by_id(monitor.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("monitor was created");
+            assert_eq!(
+                stored.check_interval_seconds, expected,
+                "requested {requested:?} must be *stored* as {expected}, not clamped later"
+            );
+        }
     }
 
     #[tokio::test]
