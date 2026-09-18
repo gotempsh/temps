@@ -51,7 +51,7 @@ export function Wizard({
       className={cn(
         'w-full min-w-0 space-y-6',
         !fullWidth && 'py-4',
-        footer && !fullWidth && 'mx-auto max-w-3xl'
+        footer && !fullWidth && 'mx-auto lg:w-4/5'
       )}
     >
       <div className="motion-reduce:hidden">

@@ -107,7 +107,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
   Projects".
 - **`Wizard`** (multi-step flow): shared page header, labeled progress, and
   an optional bordered step surface with a persistent `footer` for actions.
-  Steps with a footer default to a focused column with adjacent actions;
+  Steps with a footer default to a centered 80%-width desktop column (full
+  width on smaller screens) with adjacent actions;
   `fullWidth` opts into expanded content. Keep supporting context in the form’s
   reading path rather than in a distant sidebar.
   Existing consumers without `footer` keep their own content surfaces;

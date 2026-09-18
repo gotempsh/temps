@@ -177,7 +177,8 @@ next action. Explain what is missing before Continue can act. Allow Back
 without discarding selections. Completion names the outcome and offers a
 useful next step; sample flows must not imply a real resource was created.
 
-`Wizard` with a footer defaults to a focused `max-w-3xl` column. Keep
+`Wizard` with a footer defaults to a centered column at 80% of the available
+width on desktop and full width on smaller screens. Keep
 context beside the relevant input vertically, and group Back and the primary
 action beneath the form. Do not stretch a short form, summary, and actions
 across the viewport. Use `fullWidth` only for steps whose content needs it.
