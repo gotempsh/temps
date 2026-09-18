@@ -209,7 +209,6 @@ this phase needs):
     may already have moved under concurrent work in this worktree), roughly:
     - **Settings sub-panels** (embedded, not full pages — highest-value
       first targets, same shape as `ApiKeyTable.tsx`):
-      `project/settings/CronJobDetail.tsx`,
       `project/settings/DeploymentTokensSettings.tsx`,
       `project/settings/ProjectAccessSettings.tsx`,
       `project/settings/webhooks/WebhookDetail.tsx`,
@@ -247,7 +246,10 @@ this phase needs):
       `pages/settings/NodesPage.tsx`,
       `pages/settings/OtelPipelineStatusPage.tsx`,
       `pages/settings/TraefikDiscoveryPage.tsx`.
-    Not attempted this pass beyond `ApiKeyTable.tsx`; each of these needs
+    `CronJobDetail.tsx` is also migrated: shared status and formatters,
+    independent configuration/history loading, retryable failures, and cached
+    data retained after refresh failures. Adjacent regression tests cover these
+    states. The remaining sites listed above each need
     its own review for sorting/inline-editing/virtualization behavior that
     a mechanical swap could silently drop.
 14. `pages/Projects.tsx`'s card grid was evaluated for migration onto

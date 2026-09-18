@@ -5,7 +5,7 @@ import {
   getCronByIdOptions,
   getCronExecutionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse } from '@/api/client'
+import type { CronExecutionInfo, ProjectResponse } from '@/api/client'
 import { useQuery } from '@tanstack/react-query'
 import {
   Card,
@@ -13,20 +13,62 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-} from '@/components/ui/card'
-import { Clock, ArrowLeft, CheckCircle2, XCircle } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+  Skeleton,
+} from '@temps-sdk/ui'
+import { Clock, ArrowLeft, AlertCircle } from 'lucide-react'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+  Button,
+  Callout,
+  DataTable,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtDuration,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
 import { useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
-import { format } from 'date-fns'
+
+const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
+  {
+    key: 'time',
+    header: 'Time',
+    render: (execution) => fmtDateTime(execution.executed_at),
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    render: (execution) => {
+      const succeeded =
+        execution.status_code >= 200 && execution.status_code < 300
+      return (
+        <Status
+          tone={succeeded ? 'ok' : 'error'}
+          label={succeeded ? 'Success' : 'Failed'}
+        />
+      )
+    },
+  },
+  {
+    key: 'duration',
+    header: 'Response Time',
+    render: (execution) => fmtDuration(execution.response_time_ms),
+  },
+  {
+    key: 'details',
+    header: 'Details',
+    render: (execution) => (
+      <div className="space-y-1">
+        <div>Status: {execution.status_code}</div>
+        {execution.error_message && (
+          <div className="text-destructive whitespace-normal break-words">
+            {execution.error_message}
+          </div>
+        )}
+      </div>
+    ),
+  },
+]
 
 interface CronJobDetailProps {
   project: ProjectResponse
@@ -38,7 +80,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
     environmentId: string
     cronId: string
   }>()
-  const { data: cronJob, isLoading: isLoadingCron } = useQuery({
+  const cronQuery = useQuery({
     ...getCronByIdOptions({
       path: {
         project_id: project.id,
@@ -48,7 +90,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
     }),
   })
 
-  const { data: executions, isLoading: isLoadingExecutions } = useQuery({
+  const executionsQuery = useQuery({
     ...getCronExecutionsOptions({
       path: {
         project_id: project.id,
@@ -62,13 +104,19 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
     }),
   })
 
-  const isLoading = isLoadingCron || isLoadingExecutions
+  const cronJob = cronQuery.data
+  const executions = executionsQuery.data
 
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => goBack()}>
-          <ArrowLeft className="h-4 w-4" />
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Back to cron jobs"
+          onClick={() => goBack()}
+        >
+          <ArrowLeft className="size-4" />
         </Button>
         <div>
           <h2 className="text-lg font-medium">Cron Job Details</h2>
@@ -78,120 +126,142 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
         </div>
       </div>
 
-      {isLoading ? (
-        <div className="space-y-4">
-          <Card className="animate-pulse">
-            <CardContent className="h-32" />
-          </Card>
-          <Card className="animate-pulse">
-            <CardContent className="h-64" />
-          </Card>
-        </div>
-      ) : (
-        <div className="space-y-6">
-          {/* Cron Job Details */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Configuration</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid gap-4 md:grid-cols-2">
-                <div>
-                  <div className="text-sm font-medium">Path</div>
-                  <code className="text-sm">{cronJob?.path}</code>
+      <Card>
+        <CardHeader>
+          <CardTitle>Configuration</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {cronQuery.isError && cronJob && (
+            <Callout tone="error" title="Couldn't refresh cron job">
+              Showing the last loaded configuration.{' '}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void cronQuery.refetch()}
+                busy={cronQuery.isFetching}
+                busyLabel="Retrying…"
+              >
+                Retry configuration
+              </Button>
+            </Callout>
+          )}
+          {cronQuery.isLoading ? (
+            <div
+              className="grid gap-4 md:grid-cols-2"
+              aria-label="Loading cron job configuration"
+            >
+              {[0, 1, 2, 3].map((index) => (
+                <div key={index} className="space-y-2">
+                  <Skeleton className="h-4 w-20" />
+                  <Skeleton className="h-5 w-40" />
                 </div>
-                <div>
-                  <div className="text-sm font-medium">Schedule</div>
-                  <code className="text-sm">{cronJob?.schedule}</code>
-                </div>
-                <div>
-                  <div className="text-sm font-medium">Next Run</div>
-                  <div className="text-sm text-muted-foreground">
-                    {cronJob?.next_run
-                      ? format(new Date(cronJob.next_run), 'PPpp')
-                      : 'Not scheduled'}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-sm font-medium">Created</div>
-                  <div className="text-sm text-muted-foreground">
-                    {format(new Date(cronJob?.created_at || ''), 'PPpp')}
-                  </div>
-                </div>
+              ))}
+            </div>
+          ) : !cronJob ? (
+            <PageState
+              variant="failed"
+              size="compact"
+              icon={AlertCircle}
+              title="Couldn't load cron job"
+              description="The configuration could not be loaded. Retry to check this cron job's schedule."
+              action={
+                <Button
+                  onClick={() => void cronQuery.refetch()}
+                  busy={cronQuery.isFetching}
+                  busyLabel="Retrying…"
+                >
+                  Retry configuration
+                </Button>
+              }
+            />
+          ) : (
+            <dl className="grid gap-4 md:grid-cols-2">
+              <div>
+                <dt className="text-sm font-medium">Path</dt>
+                <dd>
+                  <code className="text-sm break-all">{cronJob.path}</code>
+                </dd>
               </div>
-            </CardContent>
-          </Card>
+              <div>
+                <dt className="text-sm font-medium">Schedule</dt>
+                <dd>
+                  <code className="text-sm">{cronJob.schedule}</code>
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm font-medium">Next Run</dt>
+                <dd className="text-sm text-muted-foreground">
+                  {cronJob.next_run
+                    ? fmtDateTime(cronJob.next_run)
+                    : 'Not scheduled'}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-sm font-medium">Created</dt>
+                <dd className="text-sm text-muted-foreground">
+                  {fmtDateTime(cronJob.created_at)}
+                </dd>
+              </div>
+            </dl>
+          )}
+        </CardContent>
+      </Card>
 
-          {/* Execution History */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Recent Executions</CardTitle>
-              <CardDescription>
-                Last 10 executions of this cron job
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {!executions?.length ? (
-                <div className="flex flex-col items-center justify-center py-8 text-center">
-                  <Clock className="h-8 w-8 text-muted-foreground mb-4" />
-                  <p className="text-sm text-muted-foreground">
-                    No executions yet
-                  </p>
-                </div>
-              ) : (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Time</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead>Response Time</TableHead>
-                      <TableHead>Details</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {executions.map((execution) => (
-                      <TableRow key={execution.id}>
-                        <TableCell>
-                          {format(new Date(execution.executed_at), 'PPpp')}
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex items-center gap-2">
-                            {execution.status_code >= 200 &&
-                            execution.status_code < 300 ? (
-                              <>
-                                <CheckCircle2 className="h-4 w-4 text-green-500" />
-                                <span className="text-sm">Success</span>
-                              </>
-                            ) : (
-                              <>
-                                <XCircle className="h-4 w-4 text-destructive" />
-                                <span className="text-sm">Failed</span>
-                              </>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell>{execution.response_time_ms}ms</TableCell>
-                        <TableCell>
-                          <div className="space-y-1">
-                            <div className="text-sm">
-                              Status: {execution.status_code}
-                            </div>
-                            {execution.error_message && (
-                              <div className="text-sm text-destructive">
-                                {execution.error_message}
-                              </div>
-                            )}
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Executions</CardTitle>
+          <CardDescription>Last 10 executions of this cron job</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {executionsQuery.isError && executions && executions.length > 0 && (
+            <Callout tone="error" title="Couldn't refresh executions">
+              Showing the last loaded executions.{' '}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void executionsQuery.refetch()}
+                busy={executionsQuery.isFetching}
+                busyLabel="Retrying…"
+              >
+                Retry executions
+              </Button>
+            </Callout>
+          )}
+          {executionsQuery.isError && !executions?.length ? (
+            <PageState
+              variant="failed"
+              size="compact"
+              icon={AlertCircle}
+              title="Couldn't load executions"
+              description="Execution history is unavailable. Retry to see recent runs."
+              action={
+                <Button
+                  onClick={() => void executionsQuery.refetch()}
+                  busy={executionsQuery.isFetching}
+                  busyLabel="Retrying…"
+                >
+                  Retry executions
+                </Button>
+              }
+            />
+          ) : !executionsQuery.isLoading && !executions?.length ? (
+            <PageState
+              variant="empty"
+              size="compact"
+              icon={Clock}
+              title="No executions yet"
+              description="Execution history will appear after this cron job runs."
+            />
+          ) : (
+            <DataTable
+              columns={executionColumns}
+              rows={executions ?? []}
+              rowKey={(execution) => execution.id}
+              isLoading={executionsQuery.isLoading}
+            />
+          )}
+        </CardContent>
+      </Card>
     </div>
   )
 }
