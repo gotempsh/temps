@@ -24772,7 +24772,7 @@ export type IngestTunneledEnvelopeErrors = {
      */
     401: unknown;
     /**
-     * Origin/Referer does not match the resolved host (Host-resolved requests only)
+     * Origin/Referer does not match the resolved host (Host-resolved requests), or the Origin is not in the DSN's allowed_origins (keyed requests)
      */
     403: unknown;
     /**

@@ -133,7 +133,27 @@ export const recordEventMetrics = <ThrowOnError extends boolean = false>(options
  * for authentication: the request must claim to come from the same host it
  * resolves to, or it is rejected. That check is deliberately **skipped** on
  * path 1 — a tunneled request from another origin is the entire point there,
- * and the DSN is a stronger claim than a self-reported `Origin`.
+ * and the DSN is a stronger claim than a self-reported `Origin`. Path 1 does
+ * honour the DSN row's own `allowed_origins` list when the operator has set
+ * one (`403` when the `Origin` is off it); an empty or absent list, which is
+ * every row Temps mints today, permits any origin.
+ *
+ * # Ordering, and why it matters
+ *
+ * This route is unauthenticated and reachable from every domain a project is
+ * deployed to, so the expensive work is placed strictly after the cheap
+ * admission control:
+ *
+ * 1. Shape gate + resolution cache + a global unresolved-credential budget,
+ * all before any database round trip (mirroring `temps-analytics`'s
+ * ADR-040 §2 defence).
+ * 2. Per-project rate limiting.
+ * 3. Only then `decompress_if_needed`, which can inflate up to
+ * `MAX_DECOMPRESSED_SIZE`.
+ *
+ * The credential-free branch has to inflate the body to read an SDK-embedded
+ * DSN, so when `Host` has not already resolved the request that inflate is
+ * charged against the same global budget a forged key pays into.
  *
  * An *explicit* credential that does not resolve is a `401`, never a silent
  * fall-through to `Host`: a typo'd key must fail loudly rather than land the
