@@ -84,6 +84,32 @@ impl IngestRateLimiter {
         true
     }
 
+    /// Read-only variant of [`Self::check`]: reports whether `project_id` has
+    /// remaining budget without consuming a slot.
+    ///
+    /// Used to gate expensive work (decompression) on a *tentative* project
+    /// attribution before the final one is known, without charging that
+    /// project for a request it may turn out not to receive — see the tunnel
+    /// handler's `Host`-then-embedded-DSN resolution, where the two can
+    /// legitimately disagree. The actual charge always happens exactly once,
+    /// against whichever project the request is finally attributed to, via
+    /// [`Self::check`].
+    pub async fn peek(&self, project_id: i32, limit_per_minute: Option<i32>) -> bool {
+        let limit = match limit_per_minute {
+            Some(limit) if limit > 0 => limit as usize,
+            _ => return true,
+        };
+
+        let now = Instant::now();
+        let window_start = now - WINDOW;
+
+        let mut entries = self.entries.lock().await;
+        let timestamps = entries.entry(project_id).or_default();
+        timestamps.retain(|t| *t > window_start);
+
+        timestamps.len() < limit
+    }
+
     /// Read-only: `true` if the global unresolved-credential bucket is already
     /// saturated. Checked *before* paying for a DB lookup (and before any
     /// decompression), so a flood of distinct forged keys stops costing

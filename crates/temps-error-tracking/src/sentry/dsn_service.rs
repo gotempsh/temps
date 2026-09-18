@@ -5,6 +5,7 @@ use chrono::Utc;
 use moka::future::Cache;
 use rand::RngExt;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_entities::{project_dsns, projects};
@@ -95,6 +96,19 @@ pub struct DSNService {
     /// short-lived negative entries. The global unresolved-credential budget
     /// in [`super::rate_limiter`] is what bounds that case.
     resolve_cache: Cache<String, Option<project_dsns::Model>>,
+    /// Bumped by every cache invalidation (targeted or global). Read before
+    /// issuing the DB query in [`Self::get_project_by_public_key`] and
+    /// compared after it returns: if a revoke, rotation, or route-table
+    /// reload happened while that query was in flight, the epoch will have
+    /// moved and the (possibly now-stale) result is returned to the caller
+    /// but never cached.
+    ///
+    /// Without this, a read that started just before a revoke can still
+    /// observe the pre-revoke active row and insert it into the cache
+    /// *after* `invalidate_cached_key` already ran — silently undoing the
+    /// synchronous invalidation and leaving a revoked key resolving for a
+    /// fresh [`RESOLVE_CACHE_TTL`] window.
+    cache_epoch: AtomicU64,
 }
 
 impl DSNService {
@@ -105,13 +119,34 @@ impl DSNService {
                 .max_capacity(RESOLVE_CACHE_CAPACITY)
                 .time_to_live(RESOLVE_CACHE_TTL)
                 .build(),
+            cache_epoch: AtomicU64::new(0),
         }
     }
 
     /// Drop a cached resolution so a rotated or revoked key stops working on
     /// the very next request rather than after [`RESOLVE_CACHE_TTL`].
     async fn invalidate_cached_key(&self, public_key: &str) {
+        // Bump the epoch *before* invalidating: any read already in flight
+        // that checks the epoch after this point will see it has moved and
+        // skip caching its (possibly stale) result. Ordering the bump first
+        // is what closes the race described on `cache_epoch`.
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.resolve_cache.invalidate(public_key).await;
+    }
+
+    /// Drop every cached resolution.
+    ///
+    /// Revoking or rotating a specific key is handled by the targeted
+    /// [`Self::invalidate_cached_key`], but nothing about a DSN row changes
+    /// when its *project* is deleted — `active_dsn_query`'s `projects` join
+    /// is what stops it resolving, and that only takes effect on the next
+    /// uncached lookup. Called from the `Job::RouteTableUpdated` subscriber
+    /// in `plugin.rs`, the same in-process signal that fires on project
+    /// deletion, mirroring `AnalyticsIngestKeyService::invalidate_all_cached_scopes`
+    /// (ADR-040 §2) exactly.
+    pub fn invalidate_all_cached_scopes(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        self.resolve_cache.invalidate_all();
     }
 
     /// Generate a new DSN for a project
@@ -381,16 +416,44 @@ impl DSNService {
             return Ok(cached);
         }
 
+        // Recorded before the query so a concurrent revoke/rotate/route-table
+        // reload that lands while it is in flight is detectable afterwards —
+        // see the doc comment on `cache_epoch`.
+        let epoch_before_query = self.cache_epoch.load(Ordering::SeqCst);
+
         let dsn = active_dsn_query()
             .filter(project_dsns::Column::PublicKey.eq(public_key))
             .one(self.db.as_ref())
             .await?;
 
-        self.resolve_cache
-            .insert(public_key.to_string(), dsn.clone())
+        self.cache_if_epoch_unchanged(epoch_before_query, public_key, dsn.clone())
             .await;
 
         Ok(dsn)
+    }
+
+    /// Cache `dsn` for `public_key` unless [`cache_epoch`](Self::cache_epoch)
+    /// moved since `epoch_before_query` was captured — i.e. unless a revoke,
+    /// rotation, or route-table reload landed while the read that produced
+    /// `dsn` was still in flight.
+    ///
+    /// Split out from [`Self::get_project_by_public_key`] purely so the
+    /// epoch comparison can be exercised directly with controlled `u64`s
+    /// rather than by racing a real query against a real invalidation, which
+    /// would make the regression test for this non-deterministic.
+    async fn cache_if_epoch_unchanged(
+        &self,
+        epoch_before_query: u64,
+        public_key: &str,
+        dsn: Option<project_dsns::Model>,
+    ) {
+        // If it moved, this result may already be stale (e.g. a revoke that
+        // committed after our snapshot but before our read returned) — the
+        // caller still gets a correct-as-of-read answer for this one
+        // request, it just isn't cached, so the next request re-reads.
+        if self.cache_epoch.load(Ordering::SeqCst) == epoch_before_query {
+            self.resolve_cache.insert(public_key.to_string(), dsn).await;
+        }
     }
 
     /// Regenerate DSN (rotate keys)
@@ -698,5 +761,115 @@ mod tests {
             .expect("Failed to validate DSN");
 
         assert!(!is_valid);
+    }
+
+    /// The revocation-race regression: a lookup that read an active row
+    /// *before* a concurrent revoke/rotate must not be allowed to cache that
+    /// row *after* the revoke's invalidation already ran, or the revoke would
+    /// be silently undone for up to `RESOLVE_CACHE_TTL`.
+    ///
+    /// Exercises `cache_if_epoch_unchanged` directly with a controlled epoch
+    /// rather than racing a real query against a real invalidation — see its
+    /// doc comment for why.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_if_epoch_unchanged_skips_insert_when_epoch_moved_during_the_query() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = DSNService::new(db);
+
+        let epoch_before_query = service.cache_epoch.load(Ordering::SeqCst);
+
+        // Simulate a revoke/rotate/route-table reload landing while our
+        // (hypothetical) database read was in flight.
+        service.cache_epoch.fetch_add(1, Ordering::SeqCst);
+
+        service
+            .cache_if_epoch_unchanged(epoch_before_query, "deadbeefcafe", None)
+            .await;
+
+        assert!(
+            service.resolve_cache.get("deadbeefcafe").await.is_none(),
+            "a result read under a since-moved epoch must never be cached"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_if_epoch_unchanged_caches_when_nothing_raced_it() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = DSNService::new(db);
+
+        let epoch_before_query = service.cache_epoch.load(Ordering::SeqCst);
+
+        service
+            .cache_if_epoch_unchanged(epoch_before_query, "cafebabe0000", None)
+            .await;
+
+        assert!(
+            service.resolve_cache.get("cafebabe0000").await.is_some(),
+            "epoch unchanged: the (negative) result should be cached as normal"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn revoke_and_rotate_bump_the_cache_epoch() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = DSNService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+
+        let dsn = service
+            .generate_project_dsn(project_id, None, None, None, "https://example.com")
+            .await
+            .expect("Failed to generate DSN");
+
+        let epoch_after_create = service.cache_epoch.load(Ordering::SeqCst);
+
+        service
+            .regenerate_project_dsn(dsn.id, project_id, "https://example.com")
+            .await
+            .expect("Failed to rotate DSN");
+        let epoch_after_rotate = service.cache_epoch.load(Ordering::SeqCst);
+        assert!(
+            epoch_after_rotate > epoch_after_create,
+            "rotating a DSN must bump the cache epoch"
+        );
+
+        service
+            .revoke_dsn(dsn.id, project_id)
+            .await
+            .expect("Failed to revoke DSN");
+        let epoch_after_revoke = service.cache_epoch.load(Ordering::SeqCst);
+        assert!(
+            epoch_after_revoke > epoch_after_rotate,
+            "revoking a DSN must bump the cache epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_all_cached_scopes_bumps_the_epoch_and_clears_the_cache() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = DSNService::new(db);
+
+        let epoch_before_query = service.cache_epoch.load(Ordering::SeqCst);
+        service
+            .cache_if_epoch_unchanged(epoch_before_query, "feedfacecafe", None)
+            .await;
+        assert!(service.resolve_cache.get("feedfacecafe").await.is_some());
+
+        service.invalidate_all_cached_scopes();
+
+        assert!(
+            service.cache_epoch.load(Ordering::SeqCst) > epoch_before_query,
+            "invalidate_all_cached_scopes must bump the epoch"
+        );
+        assert!(
+            service.resolve_cache.get("feedfacecafe").await.is_none(),
+            "invalidate_all_cached_scopes must clear every cached entry"
+        );
     }
 }

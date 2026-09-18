@@ -483,24 +483,30 @@ async fn ingest_tunneled_envelope(
     // ── Path 2: no explicit credential ──────────────────────────────────
     //
     // `Host` is resolved first because it is an in-memory route-table lookup:
-    // it lets the ordinary same-origin case reach its own rate-limit bucket
-    // before anything is inflated. The SDK-embedded DSN, which does need the
-    // body, is consulted after — and still wins when it resolves, because a
-    // credential is a stronger claim than a `Host` the proxy forwarded here
-    // regardless of its value.
+    // it lets the ordinary same-origin case gate decompression on its own
+    // rate-limit budget before anything is inflated. The SDK-embedded DSN,
+    // which does need the body, is consulted after — and still wins when it
+    // resolves, because a credential is a stronger claim than a `Host` the
+    // proxy forwarded here regardless of its value.
+    //
+    // Only *peeked*, not charged, at this point: `Host` and the embedded DSN
+    // can legitimately disagree on the project (a third-party DSN tunneled
+    // through an app Temps also hosts), and the request is ultimately
+    // attributed — and billed against exactly one rate-limit bucket — to
+    // whichever one wins below. Charging `Host`'s bucket here and the DSN's
+    // bucket again once it wins would let one tunneled request drain a
+    // project's budget for traffic it never actually received.
     let host_scope = resolve_tunnel_host_scope(&state, &metadata, &headers);
 
-    let mut charged_project = None;
     match &host_scope {
         Ok(auth) => {
             if !state
                 .rate_limiter
-                .check(auth.project_id, Some(effective_tunnel_rate_limit(auth)))
+                .peek(auth.project_id, Some(effective_tunnel_rate_limit(auth)))
                 .await
             {
                 return rate_limited_response();
             }
-            charged_project = Some(auth.project_id);
         }
         Err(_) => {
             // Nothing has authenticated this request and `Host` did not
@@ -528,20 +534,7 @@ async fn ingest_tunneled_envelope(
     let embedded = resolve_embedded_envelope_dsn(&state, &headers, &decompressed_body).await;
 
     let auth = match embedded {
-        Some(dsn) => {
-            let auth = auth_from_dsn(&dsn);
-            // Skip a second charge when `Host` already resolved to the same
-            // project and paid for this request.
-            if charged_project != Some(auth.project_id)
-                && !state
-                    .rate_limiter
-                    .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
-                    .await
-            {
-                return rate_limited_response();
-            }
-            auth
-        }
+        Some(dsn) => auth_from_dsn(&dsn),
         None => match host_scope {
             Ok(auth) => auth,
             Err(response) => {
@@ -553,6 +546,16 @@ async fn ingest_tunneled_envelope(
             }
         },
     };
+
+    // The one and only charge for this request, against whichever project it
+    // actually ended up attributed to — see the comment above `host_scope`.
+    if !state
+        .rate_limiter
+        .check(auth.project_id, Some(effective_tunnel_rate_limit(&auth)))
+        .await
+    {
+        return rate_limited_response();
+    }
 
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
@@ -2437,6 +2440,77 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
         assert!(error_event_project_ids(&ctx).await.is_empty());
+    }
+
+    /// `Host` resolving to project A while the envelope's embedded DSN
+    /// resolves to a *different* project B must attribute the event to B
+    /// (the credential, per `test_tunnel_endpoint_with_embedded_envelope_dsn_ignores_host`)
+    /// without ever consuming A's rate-limit budget — A received no data,
+    /// so it must not be billed for this request. A regression test for a
+    /// bug where the speculative `Host` charge happened before the embedded
+    /// DSN was even read, so B's traffic silently drained A's allowance.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tunnel_endpoint_host_project_is_not_charged_when_embedded_dsn_wins() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let ctx = create_test_context().await;
+        let (project_b, key_b) = create_second_project_with_dsn(&ctx).await;
+
+        // Give project A (the Host match) a single-request budget so any
+        // charge against it is immediately observable.
+        temps_entities::project_dsns::Entity::update_many()
+            .col_expr(
+                temps_entities::project_dsns::Column::RateLimitPerMinute,
+                sea_orm::sea_query::Expr::value(1),
+            )
+            .filter(temps_entities::project_dsns::Column::PublicKey.eq(ctx.dsn_key.clone()))
+            .exec(ctx._db.connection())
+            .await
+            .unwrap();
+
+        ctx.route_table
+            .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
+
+        let app = configure_tunnel_test_router(ctx.app_state.clone());
+        let server = TestServer::new(app);
+
+        let embedded_dsn_for_b = format!("https://{}@localhost/{}", key_b, project_b);
+        let response = server
+            .post(SENTRY_TUNNEL_ROUTE_PATH)
+            .content_type("application/octet-stream")
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("app.example.com"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://app.example.com"),
+            )
+            .bytes(Bytes::from(tunneled_envelope_with_dsn(&embedded_dsn_for_b)))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(
+            error_event_project_ids(&ctx).await,
+            vec![project_b],
+            "the embedded DSN's project must own the event"
+        );
+
+        // Project A's single-request budget must still be untouched: it was
+        // only ever the tentative Host match, never the attributed project.
+        assert!(
+            ctx.app_state
+                .rate_limiter
+                .peek(ctx.project_id, Some(1))
+                .await,
+            "project A must not have been charged for a request it never received"
+        );
     }
 
     /// A malformed key is rejected on shape alone — the `Ok(None)` below comes

@@ -271,6 +271,50 @@ impl TempsPlugin for ErrorTrackingPlugin {
             let sentry_provider = Arc::new(SentryProvider::new(dsn_service.clone()));
             context.register_service(sentry_provider);
 
+            // A project deletion (or any other route-table-affecting change)
+            // does not touch `project_dsns` at all — `active_dsn_query`'s
+            // `projects` join is what stops a deleted project's DSN from
+            // resolving, and that only takes effect on the next *uncached*
+            // lookup. `Job::RouteTableUpdated` is the same in-process signal
+            // the route table itself reloads on and fires on project
+            // deletion, so subscribing here closes the window immediately
+            // instead of waiting out `RESOLVE_CACHE_TTL`. Mirrors
+            // `AnalyticsIngestKeyService`'s identical subscription in
+            // `temps-analytics/src/plugin.rs` (ADR-040 §2).
+            if let Some(queue_service) = context.get_service::<dyn JobQueue>() {
+                let route_table_receiver = queue_service.subscribe();
+                let dsn_service_for_invalidation = dsn_service.clone();
+                tokio::spawn(async move {
+                    let mut job_receiver = route_table_receiver;
+                    loop {
+                        match job_receiver.recv().await {
+                            Ok(Job::RouteTableUpdated(_)) => {
+                                dsn_service_for_invalidation.invalidate_all_cached_scopes();
+                            }
+                            Ok(_) => {}
+                            Err(temps_core::QueueError::ChannelClosed) => {
+                                tracing::warn!(
+                                    "error-tracking: DSN cache invalidation subscriber stopping, queue channel closed"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                // Broadcast receiver lagged: a RouteTableUpdated
+                                // may have been missed. Invalidate defensively —
+                                // the next resolve simply re-reads current state,
+                                // which is always correct regardless of how many
+                                // updates were dropped.
+                                tracing::warn!(
+                                    "error-tracking: DSN cache invalidation subscriber lagged ({}); invalidating defensively",
+                                    e
+                                );
+                                dsn_service_for_invalidation.invalidate_all_cached_scopes();
+                            }
+                        }
+                    }
+                });
+            }
+
             // Start job listener for project lifecycle events (auto-create default alert rules)
             if let Some(queue_service) = context.get_service::<dyn JobQueue>() {
                 let job_receiver = queue_service.subscribe();
