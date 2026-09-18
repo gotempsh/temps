@@ -455,6 +455,7 @@ export function AuditLogs() {
           value={operation}
           onValueChange={(operation) => patch({ operation, page: null })}
           options={operationOptions}
+          title="Filter by operation type"
           placeholder="Filter by type"
           searchPlaceholder="Search types..."
           emptyText="No matching types."
@@ -464,6 +465,7 @@ export function AuditLogs() {
           value={selectedUserId}
           onValueChange={(user) => patch({ user, page: null })}
           options={userOptions}
+          title="Filter by user"
           placeholder="Filter by user"
           searchPlaceholder="Search users..."
           emptyText="No matching users."

@@ -38,6 +38,7 @@ test('a valid URL restores configuration, without credentials in the URL', () =>
   expect(markup).toContain('Configure Slack')
   expect(markup).toContain('form="add-notification-provider-form"')
   expect(markup).toContain('Webhook URL')
+  expect(markup).not.toContain('Provider Type')
 })
 
 test('unavailable providers and forged completion return to provider selection', () => {

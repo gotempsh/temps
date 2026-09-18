@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -38,6 +37,8 @@ interface ProviderFormProps {
   isLoading?: boolean
   formId?: string
   hideSubmit?: boolean
+  /** The surrounding wizard already owns provider selection. */
+  hideProviderType?: boolean
   revealScopeKey?: string | number
   onRevealCredential?: (field: string) => Promise<string>
 }
@@ -147,6 +148,7 @@ export function ProviderForm({
   isLoading = false,
   formId,
   hideSubmit = false,
+  hideProviderType = false,
   revealScopeKey,
   onRevealCredential,
 }: ProviderFormProps) {
@@ -188,7 +190,7 @@ export function ProviderForm({
             )}
           />
 
-          {!isEdit && (
+          {!isEdit && !hideProviderType && (
             <FormField
               control={form.control}
               name="provider_type"

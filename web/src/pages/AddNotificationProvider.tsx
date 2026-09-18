@@ -446,6 +446,7 @@ export function AddNotificationProvider() {
               isEdit={false}
               formId="add-notification-provider-form"
               hideSubmit
+              hideProviderType
             />
           </div>
         )}
