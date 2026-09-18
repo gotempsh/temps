@@ -47,7 +47,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { EmptyState } from '@/components/ui/empty-state'
+import { Callout, DataTable, PageState } from '@temps-sdk/ds'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -56,15 +56,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+
 import {
   ROLE_DESCRIPTIONS,
   ROLE_ENFORCEMENT_NOTE,
@@ -97,11 +89,15 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
     isLoading,
     isError,
     error,
+    refetch,
   } = useQuery(listProjectAccessOptions({ path: { project_id: project.id } }))
 
-  const { data: teamsData } = useQuery(
-    listTeamsOptions({ query: { page: 1, page_size: 100 } })
-  )
+  const {
+    data: teamsData,
+    isLoading: teamsLoading,
+    isError: teamsFailed,
+    refetch: retryTeams,
+  } = useQuery(listTeamsOptions({ query: { page: 1, page_size: 100 } }))
 
   const teams = teamsData?.teams ?? []
   const grantList = grants ?? []
@@ -156,12 +152,29 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
         <Button
           size="sm"
           onClick={() => setGrantOpen(true)}
-          disabled={teams.length === 0}
+          disabled={
+            isLoading ||
+            isError ||
+            teamsLoading ||
+            teamsFailed ||
+            availableTeams.length === 0
+          }
         >
           <Plus className="mr-2 h-4 w-4" />
           Grant access
         </Button>
       </div>
+
+      {!isLoading &&
+        !isError &&
+        !teamsLoading &&
+        !teamsFailed &&
+        teams.length > 0 &&
+        availableTeams.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            Every team in the current team list already has access.
+          </p>
+        )}
 
       {!isLoading && !isError && (
         <Alert>
@@ -196,90 +209,124 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
-            <div className="space-y-2">
-              {[0, 1].map((i) => (
-                <Skeleton key={i} className="h-12 w-full" />
-              ))}
-            </div>
-          ) : isError ? (
-            <EmptyState
-              icon={Users}
-              title="Couldn't load access grants"
-              description={
-                error instanceof Error
-                  ? error.message
-                  : 'The access API did not respond.'
-              }
-            />
-          ) : teams.length === 0 ? (
-            <EmptyState
-              icon={Users}
-              title="No teams exist yet"
-              description={
-                <p className="text-sm text-muted-foreground">
-                  Create a team first, then come back to grant it access.{' '}
-                  <Link to="/settings/teams" className="underline">
-                    Go to Teams
-                  </Link>
-                </p>
-              }
-            />
-          ) : grantList.length === 0 ? (
-            <EmptyState
-              icon={Globe}
-              title="No team restrictions"
-              description="Grant a team access to restrict this project to its members."
-              action={
-                <Button onClick={() => setGrantOpen(true)}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Grant access
+          <div className="space-y-4">
+            {teamsFailed && (
+              <Callout tone="warning" title="Could not load teams">
+                Existing grants are shown by team ID when names are unavailable.
+                Retry to grant access to another team.
+                <Button
+                  variant="link"
+                  size="sm"
+                  onClick={() => void retryTeams()}
+                >
+                  Retry teams
                 </Button>
-              }
-            />
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Team</TableHead>
-                    <TableHead>Role on this project</TableHead>
-                    <TableHead className="w-10" />
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {grantList.map((grant) => (
-                    <TableRow key={grant.id}>
-                      <TableCell className="font-medium">
-                        <Link
-                          to={`/settings/teams/${grant.team_id}`}
-                          className="hover:underline"
-                        >
-                          {teamName(grant.team_id)}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
+              </Callout>
+            )}
+            {isError && grants !== undefined && (
+              <Callout tone="error" title="Could not refresh access grants">
+                Showing the last loaded grants.{' '}
+                <Button variant="link" size="sm" onClick={() => void refetch()}>
+                  Retry
+                </Button>
+              </Callout>
+            )}
+            {isError && grants === undefined ? (
+              <PageState
+                variant="failed"
+                size="compact"
+                icon={Users}
+                title="Could not load access grants"
+                description={
+                  error instanceof Error
+                    ? error.message
+                    : 'The access API did not respond.'
+                }
+                action={<Button onClick={() => void refetch()}>Retry</Button>}
+              />
+            ) : !isLoading &&
+              !teamsLoading &&
+              !teamsFailed &&
+              teams.length === 0 &&
+              grantList.length === 0 ? (
+              <PageState
+                variant="not-set-up"
+                size="compact"
+                icon={Users}
+                title="Create a team to restrict access"
+                requirement="No teams exist yet."
+                example="Give your operations team access to this project."
+                settingsHref="/settings/teams"
+                settingsLabel="Go to Teams"
+              />
+            ) : !isLoading && grantList.length === 0 && !teamsLoading ? (
+              <PageState
+                variant="empty"
+                size="compact"
+                icon={Globe}
+                title="No team restrictions"
+                description="Grant a team access to restrict this project to its members."
+                action={
+                  !teamsFailed && (
+                    <Button onClick={() => setGrantOpen(true)}>
+                      <Plus className="size-4 mr-2" />
+                      Grant access
+                    </Button>
+                  )
+                }
+              />
+            ) : (
+              <DataTable
+                aria-label="Teams with project access"
+                rows={grantList}
+                rowKey={(grant) => grant.id}
+                isLoading={
+                  isLoading || (teamsLoading && grantList.length === 0)
+                }
+                columns={[
+                  {
+                    key: 'team',
+                    header: 'Team',
+                    render: (grant) => (
+                      <Link
+                        to={`/settings/teams/${grant.team_id}`}
+                        className="font-medium hover:underline"
+                      >
+                        {teamName(grant.team_id)}
+                      </Link>
+                    ),
+                  },
+                  {
+                    key: 'role',
+                    header: 'Role on this project',
+                    render: (grant) => (
+                      <>
                         <span className="capitalize">{grant.role}</span>
                         <span className="ml-2 text-xs text-muted-foreground">
                           {ROLE_DESCRIPTIONS[grant.role]}
                         </span>
-                      </TableCell>
-                      <TableCell>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Revoke access for ${teamName(grant.team_id)}`}
-                          onClick={() => setGrantToRevoke(grant)}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
+                      </>
+                    ),
+                  },
+                  {
+                    key: 'actions',
+                    header: <span className="sr-only">Actions</span>,
+                    className: 'w-10',
+                    render: (grant) => (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Revoke access for ${teamName(grant.team_id)}`}
+                        onClick={() => setGrantToRevoke(grant)}
+                      >
+                        <Trash2 className="size-4 text-destructive" />
+                      </Button>
+                    ),
+                  },
+                ]}
+              />
+            )}
+          </div>
         </CardContent>
       </Card>
 
@@ -359,9 +406,11 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
             <AlertDialogTitle>Revoke access?</AlertDialogTitle>
             <AlertDialogDescription>
               Members of{' '}
-              {grantToRevoke ? `"${teamName(grantToRevoke.team_id)}"` : 'this team'}{' '}
-              lose access to this project immediately, unless another team
-              also grants it to them.
+              {grantToRevoke
+                ? `"${teamName(grantToRevoke.team_id)}"`
+                : 'this team'}{' '}
+              lose access to this project immediately, unless another team also
+              grants it to them.
               {grantList.length === 1 &&
                 ' This is the last grant — revoking it makes the project open to everyone again.'}
             </AlertDialogDescription>

@@ -254,7 +254,6 @@ this phase needs):
     - **Settings sub-panels** (embedded, not full pages — highest-value
       first targets, same shape as `ApiKeyTable.tsx`):
       `project/settings/DeploymentTokensSettings.tsx`,
-      `project/settings/ProjectAccessSettings.tsx`,
       `project/settings/webhooks/WebhookDetail.tsx`,
       `agents/ProjectSecrets.tsx`, `project/flags/ProjectFeatureFlags.tsx`,
       `monitoring/NodeAlertRules.tsx`, `storage/MonitoringCard.tsx`.
@@ -350,3 +349,9 @@ filters use URL state, date/time presets and custom ranges, with an all-time
 option. Filter changes reset pagination. Failures have retries and cached rows
 remain visible after refresh errors. Counts describe only the loaded page;
 the API does not supply an aggregate total or overview time series.
+
+Project access (`project/settings/ProjectAccessSettings.tsx`) now uses `DataTable`
+and explicit failed/empty/not-set-up states. Team lookup failures preserve
+existing grants, access refresh failures retain cached rows, and both requests
+have independent retries. Grant/revoke dialogs, role descriptions, and the
+last-grant warning retain their existing permission semantics.
