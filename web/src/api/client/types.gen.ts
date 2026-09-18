@@ -286,6 +286,8 @@ export type ActivitySettings = {
 };
 
 export type ActivityStatus = {
+    ai_model?: string | null;
+    ai_provider?: string | null;
     configured: boolean;
     /**
      * Whether tracked non-crawler visitor events exist in the previous 24 hours.

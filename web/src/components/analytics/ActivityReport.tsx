@@ -150,191 +150,197 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               queryClient.invalidateQueries({ queryKey: options.queryKey })
             }
           />
-          <section
-            aria-label="Visitor activity"
-            className="space-y-5 border-t pt-6"
-          >
-            <div>
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <h2 className="text-lg font-semibold">
-                    {preview
-                      ? 'Preview of visitor activity'
-                      : 'Recent visitor activity'}
-                  </h2>
-                  <p className="text-sm text-muted-foreground">
-                    Last 24 hours · Up to 20 visitors
-                    {report?.environment_id &&
-                      ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
-                  </p>
+          {(report || running || data.last_error) && (
+            <section
+              aria-label="Visitor activity"
+              className="space-y-5 border-t pt-6"
+            >
+              <div>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold">
+                      {preview
+                        ? 'Preview of visitor activity'
+                        : 'Recent visitor activity'}
+                    </h2>
+                    <p className="text-sm text-muted-foreground">
+                      Last 24 hours · Up to 20 visitors
+                      {report?.environment_id &&
+                        ` Report environment: ${environments.data?.find((env) => env.id === report.environment_id)?.name ?? 'Unavailable environment'}.`}
+                    </p>
+                  </div>
+                  {data.has_recent_activity && (
+                    <Button
+                      disabled={
+                        !data.configured ||
+                        !data.settings_revision ||
+                        !data.settings.share_activity_with_ai ||
+                        !!running ||
+                        status.isFetching ||
+                        status.isError ||
+                        data.selected_environment_id !==
+                          data.settings.environment_id
+                      }
+                      onClick={() =>
+                        run.mutate({ path: { project_id: project.id } })
+                      }
+                    >
+                      {running ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Sparkles className="mr-2 h-4 w-4" />
+                      )}
+                      {running ? 'Analyzing…' : 'Run saved settings'}
+                    </Button>
+                  )}
                 </div>
-                {data.has_recent_activity && (
-                  <Button
-                    disabled={
-                      !data.configured ||
-                      !data.settings_revision ||
-                      !data.settings.share_activity_with_ai ||
-                      !!running ||
-                      status.isFetching ||
-                      status.isError ||
-                      data.selected_environment_id !==
-                        data.settings.environment_id
-                    }
-                    onClick={() =>
-                      run.mutate({ path: { project_id: project.id } })
-                    }
-                  >
-                    {running ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="mr-2 h-4 w-4" />
-                    )}
-                    {running ? 'Analyzing…' : 'Run saved settings'}
-                  </Button>
-                )}
               </div>
-            </div>
-            <div className="space-y-5">
-              {data.selected_environment_id !==
-                data.settings.environment_id && (
-                <p className="text-sm text-muted-foreground">
-                  Save this environment to run its report.
-                </p>
-              )}
-              {data.next_run_at && (
-                <p className="text-sm">
-                  Next daily run: {new Date(data.next_run_at).toLocaleString()}{' '}
-                  (within five minutes).
-                </p>
-              )}
-              {data.last_error && (
-                <Alert variant="destructive">
-                  <AlertCircle className="h-4 w-4" />
-                  <AlertDescription>{data.last_error}</AlertDescription>
-                </Alert>
-              )}
-              {!report ? (
-                <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
-                  {data.has_recent_activity
-                    ? 'Preview your visitors to see a report.'
-                    : 'Waiting for visitor activity.'}
-                </div>
-              ) : (
-                <>
-                  <div className="space-y-2">
-                    <p className="whitespace-pre-wrap">{report.summary}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {new Date(report.window_start).toLocaleString()} –{' '}
-                      {new Date(report.window_end).toLocaleString()} ·{' '}
-                      {report.visitors.length} visitors assessed ·{' '}
-                      {report.events_considered} events considered
-                      {report.model ? ` · ${report.model}` : ''}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      AI interpretation of observed activity, not confirmed
-                      intent. Category counts can overlap.
-                    </p>
-                    {report.sampled && (
-                      <p className="text-sm text-amber-700 dark:text-amber-400">
-                        Sampled report: counts cover this sample, not all
-                        traffic.
+              <div className="space-y-5">
+                {data.selected_environment_id !==
+                  data.settings.environment_id && (
+                  <p className="text-sm text-muted-foreground">
+                    Save this environment to run its report.
+                  </p>
+                )}
+                {data.next_run_at && (
+                  <p className="text-sm">
+                    Next daily run:{' '}
+                    {new Date(data.next_run_at).toLocaleString()} (within five
+                    minutes).
+                  </p>
+                )}
+                {data.last_error && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>{data.last_error}</AlertDescription>
+                  </Alert>
+                )}
+                {!report ? (
+                  <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
+                    {data.has_recent_activity
+                      ? 'Preview your visitors to see a report.'
+                      : 'Waiting for visitor activity.'}
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-2">
+                      <p className="whitespace-pre-wrap">{report.summary}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {new Date(report.window_start).toLocaleString()} –{' '}
+                        {new Date(report.window_end).toLocaleString()} ·{' '}
+                        {report.visitors.length} visitors assessed ·{' '}
+                        {report.events_considered} events considered
+                        {report.model ? ` · ${report.model}` : ''}
                       </p>
-                    )}
-                    {preview && (
-                      <p className="text-sm text-muted-foreground">
-                        Preview only. This sample is not stored as your daily
-                        report.
+                      <p className="text-xs text-muted-foreground">
+                        AI interpretation of observed activity, not confirmed
+                        intent. Category counts can overlap.
                       </p>
-                    )}
-                    {!preview &&
-                      report.settings_revision !== data.settings_revision && (
-                        <p className="text-sm text-muted-foreground">
-                          Settings have changed since this report. Run again to
-                          apply them.
+                      {report.sampled && (
+                        <p className="text-sm text-amber-700 dark:text-amber-400">
+                          Sampled report: counts cover this sample, not all
+                          traffic.
                         </p>
                       )}
-                  </div>
-                  <div
-                    className="flex flex-wrap gap-2"
-                    aria-label="Filter assessments by category"
-                  >
-                    <Button
-                      size="sm"
-                      variant={category === null ? 'default' : 'outline'}
-                      onClick={() => setCategory(null)}
+                      {preview && (
+                        <p className="text-sm text-muted-foreground">
+                          Preview only. This sample is not stored as your daily
+                          report.
+                        </p>
+                      )}
+                      {!preview &&
+                        report.settings_revision !== data.settings_revision && (
+                          <p className="text-sm text-muted-foreground">
+                            Settings have changed since this report. Run again
+                            to apply them.
+                          </p>
+                        )}
+                    </div>
+                    <div
+                      className="flex flex-wrap gap-2"
+                      aria-label="Filter assessments by category"
                     >
-                      All ({report.visitors.length})
-                    </Button>
-                    {categories.map((name) => (
                       <Button
-                        key={name}
                         size="sm"
-                        variant={category === name ? 'default' : 'outline'}
-                        onClick={() => setCategory(name)}
+                        variant={category === null ? 'default' : 'outline'}
+                        onClick={() => setCategory(null)}
                       >
-                        {name} (
-                        {
-                          report.visitors.filter((visitor) =>
-                            visitor.categories.includes(name)
-                          ).length
-                        }
-                        )
+                        All ({report.visitors.length})
                       </Button>
-                    ))}
-                  </div>
-                  <div className="divide-y">
-                    {visitors.map((visitor) => (
-                      <article
-                        key={visitor.visitor_id}
-                        className="space-y-3 py-4"
-                      >
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Link
-                            className="font-medium underline underline-offset-4"
-                            to={`/projects/${project.slug}/analytics/visitors/${visitor.visitor_id}`}
-                          >
-                            Visitor #{visitor.visitor_id}
-                          </Link>
-                          {visitor.categories.map((name) => (
-                            <Badge key={name} variant="secondary">
-                              {name}
-                            </Badge>
-                          ))}
-                        </div>
-                        <p className="text-sm">{visitor.explanation}</p>
-                        <details className="text-sm">
-                          <summary className="cursor-pointer text-muted-foreground">
-                            Supporting activity ({visitor.evidence.length})
-                          </summary>
-                          <ol className="mt-2 space-y-2 border-l pl-4">
-                            {visitor.evidence.map((event) => (
-                              <li key={event.reference} className="break-words">
-                                <span className="font-medium">
-                                  {event.event}
-                                </span>{' '}
-                                · {event.path}
-                                {event.title && ` — ${event.title}`}
-                                <br />
-                                <span className="text-xs text-muted-foreground">
-                                  {new Date(event.timestamp).toLocaleString()}
-                                  {event.properties
-                                    .map(
-                                      (property) =>
-                                        ` · ${property.key}: ${property.value}`
-                                    )
-                                    .join('')}
-                                </span>
-                              </li>
+                      {categories.map((name) => (
+                        <Button
+                          key={name}
+                          size="sm"
+                          variant={category === name ? 'default' : 'outline'}
+                          onClick={() => setCategory(name)}
+                        >
+                          {name} (
+                          {
+                            report.visitors.filter((visitor) =>
+                              visitor.categories.includes(name)
+                            ).length
+                          }
+                          )
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="divide-y">
+                      {visitors.map((visitor) => (
+                        <article
+                          key={visitor.visitor_id}
+                          className="space-y-3 py-4"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Link
+                              className="font-medium underline underline-offset-4"
+                              to={`/projects/${project.slug}/analytics/visitors/${visitor.visitor_id}`}
+                            >
+                              Visitor #{visitor.visitor_id}
+                            </Link>
+                            {visitor.categories.map((name) => (
+                              <Badge key={name} variant="secondary">
+                                {name}
+                              </Badge>
                             ))}
-                          </ol>
-                        </details>
-                      </article>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-          </section>
+                          </div>
+                          <p className="text-sm">{visitor.explanation}</p>
+                          <details className="text-sm">
+                            <summary className="cursor-pointer text-muted-foreground">
+                              Supporting activity ({visitor.evidence.length})
+                            </summary>
+                            <ol className="mt-2 space-y-2 border-l pl-4">
+                              {visitor.evidence.map((event) => (
+                                <li
+                                  key={event.reference}
+                                  className="break-words"
+                                >
+                                  <span className="font-medium">
+                                    {event.event}
+                                  </span>{' '}
+                                  · {event.path}
+                                  {event.title && ` — ${event.title}`}
+                                  <br />
+                                  <span className="text-xs text-muted-foreground">
+                                    {new Date(event.timestamp).toLocaleString()}
+                                    {event.properties
+                                      .map(
+                                        (property) =>
+                                          ` · ${property.key}: ${property.value}`
+                                      )
+                                      .join('')}
+                                  </span>
+                                </li>
+                              ))}
+                            </ol>
+                          </details>
+                        </article>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            </section>
+          )}
         </>
       )}
     </div>
@@ -415,6 +421,10 @@ function ActivitySettingsForm({
     share_activity_with_ai: shareActivity,
     daily_enabled: dailyEnabled,
   }
+  const [editing, setEditing] = useState(false)
+  useEffect(() => {
+    if (editing) form.setFocus('application_context')
+  }, [editing, form])
   const [hasSetup, setHasSetup] = useState(status.settings_revision > 0)
   const preview = useMutation({
     ...previewActivityReportMutation(),
@@ -478,6 +488,8 @@ function ActivitySettingsForm({
           form.setValue('source_domain', domain, { shouldDirty: true })
         }}
         configured={status.configured}
+        aiProvider={status.ai_provider ?? null}
+        aiModel={status.ai_model ?? null}
         disabled={busy}
         onSelect={(goal) => {
           form.setValue('application_context', goal.goal, {
@@ -486,335 +498,347 @@ function ActivitySettingsForm({
           setHasSetup(false)
           onPreview(null)
           preview.reset()
-          form.setFocus('application_context')
+          setEditing(true)
         }}
       />
-      <form
-        className="space-y-5"
-        onSubmit={form.handleSubmit((data) => {
-          if (!canPreview) return
-          onPreview(null)
-          preview.mutate({
-            path: { project_id: projectId },
-            body: {
-              environment_id: data.environment_id,
-              source_url: data.source_url,
-              source_domain: data.source_domain,
-              goal: data.application_context,
-              property_keys: properties(data.propertyKeys),
-              share_activity_with_ai: data.share_activity_with_ai,
-            },
-          })
-        })}
-        onChange={() => {
-          onPreview(null)
-          preview.reset()
-        }}
+      <details
+        open={editing}
+        onToggle={(event) => setEditing(event.currentTarget.open)}
       >
-        <fieldset disabled={busy} className="space-y-5 disabled:opacity-60">
-          <div className="space-y-2">
-            <Label htmlFor="activity-context">
-              What do you want to understand?
-            </Label>
-            <Textarea
-              id="activity-context"
-              rows={4}
-              maxLength={4000}
-              {...form.register('application_context', {
-                onChange: () => setHasSetup(false),
-              })}
-              placeholder="e.g. Which visitors are exploring our product, and who needs help?"
-              aria-invalid={!!form.formState.errors.application_context}
-              aria-describedby={
-                form.formState.errors.application_context
-                  ? 'activity-goal-help'
-                  : undefined
-              }
-            />
-            {form.formState.errors.application_context && (
-              <p
-                id="activity-goal-help"
-                role="alert"
-                className="text-sm text-destructive"
-              >
-                {form.formState.errors.application_context.message}
-              </p>
-            )}
-          </div>
-          {hasSetup && (
+        <summary className="cursor-pointer text-sm text-muted-foreground">
+          Report settings
+        </summary>
+        <form
+          className="mt-4 space-y-5"
+          onSubmit={form.handleSubmit((data) => {
+            if (!canPreview) return
+            onPreview(null)
+            preview.mutate({
+              path: { project_id: projectId },
+              body: {
+                environment_id: data.environment_id,
+                source_url: data.source_url,
+                source_domain: data.source_domain,
+                goal: data.application_context,
+                property_keys: properties(data.propertyKeys),
+                share_activity_with_ai: data.share_activity_with_ai,
+              },
+            })
+          })}
+          onChange={() => {
+            onPreview(null)
+            preview.reset()
+          }}
+        >
+          <fieldset disabled={busy} className="space-y-5 disabled:opacity-60">
             <div className="space-y-2">
-              <p className="text-sm font-medium">Categories</p>
-              <div className="flex flex-wrap gap-2">
-                {values.categories.map((category, index) => (
-                  <Badge
-                    key={index}
-                    variant="secondary"
-                    title={category.description}
-                  >
-                    {category.name}
-                  </Badge>
-                ))}
-                <Badge variant="outline">Insufficient evidence</Badge>
-              </div>
+              <Label htmlFor="activity-context">
+                What do you want to understand?
+              </Label>
+              <Textarea
+                id="activity-context"
+                rows={4}
+                maxLength={4000}
+                {...form.register('application_context', {
+                  onChange: () => setHasSetup(false),
+                })}
+                placeholder="e.g. Which visitors are exploring our product, and who needs help?"
+                aria-invalid={!!form.formState.errors.application_context}
+                aria-describedby={
+                  form.formState.errors.application_context
+                    ? 'activity-goal-help'
+                    : undefined
+                }
+              />
+              {form.formState.errors.application_context && (
+                <p
+                  id="activity-goal-help"
+                  role="alert"
+                  className="text-sm text-destructive"
+                >
+                  {form.formState.errors.application_context.message}
+                </p>
+              )}
             </div>
-          )}
-          <details>
-            <summary className="cursor-pointer text-sm font-medium">
-              Advanced settings
-            </summary>
-            {(environments.length !== 1 || environmentError) && (
-              <div className="mt-4">
-                <div className="space-y-2">
-                  <Label htmlFor="activity-environment">Environment</Label>
-                  {environmentLoading ? (
-                    <Skeleton className="h-10 w-full" />
-                  ) : (
-                    <Select
-                      value={selectedEnvironment?.toString() ?? ''}
-                      disabled={busy || environments.length === 0}
-                      onValueChange={(value) => {
-                        const id = Number(value)
-                        form.setValue('environment_id', id, {
-                          shouldDirty: true,
-                        })
-                        form.setValue('source_domain', null, {
-                          shouldDirty: true,
-                        })
-                        onPreview(null)
-                        preview.reset()
-                        onEnvironmentChange(id)
-                      }}
+            {hasSetup && (
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Categories</p>
+                <div className="flex flex-wrap gap-2">
+                  {values.categories.map((category, index) => (
+                    <Badge
+                      key={index}
+                      variant="secondary"
+                      title={category.description}
                     >
-                      <SelectTrigger id="activity-environment">
-                        <SelectValue placeholder="Choose an environment" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {environments.map((item) => (
-                          <SelectItem key={item.id} value={String(item.id)}>
-                            {item.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
-                  {environmentError && (
-                    <p role="alert" className="text-sm text-destructive">
-                      Could not load environments. Refresh the page to try
-                      again.
-                    </p>
-                  )}
-                  {!environmentLoading &&
-                    !environmentError &&
-                    environments.length === 0 && (
-                      <p className="text-sm text-muted-foreground">
-                        Create an environment before setting up an activity
-                        report.
-                      </p>
-                    )}
-                  {activityLoading && (
-                    <p role="status" className="text-sm text-muted-foreground">
-                      Checking recent activity…
-                    </p>
-                  )}
+                      {category.name}
+                    </Badge>
+                  ))}
+                  <Badge variant="outline">Insufficient evidence</Badge>
                 </div>
               </div>
             )}
-            <div className="mt-4 space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="activity-properties">
-                  Custom event property keys (optional)
-                </Label>
-                <Input
-                  id="activity-properties"
-                  {...form.register('propertyKeys')}
-                  placeholder="plan, content_topic, setup_step"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Comma-separated, up to 10. Only these property values are
-                  shared. Avoid personal information and secrets.
-                </p>
-              </div>
-              {hasSetup && (
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    Edit these categories and save to use your changes.
-                    Previewing again generates new categories from your
-                    description.
-                  </p>
-                  {fields.map((field, index) => (
-                    <div
-                      key={field.id}
-                      className="grid items-start gap-2 sm:grid-cols-[1fr_2fr_auto]"
-                    >
-                      <Input
-                        aria-label={`Category ${index + 1} name`}
-                        maxLength={60}
-                        {...form.register(`categories.${index}.name`)}
-                      />
-                      <Textarea
-                        aria-label={`Category ${index + 1} definition`}
-                        maxLength={500}
-                        rows={2}
-                        {...form.register(`categories.${index}.description`)}
-                      />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        disabled={fields.length === 1}
-                        aria-label={`Remove category ${index + 1}`}
-                        onClick={() => {
-                          remove(index)
+            <details>
+              <summary className="cursor-pointer text-sm font-medium">
+                Advanced settings
+              </summary>
+              {(environments.length !== 1 || environmentError) && (
+                <div className="mt-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="activity-environment">Environment</Label>
+                    {environmentLoading ? (
+                      <Skeleton className="h-10 w-full" />
+                    ) : (
+                      <Select
+                        value={selectedEnvironment?.toString() ?? ''}
+                        disabled={busy || environments.length === 0}
+                        onValueChange={(value) => {
+                          const id = Number(value)
+                          form.setValue('environment_id', id, {
+                            shouldDirty: true,
+                          })
+                          form.setValue('source_domain', null, {
+                            shouldDirty: true,
+                          })
                           onPreview(null)
+                          preview.reset()
+                          onEnvironmentChange(id)
                         }}
                       >
-                        Remove
-                      </Button>
-                    </div>
-                  ))}
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={fields.length >= 8}
-                    onClick={() => {
-                      append({ name: '', description: '' })
-                      onPreview(null)
-                    }}
-                  >
-                    Add category
-                  </Button>
+                        <SelectTrigger id="activity-environment">
+                          <SelectValue placeholder="Choose an environment" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {environments.map((item) => (
+                            <SelectItem key={item.id} value={String(item.id)}>
+                              {item.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    {environmentError && (
+                      <p role="alert" className="text-sm text-destructive">
+                        Could not load environments. Refresh the page to try
+                        again.
+                      </p>
+                    )}
+                    {!environmentLoading &&
+                      !environmentError &&
+                      environments.length === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          Create an environment before setting up an activity
+                          report.
+                        </p>
+                      )}
+                    {activityLoading && (
+                      <p
+                        role="status"
+                        className="text-sm text-muted-foreground"
+                      >
+                        Checking recent activity…
+                      </p>
+                    )}
+                  </div>
                 </div>
               )}
-              {status.settings_revision > 0 && (
-                <label className="flex items-center gap-3 text-sm">
-                  <Controller
-                    control={form.control}
-                    name="daily_enabled"
-                    render={({ field }) => (
-                      <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
-                        onBlur={field.onBlur}
-                        ref={field.ref}
-                        disabled={!values.share_activity_with_ai}
-                      />
-                    )}
+              <div className="mt-4 space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="activity-properties">
+                    Custom event property keys (optional)
+                  </Label>
+                  <Input
+                    id="activity-properties"
+                    {...form.register('propertyKeys')}
+                    placeholder="plan, content_topic, setup_step"
                   />
-                  Run automatically every 24 hours
-                </label>
-              )}
-            </div>
-          </details>
-          <div className="space-y-2">
-            <label className="flex items-start gap-3 text-sm">
-              <Controller
-                control={form.control}
-                name="share_activity_with_ai"
-                render={({ field }) => (
-                  <Switch
-                    className="mt-0.5"
-                    checked={field.value}
-                    onBlur={field.onBlur}
-                    ref={field.ref}
-                    onCheckedChange={(checked) => {
-                      field.onChange(checked)
-                      if (!checked) form.setValue('daily_enabled', false)
-                      onPreview(null)
-                      preview.reset()
-                    }}
-                  />
+                  <p className="text-xs text-muted-foreground">
+                    Comma-separated, up to 10. Only these property values are
+                    shared. Avoid personal information and secrets.
+                  </p>
+                </div>
+                {hasSetup && (
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                      Edit these categories and save to use your changes.
+                      Previewing again generates new categories from your
+                      description.
+                    </p>
+                    {fields.map((field, index) => (
+                      <div
+                        key={field.id}
+                        className="grid items-start gap-2 sm:grid-cols-[1fr_2fr_auto]"
+                      >
+                        <Input
+                          aria-label={`Category ${index + 1} name`}
+                          maxLength={60}
+                          {...form.register(`categories.${index}.name`)}
+                        />
+                        <Textarea
+                          aria-label={`Category ${index + 1} definition`}
+                          maxLength={500}
+                          rows={2}
+                          {...form.register(`categories.${index}.description`)}
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          disabled={fields.length === 1}
+                          aria-label={`Remove category ${index + 1}`}
+                          onClick={() => {
+                            remove(index)
+                            onPreview(null)
+                          }}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ))}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={fields.length >= 8}
+                      onClick={() => {
+                        append({ name: '', description: '' })
+                        onPreview(null)
+                      }}
+                    >
+                      Add category
+                    </Button>
+                  </div>
                 )}
-              />
-              <span>Share visitor activity with my AI provider.</span>
-            </label>
-            <details className="text-xs text-muted-foreground">
-              <summary className="cursor-pointer">What’s shared?</summary>
-              <p className="mt-2">
-                Your goal, categories, page paths and titles, events,
-                timestamps, and selected properties. These may contain personal
-                information. Visitor IDs, IP addresses, and URL query strings
-                are excluded.
-              </p>
+                {status.settings_revision > 0 && (
+                  <label className="flex items-center gap-3 text-sm">
+                    <Controller
+                      control={form.control}
+                      name="daily_enabled"
+                      render={({ field }) => (
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                          onBlur={field.onBlur}
+                          ref={field.ref}
+                          disabled={!values.share_activity_with_ai}
+                        />
+                      )}
+                    />
+                    Run automatically every 24 hours
+                  </label>
+                )}
+              </div>
             </details>
-          </div>
-          {preview.isError && (
-            <Alert variant="destructive">
-              <AlertDescription>
-                {errorMessage(preview.error)} Your saved setup has not changed.
-              </AlertDescription>
-            </Alert>
-          )}
-          {!activityLoading && !status.has_recent_activity && (
-            <p className="text-sm text-muted-foreground">
-              No visitor activity in the last 24 hours.
-            </p>
-          )}
-          <div className="flex flex-wrap gap-2">
-            {canPreview && (
-              <Button
-                type="submit"
-                disabled={!status.configured || !values.share_activity_with_ai}
-              >
-                {preview.isPending ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : (
-                  <Sparkles className="mr-2 h-4 w-4" />
-                )}
-                {preview.isPending
-                  ? 'Preparing preview…'
-                  : 'Preview my visitors'}
-              </Button>
+            <div className="space-y-2">
+              <label className="flex items-start gap-3 text-sm">
+                <Controller
+                  control={form.control}
+                  name="share_activity_with_ai"
+                  render={({ field }) => (
+                    <Switch
+                      className="mt-0.5"
+                      checked={field.value}
+                      onBlur={field.onBlur}
+                      ref={field.ref}
+                      onCheckedChange={(checked) => {
+                        field.onChange(checked)
+                        if (!checked) form.setValue('daily_enabled', false)
+                        onPreview(null)
+                        preview.reset()
+                      }}
+                    />
+                  )}
+                />
+                <span>Share visitor activity with my AI provider.</span>
+              </label>
+              <details className="text-xs text-muted-foreground">
+                <summary className="cursor-pointer">What’s shared?</summary>
+                <p className="mt-2">
+                  Your goal, categories, page paths and titles, events,
+                  timestamps, and selected properties. These may contain
+                  personal information. Visitor IDs, IP addresses, and URL query
+                  strings are excluded.
+                </p>
+              </details>
+            </div>
+            {preview.isError && (
+              <Alert variant="destructive">
+                <AlertDescription>
+                  {errorMessage(preview.error)} Your saved setup has not
+                  changed.
+                </AlertDescription>
+              </Alert>
             )}
-            {hasSetup && (
+            {!activityLoading && !status.has_recent_activity && (
+              <p className="text-sm text-muted-foreground">
+                No visitor activity in the last 24 hours.
+              </p>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {canPreview && (
+                <Button
+                  type="submit"
+                  disabled={
+                    !status.configured || !values.share_activity_with_ai
+                  }
+                >
+                  {preview.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-2 h-4 w-4" />
+                  )}
+                  {preview.isPending
+                    ? 'Preparing preview…'
+                    : 'Preview my visitors'}
+                </Button>
+              )}
+              {hasSetup &&
+                !values.daily_enabled &&
+                (preview.isSuccess || status.report != null) && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={
+                      !status.configured ||
+                      !values.share_activity_with_ai ||
+                      selectedEnvironment == null
+                    }
+                    onClick={() => saveSetup(true)}
+                  >
+                    Enable daily reports
+                  </Button>
+                )}
               <Button
                 type="button"
-                variant="outline"
-                disabled={
-                  !status.configured ||
-                  !values.share_activity_with_ai ||
-                  selectedEnvironment == null
+                variant="ghost"
+                disabled={selectedEnvironment == null}
+                onClick={() =>
+                  saveSetup(
+                    status.settings_revision > 0 && values.daily_enabled
+                  )
                 }
-                onClick={() => saveSetup(true)}
               >
-                Enable daily reports
+                {save.isPending
+                  ? 'Saving…'
+                  : status.settings_revision > 0
+                    ? 'Save settings'
+                    : hasSetup
+                      ? 'Save for manual reports'
+                      : 'Save setup'}
               </Button>
+            </div>
+            {preview.isPending && (
+              <p role="status" className="text-sm text-muted-foreground">
+                Analyzing recent activity…
+              </p>
             )}
-            <Button
-              type="button"
-              variant="ghost"
-              disabled={selectedEnvironment == null}
-              onClick={() =>
-                saveSetup(status.settings_revision > 0 && values.daily_enabled)
-              }
-            >
-              {save.isPending
-                ? 'Saving…'
-                : status.settings_revision > 0
-                  ? 'Save settings'
-                  : hasSetup
-                    ? 'Save for manual reports'
-                    : 'Save setup'}
-            </Button>
-          </div>
-          {preview.isPending && (
-            <p role="status" className="text-sm text-muted-foreground">
-              Analyzing recent activity…
-            </p>
-          )}
-        </fieldset>
-      </form>
+          </fieldset>
+        </form>
+      </details>
     </section>
   )
 }
 
 const discoverySchema = z.object({
   url: z.string().url('Enter the public URL of your application.').max(2048),
-  share: z
-    .boolean()
-    .refine(
-      (value) => value,
-      'Allow sharing public content to generate suggestions.'
-    ),
 })
 type DiscoveryForm = z.infer<typeof discoverySchema>
 
@@ -825,6 +849,8 @@ function GoalSuggestions({
   sourceDomain,
   onSourceChange,
   configured,
+  aiProvider,
+  aiModel,
   disabled,
   onSelect,
 }: {
@@ -834,6 +860,8 @@ function GoalSuggestions({
   sourceDomain: string | null
   onSourceChange: (url: string | null, domain: string | null) => void
   configured: boolean
+  aiProvider: string | null
+  aiModel: string | null
   disabled: boolean
   onSelect: (goal: ActivityGoal) => void
 }) {
@@ -845,10 +873,8 @@ function GoalSuggestions({
   })
   const form = useForm<DiscoveryForm>({
     resolver: zodResolver(discoverySchema),
-    defaultValues: { url: '', share: false },
+    defaultValues: { url: '' },
   })
-  const [selectedGoal, setSelectedGoal] = useState<string | null>(null)
-  const [open, setOpen] = useState(true)
   const [requestedUrl, setRequestedUrl] = useState<string | null>(null)
   const selectedDomain = domains.data?.find(
     (domain) => domain.domain === sourceDomain
@@ -862,23 +888,12 @@ function GoalSuggestions({
   }, [resolvedUrl, form])
   const suggest = useMutation({
     ...suggestActivityGoalsMutation(),
-    onSuccess: () => {
-      setSelectedGoal(null)
-      toast.success('Choose a goal to adapt')
-    },
+
     onError: (error) => toast.error(errorMessage(error)),
   })
   return (
-    <details
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-      className="space-y-4"
-    >
-      <summary className="cursor-pointer font-medium">
-        Discover goals from your app
-        {selectedGoal ? ` · ${selectedGoal}` : ''}
-      </summary>
-      <div className="mt-4 space-y-4">
+    <section aria-label="Website analysis">
+      <div className="space-y-4">
         <form
           className="space-y-3"
           onSubmit={form.handleSubmit((data) => {
@@ -887,7 +902,7 @@ function GoalSuggestions({
               path: { project_id: projectId },
               body: {
                 url: data.url,
-                share_with_ai: data.share,
+                share_with_ai: true,
                 environment_id: environment?.id,
               },
             })
@@ -909,7 +924,6 @@ function GoalSuggestions({
                     value !== 'primary' && value !== 'custom' ? value : null
                   )
                   suggest.reset()
-                  setSelectedGoal(null)
                 }}
               >
                 <SelectTrigger id="activity-website">
@@ -964,45 +978,24 @@ function GoalSuggestions({
                 )}
               </div>
             )}
-            <label className="flex items-start gap-3 text-sm">
-              <Controller
-                control={form.control}
-                name="share"
-                render={({ field }) => (
-                  <Switch
-                    className="mt-0.5"
-                    checked={field.value}
-                    onCheckedChange={field.onChange}
-                    onBlur={field.onBlur}
-                    ref={field.ref}
-                  />
-                )}
-              />
-              <span>
-                Share public pages and event names with my AI provider.
-              </span>
-            </label>
-            {form.formState.errors.share && (
-              <p role="alert" className="text-sm text-destructive">
-                {form.formState.errors.share.message}
-              </p>
+            {configured && (
+              <div className="space-y-1 text-xs text-muted-foreground">
+                <p>
+                  {aiProvider ?? 'Configured AI provider'} ·{' '}
+                  {aiModel ?? 'Model unavailable'}
+                </p>
+                <p>
+                  Analyze website sends public pages and event names to this
+                  provider.
+                </p>
+              </div>
             )}
             <div className="flex flex-wrap gap-2">
               <Button
                 type="submit"
                 disabled={!configured || !environment || !resolvedUrl}
               >
-                {suggest.isPending ? 'Reading your app…' : 'Suggest goals'}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => {
-                  setOpen(false)
-                  document.getElementById('activity-context')?.focus()
-                }}
-              >
-                Write my own goal
+                {suggest.isPending ? 'Analyzing website…' : 'Analyze website'}
               </Button>
             </div>
           </fieldset>
@@ -1020,17 +1013,16 @@ function GoalSuggestions({
         {suggest.isError && (
           <Alert variant="destructive">
             <AlertDescription>
-              Could not read the public site or generate goals. Use the final
-              public URL if it redirects, or write your own goal below. Your
-              saved setup has not changed.
+              Could not analyze this website. Try its final public URL, or enter
+              a goal in Report settings.
             </AlertDescription>
           </Alert>
         )}
         {suggest.data && (
           <div className="space-y-3">
-            <p className="text-sm font-medium">Choose a starting point</p>
+            <p className="text-sm font-medium">Suggested goals</p>
             <p className="break-all text-xs text-muted-foreground">
-              Suggestions for {requestedUrl}
+              Based on {requestedUrl}
             </p>
             {suggest.data.goals.map((goal) => (
               <button
@@ -1039,8 +1031,6 @@ function GoalSuggestions({
                 disabled={disabled}
                 className="block w-full rounded-lg border p-4 text-left hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 onClick={() => {
-                  setSelectedGoal(goal.title)
-                  setOpen(false)
                   onSelect(goal)
                 }}
               >
@@ -1069,6 +1059,6 @@ function GoalSuggestions({
           </div>
         )}
       </div>
-    </details>
+    </section>
   )
 }

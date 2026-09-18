@@ -312,6 +312,10 @@ impl ActivityService {
                 false,
             )
             .await?;
+        let ai_route = self
+            .ai
+            .route_metadata(Some("gateway"), Some(project_id), None)
+            .await;
         let mut status = ActivityStatus {
             has_recent_activity: match selected_environment_id {
                 Some(id) => self.has_recent_activity(project_id, id).await?,
@@ -319,6 +323,8 @@ impl ActivityService {
             },
             selected_environment_id,
             configured: self.ai.is_available_for(Some("gateway")).await,
+            ai_provider: ai_route.as_ref().map(|route| route.provider.clone()),
+            ai_model: ai_route.map(|route| route.model),
             setup_url: "/settings/ai-providers".into(),
             settings: saved_settings,
             settings_revision: 0,
@@ -953,6 +959,17 @@ mod tests {
         }
         async fn is_available(&self) -> bool {
             self.available
+        }
+        async fn route_metadata(
+            &self,
+            _: Option<&str>,
+            _: Option<i32>,
+            _: Option<&str>,
+        ) -> Option<temps_ai::AiRouteMetadata> {
+            self.available.then(|| temps_ai::AiRouteMetadata {
+                provider: "Test Provider".into(),
+                model: "test-model".into(),
+            })
         }
         async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
             if self.fail {
@@ -1683,6 +1700,8 @@ mod tests {
         svc.save(1, config.clone()).await.unwrap();
         let initial = svc.status(1, None).await.unwrap();
         assert!(initial.configured);
+        assert_eq!(initial.ai_provider.as_deref(), Some("Test Provider"));
+        assert_eq!(initial.ai_model.as_deref(), Some("test-model"));
         assert!(initial.has_recent_activity);
         assert_eq!(initial.settings.environment_id, Some(1));
         assert_eq!(initial.settings.source_url, config.source_url);

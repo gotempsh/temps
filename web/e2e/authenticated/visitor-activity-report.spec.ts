@@ -1,7 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
+
+async function openSettings(page: Page) {
+  if (
+    !(await page
+      .getByRole('textbox', {
+        name: 'What do you want to understand?',
+        exact: true,
+      })
+      .isVisible())
+  ) {
+    await page.getByText('Report settings', { exact: true }).click()
+  }
+}
 
 const environmentFixtures = [
   {
@@ -100,6 +113,8 @@ for (const width of [390, 1280]) {
           await route.fulfill({
             json: {
               configured: true,
+              ai_provider: 'OpenRouter',
+              ai_model: 'deepseek/test-model',
               has_recent_activity: true,
               selected_environment_id: 1,
               setup_url: '/settings/ai-providers',
@@ -199,7 +214,16 @@ for (const width of [390, 1280]) {
       ).toHaveAttribute('aria-current', 'page')
     await expect(
       page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeDisabled()
+    ).toHaveCount(0)
+    await expect(
+      page.getByRole('textbox', {
+        name: 'What do you want to understand?',
+        exact: true,
+      })
+    ).toBeHidden()
+    await expect(
+      page.getByRole('button', { name: 'Enable daily reports' })
+    ).toHaveCount(0)
     await expect(page.getByLabel('Public application URL')).toHaveCount(0)
     await expect(
       page.getByRole('combobox', { name: 'Environment', exact: true })
@@ -207,9 +231,14 @@ for (const width of [390, 1280]) {
     await expect(
       page.getByRole('list', { name: 'Activity report setup steps' })
     ).toHaveCount(0)
-    await page.getByRole('switch', { name: /Share public pages/ }).check()
+    await expect(
+      page.getByText('OpenRouter · deepseek/test-model', { exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('switch', { name: /Share public pages/ })
+    ).toHaveCount(0)
     await page
-      .getByRole('button', { name: 'Suggest goals', exact: true })
+      .getByRole('button', { name: 'Analyze website', exact: true })
       .click()
     await expect(
       page.getByText('Why this fits: Your site has installation documentation.')
@@ -271,6 +300,7 @@ for (const width of [390, 1280]) {
       name: 'Run automatically every 24 hours',
     })
     for (const dailyEnabled of [true, false]) {
+      await openSettings(page)
       if (!(await dailySwitch.isVisible())) {
         await page.getByText('Advanced settings', { exact: true }).click()
       }
@@ -318,6 +348,7 @@ for (const width of [390, 1280]) {
     })
 
     // Revocation must be saveable, and must prevent future runs.
+    await openSettings(page)
     await page.getByRole('switch', { name: /Share visitor activity/ }).uncheck()
     await page
       .getByRole('button', { name: 'Save settings', exact: true })
@@ -366,6 +397,10 @@ test('activity analysis is discoverable before an AI provider is configured', as
     page.getByRole('link', { name: 'Configure AI provider', exact: true })
   ).toHaveAttribute('href', '/settings/ai-providers')
   await expect(
+    page.getByRole('button', { name: 'Analyze website', exact: true })
+  ).toBeDisabled()
+  await openSettings(page)
+  await expect(
     page.getByRole('textbox', {
       name: 'What do you want to understand?',
       exact: true,
@@ -373,7 +408,7 @@ test('activity analysis is discoverable before an AI provider is configured', as
   ).toBeVisible()
   await expect(
     page.getByRole('button', { name: 'Run saved settings' })
-  ).toBeDisabled()
+  ).toHaveCount(0)
 })
 
 for (const width of [390, 1280]) {
@@ -392,6 +427,8 @@ for (const width of [390, 1280]) {
         route.fulfill({
           json: {
             configured: true,
+            ai_provider: 'OpenRouter',
+            ai_model: 'deepseek/test-model',
             has_recent_activity: hasActivity,
             selected_environment_id: 1,
             setup_url: '/settings/ai-providers',
@@ -420,7 +457,43 @@ for (const width of [390, 1280]) {
         return route.fulfill({ status: 500 })
       }
     )
+    await page.route(
+      `**/api/projects/${project.id}/analytics/activity/goals`,
+      (route) =>
+        route.fulfill({
+          json: {
+            model: 'test-model',
+            pages_read: ['https://example.com'],
+            goals: [
+              {
+                title: 'Documentation interest',
+                goal: 'Understand documentation readers',
+                rationale: 'The website has guides.',
+                missing_signals: 'Track article reads.',
+              },
+            ],
+          },
+        })
+    )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
+    await expect(
+      page.getByRole('textbox', {
+        name: 'What do you want to understand?',
+        exact: true,
+      })
+    ).toBeHidden()
+    await page
+      .getByRole('button', { name: 'Analyze website', exact: true })
+      .click()
+    await expect(
+      page.getByText('Suggested goals', { exact: true })
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: /Documentation interest/ })
+    ).toBeVisible()
+    expect(previewCalls).toBe(0)
+    await page.screenshot({ path: `/tmp/temps-website-results-${width}.png` })
+    await openSettings(page)
     await expect(
       page.getByText('No visitor activity in the last 24 hours.', {
         exact: true,
@@ -451,12 +524,13 @@ for (const width of [390, 1280]) {
     })
     hasActivity = true
     await page.reload()
+    await openSettings(page)
     await expect(
       page.getByRole('button', { name: 'Preview my visitors' })
     ).toBeEnabled()
     await expect(
       page.getByRole('button', { name: 'Run saved settings' })
-    ).toBeEnabled()
+    ).toHaveCount(0)
     await expect(
       page.getByText('No visitor activity in the last 24 hours.', {
         exact: true,
@@ -499,6 +573,8 @@ for (const width of [390, 1280]) {
         await route.fulfill({
           json: {
             configured: true,
+            ai_provider: 'OpenRouter',
+            ai_model: 'deepseek/test-model',
             has_recent_activity: id === 1,
             selected_environment_id: id,
             setup_url: '/settings/ai-providers',
@@ -523,7 +599,12 @@ for (const width of [390, 1280]) {
       name: 'Public application URL',
       exact: true,
     })
+    await expect(
+      page.getByRole('button', { name: 'Analyze website', exact: true })
+    ).toBeVisible()
     await expect(environment).toBeHidden()
+    await page.screenshot({ path: `/tmp/temps-website-first-${width}.png` })
+    await openSettings(page)
     await page.getByText('Advanced settings', { exact: true }).click()
     await expect(environment).toContainText('Production')
     await expect(url).toHaveCount(0)
@@ -552,6 +633,7 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: 'Preview my visitors' })
     ).toBeEnabled()
     const save = async () => {
+      await openSettings(page)
       const response = page.waitForResponse(
         (r) =>
           r.url().endsWith('/analytics/activity') &&

@@ -192,6 +192,12 @@ pub enum AiError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiRouteMetadata {
+    pub provider: String,
+    pub model: String,
+}
+
 /// The governed AI capability. Object-safe so it can be registered and resolved
 /// as `Arc<dyn AiService>` through the plugin DI.
 ///
@@ -208,6 +214,17 @@ pub trait AiService: Send + Sync {
     /// Provider-aware availability for a resource pinned to an immutable route.
     async fn is_available_for(&self, _provider: Option<&str>) -> bool {
         self.is_available().await
+    }
+
+    /// Resolve the provider and model an internal completion would use without
+    /// making a model request or exposing credential material.
+    async fn route_metadata(
+        &self,
+        _provider: Option<&str>,
+        _project_id: Option<i32>,
+        _model: Option<&str>,
+    ) -> Option<AiRouteMetadata> {
+        None
     }
 
     /// Cheap gate for the multi-turn tool-calling workload specifically

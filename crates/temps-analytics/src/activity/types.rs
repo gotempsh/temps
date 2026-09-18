@@ -159,6 +159,8 @@ pub struct ActivityStatus {
     pub has_recent_activity: bool,
     pub selected_environment_id: Option<i32>,
     pub configured: bool,
+    pub ai_provider: Option<String>,
+    pub ai_model: Option<String>,
     pub setup_url: String,
     pub settings: ActivitySettings,
     pub settings_revision: i32,

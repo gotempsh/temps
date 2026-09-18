@@ -17,11 +17,12 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOr
 use tracing::debug;
 
 use temps_ai::{
-    AiError, AiRequest, AiResponse, AiService, ChatMessage, ChatStreamDelta, ChatTool,
-    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, ProviderCapabilities, RefreshPolicy,
-    TokenStream, ToolCall,
+    AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, ChatMessage, ChatStreamDelta,
+    ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, ProviderCapabilities,
+    RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::providers::route_model_to_provider;
 use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
@@ -397,6 +398,44 @@ impl AiService for GatewayAiService {
                 .await,
             Ok(Some(key)) if key.is_active
         )
+    }
+
+    async fn route_metadata(
+        &self,
+        provider: Option<&str>,
+        project_id: Option<i32>,
+        explicit_model: Option<&str>,
+    ) -> Option<AiRouteMetadata> {
+        let route = Self::route_override(provider, "route.metadata").ok()?;
+        let model = self.resolve_model(project_id, explicit_model).await?;
+        if model == "temps-cloud" {
+            self.gateway.managed_model().await?;
+            return Some(AiRouteMetadata {
+                provider: "Temps Cloud".into(),
+                model,
+            });
+        }
+        let provider_id = route_model_to_provider(&model)?;
+        let key = if let Some(key_id) = route.system_key_id {
+            temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .filter(|key| key.is_active && key.provider == provider_id)
+        } else {
+            temps_entities::ai_provider_keys::Entity::find()
+                .filter(temps_entities::ai_provider_keys::Column::Provider.eq(provider_id))
+                .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()
+        }?;
+        Some(AiRouteMetadata {
+            provider: key.display_name,
+            model,
+        })
     }
 
     async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
@@ -1057,6 +1096,36 @@ mod tests {
         let svc = service_over(db);
         let model = svc.resolve_model(Some(7), None).await;
         assert_eq!(model, Some("gpt-4o".to_string()));
+    }
+
+    #[tokio::test]
+    async fn route_metadata_uses_project_model_and_matching_active_provider() {
+        let mut key = active_key("anthropic");
+        key.display_name = "Production Anthropic".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![config_row(
+                "project:7",
+                Some(serde_json::json!(["claude-haiku-4-5"])),
+            )]])
+            .append_query_results(vec![vec![key]])
+            .into_connection();
+        let metadata = service_over(db)
+            .route_metadata(Some("gateway"), Some(7), None)
+            .await
+            .unwrap();
+        assert_eq!(metadata.provider, "Production Anthropic");
+        assert_eq!(metadata.model, "claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn route_metadata_failure_is_harmless() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("offline".into())])
+            .into_connection();
+        assert!(service_over(db)
+            .route_metadata(Some("gateway"), Some(7), None)
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -756,6 +756,18 @@
       },
       "ActivityStatus": {
         "properties": {
+          "ai_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "configured": {
             "type": "boolean"
           },
