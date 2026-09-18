@@ -220,6 +220,36 @@ for (const width of [390, 1280]) {
     expect(settings.property_keys).toEqual(['topic'])
     expect(settings.share_activity_with_ai).toBe(true)
     expect(settings.daily_enabled).toBe(true)
+    // Preview-generated settings must not change the operator's schedule choice.
+    const dailySwitch = page.getByRole('switch', {
+      name: 'Run automatically every 24 hours',
+    })
+    for (const dailyEnabled of [true, false]) {
+      if (!(await dailySwitch.isVisible())) {
+        await page.getByText('Advanced settings', { exact: true }).click()
+      }
+      await dailySwitch.setChecked(dailyEnabled)
+      await page
+        .getByLabel('Your application and goal', { exact: true })
+        .fill(
+          'We provide application hosting. Understand documentation readers and their next steps.'
+        )
+      await page.getByRole('button', { name: 'Preview my visitors' }).click()
+      await expect(page.getByText(report.summary)).toBeVisible()
+      await expect(dailySwitch).toBeChecked({ checked: dailyEnabled })
+      const persisted = page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`/analytics/activity`) &&
+          response.request().method() === 'PUT'
+      )
+      await page
+        .getByRole('button', { name: 'Save settings', exact: true })
+        .click()
+      expect((await persisted).request().postDataJSON().daily_enabled).toBe(
+        dailyEnabled
+      )
+      expect(settings.daily_enabled).toBe(dailyEnabled)
+    }
     await page.getByRole('button', { name: 'Run saved settings' }).click()
     await expect(page.getByText(report.summary)).toBeVisible()
     await expect(page.getByText(/Sampled report:/)).toBeVisible()

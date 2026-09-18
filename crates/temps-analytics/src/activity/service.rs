@@ -383,16 +383,20 @@ impl ActivityService {
         }
         // The persisted lease protects across console processes and restarts.
         // Manual runs are throttled too; a report consumes at most one AI call.
-        let claimed = Stored::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        let claimed = Stored::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
             "UPDATE visitor_activity_reports SET locked_until = NOW() + INTERVAL '5 minutes',
-                last_started_at = NOW(), next_run_at = NOW() + INTERVAL '24 hours', last_error = NULL
+                last_started_at = NOW(), last_error = NULL
              WHERE project_id = $1 AND revision = $2
                 AND (locked_until IS NULL OR locked_until <= NOW())
                 AND (last_started_at IS NULL OR last_started_at <= NOW() - INTERVAL '5 minutes')
                 AND (NOT $3 OR (daily_enabled AND next_run_at <= NOW())) RETURNING *",
-            [project_id.into(), saved.revision.into(), scheduled.into()]))
-            .one(self.db.as_ref()).await.map_err(|e| Self::db_error(project_id, "claim analysis", e))?
-            .ok_or(ActivityError::Busy { project_id })?;
+            [project_id.into(), saved.revision.into(), scheduled.into()],
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|e| Self::db_error(project_id, "claim analysis", e))?
+        .ok_or(ActivityError::Busy { project_id })?;
         let started = claimed
             .last_started_at
             .ok_or_else(|| analysis_error(project_id, "Missing run timestamp"))?;
@@ -417,13 +421,17 @@ impl ActivityService {
                 (None, Some("Analysis failed. Check the AI provider and retry; the previous report is preserved.".to_string()))
             }
         };
-        self.db
+        let finalized = self
+            .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE visitor_activity_reports SET locked_until = NULL, last_error = $3,
-                report = COALESCE($4, report) WHERE project_id = $1 AND last_started_at = $2",
+                "UPDATE visitor_activity_reports SET locked_until = NULL, last_error = $4,
+                report = COALESCE($5, report), next_run_at = NOW() + INTERVAL '24 hours'
+                WHERE project_id = $1 AND revision = $2 AND last_started_at = $3
+                    AND locked_until > NOW()",
                 [
                     project_id.into(),
+                    saved.revision.into(),
                     started.into(),
                     error.into(),
                     report.into(),
@@ -431,6 +439,9 @@ impl ActivityService {
             ))
             .await
             .map_err(|e| Self::db_error(project_id, "finish analysis", e))?;
+        if finalized.rows_affected() == 0 {
+            return Err(ActivityError::Busy { project_id });
+        }
         result
     }
 
@@ -745,6 +756,7 @@ mod tests {
     use super::*;
     use sea_orm::{MockDatabase, MockExecResult};
     use temps_ai::{AiError, AiResponse};
+    use tokio::sync::Notify;
 
     struct FakeAi {
         available: bool,
@@ -807,6 +819,31 @@ mod tests {
                     serde_json::json!({"summary":"Readers explored the documentation.", "visitors": visitors}),
                 ),
             })
+        }
+    }
+
+    struct BlockingAi {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiService for BlockingAi {
+        async fn chat_stream(
+            &self,
+            _: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _: AiRequest) -> Result<AiResponse, AiError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(AiError::NotAvailable)
         }
     }
     fn settings() -> ActivitySettings {
@@ -1309,6 +1346,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_rejects_finalization_after_lease_ownership_is_lost() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project(1)], vec![stored()], vec![stored()], vec![]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }]);
+        assert!(matches!(
+            service(db, true, true).run(1, false).await,
+            Err(ActivityError::Busy { project_id: 1 })
+        ));
+    }
+
+    #[tokio::test]
     async fn database_errors_are_contextual() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![project(9)]])
@@ -1381,11 +1432,51 @@ mod tests {
         let initial = svc.status(1).await.unwrap();
         assert!(initial.configured);
         assert!(initial.report.is_none());
-        let report = svc.run(1, true).await.unwrap();
+
+        // A real run interrupted after its production claim must not consume
+        // the schedule. Once the lease expires, run_due can retry it.
+        let due_before_claim = svc.stored(1).await.unwrap().unwrap().next_run_at;
+        let entered = Arc::new(Notify::new());
+        let interrupted_service = Arc::new(ActivityService::new(
+            db.clone(),
+            Arc::new(BlockingAi {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+            }),
+        ));
+        let interrupted_run = {
+            let service = interrupted_service.clone();
+            tokio::spawn(async move { service.run(1, true).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        let interrupted = svc.stored(1).await.unwrap().unwrap();
+        assert_eq!(interrupted.next_run_at, due_before_claim);
+        assert!(interrupted
+            .locked_until
+            .is_some_and(|until| until > Utc::now()));
+        interrupted_run.abort();
+        assert!(interrupted_run.await.unwrap_err().is_cancelled());
+        db.execute_unprepared(
+            "UPDATE visitor_activity_reports
+             SET locked_until = NOW() - INTERVAL '1 second',
+                 last_started_at = NOW() - INTERVAL '6 minutes'
+             WHERE project_id = 1",
+        )
+        .await
+        .unwrap();
+
+        let retry_started_at = Utc::now();
+        svc.run_due().await.unwrap();
+        let report = svc.status(1).await.unwrap().report.unwrap();
         assert_eq!(report.visitors.len(), 1);
         assert_eq!(report.visitors[0].visitor_id, 1);
         assert_eq!(report.visitors[0].evidence[0].properties[0].key, "plan");
         assert_eq!(report.model.as_deref(), Some("test-model"));
+        let after_success = svc.stored(1).await.unwrap().unwrap();
+        assert!(after_success.next_run_at > retry_started_at + chrono::Duration::hours(23));
+        assert!(after_success.next_run_at < Utc::now() + chrono::Duration::hours(25));
         assert!(matches!(
             svc.run(1, false).await,
             Err(ActivityError::Busy { .. })

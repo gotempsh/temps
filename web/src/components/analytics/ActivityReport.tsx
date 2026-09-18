@@ -374,6 +374,8 @@ function ActivitySettingsForm({
     onSuccess: (result) => {
       form.reset({
         ...result.settings,
+        // A preview suggests classification settings, not a scheduling change.
+        daily_enabled: form.getValues('daily_enabled'),
         propertyKeys: result.settings.property_keys.join(', '),
       })
       setHasSetup(true)
