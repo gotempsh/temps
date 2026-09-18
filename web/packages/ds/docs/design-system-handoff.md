@@ -80,6 +80,14 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 - **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
   stays mounted regardless of `dirty`. Reference screen: `design-system/`
   project settings form.
+- **`CardGrid`** (list, card layout): same header shape as `Ledger`
+  (title/description/actions/toolbar), a responsive grid body instead of a
+  table — one `renderCard(item)` per record, loading skeleton cards, empty
+  state, optional pagination. For record collections better shown as cards
+  than rows (e.g. `Projects.tsx`'s project grid). Does not include or
+  reimplement any specific card component — bring your own (`ProjectCard`,
+  etc.) as `renderCard`. Reference screen: `design-system/` "CardGrid —
+  Projects".
 
 ## Responsive & keyboard
 
@@ -186,3 +194,73 @@ this phase needs):
     `MetricCard` also has a raw-color progress bar, same note as
     `ServiceResourcesPanel`), `pages/Storage.tsx`. Not attempted this pass
     beyond the one migrated site and the primitive itself.
+13. Migrate the remaining embedded-table call sites onto `DataTable`
+    (`ApiKeyTable.tsx` is migrated as the first/reference example). A grep
+    for `TableHeader` outside `web/src/components/ui/table.tsx` found 56 at
+    the time of this pass (down from the ~65 counted at audit time — some
+    may already have moved under concurrent work in this worktree), roughly:
+    - **Settings sub-panels** (embedded, not full pages — highest-value
+      first targets, same shape as `ApiKeyTable.tsx`):
+      `project/settings/CronJobDetail.tsx`,
+      `project/settings/DeploymentTokensSettings.tsx`,
+      `project/settings/ProjectAccessSettings.tsx`,
+      `project/settings/webhooks/WebhookDetail.tsx`,
+      `agents/ProjectSecrets.tsx`, `project/flags/ProjectFeatureFlags.tsx`,
+      `monitoring/NodeAlertRules.tsx`, `storage/MonitoringCard.tsx`.
+    - **Embedded tables inside detail/analytics panels** (a `Detail`'s
+      `main`, once those pages adopt `Detail` per follow-up 9):
+      `agents/AgentDetailPage.tsx`, `agents/AutopilotPage.tsx`,
+      `analytics/AiAgentsDetail.tsx`, `analytics/ApiTraffic.tsx`,
+      `analytics/DimensionList.tsx`, `analytics/EventDetail.tsx`,
+      `analytics/PageDetail.tsx`, `analytics/PageFlow.tsx`,
+      `analytics/SegmentVisitors.tsx`, `analytics/SessionReplays.tsx`,
+      `email/EmailAnalytics.tsx`, `email/EmailDomainsManagement.tsx`,
+      `email/EmailsSentList.tsx`, `logs/ProxyLogsList.tsx`,
+      `proxy-logs/ProxyLogsDataTable.tsx`,
+      `observability/LogExplorer.tsx`, `observability/LogVolume.tsx`,
+      `observe/CloudTelemetryActivationSection.tsx`,
+      `project/ProjectAnalytics.tsx`, `project/ProjectSpeedInsights.tsx`,
+      `visitors/SessionDetail.tsx`, `visitors/VisitorDetail.tsx`,
+      `visitors/VisitorsList.tsx`, `pages/BackupDetail.tsx`,
+      `pages/S3SourceDetail.tsx`, `pages/ScheduleDetail.tsx`,
+      `pages/ScheduleRunDetail.tsx`.
+    - **Full pages that are really `Ledger` candidates** (a list is the
+      whole page, not embedded — worth a full `Ledger` migration rather
+      than a bare `DataTable` swap, similar in spirit to follow-up 9's
+      `Detail` migrations): `pages/AiGateway.tsx`, `pages/Alarms.tsx`,
+      `pages/AuditLogs.tsx`, `pages/Certificates.tsx`,
+      `pages/MetricAlertForm.tsx`, `pages/ProxyMetrics.tsx`,
+      `pages/Revenue.tsx`, `pages/ServiceMonitoring.tsx`,
+      `pages/ServiceQueryPerformance.tsx`, `pages/ServiceRestore.tsx`,
+      `pages/TeamDetail.tsx`, `pages/Teams.tsx`,
+      `pages/TraceOperations.tsx`, `pages/TracesList.tsx`,
+      `pages/UserDetail.tsx`, `pages/observability/GlobalErrors.tsx`,
+      `pages/observability/GlobalTraces.tsx`,
+      `pages/settings/NodesPage.tsx`,
+      `pages/settings/OtelPipelineStatusPage.tsx`,
+      `pages/settings/TraefikDiscoveryPage.tsx`.
+    Not attempted this pass beyond `ApiKeyTable.tsx`; each of these needs
+    its own review for sorting/inline-editing/virtualization behavior that
+    a mechanical swap could silently drop.
+14. `pages/Projects.tsx`'s card grid was evaluated for migration onto
+    `CardGrid` and deliberately **not migrated** — it has batch analytics/
+    health/uptime-monitor fetching keyed off the visible page, a bounded
+    text-search fallback with its own disclosure copy ("searching N of
+    total"), first-run onboarding (`FirstProjectOnboarding`, git-provider
+    aware), a migration-source header strip (`PlatformStrip`), and
+    `ResponsivePagination` (page-size selector `CardGrid`'s pagination
+    footer doesn't support) — enough page-specific logic around the grid
+    that a mechanical swap risked behavior regressions for no real
+    consolidation win. `CardGrid` ships with a "CardGrid — Projects"
+    sandbox reference screen (invented fixtures) instead. Revisit only as
+    its own reviewed migration.
+    Also re-flagging, explicitly, the two structures called out as
+    excluded-by-design for this whole card/grid pass (same framing as the
+    log-viewer follow-up 11): `pages/DashboardBuilder.tsx` (626 lines) and
+    the `DashboardsRouter.tsx`/`DashboardView.tsx`/`Dashboards.tsx`
+    custom-dashboard-builder feature are a real drag-and-drop,
+    user-configurable dashboard system — not a `CardGrid`/`Ledger`
+    candidate, needs dedicated review if ever touched.
+    `components/dashboard/ProjectCard.tsx` (456 lines) is intentionally
+    untouched — only the generic grid layout wrapper around it (`CardGrid`)
+    was extracted; the card's own internals stay exactly as they are.

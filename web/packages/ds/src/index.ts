@@ -40,5 +40,6 @@ export * from './fmt'
 
 export { Ledger, type LedgerColumn, type LedgerProps } from './templates/ledger'
 export { DataTable, type DataTableColumn, type DataTableProps } from './templates/data-table'
+export { CardGrid, type CardGridProps } from './templates/card-grid'
 export { Detail, type DetailFact, type DetailProps } from './templates/detail'
 export { Settings, type SettingsProps } from './templates/settings'

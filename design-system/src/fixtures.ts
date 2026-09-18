@@ -79,3 +79,61 @@ export const DEPLOYMENT_METRICS = Array.from({ length: 24 }, (_, i) => ({
   p50: 110 + Math.round(Math.sin(i / 3) * 20 + Math.random() * 10),
   p99: 340 + Math.round(Math.sin(i / 3) * 60 + Math.random() * 30),
 }))
+
+export interface ProjectFixture {
+  id: string
+  name: string
+  slug: string
+  status: StatusTone
+  statusLabel: string
+  lastDeployedAt: string
+  deployCount: number
+}
+
+export const PROJECTS: ProjectFixture[] = [
+  {
+    id: 'proj_9f2a',
+    name: 'checkout-api',
+    slug: 'checkout-api',
+    status: 'ok',
+    statusLabel: 'Live',
+    lastDeployedAt: '2026-09-17T08:12:00Z',
+    deployCount: 214,
+  },
+  {
+    id: 'proj_7b04',
+    name: 'marketing-site',
+    slug: 'marketing-site',
+    status: 'error',
+    statusLabel: 'Build failed',
+    lastDeployedAt: '2026-09-16T22:03:00Z',
+    deployCount: 88,
+  },
+  {
+    id: 'proj_5e91',
+    name: 'worker-pool',
+    slug: 'worker-pool',
+    status: 'ok',
+    statusLabel: 'Live',
+    lastDeployedAt: '2026-09-16T19:18:00Z',
+    deployCount: 42,
+  },
+  {
+    id: 'proj_3a10',
+    name: 'internal-dashboard',
+    slug: 'internal-dashboard',
+    status: 'running',
+    statusLabel: 'Deploying',
+    lastDeployedAt: '2026-09-17T07:41:00Z',
+    deployCount: 61,
+  },
+  {
+    id: 'proj_2c48',
+    name: 'docs-site',
+    slug: 'docs-site',
+    status: 'idle',
+    statusLabel: 'Superseded',
+    lastDeployedAt: '2026-09-10T14:52:00Z',
+    deployCount: 19,
+  },
+]

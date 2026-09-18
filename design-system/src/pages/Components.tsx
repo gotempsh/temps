@@ -245,6 +245,17 @@ export default function Components() {
         </div>
       </Block>
 
+      <Block title="CardGrid">
+        <p className="w-full text-sm text-muted-foreground">
+          A responsive grid shell for record collections better shown as
+          cards than a table — same header shape as `Ledger`
+          (title/description/actions/toolbar), but a full template (owns its
+          own `PageHeader`), so it isn't demoed inline here — see the
+          "CardGrid — Projects" reference screen for a working example with
+          filtering, empty state and a card renderer.
+        </p>
+      </Block>
+
       <Block title="TimeChart">
         <div className="w-full">
           <TimeChart

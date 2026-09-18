@@ -11,6 +11,7 @@ import DeploymentDetail from './pages/DeploymentDetail'
 import ProjectSettings from './pages/ProjectSettings'
 import ReleaseNotes from './pages/ReleaseNotes'
 import AiSummaries from './pages/AiSummaries'
+import ProjectsGrid from './pages/ProjectsGrid'
 
 const NAV_SECTIONS = [
   {
@@ -26,6 +27,7 @@ const NAV_SECTIONS = [
       { to: '/ledger', label: 'Ledger — Deployments' },
       { to: '/detail', label: 'Detail — Deployment' },
       { to: '/settings', label: 'Settings — Project' },
+      { to: '/card-grid', label: 'CardGrid — Projects' },
       { to: '/article', label: 'Article — Release notes' },
       { to: '/onboarding', label: 'PageState — Onboarding' },
     ],
@@ -73,6 +75,7 @@ export default function App() {
           <Route path="/ledger" element={<DeploymentsLedger />} />
           <Route path="/detail" element={<DeploymentDetail />} />
           <Route path="/settings" element={<ProjectSettings />} />
+          <Route path="/card-grid" element={<ProjectsGrid />} />
           <Route path="/article" element={<ReleaseNotes />} />
           <Route path="/onboarding" element={<AiSummaries />} />
         </Routes>
