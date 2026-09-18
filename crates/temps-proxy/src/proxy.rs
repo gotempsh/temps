@@ -853,9 +853,9 @@ pub struct LoadBalancer {
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// Object-store-backed static-site file serving. `None` for every
     /// existing self-hosted install (the default, unset
-    /// `TEMPS_STATIC_STORAGE_BACKEND`): `serve_static_file` then behaves
+    /// `TEMPS_LOG_STORAGE_BACKEND`): `serve_static_file` then behaves
     /// exactly as before this field existed, reading straight off local disk.
-    /// `Some` only when an operator opts into `TEMPS_STATIC_STORAGE_BACKEND=s3`,
+    /// `Some` only when an operator opts into `TEMPS_LOG_STORAGE_BACKEND=s3`,
     /// in which case this is the same S3-backed, byte-cached `FileStore` as
     /// `file_store` above (see `temps-proxy/src/server.rs`) — the two fields
     /// exist separately because they address disjoint key namespaces (path
@@ -979,7 +979,7 @@ impl LoadBalancer {
 
     /// Enable object-store-backed static-site serving (`serve_static_file`
     /// reads through this instead of local disk). Only called when
-    /// `TEMPS_STATIC_STORAGE_BACKEND=s3` resolves to an S3 backend — leaving
+    /// `TEMPS_LOG_STORAGE_BACKEND=s3` resolves to an S3 backend — leaving
     /// this unset keeps every existing self-hosted install on the disk-only
     /// path. See the field doc on `static_object_store`.
     pub fn with_static_object_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
@@ -2202,7 +2202,7 @@ impl LoadBalancer {
         static_dir: &str,
     ) -> Result<StaticFileServeOutcome> {
         // `static_object_store` is only `Some` when an operator has explicitly
-        // set `TEMPS_STATIC_STORAGE_BACKEND=s3` — every existing self-hosted
+        // set `TEMPS_LOG_STORAGE_BACKEND=s3` — every existing self-hosted
         // install (the field defaults to `None`) falls through to the
         // disk-based path below completely unchanged.
         if let Some(store) = self.static_object_store.clone() {
@@ -2341,7 +2341,7 @@ impl LoadBalancer {
     }
 
     /// Serve a static file from an object-store-backed deployment
-    /// (`TEMPS_STATIC_STORAGE_BACKEND=s3`), through the same byte-level cache
+    /// (`TEMPS_LOG_STORAGE_BACKEND=s3`), through the same byte-level cache
     /// as CAS blobs so a warm request never touches the backend.
     ///
     /// Mirrors `serve_static_file`'s disk-based ETag/304/HEAD/streaming

@@ -321,7 +321,7 @@ pub(crate) fn metadata_etag(path: &Path, metadata: &Metadata) -> String {
 }
 
 /// Ordered plan for resolving a static-site request against an
-/// object-store-backed deployment (S3-compatible `TEMPS_STATIC_STORAGE_BACKEND=s3`),
+/// object-store-backed deployment (S3-compatible `TEMPS_LOG_STORAGE_BACKEND=s3`),
 /// mirroring [`open_static_file`]'s observable resolution order without any of
 /// its filesystem-specific machinery (canonicalization, symlink rejection —
 /// neither concept exists for object storage; path-traversal and

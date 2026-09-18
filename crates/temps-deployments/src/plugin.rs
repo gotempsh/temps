@@ -203,7 +203,7 @@ impl TempsPlugin for DeploymentsPlugin {
 
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and
-            // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
+            // the workflow execution service further down). `TEMPS_LOG_STORAGE_BACKEND`
             // is unset for every existing self-hosted install, so this resolves to
             // the same `FsFileStore` under `TEMPS_DATA_DIR/cas` as before this change.
             // No byte cache here: caching only matters for the proxy's *read* path
@@ -223,7 +223,7 @@ impl TempsPlugin for DeploymentsPlugin {
                         tracing::info!(
                             bucket = %s3_config.bucket,
                             region = %s3_config.region,
-                            "CAS assets will be persisted to S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
+                            "CAS assets will be persisted to S3 (TEMPS_LOG_STORAGE_BACKEND=s3)"
                         );
                         Arc::new(temps_file_store::s3_store::S3FileStore::new(s3_config))
                     }
@@ -355,7 +355,7 @@ impl TempsPlugin for DeploymentsPlugin {
 
             // Wire content-addressable file store for static asset deduplication
             // (same shared instance resolved once above — filesystem by default,
-            // S3 when TEMPS_STATIC_STORAGE_BACKEND=s3).
+            // S3 when TEMPS_LOG_STORAGE_BACKEND=s3).
             workflow_execution_service.set_file_store(cas_file_store.clone());
             tracing::debug!("File store wired into workflow execution service");
 
