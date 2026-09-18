@@ -20,7 +20,7 @@ use bytes::Bytes;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum FileStoreError {
     #[error(
         "Invalid CAS content hash ({length} bytes): expected exactly 64 ASCII hexadecimal characters"
@@ -109,4 +109,17 @@ pub trait FileStore: Send + Sync {
     /// `aws_sdk_s3::Client`, not this trait), so reading it back must use
     /// the identical key — not a `path/`-namespaced derivative of it.
     async fn open_raw(&self, key: &str) -> Result<OpenedBlob, FileStoreError>;
+
+    /// Return the size in bytes of the object at exactly `key` (same
+    /// namespace as [`FileStore::open_raw`]) without opening or reading its
+    /// body.
+    ///
+    /// Exists so a `HEAD` request — which only needs `Content-Length` and an
+    /// `ETag`, never the body — doesn't have to pay for a full
+    /// open-and-buffer through a caching decorator: [`crate::cache::CachingFileStore`]
+    /// answers a cached key from memory with no backend call at all, and an
+    /// uncached key with a cheap metadata-only backend request (e.g. S3
+    /// `HeadObject`) instead of a `GetObject` that a decorator would then
+    /// buffer in full.
+    async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError>;
 }

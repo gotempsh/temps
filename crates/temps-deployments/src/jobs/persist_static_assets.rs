@@ -959,6 +959,10 @@ mod tests {
         async fn open_raw(&self, _key: &str) -> Result<OpenedBlob, FileStoreError> {
             Err(FileStoreError::Backend("unused test operation".to_string()))
         }
+
+        async fn stat_raw(&self, _key: &str) -> Result<u64, FileStoreError> {
+            Err(FileStoreError::Backend("unused test operation".to_string()))
+        }
     }
 
     #[tokio::test]

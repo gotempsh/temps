@@ -337,6 +337,14 @@ impl FileStore for S3FileStore {
     async fn open_raw(&self, key: &str) -> Result<OpenedBlob, FileStoreError> {
         self.open_object(&self.full_key(key), key).await
     }
+
+    async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError> {
+        self.head_object_length(&self.full_key(key), key)
+            .await?
+            .ok_or_else(|| FileStoreError::NotFound {
+                path: key.to_string(),
+            })
+    }
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), FileStoreError> {

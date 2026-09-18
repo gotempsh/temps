@@ -65,6 +65,19 @@ impl FsFileStore {
         self.root.join(".tmp")
     }
 
+    /// Sanitized the same way `cache_path`/`blob_path` are (no absolute
+    /// paths, no traversal out of `root`), but without the `cache/`
+    /// sub-namespace — shared by `open_raw` and `stat_raw`, which address an
+    /// object by its exact key.
+    fn raw_path(&self, key: &str) -> PathBuf {
+        let clean: PathBuf = key
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+            .collect();
+        self.root.join(clean)
+    }
+
     /// Open `file_path` for streaming reads, mapping filesystem errors onto
     /// [`FileStoreError`] the same way for every path-shaped read. `log_path`
     /// is the caller-facing key/path used only in error messages.
@@ -279,12 +292,30 @@ impl FileStore for FsFileStore {
         // `LoadBalancer::static_object_store`, since its static-site files
         // are already served directly off disk), kept correct for parity
         // and test coverage.
-        let clean: PathBuf = key
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
-            .collect();
-        self.open_file_at(self.root.join(clean), key).await
+        self.open_file_at(self.raw_path(key), key).await
+    }
+
+    async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError> {
+        let file_path = self.raw_path(key);
+        let metadata = tokio::fs::metadata(&file_path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                FileStoreError::NotFound {
+                    path: key.to_string(),
+                }
+            } else {
+                FileStoreError::Io {
+                    path: key.to_string(),
+                    reason: format!("stat: {error}"),
+                }
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(FileStoreError::Io {
+                path: key.to_string(),
+                reason: "stat target is not a regular file".to_string(),
+            });
+        }
+        Ok(metadata.len())
     }
 }
 

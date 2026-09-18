@@ -116,46 +116,82 @@ impl CachingFileStore {
     fn raw_cache_key(key: &str) -> String {
         format!("raw:{key}")
     }
+}
 
-    /// Buffer a streamed `OpenedBlob` into memory and cache it under `key`,
-    /// but only when it fits under `max_cacheable_entry_bytes` — otherwise
-    /// return the original streaming reader untouched, so a very large asset
-    /// is served with exactly today's bounded, chunked-streaming behavior
-    /// instead of being fully buffered per request.
-    async fn cache_or_passthrough(
+/// Sentinel for a coalesced fetch (see [`CachingFileStore::coalesced_bytes`])
+/// that must not be cached even though it completed without a real error.
+/// `moka::Cache::try_get_with` only skips inserting on `Err`, so "fetched
+/// fine, but too large to cache" has to travel through the `Err` arm too.
+#[derive(Debug, Clone)]
+enum UncacheableFetch {
+    /// Fetched successfully but over `max_cacheable_entry_bytes`, or the
+    /// buffered size didn't match the size the backend originally reported
+    /// (not safe to memoize either way) — the caller re-fetches directly,
+    /// bypassing the cache.
+    TooLargeToCache,
+    /// A genuine backend failure, preserved so callers still see e.g.
+    /// `FileStoreError::NotFound` rather than a stringified stand-in.
+    Failed(FileStoreError),
+}
+
+impl CachingFileStore {
+    /// Fetch-and-buffer bytes for `cache_key` into memory, coalescing
+    /// concurrent misses for the *same key* into a single backend read via
+    /// `moka`'s `try_get_with`.
+    ///
+    /// Without this, a burst of concurrent first-requests for the same
+    /// newly-warmed key (e.g. right after a deploy, every visitor's first
+    /// load of `index.html`) would each independently open the backend
+    /// object and buffer their own copy — multiplying both backend load and
+    /// memory use by the number of concurrent requests, and bypassing the
+    /// cache's own size budget in the process. With coalescing, only one
+    /// concurrent caller actually performs `fetch`; the rest await its
+    /// result.
+    ///
+    /// Entries over `max_cacheable_entry_bytes` are never cached: `fetch` is
+    /// still called (once, by the coalesced winner) so its `OpenedBlob`
+    /// metadata is available to decide the size, but its body is never
+    /// buffered — the caller (which already holds a way to open the object
+    /// again) re-opens it directly to get a fresh, uncached, streaming
+    /// reader. This preserves today's bounded streaming for very large
+    /// files; only the common, cacheable case benefits from coalescing.
+    async fn coalesced_bytes<F, Fut>(
         &self,
-        key: String,
-        log_path: &str,
-        opened: OpenedBlob,
-    ) -> Result<OpenedBlob, FileStoreError> {
-        if opened.size_bytes > self.max_cacheable_entry_bytes {
-            return Ok(opened);
-        }
-
-        let mut buffer = Vec::with_capacity(opened.size_bytes as usize);
-        let mut reader = opened.reader;
-        reader
-            .read_to_end(&mut buffer)
+        cache_key: String,
+        log_path: String,
+        fetch: F,
+    ) -> Result<Bytes, UncacheableFetch>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<OpenedBlob, FileStoreError>> + Send,
+    {
+        let max_cacheable_entry_bytes = self.max_cacheable_entry_bytes;
+        match self
+            .cache
+            .try_get_with(cache_key, async move {
+                let opened = fetch().await.map_err(UncacheableFetch::Failed)?;
+                if opened.size_bytes > max_cacheable_entry_bytes {
+                    return Err(UncacheableFetch::TooLargeToCache);
+                }
+                let mut buffer = Vec::with_capacity(opened.size_bytes as usize);
+                let mut reader = opened.reader;
+                reader.read_to_end(&mut buffer).await.map_err(|error| {
+                    UncacheableFetch::Failed(FileStoreError::Io {
+                        path: log_path,
+                        reason: format!("buffering for byte cache: {error}"),
+                    })
+                })?;
+                let bytes = Bytes::from(buffer);
+                if bytes.len() as u64 != opened.size_bytes {
+                    return Err(UncacheableFetch::TooLargeToCache);
+                }
+                Ok(bytes)
+            })
             .await
-            .map_err(|error| FileStoreError::Io {
-                path: log_path.to_string(),
-                reason: format!("buffering for byte cache: {error}"),
-            })?;
-        let bytes = Bytes::from(buffer);
-        let size_bytes = bytes.len() as u64;
-
-        // A backend that streamed a size different from what it now produced
-        // is not something to memoize — serve what was actually read, but
-        // skip the insert so a future request re-fetches from the source of
-        // truth instead of trusting a mismatched snapshot.
-        if size_bytes == opened.size_bytes {
-            self.cache.insert(key, bytes.clone()).await;
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(issue) => Err((*issue).clone()),
         }
-
-        Ok(OpenedBlob {
-            reader: Box::new(std::io::Cursor::new(bytes)),
-            size_bytes,
-        })
     }
 }
 
@@ -176,11 +212,18 @@ impl FileStore for CachingFileStore {
             );
             return Ok(bytes);
         }
-        let bytes = self.inner.get_blob(hash).await?;
-        if bytes.len() as u64 <= self.max_cacheable_entry_bytes {
-            self.cache.insert(key, bytes.clone()).await;
+        let inner = self.inner.clone();
+        let owned_hash = hash.to_string();
+        match self
+            .coalesced_bytes(key, hash.to_string(), move || async move {
+                inner.open_blob(&owned_hash).await
+            })
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(UncacheableFetch::TooLargeToCache) => self.inner.get_blob(hash).await,
+            Err(UncacheableFetch::Failed(error)) => Err(error),
         }
-        Ok(bytes)
     }
 
     async fn open_blob(&self, hash: &str) -> Result<OpenedBlob, FileStoreError> {
@@ -195,8 +238,21 @@ impl FileStore for CachingFileStore {
                 reader: Box::new(std::io::Cursor::new(bytes)),
             });
         }
-        let opened = self.inner.open_blob(hash).await?;
-        self.cache_or_passthrough(key, hash, opened).await
+        let inner = self.inner.clone();
+        let owned_hash = hash.to_string();
+        match self
+            .coalesced_bytes(key, hash.to_string(), move || async move {
+                inner.open_blob(&owned_hash).await
+            })
+            .await
+        {
+            Ok(bytes) => Ok(OpenedBlob {
+                size_bytes: bytes.len() as u64,
+                reader: Box::new(std::io::Cursor::new(bytes)),
+            }),
+            Err(UncacheableFetch::TooLargeToCache) => self.inner.open_blob(hash).await,
+            Err(UncacheableFetch::Failed(error)) => Err(error),
+        }
     }
 
     async fn blob_exists(&self, hash: &str) -> Result<bool, FileStoreError> {
@@ -228,11 +284,18 @@ impl FileStore for CachingFileStore {
             debug!(path, "byte cache hit (get)");
             return Ok(bytes);
         }
-        let bytes = self.inner.get(path).await?;
-        if bytes.len() as u64 <= self.max_cacheable_entry_bytes {
-            self.cache.insert(key, bytes.clone()).await;
+        let inner = self.inner.clone();
+        let owned_path = path.to_string();
+        match self
+            .coalesced_bytes(key, path.to_string(), move || async move {
+                inner.open(&owned_path).await
+            })
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(UncacheableFetch::TooLargeToCache) => self.inner.get(path).await,
+            Err(UncacheableFetch::Failed(error)) => Err(error),
         }
-        Ok(bytes)
     }
 
     async fn open(&self, path: &str) -> Result<OpenedBlob, FileStoreError> {
@@ -244,8 +307,21 @@ impl FileStore for CachingFileStore {
                 reader: Box::new(std::io::Cursor::new(bytes)),
             });
         }
-        let opened = self.inner.open(path).await?;
-        self.cache_or_passthrough(key, path, opened).await
+        let inner = self.inner.clone();
+        let owned_path = path.to_string();
+        match self
+            .coalesced_bytes(key, path.to_string(), move || async move {
+                inner.open(&owned_path).await
+            })
+            .await
+        {
+            Ok(bytes) => Ok(OpenedBlob {
+                size_bytes: bytes.len() as u64,
+                reader: Box::new(std::io::Cursor::new(bytes)),
+            }),
+            Err(UncacheableFetch::TooLargeToCache) => self.inner.open(path).await,
+            Err(UncacheableFetch::Failed(error)) => Err(error),
+        }
     }
 
     async fn exists(&self, path: &str) -> Result<bool, FileStoreError> {
@@ -264,8 +340,35 @@ impl FileStore for CachingFileStore {
                 reader: Box::new(std::io::Cursor::new(bytes)),
             });
         }
-        let opened = self.inner.open_raw(key).await?;
-        self.cache_or_passthrough(cache_key, key, opened).await
+        let inner = self.inner.clone();
+        let owned_key = key.to_string();
+        match self
+            .coalesced_bytes(cache_key, key.to_string(), move || async move {
+                inner.open_raw(&owned_key).await
+            })
+            .await
+        {
+            Ok(bytes) => Ok(OpenedBlob {
+                size_bytes: bytes.len() as u64,
+                reader: Box::new(std::io::Cursor::new(bytes)),
+            }),
+            Err(UncacheableFetch::TooLargeToCache) => self.inner.open_raw(key).await,
+            Err(UncacheableFetch::Failed(error)) => Err(error),
+        }
+    }
+
+    async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError> {
+        // A cached key answers with zero backend calls -- exactly the case
+        // `stat_raw` exists for: a `HEAD` request against an already-warm
+        // key (the overwhelmingly common case once a deployment has served
+        // a few real requests) never has to touch S3 at all, not even a
+        // cheap HeadObject.
+        let cache_key = Self::raw_cache_key(key);
+        if let Some(bytes) = self.cache.get(&cache_key).await {
+            debug!(key, "byte cache hit (stat_raw)");
+            return Ok(bytes.len() as u64);
+        }
+        self.inner.stat_raw(key).await
     }
 }
 
@@ -288,6 +391,7 @@ mod tests {
         open_blob_calls: AtomicUsize,
         open_calls: AtomicUsize,
         open_raw_calls: AtomicUsize,
+        stat_raw_calls: AtomicUsize,
     }
 
     impl CountingStore {
@@ -371,6 +475,11 @@ mod tests {
 
         async fn open_raw(&self, key: &str) -> Result<OpenedBlob, FileStoreError> {
             self.open_raw_calls.fetch_add(1, Ordering::SeqCst);
+            // A small delay so a burst of concurrent callers actually race
+            // while this "backend fetch" is in flight, instead of the mock
+            // resolving so fast that a coalescing bug would go unnoticed by
+            // accidentally-sequential scheduling.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let data = self.raws.lock().await.get(key).cloned().ok_or_else(|| {
                 FileStoreError::NotFound {
                     path: key.to_string(),
@@ -380,6 +489,18 @@ mod tests {
                 size_bytes: data.len() as u64,
                 reader: Box::new(std::io::Cursor::new(data)),
             })
+        }
+
+        async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError> {
+            self.stat_raw_calls.fetch_add(1, Ordering::SeqCst);
+            self.raws
+                .lock()
+                .await
+                .get(key)
+                .map(|data| data.len() as u64)
+                .ok_or_else(|| FileStoreError::NotFound {
+                    path: key.to_string(),
+                })
         }
     }
 
@@ -458,6 +579,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_cold_reads_for_the_same_key_are_coalesced_into_one_backend_open() {
+        // Regression test: a burst of concurrent first-requests for the same
+        // newly-warmed key (e.g. every visitor's first load of `index.html`
+        // right after a deploy) must not each independently open the
+        // backend object and buffer their own copy -- that multiplies both
+        // backend load and buffered memory by the number of concurrent
+        // requests, bypassing the cache's own size budget in the process.
+        let inner = Arc::new(CountingStore::new());
+        let cache = Arc::new(CachingFileStore::new(inner.clone(), 1024 * 1024));
+        let key = "projects/site/production/2026/01/01/deploy-1/index.html";
+        inner.seed_raw(key, Bytes::from_static(b"<html/>")).await;
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let opened = cache.open_raw(key).await.unwrap();
+                    read_all(opened).await
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), Bytes::from_static(b"<html/>"));
+        }
+
+        // All 8 concurrent cold requests for the same key coalesce into a
+        // single backend open, not 8.
+        assert_eq!(inner.open_raw_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn raw_and_path_cache_keys_never_collide_for_the_same_string() {
         // `open` and `open_raw` are different namespaces even when called
         // with the exact same key string — a path-keyed write must never be
@@ -490,8 +643,16 @@ mod tests {
         let second = cache.open_blob(&hash).await.unwrap();
         assert_eq!(read_all(second).await.len(), 50);
 
-        // Never cached: every read hit the inner store.
-        assert_eq!(inner.open_blob_calls.load(Ordering::SeqCst), 2);
+        // Never cached: every logical read hits the inner store. Each of the
+        // two `open_blob` calls above costs *two* inner opens rather than
+        // one: `coalesced_bytes` opens once to learn the object is over
+        // budget (cheap — this reads only the metadata/headers, never the
+        // body, so it never actually buffers the 50 bytes), then the caller
+        // opens again directly to get an uncached stream to actually serve.
+        // This trades a small extra round trip on the oversized path for
+        // real request coalescing on the (far more common) cacheable path —
+        // see `coalesced_bytes`'s doc comment.
+        assert_eq!(inner.open_blob_calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
