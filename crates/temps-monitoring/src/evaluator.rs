@@ -876,9 +876,24 @@ impl AlertEvaluator {
 
     /// Clear breach tracking for a rule (metric recovered or no data).
     ///
-    /// Only writes to the database when the cache actually held a window, so
-    /// the overwhelmingly common case — a healthy rule evaluated every 30
-    /// seconds — issues no write at all.
+    /// Always issues the guarded `UPDATE` in [`Self::clear_persisted_breach_start`]
+    /// (see that function for why), not only when the in-memory cache had an
+    /// entry.
+    ///
+    /// # FIXME(metrics-scale): unconditional per-rule clear query
+    ///
+    /// This runs once per healthy rule per 30-second cycle inside
+    /// `evaluate_rule`'s sequential loop, same shape as the
+    /// `resolve_alarm_context` FIXME below. At 1,000+ rules that's 1,000+
+    /// round trips a cycle even though the `breach_started_at IS NOT NULL`
+    /// guard makes almost all of them affect zero rows — a real cost
+    /// (connection-pool pressure) for a query that changes nothing.
+    ///
+    /// Fix: collect the rule IDs evaluated as healthy/no-data during a cycle
+    /// and issue one batched `UPDATE ... WHERE id = ANY($1) AND
+    /// breach_started_at IS NOT NULL` per cycle instead of one query per
+    /// rule, mirroring the batching fix already proposed for
+    /// `resolve_alarm_context`.
     async fn clear_breach(&self, rule_id: i32) {
         self.breach_start.write().await.remove(&rule_id);
         // Unconditional, not gated on whether the cache had an entry: the
