@@ -23,7 +23,9 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
   `example`, `settingsHref` are required props.
 - Color never decorates. It appears only through `Status` (badges, dots,
   chart series). If you reach for a raw color to convey meaning outside
-  `Status`, stop and add a tone to `Status` instead.
+  `Status`, stop and add a tone to `Status` instead. Existing provider logos
+  are a narrow identity exception: keep their brand color inside the small
+  mark, never on the surrounding card, selection border, or action button.
 
 ## Tokens
 
@@ -65,8 +67,9 @@ in the same change if the app genuinely distinguishes a new state.
 
 Use `lucide-react` for interface actions and resource types. Use the existing
 provider logos through `GitProviderMark` for Git provider identity — a branch
-icon describes a branch, not GitHub or GitLab. Provider marks are monochrome
-and inherit the current text color; color remains reserved for state.
+icon describes a branch, not GitHub or GitLab. Provider marks retain their existing brand colors by default. Use
+`variant="monochrome"` when identity is secondary; it inherits the current
+text color. Always pair a selection mark with the provider name.
 
 Use `size-4` in controls, `size-5` for provider identity, and `size-3.5` for
 dense metadata. No raw dimensions. Pair icons with visible text; hide redundant

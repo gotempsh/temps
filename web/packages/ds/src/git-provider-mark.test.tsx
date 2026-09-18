@@ -17,7 +17,7 @@ test.each([
     const markup = renderToStaticMarkup(<GitProviderMark provider={provider} />)
     expect(markup).toContain(`<title>${title}</title>`)
     expect(markup).toContain('aria-hidden="true"')
-    expect(markup).toContain('[&amp;_path]:fill-current')
+    expect(markup).not.toContain('[&amp;_path]:fill-current')
   }
 )
 
@@ -32,4 +32,11 @@ test('unknown providers use an unfilled branch icon', () => {
   const markup = renderToStaticMarkup(<GitProviderMark provider="unknown" />)
   expect(markup).toContain('lucide-git-branch')
   expect(markup).not.toContain('[&amp;_path]:fill-current')
+})
+
+test('monochrome marks follow the surrounding text color', () => {
+  const markup = renderToStaticMarkup(
+    <GitProviderMark provider="gitlab" variant="monochrome" />
+  )
+  expect(markup).toContain('[&amp;_path]:fill-current')
 })

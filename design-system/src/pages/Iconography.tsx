@@ -48,8 +48,8 @@ export default function Iconography() {
         <div>
           <h2 className="text-lg font-semibold">Provider identity</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Reuse the console’s provider marks in the current text color. Always
-            show the provider name beside a selection.
+            Use a small brand-colored logo for recognition, with a visible provider
+            name. Keep the surrounding card and selection border neutral.
           </p>
         </div>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -62,6 +62,21 @@ export default function Iconography() {
               <span className="text-sm font-medium">{provider}</span>
             </div>
           ))}
+        </div>
+        <div className="space-y-3 border-t pt-4">
+          <h3 className="text-sm font-medium">Monochrome alternative</h3>
+          <p className="text-sm text-muted-foreground">
+            Use monochrome in dense toolbars where provider identity is secondary.
+            Brand color identifies a provider; it never indicates connection health.
+          </p>
+          <div className="flex flex-wrap gap-6">
+            {['GitHub', 'GitLab', 'Bitbucket', 'Gitea'].map((provider) => (
+              <span key={provider} className="inline-flex items-center gap-2 text-sm">
+                <GitProviderMark provider={provider} variant="monochrome" />
+                {provider}
+              </span>
+            ))}
+          </div>
         </div>
         <Link
           className="inline-flex items-center gap-2 text-sm underline underline-offset-4"

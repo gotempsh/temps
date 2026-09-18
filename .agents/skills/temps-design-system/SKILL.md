@@ -17,7 +17,7 @@ Two documents govern console UI, and they cover different ground:
   reviewing anything that touches it.
 
 Both describe the *same* visual system (Vercel-inspired Geist theme,
-near-black primary, color reserved for state). Neither is the old "operator
+near-black primary, state colors plus small provider brand marks). Neither is the old "operator
 ink" prototype (`@temps-sdk/op`, briefly `@temps-sdk/ds`, PR #915) — that had
 a different visual language (a glyph vocabulary, an "ink" skin class), zero
 consumers, and was deleted. Never reference it, its mockups, or its styling.
@@ -121,6 +121,23 @@ bun run build   # sandbox app; see handoff workspace-install caveat before insta
 | No raw hex/oklch/px/ms literal in `web/packages/ds/src` | `audit-records.mjs`, machine |
 | TypeScript types (incl. `PageState` `not-set-up`'s required props) | `typecheck`, machine |
 | Record recipe order, "not set up" copy actually being concrete | Honour-system — review by eye |
-| Color used only for state, never decoration | Honour-system |
+| State colors and small provider brand marks, never decoration | Honour-system |
 | Correct template chosen for a screen's data shape | Honour-system — this skill's classification procedure |
 | Production `web/src` migration follow-ups | Partially migrated; remaining sites tracked, not enforced |
+
+## UI polish references
+
+Use [better-ui](https://github.com/jakubkrehel/skills/blob/main/skills/better-ui/SKILL.md)
+and [emil-design-eng](https://github.com/emilkowalski/skills/blob/main/skills/emil-design-eng/SKILL.md)
+as supplemental review guidance when polishing this system. Read the upstream
+skill and relevant references before applying it. The binding Temps decisions,
+existing tokens, and user instructions take precedence where recipes disagree.
+Do not copy arbitrary motion values into components or introduce a new skin.
+
+Review concrete user journeys: provider selection, wizard validation and Back,
+time presets and custom ranges, loading, empty, failed, and recovery states.
+Check small icons at their actual size, neutral selection cues, light/dark
+surfaces, keyboard focus, reduced motion, and narrow layouts. Frequent filtering
+should respond immediately. Add motion only when it helps explain a change.
+Record findings in a Before/After/Why table and state what was actually verified.
+The sandbox examples must demonstrate working interactions, not inert mockups.

@@ -17,7 +17,7 @@ first of the six interview answers this package is built from (see
 ## The signature
 
 Restrained monochrome, one state accent. Near-black `--primary`, white/gray
-surfaces (`--background`, `--card`, `--muted`), color reserved entirely for
+surfaces (`--background`, `--card`, `--muted`), state color reserved for
 `--success`/`--warning`/`--destructive`. This isn't a new look invented for
 this package — it's what `web/src/globals.css` already does, and the
 signature is "don't dilute it," not "introduce it."
@@ -27,15 +27,20 @@ in project memory: white/black, not blue) and rejects the earlier "operator
 ink" redesign's instinct to invent a new visual skin. Codification, not
 redesign — see the retirement note at the top of `docs/design-system-handoff.md`.
 
-## Colour policy: state only
+## Colour policy: state and provider identity
 
 Colour is not a decoration budget. A blue button, a green sidebar icon, a
 purple chart line chosen because it "looks nice" is a bug in this system —
 every one of the five `Status` tones (`ok`/`warn`/`error`/`idle`/`running`)
-maps to a specific meaning, and nothing else in the interface should reach
-for hue to communicate. Charts get color per-series only when the series
+maps to a specific meaning, and interface controls should not borrow those hues for decoration. Charts get color per-series only when the series
 identity itself needs distinguishing (`--chart-1..5`), never to decorate a
 single-series panel.
+
+Small provider logos are the identity exception: reuse the existing GitHub,
+GitLab, Bitbucket, and Gitea artwork through `GitProviderMark`. Preserve brand
+colors inside the mark only; cards, labels, selection borders, and buttons
+remain neutral. GitHub adapts to light/dark surfaces. A green Gitea mark is
+not a successful connection — show connection health separately with `Status`.
 
 ## Taste: what "good" looks like here
 

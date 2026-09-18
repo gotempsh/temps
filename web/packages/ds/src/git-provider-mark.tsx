@@ -11,13 +11,16 @@ import { cn } from './lib/cn'
 export interface GitProviderMarkProps {
   provider: string | null | undefined
   className?: string
+  /** Brand colors identify providers; monochrome follows the surrounding text. */
+  variant?: 'brand' | 'monochrome'
   /** Omit beside visible provider text; supply only when the mark stands alone. */
   label?: string
 }
 
-/** Existing console logos, rendered in currentColor; unknown providers use a branch. */
+/** Existing console logos, with their brand colors; unknown providers use a branch. */
 export function GitProviderMark({
   provider,
+  variant = 'brand',
   className,
   label,
 }: GitProviderMarkProps) {
@@ -46,7 +49,7 @@ export function GitProviderMark({
         aria-hidden="true"
         className={cn(
           'inline-flex size-full [&>svg]:size-full!',
-          Icon !== GitBranch && '[&_path]:fill-current'
+          variant === 'monochrome' && Icon !== GitBranch && '[&_path]:fill-current'
         )}
       >
         <Icon className="size-full" />
