@@ -192,11 +192,17 @@ async function platformFeaturesAction(options: { json?: boolean }): Promise<void
   newline()
   header(`${icons.globe} Platform Features`)
   keyValue('Serve profile', features.profile)
+  keyValue('Docker daemon', yesNo(features.docker))
   keyValue('Local deployments', yesNo(features.deployments_local))
+  keyValue('Local image builds', yesNo(features.image_builds_local))
   keyValue('Managed services', yesNo(features.managed_services))
   keyValue('Local backups', yesNo(features.backups_local))
+  keyValue('Remote backups', yesNo(features.backups_remote))
   keyValue('Agent sandboxes', yesNo(features.sandboxes))
-  keyValue('Docker daemon', yesNo(features.docker))
+  keyValue('Key-value store', yesNo(features.kv))
+  keyValue('Workload importers', yesNo(features.imports))
+  keyValue('Log aggregation', yesNo(features.log_aggregation))
+  keyValue('Vulnerability scanning', yesNo(features.vulnerability_scanning))
 
   if (!features.deployments_local) {
     newline()

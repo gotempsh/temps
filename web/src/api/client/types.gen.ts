@@ -14896,6 +14896,86 @@ export type PlanTarget = {
 };
 
 /**
+ * Which capabilities this server process actually provides.
+ *
+ * A client cannot tell "this build has no sandboxes" from "this process was
+ * started in a profile that does not run them" by probing endpoints — both
+ * look like failure. This endpoint answers the question directly so the
+ * console can render an honest, actionable state (what is unavailable, and
+ * why) instead of a dead button or an empty page.
+ *
+ * **Honesty contract**: every field that is `true` MUST be backed by a
+ * registered, reachable subsystem. A `true` that is not true is worse than
+ * the endpoint not existing — it causes the console to render controls that
+ * silently fail instead of showing an onboarding state.
+ */
+export type PlatformFeatures = {
+    /**
+     * Backups can be produced from services running on this host.
+     * Remote backups of worker-node services are reported separately in
+     * [`backups_remote`][Self::backups_remote].
+     */
+    backups_local: boolean;
+    /**
+     * Backups of services on worker nodes can be orchestrated, scheduled and
+     * retained by this process. `true` when the backup scheduler is
+     * configured and worker credentials are present, regardless of profile.
+     */
+    backups_remote: boolean;
+    /**
+     * Application containers can run on this host. `false` in the
+     * `control-plane` profile: applications run on worker nodes joined with
+     * `temps join`.
+     */
+    deployments_local: boolean;
+    /**
+     * Whether a Docker client exists AND a daemon answered a ping at startup.
+     * In the `control-plane` profile a daemon may still be present for
+     * diagnostics, but no workloads are placed here regardless.
+     */
+    docker: boolean;
+    /**
+     * Container images can be built by this process. Requires a local Docker
+     * daemon; always `false` when `docker` is `false`.
+     */
+    image_builds_local: boolean;
+    /**
+     * Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,
+     * CapRover) are available. Requires a local Docker daemon to run importer
+     * containers.
+     */
+    imports: boolean;
+    /**
+     * Managed key-value store is registered and reachable.
+     */
+    kv: boolean;
+    /**
+     * Structured log aggregation, search and tailing is active.
+     */
+    log_aggregation: boolean;
+    /**
+     * Managed services (PostgreSQL, Redis, MariaDB, …) can be provisioned on
+     * this host. Requires a local Docker daemon.
+     */
+    managed_services: boolean;
+    /**
+     * Serve profile this process was started with: `"full"` or
+     * `"control-plane"`.
+     */
+    profile: string;
+    /**
+     * Agent sandboxes / workspace previews run in this process. Requires a
+     * local Docker daemon.
+     */
+    sandboxes: boolean;
+    /**
+     * Container image vulnerability scanning is available. Requires a local
+     * Docker daemon to pull and scan images.
+     */
+    vulnerability_scanning: boolean;
+};
+
+/**
  * Platform compatibility information
  */
 export type PlatformInfo = {
@@ -24500,6 +24580,14 @@ export type GetPlatformInfoErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Docker daemon unavailable in this profile
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type GetPlatformInfoResponses = {
@@ -45103,6 +45191,33 @@ export type GetAccessInfoResponses = {
 
 export type GetAccessInfoResponse = GetAccessInfoResponses[keyof GetAccessInfoResponses];
 
+export type GetPlatformFeaturesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/platform/features';
+};
+
+export type GetPlatformFeaturesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetPlatformFeaturesResponses = {
+    /**
+     * Capabilities of this server process
+     */
+    200: PlatformFeatures;
+};
+
+export type GetPlatformFeaturesResponse = GetPlatformFeaturesResponses[keyof GetPlatformFeaturesResponses];
+
 export type GetPrivateIpData = {
     body?: never;
     path?: never;
@@ -45119,6 +45234,10 @@ export type GetPrivateIpErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Failed to enumerate network interfaces
+     */
+    500: unknown;
 };
 
 export type GetPrivateIpResponses = {

@@ -29,6 +29,8 @@ import {
 import { toast } from 'sonner'
 
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
+import { PlatformFeatureNotice } from '@/components/platform/PlatformFeatureNotice'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -171,6 +173,7 @@ export default function Sandboxes({
   workspacesOnly?: boolean
 }) {
   usePageTitle(workspacesOnly ? 'Workspaces' : 'Sandboxes')
+  const platformFeatures = usePlatformFeatures()
   const [includeWorkspaceCompute, setIncludeWorkspaceCompute] = useState(false)
   const loadWorkspaces = workspacesOnly || includeWorkspaceCompute
   const [page, setPage] = useState(1)
@@ -352,6 +355,13 @@ export default function Sandboxes({
           </div>
         }
       />
+
+      {platformFeatures.data && (
+        <PlatformFeatureNotice
+          available={platformFeatures.data.sandboxes}
+          label={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
+        />
+      )}
 
       {!workspacesOnly && (
         <label className="flex items-center gap-2 text-sm">

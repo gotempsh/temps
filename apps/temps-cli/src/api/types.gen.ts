@@ -14903,26 +14903,59 @@ export type PlanTarget = {
  * look like failure. This endpoint answers the question directly so the
  * console can render an honest, actionable state (what is unavailable, and
  * why) instead of a dead button or an empty page.
+ *
+ * **Honesty contract**: every field that is `true` MUST be backed by a
+ * registered, reachable subsystem. A `true` that is not true is worse than
+ * the endpoint not existing — it causes the console to render controls that
+ * silently fail instead of showing an onboarding state.
  */
 export type PlatformFeatures = {
     /**
-     * Whether backups can be produced from services running on this host.
-     * Remote backups of worker-node services are unaffected.
+     * Backups can be produced from services running on this host.
+     * Remote backups of worker-node services are reported separately in
+     * [`backups_remote`][Self::backups_remote].
      */
     backups_local: boolean;
     /**
-     * Whether application containers can be deployed onto this host.
-     * `false` in the control-plane profile: applications run on worker nodes
-     * that joined the cluster with `temps join`.
+     * Backups of services on worker nodes can be orchestrated, scheduled and
+     * retained by this process. `true` when the backup scheduler is
+     * configured and worker credentials are present, regardless of profile.
+     */
+    backups_remote: boolean;
+    /**
+     * Application containers can run on this host. `false` in the
+     * `control-plane` profile: applications run on worker nodes joined with
+     * `temps join`.
      */
     deployments_local: boolean;
     /**
-     * Whether a Docker daemon answered a ping during startup.
+     * Whether a Docker client exists AND a daemon answered a ping at startup.
+     * In the `control-plane` profile a daemon may still be present for
+     * diagnostics, but no workloads are placed here regardless.
      */
     docker: boolean;
     /**
-     * Whether managed services (PostgreSQL, Redis, MariaDB, ...) can be
-     * provisioned on this host.
+     * Container images can be built by this process. Requires a local Docker
+     * daemon; always `false` when `docker` is `false`.
+     */
+    image_builds_local: boolean;
+    /**
+     * Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,
+     * CapRover) are available. Requires a local Docker daemon to run importer
+     * containers.
+     */
+    imports: boolean;
+    /**
+     * Managed key-value store is registered and reachable.
+     */
+    kv: boolean;
+    /**
+     * Structured log aggregation, search and tailing is active.
+     */
+    log_aggregation: boolean;
+    /**
+     * Managed services (PostgreSQL, Redis, MariaDB, …) can be provisioned on
+     * this host. Requires a local Docker daemon.
      */
     managed_services: boolean;
     /**
@@ -14931,9 +14964,15 @@ export type PlatformFeatures = {
      */
     profile: string;
     /**
-     * Whether agent sandboxes / workspace previews run in this process.
+     * Agent sandboxes / workspace previews run in this process. Requires a
+     * local Docker daemon.
      */
     sandboxes: boolean;
+    /**
+     * Container image vulnerability scanning is available. Requires a local
+     * Docker daemon to pull and scan images.
+     */
+    vulnerability_scanning: boolean;
 };
 
 /**
@@ -24541,6 +24580,14 @@ export type GetPlatformInfoErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Docker daemon unavailable in this profile
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type GetPlatformInfoResponses = {
@@ -45187,6 +45234,10 @@ export type GetPrivateIpErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Failed to enumerate network interfaces
+     */
+    500: unknown;
 };
 
 export type GetPrivateIpResponses = {

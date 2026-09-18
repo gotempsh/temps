@@ -32917,22 +32917,42 @@
         "type": "object"
       },
       "PlatformFeatures": {
-        "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.",
+        "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.\n\n**Honesty contract**: every field that is `true` MUST be backed by a\nregistered, reachable subsystem. A `true` that is not true is worse than\nthe endpoint not existing — it causes the console to render controls that\nsilently fail instead of showing an onboarding state.",
         "properties": {
           "backups_local": {
-            "description": "Whether backups can be produced from services running on this host.\nRemote backups of worker-node services are unaffected.",
+            "description": "Backups can be produced from services running on this host.\nRemote backups of worker-node services are reported separately in\n[`backups_remote`][Self::backups_remote].",
+            "type": "boolean"
+          },
+          "backups_remote": {
+            "description": "Backups of services on worker nodes can be orchestrated, scheduled and\nretained by this process. `true` when the backup scheduler is\nconfigured and worker credentials are present, regardless of profile.",
             "type": "boolean"
           },
           "deployments_local": {
-            "description": "Whether application containers can be deployed onto this host.\n`false` in the control-plane profile: applications run on worker nodes\nthat joined the cluster with `temps join`.",
+            "description": "Application containers can run on this host. `false` in the\n`control-plane` profile: applications run on worker nodes joined with\n`temps join`.",
             "type": "boolean"
           },
           "docker": {
-            "description": "Whether a Docker daemon answered a ping during startup.",
+            "description": "Whether a Docker client exists AND a daemon answered a ping at startup.\nIn the `control-plane` profile a daemon may still be present for\ndiagnostics, but no workloads are placed here regardless.",
+            "type": "boolean"
+          },
+          "image_builds_local": {
+            "description": "Container images can be built by this process. Requires a local Docker\ndaemon; always `false` when `docker` is `false`.",
+            "type": "boolean"
+          },
+          "imports": {
+            "description": "Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,\nCapRover) are available. Requires a local Docker daemon to run importer\ncontainers.",
+            "type": "boolean"
+          },
+          "kv": {
+            "description": "Managed key-value store is registered and reachable.",
+            "type": "boolean"
+          },
+          "log_aggregation": {
+            "description": "Structured log aggregation, search and tailing is active.",
             "type": "boolean"
           },
           "managed_services": {
-            "description": "Whether managed services (PostgreSQL, Redis, MariaDB, ...) can be\nprovisioned on this host.",
+            "description": "Managed services (PostgreSQL, Redis, MariaDB, …) can be provisioned on\nthis host. Requires a local Docker daemon.",
             "type": "boolean"
           },
           "profile": {
@@ -32940,17 +32960,27 @@
             "type": "string"
           },
           "sandboxes": {
-            "description": "Whether agent sandboxes / workspace previews run in this process.",
+            "description": "Agent sandboxes / workspace previews run in this process. Requires a\nlocal Docker daemon.",
+            "type": "boolean"
+          },
+          "vulnerability_scanning": {
+            "description": "Container image vulnerability scanning is available. Requires a local\nDocker daemon to pull and scan images.",
             "type": "boolean"
           }
         },
         "required": [
           "profile",
+          "docker",
           "deployments_local",
+          "image_builds_local",
           "managed_services",
           "backups_local",
+          "backups_remote",
           "sandboxes",
-          "docker"
+          "kv",
+          "imports",
+          "log_aggregation",
+          "vulnerability_scanning"
         ],
         "type": "object"
       },
@@ -54045,6 +54075,12 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Docker daemon unavailable in this profile"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -88737,6 +88773,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Failed to enumerate network interfaces"
           }
         },
         "security": [
