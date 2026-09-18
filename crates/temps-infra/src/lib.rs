@@ -21,12 +21,14 @@ It includes platform detection, network diagnostics, and service access informat
 ```rust,no_run
 use temps_infra::{PlatformInfoService, DnsService};
 use bollard::Docker;
+use std::sync::Arc;
 
 # async fn example() -> anyhow::Result<()> {
 let docker = Docker::connect_with_local_defaults()?;
-let platform_service = PlatformInfoService::new(docker);
+let platform_service = PlatformInfoService::new(Arc::new(docker));
 
-let platform_info = platform_service.get_platform_info().await?;
+let platform_info = platform_service.get_platform_info().await
+    .expect("daemon is available");
 println!("Platform: {}", platform_info.platforms[0]);
 
 let dns_service = DnsService::new();
@@ -71,7 +73,7 @@ impl DnsAppState for AppState {
 let docker = Docker::connect_with_local_defaults()?;
 
 let app_state = Arc::new(AppState {
-    platform_service: PlatformInfoService::new(docker),
+    platform_service: PlatformInfoService::new(Arc::new(docker)),
     dns_service: DnsService::new(),
 });
 
@@ -99,8 +101,8 @@ pub mod types;
 // Re-export commonly used types and services
 pub use plugin::{InfraPlugin, InfraState};
 pub use routes::{configure_routes, DnsApiDoc, DnsAppState, InfraAppState, PlatformInfoApiDoc};
-pub use services::{DnsService, PlatformInfoService};
+pub use services::{DnsService, PlatformInfoError, PlatformInfoService};
 pub use types::{
-    DnsLookupError, DnsLookupRequest, DnsLookupResponse, NetworkInterface, PlatformInfo,
-    PrivateIpInfo, PublicIpInfo, ServerMode, ServiceAccessInfo,
+    DnsLookupError, DnsLookupRequest, DnsLookupResponse, NetworkInterface, PlatformFeatures,
+    PlatformInfo, PrivateIpInfo, PublicIpInfo, ServerMode, ServiceAccessInfo,
 };

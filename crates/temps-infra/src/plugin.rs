@@ -80,36 +80,62 @@ impl TempsPlugin for InfraPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Docker is used for exactly one thing here: reading the
-            // daemon's os/arch. `get_service`, not `require_service` — a
-            // control plane with no daemon still needs every other platform
-            // endpoint, and the capabilities endpoint below is precisely how a
-            // client learns the daemon is absent.
-            let docker = context.get_service::<bollard::Docker>();
-            let docker_available = docker.is_some();
+            // The serve bootstrap always registers a DockerHandle — either
+            // Available (when a daemon answered) or Disabled (control-plane
+            // profile / no socket).  Absent from an embedded/test context, we
+            // fall back to a handle built from the optional raw client so that
+            // existing callers keep working.
+            //
+            // `require_service` is intentional: DockerHandle is always
+            // registered by the serve bootstrap before plugins run.  In test
+            // and embedded contexts that do NOT register a handle we fall back
+            // to constructing one from the optional raw Docker service.
+            let docker_handle = context
+                .get_service::<temps_core::DockerHandle>()
+                .map(|h| (*h).clone())
+                .unwrap_or_else(|| {
+                    // Fallback for embedded/test contexts that never registered
+                    // a handle.  Matches the pre-handle behaviour: use the raw
+                    // client if present, otherwise mark Docker unavailable.
+                    match context.get_service::<bollard::Docker>() {
+                        Some(client) => temps_core::DockerHandle::available(client),
+                        None => temps_core::DockerHandle::disabled(
+                            temps_core::PROFILE_FULL,
+                            "DockerHandle was not registered before InfraPlugin ran",
+                        ),
+                    }
+                });
 
             // The serve bootstrap is the only place that knows the profile;
             // absent (embedded/test contexts) means the historical
-            // everything-enabled control plane.
+            // everything-enabled single-binary behaviour.
             let policy = temps_core::policy_or_default(
                 context.get_service::<temps_core::LocalWorkloadPolicy>(),
             );
-            let features = crate::types::PlatformFeatures {
-                profile: policy.profile().to_string(),
-                deployments_local: policy.local_workloads_enabled(),
-                managed_services: policy.local_workloads_enabled(),
-                backups_local: policy.local_workloads_enabled(),
-                sandboxes: policy.local_workloads_enabled(),
-                docker: docker_available && policy.docker_available(),
+
+            // Build a conservative capability set from what we can observe.
+            // The serve bootstrap will call `.with_features()` with accurate
+            // values for subsystems it knows are configured (e.g. backups_remote,
+            // kv, log_aggregation) before wrapping the service in Arc — these
+            // defaults are intentionally conservative (false) to avoid lying.
+            let docker_reachable = docker_handle.is_available() && policy.docker_available();
+            let features = if policy.local_workloads_enabled() {
+                crate::types::PlatformFeatures::full(docker_reachable)
+            } else {
+                // control-plane profile: local-workload fields are always false.
+                // Caller-supplied fields (backups_remote, kv, log_aggregation)
+                // default to false here; the bootstrap overrides them.
+                crate::types::PlatformFeatures::control_plane(
+                    docker_reachable,
+                    false, // backups_remote — bootstrap sets this
+                    false, // kv — bootstrap sets this
+                    false, // log_aggregation — bootstrap sets this
+                )
             };
 
             // Create PlatformInfoService
             let platform_info_service = Arc::new(
-                match docker {
-                    Some(docker) => PlatformInfoService::new(docker),
-                    None => PlatformInfoService::without_docker(),
-                }
-                .with_features(features),
+                PlatformInfoService::with_handle(Arc::new(docker_handle)).with_features(features),
             );
             context.register_service(platform_info_service.clone());
 

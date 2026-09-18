@@ -1,29 +1,58 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use bollard::Docker;
 use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use temps_core::{DockerHandle, DockerUnavailable};
 use tracing::{debug, error, info};
 
 use crate::types::{
     NetworkInterface, PlatformFeatures, PlatformInfo, PrivateIpInfo, PublicIpInfo, ServerMode,
 };
 
-/// Capabilities assumed when the serve bootstrap does not supply an explicit
-/// set: the historical single-binary control plane, which runs everything.
-fn default_features(docker: bool) -> PlatformFeatures {
-    PlatformFeatures {
-        profile: temps_core::PROFILE_FULL.to_string(),
-        deployments_local: true,
-        managed_services: true,
-        backups_local: true,
-        sandboxes: true,
-        docker,
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// All ways `PlatformInfoService` can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum PlatformInfoError {
+    /// The caller asked for Docker-derived information (container platform,
+    /// architecture) but this process has no local Docker daemon.
+    ///
+    /// The profile and reason are surfaced verbatim so operators who see this
+    /// in a log or an HTTP response immediately know what is missing and how
+    /// to fix it.
+    #[error(
+        "The container platform is unknown: this process has no local Docker daemon \
+         (serve profile '{profile}'): {reason}. Worker nodes report their own \
+         architecture; join one with `temps join`"
+    )]
+    DockerUnavailable { profile: String, reason: String },
+
+    /// The Docker daemon returned an error when queried for host information.
+    #[error("Failed to read Docker daemon info: {0}")]
+    Docker(#[from] bollard::errors::Error),
+
+    /// Network interface enumeration failed at the OS level.
+    #[error("Failed to enumerate network interfaces: {0}")]
+    NetworkInterfaces(#[from] std::io::Error),
+}
+
+impl From<DockerUnavailable> for PlatformInfoError {
+    fn from(e: DockerUnavailable) -> Self {
+        Self::DockerUnavailable {
+            profile: e.profile.to_string(),
+            reason: e.reason,
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal cache
+// ---------------------------------------------------------------------------
 
 /// Cached network information
 #[derive(Debug, Clone)]
@@ -33,43 +62,66 @@ struct CachedNetworkInfo {
     pub last_updated: Instant,
 }
 
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct PlatformInfoService {
-    /// `None` when this process has no Docker daemon handle (see
-    /// [`PlatformInfoService::without_docker`]). Everything except
-    /// [`PlatformInfoService::get_platform_info`] is daemon-independent.
-    docker: Option<Arc<Docker>>,
+    /// The process-wide Docker handle.  Always present; may be
+    /// [`DockerHandle::Disabled`] when no daemon is available.  Callers that
+    /// genuinely need a client call `handle.require()` and get a typed
+    /// [`DockerUnavailable`] rather than a panic.
+    docker: Arc<DockerHandle>,
     network_cache: Arc<RwLock<Option<CachedNetworkInfo>>>,
     cache_duration: Duration,
     features: PlatformFeatures,
 }
 
 impl PlatformInfoService {
-    pub fn new(docker: Arc<Docker>) -> Self {
+    /// Build the service with a known-available Docker client.
+    ///
+    /// Wraps the client into a [`DockerHandle::Available`] so the rest of the
+    /// service can work uniformly through the handle.
+    pub fn new(docker: Arc<bollard::Docker>) -> Self {
+        Self::with_handle(Arc::new(DockerHandle::available(docker)))
+    }
+
+    /// Build the service from a pre-constructed handle.
+    ///
+    /// The handle may be [`DockerHandle::Available`] or
+    /// [`DockerHandle::Disabled`]; both are valid — calls to
+    /// [`Self::get_platform_info`] on a disabled handle return a typed
+    /// [`PlatformInfoError::DockerUnavailable`] instead of panicking.
+    pub fn with_handle(handle: Arc<DockerHandle>) -> Self {
+        let docker_present = handle.is_available();
         Self {
-            docker: Some(docker),
+            docker: handle,
             network_cache: Arc::new(RwLock::new(None)),
             cache_duration: Duration::from_secs(600), // Cache for 10 minutes
-            features: default_features(true),
+            features: crate::types::PlatformFeatures::full(docker_present),
         }
     }
 
-    /// Build the service for a process with no Docker daemon handle.
+    /// Build the service for a process that deliberately has no Docker daemon.
     ///
     /// Network diagnostics, access-mode detection and the capabilities
     /// endpoint all keep working; only the daemon-derived container platform
-    /// is unavailable, and it reports that as an error rather than guessing.
+    /// is unavailable, and it reports that as a typed error rather than
+    /// guessing.
     pub fn without_docker() -> Self {
-        Self {
-            docker: None,
-            network_cache: Arc::new(RwLock::new(None)),
-            cache_duration: Duration::from_secs(600),
-            features: default_features(false),
-        }
+        Self::with_handle(Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_FULL,
+            "no Docker client was provided to PlatformInfoService",
+        )))
     }
 
-    /// Replace the reported capability set. Called once at startup by the
-    /// serve bootstrap, which is the only place that knows the profile.
+    /// Replace the reported capability set.
+    ///
+    /// Called once at startup by the serve bootstrap, which is the only code
+    /// that knows both the profile and which optional subsystems are truly
+    /// registered.  Use [`PlatformFeatures::full`] or
+    /// [`PlatformFeatures::control_plane`] to build the argument.
     pub fn with_features(mut self, features: PlatformFeatures) -> Self {
         self.features = features;
         self
@@ -80,16 +132,16 @@ impl PlatformInfoService {
         &self.features
     }
 
-    pub async fn get_platform_info(&self) -> anyhow::Result<PlatformInfo> {
+    /// OS type and supported platforms from the local Docker daemon.
+    ///
+    /// Returns [`PlatformInfoError::DockerUnavailable`] when this process has
+    /// no daemon handle (e.g., `--profile control-plane`), or
+    /// [`PlatformInfoError::Docker`] when the daemon is present but returns an
+    /// error.
+    pub async fn get_platform_info(&self) -> Result<PlatformInfo, PlatformInfoError> {
         info!("Getting platform info from Docker");
 
-        let docker = self.docker.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "container platform is unknown: this process has no Docker daemon handle \
-                 (serve profile '{}'). Worker nodes report their own architecture",
-                self.features.profile
-            )
-        })?;
+        let docker = self.docker.require()?;
 
         let info = docker.info().await?;
 
@@ -188,7 +240,7 @@ impl PlatformInfoService {
         }
     }
 
-    pub async fn get_private_ip(&self) -> anyhow::Result<PrivateIpInfo> {
+    pub async fn get_private_ip(&self) -> Result<PrivateIpInfo, PlatformInfoError> {
         // Check cache first for primary IP
         if let Some(cached) = self.get_cached_network_info() {
             if cached.private_ip.is_some() {
@@ -218,7 +270,7 @@ impl PlatformInfoService {
                     // Check if it's a private IP address (RFC 1918)
                     let octets = addr.octets();
                     let is_private = (octets[0] == 10) || // 10.0.0.0/8
-                        (octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31)) || // 172.16.0.0/12
+                        (octets[0] == 172 && (16..=31).contains(&octets[1])) || // 172.16.0.0/12
                         (octets[0] == 192 && octets[1] == 168); // 192.168.0.0/16
 
                     ipv4_addresses.push(NetworkInterface {
@@ -362,8 +414,11 @@ impl PlatformInfoService {
         }
     }
 
-    /// Force refresh the cached information
-    pub async fn refresh_network_cache(&self) -> anyhow::Result<()> {
+    /// Force refresh the cached information.
+    ///
+    /// Errors from the individual lookups are discarded — this is a
+    /// best-effort warm-up; stale data in the cache is better than nothing.
+    pub async fn refresh_network_cache(&self) -> Result<(), PlatformInfoError> {
         info!("Refreshing network cache");
 
         // Clear existing cache
@@ -372,7 +427,8 @@ impl PlatformInfoService {
             *cache_write = None;
         }
 
-        // Fetch new info
+        // Fetch new info (errors are intentionally swallowed — this is a
+        // best-effort warm-up; the cache will be populated on next request)
         let _ = self.get_public_ip().await;
         let _ = self.get_private_ip().await;
 
@@ -463,6 +519,62 @@ fn is_private_ip(ip: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ------------------------------------------------------------------
+    // PlatformInfoError
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn docker_unavailable_error_names_profile_and_remedy() {
+        let err = PlatformInfoError::DockerUnavailable {
+            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
+            reason: "started with --profile control-plane".to_string(),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("control-plane"),
+            "message must include profile: {rendered}"
+        );
+        assert!(
+            rendered.contains("temps join"),
+            "message must include the remedy: {rendered}"
+        );
+    }
+
+    #[test]
+    fn docker_unavailable_converts_from_core_type() {
+        use temps_core::CONTROL_PLANE_DOCKER_REASON;
+        let handle = DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            CONTROL_PLANE_DOCKER_REASON,
+        );
+        let core_err = handle.require().expect_err("disabled handle must error");
+        let infra_err = PlatformInfoError::from(core_err);
+
+        let rendered = infra_err.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+    }
+
+    // ------------------------------------------------------------------
+    // Service construction and features
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn with_handle_disabled_reports_docker_false_in_default_features() {
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_FULL,
+            "unit test",
+        ));
+        let service = PlatformInfoService::with_handle(handle);
+        assert!(!service.features().docker);
+    }
+
+    #[test]
+    fn without_docker_convenience_constructor_matches_with_handle_disabled() {
+        let service = PlatformInfoService::without_docker();
+        assert!(!service.features().docker);
+        assert_eq!(service.features().profile, temps_core::PROFILE_FULL);
+    }
+
     #[test]
     fn default_features_describe_the_full_profile() {
         let service = PlatformInfoService::without_docker();
@@ -473,46 +585,50 @@ mod tests {
         assert!(features.managed_services);
         assert!(features.backups_local);
         assert!(features.sandboxes);
-        // No handle was supplied, so the daemon cannot be reported as present.
+        // No daemon was supplied, so docker must be false.
         assert!(!features.docker);
     }
 
     #[test]
     fn features_are_replaced_wholesale_by_the_bootstrap() {
-        let service = PlatformInfoService::without_docker().with_features(PlatformFeatures {
-            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
-            deployments_local: false,
-            managed_services: false,
-            backups_local: false,
-            sandboxes: false,
-            docker: false,
-        });
+        let service = PlatformInfoService::without_docker()
+            .with_features(PlatformFeatures::control_plane(false, false, false, false));
 
         assert_eq!(
             service.features().profile,
             temps_core::PROFILE_CONTROL_PLANE
         );
         assert!(!service.features().deployments_local);
+        assert!(!service.features().managed_services);
     }
 
-    #[tokio::test]
-    async fn platform_info_without_a_daemon_explains_itself() {
-        let service = PlatformInfoService::without_docker().with_features(PlatformFeatures {
-            profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
-            deployments_local: false,
-            managed_services: false,
-            backups_local: false,
-            sandboxes: false,
-            docker: false,
-        });
+    // ------------------------------------------------------------------
+    // get_platform_info — typed error for missing daemon
+    // ------------------------------------------------------------------
 
-        let error = service
+    #[tokio::test]
+    async fn platform_info_without_a_daemon_returns_typed_error() {
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        let service = PlatformInfoService::with_handle(handle)
+            .with_features(PlatformFeatures::control_plane(false, false, false, false));
+
+        let err = service
             .get_platform_info()
             .await
-            .expect_err("no daemon handle is available")
-            .to_string();
+            .expect_err("no daemon handle is available");
 
-        assert!(error.contains("control-plane"), "{error}");
-        assert!(error.contains("Docker"), "{error}");
+        match &err {
+            PlatformInfoError::DockerUnavailable { profile, .. } => {
+                assert_eq!(profile, temps_core::PROFILE_CONTROL_PLANE);
+            }
+            other => panic!("expected DockerUnavailable, got {other:?}"),
+        }
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+        assert!(rendered.contains("temps join"), "{rendered}");
     }
 }
