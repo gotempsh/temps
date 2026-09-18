@@ -31,11 +31,13 @@ enum ControlPlaneOverlayReconcileError {
     Allocation(#[from] temps_network::allocator::AllocatorError),
     #[error(transparent)]
     Setup(#[from] temps_network::control_plane::ControlPlaneSetupError),
+    #[error("Docker daemon unavailable for control-plane overlay reconciliation: {0}")]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 async fn reconcile_control_plane_overlay(
     db: Arc<sea_orm::DatabaseConnection>,
-    docker: Arc<bollard::Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<&str>,
     underlay_dev: Option<&str>,
 ) -> Result<bool, ControlPlaneOverlayReconcileError> {
@@ -53,9 +55,10 @@ async fn reconcile_control_plane_overlay(
         return Ok(false);
     };
 
+    let raw_docker = docker.require()?;
     let overlay = temps_network::control_plane::setup(
         db.clone(),
-        docker.as_ref(),
+        raw_docker.as_ref(),
         private_address,
         underlay_dev,
     )
@@ -66,7 +69,7 @@ async fn reconcile_control_plane_overlay(
 
 fn spawn_control_plane_overlay_setup_watcher(
     db: Arc<sea_orm::DatabaseConnection>,
-    docker: Arc<bollard::Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<String>,
     underlay_dev: Option<String>,
 ) {
@@ -132,74 +135,73 @@ impl DeployerPlugin {
         Self
     }
 
-    /// Detect if Docker BuildKit is available by checking daemon version and capabilities
-    async fn detect_buildkit() -> bool {
-        match bollard::Docker::connect_with_defaults() {
-            Ok(docker) => {
-                // Check Docker version
-                match docker.version().await {
-                    Ok(version) => {
-                        // BuildKit is available in Docker Engine 18.09+
-                        if let Some(version_str) = version.version {
-                            tracing::debug!("Docker version: {}", version_str);
+    /// Detect if Docker BuildKit is available by checking daemon version and capabilities.
+    ///
+    /// Returns `false` immediately when no Docker client is available in this process;
+    /// the caller is expected to gate this behind `local_workloads_enabled`.
+    async fn detect_buildkit(handle: &temps_core::DockerHandle) -> bool {
+        let docker = match handle.cloned() {
+            Some(d) => d,
+            None => return false,
+        };
+        // Check Docker version
+        match docker.version().await {
+            Ok(version) => {
+                // BuildKit is available in Docker Engine 18.09+
+                if let Some(version_str) = version.version {
+                    tracing::debug!("Docker version: {}", version_str);
 
-                            // Parse version and check if >= 18.09
-                            if let Some(major_minor) =
-                                version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
-                            {
-                                if let (Ok(major), Ok(minor)) =
-                                    (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
-                                {
-                                    let supports_buildkit =
-                                        major > 18 || (major == 18 && minor >= 9);
+                    // Parse version and check if >= 18.09
+                    if let Some(major_minor) =
+                        version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
+                    {
+                        if let (Ok(major), Ok(minor)) =
+                            (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
+                        {
+                            let supports_buildkit = major > 18 || (major == 18 && minor >= 9);
 
-                                    if !supports_buildkit {
-                                        tracing::warn!(
-                                            "Docker {}.{} does not support BuildKit (requires 18.09+)",
-                                            major, minor
-                                        );
-                                        return false;
-                                    }
-
-                                    tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
-                                }
-                            }
-                        }
-
-                        // Check Docker info for BuildKit support
-                        match docker.info().await {
-                            Ok(info) => {
-                                // Log out all info for debug
-                                tracing::debug!(
-                                    "Docker info arch: {:?} os: {:?}",
-                                    info.architecture,
-                                    info.os_type
+                            if !supports_buildkit {
+                                tracing::warn!(
+                                    "Docker {}.{} does not support BuildKit (requires 18.09+)",
+                                    major,
+                                    minor
                                 );
-                                // Check if BuildKit is explicitly disabled
-                                // Note: BuildKit is enabled by default in newer Docker versions
-                                tracing::debug!("Docker info retrieved successfully");
+                                return false;
+                            }
 
-                                // Modern Docker (20.10+) has BuildKit enabled by default
-                                tracing::debug!("BuildKit available and will be used for builds");
-                                true
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Failed to get Docker info: {}, assuming BuildKit available",
-                                    e
-                                );
-                                true // Assume available if we can't check
-                            }
+                            tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
                         }
                     }
+                }
+
+                // Check Docker info for BuildKit support
+                match docker.info().await {
+                    Ok(info) => {
+                        // Log out all info for debug
+                        tracing::debug!(
+                            "Docker info arch: {:?} os: {:?}",
+                            info.architecture,
+                            info.os_type
+                        );
+                        // Check if BuildKit is explicitly disabled
+                        // Note: BuildKit is enabled by default in newer Docker versions
+                        tracing::debug!("Docker info retrieved successfully");
+
+                        // Modern Docker (20.10+) has BuildKit enabled by default
+                        tracing::debug!("BuildKit available and will be used for builds");
+                        true
+                    }
                     Err(e) => {
-                        tracing::warn!("Failed to get Docker version: {}", e);
-                        false
+                        tracing::debug!(
+                            "Failed to get Docker info: {}, assuming BuildKit available",
+                            e
+                        );
+                        true // Assume available if we can't check
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to connect to Docker: {}", e);
+                tracing::warn!("Failed to get Docker version: {}", e);
                 false
             }
         }
@@ -220,7 +222,7 @@ impl TempsPlugin for DeployerPlugin {
     fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
         use temps_core::plugin::RequiredService;
         vec![
-            RequiredService::of::<bollard::Docker>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
             RequiredService::of::<temps_config::ConfigService>(),
         ]
     }
@@ -230,8 +232,8 @@ impl TempsPlugin for DeployerPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Create Docker client
-            let docker = context.require_service::<bollard::Docker>();
+            // Obtain the process-wide Docker handle (always registered; may be Disabled).
+            let docker = context.require_service::<temps_core::DockerHandle>();
 
             // Whether this process is allowed to build and run containers on
             // its own daemon. Absent from the registry in embeddings that
@@ -254,7 +256,7 @@ impl TempsPlugin for DeployerPlugin {
             // daemon, which is exactly what a no-local-workloads profile must
             // not do at boot.
             let use_buildkit = if local_workloads_enabled {
-                Self::detect_buildkit().await
+                Self::detect_buildkit(&docker).await
             } else {
                 false
             };
@@ -289,9 +291,11 @@ impl TempsPlugin for DeployerPlugin {
                     }
                 };
 
-            // Create DockerRuntime service
+            // Create DockerRuntime service.  Pass the DockerHandle — the runtime
+            // defers any actual daemon access to the point of use, so constructing
+            // it here is always safe regardless of whether a daemon is present.
             let server_config = config_service.get_server_config();
-            let mut docker_runtime = DockerRuntime::new(
+            let mut docker_runtime = DockerRuntime::new_with_handle(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),

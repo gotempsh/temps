@@ -4389,7 +4389,9 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
         );
-        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+        let docker_log_service = Arc::new(DockerLogService::new(Arc::new(
+            temps_core::DockerHandle::available(docker.clone()),
+        )));
 
         let server_config = Arc::new(
             temps_config::ServerConfig::new(

@@ -111,6 +111,7 @@ pub fn build_router(
         )
         .route("/agent/containers", get(handlers::list_containers))
         .route("/agent/images/import", post(handlers::import_image))
+        .route("/agent/images/pull", post(handlers::pull_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes

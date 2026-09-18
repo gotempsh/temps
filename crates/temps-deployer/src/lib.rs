@@ -199,6 +199,12 @@ pub enum BuilderError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    /// The local Docker daemon is unavailable in this process. Returned when
+    /// a build is requested on a control-plane node that runs no workloads;
+    /// applications must be deployed on worker nodes joined with `temps join`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 #[derive(Error, Debug)]
@@ -226,6 +232,13 @@ pub enum DeployerError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    /// The local Docker daemon is unavailable in this process. Returned when
+    /// a deployment is requested on a control-plane node that runs no
+    /// workloads; applications must be deployed on worker nodes joined with
+    /// `temps join`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

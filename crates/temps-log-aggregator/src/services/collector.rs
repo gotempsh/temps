@@ -56,7 +56,7 @@ struct StreamTask {
 /// to the Docker daemon. Tracks the last seen timestamp per container so
 /// reconnections resume without gaps.
 pub struct CollectorService {
-    docker: Arc<Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     chunk_writer: Arc<ChunkWriterService>,
     metadata_service: Arc<LogMetadataService>,
     /// DB handle used to resolve an imported external service's
@@ -73,7 +73,7 @@ pub struct CollectorService {
 
 impl CollectorService {
     pub fn new(
-        docker: Arc<Docker>,
+        docker: Arc<temps_core::DockerHandle>,
         chunk_writer: Arc<ChunkWriterService>,
         metadata_service: Arc<LogMetadataService>,
         tail_capacity: usize,
@@ -168,7 +168,13 @@ impl CollectorService {
             );
         }
 
-        let docker = self.docker.clone();
+        // Resolve the daemon at streaming start — returns a typed error on a
+        // control-plane process instead of spawning a task that immediately
+        // fails with a connection error.
+        let docker: Arc<Docker> = self
+            .docker
+            .require()
+            .map_err(LogAggregatorError::DockerUnavailable)?;
         let chunk_writer = self.chunk_writer.clone();
         let tail_tx = self.tail_tx.clone();
         let container_id_owned = container_id.to_string();
@@ -253,8 +259,11 @@ impl CollectorService {
         &self,
         container_id: &str,
     ) -> Result<Option<ContainerContext>, LogAggregatorError> {
-        let inspect = self
+        let docker = self
             .docker
+            .require()
+            .map_err(LogAggregatorError::DockerUnavailable)?;
+        let inspect = docker
             .inspect_container(
                 container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -596,15 +605,18 @@ mod tests {
 
     /// Build a CollectorService backed by a MockDatabase. `extract_external_service_context`
     /// only touches `self.db`, so the Docker handle is never dialed — but `new`
-    /// requires one, so we lazily construct a client (no daemon connection).
-    fn collector_with_db(db: Arc<sea_orm::DatabaseConnection>) -> Option<CollectorService> {
-        let docker = Docker::connect_with_local_defaults().ok()?;
+    /// requires one, so we use a disabled handle (no daemon connection needed).
+    fn collector_with_db(db: Arc<sea_orm::DatabaseConnection>) -> CollectorService {
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            "test",
+            "no docker needed for db-only tests".to_string(),
+        ));
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn LogStorage> =
             Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
         let chunk_writer = Arc::new(ChunkWriterService::new(storage));
         let metadata = Arc::new(LogMetadataService::new(db.clone()));
-        Some(CollectorService::new(Arc::new(docker), chunk_writer, metadata, 16).with_db(db))
+        CollectorService::new(handle, chunk_writer, metadata, 16).with_db(db)
     }
 
     fn member(service_id: i32, container_name: &str) -> temps_entities::service_members::Model {
@@ -640,10 +652,7 @@ mod tests {
             // Path 3: service_members by container_name → the member.
             .append_query_results(vec![vec![member(7, "postgres-mydb-1")]])
             .into_connection();
-        let Some(collector) = collector_with_db(Arc::new(db)) else {
-            println!("Docker client unavailable, skipping");
-            return;
-        };
+        let collector = collector_with_db(Arc::new(db));
 
         let labels = HashMap::new(); // no temps.service_name label
         let ctx = collector
@@ -671,10 +680,7 @@ mod tests {
             .append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
             .append_query_results(vec![Vec::<temps_entities::service_members::Model>::new()])
             .into_connection();
-        let Some(collector) = collector_with_db(Arc::new(db)) else {
-            println!("Docker client unavailable, skipping");
-            return;
-        };
+        let collector = collector_with_db(Arc::new(db));
 
         let labels = HashMap::new();
         let ctx = collector

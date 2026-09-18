@@ -30,6 +30,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use temps_core::{DockerHandle, DockerUnavailable};
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_backups,
     external_service_health_checks, external_services, nodes, postgres_major_upgrades,
@@ -439,6 +440,26 @@ pub enum ExternalServiceError {
 
     #[error("Internal error: {reason}")]
     InternalError { reason: String },
+
+    /// The local Docker daemon is structurally unavailable in this process —
+    /// the process was started without a socket (e.g. a containerised
+    /// control plane). Use [`Self::LocalWorkloadsDisabled`] when the daemon
+    /// *could* be present but the serve profile forbids using it.
+    #[error(transparent)]
+    DockerUnavailable(#[from] DockerUnavailable),
+
+    /// A request tried to provision or start a container locally on a process
+    /// that was started with `--profile control-plane`. Workloads run on
+    /// worker nodes instead; the HTTP surface stays mounted so the console
+    /// can still list remote services and explain that provisioning is
+    /// unavailable here.
+    #[error(
+        "Managed service '{name}' cannot run on this control plane: it was started with serve \
+         profile 'control-plane', which runs no local containers. Create the service on a \
+         worker node (set `node_id`) — join one with `temps join` — or run the control \
+         plane with `--profile full`"
+    )]
+    LocalWorkloadsDisabled { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1346,7 +1367,18 @@ const STANDALONE_SERVICE_DNS_TTL: i32 = 30;
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
-    docker: Arc<Docker>,
+    /// The process-wide Docker handle. May be `Disabled` on a control-plane
+    /// profile that deliberately runs no local workloads. Call
+    /// [`Self::require_docker`] anywhere an actual client is needed; call
+    /// [`Self::local_workloads_enabled`] to gate local-provisioning paths
+    /// before touching the handle.
+    docker: Arc<DockerHandle>,
+    /// Whether this process is allowed to start containers locally.
+    /// `false` on `--profile control-plane`, `true` on `--profile full`
+    /// (the historical default). This is a *policy* flag — it gates local
+    /// provisioning even when a Docker socket happens to be mounted, so the
+    /// serve profile is a hard contract and not just a fallback.
+    local_workloads_enabled: bool,
     /// Internal DNS registry (ADR-011). Required, not optional — making it
     /// optional led to silent no-ops where one constructor wired it and
     /// another didn't, so cluster members that *should* have DNS records
@@ -1429,6 +1461,12 @@ impl ExternalServiceManager {
     /// Callers that don't have a `DnsRegistry` in scope can build one
     /// trivially: `Arc::new(temps_dns::DnsRegistry::new(db.clone()))`.
     /// The registry is a stateless wrapper over the same `db` handle.
+    ///
+    /// This constructor wraps `docker` into a [`DockerHandle::Available`]
+    /// and sets `local_workloads_enabled = true` (the historical behaviour
+    /// of a full-profile process that owns a Docker daemon). Call
+    /// [`Self::new_with_handle`] when the handle and policy come from the
+    /// serve bootstrap rather than a direct socket.
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<EncryptionService>,
@@ -1438,10 +1476,50 @@ impl ExternalServiceManager {
         Self {
             db,
             encryption_service,
-            docker,
+            docker: Arc::new(DockerHandle::available(docker)),
+            local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Construct with a pre-built [`DockerHandle`] and an explicit
+    /// `local_workloads_enabled` policy flag. Used by the serve bootstrap
+    /// when the profile is known at startup time.
+    pub fn new_with_handle(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<EncryptionService>,
+        docker: Arc<DockerHandle>,
+        local_workloads_enabled: bool,
+        dns_registry: Arc<temps_dns::DnsRegistry>,
+    ) -> Self {
+        Self {
+            db,
+            encryption_service,
+            docker,
+            local_workloads_enabled,
+            dns_registry,
+            reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether this process may run containers locally. Gates local
+    /// provisioning paths independently of whether a Docker socket is
+    /// mounted — the profile is a contract, not a capability check.
+    pub fn local_workloads_enabled(&self) -> bool {
+        self.local_workloads_enabled
+    }
+
+    /// Extract the Docker client, returning a typed error when this process
+    /// was started without a daemon (e.g. a containerised control plane).
+    ///
+    /// Every daemon-dependent code path should call this once — as late as
+    /// possible — and propagate [`ExternalServiceError::DockerUnavailable`]
+    /// upward. Local-provisioning paths should also check
+    /// [`Self::local_workloads_enabled`] **first** so the user gets a
+    /// policy error (409) rather than a capability error.
+    fn require_docker(&self) -> Result<Arc<Docker>, ExternalServiceError> {
+        Ok(self.docker.require()?)
     }
 
     /// Determine the local machine's private IP address for inter-node communication.
@@ -1494,29 +1572,39 @@ impl ExternalServiceManager {
         );
         Ok(address)
     }
+    /// Build a service engine instance for the given name and type.
+    ///
+    /// Returns [`ExternalServiceError::DockerUnavailable`] when this process
+    /// has no Docker daemon — that is the typed signal callers map to a
+    /// 409/503 rather than a connection-refused from inside the engine.
+    /// Local-provisioning callers must additionally guard on
+    /// [`Self::local_workloads_enabled`] before reaching this function so
+    /// the policy error (not the capability error) is what the operator sees.
     pub fn get_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Box<dyn ExternalService> {
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         self.create_service_instance(name, service_type)
     }
+
     #[allow(deprecated)]
     fn create_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Box<dyn ExternalService> {
-        match service_type {
-            ServiceType::Mariadb => Box::new(MariaDbService::new(name, self.docker.clone())),
-            ServiceType::Mongodb => Box::new(MongodbService::new(name, self.docker.clone())),
-            ServiceType::Postgres => Box::new(PostgresService::new(name, self.docker.clone())),
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        let docker = self.require_docker()?;
+        Ok(match service_type {
+            ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker)),
+            ServiceType::Mongodb => Box::new(MongodbService::new(name, docker)),
+            ServiceType::Postgres => Box::new(PostgresService::new(name, docker)),
             // Note: PostgresCluster is handled via create_cluster_service_instance, not here
-            ServiceType::Redis => Box::new(RedisService::new(name, self.docker.clone())),
+            ServiceType::Redis => Box::new(RedisService::new(name, docker)),
             // S3 now uses RustFS by default (high-performance S3-compatible storage)
             ServiceType::S3 => Box::new(RustfsService::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // Temps KV uses Redis backend. The instance name must come from
@@ -1524,28 +1612,28 @@ impl ExternalServiceManager {
             // see the module docs on `externalsvc::naming` and issue #495.
             ServiceType::Kv => Box::new(RedisService::new(
                 managed_instance_name(&name, service_type),
-                self.docker.clone(),
+                docker,
             )),
             // Temps Blob uses RustfsService (high-performance S3-compatible
             // storage). Same naming contract as `Kv` above.
             ServiceType::Blob => Box::new(RustfsService::new(
                 managed_instance_name(&name, service_type),
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // RustFS standalone S3-compatible storage
             ServiceType::Rustfs => Box::new(RustfsService::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // MinIO (deprecated) - kept for backward compatibility with existing services
             ServiceType::Minio => Box::new(S3Service::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
-        }
+        })
     }
 
     #[allow(deprecated)]
@@ -1570,7 +1658,7 @@ impl ExternalServiceManager {
         parameters: &serde_json::Value,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
-            return Ok(self.create_service_instance(name, service_type));
+            return self.create_service_instance(name, service_type);
         }
 
         let backend_selection =
@@ -1581,11 +1669,12 @@ impl ExternalServiceManager {
                 }
             })?;
         match backend_selection.backend {
-            ManagedS3BackendKind::Rustfs => Ok(self.create_service_instance(name, service_type)),
+            ManagedS3BackendKind::Rustfs => self.create_service_instance(name, service_type),
             ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                let docker = self.require_docker()?;
                 Ok(Box::new(S3Service::new(
                     name,
-                    self.docker.clone(),
+                    docker,
                     self.encryption_service.clone(),
                 )))
             }
@@ -1971,7 +2060,7 @@ impl ExternalServiceManager {
             .unwrap_or(container_port);
 
         let container_name = self
-            .create_service_instance(service_name.to_string(), backend_service_type)
+            .create_service_instance(service_name.to_string(), backend_service_type)?
             .get_docker_container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
@@ -2088,6 +2177,20 @@ impl ExternalServiceManager {
                 reason:
                     "MinIO service creation is deprecated; create an S3 or RustFS service instead"
                         .to_string(),
+            });
+        }
+
+        // For standalone services that would run locally, guard the profile
+        // contract BEFORE writing any database state. A cluster with only
+        // remote members is fine — that path spawns containers on worker nodes
+        // only; `initialize_cluster` catches any local member in a cluster
+        // created with mixed placement.
+        if request.node_id.is_none()
+            && request.topology != "cluster"
+            && !self.local_workloads_enabled
+        {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: request.name.clone(),
             });
         }
 
@@ -2804,7 +2907,7 @@ impl ExternalServiceManager {
                         }
                     })?;
                 let old_instance =
-                    self.create_service_instance(service.name.clone(), service_type_enum);
+                    self.create_service_instance(service.name.clone(), service_type_enum)?;
                 if let Err(e) = old_instance.stop().await {
                     info!(
                         "Could not stop pre-rename container for service {} (may not exist): {}",
@@ -3002,37 +3105,47 @@ impl ExternalServiceManager {
                         }
                     }
                 } else {
-                    // Local container
-                    if let Err(e) = self
-                        .docker
-                        .remove_container(
-                            &member.container_name,
-                            Some(bollard::query_parameters::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    {
-                        let msg = format!(
-                            "Failed to remove local container '{}': {}",
-                            member.container_name, e
-                        );
-                        error!("{}", msg);
-                        errors.push(msg);
-                    }
+                    // Local container. If this process has no local Docker
+                    // daemon (control-plane profile), there is nothing local
+                    // to clean up here — that's expected, not a failure.
+                    match self.docker.get() {
+                        Some(docker) => {
+                            if let Err(e) = docker
+                                .remove_container(
+                                    &member.container_name,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await
+                            {
+                                let msg = format!(
+                                    "Failed to remove local container '{}': {}",
+                                    member.container_name, e
+                                );
+                                error!("{}", msg);
+                                errors.push(msg);
+                            }
 
-                    // Also remove the volume
-                    let volume_name = format!("{}_data", member.container_name);
-                    if let Err(e) = self
-                        .docker
-                        .remove_volume(
-                            &volume_name,
-                            None::<bollard::query_parameters::RemoveVolumeOptions>,
-                        )
-                        .await
-                    {
-                        warn!("Failed to remove volume '{}': {}", volume_name, e);
+                            // Also remove the volume
+                            let volume_name = format!("{}_data", member.container_name);
+                            if let Err(e) = docker
+                                .remove_volume(
+                                    &volume_name,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await
+                            {
+                                warn!("Failed to remove volume '{}': {}", volume_name, e);
+                            }
+                        }
+                        None => {
+                            debug!(
+                                container_name = %member.container_name,
+                                "No local Docker daemon in this process; skipping local cleanup for member"
+                            );
+                        }
                     }
                 }
             }
@@ -3095,21 +3208,25 @@ impl ExternalServiceManager {
         // turn an otherwise successful delete into a 500.
         if service.node_id.is_none() {
             for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
-                match self
-                    .create_service_instance(legacy_name.clone(), service_type_enum)
-                    .remove()
-                    .await
-                {
-                    Ok(()) => info!(
-                        service_id,
-                        legacy_name,
-                        "Removed duplicate container left behind by the earlier managed-service naming split"
-                    ),
+                match self.create_service_instance(legacy_name.clone(), service_type_enum) {
+                    Ok(instance) => match instance.remove().await {
+                        Ok(()) => info!(
+                            service_id,
+                            legacy_name,
+                            "Removed duplicate container left behind by the earlier managed-service naming split"
+                        ),
+                        Err(e) => debug!(
+                            service_id,
+                            legacy_name,
+                            error = %e,
+                            "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                        ),
+                    },
                     Err(e) => debug!(
                         service_id,
                         legacy_name,
                         error = %e,
-                        "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                        "Skipping legacy container cleanup (Docker unavailable or disabled)"
                     ),
                 }
             }
@@ -3407,10 +3524,9 @@ impl ExternalServiceManager {
                 parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
             };
 
-            let postgres = crate::externalsvc::postgres::PostgresService::new(
-                service.name.clone(),
-                Arc::clone(&self.docker),
-            );
+            let docker = self.require_docker()?;
+            let postgres =
+                crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
             postgres
                 .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
                 .await
@@ -4360,8 +4476,9 @@ impl ExternalServiceManager {
         // looks like `localhost:9000` from the host but needs to be
         // a Docker-routable address from inside the container.
         let resolved_endpoint = if primary.node_id.is_none() {
+            let docker = self.require_docker()?;
             s3_credentials
-                .resolve_endpoint_for_container(&self.docker, &primary.container_name)
+                .resolve_endpoint_for_container(&docker, &primary.container_name)
                 .await
         } else {
             // Remote primary — we can't introspect the worker's docker
@@ -4670,6 +4787,7 @@ impl ExternalServiceManager {
             use bollard::exec::{CreateExecOptions, StartExecOptions};
             use futures::StreamExt;
 
+            let docker = self.require_docker()?;
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let env_strings: Vec<String> =
                 env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -4679,8 +4797,7 @@ impl ExternalServiceManager {
                 Some(env_strings.iter().map(|s| s.as_str()).collect())
             };
 
-            let exec = self
-                .docker
+            let exec = docker
                 .create_exec(
                     &member.container_name,
                     CreateExecOptions {
@@ -4701,8 +4818,7 @@ impl ExternalServiceManager {
                     ),
                 })?;
 
-            let output = self
-                .docker
+            let output = docker
                 .start_exec(
                     &exec.id,
                     Some(StartExecOptions {
@@ -4738,7 +4854,7 @@ impl ExternalServiceManager {
                 }
             }
 
-            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+            let inspect = docker.inspect_exec(&exec.id).await.map_err(|e| {
                 ExternalServiceError::DockerError {
                     id: 0,
                     reason: format!("Failed to inspect exec result: {}", e),
@@ -4866,29 +4982,37 @@ impl ExternalServiceManager {
                 .await;
 
             // Stop + remove the container. Best-effort; container may
-            // have died on its own already.
-            let _ = self
-                .docker
-                .remove_container(
-                    &m.container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            // have died on its own already. If this process has no local
+            // Docker daemon (control-plane profile), there is nothing to
+            // clean up locally — that's expected, not a failure.
+            if let Some(docker) = self.docker.get() {
+                let _ = docker
+                    .remove_container(
+                        &m.container_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
 
-            // Remove the data volume too — full reset. The primary's
-            // volume gets recreated below with restored pgdata; the
-            // monitor and replicas get fresh ones.
-            let volume_name = format!("{}_data", m.container_name);
-            let _ = self
-                .docker
-                .remove_volume(
-                    &volume_name,
-                    None::<bollard::query_parameters::RemoveVolumeOptions>,
-                )
-                .await;
+                // Remove the data volume too — full reset. The primary's
+                // volume gets recreated below with restored pgdata; the
+                // monitor and replicas get fresh ones.
+                let volume_name = format!("{}_data", m.container_name);
+                let _ = docker
+                    .remove_volume(
+                        &volume_name,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await;
+            } else {
+                debug!(
+                    member_id = m.id,
+                    container_name = %m.container_name,
+                    "No local Docker daemon in this process; skipping local teardown for cluster member"
+                );
+            }
         }
 
         // Drop role/VIP records (Tier 3) once.
@@ -4980,10 +5104,13 @@ impl ExternalServiceManager {
         use bollard::query_parameters::CreateContainerOptionsBuilder;
         use futures::StreamExt;
 
+        // Provisioning a new helper container needs a real Docker daemon;
+        // this is a hard requirement, not a best-effort path.
+        let docker = self.docker.require()?;
+
         // Make sure the volume exists. Docker is happy to (re)create
         // it; this also covers the case where teardown removed it.
-        let _ = self
-            .docker
+        let _ = docker
             .create_volume(bollard::models::VolumeCreateRequest {
                 name: Some(primary_volume_name.to_string()),
                 ..Default::default()
@@ -5095,8 +5222,7 @@ echo "[restore] Pre-seed complete"
             ..Default::default()
         };
 
-        let helper = self
-            .docker
+        let helper = docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::new()
@@ -5113,8 +5239,7 @@ echo "[restore] Pre-seed complete"
 
         // Pull the image first if it's missing (debug builds skip web,
         // but they don't pre-pull our images either).
-        if let Err(e) = self
-            .docker
+        if let Err(e) = docker
             .start_container(
                 &helper.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
@@ -5122,8 +5247,7 @@ echo "[restore] Pre-seed complete"
             .await
         {
             // Clean up the half-created helper before bubbling out.
-            let _ = self
-                .docker
+            let _ = docker
                 .remove_container(
                     &helper.id,
                     Some(bollard::query_parameters::RemoveContainerOptions {
@@ -5140,8 +5264,7 @@ echo "[restore] Pre-seed complete"
         }
 
         // Wait for the helper to finish.
-        let wait_result = self
-            .docker
+        let wait_result = docker
             .wait_container(
                 &helper.id,
                 None::<bollard::query_parameters::WaitContainerOptions>,
@@ -5151,8 +5274,7 @@ echo "[restore] Pre-seed complete"
 
         // Capture logs before removing — useful for surfacing the real
         // reason a wal-g fetch failed.
-        let logs = self
-            .docker
+        let logs = docker
             .logs(
                 &helper.id,
                 Some(bollard::query_parameters::LogsOptions {
@@ -5170,8 +5292,7 @@ echo "[restore] Pre-seed complete"
             .await
             .join("");
 
-        let _ = self
-            .docker
+        let _ = docker
             .remove_container(
                 &helper.id,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -5570,6 +5691,13 @@ echo "[restore] Pre-seed complete"
                 .await;
         }
 
+        // Local node — guard the profile contract before starting any container.
+        if !self.local_workloads_enabled {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: service.name.clone(),
+            });
+        }
+
         // Local node — use existing Docker-based service logic
         let service_instance = self.create_service_instance_for_parameters(
             service.name.clone(),
@@ -5765,15 +5893,15 @@ echo "[restore] Pre-seed complete"
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Option<Box<dyn ExternalService>> {
-        match service_type {
-            ServiceType::Postgres => Some(Box::new(PostgresClusterService::new(
-                name,
-                self.docker.clone(),
-            ))),
+    ) -> Result<Option<Box<dyn ExternalService>>, ExternalServiceError> {
+        Ok(match service_type {
+            ServiceType::Postgres => {
+                let docker = self.require_docker()?;
+                Some(Box::new(PostgresClusterService::new(name, docker)))
+            }
             // Future: Redis Sentinel, MongoDB Replica Set, RustFS distributed
             _ => None,
-        }
+        })
     }
 
     /// Node id the API uses for the control plane in the node list.
@@ -5922,7 +6050,7 @@ echo "[restore] Pre-seed complete"
         // helpful message) instead of a generic "Service has no config".
         // Older ordering decrypted first and ate the validation error.
         let cluster_instance = self
-            .create_cluster_service_instance(service.name.clone(), service_type)
+            .create_cluster_service_instance(service.name.clone(), service_type)?
             .ok_or_else(|| ExternalServiceError::InitializationFailed {
                 id: service_id,
                 reason: format!(
@@ -6051,12 +6179,15 @@ echo "[restore] Pre-seed complete"
             precreate_cluster_members(self.db.as_ref(), service_id, &member_results, &member_specs)
                 .await?;
 
-        // Get the Postgres cluster service for building member params
+        // Get the Postgres cluster service for building member params.
+        // The guard for local members (LocalWorkloadsDisabled) is below,
+        // where we know each member's placement. Requiring docker here is
+        // safe because create_cluster_service_instance already did so above.
         let pg_cluster = match service_type {
-            ServiceType::Postgres => Some(PostgresClusterService::new(
-                service.name.clone(),
-                self.docker.clone(),
-            )),
+            ServiceType::Postgres => {
+                let docker = self.require_docker()?;
+                Some(PostgresClusterService::new(service.name.clone(), docker))
+            }
             _ => None,
         };
 
@@ -6212,8 +6343,15 @@ echo "[restore] Pre-seed complete"
                         response.compute_ip,
                     )
                 } else {
-                    // Local: create container directly via Docker
-                    // For now, use the agent-style approach via local Docker
+                    // Local: create container directly via Docker. Guard the
+                    // profile contract before touching the daemon — even if a
+                    // socket is mounted, a control-plane profile forbids local
+                    // container creation.
+                    if !self.local_workloads_enabled {
+                        return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                            name: service.name.clone(),
+                        });
+                    }
                     let member_params = if let Some(ref pg) = pg_cluster {
                         pg.build_member_params(
                             spec,
@@ -6394,43 +6532,54 @@ echo "[restore] Pre-seed complete"
                         }
                     }
                 } else {
-                    // Local: remove container directly via Docker
-                    if let Err(rm_err) = self
-                        .docker
-                        .remove_container(
-                            &member.container_name,
-                            Some(bollard::query_parameters::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    {
-                        error!(
-                            "Rollback: failed to remove local container '{}': {}",
-                            member.container_name, rm_err
-                        );
-                    } else {
-                        info!(
-                            "Rollback: removed local container '{}'",
-                            member.container_name
-                        );
-                    }
+                    // Local: remove container directly via Docker. If this
+                    // process has no local Docker daemon (control-plane
+                    // profile), there is nothing local to roll back — the
+                    // member was never actually created here.
+                    match self.docker.get() {
+                        Some(docker) => {
+                            if let Err(rm_err) = docker
+                                .remove_container(
+                                    &member.container_name,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Rollback: failed to remove local container '{}': {}",
+                                    member.container_name, rm_err
+                                );
+                            } else {
+                                info!(
+                                    "Rollback: removed local container '{}'",
+                                    member.container_name
+                                );
+                            }
 
-                    // Also remove the volume
-                    let volume_name = format!("{}_data", member.container_name);
-                    if let Err(vol_err) = self
-                        .docker
-                        .remove_volume(
-                            &volume_name,
-                            None::<bollard::query_parameters::RemoveVolumeOptions>,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Rollback: failed to remove volume '{}': {}",
-                            volume_name, vol_err
-                        );
+                            // Also remove the volume
+                            let volume_name = format!("{}_data", member.container_name);
+                            if let Err(vol_err) = docker
+                                .remove_volume(
+                                    &volume_name,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Rollback: failed to remove volume '{}': {}",
+                                    volume_name, vol_err
+                                );
+                            }
+                        }
+                        None => {
+                            debug!(
+                                container_name = %member.container_name,
+                                "Rollback: no local Docker daemon in this process; nothing to remove locally"
+                            );
+                        }
                     }
                 }
             }
@@ -6790,9 +6939,8 @@ echo "[restore] Pre-seed complete"
                         );
                     }
                 }
-            } else {
-                let _ = self
-                    .docker
+            } else if let Some(docker) = self.docker.get() {
+                let _ = docker
                     .remove_container(
                         &member.container_name,
                         Some(bollard::query_parameters::RemoveContainerOptions {
@@ -6804,13 +6952,17 @@ echo "[restore] Pre-seed complete"
 
                 // Also remove the volume
                 let volume_name = format!("{}_data", member.container_name);
-                let _ = self
-                    .docker
+                let _ = docker
                     .remove_volume(
                         &volume_name,
                         None::<bollard::query_parameters::RemoveVolumeOptions>,
                     )
                     .await;
+            } else {
+                debug!(
+                    container_name = %member.container_name,
+                    "Retry cleanup: no local Docker daemon in this process; nothing to remove locally"
+                );
             }
         }
 
@@ -7083,7 +7235,8 @@ echo "[restore] Pre-seed complete"
 
         let pg_cluster = match service_type {
             ServiceType::Postgres => {
-                PostgresClusterService::new(service.name.clone(), self.docker.clone())
+                let docker = self.require_docker()?;
+                PostgresClusterService::new(service.name.clone(), docker)
             }
             _ => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
@@ -7705,10 +7858,9 @@ echo "[restore] Pre-seed complete"
                     );
                 }
             }
-        } else {
+        } else if let Some(docker) = self.docker.get() {
             // Local container.
-            if let Err(e) = self
-                .docker
+            if let Err(e) = docker
                 .remove_container(
                     &member.container_name,
                     Some(bollard::query_parameters::RemoveContainerOptions {
@@ -7728,8 +7880,7 @@ echo "[restore] Pre-seed complete"
             }
 
             let volume_name = format!("{}_data", member.container_name);
-            if let Err(e) = self
-                .docker
+            if let Err(e) = docker
                 .remove_volume(
                     &volume_name,
                     None::<bollard::query_parameters::RemoveVolumeOptions>,
@@ -7746,6 +7897,15 @@ echo "[restore] Pre-seed complete"
                     "Volume cleanup skipped"
                 );
             }
+        } else {
+            // No local Docker daemon in this process (control-plane
+            // profile) — there is nothing local to remove.
+            debug!(
+                service_id,
+                member_id,
+                container = %member.container_name,
+                "No local Docker daemon in this process; skipping local container/volume cleanup"
+            );
         }
 
         // 3. Delete the service_members row.
@@ -8030,9 +8190,9 @@ echo "[restore] Pre-seed complete"
         use bollard::exec::{CreateExecOptions, StartExecOptions};
         use futures::StreamExt;
 
+        let docker = self.require_docker()?;
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let exec = self
-            .docker
+        let exec = docker
             .create_exec(
                 container_name,
                 CreateExecOptions {
@@ -8049,8 +8209,7 @@ echo "[restore] Pre-seed complete"
                 reason: format!("Failed to create exec in '{}': {}", container_name, e),
             })?;
 
-        let output = self
-            .docker
+        let output = docker
             .start_exec(
                 &exec.id,
                 Some(StartExecOptions {
@@ -8093,12 +8252,14 @@ echo "[restore] Pre-seed complete"
             }
         }
 
-        let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
-            ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to inspect exec result: {}", e),
-            }
-        })?;
+        let inspect =
+            docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: 0,
+                    reason: format!("Failed to inspect exec result: {}", e),
+                })?;
         let exit_code = inspect.exit_code.unwrap_or(-1);
         Ok((exit_code, stdout, stderr))
     }
@@ -8192,8 +8353,8 @@ echo "[restore] Pre-seed complete"
     ) -> Option<String> {
         use bollard::query_parameters::InspectContainerOptions;
 
-        match self
-            .docker
+        let docker = self.docker.get()?;
+        match docker
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
@@ -8234,8 +8395,11 @@ echo "[restore] Pre-seed complete"
         // without FQDN resolution inside containers.
         const OVERLAY_NETWORK: &str = "temps0";
 
-        let inspected = match self
-            .docker
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => return None,
+        };
+        let inspected = match docker
             .inspect_network(
                 OVERLAY_NETWORK,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
@@ -8285,8 +8449,10 @@ echo "[restore] Pre-seed complete"
         use bollard::models::*;
         use bollard::query_parameters::*;
 
+        let docker = self.require_docker()?;
+
         // Ensure network exists
-        crate::utils::ensure_network_exists(&self.docker)
+        crate::utils::ensure_network_exists(&docker)
             .await
             .map_err(|e| ExternalServiceError::DockerError {
                 id: 0,
@@ -8294,14 +8460,13 @@ echo "[restore] Pre-seed complete"
             })?;
 
         // Pull image
-        crate::utils::pull_image_with_retry(&self.docker, &params.image, None)
+        crate::utils::pull_image_with_retry(&docker, &params.image, None)
             .await
             .map_err(|e| ExternalServiceError::DockerError { id: 0, reason: e })?;
 
         // Create volume
         let volume_name = format!("{}_data", container_name);
-        let _ = self
-            .docker
+        let _ = docker
             .create_volume(bollard::models::VolumeCreateRequest {
                 name: Some(volume_name.clone()),
                 ..Default::default()
@@ -8372,8 +8537,7 @@ echo "[restore] Pre-seed complete"
             ..Default::default()
         };
 
-        let response = self
-            .docker
+        let response = docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::new()
@@ -8395,8 +8559,7 @@ echo "[restore] Pre-seed complete"
         // records pointing at it. Skipped silently when the overlay
         // isn't bootstrapped on this host (single-host mode).
         let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
-        match self
-            .docker
+        match docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
         {
@@ -8409,7 +8572,7 @@ echo "[restore] Pre-seed complete"
                     container: response.id.clone(),
                     ..Default::default()
                 };
-                match self.docker.connect_network(&overlay_name, req).await {
+                match docker.connect_network(&overlay_name, req).await {
                     Ok(()) => {
                         info!(
                             container = container_name,
@@ -8445,7 +8608,7 @@ echo "[restore] Pre-seed complete"
         }
 
         // Start container
-        self.docker
+        docker
             .start_container(container_name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ExternalServiceError::DockerError {
@@ -8459,8 +8622,7 @@ echo "[restore] Pre-seed complete"
         // Best-effort overlay-IP discovery for the DNS registry (ADR-011).
         // Failure here is non-fatal — the member still starts; the DNS
         // record is just not written for this generation.
-        let compute_ip = match self
-            .docker
+        let compute_ip = match docker
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
@@ -8497,6 +8659,7 @@ echo "[restore] Pre-seed complete"
         use bollard::query_parameters::InspectContainerOptions;
         use std::time::{Duration, Instant};
 
+        let docker = self.require_docker()?;
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -8511,8 +8674,7 @@ echo "[restore] Pre-seed complete"
                 });
             }
 
-            if let Ok(info) = self
-                .docker
+            if let Ok(info) = docker
                 .inspect_container(container_name, None::<InspectContainerOptions>)
                 .await
             {
@@ -8789,7 +8951,13 @@ echo "[restore] Pre-seed complete"
                 }
             }
         } else {
-            // Local node
+            // Local node — guard the profile contract before starting any container.
+            if !self.local_workloads_enabled {
+                return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                    name: service.name.clone(),
+                });
+            }
+
             let service_instance = self.create_service_instance_for_parameters(
                 service.name.clone(),
                 service_type_enum,
@@ -9619,8 +9787,18 @@ echo "[restore] Pre-seed complete"
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
         let overlay = Self::overlay_network_name();
         let network_config = temps_network::NetworkConfig::default();
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => {
+                debug!(
+                    container = container_ref,
+                    "Docker unavailable; skipping overlay attach"
+                );
+                return None;
+            }
+        };
         if let Err(error) =
-            temps_network::docker::validate_owned_network(&self.docker, &network_config).await
+            temps_network::docker::validate_owned_network(docker, &network_config).await
         {
             debug!(
                 container = container_ref,
@@ -9635,7 +9813,7 @@ echo "[restore] Pre-seed complete"
             container: container_ref.to_string(),
             ..Default::default()
         };
-        match self.docker.connect_network(&overlay, req).await {
+        match docker.connect_network(&overlay, req).await {
             Ok(()) => {
                 info!(
                     container = container_ref,
@@ -10334,7 +10512,7 @@ echo "[restore] Pre-seed complete"
         &self,
         service_type: ServiceType,
     ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
-        let service_instance = self.create_service_instance("temp".to_string(), service_type);
+        let service_instance = self.create_service_instance("temp".to_string(), service_type)?;
         Ok(service_instance
             .get_parameter_schema()
             .map(|schema| service_creation_schema(service_type, schema)))
@@ -10694,8 +10872,8 @@ echo "[restore] Pre-seed complete"
         let mut filters = HashMap::new();
         filters.insert("status".to_string(), vec!["running".to_string()]);
 
-        let containers = self
-            .docker
+        let docker = self.docker.require()?;
+        let containers = docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
                 filters: Some(filters),
@@ -10813,8 +10991,10 @@ echo "[restore] Pre-seed complete"
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo> {
         // Get the service-specific implementation based on Docker inspection
-        let container = self
-            .docker
+        let docker = self
+            .require_docker()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let container = docker
             .inspect_container(
                 &request.container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -10864,7 +11044,7 @@ echo "[restore] Pre-seed complete"
         #[allow(deprecated)]
         let service_config = match request.service_type {
             ServiceType::Mariadb => {
-                let mariadb = MariaDbService::new(request.name.clone(), Arc::clone(&self.docker));
+                let mariadb = MariaDbService::new(request.name.clone(), Arc::clone(&docker));
                 mariadb
                     .import_from_container(
                         request.container_id.clone(),
@@ -10875,7 +11055,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Postgres => {
-                let postgres = PostgresService::new(request.name.clone(), Arc::clone(&self.docker));
+                let postgres = PostgresService::new(request.name.clone(), Arc::clone(&docker));
                 postgres
                     .import_from_container(
                         request.container_id.clone(),
@@ -10886,7 +11066,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Redis => {
-                let redis = RedisService::new(request.name.clone(), Arc::clone(&self.docker));
+                let redis = RedisService::new(request.name.clone(), Arc::clone(&docker));
                 redis
                     .import_from_container(
                         request.container_id.clone(),
@@ -10897,7 +11077,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Mongodb => {
-                let mongodb = MongodbService::new(request.name.clone(), Arc::clone(&self.docker));
+                let mongodb = MongodbService::new(request.name.clone(), Arc::clone(&docker));
                 mongodb
                     .import_from_container(
                         request.container_id.clone(),
@@ -10911,7 +11091,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::S3 => {
                 let rustfs = RustfsService::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10927,7 +11107,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Kv => {
                 let redis = RedisService::new(
                     managed_instance_name(&request.name, request.service_type),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                 );
                 redis
                     .import_from_container(
@@ -10942,7 +11122,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Blob => {
                 let rustfs = RustfsService::new(
                     managed_instance_name(&request.name, request.service_type),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10958,7 +11138,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Rustfs => {
                 let rustfs = RustfsService::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10974,7 +11154,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Minio => {
                 let s3 = S3Service::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 s3.import_from_container(
@@ -11107,8 +11287,26 @@ echo "[restore] Pre-seed complete"
         role: String,
         container_name: String,
     ) -> ContainerRuntimeInfo {
-        let inspected = self
-            .docker
+        // No local Docker daemon in this process (control-plane profile) is
+        // the same soft signal as "container not found" here — there is no
+        // separate error path for this best-effort inspection.
+        let Some(docker) = self.docker.get() else {
+            return ContainerRuntimeInfo {
+                role,
+                container_name,
+                container_id: None,
+                status: None,
+                restart_count: None,
+                oom_killed: None,
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+                image: None,
+                resource_limits: crate::externalsvc::ServiceResourceLimits::default(),
+            };
+        };
+
+        let inspected = docker
             .inspect_container(
                 &container_name,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -11215,7 +11413,26 @@ echo "[restore] Pre-seed complete"
             // ourselves. Matches `docker stats` exactly. The 1s window is
             // the same default the Docker CLI uses for its "default"
             // streaming interval.
-            let stats = match sample_container_stats_twice(&self.docker, &name).await {
+            let stats = match sample_container_stats_twice(
+                match self.docker.get() {
+                    Some(d) => d,
+                    None => {
+                        members.push(ContainerStatsSample {
+                            role,
+                            container_name: name,
+                            cpu_percent: None,
+                            memory_usage_bytes: None,
+                            memory_limit_bytes: None,
+                            memory_percent: None,
+                            online_cpus: None,
+                        });
+                        continue;
+                    }
+                },
+                &name,
+            )
+            .await
+            {
                 Some((first, second)) => {
                     // `first` is the earlier sample, `second` is the later one.
                     // `compute_stats_sample` wants (current=later, previous=earlier)
@@ -11271,7 +11488,29 @@ echo "[restore] Pre-seed complete"
         let mut next_baselines = HashMap::with_capacity(containers.len());
 
         for (role, name) in containers {
-            match sample_container_stats_once(&self.docker, &name).await {
+            match sample_container_stats_once(
+                match self.docker.get() {
+                    Some(d) => d,
+                    None => {
+                        if let Some(prev) = baselines.remove(&name) {
+                            next_baselines.insert(name.clone(), prev);
+                        }
+                        members.push(ContainerStatsSample {
+                            role,
+                            container_name: name,
+                            cpu_percent: None,
+                            memory_usage_bytes: None,
+                            memory_limit_bytes: None,
+                            memory_percent: None,
+                            online_cpus: None,
+                        });
+                        continue;
+                    }
+                },
+                &name,
+            )
+            .await
+            {
                 Some(current) => {
                     let previous = baselines.get(&name);
                     members.push(compute_stats_sample(role, name.clone(), &current, previous));
@@ -11347,13 +11586,16 @@ echo "[restore] Pre-seed complete"
 
         let mut results = Vec::with_capacity(containers.len());
 
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
         for (role, container_name) in containers {
             // First check whether the container actually exists. Calling
             // update_container on a missing name returns a confusing 404;
             // distinguishing "missing" from "failed" up front gives the
             // operator a clearer signal in the response.
-            let inspected = self
-                .docker
+            let inspected = docker
                 .inspect_container(
                     &container_name,
                     None::<bollard::query_parameters::InspectContainerOptions>,
@@ -11436,7 +11678,7 @@ echo "[restore] Pre-seed complete"
                         // per-member override (different caps per cluster
                         // role, etc.) slots in cleanly.
                         let body = build_container_update_body(limits);
-                        match self.docker.update_container(&container_name, body).await {
+                        match docker.update_container(&container_name, body).await {
                             Ok(()) => ResourceLimitApplyResult {
                                 role,
                                 container_name,
@@ -11539,17 +11781,19 @@ echo "[restore] Pre-seed complete"
         )?;
         let container_name = instance.get_docker_container_name();
 
+        // Recreating a local container needs a real Docker daemon; this is
+        // a hard requirement (the caller already ruled out remote/cluster).
+        let docker = self.docker.require()?;
+
         // Stop, then DELETE the container (volume preserved). Stop is
         // best-effort — the container may already be stopped or gone.
-        let _ = self
-            .docker
+        let _ = docker
             .stop_container(
                 &container_name,
                 None::<bollard::query_parameters::StopContainerOptions>,
             )
             .await;
-        match self
-            .docker
+        match docker
             .remove_container(
                 &container_name,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -14349,7 +14593,9 @@ mod tests {
     #[test]
     fn blob_service_instance_targets_the_container_the_plugin_created() {
         let manager = mock_service_manager(vec![]);
-        let instance = manager.create_service_instance("temps-blob".to_string(), ServiceType::Blob);
+        let instance = manager
+            .create_service_instance("temps-blob".to_string(), ServiceType::Blob)
+            .expect("mock manager always has an available Docker handle");
 
         assert_eq!(
             instance.get_name(),
@@ -14367,7 +14613,9 @@ mod tests {
     #[test]
     fn kv_service_instance_targets_the_container_the_plugin_created() {
         let manager = mock_service_manager(vec![]);
-        let instance = manager.create_service_instance("temps-kv".to_string(), ServiceType::Kv);
+        let instance = manager
+            .create_service_instance("temps-kv".to_string(), ServiceType::Kv)
+            .expect("mock manager always has an available Docker handle");
 
         assert_eq!(
             instance.get_name(),
@@ -14421,7 +14669,9 @@ mod tests {
             let legacy = legacy_managed_instance_names(service_name, service_type);
             assert_eq!(legacy, vec![expected.to_string()]);
 
-            let instance = manager.create_service_instance(legacy[0].clone(), service_type);
+            let instance = manager
+                .create_service_instance(legacy[0].clone(), service_type)
+                .expect("mock manager always has an available Docker handle");
             assert_eq!(
                 instance.get_name(),
                 expected,
@@ -14431,6 +14681,7 @@ mod tests {
                 instance.get_name(),
                 manager
                     .create_service_instance(service_name.to_string(), service_type)
+                    .expect("mock manager always has an available Docker handle")
                     .get_name(),
                 "sweeping the canonical container would delete the live service's data"
             );
@@ -17020,5 +17271,117 @@ mod tests {
             }
             other => panic!("expected ArchiveSourceDesynced(102, 7, false), got: {other:?}"),
         }
+    }
+
+    // --- Docker-optional / control-plane policy tests ---
+
+    /// A disabled `DockerHandle` causes `require_docker()` to return a typed
+    /// `DockerUnavailable` error. The policy flag is independent: even when
+    /// `local_workloads_enabled = true`, no daemon → clear typed error.
+    #[test]
+    fn disabled_handle_yields_docker_unavailable() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "no socket mounted in this process",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle,
+            true, // local_workloads_enabled — policy allows it, but handle is disabled
+            dns,
+        );
+
+        let err = manager
+            .require_docker()
+            .expect_err("disabled handle must yield an error");
+        assert!(
+            matches!(err, ExternalServiceError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {err:?}"
+        );
+        // The error message must carry the profile so operators know why
+        assert!(
+            err.to_string().contains("control-plane"),
+            "error must name the profile: {err}"
+        );
+    }
+
+    /// When `local_workloads_enabled = false` (control-plane profile), the
+    /// policy flag is `false` regardless of whether a Docker socket exists.
+    #[test]
+    fn control_plane_policy_flag_is_false() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        // Use a disabled handle — that is the normal control-plane state, but
+        // the policy flag is what gates local provisioning, not the handle.
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "control-plane profile",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle, false, // <-- the policy says no local workloads
+            dns,
+        );
+
+        assert!(
+            !manager.local_workloads_enabled(),
+            "control-plane policy must report local_workloads_enabled = false"
+        );
+    }
+
+    /// `LocalWorkloadsDisabled` carries the service name in its error text so
+    /// an operator reading the 409 response knows which service was rejected.
+    #[test]
+    fn local_workloads_disabled_error_includes_service_name() {
+        let err = ExternalServiceError::LocalWorkloadsDisabled {
+            name: "my-postgres".to_string(),
+        };
+        assert!(
+            err.to_string().contains("my-postgres"),
+            "error must include the service name: {err}"
+        );
+        assert!(
+            err.to_string().contains("control-plane"),
+            "error must mention the profile: {err}"
+        );
+        assert!(
+            err.to_string().contains("temps join"),
+            "error must mention the remedy: {err}"
+        );
+    }
+
+    /// Full-profile managers report `local_workloads_enabled = true`.
+    #[test]
+    fn full_profile_policy_flag_is_true() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "no socket (even full-profile constructors get tested here)",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle, true, // full-profile
+            dns,
+        );
+
+        assert!(
+            manager.local_workloads_enabled(),
+            "full profile must report local_workloads_enabled = true"
+        );
     }
 }

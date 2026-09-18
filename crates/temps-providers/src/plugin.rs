@@ -42,7 +42,7 @@ impl TempsPlugin for ProvidersPlugin {
         vec![
             RequiredService::of::<sea_orm::DatabaseConnection>(),
             RequiredService::of::<temps_core::EncryptionService>(),
-            RequiredService::of::<bollard::Docker>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
         ]
     }
 
@@ -55,17 +55,21 @@ impl TempsPlugin for ProvidersPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             // AuditService should already be registered by the audit plugin
-            let docker = context.require_service::<bollard::Docker>();
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
 
             // Create ExternalServiceManager. The DnsRegistry is constructed
             // here (not pulled from the registry) because it's a thin wrapper
             // over the same DatabaseConnection — going through the registry
             // would force a plugin-init ordering constraint with no benefit.
             let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
-            let external_service_manager = Arc::new(ExternalServiceManager::new(
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let external_service_manager = Arc::new(ExternalServiceManager::new_with_handle(
                 db.clone(),
                 encryption_service.clone(),
-                docker,
+                docker_handle,
+                local_workloads.local_workloads_enabled(),
                 dns_registry,
             ));
             context.register_service(external_service_manager.clone());
@@ -89,9 +93,6 @@ impl TempsPlugin for ProvidersPlugin {
             // left to retry against an absent daemon. The HTTP surface stays
             // registered so the console can still list what exists and explain
             // why provisioning is unavailable here.
-            let local_workloads = temps_core::policy_or_default(
-                context.get_service::<temps_core::LocalWorkloadPolicy>(),
-            );
             if !local_workloads.local_workloads_enabled() {
                 tracing::info!(
                     profile = local_workloads.profile(),

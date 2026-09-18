@@ -1296,31 +1296,6 @@ fn docker_unavailable_error(reason: &str) -> anyhow::Error {
     )
 }
 
-/// The `control-plane` profile does not USE Docker, but it still has to hand a
-/// `bollard::Docker` handle to the plugins that own the deployment API, and
-/// bollard validates that a unix socket path exists before it will build a
-/// client. Say exactly that, and what to do about it, rather than repeating
-/// the "start Docker" advice — the daemon genuinely does not need to be
-/// running here.
-fn docker_client_unconstructable_error(reason: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "❌ Could not construct a Docker client\n\n\
-        Error details: {}\n\n\
-        This process runs with `--profile control-plane`, so it never deploys \
-        containers here and does NOT need a Docker daemon running. It does still \
-        need a Docker *client handle* to hand to the deployment API, and the \
-        Docker client library refuses to build one when DOCKER_HOST points at a \
-        unix socket path that does not exist.\n\n\
-        Either:\n\
-        1. Point DOCKER_HOST at a TCP endpoint instead — it is never contacted in \
-           this profile, e.g. DOCKER_HOST=tcp://127.0.0.1:2375\n\
-        2. Or mount a Docker socket into this container (it does not have to have \
-           a daemon behind it that you intend to use)\n\n\
-        Applications run on worker nodes joined with `temps join` either way.",
-        reason
-    )
-}
-
 /// Storage backend selection for the log aggregator.
 #[derive(Debug, thiserror::Error)]
 pub enum LogStorageConfigError {
@@ -1526,6 +1501,12 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_health",
         "get_quota",
         "get_pipeline_stats",
+        // ── Platform capabilities: which subsystems this process actually
+        //    runs (profile, docker, local workloads, kv, imports, log
+        //    aggregation, vulnerability scanning, backups). No secrets — lets
+        //    the AI tell the user "not available in this profile" instead of
+        //    proposing an action that will fail.
+        "get_platform_features",
         // ── Container runtime: logs + metrics (no secrets) ──
         "get_container_metrics",
         "get_container_logs",
@@ -1944,6 +1925,11 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Platform info + update status ──
         // OS type, architecture, and supported platform strings — no secrets.
         "get_platform_info",
+        // Which subsystems this process actually provides (serve profile plus a
+        // boolean per capability). No secrets, and it is what lets the assistant
+        // answer "why can't I create a database here?" with the real reason
+        // instead of guessing from a failed call.
+        "get_platform_features",
         // Server's externally-reachable public IP as detected at startup.
         "get_public_ip",
         // Whether an in-place binary update is possible and what version is available.
@@ -2338,57 +2324,52 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // descriptor that "connects" successfully to a socket that does not exist,
     // and reporting `docker: true` on that basis would be a lie.
     debug!("Checking Docker daemon connectivity...");
-    let docker_client = bollard::Docker::connect_with_defaults().map_err(|e| {
-        if profile.local_workloads_enabled() {
-            docker_unavailable_error(&e.to_string())
-        } else {
-            docker_client_unconstructable_error(&e.to_string())
-        }
-    })?;
+    let (docker_handle, docker_available) = if profile.local_workloads_enabled() {
+        // `full`: a daemon is this profile's entire job, so a missing one is a
+        // misconfiguration the operator must see immediately. Probe it for
+        // real rather than trusting client construction — a bollard client is
+        // a lazy descriptor that "connects" successfully to a socket path
+        // that does not exist, so construction alone proves nothing and
+        // reporting `docker: true` on that basis would be a lie the console
+        // shows to the operator.
+        let client = bollard::Docker::connect_with_defaults()
+            .map_err(|e| docker_unavailable_error(&e.to_string()))?;
 
-    // Whether a daemon actually ANSWERS, as distinct from "a client handle
-    // exists". A bollard client is a lazy descriptor: it constructs
-    // successfully against a socket path that does not exist, so
-    // construction alone says nothing about reachability, and reporting
-    // `docker: true` on that basis would be a lie the console shows to the
-    // operator.
-    //
-    // `full` keeps the historical behaviour exactly: no round-trip here, and
-    // an unreachable daemon surfaces at the first container operation.
-    // `control-plane` probes once, non-fatally, purely so
-    // `GET /api/platform/features` can answer honestly — this profile is
-    // designed to run in a container with no Docker socket at all.
-    let docker_available = if profile.local_workloads_enabled() {
-        debug!("✓ Docker daemon is accessible");
-        true
-    } else {
-        match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, docker_client.ping()).await {
-            Ok(Ok(_)) => {
-                info!("Docker daemon is reachable, but this profile runs no local workloads");
-                true
-            }
-            Ok(Err(e)) => {
-                info!(
-                    profile = profile.as_str(),
-                    reason = %e,
-                    "No Docker daemon is reachable. This profile runs no workloads, so startup \
-                     continues; container-backed features are reported as unavailable by \
-                     GET /api/platform/features"
-                );
-                false
-            }
+        match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, client.ping()).await {
+            Ok(Ok(_)) => debug!("✓ Docker daemon is accessible"),
+            Ok(Err(e)) => return Err(docker_unavailable_error(&e.to_string())),
             Err(_) => {
-                info!(
-                    profile = profile.as_str(),
-                    timeout_secs = DOCKER_PROBE_TIMEOUT.as_secs(),
-                    "Docker daemon did not answer a ping in time; treating it as unavailable \
-                     rather than blocking startup"
-                );
-                false
+                return Err(docker_unavailable_error(&format!(
+                    "the daemon did not answer a ping within {}s",
+                    DOCKER_PROBE_TIMEOUT.as_secs()
+                )))
             }
         }
+
+        (temps_core::DockerHandle::available(Arc::new(client)), true)
+    } else {
+        // `control-plane`: no client is constructed at all. Not "constructed
+        // and unused" — constructed. This profile is designed to run in a
+        // container with no Docker socket and no DOCKER_HOST, where
+        // `connect_with_defaults()` itself fails, and where any probe would
+        // only produce a guaranteed error line on every boot. Every
+        // daemon-dependent path resolves this handle and fails with a typed
+        // `DockerUnavailable` naming the remedy.
+        info!(
+            profile = profile.as_str(),
+            "Local workloads are disabled: no Docker client is constructed and no daemon is \
+             contacted. Applications run on worker nodes joined with `temps join`; see \
+             GET /api/platform/features"
+        );
+        (
+            temps_core::DockerHandle::disabled(
+                profile.as_str(),
+                temps_core::CONTROL_PLANE_DOCKER_REASON,
+            ),
+            false,
+        )
     };
-    let docker = Arc::new(docker_client);
+    let docker_handle = Arc::new(docker_handle);
 
     // 2. Validate GeoPlugin dependencies (GeoLite2 database)
     debug!("Checking GeoLite2 database...");
@@ -2431,7 +2412,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(db.clone());
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
-    service_context.register_service(docker.clone());
+    // The Docker client handle is ALWAYS registered; the daemon behind it is
+    // not always there. Plugins resolve the handle with `require_service` (it
+    // genuinely always exists) and then make the *daemon* optional at the
+    // point of use, so a control plane with no socket never panics inside
+    // `require_service::<bollard::Docker>()`.
+    service_context.register_service(docker_handle.clone());
+    // The raw client stays registered too, but only when one exists, so any
+    // consumer that has not been migrated to the handle fails the boot-time
+    // `verify_required_services` check with a readable error naming itself
+    // rather than panicking half-way through initialization.
+    if let Some(client) = docker_handle.cloned() {
+        service_context.register_service(client);
+    }
     // The single boot-time answer to "may this process run workloads?".
     // Registered before any plugin runs so `register_services` can consult it.
     let local_workload_policy = Arc::new(if profile.local_workloads_enabled() {
@@ -2692,17 +2685,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(error_tracking_plugin);
 
     // 8.5. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
-    // MUST be registered before DeploymentsPlugin since deployments depend on vulnerability scanner services
-    // Scanning runs Trivy against images in THIS host's local image store.
-    // Images for remote deployments are built and scanned on the node that
-    // owns them.
-    if local_workloads {
-        debug!("Registering VulnerabilityScannerPlugin");
-        let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
-        plugin_manager.register_plugin(vulnerability_scanner_plugin);
-    } else {
-        skipped_plugins.push("vulnerability-scanner");
-    }
+    //
+    // Registered in EVERY profile. Scanning a fresh image requires Trivy
+    // against THIS host's local image store, and is gated internally: the
+    // scanner holds a `DockerHandle` and returns a typed
+    // `ScannerError::DockerUnavailable` from every scan call on a
+    // control-plane process (no local daemon), rather than failing plugin
+    // registration. Dropping the plugin entirely would also 404 the
+    // `/vulnerability-scans` API and lose access to scan history recorded
+    // before this instance was reconfigured to `control-plane`, which is a
+    // control-plane responsibility, not a local-workload one.
+    //
+    // Scanning images that live only on a worker node is not implemented in
+    // any profile today -- there is no remote scan orchestration over the
+    // agent channel. `PlatformFeatures::vulnerability_scanning` is `false`
+    // under `control-plane` and that is the honest, complete picture; no
+    // code path here silently claims otherwise.
+    debug!("Registering VulnerabilityScannerPlugin");
+    let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
+    plugin_manager.register_plugin(vulnerability_scanner_plugin);
 
     // 8.6. AgentsPlugin - MUST be registered before DeploymentsPlugin so DeploymentsPlugin can
     // resolve AgentSyncService via the plugin context. If registered after, DeploymentsPlugin
@@ -2759,21 +2760,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 9.1. LogAggregatorPlugin - structured log collection, storage, search, and streaming
     // Depends on database, Docker (from DeployerPlugin), and AuditLogger (from AuditPlugin).
     //
-    // The collector tails containers on THIS host's daemon. Logs from
-    // applications on worker nodes reach the console through the deployments
-    // plugin's remote log source instead, which does not need this plugin.
-    if local_workloads {
-        debug!("Registering LogAggregatorPlugin");
-        let log_aggregator_storage_config = log_aggregator_storage_config(&config.data_dir)
-            .map_err(|e| {
-                anyhow::anyhow!("❌ Log aggregator storage configuration is invalid\n\n{e}")
-            })?;
-        let log_aggregator_plugin =
-            Box::new(LogAggregatorPlugin::new(log_aggregator_storage_config));
-        plugin_manager.register_plugin(log_aggregator_plugin);
-    } else {
-        skipped_plugins.push("log-aggregator");
-    }
+    // Registered in EVERY profile. Its local collector tails containers on
+    // this host's daemon and is gated internally on the local-workload
+    // policy, but `RemoteLogCollectorService` — which collects logs from
+    // worker nodes over the agent — and the `/logs/search` and `/logs/tail`
+    // routes are exactly what a control plane needs most. Dropping the plugin
+    // would 404 those routes and leave worker logs uncollected, which is the
+    // opposite of what this profile is for.
+    debug!("Registering LogAggregatorPlugin");
+    let log_aggregator_storage_config =
+        log_aggregator_storage_config(&config.data_dir).map_err(|e| {
+            anyhow::anyhow!("❌ Log aggregator storage configuration is invalid\n\n{e}")
+        })?;
+    let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(log_aggregator_storage_config));
+    plugin_manager.register_plugin(log_aggregator_plugin);
 
     // 9.5. ImportPlugin - provides workload import functionality (depends on
     // GitPlugin, ProjectsPlugin, DeploymentsPlugin).
@@ -2814,15 +2814,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(auth_plugin);
 
     // 11. BackupPlugin - provides backup services (depends on database, audit, and notification services, and providers)
-    // Backup engines exec into managed-service containers on this host. With
-    // no local managed services there is nothing here to back up.
-    if local_workloads {
-        debug!("Registering BackupPlugin");
-        let backup_plugin = Box::new(BackupPlugin::new());
-        plugin_manager.register_plugin(backup_plugin);
-    } else {
-        skipped_plugins.push("backup");
-    }
+    //
+    // Registered in EVERY profile. Only backup *execution against a container
+    // on this host* depends on a local daemon, and that is gated inside the
+    // plugin by the local-workload policy. Scheduling, retention, listing,
+    // restore orchestration and backups of services owned by worker nodes are
+    // control-plane responsibilities and must keep running here — skipping
+    // the plugin would remove the entire backup API, not just local execution.
+    debug!("Registering BackupPlugin");
+    let backup_plugin = Box::new(BackupPlugin::new());
+    plugin_manager.register_plugin(backup_plugin);
 
     // 11a. RevenuePlugin - per-project revenue tracking via inbound webhooks
     // (depends on database + encryption service only — no outbound API calls)
@@ -3540,7 +3541,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             external_service_manager,
             alarm_service,
             ExternalServiceHealthConfig::default(),
-            docker.clone(),
+            docker_handle.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
         );
 
@@ -5010,10 +5011,36 @@ mod log_storage_config_tests {
         }
     }
 
+    /// Holds the lock AND guarantees the environment is clean again.
+    ///
+    /// Cleaning up at the end of each test body only works while every test
+    /// passes: a failed assertion unwinds straight past it and leaks
+    /// `TEMPS_LOG_STORAGE_BACKEND=s3` into whichever test takes the lock next,
+    /// turning one real failure into a cascade of unrelated ones. Cleanup
+    /// belongs in `Drop`, which runs on the unwind path too.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clear_log_storage_env();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            clear_log_storage_env();
+        }
+    }
+
     #[test]
     fn defaults_to_the_filesystem_backend() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_log_storage_env();
+        let _guard = EnvGuard::acquire();
 
         let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
             .expect("the filesystem backend needs no configuration");
@@ -5028,8 +5055,7 @@ mod log_storage_config_tests {
 
     #[test]
     fn s3_backend_missing_a_variable_is_an_error_not_a_panic() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_log_storage_env();
+        let _guard = EnvGuard::acquire();
         std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
         std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
         // TEMPS_LOG_S3_ACCESS_KEY_ID deliberately unset.
@@ -5045,14 +5071,11 @@ mod log_storage_config_tests {
         // The remedy has to be in the message: this is the only place an
         // operator sees it.
         assert!(rendered.contains("TEMPS_LOG_STORAGE_BACKEND"), "{rendered}");
-
-        clear_log_storage_env();
     }
 
     #[test]
     fn a_blank_variable_counts_as_missing() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_log_storage_env();
+        let _guard = EnvGuard::acquire();
         std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
         std::env::set_var("TEMPS_LOG_S3_BUCKET", "   ");
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
@@ -5062,14 +5085,11 @@ mod log_storage_config_tests {
             .expect_err("a whitespace-only bucket name is not a bucket name");
 
         assert!(error.to_string().contains("TEMPS_LOG_S3_BUCKET"));
-
-        clear_log_storage_env();
     }
 
     #[test]
     fn complete_s3_configuration_is_accepted() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_log_storage_env();
+        let _guard = EnvGuard::acquire();
         std::env::set_var("TEMPS_LOG_STORAGE_BACKEND", "s3");
         std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
@@ -5085,7 +5105,5 @@ mod log_storage_config_tests {
             }
             other => panic!("expected the S3 backend, got {other:?}"),
         }
-
-        clear_log_storage_env();
     }
 }

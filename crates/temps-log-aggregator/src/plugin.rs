@@ -92,15 +92,17 @@ impl TempsPlugin for LogAggregatorPlugin {
             let chunk_writer = Arc::new(ChunkWriterService::new(storage.clone()));
             context.register_service(chunk_writer.clone());
 
-            // Docker (required for collector)
-            let docker = context.require_service::<bollard::Docker>();
+            // DockerHandle — always registered; CollectorService holds it and
+            // resolves the daemon at streaming time via require(), returning a typed
+            // error on a control-plane process instead of failing at startup.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
 
             // Metadata service (used by collector to resume from last known position on restart)
             let collector_metadata = Arc::new(LogMetadataService::new(db.clone()));
 
             // Collector service — set the on_chunk_flushed callback before wrapping in Arc
             let mut collector = CollectorService::new(
-                docker,
+                docker_handle,
                 chunk_writer.clone(),
                 collector_metadata.clone(),
                 10_000,

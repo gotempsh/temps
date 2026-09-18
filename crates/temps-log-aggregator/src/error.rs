@@ -62,6 +62,12 @@ pub enum LogAggregatorError {
     #[error("Container '{container_id}' not found")]
     ContainerNotFound { container_id: String },
 
+    /// The local Docker daemon is not available in this serve profile.
+    /// Container log streaming requires a Docker daemon on the same host.
+    /// Remote logs are collected via the `RemoteLogCollectorService`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
     // ── Search errors ───────────────────────────────────────────────────
     #[error("Search requires project_id and time range")]
     SearchMissingRequiredParams,

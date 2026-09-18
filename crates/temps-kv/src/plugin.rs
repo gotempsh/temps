@@ -61,8 +61,30 @@ impl TempsPlugin for KvPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Get Docker client from service registry
-            let docker = context.require_service::<bollard::Docker>();
+            // Get Docker handle from service registry. The handle is always
+            // registered; the actual daemon may not be present on a
+            // control-plane process.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
+            let docker = match docker_handle.cloned() {
+                Some(d) => d,
+                None => {
+                    // The KV service is a local workload (a Redis container on
+                    // this host). Control-plane processes run no local
+                    // workloads — skip registration and let the operator know
+                    // the service lives on a worker node joined with
+                    // `temps join`.
+                    tracing::info!(
+                        "KV plugin: local Docker daemon is unavailable ({}); \
+                         the KV service runs as a managed container on worker \
+                         nodes joined with `temps join`. Skipping registration.",
+                        docker_handle
+                            .unavailable_error()
+                            .map(|e| e.profile)
+                            .unwrap_or("unknown"),
+                    );
+                    return Ok(());
+                }
+            };
 
             // Create RedisService from temps-providers for container management
             // This gives us version tracking, upgrades, and backup support.

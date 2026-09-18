@@ -11892,6 +11892,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "temps-core",
  "temps-database",
  "temps-deployer",
  "temps-deployments",

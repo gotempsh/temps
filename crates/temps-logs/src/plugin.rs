@@ -44,22 +44,15 @@ impl TempsPlugin for LogsPlugin {
             // Create LogService (file-based logging)
             let log_service = Arc::new(LogService::new(self.log_base_path.clone()));
             context.register_service(log_service);
-            // Container log streaming is only meaningful where a Docker
-            // daemon handle exists. `get_service` rather than
-            // `require_service`: a control plane that runs no workloads has no
-            // local containers to tail, and must not abort startup (or panic
-            // mid-registration) over a service it will never call.
-            match context.get_service::<bollard::Docker>() {
-                Some(docker) => {
-                    let docker_log_service = Arc::new(DockerLogService::new(docker));
-                    context.register_service(docker_log_service);
-                    tracing::debug!("Docker log service registered successfully");
-                }
-                None => tracing::info!(
-                    "no Docker handle is registered; container log streaming is unavailable in \
-                     this process. File-based logs are unaffected"
-                ),
-            }
+            // DockerLogService is registered unconditionally — it holds an
+            // Arc<DockerHandle> and returns a typed DockerUnavailable error
+            // at point of use if the daemon is absent. File-based logs are
+            // always unaffected. Container tailing simply returns a
+            // DockerUnavailable on a control-plane process.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
+            let docker_log_service = Arc::new(DockerLogService::new(docker_handle));
+            context.register_service(docker_log_service);
+            tracing::debug!("Docker log service registered successfully");
 
             tracing::debug!("Logs plugin services registered successfully");
             Ok(())
