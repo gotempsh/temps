@@ -83,7 +83,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
 | `DataTable` | `columns`, `rows`, `rowKey`, `onRowClick?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
 | `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
-| `Wizard` | `title`, `description`, `currentStep`, `steps`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
+| `Wizard` | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
 
 ## Page templates + record recipe
 
@@ -102,12 +102,15 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
   reimplement any specific card component — bring your own (`ProjectCard`,
   etc.) as `renderCard`. Reference screen: `design-system/` "CardGrid —
   Projects".
-- **`Wizard`** (multi-step flow): step indicator + title/description +
-  confetti celebration on the final step. Not one of the three original
+- **`Wizard`** (multi-step flow): shared page header, labeled progress, and
+  an optional bordered step surface with a persistent `footer` for actions.
+  Existing consumers without `footer` keep their own content surfaces;
+  `celebrate` remains opt-in. Not one of the three original
   templates (`Ledger`/`Detail`/`Settings`) — a fourth shape for input
-  collected across steps rather than a single form. Promoted as-is from
+  collected across steps rather than a single form. Promoted from
   `SetupWizardShell.tsx`. Reference screen: `design-system/` "Wizard —
-  Connect a repository".
+  Connect a repository" — provider choices, labeled repository input, Back,
+  validation, URL-restored selections, and honest sample-only completion.
 
 ## Responsive & keyboard
 

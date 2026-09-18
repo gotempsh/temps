@@ -138,6 +138,20 @@ real requirement, not "Nothing here yet."
 Shortcuts get a visible `Kbd` badge next to the control they trigger, never a
 keyboard-only entry point. `Picker` is filterable by keyboard from focus.
 
+## Wizards
+
+Use `Wizard` for a sequence of decisions. Its `PageHeader` stays aligned
+with the page; progress labels remain readable on small screens. Put the
+current step in a defined surface and actions in the `footer` slot. Each
+step needs a descriptive heading, labeled inputs or choices, and a clear
+next action. Explain what is missing before Continue can act. Allow Back
+without discarding selections. Completion names the outcome and offers a
+useful next step; sample flows must not imply a real resource was created.
+
+`Wizard` does not own gutters: wrap standalone pages in `PageContainer`.
+Keep existing embedded consumers' surrounding containers. Celebration is
+opt-in, never needed to communicate success; use a text-labeled `Status`.
+
 ## Responsive
 
 `PageHeader` actions wrap to a second row before they overflow. `Detail`'s
