@@ -459,7 +459,7 @@ impl TempsPlugin for DeployerPlugin {
             let image_builder: Arc<dyn crate::ImageBuilder> = docker_runtime;
             context.register_service(image_builder);
 
-            // Create and register StaticDeployer. `TEMPS_LOG_STORAGE_BACKEND`
+            // Create and register StaticDeployer. `TEMPS_STATIC_STORAGE_BACKEND`
             // is unset for every existing self-hosted install, so this resolves
             // to `StaticStorageBackend::Filesystem` and reproduces today's
             // behavior exactly (local disk under `TEMPS_DATA_DIR/static`).
@@ -478,7 +478,7 @@ impl TempsPlugin for DeployerPlugin {
                     tracing::info!(
                         bucket = %s3_config.bucket,
                         region = %s3_config.region,
-                        "Static-site deployments will be stored in S3 (TEMPS_LOG_STORAGE_BACKEND=s3)"
+                        "Static-site deployments will be stored in S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
                     );
                     Arc::new(S3StaticDeployer::new(s3_config))
                 }

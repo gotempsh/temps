@@ -493,14 +493,14 @@ pub fn setup_proxy_server(
         as Arc<dyn ProjectContextResolver>;
 
     // Create the deployment-asset store for CAS blobs and (when configured)
-    // object-store-backed static-site files. `TEMPS_LOG_STORAGE_BACKEND`
+    // object-store-backed static-site files. `TEMPS_STATIC_STORAGE_BACKEND`
     // is unset for every existing self-hosted install, so this resolves to
     // `StaticStorageBackend::Filesystem` and reproduces today's exact
     // behavior: an `FsFileStore` for the CAS fallback path, and no
     // object-store-backed static serving at all (`static_object_store` stays
     // `None`, so `serve_static_file` keeps reading straight off local disk).
     //
-    // When `TEMPS_LOG_STORAGE_BACKEND=s3`, the SAME S3-backed store,
+    // When `TEMPS_STATIC_STORAGE_BACKEND=s3`, the SAME S3-backed store,
     // wrapped in one byte-level cache (`CachingFileStore`), backs both the
     // CAS fallback path and static-site serving — both are read on every
     // request to a deployed site, so a warm key must never re-hit S3. See
@@ -527,7 +527,7 @@ pub fn setup_proxy_server(
                 region = %s3_config.region,
                 byte_cache_max_bytes,
                 "Static-site files and CAS assets are read from S3 \
-                 (TEMPS_LOG_STORAGE_BACKEND=s3), through an in-process byte cache"
+                 (TEMPS_STATIC_STORAGE_BACKEND=s3), through an in-process byte cache"
             );
             let backend: Arc<dyn temps_file_store::FileStore> =
                 Arc::new(temps_file_store::cache::CachingFileStore::new(
