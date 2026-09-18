@@ -302,8 +302,9 @@ impl AgentConfigService {
 
     /// List the enabled, cron-scheduled agents that are due at `now`.
     ///
-    /// The cron scheduler used to call [`Self::list_all_enabled_agents`] once
-    /// a minute, decrypt every agent's provider credentials, and then discard
+    /// The cron scheduler used to load *every* enabled agent once a minute
+    /// (`list_all_enabled_agents`, removed with this query), decrypt every
+    /// agent's provider credentials, and then discard
     /// all but the handful with a `schedule.cron` entry — 1,440 full table
     /// scans a day on an instance where nothing may be scheduled at all.
     ///
@@ -366,16 +367,6 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
         Ok(())
-    }
-
-    /// List all enabled agents across all projects.
-    pub async fn list_all_enabled_agents(&self) -> Result<Vec<project_agents::Model>, AgentError> {
-        let models = project_agents::Entity::find()
-            .filter(project_agents::Column::Enabled.eq(true))
-            .all(self.db.as_ref())
-            .await
-            .map_err(AgentError::Database)?;
-        self.decrypt_agent_models(models)
     }
 
     /// List enabled agents that match a trigger type for a project.

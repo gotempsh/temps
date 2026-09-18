@@ -105,6 +105,23 @@ impl AgentCronScheduler {
             // Belt and braces: the row was due per the query, but confirm the
             // expression really matches this minute before spending a run.
             if !should_fire(cron_expr, &now) {
+                // The row was due and has now been rescheduled, so this
+                // occurrence is gone. That is intentional (crons do not
+                // backfill), but it is *not* silent: the only way to get here
+                // is a tick that arrived in a later minute than the one the
+                // agent was due in — a stalled scheduler, a long GC/IO pause,
+                // or a host clock jump. Left unlogged, "my agent just didn't
+                // run last night" has no evidence trail at all.
+                tracing::warn!(
+                    agent_slug = %agent.slug,
+                    project_id = agent.project_id,
+                    schedule = %cron_expr,
+                    due_at = ?agent.cron_next_run_at,
+                    tick_at = %now,
+                    "Agent cron occurrence dropped: the tick arrived after the due minute had \
+                     passed, so the expression no longer matches. The run is skipped (crons do \
+                     not backfill) and the agent is rescheduled for its next occurrence."
+                );
                 continue;
             }
 
